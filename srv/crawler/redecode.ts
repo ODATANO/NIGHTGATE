@@ -1,6 +1,6 @@
 /**
- * Cursor reset for the ledger payload decode pass: the pass replays every
- * block above the cursor, so lowering it re-decodes a range in place.
+ * Resets the cursor of the ledger payload decode pass.
+ * The pass decodes every block above the cursor, so lowering the cursor decodes those blocks again.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -12,13 +12,11 @@ const { SELECT, UPDATE } = cds.ql;
 const log = cds.log('nightgate:crawler');
 
 export interface RedecodeResult {
-    /** First height the pass decodes again. */
     fromHeight: number;
-    /** Where the cursor stood; null = nothing was decoded yet. */
+    /** Previous cursor position. Null means nothing was decoded yet. */
     previousDecodedHeight: number | null;
-    /** Indexed blocks from `fromHeight` to the indexed tip. */
     blocks: number;
-    /** False when the cursor already stood below `height`: nothing was moved. */
+    /** False when the cursor was already below `height` and was left alone. */
     changed: boolean;
 }
 
@@ -30,12 +28,12 @@ export class RedecodeError extends Error {
 }
 
 /**
- * Moves the decode cursor to `height - 1` so the pass re-decodes from `height`
- * up. The cursor is only ever lowered: raising it would skip blocks. Runs
- * under the reorg lock, so a pass in flight drops its own cursor write.
+ * Moves the decode cursor to `height - 1`, so the pass decodes again from `height` upwards.
+ * The cursor is only ever lowered, because raising it would skip blocks.
+ * Runs under the reorg lock, so a pass that is running at the same time discards its own cursor update.
  */
 export async function redecodeFromHeight(db: cds.DatabaseService, height: unknown): Promise<RedecodeResult> {
-    // Integer64 arrives as a number or a decimal string; nothing else counts.
+    // An Integer64 arrives as a number or a decimal string. Anything else is rejected.
     const from = typeof height === 'number' || (typeof height === 'string' && /^\d+$/.test(height)) ? Number(height) : NaN;
     if (!Number.isInteger(from) || from < 0) throw new RedecodeError('height must be a non-negative integer');
 
@@ -53,7 +51,6 @@ export async function redecodeFromHeight(db: cds.DatabaseService, height: unknow
                 .where({ height: { '>=': from } }).and({ height: { '<=': indexed } })
         );
         const blocks = Number(counted?.blocks ?? 0);
-        // Already below: the pass will get there on its own.
         if (cursor == null || cursor < from) {
             result = { fromHeight: from, previousDecodedHeight: cursor, blocks, changed: false };
             return;

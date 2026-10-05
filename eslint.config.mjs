@@ -1,6 +1,10 @@
 import cds from '@sap/cds/eslint.config.mjs'
 import globals from 'globals'
 import tseslint from 'typescript-eslint'
+import { readFileSync } from 'node:fs'
+
+// Files that still carry `any`, with their count; scripts/check-any-baseline.mjs lets the counts only shrink.
+const anyBaseline = Object.keys(JSON.parse(readFileSync(new URL('./eslint.any-baseline.json', import.meta.url), 'utf8')))
 
 export default [
     {
@@ -60,8 +64,12 @@ export default [
             'no-redeclare': 'off',
             'no-unused-vars': 'off',
             '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrors: 'none' }],
-            '@typescript-eslint/no-explicit-any': 'warn'
+            '@typescript-eslint/no-explicit-any': 'error'
         }
+    },
+    {
+        files: anyBaseline,
+        rules: { '@typescript-eslint/no-explicit-any': 'warn' }
     },
     {
         // SDK objects are duck-typed (real types would pull in the ESM-only SDK type graphs); test doubles too.

@@ -1,22 +1,20 @@
 /**
- * Reads the serialized ledger transaction inside a `Midnight.send_mn_transaction`
- * extrinsic.
+ * Reads the serialized ledger transaction inside a `Midnight.send_mn_transaction` extrinsic.
  *
- * What the block's events report is the OUTCOME; the payload is what the
- * transaction asked for, and it is the only place the circuit name of a call,
- * the zswap offers and the DUST actions appear. Deserializing costs tens of
- * milliseconds in wasm, which is why this runs in its own pass rather than in
- * the crawl loop.
+ * The block's events say what happened. The transaction itself is the only place that names
+ * the called circuit, the zswap offers and the DUST actions.
+ * Decoding is slow, so it runs in a separate pass and not in the main crawl loop.
  */
 
 import { decodeCompact } from '../utils/scale';
 import { loadLedgerV8 } from '../midnight/sdk-loader';
 import { stripContractAddressPrefix } from './block-events';
+import { errorMessage } from '../utils/errors';
 
 /** One contract action as the transaction declared it, in intent order. */
 export interface DeclaredContractAction {
     address: string;
-    /** Circuit name for a call; absent on a deploy or a maintenance update. */
+    /** Circuit name of a call. Null for a deploy or a maintenance update. */
     entryPoint: string | null;
 }
 
@@ -29,18 +27,13 @@ export interface LedgerPayloadFacts {
     dustSpendCount: number;
     dustRegistrationCount: number;
     /**
-     * Sum of the DUST spends' `vFee`: the DUST this transaction's spends
-     * declare. NOT the fee the indexer reports, which is a different figure
-     * (measured: 3e14 here against 1 there on the same transaction).
+     * Sum of `vFee` over the transaction's DUST spends.
+     * This is not the fee the Midnight indexer reports, which is a different number.
      */
     dustSpendValue: bigint;
 }
 
-/**
- * The ledger transaction bytes of an extrinsic body, or null when the call
- * carries none. `send_mn_transaction(midnight_tx: Vec<u8>)` puts them behind a
- * compact length prefix at the start of the argument region.
- */
+/** The ledger transaction bytes follow a SCALE compact length prefix at the start of the call arguments. */
 export function extractLedgerPayload(buf: Buffer, argsOffset: number): Uint8Array | null {
     const compact = decodeCompact(buf, argsOffset);
     if (!compact) return null;
@@ -50,7 +43,10 @@ export function extractLedgerPayload(buf: Buffer, argsOffset: number): Uint8Arra
     return new Uint8Array(buf.subarray(start, start + length));
 }
 
-/** On-chain transactions are signed, proven and bound; the rest are for a caller's own bytes. */
+/**
+ * Serialization variants to try, in order. On-chain transactions use the first one.
+ * The others cover transactions that are not yet bound or have erased signatures.
+ */
 const MARKERS: ReadonlyArray<readonly [string, string, string]> = [
     ['signature', 'proof', 'binding'],
     ['signature', 'proof', 'pre-binding'],
@@ -64,7 +60,7 @@ function deserialize(ledger: any, bytes: Uint8Array): any {
             const tx = ledger.Transaction.deserialize(s, p, b, bytes);
             if (tx) return tx;
         } catch (err) {
-            errors.push(`(${s},${p},${b}) ${String((err as Error)?.message ?? err).slice(0, 80)}`);
+            errors.push(`(${s},${p},${b}) ${errorMessage(err).slice(0, 80)}`);
         }
     }
     throw new Error(`no marker combination deserialized ${bytes.length} bytes: ${errors.join(' | ')}`);
@@ -84,7 +80,7 @@ function entryPointOf(action: any): string | null {
     return null;
 }
 
-/** Reading one accessor must not cost the whole transaction. */
+/** Returns the fallback if a read throws, so one bad field does not lose the whole transaction. */
 function safe<T>(read: () => T, fallback: T): T {
     try {
         const value = read();
@@ -94,7 +90,6 @@ function safe<T>(read: () => T, fallback: T): T {
     }
 }
 
-/** Everything the stored columns want out of one deserialized transaction. */
 export function readLedgerFacts(tx: any): LedgerPayloadFacts {
     const facts: LedgerPayloadFacts = {
         identifiers: safe(() => (tx.identifiers() ?? []).map(hex).filter(Boolean), []),
@@ -122,8 +117,8 @@ export function readLedgerFacts(tx: any): LedgerPayloadFacts {
     const intents = safe(() => tx.intents, undefined);
     if (!intents || typeof intents.entries !== 'function') return facts;
 
-    // Segment order is the order the ledger applies them in, so the actions come
-    // out in the same order the events report them.
+    // Sorted by segment, the order in which the ledger applies them.
+    // This gives the actions in the same order as the block events.
     const bySegment = Array.from(intents.entries() as Iterable<[number, any]>)
         .sort((a, b) => Number(a[0]) - Number(b[0]));
 
@@ -146,20 +141,19 @@ export function readLedgerFacts(tx: any): LedgerPayloadFacts {
     return facts;
 }
 
-/** True when the transaction moves shielded coins: any zswap input, output or transient. */
 export function carriesShieldedCoins(facts: LedgerPayloadFacts): boolean {
     return facts.zswapInputCount + facts.zswapOutputCount + facts.zswapTransientCount > 0;
 }
 
-/** True for a contract call or a zswap coin; a DUST spend is proven too, but every fee-paying transaction has one. */
+/** DUST spends are ignored here, because every transaction that pays a fee has one. */
 export function carriesProof(facts: LedgerPayloadFacts): boolean {
     return carriesShieldedCoins(facts) || facts.contractActions.some(a => a.entryPoint !== null);
 }
 
 /**
- * What a transaction without any contract action is. The block's events name
- * contract actions and unshielded movements only, so such a transaction has
- * nothing but its pallet's default type until the payload is read.
+ * The type of a transaction without contract actions, or null.
+ * Block events only report contract actions and unshielded transfers.
+ * Other transactions get their real type only from the decoded payload.
  */
 export function callFreeTxType(facts: LedgerPayloadFacts): 'shielded_transfer' | 'dust_registration' | null {
     if (facts.contractActions.length > 0) return null;
@@ -168,7 +162,6 @@ export function callFreeTxType(facts: LedgerPayloadFacts): 'shielded_transfer' |
     return null;
 }
 
-/** Deserializes the payload and reads it; throws when no marker combination fits. */
 export async function decodeLedgerPayload(bytes: Uint8Array): Promise<LedgerPayloadFacts> {
     const ledger = await loadLedgerV8();
     return readLedgerFacts(deserialize(ledger, bytes));

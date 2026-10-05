@@ -1,11 +1,7 @@
-// Self-funded submission: the pieces a caller needs when it pays its own dust
-// and submits to the node itself instead of handing the transaction to a
-// sponsor. Build with `createTxBuilder`, balance the fee in your own wallet
-// facade, then submit and confirm here.
+// Helpers for callers that pay their own fee and submit to the node themselves, without a sponsor.
+// On Midnight the fee is paid in DUST.
 //
-// The node's HTTP gateway rejects request bodies over ~14 KB with a 403, so a
-// proven contract-call transaction only submits over WebSocket. Encoding the
-// extrinsic still runs over HTTP (a metadata read, no persistent socket).
+// The node's HTTP gateway rejects large request bodies, so transactions are submitted over WebSocket.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -13,7 +9,6 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 
-/** Tag sets a built transaction deserializes under: bound first, then pre-binding. */
 const DESERIALIZE_TAGS = [
     ['signature', 'proof', 'binding'],
     ['signature', 'proof', 'pre-binding']
@@ -25,10 +20,7 @@ const toBytes = (input) => {
     throw new Error('expected a Uint8Array or a base64 string');
 };
 
-/**
- * Deserialize a built transaction (bytes or base64) into a ledger
- * `Transaction`, trying the bound tag set first, then pre-binding.
- */
+/** Decodes a built transaction from bytes or base64. Accepts sealed and unsealed transactions. */
 export async function deserializeTransaction(bytesOrB64) {
     const bytes = toBytes(bytesOrB64);
     const { Transaction } = await import('@midnight-ntwrk/ledger-v8');
@@ -43,10 +35,8 @@ export async function deserializeTransaction(bytesOrB64) {
 }
 
 /**
- * The transaction's identifiers (`tx.identifiers()`), the last one being what
- * the wallet SDK's submit returns and what the indexer's
- * `transactions(offset:{identifier})` query takes. Resend the SAME bytes only
- * after `probeLanded` says the first send did not land.
+ * Returns the transaction's identifiers. Use the last one to look the transaction up in the indexer.
+ * Resend the same bytes only after `probeLanded` says the first send did not land.
  */
 export function txIdentifiers(tx) {
     if (typeof tx?.identifiers !== 'function') {
@@ -55,8 +45,8 @@ export function txIdentifiers(tx) {
     return Array.from(tx.identifiers(), String);
 }
 
-// Messages of the error and its cause chain, `:line:col` tokens stripped so a
-// source position can never register as a reject code.
+// Joins the messages of an error and its causes.
+// Source positions like `:12:34` are removed so they are never read as error codes.
 function rejectHaystack(err) {
     const parts = [];
     let cur = err;
@@ -69,33 +59,24 @@ function rejectHaystack(err) {
 }
 
 /**
- * Substrate rejects that provably never entered the mempool: 1010 (invalid),
- * 1014 (priority too low: the pool kept the earlier transaction) and 1016
- * (immediately dropped). Deliberately NOT 1013 (already imported: the
- * transaction IS in the pool). A pre-mempool reject spends no fee; after one
- * on a dust-spending transaction, restore the dust wallet (`withDustGuard`)
- * or its spent note stays pending until the wallet cannot balance.
+ * Whether the node refused the transaction before it entered the mempool (codes 1010, 1014, 1016).
+ * No fee was spent. If the transaction paid its own fee, restore the DUST wallet with `withDustGuard`.
  */
 export function isPreMempoolReject(err) {
     return /\b101[046]\s*:|priority is too low|immediately dropped|invalid transaction/i.test(rejectHaystack(err));
 }
 
 /**
- * 1013 Transaction Already Imported: the transaction IS in the pool. After a
- * resend of the same bytes (the first reply was lost) this is the expected
- * answer, and it means the ORIGINAL send succeeded: go to the confirmation
- * loop (`probeLanded`), never treat it as a failure; an immediate probe can
- * still be null from indexer lag.
+ * Whether the node says the transaction is already in the pool (code 1013).
+ * After a resend this means the first send worked. Wait for it with `waitLanded`, do not treat it as a failure.
  */
 export function isAlreadyImported(err) {
     return /\b1013\s*:|already imported/i.test(rejectHaystack(err));
 }
 
 /**
- * The send itself failed (socket closed or reset, no reply, submit timeout):
- * the transaction MAY still be in the mempool. Probe the indexer for the
- * identifier, then resend the SAME bytes; never rebuild on transport alone,
- * a rebuilt duplicate can land next to the original.
+ * Whether the connection failed while sending. The transaction may still have reached the node.
+ * Check with `probeLanded`, then resend the same bytes. Never rebuild, or both transactions may land.
  */
 export function isTransportFailure(err) {
     if (isPreMempoolReject(err)) return false;
@@ -104,32 +85,19 @@ export function isTransportFailure(err) {
 }
 
 /**
- * What a node reject means, from the ledger sub-code in the error (message or
- * cause chain). The kinds and their remedies:
+ * Explains a node rejection by its ledger error code, and what to do about it.
  *
- *   'stale-dust-proof'  170 InvalidDustSpendProof / 171 OutOfDustValidityWindow /
- *                       196 nullifier already known: the dust fee was proven
- *                       against a state the node moved past. The wallet is NOT
- *                       out of dust: re-sync it to the tip, rebuild, resubmit.
- *   'funds'             138 BalanceCheckOverspend / 173, or the balancer's own
- *                       "could not balance dust": the wallet genuinely cannot
- *                       pay. Retrying or splitting buys nothing.
- *   'sequencing'        219-224 (188 on older nodes): the batch's call order is
- *                       illegal for the contract's current state. Splitting
- *                       into single-call transactions is the remedy.
- *   'malformed'         117 NotNormalized (classically a zero fee). Neither
- *                       waiting nor an identical rebuild fixes it.
- *   'stale-transcript'  104: the node refused the call's transcript against
- *                       the current contract state. Another transaction on
- *                       the same contract landed first (typically it grew a
- *                       map by one trie level, so the declared gas budget no
- *                       longer covers the call). Nothing entered the pool, no
- *                       fee: build the call AGAIN against current state
- *                       (`rebuildOnStaleTranscript`), never resend the bytes.
- *   'unknown'           a 1010 this table does not know, or not a coded reject.
+ *   'stale-dust-proof'  Codes 170, 171, 196. The fee was proven against an outdated state.
+ *                       Sync the wallet, rebuild and submit again.
+ *   'funds'             Codes 138, 173. The wallet cannot pay. Retrying does not help.
+ *   'sequencing'        Codes 219-224 and 188. The batch's call order is not allowed.
+ *                       Send the calls as separate transactions.
+ *   'malformed'         Code 117, often a zero fee. Retrying does not help.
+ *   'stale-transcript'  Code 104. Another transaction changed the contract first. No fee was spent.
+ *                       Build the call again, for example with `rebuildOnStaleTranscript`.
+ *   'unknown'           Any other rejection.
  *
- * Rebuilds after a reject must produce FRESH bytes; resubmitting identical
- * bytes is only ever correct after a transport failure (see isTransportFailure).
+ * After a rejection, always build new bytes. Resend the same bytes only after a connection failure.
  */
 export function classifyNodeReject(err) {
     const haystack = rejectHaystack(err);
@@ -148,13 +116,9 @@ export function classifyNodeReject(err) {
 }
 
 /**
- * Run `attempt` again when the node (or a sponsor job) refused the call's
- * transcript against the current contract state (`classifyNodeReject` kind
- * `stale-transcript`, ledger error 104). `attempt(retry)` must BUILD fresh
- * bytes each time (`buildSponsorable` reads the current state) and hand them
- * over; identical bytes stay refused. Any other error, and the last refusal
- * once `retries` are used, is rethrown. The pause lets the indexer serve the
- * state that includes the competing transaction.
+ * Runs `attempt` again after a 'stale-transcript' rejection, up to `retries` times.
+ * `attempt` must build a new transaction each time, because the same bytes are refused again.
+ * The pause gives the indexer time to show the contract's new state.
  */
 export async function rebuildOnStaleTranscript(attempt, { retries = 2, backoffMs = 15_000, onRetry, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
     for (let retry = 0; ; retry++) {
@@ -168,7 +132,7 @@ export async function rebuildOnStaleTranscript(attempt, { retries = 2, backoffMs
     }
 }
 
-/** `wss://host/path` -> `https://host/path` (and ws -> http); http(s) passes through. */
+/** Turns a ws(s):// node URL into the matching http(s):// URL. */
 export function nodeHttpUrlFor(nodeUrl) {
     const u = new URL(nodeUrl);
     if (u.protocol === 'wss:') u.protocol = 'https:';
@@ -180,10 +144,8 @@ export function nodeHttpUrlFor(nodeUrl) {
 }
 
 /**
- * Submit an already-encoded extrinsic over a one-shot WebSocket
- * (`author_submitExtrinsic`). Resolves with the extrinsic hash; a node reject
- * becomes an Error carrying the code, message and the ledger sub-code in
- * `error.data` (feed it to `classifyNodeReject`).
+ * Submits an encoded extrinsic over a new WebSocket and returns its hash.
+ * A rejection throws an Error. Pass it to `classifyNodeReject`.
  */
 export function submitExtrinsic(extrinsicHex, { nodeUrl, timeoutMs = 30_000, WebSocketImpl } = {}) {
     if (!nodeUrl) throw new Error('submitExtrinsic: nodeUrl is required (the node WebSocket RPC)');
@@ -222,8 +184,7 @@ export function submitExtrinsic(extrinsicHex, { nodeUrl, timeoutMs = 30_000, Web
             }
         };
         ws.onerror = (ev) => failTransport('websocket error during submit: ' + String(ev?.message ?? ev?.error?.message ?? 'connection failed'));
-        // A close before the reply (the gateway's own 1000 Normal Closure
-        // included) must fail NOW as transport, not wait out the timeout.
+        // A close before the reply fails at once, without waiting for the timeout.
         ws.onclose = (ev) => failTransport(
             `disconnected from ${nodeUrl}: ${ev?.code ?? '?'}:: ${ev?.reason || 'socket closed before the submit reply'}; ` +
             'the transaction MAY be in the mempool: probe the indexer for its identifier before resending'
@@ -232,15 +193,8 @@ export function submitExtrinsic(extrinsicHex, { nodeUrl, timeoutMs = 30_000, Web
 }
 
 /**
- * Submit a finalized (bound, fee-paid) transaction to the node. Takes the
- * ledger `Transaction` or its serialized bytes/base64; encodes the
- * `midnight.sendMnTransaction` extrinsic over HTTP (derived from `nodeUrl`
- * unless `nodeHttpUrl` is given), then submits over a one-shot WebSocket.
- * Returns the extrinsic hash; the transaction identifier for the indexer
- * comes from `txIdentifiers`.
- *
- * Needs `@polkadot/api` (an optional peer dependency): the extrinsic encoding
- * reads the runtime metadata, so a runtime upgrade cannot silently break it.
+ * Submits a sealed transaction with its fee paid and returns the extrinsic hash.
+ * Needs the optional dependency `@polkadot/api`. To look the transaction up in the indexer, use `txIdentifiers`.
  */
 export async function submitFinalized(tx, { nodeUrl, nodeHttpUrl, timeoutMs = 30_000, WebSocketImpl } = {}) {
     if (!nodeUrl) throw new Error('submitFinalized: nodeUrl is required (the node WebSocket RPC, e.g. wss://rpc.preprod.midnight.network/)');
@@ -263,14 +217,9 @@ export async function submitFinalized(tx, { nodeUrl, nodeHttpUrl, timeoutMs = 30
 }
 
 /**
- * Ask the indexer whether a transaction landed. Returns null while unknown
- * (not indexed yet, an HTTP or GraphQL error, or a partial answer without a
- * transaction result), else `{ height, status, failedSegments, applied }`:
- * `applied` is true only for ledger result SUCCESS; false means the
- * transaction is in a block but its call did NOT apply (FAILURE /
- * PARTIAL_SUCCESS: the fee was spent, rebuild against current state).
- * Confirm by identifier, never by watching the contract address: on a
- * public contract someone else's call confirms yours otherwise.
+ * Asks the indexer whether a transaction landed. Returns null while this is not known yet.
+ * `applied: false` means the transaction is in a block but its call failed. The fee was still spent.
+ * Always check by identifier. Watching the contract address could pick up someone else's call.
  */
 export async function probeLanded(identifier, { indexerHttpUrl, fetchFn, timeoutMs = 15_000 } = {}) {
     if (!identifier) throw new Error('probeLanded: identifier is required (txIdentifiers(tx).at(-1))');
@@ -289,9 +238,7 @@ export async function probeLanded(identifier, { indexerHttpUrl, fetchFn, timeout
         const t = j?.data?.transactions?.[0];
         const height = t?.block?.height;
         if (height == null) return null;
-        // Every submitted transaction is a RegularTransaction, so a landing
-        // carries a status; a missing one is a partial indexer answer and
-        // must read as unknown, never as applied.
+        // A landed transaction always has a status. Without one the indexer answer is incomplete.
         const status = t?.transactionResult?.status;
         if (status == null) return null;
         const segments = t.transactionResult.segments;
@@ -303,13 +250,8 @@ export async function probeLanded(identifier, { indexerHttpUrl, fetchFn, timeout
 }
 
 /**
- * `probeLanded` in a bounded loop: poll until the identifier is known or
- * `timeoutMs` is up (one probe minimum, so `timeoutMs: 0` asks exactly once).
- * Use it before trusting the refusal of a RESEND: any reject of resent bytes
- * (1013 Already Imported, but also e.g. a 1010 whose note the landed first
- * send already spent) can mean the FIRST send is on chain while the indexer
- * still lags; a reject propagated too early makes a landed transaction look
- * like a failure, and a dust guard would then restore a snapshot it must not.
+ * Calls `probeLanded` until the transaction is found or `timeoutMs` has passed. It asks at least once.
+ * Use it when a resend is rejected. The first send may already be on chain while the indexer lags behind.
  */
 export async function waitLanded(identifier, { indexerHttpUrl, timeoutMs = 30_000, pollMs = 5_000, fetchFn } = {}) {
     const deadline = Date.now() + timeoutMs;
@@ -323,23 +265,16 @@ export async function waitLanded(identifier, { indexerHttpUrl, timeoutMs = 30_00
 }
 
 /**
- * Dust wedge protection around a dust-spending build + submit. A pre-mempool
- * reject leaves the spent dust note pending inside the SDK's dust wallet
- * (upstream bug); the pending atoms accumulate until the wallet cannot
- * balance a fee it can afford. This snapshots the dust sub-wallet before
- * `fn`, and on a pre-mempool reject swaps in a wallet restored from the
- * snapshot (`error.dustRestored = true` on the rethrown error). The caller
- * owns persistence: if you snapshot the facade to disk, persist the restored
- * state and never a post-reject one, or a restart restores the wedge.
+ * Runs `fn`, which builds and submits one transaction that pays its own fee.
+ * If the node rejects it before the mempool, the SDK's DUST wallet wrongly keeps the fee reserved.
+ * Enough of these and the wallet can no longer pay. So this saves the DUST wallet first and restores it after such a rejection.
+ * The rethrown error then has `dustRestored = true`. If you save the wallet to disk, save the restored state.
+ * Run only one guarded build per wallet at a time.
  *
- * Serialize your builds: one guarded build per facade at a time.
- *
- * @param facade  the wallet facade whose `dust` sub-wallet to guard
- * @param opts    `{ configuration, dustKey, dustWalletFactory? }`: the same
- *                configuration object the facade was created with, the dust
- *                secret key, and optionally your own `(configuration) =>
- *                DustWallet` (defaults to the SDK's).
- * @param fn      builds, balances and submits ONE transaction
+ * @param facade  The wallet facade whose DUST wallet to protect.
+ * @param opts    The configuration the facade was created with, the DUST secret key,
+ *                and optionally your own DustWallet factory.
+ * @param fn      Builds, balances and submits one transaction.
  */
 export async function withDustGuard(facade, { configuration, dustKey, dustWalletFactory } = {}, fn) {
     if (!facade?.dust) throw new Error('withDustGuard: facade with a dust sub-wallet is required');
@@ -358,7 +293,7 @@ export async function withDustGuard(facade, { configuration, dustKey, dustWallet
                 facade.dust = fresh;
                 try { await old.stop(); } catch { /* already dead is fine */ }
                 try { e.dustRestored = true; } catch { /* frozen error */ }
-            } catch { /* restore failed: the old (possibly wedged) wallet stays, no worse than without the guard */ }
+            } catch { /* restore failed: keep the old wallet */ }
         }
         throw e;
     }

@@ -21,6 +21,7 @@ import {
     assertArtifactGeneration,
     ContractNotRegisteredError
 } from '../../srv/submission/contract-registry';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 beforeEach(() => clearRegistry());
 
@@ -101,7 +102,7 @@ describe('artifact generation digest', () => {
     test('digest is deterministic and covers the artifact + verifier keys', () => {
         registerContract('gen', VAULT);
         const d1 = getArtifactGenerationDigest('gen');
-        expect(d1).toMatch(/^[0-9a-f]{64}$/);
+        expect(d1).toMatch(HEX64_RE);
         expect(getArtifactGenerationDigest('gen')).toBe(d1);
     });
 
@@ -392,7 +393,7 @@ describe('package-form config entries', () => {
         expect(counter.package).toMatchObject({ name: '@odatano/contract-counter', zkAssetLayout: 'flat' });
         expect(counter.package!.zkAssetUrl).toMatch(/releases\/download\/counter-v/);
         expect(getContractRegistration('pkg-vault-32')!.slotWidth).toBe(32);
-        expect(getArtifactGenerationDigest('pkg-counter')).toMatch(/^[0-9a-f]{64}$/);
+        expect(getArtifactGenerationDigest('pkg-counter')).toMatch(HEX64_RE);
     });
 
     test('a package that is not installed leaves that alias unregistered and the others registered', () => {

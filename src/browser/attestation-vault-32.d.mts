@@ -1,2 +1,2 @@
-/** Re-export of @odatano/contract-attestation-vault-32 for one release line. */
+/** Re-exports @odatano/contract-attestation-vault-32. Kept for compatibility. */
 export * from '@odatano/contract-attestation-vault-32';

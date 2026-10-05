@@ -38,10 +38,7 @@ function positiveInteger(value: unknown): number | undefined {
 }
 
 function configuredReplicaCount(config: NightgatePluginConfig): number {
-    // NB: WEB_CONCURRENCY is deliberately NOT consulted - it counts HTTP worker
-    // processes within one instance (Puma/Heroku convention), not replicas of
-    // this stateful service, so reading it would false-positive abort a single
-    // instance that happens to set it.
+    // WEB_CONCURRENCY is ignored on purpose. It counts worker processes inside one instance, not instances.
     return configInt('NIGHTGATE_REPLICA_COUNT')
         ?? positiveInteger(process.env.CF_INSTANCE_COUNT)
         ?? positiveInteger(process.env.KUBERNETES_REPLICA_COUNT)
@@ -50,12 +47,9 @@ function configuredReplicaCount(config: NightgatePluginConfig): number {
 }
 
 /**
- * Cloud Foundry sets CF_INSTANCE_INDEX (0-based) per running instance - unlike
- * CF_INSTANCE_COUNT/KUBERNETES_REPLICA_COUNT, which the platforms do NOT inject
- * automatically. Any index > 0 means CF actually scaled Nightgate to multiple
- * instances, so THIS instance must not run the crawler/wallet/jobs. This is the
- * only signal that catches an accidental scale-out (where the operator forgot to
- * declare replicaCount). Returns undefined when not on CF or malformed.
+ * Cloud Foundry sets CF_INSTANCE_INDEX for every running instance, starting at 0.
+ * An index above 0 means there is more than one instance, even if nobody configured a replica count.
+ * Returns undefined when not on Cloud Foundry or when the value is invalid.
  */
 function cfInstanceIndex(): number | undefined {
     const raw = process.env.CF_INSTANCE_INDEX;
@@ -128,7 +122,7 @@ export function getRuntimeTopology(config: NightgatePluginConfig = {}): RuntimeT
         }
     }
 
-    // `dummy` makes every request a privileged user, signing-key export included.
+    // With `dummy` auth every request is a privileged user and could even export signing keys.
     if (productionMode() && authKind() === 'dummy') {
         const message = "Authentication kind 'dummy' serves every request unauthenticated and privileged.";
         if (configFlag('NIGHTGATE_ALLOW_UNAUTHENTICATED')) {

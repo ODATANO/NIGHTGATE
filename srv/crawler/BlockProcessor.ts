@@ -1,4 +1,4 @@
-/** Parses Midnight blocks (header, extrinsic classification, outcomes) and persists them. */
+/** Reads Midnight blocks from the node and stores them with their transactions, UTXOs and balances. */
 
 import cds from '@sap/cds';
 import { blake2b } from '@noble/hashes/blake2';
@@ -19,7 +19,7 @@ import { encodeUnshieldedOwner, computeInitialNonce } from './utxo-identity';
 import type { DbRunner } from '../utils/db-types';
 import {
     Blocks, Transactions, TransactionResults, TransactionFees, ContractActions,
-    UnshieldedUtxos, NightBalances, SyncState
+    UnshieldedUtxos, NightBalances, SyncState, type UnshieldedUtxo
 } from '#cds-models/midnight';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
@@ -33,7 +33,6 @@ interface ExtrinsicClassification {
     callIndex?: number;
 }
 
-/** Pallet index → name + transaction type, for classifying extrinsics. */
 export interface PalletMapping {
     name: string;
     txType: string;
@@ -41,24 +40,24 @@ export interface PalletMapping {
     isSystem?: boolean;
 }
 
-/** Intent hashes per spend lookup: well under the bind-parameter limits of SQLite and PostgreSQL. */
+/** Intent hashes per spend query, well below the parameter limits of SQLite and PostgreSQL. */
 const SPEND_LOOKUP_CHUNK = 500;
 
-/** Valid TxType values matching the schema enum in db/schema.cds */
+/** Must match the TxType enum in db/schema.cds. */
 const VALID_TX_TYPES = new Set([
     'night_transfer', 'shielded_transfer', 'contract_deploy', 'contract_call',
     'contract_update', 'dust_registration', 'dust_generation', 'governance',
     'system', 'unknown'
 ]);
 
-/** Default pallet index -> classification; runtime metadata re-maps these by pallet name. */
+/** Default classification per pallet index. Runtime metadata moves entries to their real index by pallet name. */
 const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     0: { name: 'System', txType: 'system', isSystem: true },
     1: { name: 'Timestamp', txType: 'system', isSystem: true },
     2: { name: 'Aura', txType: 'system', isSystem: true },
     3: { name: 'Grandpa', txType: 'system', isSystem: true },
     4: { name: 'Sidechain', txType: 'system', isSystem: true },
-    5: { name: 'Midnight', txType: 'contract_call' }, // send_mn_transaction: all ledger txs
+    5: { name: 'Midnight', txType: 'contract_call' }, // send_mn_transaction carries every ledger transaction
     6: { name: 'MidnightSystem', txType: 'system', isSystem: true },
     8: { name: 'SessionCommitteeManagement', txType: 'system', isSystem: true },
     11: { name: 'NodeVersion', txType: 'system', isSystem: true },
@@ -72,7 +71,7 @@ const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     22: { name: 'Mmr', txType: 'system', isSystem: true },
     23: { name: 'BeefyMmrLeaf', txType: 'system', isSystem: true },
     30: { name: 'Session', txType: 'system', isSystem: true },
-    32: { name: 'Bridge', txType: 'night_transfer' }, // handle_transfers: cross-chain NIGHT
+    32: { name: 'Bridge', txType: 'night_transfer' }, // handle_transfers moves NIGHT across chains
     40: { name: 'Council', txType: 'governance' },
     41: { name: 'CouncilMembership', txType: 'governance' },
     42: { name: 'TechnicalCommittee', txType: 'governance' },
@@ -87,7 +86,7 @@ function hexToBinaryValue(hex: string): string {
     return Buffer.from(hex.startsWith('0x') ? hex.slice(2) : hex, 'hex').toString('base64');
 }
 
-/** `cds.requires.nightgate.palletMap`: index-keyed overrides on top of defaults or runtime metadata. */
+/** Entries from `cds.requires.nightgate.palletMap` override both the defaults and the runtime metadata. */
 function configPalletOverrides(): Map<number, PalletMapping> {
     const map = new Map<number, PalletMapping>();
     const nightgateConfig = getNightgatePluginConfig();
@@ -114,7 +113,6 @@ function buildPalletMap(): Map<number, PalletMapping> {
     return map;
 }
 
-/** Pallet map from runtime metadata: default mappings matched by name, then the overrides. */
 export function resolvePalletMapFromMetadata(
     pallets: Array<{ name: unknown; index: unknown }>,
     overrides: Map<number, PalletMapping> = new Map()
@@ -145,13 +143,11 @@ export interface ProcessResult {
     processingTimeMs: number;
 }
 
-/** What one runtime version decodes with: its event registry and its pallet map, cached together per specVersion. */
 interface RuntimeContext {
     registry: TypeRegistry;
     palletMap: Map<number, PalletMapping>;
 }
 
-/** Per-block node data from `fetchBlockBatch`, ready for `persistPreparedBlock`. */
 export type PreparedBlock = PreparedBlockSkipped | PreparedBlockFetched;
 
 export interface PreparedBlockSkipped {
@@ -168,34 +164,23 @@ export interface PreparedBlockFetched {
     protocolVersion: number;
     palletMap: Map<number, PalletMapping>;
     timestamp: number;
-    /** null when the block carried no readable events; the pallet map then classifies alone. */
+    /** Null when the block has no readable events. Then only the pallet map classifies extrinsics. */
     extrinsicEvents: Map<number, ExtrinsicEvents> | null;
     fetchStartedAt: number;
     fetchCompletedAt?: number;
     alreadyIndexed: false;
 }
 
-/** One `UnshieldedUtxos` row, less the transaction it was created at. */
-interface PreparedUtxoRow {
-    owner: string;
-    tokenType: string;
-    value: string;
-    intentHash: string;
-    outputIndex: number;
-    initialNonce: string;
-    ctime: number;
-}
+type PreparedUtxo = Pick<UnshieldedUtxo, 'owner' | 'tokenType' | 'value' | 'intentHash' | 'outputIndex' | 'initialNonce'> & { ctime: number };
 
-/** What one extrinsic's events project onto columns, with addresses resolved. */
 interface EventProjection {
-    created: PreparedUtxoRow[];
+    created: PreparedUtxo[];
     spent: Array<{ intentHash: string; outputIndex: number }>;
     senderAddress: string | null;
     receiverAddress: string | null;
     nightAmount: string | null;
 }
 
-/** Running NightBalances change for one address within a block. */
 interface BalanceDelta {
     balance: bigint;
     utxoCount: number;
@@ -209,7 +194,7 @@ function emptyBalanceDelta(): BalanceDelta {
     return { balance: 0n, utxoCount: 0, totalReceived: 0n, txReceivedCount: 0, totalSent: 0n, txSentCount: 0 };
 }
 
-/** One node lookup per LastRuntimeUpgrade value: which block asked, and whether the node agreed with the value. */
+/** `agreed` is false when the node's answer differs from the decoded LastRuntimeUpgrade value. */
 interface SpecVersionLookup {
     blockHash: string;
     answer: Promise<{ specVersion: number; agreed: boolean }>;
@@ -217,12 +202,9 @@ interface SpecVersionLookup {
 
 export class BlockProcessor {
     private db!: cds.DatabaseService;
-    /** Pallet map without runtime metadata (defaults + config overrides); the metadata-derived map per specVersion lives in `runtimes`. */
     private readonly defaultPalletMap: Map<number, PalletMapping>;
-    /** Event registry + pallet map per runtime specVersion, loaded once from the node's metadata. */
     private readonly runtimes = new Map<number, RuntimeContext>();
     private readonly palletOverrides = configPalletOverrides();
-    /** Bech32m HRP network of the unshielded owners this index stores. */
     private resolvedNetwork?: string;
 
     /** Timestamp::Now = twox128("Timestamp") + twox128("Now"). */
@@ -232,13 +214,12 @@ export class BlockProcessor {
     private static readonly SYSTEM_EVENTS_STORAGE_KEY =
         '0x26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7';
     /**
-     * System::LastRuntimeUpgrade = twox128("System") + twox128("LastRuntimeUpgrade"),
-     * SCALE `{ spec_version: Compact<u32>, spec_name: Vec<u8> }`. A plain storage
-     * read, where `state_getRuntimeVersion` at a historical hash compiles that runtime.
+     * System::LastRuntimeUpgrade = twox128("System") + twox128("LastRuntimeUpgrade").
+     * Reading it is cheap. `state_getRuntimeVersion` at an old block makes the node compile that runtime.
      */
     private static readonly LAST_RUNTIME_UPGRADE_STORAGE_KEY =
         '0x26aa394eea5630e07c48ae0c9558cef7f9cce9c888469bb1a0dceaa129672ef8';
-    /** specVersion per raw LastRuntimeUpgrade value: the node is asked once per value, not per block. */
+    /** Runtime version per raw LastRuntimeUpgrade value, so the node is asked once per value and not per block. */
     private readonly specVersionByUpgrade = new Map<string, SpecVersionLookup>();
 
     constructor(
@@ -247,7 +228,6 @@ export class BlockProcessor {
         this.defaultPalletMap = buildPalletMap();
     }
 
-    /** The pallet map of a runtime version: from its metadata when loaded, else the defaults. */
     private palletMapFor(specVersion: number): Map<number, PalletMapping> {
         return this.runtimes.get(specVersion)?.palletMap ?? this.defaultPalletMap;
     }
@@ -257,13 +237,13 @@ export class BlockProcessor {
         this.db = await cds.connect.to('db');
     }
 
-    /** Not height-sequenced: a missing parent persists `parent_ID = null` instead of failing. */
+    /** A missing parent is allowed here and stored as `parent_ID = null`. */
     async processBlockByHash(blockHash: string): Promise<ProcessResult> {
         const start = Date.now();
         return this.processFromNode(blockHash, start, { requireParent: false });
     }
 
-    /** Height-sequenced: a missing parent is an index gap and fails instead of persisting an orphan. */
+    /** A missing parent means a gap in the index, so this fails instead of storing a block without parent. */
     async processBlockByHeight(height: number): Promise<ProcessResult> {
         const hash = await this.nodeProvider.getBlockHash(height);
         if (!hash) throw new Error(`No block at height ${height}`);
@@ -271,8 +251,8 @@ export class BlockProcessor {
     }
 
     /**
-     * Fetches a height range in two batch frames: all hashes, then block,
-     * timestamp, System.Events and runtime version for every hash not yet indexed.
+     * Fetches a range of heights in two JSON-RPC batches.
+     * The first gets all hashes, the second the block data for every hash not indexed yet.
      */
     async fetchBlockBatch(heights: number[]): Promise<PreparedBlock[]> {
         if (heights.length === 0) return [];
@@ -359,7 +339,7 @@ export class BlockProcessor {
         return out;
     }
 
-    /** Timestamp::Now storage (SCALE u64 LE milliseconds) as UNIX seconds, or null when absent/unparseable. */
+    /** Timestamp::Now is a little-endian u64 in milliseconds. Returns UNIX seconds, or null. */
     private parseTimestampHex(hex: string | null | undefined): number | null {
         if (!hex) return null;
         const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
@@ -370,7 +350,7 @@ export class BlockProcessor {
         }
     }
 
-    /** Timestamp::Now storage, else the `Timestamp.set` inherent at extrinsic 0 (survives state pruning). */
+    /** Falls back to the `Timestamp.set` inherent, which still exists after the node pruned the state. */
     private resolveTimestamp(storageHex: string | null | undefined, extrinsics: string[] | undefined, where: string, palletMap: Map<number, PalletMapping> = this.defaultPalletMap): number {
         const fromStorage = this.parseTimestampHex(storageHex);
         if (fromStorage != null) return fromStorage;
@@ -391,7 +371,6 @@ export class BlockProcessor {
         return Number(decoded[0] / 1000n);
     }
 
-    /** Persists a block from `fetchBlockBatch` without further RPC calls. */
     async persistPreparedBlock(prep: PreparedBlock): Promise<ProcessResult> {
         const start = prep.fetchStartedAt;
         if (prep.alreadyIndexed) {
@@ -403,7 +382,7 @@ export class BlockProcessor {
                 processingTimeMs: Date.now() - start
             };
         }
-        // Catch-up persists in height order: a missing parent is an index gap.
+        // Catch-up stores blocks in height order, so a missing parent is a gap in the index.
         return this.persistFromNode(prep, start, { requireParent: true });
     }
 
@@ -471,9 +450,8 @@ export class BlockProcessor {
         let txCount = 0;
         let actionCount = 0;
 
-        // Bech32m encoding and the nonce derivation run before the transaction
-        // opens: both are SDK calls, and a db transaction is not the place to
-        // await one.
+        // These SDK calls run before the database transaction opens,
+        // so the transaction is not held open while waiting for them.
         const projections = await this.projectEvents(extrinsicEvents, timestamp, `block ${blockHash}`);
 
         const written = await this.db.tx(async (tx) => {
@@ -526,7 +504,7 @@ export class BlockProcessor {
                 const senderAddress = projection?.senderAddress ?? null;
                 const receiverAddress = projection?.receiverAddress ?? null;
                 const nightAmount = projection?.nightAmount ?? null;
-                // The pallet call does not say what the ledger payload carries: unknown until decoded.
+                // The pallet call does not show what the ledger transaction contains. Unknown until it is decoded.
                 const shielded = classification.isSystem ? false : (classification.isShielded ? true : null);
 
                 txRows.push({
@@ -582,7 +560,7 @@ export class BlockProcessor {
 
                 for (const utxo of projection?.created ?? []) {
                     utxoRows.push({ ID: cds.utils.uuid(), ...utxo, createdAtTransaction_ID: txId });
-                    // A UTXO can hold any token; NightBalances counts NIGHT.
+                    // Only NIGHT counts towards NightBalances.
                     if (utxo.tokenType !== NIGHT_RAW_TOKEN_TYPE) continue;
                     const delta = deltaFor(utxo.owner);
                     const value = BigInt(utxo.value);
@@ -594,7 +572,7 @@ export class BlockProcessor {
                 for (const spend of projection?.spent ?? []) {
                     spendRequests.push({ ...spend, txId });
                 }
-                // Mirrors the sent-transaction rule in recomputeNightBalance.
+                // Same rule for sent transactions as in recomputeNightBalance.
                 if (senderAddress && receiverAddress && receiverAddress !== senderAddress && BigInt(nightAmount ?? '0') > 0n) {
                     const delta = deltaFor(senderAddress);
                     delta.totalSent += BigInt(nightAmount ?? '0');
@@ -608,7 +586,7 @@ export class BlockProcessor {
             if (txResultRows.length) await tx.run(INSERT.into(TransactionResults).entries(txResultRows));
             if (txFeeRows.length) await tx.run(INSERT.into(TransactionFees).entries(txFeeRows));
             if (contractActionRows.length) await tx.run(INSERT.into(ContractActions).entries(contractActionRows));
-            // Before the spends: a UTxO can be created and consumed in one block.
+            // Insert before the spends, because a UTXO can be created and spent in the same block.
             if (utxoRows.length) await tx.run(INSERT.into(UnshieldedUtxos).entries(utxoRows));
 
             await this.applySpends(tx, spendRequests, deltaFor, height);
@@ -626,10 +604,8 @@ export class BlockProcessor {
             );
             return true;
         }).catch(async (err: unknown) => {
-            // Another writer landed this block between the fetch and the insert
-            // (a catch-up next to a live head): the row is there, the
-            // transaction rolled back, nothing is broken. A unique violation
-            // without the row is a real fault and propagates.
+            // Another writer, such as catch-up next to the live handler, stored this block in the meantime.
+            // The block exists, so nothing is lost. A unique violation without the block is a real error.
             if (isUniqueViolation(err) && await this.blockExists(blockHash)) {
                 log.warn(`Block ${height} (${blockHash}) was indexed by another writer meanwhile; skipped`);
                 return false;
@@ -656,7 +632,7 @@ export class BlockProcessor {
         };
     }
 
-    /** The network whose HRP unshielded owners are encoded under. */
+    /** Network prefix of the Bech32m owner addresses. */
     private network(): string {
         if (!this.resolvedNetwork) {
             this.resolvedNetwork = normalizeNightgateNetwork(
@@ -667,10 +643,8 @@ export class BlockProcessor {
     }
 
     /**
-     * Resolves each extrinsic's events into storable columns: Bech32m owners,
-     * DUST initial nonces and the transfer projection. An entry whose identity
-     * cannot be derived is dropped with a warning rather than failing the
-     * block, since `initialNonce` has no null form.
+     * A UTXO whose address or nonce cannot be derived is skipped with a warning instead of failing the block.
+     * `initialNonce` cannot be null.
      */
     private async projectEvents(
         extrinsicEvents: Map<number, ExtrinsicEvents> | null,
@@ -684,7 +658,7 @@ export class BlockProcessor {
         for (const [index, events] of extrinsicEvents) {
             if (!events.created.length && !events.spent.length) continue;
 
-            const created: PreparedUtxoRow[] = [];
+            const created: PreparedUtxo[] = [];
             for (const utxo of events.created) {
                 try {
                     created.push({
@@ -732,10 +706,8 @@ export class BlockProcessor {
     }
 
     /**
-     * Contract actions of one extrinsic. The pallet's own report wins where it
-     * exists; the pallet-map classification only fills in for an extrinsic the
-     * chain said nothing about, since a pallet index alone cannot tell a
-     * contract call from a plain token movement.
+     * The pallet's events win. The pallet map is only a fallback for an extrinsic without events,
+     * because a pallet index cannot tell a contract call from a token transfer.
      */
     private contractActionsFor(
         events: ExtrinsicEvents | undefined,
@@ -747,7 +719,6 @@ export class BlockProcessor {
         return fallback ? [{ actionType: fallback, address: null }] : [];
     }
 
-    /** Marks spent UTxOs and folds their value into the owners' balance deltas. */
     private async applySpends(
         tx: DbRunner,
         spends: Array<{ intentHash: string; outputIndex: number; txId: string }>,
@@ -755,8 +726,7 @@ export class BlockProcessor {
         height: number
     ): Promise<void> {
         if (spends.length === 0) return;
-        // One read for the block's spends (chunked by intent hash); outputs created in
-        // this block are already inserted in the same transaction.
+        // Outputs created in this block are already inserted in the same transaction, so they are found too.
         const byKey = new Map<string, { ID: string; owner: string; value: unknown; tokenType: string; spentAtTransaction_ID: string | null }>();
         const hashes = [...new Set(spends.map(s => s.intentHash))];
         for (let i = 0; i < hashes.length; i += SPEND_LOOKUP_CHUNK) {
@@ -771,7 +741,7 @@ export class BlockProcessor {
         for (const spend of spends) {
             const row = byKey.get(`${spend.intentHash}#${spend.outputIndex}`);
             if (!row) {
-                // Normal below the first indexed height: the output predates the index.
+                // Normal when the output was created before the first indexed block.
                 log.debug(`spent UTXO ${spend.intentHash}#${spend.outputIndex} at height ${height} was never indexed`);
                 continue;
             }
@@ -791,9 +761,8 @@ export class BlockProcessor {
     }
 
     /**
-     * Folds one block's change into an address's NightBalances row. Must stay
-     * the mirror of `recomputeNightBalance` in rollback.ts, which rebuilds the
-     * same figures from scratch after a reorg.
+     * Must give the same result as `recomputeNightBalance` in rollback.ts,
+     * which rebuilds the values from scratch after a reorg.
      */
     private async applyBalanceDelta(tx: DbRunner, address: string, delta: BalanceDelta, height: number): Promise<void> {
         const nowIso = new Date().toISOString();
@@ -807,11 +776,11 @@ export class BlockProcessor {
         if (!existing) {
             await tx.run(INSERT.into(NightBalances).entries({
                 address,
-                balance: delta.balance.toString() as any,
+                balance: delta.balance.toString(),
                 utxoCount: delta.utxoCount,
-                totalReceived: delta.totalReceived.toString() as any,
+                totalReceived: delta.totalReceived.toString(),
                 txReceivedCount: delta.txReceivedCount,
-                totalSent: delta.totalSent.toString() as any,
+                totalSent: delta.totalSent.toString(),
                 txSentCount: delta.txSentCount,
                 firstSeenHeight: height,
                 firstSeenAt: nowIso,
@@ -825,11 +794,11 @@ export class BlockProcessor {
 
         const priorFirstSeen = Number(existing.firstSeenHeight);
         await tx.run(UPDATE.entity(NightBalances).set({
-            balance: (this.toBigInt(existing.balance) + delta.balance).toString() as any,
+            balance: (this.toBigInt(existing.balance) + delta.balance).toString(),
             utxoCount: this.toInt(existing.utxoCount) + delta.utxoCount,
-            totalReceived: (this.toBigInt(existing.totalReceived) + delta.totalReceived).toString() as any,
+            totalReceived: (this.toBigInt(existing.totalReceived) + delta.totalReceived).toString(),
             txReceivedCount: this.toInt(existing.txReceivedCount) + delta.txReceivedCount,
-            totalSent: (this.toBigInt(existing.totalSent) + delta.totalSent).toString() as any,
+            totalSent: (this.toBigInt(existing.totalSent) + delta.totalSent).toString(),
             txSentCount: this.toInt(existing.txSentCount) + delta.txSentCount,
             firstSeenHeight: Number.isFinite(priorFirstSeen) ? Math.min(priorFirstSeen, height) : height,
             lastActivityHeight: height,
@@ -839,7 +808,6 @@ export class BlockProcessor {
         }).where({ address }));
     }
 
-    /** Classify with the pallet map of the block's runtime; the default map only when none is given (tests). */
     private classifyExtrinsic(hex: string, palletMap: Map<number, PalletMapping> = this.defaultPalletMap): ExtrinsicClassification {
         if (!hex || hex.length < 10) {
             return { txType: 'system', isShielded: false, isSystem: true };
@@ -854,7 +822,7 @@ export class BlockProcessor {
             };
         }
 
-        // Unparseable: length heuristic.
+        // Not parseable, so guess by length.
         if (hex.length < 100) {
             return { txType: 'system', isShielded: false, isSystem: true };
         }
@@ -891,8 +859,7 @@ export class BlockProcessor {
             return { txType: 'unknown', isShielded: false, isSystem: false };
         }
 
-        // A `Contracts`-named mapping (config override / tests) distinguishes
-        // deploy vs call vs update by call_index.
+        // A mapping named `Contracts`, from config or tests, tells deploy, call and update apart by call index.
         let txType = entry.txType;
         if (entry.name === 'Contracts') {
             if (callIndex === 0) txType = 'contract_call';
@@ -929,7 +896,7 @@ export class BlockProcessor {
         return 0;
     }
 
-    /** blake2b-256 of the raw extrinsic bytes: the canonical extrinsic hash explorers use. */
+    /** blake2b-256 of the raw extrinsic bytes, the standard extrinsic hash used by block explorers. */
     private hashExtrinsic(hex: string): string {
         const cleanHex = hex.startsWith('0x') ? hex.slice(2) : hex;
         const bytes = Buffer.from(cleanHex, 'hex');
@@ -937,9 +904,8 @@ export class BlockProcessor {
         return '0x' + bytesToHex(hash);
     }
 
-    /** Event registry of a runtime version, loaded from node metadata once per specVersion. */
     private async getEventRegistry(blockHash: string, specVersion: number): Promise<TypeRegistry | undefined> {
-        // 0 is a valid specVersion: no falsy check.
+        // 0 is a valid specVersion, so no falsy check.
         if (!Number.isInteger(specVersion) || specVersion < 0) {
             throw new Error(`Invalid runtime specVersion ${String(specVersion)} for block ${blockHash}`);
         }
@@ -952,7 +918,7 @@ export class BlockProcessor {
             throw new Error(`Runtime metadata unavailable for block ${blockHash} (specVersion ${specVersion}): ${(err as Error).message}`);
         }
         if (typeof metadataHex !== 'string' || !metadataHex.startsWith('0x') || metadataHex.length < 4) {
-            // A null/empty answer is what a pruned or racing node gives: transient.
+            // An empty answer comes from a pruned or lagging node, so it is treated as temporary.
             throw new Error(`No runtime metadata for block ${blockHash} (specVersion ${specVersion}): pruned or racing node`);
         }
         let registry: TypeRegistry;
@@ -962,8 +928,8 @@ export class BlockProcessor {
         } catch (err) {
             throw new Error(`Runtime metadata for block ${blockHash} (specVersion ${specVersion}) does not decode: ${(err as Error).message}`);
         }
-        // Registry and pallet map are ONE cache entry per specVersion: a block
-        // is always classified with the map of the runtime it was produced by.
+        // Registry and pallet map are cached together, so a block is always classified
+        // with the pallet map of the runtime that produced it.
         this.runtimes.set(specVersion, { registry, palletMap: this.palletMapFromMetadata(registry, specVersion) });
         return registry;
     }
@@ -986,8 +952,8 @@ export class BlockProcessor {
     }
 
     /**
-     * Per-extrinsic events of one block. A block with extrinsics but no readable events is
-     * never persisted: its UTXO rows and balance deltas would be missing for good.
+     * A block with extrinsics but without readable events is never stored.
+     * Its UTXOs and balance changes would otherwise be missing for good.
      */
     private decodeBlockEvents(
         rawEvents: string | null | undefined,
@@ -1016,12 +982,11 @@ export class BlockProcessor {
         throw new Error(`No runtime version for ${where} (pruned or racing node)`);
     }
 
-    /** Timestamp::Now storage at a block as UNIX seconds, null when absent (no wall clock). */
+    /** Never falls back to the local clock. */
     private async getBlockTimestamp(blockHash: string): Promise<number | null> {
         return this.parseTimestampHex(await this.getBlockTimestampHex(blockHash));
     }
 
-    /** Timestamp::Now storage at a block (raw hex), null when the RPC fails or the state is gone. */
     private async getBlockTimestampHex(blockHash: string): Promise<string | null> {
         try {
             return (await this.nodeProvider.getStorage(BlockProcessor.TIMESTAMP_STORAGE_KEY, blockHash)) ?? null;
@@ -1031,7 +996,6 @@ export class BlockProcessor {
         }
     }
 
-    /** System::LastRuntimeUpgrade storage at a block (raw hex), null when the RPC fails or the state is gone. */
     private async getLastRuntimeUpgradeHex(blockHash: string): Promise<string | null> {
         try {
             return (await this.nodeProvider.getStorage(BlockProcessor.LAST_RUNTIME_UPGRADE_STORAGE_KEY, blockHash)) ?? null;
@@ -1042,15 +1006,10 @@ export class BlockProcessor {
     }
 
     /**
-     * The runtime specVersion of a block, keyed by its `System.LastRuntimeUpgrade`
-     * value: the node is asked (`state_getRuntimeVersion`, the expensive call)
-     * once per distinct value, so an upgrade still applies from its first block
-     * while a million blocks under one runtime cost one call. The node stays the
-     * authority; the decoded value cross-checks it, and an answer that disagrees
-     * with it is used for that block only, never cached under the value (the
-     * block that carries a runtime upgrade still reports the previous value).
-     * A block whose storage carries no such value (pruned or racing node, or a
-     * chain without it) is asked per block, as before.
+     * The node is asked for the runtime version once per `System.LastRuntimeUpgrade` value, because the call is expensive.
+     * An answer that differs from the decoded value is used for that block only and not cached.
+     * This happens on the block that performs an upgrade, which still carries the old value.
+     * Without a stored value, the node is asked for every block.
      */
     private async resolveSpecVersion(upgradeHex: string | null | undefined, blockHash: string, where: string): Promise<number> {
         if (typeof upgradeHex !== 'string' || !/^0x[0-9a-fA-F]{2,}$/.test(upgradeHex)) {
@@ -1072,22 +1031,19 @@ export class BlockProcessor {
                 })
             };
             this.specVersionByUpgrade.set(upgradeHex, fresh);
-            // A failed lookup is not an answer: the next block with this value asks again.
+            // A failed lookup is not cached, so the next block with this value asks again.
             fresh.answer.catch(() => {
                 if (this.specVersionByUpgrade.get(upgradeHex) === fresh) this.specVersionByUpgrade.delete(upgradeHex);
             });
             lookup = fresh;
         }
         const { specVersion, agreed } = await lookup.answer;
-        // A disagreeing answer belongs to the block that asked; a block that waited on it asks for itself.
+        // A differing answer applies only to the block that asked. Other blocks ask for themselves.
         if (agreed || lookup.blockHash === blockHash) return specVersion;
         return this.getProtocolVersion(blockHash, where);
     }
 
-    /**
-     * `spec_version` of a SCALE `LastRuntimeUpgradeInfo { spec_version: Compact<u32>, spec_name: Vec<u8> }`,
-     * null when the bytes do not decode as one.
-     */
+    /** Reads `spec_version` from a SCALE `LastRuntimeUpgradeInfo`. Null if the bytes do not decode. */
     static decodeLastRuntimeUpgrade(hex: string): number | null {
         const bytes = Buffer.from(hex.startsWith('0x') ? hex.slice(2) : hex, 'hex');
         if (bytes.length === 0) return null;
@@ -1095,11 +1051,11 @@ export class BlockProcessor {
             case 0: return bytes[0] >>> 2;
             case 1: return bytes.length >= 2 ? bytes.readUInt16LE(0) >>> 2 : null;
             case 2: return bytes.length >= 4 ? bytes.readUInt32LE(0) >>> 2 : null;
-            default: return null; // big-integer mode: not a u32
+            default: return null; // big-integer mode, not a u32
         }
     }
 
-    /** Asks the node for the runtime version AT this block: the expensive call, reserved for the first block of each runtime. */
+    /** The expensive call. Used only for the first block of each runtime. */
     private async getProtocolVersion(blockHash: string, where: string = `block ${blockHash}`): Promise<number> {
         let rv: { specVersion?: number } | null | undefined;
         try {
@@ -1110,7 +1066,7 @@ export class BlockProcessor {
         return this.specVersionFromBatch(rv, where);
     }
 
-    /** `engineId:data` of the PreRuntime digest log (type 6), else the first log. */
+    /** Returns `engineId:data` of the PreRuntime digest log, which has type 6. Otherwise the first log. */
     private extractAuthor(digestLogs: string[] | undefined): string | null {
         if (!digestLogs || digestLogs.length === 0) return null;
 

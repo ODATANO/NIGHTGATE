@@ -1,6 +1,5 @@
 /**
- * Contract path: deploy, call, batch. Provider construction, the deployed-
- * contract query cache, phase timing and the compile step.
+ * Deploys contracts and calls their circuits from the worker.
  */
 
 import { proofRequestTimeoutMs } from '../../utils/proof-timeout';
@@ -17,9 +16,9 @@ import { BoundSubmitIntent, buildSponsoredWalletProvider, buildWorkerWalletProvi
 import { DEPLOY_ENTRY_POINT, resolveSponsorEntry } from './sponsor';
 
 /**
- * Vault-family constructors take the registrar and the recovery identity as public
- * args (a witness-backed constructor exceeds the node's block cost limits): the
- * deploy session's attester id and the caller's `recoveryId` (zero = none).
+ * The attestation vault constructors take the deployer's attester id and a recovery id as plain arguments.
+ * A constructor that read them from witnesses would exceed the node's cost limit.
+ * A recovery id of all zeros means none.
  */
 export async function deployConstructorArgs(contractName: string, entry: FacadeEntry, recoveryId?: string): Promise<unknown[]> {
     if (!contractName.startsWith('attestation-vault')) return [];
@@ -30,8 +29,9 @@ export async function deployConstructorArgs(contractName: string, entry: FacadeE
 }
 
 /**
- * Witnesses for a contract without a factory: every name passes the Compact
- * constructor's check, calling one throws. A proxy, since the names are not exported.
+ * Witnesses for a contract we hold no witness code for.
+ * Every name exists, so the constructor's check passes, but calling one throws.
+ * A proxy is needed because the contract does not export the names.
  */
 export function unregisteredWitnessStub(contractName: string): Record<string, unknown> {
     return new Proxy({}, {
@@ -49,7 +49,7 @@ export function unregisteredWitnessStub(contractName: string): Record<string, un
     });
 }
 
-/** Built fresh per call: witnesses bind to the instance and carry the session's secret. */
+/** Built for each call, because the witnesses carry the session's secret. */
 export async function getOrCompileContract(
     name: string,
     registration: ContractRegistration,
@@ -73,19 +73,16 @@ export async function getOrCompileContract(
             attestationSecret: entry.attestationSecret, issuerSecret: entry.tokenFactoryIssuerSecret, merkleProof, merkleProofHolder,
             ...(registration.slotWidth !== undefined ? { slotWidth: registration.slotWidth } : {})
         }))
-        // Vacant witnesses would fail the constructor's name check and block deploys.
         : CompiledContract.withWitnesses(unregisteredWitnessStub(name));
 
     return CompiledContract.make(name, contractClass).pipe(
         witnessStep,
-        // Assets of the pinned generation, never the mutable directory.
+        // Read keys from the snapshot, never from the registered folder that may change.
         CompiledContract.withCompiledFileAssets(artifactAssetPath(name, registration))
     );
 }
 
-// ---- Worker-side provider construction ------------------------------------
-
-// One indexer connection per endpoint; zk/proving providers per (proof server, asset path, generation), bounded.
+// One indexer connection per endpoint. Proving providers are cached per proof server and contract version.
 export const publicDataProviders = new Map<string, Promise<any>>();
 export const zkProviderBundles = new BoundedCache<string, Promise<{ zkConfigProvider: any; proofProvider: any }>>(generationCacheSize(), (key) => onGenerationEvicted(key.split('|').pop() ?? ''));
 
@@ -109,7 +106,6 @@ export function buildWorkerContractProviders(args: {
     indexerHttpUrl: string;
     indexerWsUrl: string;
     proofServerUrl: string;
-    /** Immutable asset path of the pinned generation, or the registration dir for digest-less callers. */
     zkConfigPath: string;
     generation?: string;
 }): Promise<{ publicDataProvider: any; zkConfigProvider: any; proofProvider: any }> {
@@ -128,7 +124,7 @@ export function buildWorkerContractProviders(args: {
             }
             return { zkConfigProvider, proofProvider };
         })();
-        // A failed build must not stick.
+        // Forget a failed build so the next call tries again.
         bundleP.catch(() => { zkProviderBundles.delete(key); });
         zkProviderBundles.set(key, bundleP);
     }
@@ -136,13 +132,11 @@ export function buildWorkerContractProviders(args: {
         .then(([publicDataProvider, bundle]) => ({ publicDataProvider, ...bundle }));
 }
 
-// ---- findDeployedContract query caching -----------------------------------
-
-// Only the per-address immutable queries are cached. Current state is not:
-// the SDK checks verifier keys against it (maintenance txs can rotate them)
-// and calls must build transcripts on fresh state.
+// Only queries whose answer never changes for an address are cached.
+// The current contract state is never cached, because its verifier keys can change
+// and every call must be built on fresh state.
 export const FIND_CONTRACT_CACHED_METHODS = new Set(['watchForDeployTxData', 'queryDeployContractState']);
-// Bounded: one entry per contract and method, and the worker may live for months.
+// Limited in size, because the worker may run for months.
 export const findContractQueryCache = new BoundedCache<string, Promise<unknown>>(256);
 
 export function withFindContractQueryCache(publicDataProvider: any, indexerHttpUrl: string): any {
@@ -152,7 +146,7 @@ export function withFindContractQueryCache(publicDataProvider: any, indexerHttpU
             if (typeof v !== 'function') return v;
             if (typeof prop !== 'string' || !FIND_CONTRACT_CACHED_METHODS.has(prop)) return v.bind(target);
             return (contractAddress: string, ...rest: unknown[]) => {
-                // Extra args select non-latest variants; not cacheable.
+                // Extra arguments ask for older data, which is not cached.
                 if (rest.length > 0) return v.call(target, contractAddress, ...rest);
                 const cacheKey = `${prop}|${indexerHttpUrl}|${contractAddress}`;
                 let p = findContractQueryCache.get(cacheKey);
@@ -167,9 +161,7 @@ export function withFindContractQueryCache(publicDataProvider: any, indexerHttpU
     });
 }
 
-// ---- Contract-call phase timing -------------------------------------------
-
-/** Per-phase wall-clock durations of one submission, logged also when a phase throws. */
+/** Measures how long each step of a submission takes, for logging. */
 export class PhaseTimer {
     private readonly t0 = Date.now();
     private tPhase = this.t0;
@@ -181,7 +173,7 @@ export class PhaseTimer {
         this.tPhase = now;
     }
 
-    /** Record an externally measured duration (does not advance the cursor). */
+    /** Records a duration measured elsewhere. Does not start a new step. */
     add(name: string, ms: number): void {
         this.phases.push([name, ms]);
     }
@@ -193,8 +185,8 @@ export class PhaseTimer {
 }
 
 /**
- * Times proving, balancing and submit. The first proveTx after `callRegion.start`
- * yields `circuitToProve`; `prove` counts contract proofs only.
+ * Measures proving, balancing and sending.
+ * Also stops before proving or balancing when the caller cancelled.
  */
 export function wrapProvidersForTiming(providers: any, timer: PhaseTimer, callRegion: { start: number }): any {
     const timed = async <T>(label: string, run: () => Promise<T>): Promise<T> => {
@@ -207,7 +199,7 @@ export function wrapProvidersForTiming(providers: any, timer: PhaseTimer, callRe
         ? {
             ...providers.proofProvider,
             proveTx: (...pArgs: any[]) => {
-                // A running wasm prove cannot be interrupted; the next one is not started.
+                // A running wasm proof cannot be stopped, so only the next one is skipped.
                 throwIfRpcCancelled('before proving');
                 const n = ++proveCalls;
                 if (n === 1 && callRegion.start > 0) {
@@ -231,7 +223,7 @@ export function wrapProvidersForTiming(providers: any, timer: PhaseTimer, callRe
 }
 
 
-/** Deploy in the worker; private state round-trips to main via proxyId. Returns primitives. */
+/** Private state goes through the main thread under `proxyId`. */
 export async function deployContract({
     sessionId, proxyId, contractName, registration,
     indexerHttpUrl, indexerWsUrl, proofServerUrl,
@@ -246,10 +238,10 @@ export async function deployContract({
     proofServerUrl: string;
     networkId: string;
     initialPrivateState: unknown;
-    /** Optional fee sponsor: this facade balances ['dust'] and submits. */
+    /** Optional fee sponsor. This wallet pays the dust fee and sends the tx. */
     sponsorSessionId?: string;
     recoveryId?: string;
-    /** Set by the dispatcher: the pre-broadcast submit-intent handshake. */
+    /** Set by the dispatcher. Used to announce the tx before sending it. */
     __replyPort?: MessagePort;
 }) {
     const entry = facades.get(sessionId);
@@ -296,7 +288,6 @@ export async function deployContract({
     return out;
 }
 
-/** Call one circuit on a deployed contract. */
 export async function submitContractCall({
     sessionId, proxyId, contractName, registration,
     contractAddress, circuit, args: callArgs,
@@ -311,16 +302,16 @@ export async function submitContractCall({
     contractAddress: string;
     circuit: string;
     args: unknown[];
-    /** Set by the dispatcher: the pre-broadcast submit-intent handshake. */
+    /** Set by the dispatcher. Used to announce the tx before sending it. */
     __replyPort?: MessagePort;
     indexerHttpUrl: string;
     indexerWsUrl: string;
     proofServerUrl: string;
     networkId: string;
     merkleProof?: MerkleProofBundle;
-    /** Seeded on this wallet's first call to the contract; defaults to `{}`. */
+    /** Used on this wallet's first call to the contract. Defaults to `{}`. */
     initialPrivateState?: unknown;
-    /** Optional fee sponsor: this facade balances ['dust'] and submits. */
+    /** Optional fee sponsor. This wallet pays the dust fee and sends the tx. */
     sponsorSessionId?: string;
 }) {
     const entry = facades.get(sessionId);
@@ -358,9 +349,9 @@ export async function submitContractCall({
         log('info', `submitContractCall: ${contractName}.${circuit}@${contractAddress.slice(0, 12)}` +
             (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
 
-        // A non-deployer wallet has no private state and findDeployedContract
-        // throws. Seed only when none exists: the initialPrivateState variant
-        // overwrites. The address must be set before this probe reads.
+        // A wallet that did not deploy the contract has no private state, and findDeployedContract
+        // then throws. Pass initial state only when none exists, because it overwrites.
+        // The address must be set before the read.
         privateStateProvider.setContractAddress(contractAddress);
         const existingPrivateState = await privateStateProvider.get(registration.privateStateId);
         const seed = existingPrivateState === undefined || existingPrivateState === null;
@@ -398,9 +389,9 @@ export async function submitContractCall({
 }
 
 /**
- * Several calls on one contract in one transaction. A failure before submit
- * sends nothing; after submit a PARTIAL_SUCCESS is on chain with a subset
- * applied, so callers check effect state rather than assume all-or-nothing.
+ * Several calls on one contract in one transaction.
+ * A failure before sending sends nothing. After sending, the tx can land with only some
+ * calls applied, so callers must check the contract state.
  */
 export async function submitContractCallBatch({
     sessionId, proxyId, contractName, registration,
@@ -414,21 +405,21 @@ export async function submitContractCallBatch({
     contractName: string;
     registration: ContractRegistration;
     contractAddress: string;
-    /** Any per-call `merkleProof` switches the batch to holder mode (exclusive with batch-level). */
+    /** If any call has its own `merkleProof`, the batch-level one must be unset. */
     calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
     indexerHttpUrl: string;
     indexerWsUrl: string;
     proofServerUrl: string;
     networkId: string;
-    /** Bound once, shared by every call. */
+    /** Shared by every call. */
     merkleProof?: MerkleProofBundle;
     initialPrivateState?: unknown;
-    /** Optional fee sponsor: this facade balances ['dust'] and submits. */
+    /** Optional fee sponsor. This wallet pays the dust fee and sends the tx. */
     sponsorSessionId?: string;
-    /** The calls past `orderedPrefix` share no state: group them by execution stage before proving. */
+    /** The calls after `orderedPrefix` do not depend on each other, so they may be reordered. */
     independentCalls?: boolean;
     orderedPrefix?: number;
-    /** Set by the dispatcher: the pre-broadcast submit-intent handshake. */
+    /** Set by the dispatcher. Used to announce the tx before sending it. */
     __replyPort?: MessagePort;
 }) {
     if (!Array.isArray(calls) || calls.length === 0) {
@@ -445,8 +436,8 @@ export async function submitContractCallBatch({
         await ensureNetworkId(networkId, sdk);
         timer.mark('init');
 
-        // In holder mode every call gets a hook, so a call without a proof
-        // clears the holder instead of inheriting its predecessor's.
+        // With per-call proofs, each call sets the shared proof slot before it runs.
+        // A call without a proof clears it, so it never sees the previous call's proof.
         const holderMode = calls.some(c => c.merkleProof);
         if (holderMode && merkleProof) {
             throw new Error('submitContractCallBatch: per-call merkleProof and batch-level merkleProof are mutually exclusive');
@@ -485,7 +476,7 @@ export async function submitContractCallBatch({
         log('info', `submitContractCallBatch: ${contractName}.[${circuits.join('+')}]@${contractAddress.slice(0, 12)}` +
             (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
 
-        // First-contact seeding as in submitContractCall; never overwrite.
+        // Same initial private state handling as in submitContractCall.
         privateStateProvider.setContractAddress(contractAddress);
         const existingPrivateState = await privateStateProvider.get(registration.privateStateId);
         const seed = existingPrivateState === undefined || existingPrivateState === null;

@@ -1,13 +1,6 @@
 /**
- * The two `UnshieldedUtxos` columns the chain event does not carry.
- *
- * `Midnight.UnshieldedTokens` reports the raw 32-byte owner and the
- * `(intentHash, outputNo)` pair; the stored row wants the Bech32m address and
- * the DUST initial nonce. Both are functions of what the event already gives,
- * and both reproduce the Midnight indexer's values byte for byte.
- *
- * Loaded through dynamic `import()` like the rest of the ESM-only SDK
- * (see srv/midnight/sdk-loader.ts).
+ * Derives the Bech32m address and the DUST initial nonce of an unshielded UTXO, which the chain event does not carry.
+ * Both match the Midnight indexer's values exactly.
  */
 
 import { loadLedgerV8 } from '../midnight/sdk-loader';
@@ -32,9 +25,6 @@ async function loadAddressFormat(): Promise<AddressFormatModule> {
     }
 }
 
-// Encoding costs ~200 us and a chain has few busy addresses, so the same owner
-// recurs constantly across blocks. Cleared wholesale rather than evicted: the
-// cache is a speed-up, and a cold start after a clear costs one encode.
 const MAX_CACHED_ADDRESSES = 20000;
 const addressCache = new Map<string, string>();
 
@@ -53,10 +43,7 @@ export async function encodeUnshieldedOwner(rawHex: string, network: string): Pr
     return encoded;
 }
 
-/**
- * The UTxO's DUST initial nonce, the backing-NIGHT hash DUST generation is
- * tracked by. `intentHash` is hex without `0x`; the ledger rejects the prefix.
- */
+/** `intentHash` must be hex without `0x`, because the ledger rejects the prefix. */
 export async function computeInitialNonce(outputNo: number, intentHash: string): Promise<string> {
     const ledger = await loadLedgerV8();
     const nonce = ledger.dustInitialNonce(BigInt(outputNo), intentHash);
@@ -65,7 +52,7 @@ export async function computeInitialNonce(outputNo: number, intentHash: string):
         : Buffer.from(nonce).toString('hex');
 }
 
-/** Test seam: drops the memoized module and the address cache. */
+/** For tests: forgets the loaded module and clears the address cache. */
 export function resetUtxoIdentityCache(): void {
     cachedAddressFormat = undefined;
     inflightAddressFormat = undefined;

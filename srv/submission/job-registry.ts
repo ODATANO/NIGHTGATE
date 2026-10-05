@@ -1,13 +1,14 @@
 /**
- * Job kinds, processors and reconciliation finalizers, keyed by kind and command version.
+ * Registry of background job kinds, their processors and their finalizers.
+ * A finalizer does the database writes that must follow a confirmed transaction.
  * SPDX-License-Identifier: Apache-2.0
  */
+import type { BackgroundJob } from '#cds-models/midnight';
 import { JOB_KIND_TRAITS, LIGHT_KIND, type JobKindTraits } from './job-kinds';
 import { decrypt as decryptAtRest, getEncryptionKey } from '../utils/crypto';
 import { jobCommandBinding } from '../utils/envelope-bindings';
-import { BackgroundJobRow, ReconciliationEvidence } from './job-store';
+import { ReconciliationEvidence } from './job-store';
 
-// Filled by registration; every kind set below derives from it.
 const kindTraits = new Map<string, JobKindTraits>();
 
 function isTraits(value: unknown): value is JobKindTraits {
@@ -21,7 +22,7 @@ export function declareJobKind(kind: string, traits: JobKindTraits): void {
     kindTraits.set(kind, { ...traits });
 }
 
-/** An unregistered kind (row of a removed kind) counts as light. */
+/** An unknown kind, for example a row of a removed kind, counts as light. */
 export function jobKindTraits(kind: string): JobKindTraits {
     return kindTraits.get(kind) ?? LIGHT_KIND;
 }
@@ -32,11 +33,11 @@ export function kindsWithTrait(trait: 'heavy' | 'workflowParent' | 'identifierKe
 
 export function __workflowParentKindsForTests(): ReadonlySet<string> { return new Set(kindsWithTrait('workflowParent')); }
 
-export type BackgroundJobProcessor = (command: unknown, row: BackgroundJobRow) => Promise<unknown>;
+export type BackgroundJobProcessor = (command: unknown, row: BackgroundJob) => Promise<unknown>;
 
 export type BackgroundJobReconciliationFinalizer = (
     command: unknown,
-    row: BackgroundJobRow,
+    row: BackgroundJob,
     evidence: ReconciliationEvidence
 ) => Promise<unknown>;
 
@@ -54,13 +55,13 @@ export function registerBackgroundJobProcessor(kind: string, version: number, tr
     processors.set(processorKey(kind, version), processor);
 }
 
-/** Declared kinds without a processor: the runner refuses to start with any. */
+/** Declared kinds without a processor. The job runner refuses to start if there are any. */
 export function undeclaredOrUnregisteredJobKinds(): string[] {
     const registered = new Set([...processors.keys()].map(k => k.split('\0')[0]));
     return Object.keys(JOB_KIND_TRAITS).filter(kind => !registered.has(kind));
 }
 
-/** Register idempotent post-submit writes for one durable leaf command. */
+/** Register the finalizer of one command. It must be safe to run more than once. */
 export function registerBackgroundJobReconciliationFinalizer(
     kind: string,
     version: number,
@@ -72,7 +73,7 @@ export function registerBackgroundJobReconciliationFinalizer(
     reconciliationFinalizers.set(processorKey(kind, version), finalizer);
 }
 
-export async function executePersistedCommand(row: BackgroundJobRow): Promise<unknown> {
+export async function executePersistedCommand(row: BackgroundJob): Promise<unknown> {
     const processor = processors.get(processorKey(row.kind, row.commandVersion!));
     if (!processor) throw new Error(`No background-job processor registered for '${row.kind}' v${row.commandVersion}`);
     const serialized = row.commandEncoding === 'aes-gcm-v1'
@@ -81,8 +82,8 @@ export async function executePersistedCommand(row: BackgroundJobRow): Promise<un
     return processor(JSON.parse(serialized), row);
 }
 
-/** Every reconciliation path runs this: no job closes as succeeded without its finalizer's writes. */
-export async function runReconciliationFinalizer(job: BackgroundJobRow, evidence: ReconciliationEvidence): Promise<unknown | undefined> {
+/** Every path that confirms a job runs this, so no job succeeds without its finalizer's writes. */
+export async function runReconciliationFinalizer(job: BackgroundJob, evidence: ReconciliationEvidence): Promise<unknown | undefined> {
     const finalizer = job.commandVersion
         ? reconciliationFinalizers.get(processorKey(job.kind, job.commandVersion))
         : undefined;

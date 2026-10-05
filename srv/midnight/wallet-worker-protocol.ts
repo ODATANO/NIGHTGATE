@@ -1,13 +1,13 @@
 /**
- * Constants both sides of the wallet-worker RPC share. Dependency-free: the
- * main thread must never import the worker module (it loads the ESM SDK).
+ * Shared constants and types for messages between the main thread and the wallet worker.
+ * Keep this file free of imports, because the main thread must never load the worker's SDK.
  * SPDX-License-Identifier: Apache-2.0
  */
 import type { NightgateErrorPayload } from '../utils/errors';
 
 /**
- * Methods that run under the worker's per-session submit lock (an evict waits
- * for them); each announces its tx identifier before broadcasting.
+ * Methods that hold the session's submit lock, so a session is never removed while they run.
+ * Each one reports its tx id to the main thread before it sends the tx.
  */
 export const SUBMIT_METHODS: ReadonlySet<string> = new Set([
     'deployContract', 'submitContractCall', 'submitContractCallBatch',
@@ -16,33 +16,28 @@ export const SUBMIT_METHODS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Methods that may broadcast: SUBMIT_METHODS plus the unbound sponsor path (no
- * whole-call lock). A rotation drain waits for these and never repeats them.
+ * Methods that may send a transaction. `sponsorUnboundTx` is one of them but takes no submit lock.
+ * A worker restart waits for these calls and never repeats them.
  */
 export function isSubmittingMethod(method: string): boolean {
     return SUBMIT_METHODS.has(method) || method === 'sponsorUnboundTx';
 }
 
-/** Refusal name: admission closed for a rotation; the client retries on the respawn. */
+/** The worker accepts no new calls because it is about to restart. The client retries on the new worker. */
 export const WORKER_ROTATING = 'WORKER_ROTATING';
-/** Rejection name: the worker was terminated for its rotation while this call was in flight. */
+/** The worker was restarted while this call was still running. */
 export const WORKER_ROTATED = 'WORKER_ROTATED';
 
-// ---- Submit-failure classification, shared by both sides -------------------
-
 /**
- * Submit-failure codes. The worker classifies against the SDK error objects;
- * the main thread branches on the code, never on message text.
- *  pre-mempool-reject  refused before the mempool, fee unspent; `ledgerCode` =
- *                      node code, `intent-rejected` or `intent-timeout`
- *  dust-race           1010/170, 1010/196 or `pool-invalid`; rebuild-retryable
- *  transport           send died before an answer; resend-eligible
- *                      (`closing-socket`: never left the client)
- *  ambiguous           may have landed; never rebuild, reconcile by identifier
- *  landed-not-applied  in a block, the contract call did not apply
- *  policy              sponsor shape or allow-list refusal
- *  causality           batch causality refusal before proving (`calls`)
- *  internal            anything else
+ * Why a submit failed. The main thread decides on this code, never on message text.
+ *  pre-mempool-reject  the node refused the tx and no fee was spent. `ledgerCode` holds the node's code.
+ *  dust-race           another tx spent the same dust first. Build again and retry.
+ *  transport           the connection broke before an answer. The tx may be sent again.
+ *  ambiguous           the tx may have landed. Never rebuild. Look it up by its id instead.
+ *  landed-not-applied  the tx is in a block, but the contract call did not apply.
+ *  policy              the fee sponsor refused the tx.
+ *  causality           the batch calls are in an order the ledger rejects. Found before proving.
+ *  internal            anything else.
  */
 export const SUBMIT_FAILURE_CODES = [
     'pre-mempool-reject', 'dust-race', 'transport', 'ambiguous',
@@ -54,35 +49,35 @@ export function isSubmitFailureCode(value: unknown): value is SubmitFailureCode 
     return typeof value === 'string' && (SUBMIT_FAILURE_CODES as readonly string[]).includes(value);
 }
 
-/** One batched call's apply position, for a `causality` refusal. */
+/** One call of a batch and where the ledger applies it. Used for `causality` errors. */
 export interface BatchCallStageInfo { name: string; segId: number; stages: string }
 
 export interface SubmitFailureInfo {
     code: SubmitFailureCode;
     ledgerCode?: string;
-    /** Whether the SAME work may be attempted again (rebuild or resend). */
+    /** Whether the same work may be tried again, by rebuilding or by sending again. */
     retryable: boolean;
     calls?: BatchCallStageInfo[];
-    /** `landed-not-applied`: the block height the indexer placed the transaction in (rollback coordinate). */
+    /** For `landed-not-applied`: the block the tx landed in. A chain rollback uses it. */
     blockHeight?: number;
 }
 
-/** The worker's RPC failure reply. `code` and friends are present on submitting methods only. */
+/** The worker's error reply. `code` and the fields after it are set only for submitting methods. */
 export interface RpcErrorPayload {
     name: string;
     message: string;
-    /** Messages of the nested cause chain, outermost first (bounded). */
+    /** Messages of the nested causes, outermost first. */
     causes?: string[];
     code?: SubmitFailureCode;
     ledgerCode?: string;
     retryable?: boolean;
     calls?: BatchCallStageInfo[];
     blockHeight?: number;
-    /** Our own coded error in the chain: code, status, retryable and info survive the thread boundary. */
+    /** Our own coded error, if one is among the causes, so it reaches the main thread intact. */
     nightgate?: NightgateErrorPayload;
 }
 
-/** Client-side error rebuilt from a classified failure payload. */
+/** The worker's submit error, rebuilt on the main thread. */
 export class WorkerSubmitError extends Error {
     readonly code: SubmitFailureCode;
     readonly ledgerCode?: string;
@@ -102,7 +97,7 @@ export class WorkerSubmitError extends Error {
     }
 }
 
-/** The classification an error carries, when it was classified upstream (worker RPC). */
+/** The failure code an error already carries from the worker, or null. */
 export function carriedSubmitFailure(err: unknown): SubmitFailureInfo | null {
     const e = err as any;
     if (!e || typeof e !== 'object' || !isSubmitFailureCode(e.code)) return null;

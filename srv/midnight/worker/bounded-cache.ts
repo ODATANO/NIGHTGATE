@@ -1,4 +1,4 @@
-// Bounded insertion-ordered cache with an eviction hook (worker-local, dependency-free).
+// Size-limited cache that drops the least recently used entry first.
 
 
 

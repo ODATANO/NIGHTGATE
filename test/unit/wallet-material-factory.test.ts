@@ -75,6 +75,7 @@ import {
     WalletSigningNotAvailable
 } from '../../srv/submission/wallet-material-factory';
 import { encrypt, KeyRing, decrypt } from '../../srv/utils/crypto';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 // ---- Fake DB --------------------------------------------------------------
 
@@ -118,12 +119,12 @@ describe('deriveAccountId / deriveStoragePassword', () => {
 
     test('accountId is 64-char hex', () => {
         const a = deriveAccountId('any-input');
-        expect(a).toMatch(/^[0-9a-f]{64}$/);
+        expect(a).toMatch(HEX64_RE);
     });
 
     test('storage password is 64-char hex, ≥16 chars', () => {
         const p = deriveStoragePassword('any-input');
-        expect(p).toMatch(/^[0-9a-f]{64}$/);
+        expect(p).toMatch(HEX64_RE);
         expect(p.length).toBeGreaterThanOrEqual(16);
     });
 
@@ -152,7 +153,7 @@ describe('privateStatePasswordCandidates', () => {
         expect(c[0].password).toBe(derivePrivateStatePassword(ring, 'k2', vk));
         expect(c[2].password).toBe(deriveStoragePassword(vk));
         expect(new Set(c.map(x => x.password)).size).toBe(3);
-        for (const x of c) expect(x.password).toMatch(/^[0-9a-f]{64}$/);
+        for (const x of c) expect(x.password).toMatch(HEX64_RE);
     });
 });
 

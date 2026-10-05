@@ -1,12 +1,9 @@
 /**
- * The Midnight indexer's answer for one block, and how it maps onto the
- * entities a block alone cannot fill.
+ * Fetches one block from the Midnight indexer and maps the data that the node's block does not contain.
  *
- * Contract balances are the contract's state AFTER apply, the two ledger-event
- * streams are the indexer's own sequence, per-segment outcomes are not in any
- * event, and a UTXO's DUST registration flag changes after the UTXO exists.
- * None of that is derivable from the block the crawler already has, so this is
- * a SECOND source with its own cursor, kept clearly apart from the node pass.
+ * Examples are contract state after a call, the indexer's ledger event lists,
+ * the result of each transaction segment, and the DUST registration flag of a UTXO.
+ * The indexer is therefore a second data source, with its own cursor, separate from the node.
  */
 
 const BLOCK_QUERY = `query($height: Int!) {
@@ -43,7 +40,7 @@ export interface SupplementBalance {
 export interface SupplementContractAction {
     actionType: 'DEPLOY' | 'CALL' | 'UPDATE';
     address: string;
-    /** Base64, the form CAP stores a LargeBinary in. */
+    /** Base64, the format CAP uses for a LargeBinary. */
     state: string | null;
     zswapState: string | null;
     balances: SupplementBalance[];
@@ -52,37 +49,30 @@ export interface SupplementContractAction {
 export interface SupplementLedgerEvent {
     eventId: number;
     maxId: number;
-    /** Base64. */
     raw: string | null;
 }
 
 export interface SupplementDustEvent extends SupplementLedgerEvent {
     eventType: 'DTIME_UPDATE' | 'INITIAL_UTXO' | 'SPEND_PROCESSED' | 'PARAM_CHANGE';
-    /** The backing DUST output's nonce; INITIAL_UTXO only. */
+    /** Nonce of the DUST output. Set only for INITIAL_UTXO. */
     dustOutputNonce: string | null;
 }
 
 export interface SupplementTransaction {
     ledgerTxHash: string;
     status: string | null;
-    /**
-     * The fee this transaction paid. Reproduced exactly by
-     * `Transaction.fees(block.ledgerParameters)` from the ledger, which needs
-     * per-block parameters the node does not serve, so the indexer is the
-     * practical source.
-     */
+    /** Computing the fee needs ledger parameters the node does not provide, so it comes from the indexer. */
     fee: string | null;
     segments: SupplementSegment[];
     contractActions: SupplementContractAction[];
     zswapEvents: SupplementLedgerEvent[];
     dustEvents: SupplementDustEvent[];
-    /** `(intentHash, outputIndex)` of the created outputs registered for DUST. */
     dustRegisteredOutputs: Array<{ intentHash: string; outputIndex: number }>;
 }
 
 export interface SupplementBlock {
     height: number;
-    /** Base64; the node serves only a storage key for the ledger state. */
+    /** Base64. The node does not provide these parameters. */
     ledgerParameters: string | null;
     transactions: SupplementTransaction[];
 }
@@ -94,7 +84,6 @@ function toInt(value: unknown): number {
     return Number.isFinite(n) ? Math.trunc(n) : 0;
 }
 
-/** The indexer serves bytes as hex; CAP wants base64 for a LargeBinary. */
 function toBinary(value: unknown): string | null {
     const clean = hex(value);
     if (!clean || clean.length % 2 !== 0) return null;
@@ -116,7 +105,6 @@ function readEvents(list: unknown): SupplementLedgerEvent[] {
     }));
 }
 
-/** The DUST stream is an interface; the concrete type names the kind. */
 const DUST_EVENT_TYPE: Record<string, SupplementDustEvent['eventType']> = {
     DustGenerationDtimeUpdate: 'DTIME_UPDATE',
     DustInitialUtxo: 'INITIAL_UTXO',
@@ -129,7 +117,7 @@ function readDustEvents(list: unknown): SupplementDustEvent[] {
     const out: SupplementDustEvent[] = [];
     for (const e of list as any[]) {
         const eventType = DUST_EVENT_TYPE[String(e?.__typename)];
-        // An unknown kind is dropped rather than filed under a wrong one.
+        // Unknown kinds are skipped, so they are never stored under a wrong kind.
         if (!eventType) continue;
         out.push({
             eventId: toInt(e?.id),
@@ -142,7 +130,6 @@ function readDustEvents(list: unknown): SupplementDustEvent[] {
     return out;
 }
 
-/** Maps one `block` payload; a transaction without a ledger hash is skipped. */
 export function readSupplementBlock(payload: any): SupplementBlock | null {
     const block = payload?.block;
     if (!block) return null;
@@ -194,7 +181,7 @@ export interface IndexerClient {
     fetchBlock(height: number): Promise<SupplementBlock | null>;
 }
 
-/** A non-2xx answer from the indexer, with the status for the caller's backoff. */
+/** A non-2xx response from the indexer. The caller uses the status to decide how long to back off. */
 export class IndexerHttpError extends Error {
     constructor(readonly status: number) {
         super(`indexer answered ${status}`);
@@ -203,16 +190,14 @@ export class IndexerHttpError extends Error {
 }
 
 /**
- * 403 and 429: the indexer's edge refuses this client. The public indexers
- * sit behind an AWS load balancer that blocks the whole host IP once a client
- * sends too many requests (seen at ~15/s on 2026-09-24), and that block also
- * hits the sponsor facades' WebSocket on the same host.
+ * True for 403 and 429, which mean the indexer refuses this client.
+ * The public indexer blocks the host's whole IP when it gets too many requests.
+ * That block also cuts off the sponsor wallets on the same host.
  */
 export function isIndexerRateLimit(err: unknown): boolean {
     return err instanceof IndexerHttpError && (err.status === 403 || err.status === 429);
 }
 
-/** One GraphQL POST; the indexer needs no credentials for these reads. */
 async function postQuery(url: string, query: string, variables: Record<string, unknown>, timeoutMs: number, what: string): Promise<any> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -247,9 +232,8 @@ const CONTRACT_STATE_QUERY = `query($address: HexEncoded!, $offset: ContractActi
 }`;
 
 /**
- * A contract's state as of `height` (its newest action at or below it), or its
- * newest state without a height; base64 like the supplement's. Null when the
- * indexer knows no action of the contract there.
+ * A contract's state at `height`, or its latest state when no height is given. Values are base64.
+ * Returns null when the indexer has no action of the contract up to that height.
  */
 export async function fetchContractState(
     url: string,

@@ -1,16 +1,8 @@
 /**
- * ORDER BY on PostgreSQL: no NULLS clause for columns that cannot be NULL.
- *
- * @cap-js/postgres renders every ordering term as `ASC NULLS FIRST` /
- * `DESC NULLS LAST` (SQLite's and HANA's null order). A Postgres btree index
- * is `ASC NULLS LAST` (backwards `DESC NULLS FIRST`), so the planner cannot
- * walk an index for such an ORDER BY and sorts the table before the LIMIT;
- * CAP orders every `$top` read by the entity key. For a key or `not null`
- * column the placement is meaningless, so it is dropped and the plain `ASC` /
- * `DESC` matches the primary key and the secondary indexes. Nullable columns
- * and an explicit `nulls` on the term keep the clause, as does a column
- * reached through a join (an outer join yields NULL). Installed once on the
- * driver's renderer class. SPDX-License-Identifier: Apache-2.0
+ * Removes the NULLS FIRST or NULLS LAST clause from ORDER BY on PostgreSQL for columns that cannot be NULL.
+ * The CAP Postgres driver always adds such a clause, and it does not match the order of a normal Postgres index.
+ * So Postgres would sort the whole table instead of reading the index. For non-null columns the clause has no effect anyway.
+ * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
 
@@ -22,7 +14,7 @@ interface FromShape { ref?: unknown[]; as?: string; join?: string; args?: FromSh
 interface SelectShape { from?: FromShape; columns?: Array<{ ref?: string[]; as?: string }> }
 type OrderByFn = (this: { cqn?: { SELECT?: SelectShape } }, orderBy: OrderTerm[], ...rest: unknown[]) => string[];
 
-/** Alias of the query's own table, the one every result row comes from; undefined for a subselect source. */
+/** Alias of the query's main table. Undefined when the query reads from a subselect. */
 function sourceAlias(from: FromShape | undefined): string | undefined {
     if (!from) return undefined;
     if (from.ref) return from.as;
@@ -30,7 +22,7 @@ function sourceAlias(from: FromShape | undefined): string | undefined {
     return undefined;
 }
 
-/** The column ref an ordering term stands for: its own, or the one behind a column alias. */
+/** The column an ORDER BY term refers to, resolving a column alias. */
 function termRef(term: OrderTerm, columns: SelectShape['columns']): string[] | undefined {
     const ref = term.ref;
     if (ref?.length === 1 && columns) {
@@ -41,10 +33,8 @@ function termRef(term: OrderTerm, columns: SelectShape['columns']): string[] | u
 }
 
 /**
- * Strips the null placement from the rendered terms whose column cannot be
- * NULL: a key or NOT NULL column of the query's own table. The same column
- * reached through a join (`parent.height`, an outer join) can be NULL and
- * keeps the clause.
+ * Removes the NULLS clause for key and NOT NULL columns of the main table.
+ * A column reached through a join keeps it, because an outer join can produce NULL.
  */
 export function stripNullsForNotNull(orderBy: OrderTerm[], rendered: string[], select?: SelectShape): string[] {
     const alias = sourceAlias(select?.from);
@@ -60,7 +50,7 @@ export function stripNullsForNotNull(orderBy: OrderTerm[], rendered: string[], s
     });
 }
 
-/** Wraps the driver's `_orderBy` once; returns false when the driver or the hook is missing. */
+/** Patches the driver's `_orderBy` once. Returns false when the driver or the method is missing. */
 export function installPostgresOrderNulls(): boolean {
     let PostgresService: { CQN2SQL?: { prototype: Record<string | symbol, unknown> } };
     try {

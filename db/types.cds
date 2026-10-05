@@ -1,11 +1,10 @@
-// ============================================================================
-// Custom Types
-// ============================================================================
-
 type HexEncoded              : String(512);
-type UnshieldedAddr          : String(256); // Bech32m-encoded
-type DustAddr                : String(256); // Bech32m-encoded
-type BigInt                  : String(78); // For u128 values as strings
+@assert.format: '^[0-9a-fA-F]{64}$'
+@assert.format.message: 'must be 64 hex characters'
+type Hex64                   : String; // 32 bytes as 64 hex characters
+type UnshieldedAddr          : String(256); // Bech32m
+type DustAddr                : String(256); // Bech32m
+type BigInt                  : String(78); // decimal; unsigned 128-bit integer
 
 type TransactionResultStatus : String enum {
     SUCCESS;
@@ -24,14 +23,14 @@ type ContractActionType      : String enum {
     UPDATE;
 }
 
-/** Outcome of the crawler's ledger-payload decode for one transaction. */
+/** Result of decoding the ledger transaction inside an extrinsic. */
 type PayloadDecodeState      : String(20) enum {
     decoded;
-    absent;  // no ledger payload in this extrinsic
-    failed;  // the payload did not deserialize
+    absent;  // the extrinsic carries no ledger transaction
+    failed;  // the bytes could not be decoded
 }
 
-/** The four kinds the Midnight indexer's DUST event stream carries. */
+/** The event kinds of the Midnight indexer's DUST event stream. */
 type DustLedgerEventType     : String enum {
     DTIME_UPDATE;
     INITIAL_UTXO;
@@ -39,7 +38,6 @@ type DustLedgerEventType     : String enum {
     PARAM_CHANGE;
 }
 
-// Crawler classification
 type TxType                  : String(30) enum {
     night_transfer;
     shielded_transfer;
@@ -67,26 +65,39 @@ type PendingSubmissionStatus : String(20) enum {
     failed;
 }
 
-// Background job lifecycle:
-//   pending: queued; running: before the external-effect boundary;
-//   external_execution: an SDK call that may touch the chain is in progress;
-//   submitted: tx hash returned, finality pending;
-//   reconciliation_required: interrupted after a possible chain effect;
-//   succeeded: `result` holds the return JSON; failed: see errorCode/errorMessage
 type BackgroundJobStatus     : String(32) enum {
-    pending;
-    running;
-    external_execution;
-    submitted;
-    reconciliation_required;
-    succeeded;
-    failed;
+    pending;                 // queued
+    running;                 // working, nothing sent to the chain yet
+    external_execution;      // in a call that may reach the chain
+    submitted;               // transaction hash known, waiting for finality
+    reconciliation_required; // stopped after it may have reached the chain
+    succeeded;               // `result` holds the return value
+    failed;                  // see errorCode and errorMessage
 }
 
 type BackgroundJobKind       : String(64);
+
+type BackgroundJobChainStatus : String(20) enum {
+    pending;
+    success;
+    failure;
+    dropped;
+}
+
+type CommandEncoding         : String(20) enum {
+    json_v1    = 'json-v1';
+    aes_gcm_v1 = 'aes-gcm-v1';
+}
 
 type DisclosureRole          : String(30) enum {
     public_only;
     legitimate_interest;
     authority;
+}
+
+type SwapOfferStatus         : String(10) enum {
+    open;
+    filled;
+    retired;
+    expired;
 }

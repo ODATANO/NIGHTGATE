@@ -1,25 +1,11 @@
 /**
- * Private-state proxy: the worker reads and writes contract private state
- * through the main thread (CapDbPrivateStateProvider) over per-call ports.
+ * The worker reads and writes contract private state through the main thread,
+ * which stores it in the database.
  */
 
 import { parentPort, MessageChannel } from 'node:worker_threads';
 
-// ---- Private-state proxy (worker → main RPC) ------------------------------
-
-/**
- * Each CRUD call on the proxy posts a `private-state-rpc` message back to the
- * main thread, which holds the real CapDbPrivateStateProvider (keyed by
- * proxyId, see srv/midnight/wallet-worker-client.ts). The SDK consumes the
- * returned object as a plain PrivateStateProvider; await semantics work
- * because each method returns a Promise that resolves on the reply port.
- *
- * `setContractAddress` is sync in the SDK contract; we forward it as a
- * fire-and-forget message (no reply port). worker_threads guarantees ordering
- * on parentPort, so the next async set/get from the same proxy is always
- * dispatched on main AFTER the address-set has been applied.
- */
-/** A private-state round trip that the main thread never answers (a stalled CAP DB) must not pin the worker op and its session lock forever. */
+/** A stuck database must not hold the worker call and its session lock forever. */
 export const PRIVATE_STATE_RPC_TIMEOUT_MS = 60_000;
 
 export function privateStateRpc<T>(proxyId: string, method: string, args: unknown[]): Promise<T> {
@@ -54,7 +40,8 @@ export function createPrivateStateProxy(proxyId: string): any {
     return {
         setContractAddress(addr: string): void {
             if (!addr) throw new Error('Contract address must not be empty');
-            // Fire-and-forget; order preserved relative to subsequent async ops.
+            // The SDK expects this to be synchronous, so no reply is awaited.
+            // Messages arrive in order, so it is applied before the next get or set.
             parentPort!.postMessage({
                 kind: 'private-state-rpc',
                 proxyId,

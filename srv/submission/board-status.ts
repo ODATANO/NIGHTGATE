@@ -1,8 +1,6 @@
 /**
- * Counts-only view of the offer board and the sponsor pool for an anonymous
- * reader: how many offers are open, how many filled today, how many sponsors
- * can pay now. No identifiers, no amounts, and no worker call: sponsor readiness
- * comes from the sync readings the worker pushes anyway.
+ * Public counts for the offer board and the sponsor pool. Shows no ids and no amounts.
+ * Sponsor readiness comes from the reports the worker sends anyway, so no worker call is needed.
  * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
@@ -32,7 +30,7 @@ async function countRows(db: DbRunner, query: unknown): Promise<number> {
     return Number.isFinite(n) ? n : 0;
 }
 
-/** A sponsor is ready when its last pushed reading is at tip with a spendable dust note. */
+/** A sponsor is ready when its last report says it is synced and has spendable dust. */
 export async function countReadySponsors(db: DbRunner, sponsorIds: string[]): Promise<number> {
     let ready = 0;
     for (const sessionId of sponsorIds) {
@@ -42,13 +40,13 @@ export async function countReadySponsors(db: DbRunner, sponsorIds: string[]): Pr
             const progress = walletGetSyncProgress(sess.accountId);
             if (syncGateReading(progress).caughtUp && Number(progress?.dust?.availableNotes ?? 0) > 0) ready++;
         } catch {
-            // An unreadable sponsor counts as not ready.
+            // A sponsor that cannot be read counts as not ready.
         }
     }
     return ready;
 }
 
-// Anonymous and polled by pages: one computation serves every reader for a few seconds.
+// Anyone can poll this, so one result is shared by all readers for a few seconds.
 const MEMO_MS = 10_000;
 let memo: { at: number; value: Promise<BoardStatus> } | null = null;
 
@@ -70,7 +68,7 @@ async function computeBoardStatus(db: DbRunner, now: Date): Promise<BoardStatus>
     const [openOffers, offersFilledToday, swapsToday] = await Promise.all([
         countRows(db, SELECT.one.from(SwapOffers).columns('count(*) as count').where({ status: 'open' }).and('expiresAt is null or expiresAt >', nowIso)),
         countRows(db, SELECT.one.from(SwapOffers).columns('count(*) as count').where({ status: 'filled' }).and('closedAt >=', dayStart)),
-        // Jobs that finished today without a chain failure; the confirmer's verdict may still be pending.
+        // Jobs that finished today without a chain failure. Some may not be confirmed on chain yet.
         countRows(db, SELECT.one.from(BackgroundJobs).columns('count(*) as count').where({ kind: 'sponsorSwap', status: 'succeeded' }).and("chainStatus is null or chainStatus != 'failure'").and('finishedAt >=', dayStart))
     ]);
     const sponsorIds = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());

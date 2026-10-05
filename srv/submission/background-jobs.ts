@@ -1,25 +1,27 @@
 /**
- * Durable async job runner: the request tx only inserts the row, the leased work
- * runs detached with short per-write txs (no pool connection held for hours).
- * `idempotencyKey` dedupes via the (sessionId, kind, key) constraint.
+ * Runs long work as background jobs stored in the database.
+ * The request only inserts the job row. The work runs later in short database
+ * transactions, so no connection stays open for hours.
+ * A unique (sessionId, kind, idempotencyKey) prevents duplicate jobs.
  */
 
-import { isLockContention, lockContentionBackoffMs, __resetLockContentionBackoffForTests } from './db-write-retry';
+import { isLockContention, lockContentionBackoffMs, __resetLockContentionBackoffForTests, LOCK_CONTENTION_ATTEMPTS, withLockContentionRetry } from './db-write-retry';
 import cds from '@sap/cds';
 import crypto from 'crypto';
-import { BackgroundJobs } from '#cds-models/midnight';
+import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
 import { encrypt as encryptAtRest, getEncryptionKey } from '../utils/crypto';
 import { jobCommandBinding } from '../utils/envelope-bindings';
 import { getArtifactGenerationDigest } from './contract-registry';
 import { configInt, configMs } from '../utils/config';
 import type { DbRunner } from '../utils/db-types';
-import { BackgroundJobRow, safeStringify, sleep, STATUS_WRITE_ATTEMPTS, IDEMPOTENCY_KEY_MAX_LENGTH, IdempotencyKeyInvalidError, JobAdmissionBusyError, isUniqueViolation, withStatusWriteRetry, WorkflowReconciliationRequiredError, getJobById, IdempotencyConflictError, __resetStoreForTests } from './job-store';
+import { safeStringify, sleep, IDEMPOTENCY_KEY_MAX_LENGTH, IdempotencyKeyInvalidError, JobAdmissionBusyError, isUniqueViolation, WorkflowReconciliationRequiredError, getJobById, IdempotencyConflictError, __resetStoreForTests } from './job-store';
 import { processors, processorKey } from './job-registry';
 import { scheduleJob, __resetSchedulerForTests } from './job-scheduler';
 import { __resetReconciliationForTests } from './job-reconciliation';
+import { errorMessage } from '../utils/errors';
 
 export { declareJobKind, jobKindTraits, kindsWithTrait, __workflowParentKindsForTests, registerBackgroundJobProcessor, undeclaredOrUnregisteredJobKinds, registerBackgroundJobReconciliationFinalizer, type BackgroundJobProcessor, type BackgroundJobReconciliationFinalizer } from './job-registry';
-export { type BackgroundJobRow, type ReconciliationEvidence, WorkflowReconciliationRequiredError, runWithoutAmbientTx, getJobById, dropPendingJobsForClosedSessions, findLatestJob, supersedeQueuedJobs, IDEMPOTENCY_KEY_MAX_LENGTH, IdempotencyKeyInvalidError, IdempotencyConflictError, JobAdmissionBusyError, markJobExternalExecution, markJobBroadcastOn, markJobSubmissionRejectedOn, withLockContentionRetry, markJobSubmitted, __setStatusWriteBackoffForTests } from './job-store';
+export { type ReconciliationEvidence, WorkflowReconciliationRequiredError, runWithoutAmbientTx, getJobById, dropPendingJobsForClosedSessions, findLatestJob, supersedeQueuedJobs, IDEMPOTENCY_KEY_MAX_LENGTH, IdempotencyKeyInvalidError, IdempotencyConflictError, JobAdmissionBusyError, markJobExternalExecution, markJobBroadcastOn, markJobSubmissionRejectedOn, markJobSubmitted } from './job-store';
 export { recoverInterruptedJobs, BROADCAST_UNCONFIRMED, BROADCAST_NOT_INCLUDED, settleRejectedSponsorAttempts, registerChainOutcomeConfirmer, reconcileBackgroundJobs, refreshSucceededChainOutcomes, confirmChainOutcomesViaIndexer } from './job-reconciliation';
 export { startBackgroundJobProcessor, stopBackgroundJobProcessor, reclaimExpiredLeases, __pollOnceForTests } from './job-scheduler';
 export { REJECTED_ATTEMPT_BOOKKEEPING_PENDING, SponsorAttemptBookkeepingPendingError } from './job-execution-context';
@@ -30,34 +32,34 @@ export interface StartJobArgs<TIn, TOut> {
     kind: string;
     sessionId: string;
     idempotencyKey?: string | null;
-    /** Persisted as plain JSON: strip secrets first. */
+    /** Stored as plain JSON, so remove secrets first. */
     request: TIn;
-    /** Fingerprinted instead of `request` when that contains generated IDs. */
+    /** Used for duplicate detection instead of `request` when the request contains generated IDs. */
     idempotencyPayload?: unknown;
-    /** Revalidates session ownership on replay. */
+    /** Checked again on a re-run to confirm the caller still owns the session. */
     requestedBy?: string;
     grantId?: string | null;
-    /** Versioned replayable command; requires a registered processor for `kind`. */
+    /** Stored command that can be re-run after a restart. Needs a registered processor for `kind`. */
     command?: unknown;
     commandVersion?: number;
-    /** Required for private circuit inputs. */
+    /** Must be set when the command holds private circuit inputs. */
     encryptCommand?: boolean;
     parentJobId?: string;
     workflowStep?: string;
-    /** Legacy in-memory execution. Omit for replayable commands. */
+    /** In-memory work that cannot be re-run after a restart. Omit when `command` is set. */
     work?: () => Promise<TOut>;
 }
 
 export interface StartJobResult<TOut = unknown, TIn = unknown> {
     jobId: string;
-    status: BackgroundJobRow['status'];
-    /** Only when an idempotent retry hit an already-succeeded row. */
+    status: BackgroundJob['status'];
+    /** Set only when a repeated request found a job that already succeeded. */
     result?: TOut;
     deduplicated?: boolean;
     originalRequest?: TIn;
 }
 
-/** Insert the job row on the caller's tx and detach the work; returns at once. */
+/** Inserts the job row in the caller's transaction and starts the work in the background. Returns at once. */
 export async function startJob<TIn, TOut>(
     args: StartJobArgs<TIn, TOut>
 ): Promise<StartJobResult<TOut>> {
@@ -82,25 +84,24 @@ export async function startJob<TIn, TOut>(
         .update(`${kind}\0${sessionId}\0${fingerprintPayload}`)
         .digest('hex');
 
-    // Savepoints need one pinned connection, which only an ambient request tx
-    // gives; outside one db.run autocommits. Reads share it to see its own writes.
+    // Savepoints need one fixed connection, which only the request's transaction provides.
+    // Without one, each db.run commits on its own. Reads use the same connection to see its writes.
     const pinnedRunner: DbRunner | undefined =
         cds.context ? db.tx(cds.context) : undefined;
     const reader = pinnedRunner ?? db;
 
     if (idempotencyKey && idempotencyKey.length > IDEMPOTENCY_KEY_MAX_LENGTH) throw new IdempotencyKeyInvalidError();
-    // Fast path only: in-flight same-key rows are caught by the constraint below.
+    // Quick check only. A parallel insert with the same key is caught by the unique constraint below.
     if (idempotencyKey) {
         const dup = await dedupExisting<TIn, TOut>(reader, sessionId, kind, idempotencyKey, payloadFingerprint);
         if (dup) return dup;
     }
 
-    // The INSERT rides the caller's ambient tx: handlers often write first, so
-    // that tx already holds the SQLite write lock.
+    // Insert in the caller's transaction. Handlers often write first, so it already holds the SQLite write lock.
     const jobId = crypto.randomUUID();
     const queuedAt = new Date().toISOString();
-    // `compiledArtifactRef` is a mutable alias: stamp its digest now so the
-    // executor fails closed if it is re-pointed before execution.
+    // `compiledArtifactRef` is a name that can later point to another contract build.
+    // Store the build's digest now so the job refuses to run if the name changes.
     let effectiveCommand: unknown = command;
     if (replayable && command && typeof command === 'object'
         && typeof (command as any).compiledArtifactRef === 'string'
@@ -137,8 +138,8 @@ export async function startJob<TIn, TOut>(
 
     // A failed INSERT committed nothing, so retrying on lock contention is safe.
     if (idempotencyKey && pinnedRunner) {
-        // A same-key collision resolves to the winner's job; ROLLBACK TO clears
-        // Postgres's aborted-tx state so the handler's tx can continue.
+        // On a duplicate key, return the job that was inserted first.
+        // Rolling back to the savepoint lets the caller's Postgres transaction continue after the error.
         const sp = 'nightgate_job_insert';
         for (let attempt = 0; ; attempt++) {
             if (lockContentionBackoffMs()[attempt]) await sleep(lockContentionBackoffMs()[attempt]);
@@ -150,8 +151,8 @@ export async function startJob<TIn, TOut>(
             } catch (insertErr) {
                 await pinnedRunner.run(`ROLLBACK TO SAVEPOINT ${sp}`);
                 await pinnedRunner.run(`RELEASE SAVEPOINT ${sp}`);
-                if (isLockContention(insertErr) && attempt + 1 < STATUS_WRITE_ATTEMPTS) {
-                    cds.log('nightgate').warn(`startJob(${kind}): admission insert lost the SQLite lock (attempt ${attempt + 1}/${STATUS_WRITE_ATTEMPTS})`);
+                if (isLockContention(insertErr) && attempt + 1 < LOCK_CONTENTION_ATTEMPTS) {
+                    cds.log('nightgate').warn(`startJob(${kind}): admission insert lost the SQLite lock (attempt ${attempt + 1}/${LOCK_CONTENTION_ATTEMPTS})`);
                     continue;
                 }
                 if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
@@ -162,9 +163,9 @@ export async function startJob<TIn, TOut>(
             }
         }
     } else if (idempotencyKey) {
-        // Autocommit: a collision poisons nothing, recover the winner on a fresh read.
+        // No surrounding transaction, so a duplicate key breaks nothing. Read the existing job.
         try {
-            await withStatusWriteRetry(`startJob(${kind}) admission insert`, () => db.run(buildInsert()));
+            await withLockContentionRetry(`startJob(${kind}) admission insert`, () => db.run(buildInsert()));
         } catch (insertErr) {
             if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
             if (!isUniqueViolation(insertErr)) throw insertErr;
@@ -179,8 +180,8 @@ export async function startJob<TIn, TOut>(
                 await pinnedRunner.run(buildInsert());
                 break;
             } catch (insertErr) {
-                if (isLockContention(insertErr) && attempt + 1 < STATUS_WRITE_ATTEMPTS) {
-                    cds.log('nightgate').warn(`startJob(${kind}): admission insert lost the SQLite lock (attempt ${attempt + 1}/${STATUS_WRITE_ATTEMPTS})`);
+                if (isLockContention(insertErr) && attempt + 1 < LOCK_CONTENTION_ATTEMPTS) {
+                    cds.log('nightgate').warn(`startJob(${kind}): admission insert lost the SQLite lock (attempt ${attempt + 1}/${LOCK_CONTENTION_ATTEMPTS})`);
                     continue;
                 }
                 if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
@@ -189,7 +190,7 @@ export async function startJob<TIn, TOut>(
         }
     } else {
         try {
-            await withStatusWriteRetry(`startJob(${kind}) admission insert`, () => db.run(buildInsert()));
+            await withLockContentionRetry(`startJob(${kind}) admission insert`, () => db.run(buildInsert()));
         } catch (insertErr) {
             if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
             throw insertErr;
@@ -214,7 +215,7 @@ function childWaitTimeoutMs(): number {
     return configMs('NIGHTGATE_WORKER_RPC_TIMEOUT_MS') + 5 * 60_000;
 }
 
-/** Did any step of this workflow succeed or leave a possible effect (txHash, reconciliation)? */
+/** True when a step of this workflow succeeded or may have reached the chain. */
 async function hasCompletedChild(parentJobId: string): Promise<boolean> {
     try {
         const db = await cds.connect.to('db');
@@ -225,10 +226,9 @@ async function hasCompletedChild(parentJobId: string): Promise<boolean> {
         if (!Array.isArray(children)) return true;
         return children.some(c => c.status === 'succeeded' || c.status === 'reconciliation_required' || !!c.txHash);
     } catch (err) {
-        // Unknown counts as "something happened": the other guess could plainly
-        // fail a workflow with a step on chain, and a retry would pay twice.
+        // When unsure, assume a step ran. Otherwise a retry could pay for a step that is already on chain.
         cds.log('nightgate').warn(
-            `hasCompletedChild(${parentJobId}) could not read child state (${String((err as Error)?.message ?? err)}); ` +
+            `hasCompletedChild(${parentJobId}) could not read child state (${errorMessage(err)}); ` +
             'assuming the workflow is partially executed'
         );
         return true;
@@ -236,11 +236,11 @@ async function hasCompletedChild(parentJobId: string): Promise<boolean> {
 }
 
 /**
- * Run one child command and wait for its durable result. A re-run parent
- * resolves the same child through its immutable idempotency key.
+ * Runs one workflow step as its own job and waits for its result.
+ * A re-run parent finds the same step job again through its fixed idempotency key.
  */
 export async function runChildCommand<T>(args: {
-    parent: BackgroundJobRow;
+    parent: BackgroundJob;
     kind: string;
     step: string;
     commandVersion: number;
@@ -267,8 +267,8 @@ export async function runChildCommand<T>(args: {
             workflowStep: step
         });
     } catch (err) {
-        // Once an earlier step may be on chain, a plain failure (the parent has no
-        // txHash) would never be reconciled and a retry would repeat fee-spending steps.
+        // An earlier step may be on chain. A plain failure would never be checked against
+        // the chain, and a retry would repeat steps that cost fees.
         if (err instanceof JobAdmissionBusyError && await hasCompletedChild(parent.ID)) {
             throw new WorkflowReconciliationRequiredError(
                 `Could not admit workflow step '${step}' (${err.message}), and an earlier step of job ${parent.ID} already completed; verify chain state before retrying`
@@ -294,7 +294,7 @@ export async function runChildCommand<T>(args: {
     }
 }
 
-/** The existing job for an idempotency identity, or null; throws on a reused key with a changed payload. */
+/** The existing job for this idempotency key, or null. Throws when the key is reused with a different payload. */
 async function dedupExisting<TIn, TOut>(
     runner: DbRunner,
     sessionId: string,

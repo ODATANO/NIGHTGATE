@@ -1,14 +1,10 @@
 /**
- * Types for providers.mjs. The package's public surface is declared in index.d.ts; this sibling
- * exists so the deep path (`@odatano/nightgate/browser/providers.mjs`) and the unit suite are typed
- * too — NodeNext resolves declarations for an `.mjs` file only from a `.d.mts` next to it.
+ * Types for providers.mjs, so a direct import of that file is typed.
+ * TypeScript only finds types for an `.mjs` file in a `.d.mts` file next to it.
  */
-// Structural, NOT `import type { FetchZkConfigProvider } from './zk-config.mjs'`: that module ships
-// as plain .mjs with no declaration sibling, so importing from it makes this file error under a
-// consumer's `skipLibCheck: false` ("implicitly has an 'any' type"). The repo's own typecheck hides
-// that (skipLibCheck is on); only an installed-package typecheck catches it — see
-// scripts/check-package-exports.mjs for why packaging is verified against the real tarball.
-/** What this module needs from a zk-config provider: the wallet's key-material view. */
+// This interface is written out here on purpose. zk-config.mjs ships without types,
+// so importing its type would fail for users who type-check installed packages.
+/** The part of a zk-config provider this module uses. */
 export interface KeyMaterialSource {
     asKeyMaterialProvider(): unknown;
 }

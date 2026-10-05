@@ -1,13 +1,13 @@
 /**
- * Resolves the caller's disclosure tier (0 public, 1 legitimate interest, 2 authority)
- * to gate response shape; orthogonal to `@requires`, which gates service access.
+ * Finds out how much the caller may see: 0 public, 1 legitimate interest, 2 authority.
+ * This decides which fields a response contains. `@requires` decides service access.
  */
 import cds from '@sap/cds';
-import { DisclosureRoles, DisclosureGrants } from '#cds-models/midnight';
+import { DisclosureRoles, DisclosureGrants, type DisclosureRole } from '#cds-models/midnight';
 import { resolveGranteeId } from '../submission/grantee-identity';
-import type { NightgateRequest } from '../utils/request-types';
+import type { Request } from '@sap/cds';
 
-export type DisclosureRoleValue = 'public_only' | 'legitimate_interest' | 'authority';
+export type DisclosureRoleValue = DisclosureRole['role'];
 
 export const DEFAULT_DISCLOSURE_ROLE: DisclosureRoleValue = 'public_only';
 
@@ -23,35 +23,26 @@ const RANK: Record<DisclosureRoleValue, number> = {
     authority: 2
 };
 
-/** On-chain vault `level` -> tier; inverse of RANK. */
 const LEVEL_TO_ROLE: Record<number, DisclosureRoleValue> = {
     0: 'public_only',
     1: 'legitimate_interest',
     2: 'authority'
 };
 
-interface DisclosureRoleRow {
-    userId: string;
-    role: DisclosureRoleValue;
-    scope?: string | null;
-    validFrom?: string | null;
-    validUntil?: string | null;
-}
-
 export interface AttachDisclosureRoleOptions {
 
     scope?: string;
-    contractAddress?: string; // AttestationVault deployment address
-    payloadHash?: string; // Optional attestation payload hash; needs attesterId
-    attesterId?: string; // The attester whose record of payloadHash the grant belongs to
+    contractAddress?: string;
+    payloadHash?: string; // Optional hash of one attested payload. Needs attesterId.
+    attesterId?: string;
 }
 
 /**
- * Sets and returns `req.disclosureRole`: from on-chain `DisclosureGrants` when
- * `contractAddress` is given, else from the operator's `DisclosureRoles` table.
+ * Sets and returns `req.disclosureRole`. With `contractAddress` it reads the on-chain
+ * grants in `DisclosureGrants`. Otherwise it reads the operator's `DisclosureRoles` table.
  */
 export async function attachDisclosureRole(
-    req: NightgateRequest,
+    req: Request,
     db: cds.DatabaseService,
     options: AttachDisclosureRoleOptions = {}
 ): Promise<DisclosureRoleValue> {
@@ -69,8 +60,8 @@ export async function attachDisclosureRole(
     }
 
     const { SELECT } = cds.ql;
-    const rows: DisclosureRoleRow[] =
-        (await db.run(SELECT.from(DisclosureRoles).where({ userId })) as DisclosureRoleRow[]) || [];
+    const rows: DisclosureRole[] =
+        (await db.run(SELECT.from(DisclosureRoles).where({ userId })) as DisclosureRole[]) || [];
 
     const now = new Date().toISOString();
     const valid = rows.filter(r => isCurrentlyValidGrant(r, now, options.scope));
@@ -88,8 +79,8 @@ export async function attachDisclosureRole(
 }
 
 /**
- * Highest active grant for the caller's granteeId. A payload without an attester
- * resolves to public_only: another attester's grant on the same hash must not open it.
+ * Returns the highest active grant for the caller. A payload hash without an attester
+ * gives public_only, so a grant from another attester on the same hash cannot unlock it.
  */
 async function resolveOnChainRole(
     req: cds.Request,
@@ -103,7 +94,7 @@ async function resolveOnChainRole(
     if (!granteeId) return DEFAULT_DISCLOSURE_ROLE;
 
     const { SELECT } = cds.ql;
-    // Stored lowercase. Only the confirmed `level` counts, never `pendingLevel`.
+    // Values are stored lowercase. Only the confirmed `level` counts, never `pendingLevel`.
     const where: Record<string, unknown> = {
         contractAddress: contractAddress.toLowerCase(),
         grantee: granteeId,
@@ -123,7 +114,7 @@ async function resolveOnChainRole(
 }
 
 function isCurrentlyValidGrant(
-    row: DisclosureRoleRow,
+    row: DisclosureRole,
     now: string,
     requestedScope: string | undefined
 ): boolean {
@@ -147,7 +138,6 @@ export function isValidDisclosureRoleValue(value: unknown): value is DisclosureR
         && (DISCLOSURE_ROLE_VALUES as readonly string[]).includes(value);
 }
 
-/** Higher tiers satisfy lower requirements. */
 export function meetsDisclosure(
     actual: DisclosureRoleValue | undefined,
     required: DisclosureRoleValue

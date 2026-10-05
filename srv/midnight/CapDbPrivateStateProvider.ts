@@ -1,7 +1,7 @@
 /**
- * Private-state provider on the CAP DB, replacing the SDK's LevelDB provider (not for production).
- * Exports are wire-compatible with the LevelDB provider (storage-encryption.ts).
- * Scoped to one `accountId` and to the contract set via `setContractAddress()`.
+ * Stores a contract's private state in the CAP database instead of the SDK's LevelDB store.
+ * Exports use the same format as the LevelDB provider.
+ * Each instance serves one account and the contract chosen with `setContractAddress()`.
  */
 
 import crypto from 'crypto';
@@ -26,7 +26,7 @@ const SIGNING_KEY_EXPORT_FORMAT = 'midnight-signing-key-export';
 const CURRENT_EXPORT_VERSION = 1;
 const SUPPORTED_EXPORT_VERSIONS = [1];
 
-// Interface mirror types (decoupled from SDK imports, SDK is ESM-only)
+// Copies of the SDK's types, because the SDK is ESM only and cannot be imported here.
 
 type ContractAddress = string;
 type PrivateStateId = string;
@@ -94,9 +94,9 @@ export class ImportConflictError extends NightgateError {
 
 export interface CapDbPrivateStateProviderConfig {
     accountId: string;
-    /** The account-DEK-derived password (wallet-material-factory.ts); every row is written under it. */
+    /** The account's storage password. Every row is written with it. */
     privateStoragePasswordProvider: () => Promise<string> | string;
-    /** Read-only passwords of older derivations; a row opened through one is rewritten under the current password. */
+    /** Older passwords, used only for reading. A row opened with one is saved again with the current password. */
     privateStoragePasswordFallbacks?: () => Promise<string[]> | string[];
     db?: DbRunner;
 }
@@ -104,8 +104,8 @@ export interface CapDbPrivateStateProviderConfig {
 const PRIVATE_STATE_SALT_LABEL = 'nightgate-private-state-salt-v1';
 
 /**
- * Deterministic salt per (account, password): a stored blob's salt names its password,
- * so fallback readers pick a candidate without trial decrypts.
+ * The same account and password always give the same salt.
+ * So a stored row's salt shows which password wrote it, and no trial decryption is needed.
  */
 export function privateStateStableSalt(accountId: string, password: string): Buffer {
     return crypto
@@ -164,7 +164,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         );
     }
 
-    /** Scoped to the current contract like get/set/remove (the SDK's provider does the same). */
+    /** Clears only the current contract's state, like the SDK's provider does. */
     async clear(): Promise<void> {
         const contractAddress = this.requireContractAddress('clear');
         const db = await this.getDb();
@@ -409,9 +409,9 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
     }
 
     /**
-     * Deterministic salt: each submission builds its own provider, and a random salt would make
-     * a reader reject the writer's blob. The password is a high-entropy per-account secret;
-     * export blobs get a random salt.
+     * Uses a fixed salt because each submission creates its own provider.
+     * With a random salt, one provider could not read what another wrote.
+     * The password is a strong secret per account. Exports still get a random salt.
      */
     private getEncryption(): Promise<StorageEncryption> {
         if (!this.encryptionPromise) {
@@ -425,7 +425,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         return privateStateStableSalt(this.config.accountId, password);
     }
 
-    /** Decrypt under the current password or the fallback matching the blob's salt; a fallback hit is rewritten. */
+    /** Decrypts with the current password, or with the older password that matches the salt. In that case the row is saved again. */
     private async decryptStored(ciphertext: string, rewrite: (fresh: string) => Promise<void>): Promise<string> {
         const enc = await this.getEncryption();
         try {
@@ -495,7 +495,7 @@ function validateExportPassword(password: string): void {
     }
 }
 
-/** Signing-key export envelope over already-decrypted keys, sealed under `password`. */
+/** Packs already decrypted signing keys into an export encrypted with `password`. */
 export function buildSigningKeyExport(keys: Record<string, string>, password: string): SigningKeyExport {
     validateExportPassword(password);
     const addresses = Object.keys(keys);

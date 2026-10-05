@@ -1,8 +1,6 @@
 /**
- * `srv.on('error')` handler of the NIGHTGATE services: every error response carries a
- * string code. CAP runs it synchronously inside the transaction rollback, with the
- * error and `cds.context` (not always the request), for rejects, throws and each
- * `$batch` part.
+ * Error handler of the NIGHTGATE services. It makes sure every error response has a text code.
+ * CAP calls it synchronously for every error, also for each part of a `$batch` request.
  * SPDX-License-Identifier: Apache-2.0
  */
 import { statusClassCode } from './errors';
@@ -21,20 +19,20 @@ const numericCode = (code: unknown): boolean =>
 
 const isProduction = (): boolean => process.env.NODE_ENV === 'production' || process.env.CDS_ENV === 'prod';
 
-/** What a sanitized 5xx keeps; everything else CAP would pass into the body. */
+/** The only fields a server error keeps in production. */
 const SANITIZED_KEYS = new Set(['code', 'message', 'status', 'statusCode', '$sanitize']);
 
 const GENERIC_5XX: Record<number, string> ={ 502: 'Bad Gateway', 503: 'Service Unavailable', 504: 'Gateway Timeout' };
 
 function normalizeOne(err: HttpErrorLike): void {
-    // `req.reject(400, text)` yields code 400 and no status; CAP derives the status from
-    // the numeric code later, so the status must be taken before the code is replaced.
+    // `req.reject(400, text)` sets code 400 but no status.
+    // Copy the status from the code before the code is replaced.
     if (err.status === undefined && err.statusCode === undefined && numericCode(err.code)) err.status = Number(err.code);
     const status = Number(err.status ?? err.statusCode ?? 500);
     if (err.code === undefined || err.code === null || err.code === '' || numericCode(err.code)) err.code = statusClassCode(status);
-    // CAP replaces a 5xx body including its code in production; sanitize here instead,
-    // so the code survives. With CAP's guard off, only the allowed keys may remain
-    // (`reason` would surface as `innererror`). An error that opted in keeps its body.
+    // In production CAP would replace the whole body of a server error, including the code.
+    // So we hide the details here ourselves and keep the code.
+    // An error with `$sanitize: false` keeps its full body.
     if (status >= 500 && err.$sanitize !== false && isProduction()) {
         for (const key of Object.keys(err)) if (!SANITIZED_KEYS.has(key)) delete (err as Record<string, unknown>)[key];
         err.message = GENERIC_5XX[status] ?? 'Internal Server Error';

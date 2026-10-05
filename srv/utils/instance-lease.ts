@@ -1,6 +1,6 @@
 /**
- * One process per database runs the background work (job loops, restart recovery, crawler):
- * it holds a heartbeated row in `InstanceLeases`. A graceful stop releases it.
+ * Only one process per database may run background work such as jobs and the crawler.
+ * That process holds a row in `InstanceLeases` (the "lease") and refreshes it regularly. A clean shutdown deletes the row.
  * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
@@ -24,8 +24,8 @@ export class InstanceLeaseHeldError extends NightgateError {
     }
 }
 
-// The lease this process holds, and whether it lost it: a fenced process dispatches no
-// job, refuses write actions and never crosses a broadcast boundary again.
+// The lease this process holds, and whether it lost it ("fenced").
+// A fenced process starts no jobs, refuses writes and never sends a transaction again.
 let activeLease: { role: string; holder: string } | null = null;
 let fenced = false;
 
@@ -47,8 +47,8 @@ export function isBackgroundFenced(): boolean {
 }
 
 /**
- * Before a broadcast boundary commits: the row must still name this process. A process
- * without a lease (tests, SKIP_AUTO_INIT) is not checked.
+ * Called right before a transaction is sent. Throws unless the lease row still names this process.
+ * A process without a lease, as in tests or with SKIP_AUTO_INIT, is not checked.
  */
 export async function assertLeaseHeld(db: DbRunner): Promise<void> {
     if (fenced) throw leaseLostError();
@@ -75,7 +75,10 @@ function affected(value: unknown): number {
     return typeof value === 'number' ? value : Number((value as { changes?: number } | null)?.changes ?? 0);
 }
 
-/** Takes the role when it is ours, free, or its heartbeat is older than `ttlMs`; else names the live holder. */
+/**
+ * Takes the lease when it is ours, free, or not refreshed for `ttlMs`.
+ * Otherwise returns the process that holds it.
+ */
 export async function tryAcquireInstanceLease(
     db: DbRunner, role: string, holder: string, ttlMs: number, now: number = Date.now(), afterInsertRace = false
 ): Promise<LeaseAttempt> {
@@ -83,7 +86,7 @@ export async function tryAcquireInstanceLease(
     if (affected(await db.run(UPDATE.entity(InstanceLeases).set({ heartbeatAt: nowIso }).where({ role, instanceId: holder }))) > 0) {
         return { acquired: true };
     }
-    // CAS on the stale heartbeat: of two instances taking over, one matches.
+    // The update only matches a stale row, so if two processes try at once only one wins.
     const staleBefore = new Date(now - ttlMs).toISOString();
     const takeover = await db.run(UPDATE.entity(InstanceLeases)
         .set({ instanceId: holder, acquiredAt: nowIso, heartbeatAt: nowIso })
@@ -95,7 +98,7 @@ export async function tryAcquireInstanceLease(
             await db.run(INSERT.into(InstanceLeases).entries({ role, instanceId: holder, acquiredAt: nowIso, heartbeatAt: nowIso }));
             return { acquired: true };
         } catch (err) {
-            // Lost the insert race: the row exists now, one more pass reports the winner.
+            // Another process inserted first. One more pass reports who holds it.
             if (!isUniqueViolation(err) || afterInsertRace) throw err;
             return tryAcquireInstanceLease(db, role, holder, ttlMs, now, true);
         }
@@ -105,8 +108,8 @@ export async function tryAcquireInstanceLease(
 }
 
 /**
- * `tryAcquireInstanceLease` that waits out a holder whose heartbeat may still expire
- * (a killed process), polling every `pollMs`. A holder that keeps renewing: InstanceLeaseHeldError.
+ * Like `tryAcquireInstanceLease`, but waits for a lease left by a killed process to expire.
+ * Throws InstanceLeaseHeldError when the holder keeps refreshing it.
  */
 export async function acquireInstanceLease(
     db: DbRunner, role: string, holder: string, ttlMs: number,
@@ -118,7 +121,7 @@ export async function acquireInstanceLease(
         const attempt = await tryAcquireInstanceLease(db, role, holder, ttlMs);
         if (attempt.acquired) return;
         const now = Date.now();
-        // A live holder renews before its ttl runs out; one full ttl past the first sighting settles it.
+        // A live holder refreshes within one ttl. Wait that long before giving up.
         deadline ??= now + ttlMs;
         if (now >= deadline) throw new InstanceLeaseHeldError(attempt.holder, attempt.heartbeatAgeMs);
         opts.onWait?.(attempt.holder, deadline - now);
@@ -126,7 +129,7 @@ export async function acquireInstanceLease(
     }
 }
 
-/** Renews the heartbeat; false when another instance took the role over. */
+/** Refreshes the lease. Returns false when another process has taken it over. */
 export async function renewInstanceLease(db: DbRunner, role: string, holder: string): Promise<boolean> {
     const n = await db.run(UPDATE.entity(InstanceLeases).set({ heartbeatAt: new Date().toISOString() }).where({ role, instanceId: holder }));
     return affected(n) > 0;
@@ -137,8 +140,8 @@ export async function releaseInstanceLease(db: DbRunner, role: string, holder: s
 }
 
 /**
- * Heartbeat every `intervalMs`; `onLost` once when the row no longer names `holder`.
- * A failed write only logs: the next tick retries before the ttl runs out.
+ * Refreshes the lease every `intervalMs`. Calls `onLost` once when another process holds it.
+ * A failed write is only reported. The next tick retries before the lease expires.
  */
 export function startInstanceLeaseHeartbeat(
     db: DbRunner, role: string, holder: string, intervalMs: number,

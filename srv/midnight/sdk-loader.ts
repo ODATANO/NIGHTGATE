@@ -1,15 +1,8 @@
 /**
- * Memoized dynamic-import loader for the Midnight JS SDK.
- *
- * The SDK is pure ESM (terminates at `@midnight-ntwrk/compact-runtime`, no CJS
- * export); NIGHTGATE is CommonJS, so a top-level `import` compiles to `require()`
- * and fails at runtime. Load once via dynamic `import()`, cache the namespaces,
- * reuse. Call sites await `loadMidnightSdk()`; only the first call is async.
- *
- * Scope: the MAIN-thread provider surface only (providers.ts). The wallet
- * worker loads its own SDK set inside the worker thread (wallet-worker.ts),
- * so heavyweight packages the main thread never touches (contracts, facade,
- * wallet sub-wallets) are deliberately NOT part of this bundle.
+ * Loads the Midnight JS SDK once and caches it.
+ * The SDK is ESM only and this project is CommonJS, so a normal import would fail.
+ * A dynamic `import()` works.
+ * This covers only what the main thread needs. The wallet worker loads its own SDK packages.
  */
 
 type MidnightSdkIndexerProvider = any;
@@ -58,8 +51,7 @@ export function resetMidnightSdkCache(): void {
     inflightLedger = undefined;
 }
 
-// ---- ledger-v8 ----
-// Loaded separately because not every code path needs the rest of the SDK.
+// The ledger package is loaded on its own because many callers need only the ledger.
 
 let cachedLedgerV8: LedgerV8 | undefined;
 let inflightLedger: Promise<LedgerV8> | undefined;

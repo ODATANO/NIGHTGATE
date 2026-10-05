@@ -1,10 +1,8 @@
 /**
- * Reading a `LargeBinary` back from CAP.
- *
- * The value arrives as a Buffer, a base64 string or a Readable of bytes
- * depending on the driver and the query, and a stream that is not drained
- * reads as an object rather than failing, which is the trap.
+ * CAP returns a `LargeBinary` as a Buffer, a base64 string or a byte stream, depending on the driver.
+ * A stream that is not drained looks like a plain object instead of failing.
  */
+import type { Readable } from 'node:stream';
 
 export async function readCapBinary(value: unknown): Promise<Buffer | null> {
     if (value == null) return null;
@@ -19,4 +17,9 @@ export async function readCapBinary(value: unknown): Promise<Buffer | null> {
         return Buffer.concat(chunks);
     }
     return null;
+}
+
+/** CAP writes a base64 string into a `LargeBinary`; cds-typer types the column as a stream only. */
+export function capBinaryInput(base64: string): Readable {
+    return base64 as unknown as Readable;
 }

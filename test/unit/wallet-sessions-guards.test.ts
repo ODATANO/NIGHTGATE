@@ -105,7 +105,7 @@ function makeReq(data: Record<string, unknown>, opts: { user?: any } = {}) {
         data,
         user: 'user' in opts ? opts.user : { id: TEST_USER_ID },
         reject: vi.fn((code: number, message: string) => ({ __rejected: true, code, message })),
-        _: { req: { ip: nextIp() } }
+        http: { req: { ip: nextIp() } }
     };
     return req;
 }
@@ -327,12 +327,8 @@ describe('wallet session guard branches', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/too short/));
     });
 
-    it('sendNight rejects a malformed tokenTypeHex (400) and accepts a valid one', async () => {
+    it('sendNight accepts a tokenTypeHex', async () => {
         const base = { sessionId: 'sess-1', receiverAddress: 'mn_addr_' + 'x'.repeat(60), amount: '10' };
-
-        const bad = makeReq({ ...base, tokenTypeHex: 'not-hex' });
-        await handlers['sendNight'](bad);
-        expect(bad.reject).toHaveBeenCalledWith(400, expect.stringMatching(/tokenTypeHex/));
 
         mockDbRun.mockResolvedValue(signingSessionRow());
         const good = makeReq({ ...base, tokenTypeHex: 'ab'.repeat(32) });

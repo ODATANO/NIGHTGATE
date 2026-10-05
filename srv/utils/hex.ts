@@ -1,10 +1,7 @@
 /**
- * Server entry for the one hex codec; the implementation lives in
- * `@odatano/contract-kit`, so browser bundle, txbuilder and server parse hex
- * with the same strictness (optional 0x, even length, hex digits only,
- * lowercase out).
+ * Hex helpers re-exported from `@odatano/contract-kit`.
+ * The browser bundle, the txbuilder and the server use the same code, so they all parse hex the same way.
  */
 export { hexToBytes, hexToBytes32, bytesToHex, normalizeHex } from '@odatano/contract-kit';
 
-/** A normalized 32-byte value (token type, nullifier, hash): 64 lowercase hex characters. */
-export const HEX64_RE = /^[0-9a-f]{64}$/;
+export { HEX64_RE, HEX64_ANY_CASE_RE } from './hex-patterns';

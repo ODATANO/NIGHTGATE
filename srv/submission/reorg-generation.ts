@@ -1,36 +1,36 @@
 /**
- * Rollback counter on SyncState. Indexer lookups run outside the transaction
- * that records them: capture the generation first, lock + compare at write.
+ * A counter on SyncState that goes up with every chain rollback.
+ * Indexer lookups run outside the database transaction that saves their result.
+ * So read the counter before the lookup, then lock and compare it when writing.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 import cds from '@sap/cds';
 import { SyncState } from '#cds-models/midnight';
+import type { DbRunner } from '../utils/db-types';
 
 const { SELECT } = cds.ql;
 
-type Runner = { run: (...args: any[]) => Promise<unknown> };
 
-export async function readReorgGeneration(runner: Runner): Promise<number> {
+export async function readReorgGeneration(runner: DbRunner): Promise<number> {
     const row = await runner.run(SELECT.one.from(SyncState).columns('reorgGeneration').where({ ID: 'SINGLETON' })) as { reorgGeneration?: unknown } | null;
     const n = Number(row?.reorgGeneration ?? 0);
     return Number.isFinite(n) ? n : 0;
 }
 
 /**
- * Take the singleton's row lock (the same-value UPDATE), then read the
- * generation as this transaction sees it. Serialises with a rollback's bump.
+ * Lock the SyncState row, then read the counter. The lock makes this wait for a running rollback.
  */
-export async function lockReorgGeneration(tx: Runner): Promise<number> {
+export async function lockReorgGeneration(tx: DbRunner): Promise<number> {
     await tx.run("UPDATE midnight_SyncState SET reorgGeneration = COALESCE(reorgGeneration, 0) WHERE ID = 'SINGLETON'");
     return readReorgGeneration(tx);
 }
 
 /**
- * Must be the rollback transaction's FIRST write: the lock it takes makes
- * confirmer commits wait, so none can slip old-fork evidence past the cleanup.
+ * Must be the first write of the rollback transaction. Its lock makes confirmations wait,
+ * so none can save data from the abandoned fork after the cleanup.
  */
-export async function bumpReorgGeneration(tx: Runner): Promise<number> {
+export async function bumpReorgGeneration(tx: DbRunner): Promise<number> {
     await tx.run("UPDATE midnight_SyncState SET reorgGeneration = COALESCE(reorgGeneration, 0) + 1 WHERE ID = 'SINGLETON'");
     return readReorgGeneration(tx);
 }

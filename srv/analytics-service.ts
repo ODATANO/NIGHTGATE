@@ -1,7 +1,3 @@
-/**
- * NightgateAnalyticsService: count/average aggregates over indexed data.
- */
-
 import cds from '@sap/cds';
 const { SELECT } = cds.ql;
 

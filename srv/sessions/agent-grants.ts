@@ -1,19 +1,19 @@
 /**
- * Agent grants: a bearer token that only restricts one wallet session, never an
- * identity. A valid token swaps the principal to the grant's operator, so every
- * existing userId gate applies unchanged.
+ * Agent grants: a token that lets an agent use one wallet session with limited rights.
+ * A valid token makes the request run as the user who issued the grant,
+ * so all existing per-user checks still apply.
  */
 
 import { parseJsonStringList } from '../utils/json-list';
 import cds from '@sap/cds';
 import crypto from 'crypto';
-import { AgentGrants, WalletSessions, BackgroundJobs, Transactions, TransactionFees, type WalletSession } from '#cds-models/midnight';
+import { AgentGrants, WalletSessions, BackgroundJobs, Transactions, TransactionFees, type WalletSession, type AgentGrant } from '#cds-models/midnight';
 import { RateLimiter } from '../utils/rate-limiter';
 import { PLATFORM_POOL_SENTINEL } from '../submission/sponsor-pool';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import {
     GrantPolicyInput, validatePolicyList, validateTokenTypeList, grantPolicyConflict, getGlobalSponsorPolicy, MAX_POLICY_ENTRIES,
-    effectiveSponsorPolicy, describeGlobalSponsorPolicy, SponsorPolicyEmptyError, SponsorPolicyUnavailableError
+    effectiveSponsorPolicy, describeGlobalSponsorPolicy, SponsorPolicyEmptyError, SponsorPolicyUnavailableError, type SponsorPolicy
 } from '../submission/sponsor-policy';
 import { withKeyedLock } from '../utils/keyed-lock';
 import { runWithoutAmbientTx } from '../submission/background-jobs';
@@ -24,7 +24,11 @@ import { isSessionExpired } from '../utils/session-expiry';
 import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER, PUBLIC_VERIFY_TRANSPORT_USER } from '../utils/agent-token-transport';
 import { principalRateKey } from '../utils/rate-limiter';
 import type { DbRunner } from '../utils/db-types';
-import type { NightgateRequest } from '../utils/request-types';
+import { errorMessage } from '../utils/errors';
+import { HEX64_RE } from '../utils/hex-patterns';
+import { createAgentGrant, createAgentGrants, getGrantUsage, revokeAgentGrant, rotateAgentGrantToken, updateAgentGrant } from '#cds-models/NightgateService';
+import type { getSponsorPolicy } from '#cds-models/NightgateAdminService';
+import type { Request } from '@sap/cds';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -33,10 +37,9 @@ const log = cds.log('nightgate:agent-grants');
 export { AGENT_TOKEN_HEADER };
 const TOKEN_PREFIX = 'ngat_';
 const TOKEN_BYTES = 32;
-/** Upper bound of `createAgentGrants(count)`: one call, one shape, this many tokens. */
 const MAX_GRANTS_PER_CALL = 50;
 
-/** Write actions a grant may allow; anything else not always-allowed is a 403 for a token. */
+/** Write actions a grant may allow. A token gets 403 for any other action that is not always allowed. */
 export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     'anchorDocument',
     'attestAgentOutput',
@@ -49,8 +52,8 @@ export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     'grantDisclosure',
     'revokeDisclosure',
     'reindexDisclosures',
-    // The transaction arrives proven and signed: the grant spends only the
-    // sponsor's dust, which sponsor pinning and the daily budget meter.
+    // The transaction arrives proven and signed. The grant only spends the sponsor's dust,
+    // which is limited by the fixed sponsor and the daily budget.
     'sponsorFinalizedTransaction',
     'sponsorUnboundTransaction',
     'sponsorSwap',
@@ -61,24 +64,23 @@ export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     'mintFactoryToken'
 ];
 
-/** Actions that resolve no sponsor: a platform-pool grant may allow them next to the sponsoring ones. */
+/** Actions that use no sponsor. A grant on the platform sponsor pool may allow them as well. */
 const POOL_NEUTRAL_ACTIONS: ReadonlySet<string> = new Set(['postSwapOffer', 'retireSwapOffer']);
 
-/** The sponsoring actions that take one caller transaction, which may be a deploy. */
 const SPONSOR_TRANSACTION_ACTIONS: ReadonlySet<string> = new Set([
     'sponsorFinalizedTransaction',
     'sponsorUnboundTransaction'
 ]);
 
-/** Its presence in a grant's `allowedActions` is the grant's right to have swaps sponsored. */
+/** A grant may have swaps sponsored if `allowedActions` contains this action. */
 export const SPONSOR_SWAP_ACTION = 'sponsorSwap';
 
-/** The phase-2 sponsoring actions: keyed by the SPONSOR session, pool-aware. */
+/** Actions where a sponsor pays for a caller's transaction. Their jobs run under the sponsor session, which may be the platform pool. */
 export const SPONSOR_PHASE2_ACTIONS: ReadonlySet<string> = new Set([...SPONSOR_TRANSACTION_ACTIONS, SPONSOR_SWAP_ACTION]);
 
 /**
- * Entities a token may READ; session-bound ones are narrowed in enforceAgentGrant.
- * Any other owner-scoped listing would expose the operator's other sessions.
+ * Entities a token may read. Session-specific ones are filtered to the grant's session in enforceAgentGrant.
+ * Other per-user lists are excluded, because they would show the issuer's other sessions.
  */
 export const AGENT_READABLE_ENTITIES: ReadonlySet<string> = new Set([
     'Blocks', 'Transactions', 'TransactionResults', 'TransactionSegments', 'TransactionFees',
@@ -87,78 +89,52 @@ export const AGENT_READABLE_ENTITIES: ReadonlySet<string> = new Set([
     'WalletSessions', 'PendingSubmissions', 'AgentGrants', 'Documents'
 ]);
 
-/** Events every valid token may use without an allowlist entry or budget. */
+/** Events any valid token may use without listing them in the grant and without using its budget. */
 export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'READ',
     'verifyDocument',
     'verifyAttestationState',
     'verifyPredicateState',
     'verifyPredicateAttestation',
-    'prepareDocumentProof', // compute-only
-    'prepareMembershipSet', // compute-only
-    'deriveTokenType', // compute-only
-    'listSwapOffers', // the board is public to every token
+    'prepareDocumentProof', // only computes, writes nothing
+    'prepareMembershipSet', // only computes, writes nothing
+    'deriveTokenType', // only computes, writes nothing
+    'listSwapOffers', // the offer list is public to every token
     'getSwapOffer',
-    'claimDisclosure', // proves a holding with a secret; no wallet, no grant scope
+    'claimDisclosure', // the caller proves ownership with a secret, no wallet involved
     'getJobStatus',
-    'getGrantUsage', // narrowed to the token's own grant in enforceAgentGrant
-    // Bound read functions of the indexer entities: the rows `READ` already
-    // admits, but a bound function arrives as its own event and is not grantable.
+    'getGrantUsage', // limited to the token's own grant in enforceAgentGrant
+    // Read functions bound to indexer entities. They return rows that `READ` already allows,
+    // but CAP reports each one as its own event.
     'latest', 'byHeight', 'range',          // Blocks
     'byHash', 'byType',                     // Transactions
     'byAddress', 'history',                 // ContractActions
     'stateAt',                              // ContractStates
     'byOwner', 'unspent',                   // UnshieldedUtxos
     'getBalance', 'getTopHolders',          // NightBalances
-    // Not getSponsorPoolStatus: as the operator, a token would read every
-    // sponsor session that operator owns.
+    // getSponsorPoolStatus is excluded. Running as the issuer, a token would see
+    // all sponsor sessions of that user.
 ]);
 
-// Grant administration (create, update, rotate, revoke) per hour per principal.
 const grantAdminRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: configNumber('NIGHTGATE_GRANT_ADMIN_RATE_LIMIT') });
 
-/** Forget every rate-limit window (tests: one principal serves every case). */
 export function __resetGrantRateLimiterForTests(): void {
     grantAdminRateLimiter.reset();
 }
 
-interface AgentGrantRow {
-    ID: string;
-    userId: string;
-    sessionId: string;
-    allowedActions: string;
-    maxJobsPerDay?: number | null;
-    jobsUsedToday?: number | null;
-    budgetWindow?: string | null;
-    sponsorSessionId?: string | null;
-    allowedContracts?: string | null; // JSON array or null
-    allowedCircuits?: string | null;
-    allowDeploy?: boolean | null;
-    maxDeploys?: number | null;
-    deploysUsed?: number | null;
-    deployedContracts?: string | null; // JSON array: addresses deployed under this grant
-    allowedTokenTypes?: string | null; // JSON array of raw token types, or null
-    mintedTokenTypes?: string | null; // JSON array: raw token types minted under this grant
-    validUntil?: string | null;
-    isActive?: boolean;
-    revokedAt?: string | null;
-}
-
-/** Anything that runs a CQL statement: the db service, or one transaction of it. */
-type Runner = { run: (q: unknown) => Promise<unknown> };
 
 /**
- * Record addresses deployed under a grant; the sponsor policy adds them on top of
- * `floor ∩ grant` (in `allowedContracts` they would fall out of the intersection).
+ * Records contracts deployed under a grant. The sponsor policy allows calls to them
+ * in addition to the contracts both the platform and the grant allow.
  */
-export async function recordDeployedContracts(db: Runner, grantId: string, addresses: string[]): Promise<void> {
+export async function recordDeployedContracts(db: DbRunner, grantId: string, addresses: string[]): Promise<void> {
     const fresh = addresses.map(a => String(a).trim()).filter(Boolean);
     if (!grantId || fresh.length === 0) return;
     await withKeyedLock(`agent-grant-deploys:${grantId}`, async () => {
         try {
-            const grant: AgentGrantRow | null = await runWithoutAmbientTx(() => db.run(
+            const grant: AgentGrant | null = await runWithoutAmbientTx(() => db.run(
                 SELECT.one.from(AgentGrants).where({ ID: grantId })
-            )) as AgentGrantRow | null;
+            )) as AgentGrant | null;
             if (!grant) return;
             const current = parseGrantList(grant.deployedContracts);
             const merged = [...current];
@@ -169,21 +145,21 @@ export async function recordDeployedContracts(db: Runner, grantId: string, addre
             ));
             log.info(`agent grant ${grantId.slice(0, 8)}… now sponsors ${fresh.map(a => a.slice(0, 12)).join(', ')} (deployed under it; ${grant.deploysUsed ?? 0}/${grant.maxDeploys ?? 1} deploys used)`);
         } catch (err) {
-            log.error(`could not record deployed contract(s) ${fresh.map(a => a.slice(0, 12)).join(', ')} on grant ${grantId.slice(0, 8)}…: ${(err as Error)?.message ?? err}`);
+            log.error(`could not record deployed contract(s) ${fresh.map(a => a.slice(0, 12)).join(', ')} on grant ${grantId.slice(0, 8)}…: ${errorMessage(err)}`);
             throw err;
         }
     });
 }
 
-/** Record token types minted under a grant; the sponsor policy counts them as listed for it. */
-export async function recordMintedTokenTypes(db: Runner, grantId: string, types: string[]): Promise<void> {
-    const fresh = [...new Set(types.map(t => String(t).trim().toLowerCase()).filter(t => /^[0-9a-f]{64}$/.test(t)))];
+/** Records token types minted under a grant. The sponsor policy treats them as allowed for this grant. */
+export async function recordMintedTokenTypes(db: DbRunner, grantId: string, types: string[]): Promise<void> {
+    const fresh = [...new Set(types.map(t => String(t).trim().toLowerCase()).filter(t => HEX64_RE.test(t)))];
     if (!grantId || fresh.length === 0) return;
     await withKeyedLock(`agent-grant-mints:${grantId}`, async () => {
         try {
-            const grant: AgentGrantRow | null = await runWithoutAmbientTx(() => db.run(
+            const grant: AgentGrant | null = await runWithoutAmbientTx(() => db.run(
                 SELECT.one.from(AgentGrants).where({ ID: grantId })
-            )) as AgentGrantRow | null;
+            )) as AgentGrant | null;
             if (!grant) return;
             const current = parseGrantList(grant.mintedTokenTypes);
             const added = fresh.filter(t => !current.includes(t));
@@ -197,19 +173,19 @@ export async function recordMintedTokenTypes(db: Runner, grantId: string, types:
             ));
             log.info(`agent grant ${grantId.slice(0, 8)}… minted token type(s) ${added.map(t => t.slice(0, 12)).join(', ')}`);
         } catch (err) {
-            // The mint is on chain; a type that was not recorded is recorded by the next mint of it.
-            log.error(`could not record minted token type(s) ${fresh.map(t => t.slice(0, 12)).join(', ')} on grant ${grantId.slice(0, 8)}…: ${(err as Error)?.message ?? err}`);
+            // The mint is already on chain. A type missed here is recorded on its next mint.
+            log.error(`could not record minted token type(s) ${fresh.map(t => t.slice(0, 12)).join(', ')} on grant ${grantId.slice(0, 8)}…: ${errorMessage(err)}`);
         }
     });
 }
 
 /**
- * Reserve deploys of the grant's lifetime budget before the broadcast, all or
- * nothing. Run it in the transaction that inserts the attempt row.
+ * Reserves deploys from the grant's total deploy budget before sending. All or nothing.
+ * Run it in the same database transaction that inserts the submission attempt row.
  */
-export async function reserveDeployBudget(runner: Runner, grantId: string, count: number): Promise<boolean> {
+export async function reserveDeployBudget(runner: DbRunner, grantId: string, count: number): Promise<boolean> {
     if (!grantId || !Number.isInteger(count) || count < 1) return false;
-    const grant = await runner.run(SELECT.one.from(AgentGrants).where({ ID: grantId })) as AgentGrantRow | null;
+    const grant = await runner.run(SELECT.one.from(AgentGrants).where({ ID: grantId })) as AgentGrant | null;
     if (!grant || grant.isActive === false || grant.allowDeploy !== true) return false;
     const max = grant.maxDeploys ?? 1;
     const updated = await runner.run(
@@ -220,8 +196,8 @@ export async function reserveDeployBudget(runner: Runner, grantId: string, count
     return Number(updated) > 0;
 }
 
-/** Refund a reservation whose attempt was rejected; an ambiguous broadcast keeps it. */
-export async function releaseDeployBudget(db: Runner, grantId: string, count: number): Promise<void> {
+/** Gives back a reservation whose transaction was rejected. Keep it if the transaction may still land. */
+export async function releaseDeployBudget(db: DbRunner, grantId: string, count: number): Promise<void> {
     if (!grantId || !Number.isInteger(count) || count < 1) return;
     try {
         await runWithoutAmbientTx(() => db.run(
@@ -230,16 +206,16 @@ export async function releaseDeployBudget(db: Runner, grantId: string, count: nu
                 .where({ ID: grantId, deploysUsed: { '>=': count } })
         ));
     } catch (err) {
-        log.error(`could not release ${count} reserved deploy(s) on grant ${grantId.slice(0, 8)}…; deploysUsed is now one too high, correct it by hand: ${(err as Error)?.message ?? err}`);
+        log.error(`could not release ${count} reserved deploy(s) on grant ${grantId.slice(0, 8)}…; deploysUsed is now one too high, correct it by hand: ${errorMessage(err)}`);
         throw err;
     }
 }
 
 /**
- * The grant's current policy, re-resolved per job so a revoke or narrowing
- * applies to queued jobs too. null = revoked, expired or gone.
+ * Reads the grant's current policy for each job, so a revoke or a narrower grant also hits queued jobs.
+ * Returns null if the grant is revoked, expired or deleted.
  */
-export async function currentGrantPolicy(runner: Runner, grantId: string): Promise<GrantPolicyInput | null> {
+export async function currentGrantPolicy(runner: DbRunner, grantId: string): Promise<GrantPolicyInput | null> {
     const grant = await currentGrantRow(runner, grantId);
     if (!grant) return null;
     return {
@@ -253,21 +229,19 @@ export async function currentGrantPolicy(runner: Runner, grantId: string): Promi
     };
 }
 
-/** The grant as it is now, for a re-check when a queued job runs; null = revoked, expired or gone. */
-export async function currentGrantRow(runner: Runner, grantId: string): Promise<AgentGrantRow | null> {
-    const grant = await runner.run(SELECT.one.from(AgentGrants).where({ ID: grantId })) as AgentGrantRow | null;
+export async function currentGrantRow(runner: DbRunner, grantId: string): Promise<AgentGrant | null> {
+    const grant = await runner.run(SELECT.one.from(AgentGrants).where({ ID: grantId })) as AgentGrant | null;
     if (!grant || grant.isActive === false || grant.revokedAt || grantExpired(grant)) return null;
     return grant;
 }
 
-/** The action(s) a job of this kind was admitted as; a retract command carries its mode. */
 function actionsOfJob(kind: string, command: Record<string, unknown>): string[] {
     if (kind === 'retract') return command.mode === 1 ? ['purgeExpired'] : ['retractAttestation'];
     if (kind === 'anchorDocument') return ['anchorDocument', 'attestAgentOutput'];
     return [kind];
 }
 
-/** Circuits a persisted command runs when its op does not spell them out. */
+/** Circuits a stored command runs when the command does not list them itself. */
 const OP_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
     fieldPredicateWorkflow: ['anchorContentRoot', 'proveFieldPredicate'],
     fieldEqualityWorkflow: ['anchorContentRoot', 'proveFieldEquality'],
@@ -283,21 +257,19 @@ const OP_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
 };
 
 /**
- * Re-check of a queued job against the grant as it is NOW: the action the job
- * was admitted as (a child: its parent's kind, `parentKind`), then the contract
- * and every circuit the persisted command runs. null = still within scope.
+ * Checks a queued job against the grant as it is now. A child job is checked by its parent's kind.
+ * Returns null if the job is still allowed, else the reason.
  */
 export function grantJobScopeViolation(
-    grant: Pick<AgentGrantRow, 'allowedActions' | 'allowedContracts' | 'allowedCircuits'>,
+    grant: Pick<AgentGrant, 'allowedActions' | 'allowedContracts' | 'allowedCircuits'>,
     job: { kind: string; parentJobId?: string | null; parentKind?: string | null },
     command: Record<string, unknown>
 ): string | null {
     const admittedKind = job.parentJobId ? job.parentKind : job.kind;
     if (!admittedKind) return 'the action the parent job was admitted as is unknown';
-    let allowed: unknown = [];
-    try { allowed = JSON.parse(grant.allowedActions || '[]'); } catch { allowed = []; }
+    const allowed = parseJsonStringList(grant.allowedActions);
     const actions = actionsOfJob(admittedKind, job.parentJobId ? {} : command);
-    if (!Array.isArray(allowed) || !actions.some(a => allowed.includes(a))) {
+    if (!actions.some(a => allowed.includes(a))) {
         return `action '${actions[0]}' is no longer allowed for this agent grant`;
     }
     const op = String(command.op ?? '');
@@ -308,16 +280,15 @@ export function grantJobScopeViolation(
     return grantScopeViolation(grant, data, op);
 }
 
-/** A grant's JSON list column as an array; malformed or absent = no narrowing. */
+/** Parses a grant's JSON list column. A missing or broken value gives an empty list, which means no limit. */
 const parseGrantList = parseJsonStringList;
 
-function grantExpired(grant: Pick<AgentGrantRow, 'validUntil'>, now: Date = new Date()): boolean {
+function grantExpired(grant: Pick<AgentGrant, 'validUntil'>, now: Date = new Date()): boolean {
     return !!grant.validUntil && new Date(grant.validUntil) < now;
 }
 
-/** The 403 message when the request's contract or circuits leave the grant's lists, else null. */
 export function grantScopeViolation(
-    grant: Pick<AgentGrantRow, 'allowedContracts' | 'allowedCircuits'>,
+    grant: Pick<AgentGrant, 'allowedContracts' | 'allowedCircuits'>,
     data: unknown,
     event?: string
 ): string | null {
@@ -342,8 +313,8 @@ export function grantScopeViolation(
 }
 
 /**
- * Circuits an action may run server-side; a grant's circuit list must allow all
- * of them. An action resolving to nothing known is refused under a circuit list.
+ * Circuits each action may run on the server. A grant with a circuit list must allow all of them.
+ * If the circuits of a request cannot be determined, a grant with a circuit list refuses it.
  */
 const ACTION_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
     issueFieldPredicateAttestation: ['anchorContentRoot', 'proveFieldPredicate'],
@@ -392,7 +363,7 @@ export function hashAgentToken(token: string): string {
     return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-function requireUserId(req: NightgateRequest): string | undefined {
+function requireUserId(req: Request): string | undefined {
     const uid = req.user?.id;
     if (!uid) { req.reject?.(401, 'authentication required'); return undefined; }
     return uid as string;
@@ -402,9 +373,6 @@ function utcDay(now: Date = new Date()): string {
     return now.toISOString().slice(0, 10);
 }
 
-// ---- Grant administration -------------------------------------------------
-
-/** The editable grant fields, as a client sends them. */
 interface GrantShapeInput {
     allowedActions?: string[] | null;
     maxJobsPerDay?: number | null;
@@ -417,7 +385,7 @@ interface GrantShapeInput {
     allowedTokenTypes?: string[] | null;
 }
 
-/** Validated values, ready for the row: lists are arrays (empty = unrestricted). */
+/** Validated values, ready to store. An empty list means no limit. */
 interface GrantShapeValues {
     allowedActions?: string[];
     maxJobsPerDay?: number | null;
@@ -431,12 +399,12 @@ interface GrantShapeValues {
 }
 
 /**
- * Validation of the editable fields for create and update. On update a field
- * absent from the input keeps `existing`'s value; explicit null clears it.
+ * Validates the editable fields for create and update. On update, a missing field
+ * keeps its value from `existing`, and an explicit null clears it.
  */
 export function validateGrantShape(
     input: GrantShapeInput,
-    existing?: AgentGrantRow
+    existing?: AgentGrant
 ): { ok: true; values: GrantShapeValues } | { ok: false; message: string } {
     const has = (k: keyof GrantShapeInput) => Object.prototype.hasOwnProperty.call(input, k);
     const fail = (message: string) => ({ ok: false as const, message });
@@ -453,8 +421,8 @@ export function validateGrantShape(
     }
     const effectiveActions: string[] = actions ?? parseGrantList(existing?.allowedActions);
 
-    // A deploy is a distinct right with its own budget, never implied by the
-    // action list; only the sponsoring actions can carry one.
+    // Deploying is a separate right with its own budget, not implied by the action list.
+    // Only a grant with a sponsoring action can have it.
     const allowDeploy = has('allowDeploy') || !existing ? input.allowDeploy === true : existing.allowDeploy === true;
     if (allowDeploy && !effectiveActions.some(a => SPONSOR_TRANSACTION_ACTIONS.has(a))) {
         return fail("allowDeploy needs 'sponsorFinalizedTransaction' or 'sponsorUnboundTransaction' in allowedActions: a deploy is sponsored, never run by the server wallet");
@@ -473,7 +441,7 @@ export function validateGrantShape(
         return fail('maxDeploys needs allowDeploy: true');
     }
 
-    // Same rule as the policy file: the effective policy is floor ∩ grant.
+    // Same rule as the policy file: only what both the platform policy and the grant allow is allowed.
     let allowedContracts: string[];
     let allowedCircuits: string[];
     let allowedTokenTypes: string[];
@@ -516,10 +484,10 @@ export function validateGrantShape(
     return { ok: true, values };
 }
 
-/** Row fields a grant edit never touches; a different pin is a different grant. */
+/** Fields an update may not change. Changing them needs a new grant. */
 const GRANT_IMMUTABLE_FIELDS = ['sessionId', 'sponsorSessionId', 'userId', 'tokenHash'] as const;
 
-/** ISO timestamp or undefined; `null` when the value does not parse. */
+/** Returns an ISO timestamp, undefined for an empty value, or null if it does not parse. */
 function parseTimestamp(raw: unknown): string | null | undefined {
     if (raw === undefined || raw === null || raw === '') return undefined;
     const t = new Date(String(raw));
@@ -527,8 +495,8 @@ function parseTimestamp(raw: unknown): string | null | undefined {
 }
 
 /**
- * The reject for lists the platform policy leaves nothing of, or null. A grant
- * without lists of its own inherits the platform's and needs no policy to be written.
+ * Returns a reject if the platform policy allows nothing from the grant's lists, else null.
+ * A grant without own lists uses the platform's, so it is not checked here.
  */
 function policyReject(values: GrantShapeValues, deployedContracts: string[] = []): { status: number; code?: string; message: string } | null {
     if (!values.allowedContracts.length && !values.allowedCircuits.length && !values.allowedTokenTypes.length) return null;
@@ -558,16 +526,38 @@ export interface GrantSponsorPolicyView {
     deploysUsed: number;
 }
 
-/** The platform policy, and with a grant what is left of it for that grant. */
-export async function describeSponsorPolicy(db: DbRunner, grantId?: string | null): Promise<Record<string, unknown> | null> {
+type SponsorPolicyDescription = NonNullable<Awaited<ReturnType<typeof getSponsorPolicy>>>;
+
+/** A policy as the admin API shows it. An unset list means an empty one. */
+function policyView(p: SponsorPolicy): NonNullable<SponsorPolicyDescription['effective']> {
+    return {
+        allowedContracts: p.allowedContracts,
+        allowedCircuits: p.allowedCircuits,
+        allowedTokenTypes: p.allowedTokenTypes ?? [],
+        ownContracts: p.ownContracts ?? [],
+        ownTokenTypes: p.ownTokenTypes ?? [],
+        allowDeploy: p.allowDeploy ?? null,
+        allowContractMints: p.allowContractMints ?? null,
+        allowSwaps: p.allowSwaps ?? null
+    };
+}
+
+function floorView(p: SponsorPolicy): NonNullable<SponsorPolicyDescription['floor']> {
+    const { ownContracts: _own, ownTokenTypes: _ownTypes, ...floor } = policyView(p);
+    return floor;
+}
+
+export async function describeSponsorPolicy(db: DbRunner, grantId?: string | null): Promise<SponsorPolicyDescription | null> {
     const platform = describeGlobalSponsorPolicy();
-    const out: Record<string, unknown> = { ...platform, grant: null, effective: null, effectiveError: null };
+    const out: SponsorPolicyDescription = {
+        ...platform, floor: platform.floor ? floorView(platform.floor) : null, grant: null, effective: null, effectiveError: null
+    };
     if (!grantId) {
-        out.effective = platform.floor ? effectiveSponsorPolicy(platform.floor) : null;
+        out.effective = platform.floor ? policyView(effectiveSponsorPolicy(platform.floor)) : null;
         out.effectiveError = platform.floorError;
         return out;
     }
-    const row = await runWithoutAmbientTx(() => db.run(SELECT.one.from(AgentGrants).where({ ID: grantId }))) as AgentGrantRow | null;
+    const row = await runWithoutAmbientTx(() => db.run(SELECT.one.from(AgentGrants).where({ ID: grantId }))) as AgentGrant | null;
     if (!row) return null;
     const active = row.isActive !== false && !row.revokedAt && !grantExpired(row);
     const grant: GrantSponsorPolicyView = {
@@ -588,9 +578,9 @@ export async function describeSponsorPolicy(db: DbRunner, grantId?: string | nul
     else if (!platform.floor) out.effectiveError = platform.floorError;
     else {
         try {
-            out.effective = effectiveSponsorPolicy(platform.floor, {
+            out.effective = policyView(effectiveSponsorPolicy(platform.floor, {
                 ...grant, allowDeploy: grant.allowDeploy && grant.deploysUsed < (grant.maxDeploys ?? 1)
-            });
+            }));
         } catch (e) {
             if (!(e instanceof SponsorPolicyEmptyError)) throw e;
             out.effectiveError = e.message;
@@ -602,10 +592,10 @@ export async function describeSponsorPolicy(db: DbRunner, grantId?: string | nul
 const USAGE_WINDOW_MAX_MS = 366 * 24 * 60 * 60 * 1000;
 const USAGE_WINDOW_DEFAULT_MS = 30 * 24 * 60 * 60 * 1000;
 
-export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
+export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRunner): void {
     interface GrantCreationInput {
-        sessionId?: string;
-        allowedActions?: string[];
+        sessionId?: string | null;
+        allowedActions?: string[] | null;
         maxJobsPerDay?: number | null;
         sponsorSessionId?: string | null;
         validUntil?: string | null;
@@ -618,10 +608,10 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
     }
 
     /**
-     * Everything a grant creation checks before it writes: shape, policy, the
-     * session and the sponsor. Rejects the request itself and returns undefined.
+     * Runs all checks before a grant is created.
+     * On failure it rejects the request and returns undefined.
      */
-    async function prepareGrantCreation(req: NightgateRequest, data: GrantCreationInput, userId: string): Promise<{ values: GrantShapeValues; actions: string[] } | undefined> {
+    async function prepareGrantCreation(req: Request, data: GrantCreationInput, userId: string): Promise<{ values: GrantShapeValues; actions: string[]; sessionId: string } | undefined> {
         if (!data.sessionId) { req.reject(400, 'sessionId is required'); return undefined; }
         const shape = validateGrantShape(data);
         if (!shape.ok) { req.reject(400, shape.message); return undefined; }
@@ -635,10 +625,9 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         if (!session) { req.reject(404, 'Session not found or inactive'); return undefined; }
         if (isSessionExpired(data.sessionId, session.expiresAt)) { req.reject(410, 'Session expired'); return undefined; }
 
-        // Validate the sponsor at creation: it is injected into every write of
-        // the grant, and a dead one would fail only after budget was spent.
-        // The per-use resolution still runs. Only the sponsoring actions
-        // understand the pool sentinel.
+        // Check the sponsor now. It is used on every write of the grant, and a broken one
+        // would only fail after budget was spent. It is checked again on each use.
+        // Only the sponsoring actions can use the platform pool.
         if (data.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
             const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
             if (pool.length === 0) {
@@ -668,17 +657,17 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
                 throw err;
             }
         }
-        return { values: shape.values, actions };
+        return { values: shape.values, actions, sessionId: data.sessionId };
     }
 
-    function newGrantRow(userId: string, data: GrantCreationInput, values: GrantShapeValues, actions: string[], agentLabel: string | null) {
+    function newGrantRow(userId: string, sessionId: string, data: GrantCreationInput, values: GrantShapeValues, actions: string[], agentLabel: string | null) {
         const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes } = values;
         const token = TOKEN_PREFIX + crypto.randomBytes(TOKEN_BYTES).toString('hex');
         const grant = {
             ID: cds.utils.uuid(),
             userId,
             agentLabel,
-            sessionId: data.sessionId,
+            sessionId,
             tokenHash: hashAgentToken(token),
             allowedActions: JSON.stringify(actions),
             maxJobsPerDay: data.maxJobsPerDay ?? null,
@@ -711,29 +700,27 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         return { allowedActions: actions, allowedContracts, allowedCircuits, allowDeploy, maxDeploys, allowedTokenTypes, validUntil };
     }
 
-    srv.on('createAgentGrant', async (req: NightgateRequest) => {
+    srv.on(createAgentGrant, async (req) => {
         if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const data = req.data as GrantCreationInput;
+        const data = req.data;
         const prepared = await prepareGrantCreation(req, data, userId);
         if (!prepared) return;
-        const { values, actions } = prepared;
+        const { values, actions, sessionId } = prepared;
 
-        const { grant, token } = newGrantRow(userId, data, values, actions, data.agentLabel ?? null);
+        const { grant, token } = newGrantRow(userId, sessionId, data, values, actions, data.agentLabel ?? null);
         await db.run(INSERT.into(AgentGrants).entries(grant));
         log.info(`agent grant ${grant.ID} created for session ${String(data.sessionId).slice(0, 8)}… (${describeGrantCreation(values, actions, grant.maxJobsPerDay)})`);
 
         return { grantId: grant.ID, token, ...grantShapeView(values, actions, grant.validUntil) };
     });
 
-    // One shape, N grants: a population of agents on one session, each with a
-    // token and label of its own.
-    srv.on('createAgentGrants', async (req: NightgateRequest) => {
+    srv.on(createAgentGrants, async (req) => {
         if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const data = req.data as GrantCreationInput & { count?: number; labels?: string[] | null };
+        const data = req.data;
         const count = Number(data.count);
         if (!Number.isInteger(count) || count < 1 || count > MAX_GRANTS_PER_CALL) {
             return req.reject(400, `count must be an integer from 1 to ${MAX_GRANTS_PER_CALL}`);
@@ -751,9 +738,9 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         }
         const prepared = await prepareGrantCreation(req, data, userId);
         if (!prepared) return;
-        const { values, actions } = prepared;
+        const { values, actions, sessionId } = prepared;
 
-        const rows = labels.map(label => newGrantRow(userId, data, values, actions, label));
+        const rows = labels.map(label => newGrantRow(userId, sessionId, data, values, actions, label));
         await db.run(INSERT.into(AgentGrants).entries(rows.map(r => r.grant)));
         log.info(`${rows.length} agent grants created for session ${String(data.sessionId).slice(0, 8)}… (${describeGrantCreation(values, actions, data.maxJobsPerDay)})`);
 
@@ -763,11 +750,11 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         };
     });
 
-    srv.on('revokeAgentGrant', async (req: NightgateRequest) => {
+    srv.on(revokeAgentGrant, async (req) => {
         if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const { grantId } = req.data as { grantId?: string };
+        const { grantId } = req.data;
         if (!grantId) return req.reject(400, 'grantId is required');
 
         const affected = await db.run(
@@ -780,11 +767,11 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         return { revoked: true };
     });
 
-    srv.on('updateAgentGrant', async (req: NightgateRequest) => {
+    srv.on(updateAgentGrant, async (req) => {
         if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const data = req.data as GrantShapeInput & { grantId?: string } & Record<string, unknown>;
+        const data = req.data;
         if (!data.grantId) return req.reject(400, 'grantId is required');
         const immutable = GRANT_IMMUTABLE_FIELDS.filter(f => Object.prototype.hasOwnProperty.call(data, f));
         if (immutable.length > 0) {
@@ -813,7 +800,7 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         if ('agentLabel' in v) patch.agentLabel = v.agentLabel;
         const updated = Object.keys(data).filter(k => k !== 'grantId');
 
-        // Conditional on isActive: a concurrent revoke wins over the edit.
+        // Only updates active grants, so a revoke at the same time wins over the edit.
         const affected = await db.run(
             UPDATE.entity(AgentGrants).set(patch).where({ ID: data.grantId, userId, isActive: true })
         );
@@ -822,11 +809,11 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         return { grantId: data.grantId, updated };
     });
 
-    srv.on('rotateAgentGrantToken', async (req: NightgateRequest) => {
+    srv.on(rotateAgentGrantToken, async (req) => {
         if (!checkGrantAdminRate(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const { grantId } = req.data as { grantId?: string };
+        const { grantId } = req.data;
         if (!grantId) return req.reject(400, 'grantId is required');
 
         const token = TOKEN_PREFIX + crypto.randomBytes(TOKEN_BYTES).toString('hex');
@@ -840,10 +827,10 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         return { grantId, token };
     });
 
-    srv.on('getGrantUsage', async (req: NightgateRequest) => {
+    srv.on(getGrantUsage, async (req) => {
         const userId = requireUserId(req);
         if (!userId) return;
-        const data = req.data as { grantId?: string; since?: string; until?: string };
+        const data = req.data;
         if (!data.grantId) return req.reject(400, 'grantId is required');
         const to = parseTimestamp(data.until);
         const from = parseTimestamp(data.since);
@@ -856,10 +843,10 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         const fromIso = new Date(fromMs).toISOString();
         const toIso = new Date(toMs).toISOString();
 
-        // Revoked grants keep their history: the lookup is owner-scoped only.
-        const grant: AgentGrantRow | null = await runWithoutAmbientTx(() => db.run(
+        // Revoked grants still show their history, so this only checks the owner.
+        const grant: AgentGrant | null = await runWithoutAmbientTx(() => db.run(
             SELECT.one.from(AgentGrants).where({ ID: data.grantId, userId })
-        )) as AgentGrantRow | null;
+        )) as AgentGrant | null;
         if (!grant) return req.reject(404, 'Grant not found');
 
         const rows = (await runWithoutAmbientTx(() => db.run(
@@ -888,7 +875,7 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
         }
         const jobs = [...counts.values()].sort((a, b) => a.kind.localeCompare(b.kind) || a.status.localeCompare(b.status));
 
-        // Fees are known only where the crawler indexed the transactions.
+        // Fees are only known for transactions the crawler has indexed.
         const crawlerOn = (resolveNightgateRuntimeConfig(getNightgatePluginConfig()).crawlerConfig as any)?.enabled !== false;
         const dustPaid = crawlerOn ? await sumIndexedFees(db, landedHashes) : null;
 
@@ -908,22 +895,21 @@ export function registerAgentGrantHandlers(srv: any, db: DbRunner): void {
     });
 }
 
-function checkGrantAdminRate(req: NightgateRequest): boolean {
+function checkGrantAdminRate(req: Request): boolean {
     const rate = grantAdminRateLimiter.check(principalRateKey(req, 'grant-admin'));
     if (rate.allowed) return true;
     req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
     return false;
 }
 
-/** The caller's own grant, active or revoked; null for a foreign or unknown id. */
-async function loadOwnGrant(db: Runner, grantId: string, userId: string): Promise<AgentGrantRow | null> {
+async function loadOwnGrant(db: DbRunner, grantId: string, userId: string): Promise<AgentGrant | null> {
     return await runWithoutAmbientTx(() => db.run(
         SELECT.one.from(AgentGrants).where({ ID: grantId, userId })
-    )) as AgentGrantRow | null;
+    )) as AgentGrant | null;
 }
 
 /** Sum of the indexed fees (DUST atoms) of the given job `txHash`es, as a decimal string. */
-async function sumIndexedFees(db: Runner, hashes: string[]): Promise<string> {
+async function sumIndexedFees(db: DbRunner, hashes: string[]): Promise<string> {
     let total = 0n;
     for (let i = 0; i < hashes.length; i += 500) {
         const chunk = hashes.slice(i, i + 500);
@@ -943,13 +929,11 @@ async function sumIndexedFees(db: Runner, hashes: string[]): Promise<string> {
     return total.toString();
 }
 
-// ---- Enforcement ----------------------------------------------------------
-
-/** The token-enforcement before-hook; register it first in the service init. */
+/** Registers the hook that checks agent tokens. Register it first in the service init. */
 export function attachAgentGrantEnforcement(srv: any, db: DbRunner): void {
-    srv.before('*', (req: NightgateRequest) => {
-        // CAP runs before-handlers in parallel, so the principal swap (after an
-        // awaited lookup) is published for owner-scoping hooks to await.
+    srv.before('*', (req: Request) => {
+        // CAP runs before-handlers in parallel. Other hooks that check the user
+        // must wait for this one to set it, so the promise is stored on the request.
         const resolution = enforceAgentGrant(req, db);
         (req as any)[AGENT_PRINCIPAL_READY] = resolution.then(() => undefined, () => undefined);
         return resolution;
@@ -959,22 +943,24 @@ export function attachAgentGrantEnforcement(srv: any, db: DbRunner): void {
 const AGENT_PRINCIPAL_READY = Symbol.for('nightgate.agentPrincipalReady');
 
 /**
- * Await the effective principal; every before-hook reading `req.user` calls this
- * first, since registration order does not sequence CAP's before-handlers.
+ * Waits until the agent token check has set the request user.
+ * Every before-hook that reads `req.user` must call this first.
  */
-export async function awaitAgentPrincipal(req: NightgateRequest): Promise<void> {
+export async function awaitAgentPrincipal(req: Request): Promise<void> {
     const ready = (req as any)[AGENT_PRINCIPAL_READY];
     if (ready) await ready;
 }
 
-/** Exported for unit tests. */
-export async function enforceAgentGrant(req: NightgateRequest, db: DbRunner): Promise<unknown> {
-    // `req.headers` merges a $batch envelope's headers into each part;
-    // `_.req.headers` alone is only the synthetic part request.
+/** CAP's per-request HTTP context. In a $batch it holds the headers of the single part. */
+type BatchPartRequest = Request & { _?: { req?: { headers?: Record<string, string | string[] | undefined> } } };
+
+export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Promise<unknown> {
+    // In a $batch request, `req.headers` also contains the outer request's headers.
+    // `_.req.headers` only has the headers of the single part.
     const token = req?.headers?.[AGENT_TOKEN_HEADER] ?? req?._?.req?.headers?.[AGENT_TOKEN_HEADER];
     if (!token || typeof token !== 'string') {
-        // Transport markers admitted a request nobody authenticated here; they
-        // must never reach a handler as a user.
+        // These placeholder users mark requests the auth layer let through without a login.
+        // They must never reach a handler as a real user.
         const uid = req?.user?.id;
         if (uid === AGENT_TOKEN_TRANSPORT_USER) {
             return req.reject(401, 'agent token required');
@@ -982,38 +968,36 @@ export async function enforceAgentGrant(req: NightgateRequest, db: DbRunner): Pr
         if (uid === PUBLIC_VERIFY_TRANSPORT_USER) {
             return req.reject(401, 'authentication required');
         }
-        return; // normal principal path
+        return;
     }
 
     if (!token.startsWith(TOKEN_PREFIX)) {
         return req.reject(401, 'invalid agent token');
     }
-    const grant: AgentGrantRow | null = await runWithoutAmbientTx(() => db.run(
+    const grant: AgentGrant | null = await runWithoutAmbientTx(() => db.run(
         SELECT.one.from(AgentGrants).where({ tokenHash: hashAgentToken(token), isActive: true })
-    )) as AgentGrantRow | null;
-    if (!grant) return req.reject(401, 'invalid agent token'); // non-leaking
+    )) as AgentGrant | null;
+    if (!grant) return req.reject(401, 'invalid agent token'); // same message, so it reveals nothing
     if (grantExpired(grant)) {
         return req.reject(410, 'agent grant expired');
     }
 
     const event = String(req.event ?? '');
     const alwaysAllowed = AGENT_ALWAYS_ALLOWED_EVENTS.has(event);
-    // The handler's owner scoping alone would answer for every grant of the operator.
+    // The handler only checks the owner, which would allow every grant of that user.
     if (event === 'getGrantUsage' && String(req.data?.grantId ?? '') !== grant.ID) {
         return req.reject(404, 'Grant not found');
     }
     let allowlisted = false;
     if (!alwaysAllowed) {
-        let allowed: string[] = [];
-        try { allowed = JSON.parse(grant.allowedActions || '[]'); } catch { /* treat as empty */ }
-        allowlisted = Array.isArray(allowed) && allowed.includes(event);
+        allowlisted = parseJsonStringList(grant.allowedActions).includes(event);
         if (!allowlisted) {
             return req.reject(403, `action '${event}' is not allowed for this agent grant`);
         }
     }
 
-    // A grant covers one session: user-scoped listings must not widen to the
-    // whole operator. The owner-scoping hooks AND their userId filter on top.
+    // A grant covers one session, so lists must not show the user's other sessions.
+    // The owner hooks add their userId filter on top of this one.
     if (event === 'READ') {
         const target = String(req.target?.name ?? '');
         const entity = target.slice(target.lastIndexOf('.') + 1);
@@ -1030,7 +1014,7 @@ export async function enforceAgentGrant(req: NightgateRequest, db: DbRunner): Pr
         }
     }
 
-    // The sponsoring actions are checked on the transaction's shape in the worker.
+    // Sponsoring actions are checked by the worker, which inspects the transaction itself.
     if (allowlisted && !SPONSOR_PHASE2_ACTIONS.has(event)) {
         const scope = grantScopeViolation(grant, req.data, event);
         if (scope) return req.reject(403, scope);
@@ -1038,14 +1022,14 @@ export async function enforceAgentGrant(req: NightgateRequest, db: DbRunner): Pr
 
     const data = req.data;
     if (data && typeof data === 'object' && event !== 'READ') {
-        // Sponsoring jobs are keyed by the sponsor session, so only a
-        // getJobStatus may name it; a write with it would act as the sponsor.
+        // Sponsoring jobs belong to the sponsor session. Only getJobStatus may name it,
+        // because a write with it would act as the sponsor.
         const sponsorPoll = event === 'getJobStatus'
             && !!grant.sponsorSessionId
             && (data.sessionId === grant.sponsorSessionId
                 || (grant.sponsorSessionId === PLATFORM_POOL_SENTINEL
                     && getConfiguredFeeSponsorSessions(getNightgatePluginConfig()).includes(String(data.sessionId ?? ''))));
-        // Pool jobs are keyed under the sentinel, not the concrete member.
+        // Pool jobs are stored under the pool placeholder id, not under one pool wallet.
         if (sponsorPoll && grant.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
             data.sessionId = PLATFORM_POOL_SENTINEL;
         }
@@ -1065,18 +1049,18 @@ export async function enforceAgentGrant(req: NightgateRequest, db: DbRunner): Pr
         }
     }
 
-    // Detached from the request tx: the spend sticks when the request later
-    // fails (over-counting failures rather than under-counting abuse).
+    // Runs outside the request transaction, so the count stays even if the request fails later.
+    // Counting a failure is better than missing abuse.
     if (allowlisted && grant.maxJobsPerDay !== undefined && grant.maxJobsPerDay !== null) {
         const consumed = await consumeDailyBudget(db, grant);
         if (!consumed) {
             return req.reject(429, `agent grant daily job budget exhausted (${grant.maxJobsPerDay}/day)`);
         }
-        // A 400..428 refusal admitted no job: refund. 429 and 5xx keep the unit.
+        // A 400 to 428 error started no job, so give the unit back. 429 and 5xx keep it.
         (req as any).on?.('failed', (err: any) => {
             const status = Number(err?.status ?? err?.statusCode ?? err?.code);
             if (Number.isInteger(status) && status >= 400 && status < 429) {
-                void refundDailyBudget(db, grant).catch((e: unknown) => log.warn(`daily budget refund for grant ${grant.ID} failed: ${String((e as Error)?.message ?? e)}`));
+                void refundDailyBudget(db, grant).catch((e: unknown) => log.warn(`daily budget refund for grant ${grant.ID} failed: ${errorMessage(e)}`));
             }
         });
     }
@@ -1091,14 +1075,13 @@ export async function enforceAgentGrant(req: NightgateRequest, db: DbRunner): Pr
         allowedTokenTypes: parseGrantList(grant.allowedTokenTypes),
         mintedTokenTypes: parseGrantList(grant.mintedTokenTypes),
         allowSwaps: parseGrantList(grant.allowedActions).includes(SPONSOR_SWAP_ACTION),
-        // Admission pre-check only; the lifetime budget is reserved per deploy
-        // before the broadcast (reserveDeployBudget).
+        // Only a first check. The deploy budget is reserved before each deploy is sent,
+        // in reserveDeployBudget.
         allowDeploy: grant.allowDeploy === true && (grant.deploysUsed ?? 0) < (grant.maxDeploys ?? 1)
     };
 }
 
-/** Undo one consumeDailyBudget within the same UTC day. */
-async function refundDailyBudget(db: DbRunner, grant: AgentGrantRow): Promise<void> {
+async function refundDailyBudget(db: DbRunner, grant: AgentGrant): Promise<void> {
     await runWithoutAmbientTx(() => db.run(
         UPDATE.entity(AgentGrants)
             .set({ jobsUsedToday: { '-=': 1 } })
@@ -1107,10 +1090,10 @@ async function refundDailyBudget(db: DbRunner, grant: AgentGrantRow): Promise<vo
 }
 
 /**
- * Consume one budget unit without overspend under concurrency: a window reset
- * that CASes on the old window, then a bounded increment.
+ * Uses one unit of the daily budget. Safe under parallel requests.
+ * A new day resets the counter only if no other request reset it first.
  */
-async function consumeDailyBudget(db: DbRunner, grant: AgentGrantRow): Promise<boolean> {
+async function consumeDailyBudget(db: DbRunner, grant: AgentGrant): Promise<boolean> {
     const today = utcDay();
     const max = grant.maxJobsPerDay as number;
 
@@ -1121,7 +1104,6 @@ async function consumeDailyBudget(db: DbRunner, grant: AgentGrantRow): Promise<b
                 .where({ ID: grant.ID, budgetWindow: grant.budgetWindow ?? null })
         ));
         if (Number(reset)) return true;
-        // Lost the reset race: another request already moved the window.
     }
     const incremented = await runWithoutAmbientTx(() => db.run(
         UPDATE.entity(AgentGrants)

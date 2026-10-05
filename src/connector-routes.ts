@@ -6,13 +6,12 @@ import { getNightgatePluginConfig, getConfiguredNightgateNetwork, DEFAULT_NETWOR
 import { getContractRegistration, listRegisteredContracts } from '../srv/submission/contract-registry';
 import { configString } from '../srv/utils/config';
 
-// Browser connector routes (/zk-config, /contract-manifest). HTTP security and
-// CORS belong to the consuming CAP host.
+// HTTP routes that browser apps use to load proving files and the contract list.
+// HTTP security and CORS are left to the host app.
 
-// URL layout mirrors the on-disk zk config, so a fetch provider at
-// `<server>/zk-config/<contract>` resolves it. Only registered contracts are servable.
+// The URLs follow the folder layout on disk. Only registered contracts are served.
 const ZK_FILE_RE = /^([A-Za-z0-9_]+\.(prover|verifier|zkir|bzkir)|manifest\.json)$/;
-// Keyed by (mtime, size): large prover keys are hashed once per generation.
+// Prover keys are large, so a file is hashed again only when its mtime or size changes.
 const zkEtagCache = new Map<string, { mtimeMs: number; size: number; etag: string }>();
 
 export function zkFileEtag(absPath: string): string | null {
@@ -28,31 +27,31 @@ export function zkFileEtag(absPath: string): string | null {
 
 export function mountZkConfigRoute(app: any): void {
     app.get('/zk-config/:contract/:dir/:file', (req: any, res: any) => {
-            const { contract, dir, file } = req.params;
-            if ((dir !== 'keys' && dir !== 'zkir') || !ZK_FILE_RE.test(file)) {
-                res.status(404).end();
-                return;
-            }
-            const reg = getContractRegistration(contract);
-            if (!reg) { res.status(404).end(); return; }
-            const baseDir = path.resolve(reg.zkConfigPath, dir);
-            const absPath = path.resolve(baseDir, file);
-            // Path-traversal guard (defence in depth; the regex already bars `/`/`..`).
-            if (!absPath.startsWith(baseDir + path.sep)) { res.status(404).end(); return; }
-            const etag = zkFileEtag(absPath);
-            if (!etag) { res.status(404).end(); return; }
-            res.setHeader('ETag', etag);
-            // Not immutable: the same path serves different keys after an upgrade.
-            res.setHeader('Cache-Control', 'public, no-cache');
-            res.setHeader('Content-Type', 'application/octet-stream');
-            if (req.headers['if-none-match'] === etag) { res.status(304).end(); return; }
-            fs.createReadStream(absPath)
-                .on('error', () => { if (!res.headersSent) res.status(500).end(); })
-                .pipe(res);
+        const { contract, dir, file } = req.params;
+        if ((dir !== 'keys' && dir !== 'zkir') || !ZK_FILE_RE.test(file)) {
+            res.status(404).end();
+            return;
+        }
+        const reg = getContractRegistration(contract);
+        if (!reg) { res.status(404).end(); return; }
+        const baseDir = path.resolve(reg.zkConfigPath, dir);
+        const absPath = path.resolve(baseDir, file);
+        // Refuse paths that leave the contract's folder.
+        if (!absPath.startsWith(baseDir + path.sep)) { res.status(404).end(); return; }
+        const etag = zkFileEtag(absPath);
+        if (!etag) { res.status(404).end(); return; }
+        res.setHeader('ETag', etag);
+        // Not cached forever, because a contract upgrade serves new keys under the same path.
+        res.setHeader('Cache-Control', 'public, no-cache');
+        res.setHeader('Content-Type', 'application/octet-stream');
+        if (req.headers['if-none-match'] === etag) { res.status(304).end(); return; }
+        fs.createReadStream(absPath)
+            .on('error', () => { if (!res.headersSent) res.status(500).end(); })
+            .pipe(res);
     });
 }
 
-// Contracts that ship a browser artifact export (`@odatano/nightgate/browser/<name>`).
+// Contracts this package also exports for the browser as `@odatano/nightgate/browser/<name>`.
 const BROWSER_EXPORTED = new Set(['attestation-vault', 'attestation-vault-32']);
 
 function listContractCircuits(zkConfigPath: string): string[] {
@@ -64,12 +63,12 @@ function listContractCircuits(zkConfigPath: string): string[] {
     } catch { return []; }
 }
 
-// Registered contracts only; addresses only when pinned in config.
+// Lists registered contracts. Addresses are included only when set in the config.
 export function mountContractManifestRoute(app: any): void {
     app.get('/contract-manifest', (req: any, res: any) => {
         const cfg = getNightgatePluginConfig();
         const network = getConfiguredNightgateNetwork(cfg) || DEFAULT_NETWORK;
-        // No configured base: relative URLs, never reflect the Host header.
+        // Without a configured base URL the links are relative. The Host header is never used.
         const base = (configString('NIGHTGATE_ZK_CONFIG_PUBLIC_URL') ?? '').replace(/\/+$/, '');
         const contracts = listRegisteredContracts().map((name: string) => {
             const reg = getContractRegistration(name);

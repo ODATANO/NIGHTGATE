@@ -1,7 +1,7 @@
 /**
- * Boot preflight (fail-closed on a stored key id outside the ring) and `nightgate-rewrap-keys`.
- * Envelope columns carry the key id in their prefix: scanned and rewrapped without wallet secrets.
- * Legacy rows (`keyScheme` null) need the viewing key; their ring key must stay until none remain.
+ * Startup check that every stored encryption key id is in the key ring, and the `nightgate-rewrap-keys` tool.
+ * Ring-encrypted values start with their key id, so they can be re-encrypted without any wallet secret.
+ * "Legacy rows" (`keyScheme` null) use an older scheme that needs the wallet's viewing key to decrypt.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -15,9 +15,10 @@ import {
     holderDisclosureContentBinding
 } from './envelope-bindings';
 import { StorageEncryption, decryptWithPassword, extractEncryptedComponents } from './storage-encryption';
-// Static import: shares the DEK cache with sessions reading the same rows.
+// Imported statically so the data key cache is shared with the sessions that read the same rows.
 import { resolveAccountDek, privateStatePasswordFromDek, syncStatePassphraseFromDek, DEK_SCHEME } from '../submission/account-keys';
 import type { DbService } from './db-types';
+import { errorMessage } from './errors';
 
 const log = cds.log('nightgate:crypto');
 
@@ -26,18 +27,16 @@ export interface CiphertextColumn {
     table: string;
     key: string;
     column: string;
-    /** Extra filter for the rows that hold ciphertext. */
     where?: Record<string, unknown>;
     whereSql?: string;
-    /** Columns the binding needs besides the key. */
+    /** Extra columns the binding needs. */
     select?: string[];
-    /** The v3 binding of a row's value (envelope-bindings.ts). */
     binding: (row: Record<string, any>) => EnvelopeBinding;
-    /** A value with this prefix is not an envelope but plaintext to wrap (a bare seal). */
+    /** A value with this prefix is not ring-encrypted yet and only needs to be encrypted. */
     plainPrefix?: string;
 }
 
-/** Prefix of a bare viewing-key seal (account-keys.ts) that predates the ring wrapping. */
+/** Prefix of an account data key sealed only with the viewing key, not yet with the key ring. */
 export const BARE_VIEWING_KEY_SEAL_PREFIX = 'vk1:';
 
 export const ENVELOPE_COLUMNS: readonly CiphertextColumn[] = [
@@ -49,14 +48,14 @@ export const ENVELOPE_COLUMNS: readonly CiphertextColumn[] = [
     { entity: 'midnight.HolderDisclosureGrants', table: 'midnight_HolderDisclosureGrants', key: 'ID', column: 'content', binding: r => holderDisclosureContentBinding(r.ID) }
 ];
 
-/** Tables whose rows are under the account DEK once `keyScheme` = 'dek1'; null = legacy derivation. */
+/** Tables whose rows use the per-account data key when `keyScheme` is 'dek1', and the legacy scheme when it is null. */
 export const DEK_TABLES = [
     { entity: 'midnight.PrivateStates', table: 'midnight_PrivateStates', what: 'private state row(s)' },
     { entity: 'midnight.ContractSigningKeys', table: 'midnight_ContractSigningKeys', what: 'signing key(s)' },
     { entity: 'midnight.WalletSyncStates', table: 'midnight_WalletSyncStates', what: 'sync-state row(s)' }
 ] as const;
 
-/** Key id named by a ciphertext prefix; null for a bare viewing-key seal. */
+/** The key id at the start of a stored value. Null for a value sealed only with the viewing key. */
 export function keyIdFromPrefix(prefix: string): string | null {
     if (prefix.startsWith(BARE_VIEWING_KEY_SEAL_PREFIX)) return null;
     for (const version of [BOUND_ENVELOPE_VERSION, ENVELOPE_VERSION]) {
@@ -68,7 +67,7 @@ export function keyIdFromPrefix(prefix: string): string | null {
     return LEGACY_KEY_ID;
 }
 
-/** Distinct key ids per envelope column; only prefixes leave the database (`substr` is portable). */
+/** The key ids used in each encrypted column. Only the first characters of each value are read. */
 export async function scanStoredKeyIds(db: DbService): Promise<Array<{ column: CiphertextColumn; keyIds: string[] }>> {
     const out: Array<{ column: CiphertextColumn; keyIds: string[] }> = [];
     for (const column of ENVELOPE_COLUMNS) {
@@ -88,14 +87,12 @@ export async function scanStoredKeyIds(db: DbService): Promise<Array<{ column: C
 }
 
 export interface LegacyRowCensus {
-    /** Per table: rows whose `keyScheme` is null (pre-DEK derivation). */
     tables: Array<{ entity: string; what: string; rows: number; accounts: number }>;
-    /** Distinct account ids that still hold at least one legacy row. */
     accounts: string[];
     total: number;
 }
 
-/** Rows still under a pre-DEK derivation; read-only, no decryption. */
+/** Counts legacy rows. Reads only, decrypts nothing. */
 export async function countLegacyRows(db: DbService): Promise<LegacyRowCensus> {
     const tables: LegacyRowCensus['tables'] = [];
     const accounts = new Set<string>();
@@ -118,8 +115,9 @@ export async function countLegacyRows(db: DbService): Promise<LegacyRowCensus> {
 }
 
 /**
- * Every stored key id must be in the ring: an unopenable seed must not look like no seed.
- * Legacy rows only warn; they need the viewing key either way.
+ * Fails when a stored value uses a key id that is not in the ring.
+ * Otherwise a seed that cannot be decrypted would look like a missing seed.
+ * Legacy rows only cause a warning.
  */
 export async function assertStoredKeyIdsKnown(db: DbService, ring: KeyRing = getEncryptionKey(), opts: { reportLegacy?: boolean } = {}): Promise<void> {
     const unknown = new Map<string, string[]>();
@@ -132,11 +130,11 @@ export async function assertStoredKeyIdsKnown(db: DbService, ring: KeyRing = get
         const detail = [...unknown].map(([id, cols]) => `'${id}' (${cols.join(', ')})`).join('; ');
         throw new Error(`stored ciphertexts reference encryption key id(s) not in the ring: ${detail}. Add the key to ENCRYPTION_KEYS, or run nightgate-rewrap-keys with the old key still in the ring before removing it.`);
     }
-    if (opts.reportLegacy === false) return;   // the rewrap tool prints its own census
+    if (opts.reportLegacy === false) return;   // the rewrap tool prints its own counts
     let census: LegacyRowCensus | undefined;
     try { census = await countLegacyRows(db); } catch (err) {
-        // No marker columns yet: the schema-delta preflight reports that.
-        log.warn(`legacy-row census skipped: ${String((err as Error)?.message ?? err)}`);
+        // The `keyScheme` column is missing. The schema check reports that separately.
+        log.warn(`legacy-row census skipped: ${errorMessage(err)}`);
         return;
     }
     if (census.total > 0) {
@@ -149,7 +147,7 @@ export interface RewrapOptions {
     ring?: KeyRing;
     dryRun?: boolean;
     batchSize?: number;
-    /** Drop legacy sync-state blobs of accounts without a decryptable viewing key (they re-sync). Never touches private state or signing keys. */
+    /** Delete legacy wallet sync data of accounts whose viewing key cannot be read. Those wallets re-sync. Private state and signing keys are never touched. */
     dropLegacySyncState?: boolean;
     log?: (msg: string) => void;
 }
@@ -160,15 +158,15 @@ export interface RewrapReport {
     envelope: Array<{ column: string; scanned: number; rewrapped: number; unreadable: number; bySourceKey: Record<string, number> }>;
     syncState: { accounts: number; blobsRewrapped: number; blobsDropped: number; sessionsUnreadable: number };
     privateState: { accounts: number; rowsRewrapped: number; rowsUnreadable: number };
-    /** Rows still under a pre-DEK derivation after this run (a dry run reports the current state). */
+    /** Legacy rows left after this run. A dry run reports the current state. */
     legacy: LegacyRowCensus;
-    /** Accounts whose legacy rows this run migrated (dry run: could migrate) through a session's viewing key. */
+    /** Accounts whose legacy rows were migrated, or could be in a dry run. */
     migratableAccounts: string[];
 }
 
 /**
- * Rewrap ring-sealed values under the active key and migrate legacy rows a session's viewing key
- * still opens. Refuses before any write when a stored key id is not in the ring.
+ * Re-encrypts all ring-encrypted values with the active key.
+ * Also migrates legacy rows whose viewing key is still available in a wallet session.
  */
 export async function rewrapStoredCiphertexts(db: DbService, opts: RewrapOptions = {}): Promise<RewrapReport> {
     const ring = opts.ring ?? getEncryptionKey();
@@ -253,11 +251,9 @@ export async function rewrapStoredCiphertexts(db: DbService, opts: RewrapOptions
     return report;
 }
 
-// ---- Legacy rows: migrate through the sessions that still hold a viewing key ----
-
 async function migrateLegacyRows(db: DbService, ring: KeyRing, dryRun: boolean, report: RewrapReport, say: (m: string) => void): Promise<Set<string>> {
     const { SELECT, UPDATE } = cds.ql;
-    // Lazy: the boot preflight must not load the facade builder and worker client.
+    // Required lazily, so the startup check does not load the wallet worker code.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { deriveAccountId, deriveStoragePassword, privateStatePasswordCandidates } = require('../submission/wallet-material-factory') as typeof import('../submission/wallet-material-factory');
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -284,7 +280,6 @@ async function migrateLegacyRows(db: DbService, ring: KeyRing, dryRun: boolean, 
         if (seen.has(accountId)) continue;
         seen.add(accountId);
         const storagePassword = deriveStoragePassword(viewingKey);
-        // A dry run neither creates nor re-seals the DEK.
         let dek: Buffer | null;
         try {
             dek = dryRun

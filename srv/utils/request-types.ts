@@ -1,11 +1,7 @@
-/**
- * CAP request plus the fields NIGHTGATE's before-handlers attach.
- * SPDX-License-Identifier: Apache-2.0
- */
-import type { Request } from '@sap/cds';
+// SPDX-License-Identifier: Apache-2.0
 import type { DisclosureRoleValue } from '../middleware/disclosure-role';
 
-/** Scope of the agent grant a request runs under; lists parsed, set by the agent-token check. */
+/** The agent grant a request runs under. The agent token check sets it. */
 export interface RequestAgentGrant {
     ID: string;
     sessionId: string;
@@ -16,13 +12,14 @@ export interface RequestAgentGrant {
     allowedTokenTypes: string[];
     mintedTokenTypes: string[];
     allowDeploy: boolean;
-    /** The grant lists the swap action. */
     allowSwaps: boolean;
 }
 
-export type NightgateRequest<D = any> = Request<D> & {
-    agentGrant?: RequestAgentGrant;
-    disclosureRole?: DisclosureRoleValue;
-    /** CAP's raw HTTP request, absent outside HTTP. */
-    _?: { req?: { ip?: string; headers?: Record<string, string | string[] | undefined> } };
-};
+// Fields the plugin's before-handlers set on every CAP request.
+declare module '@sap/cds' {
+    interface Request {
+        agentGrant?: RequestAgentGrant;
+        disclosureRole?: DisclosureRoleValue;
+    }
+}
+

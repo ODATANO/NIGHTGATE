@@ -4,6 +4,7 @@
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 import { deriveGranteeId, resolveGranteeId } from '../../srv/submission/grantee-identity';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 describe('deriveGranteeId', () => {
     test('custom: passes through a valid 64-hex (lower-cased)', () => {
@@ -21,7 +22,7 @@ describe('deriveGranteeId', () => {
         const expected = bytesToHex(sha256(Uint8Array.from(Buffer.from(pubkey, 'hex'))));
         expect(deriveGranteeId('wallet', pubkey)).toBe(expected);
         expect(deriveGranteeId('wallet', pubkey)).toBe(deriveGranteeId('wallet', pubkey));
-        expect(deriveGranteeId('wallet', pubkey)).toMatch(/^[0-9a-f]{64}$/);
+        expect(deriveGranteeId('wallet', pubkey)).toMatch(HEX64_RE);
     });
 
     test('wallet: rejects non-hex input', () => {
@@ -32,7 +33,7 @@ describe('deriveGranteeId', () => {
         const did = 'did:web:recycler.example';
         const expected = bytesToHex(sha256(new TextEncoder().encode(did)));
         expect(deriveGranteeId('did', did)).toBe(expected);
-        expect(deriveGranteeId('did', did)).toMatch(/^[0-9a-f]{64}$/);
+        expect(deriveGranteeId('did', did)).toMatch(HEX64_RE);
     });
 
     test('different kinds/inputs yield different ids', () => {

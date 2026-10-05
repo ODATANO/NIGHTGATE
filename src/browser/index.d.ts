@@ -1,4 +1,4 @@
-/** `@odatano/nightgate/browser` - browser entry. See index.mjs. */
+/** `@odatano/nightgate/browser`, the entry point for browser apps. See index.mjs. */
 
 
 export {
@@ -18,9 +18,7 @@ export {
     type AttestationVaultWitnesses
 } from '@odatano/contract-kit';
 
-// Providers + typed call helpers.
-
-/** Browser ZK-config provider that fetches keys/zkir from `/zk-config/<contract>`. */
+/** Loads a contract's proving files over HTTP from `/zk-config/<contract>`. */
 export class FetchZkConfigProvider {
     constructor(baseUrl: string, fetchFn?: typeof fetch);
     getProverKey(circuitId: string): Promise<Uint8Array>;
@@ -35,7 +33,7 @@ export class FetchZkConfigProvider {
     };
 }
 
-/** Trivial in-memory PrivateStateProvider (the vault has no contract private state). */
+/** Keeps contract private state in memory. The vault contract has no private state. */
 export class InMemoryPrivateStateProvider {
     setContractAddress(address: unknown): void;
     set(id: unknown, state: unknown): Promise<void>;
@@ -53,11 +51,10 @@ export class InMemoryPrivateStateProvider {
 }
 
 /**
- * Which proving modality a consumer wants.
- *   'server' - httpClientProofProvider against the connector-reported proof server (default).
- *   'wallet' - delegate contract proving to the wallet's own prover; THROWS when the connected
- *              wallet has no `getProvingProvider` (never silently downgrades).
- *   'auto'   - wallet when available, else server.
+ * Where proofs are made.
+ *   'server' - on the proof server the wallet reports. This is the default.
+ *   'wallet' - in the wallet. Throws if the wallet cannot prove.
+ *   'auto'   - in the wallet if it can prove, else on the server.
  */
 export type ProvingModality = 'server' | 'wallet' | 'auto';
 
@@ -65,7 +62,7 @@ export interface ConnectorProvidersResult {
     publicDataProvider: unknown;
     zkConfigProvider: FetchZkConfigProvider;
     proofProvider: unknown | undefined;
-    /** The modality actually assembled. Log it: it says where the transaction preimage goes. */
+    /** Where proofs are actually made. Log it, because it says where the private inputs go. */
     provingModality: 'server' | 'wallet' | 'none';
     privateStateProvider: InMemoryPrivateStateProvider;
     connector: unknown;
@@ -78,7 +75,7 @@ export interface ConnectorProvidersResult {
 export function createNightgateConnectorProviders(opts: {
     connector: any;
     manifest: { contracts: Array<{ name: string; zkConfigBaseUrl: string; circuits: string[] }> };
-    /** URL the manifest was fetched from; required when it carries relative zkConfigBaseUrls and the dApp runs on another origin. */
+    /** The URL the manifest was loaded from. Needed when the manifest has relative URLs and the app runs on another origin. */
     manifestUrl?: string;
     contract: string;
     fetchFn?: typeof fetch;
@@ -86,10 +83,7 @@ export function createNightgateConnectorProviders(opts: {
     proving?: ProvingModality;
 }): Promise<ConnectorProvidersResult>;
 
-/**
- * The proof-provider assembly on its own, for consumers that build the other providers
- * themselves. Same rules as the `proving` option above.
- */
+/** Creates only the proof provider, for apps that set up the other providers themselves. */
 export function buildProofProvider(input: {
     proving?: ProvingModality;
     connector: any;
@@ -122,21 +116,20 @@ export {
 
 export interface ContractBrowserMeta {
     name: string;
-    /** npm subpath to import the compiled contract artifact from. */
     artifactSubpath: string;
     circuits: string[];
-    /** Circuits requiring the attester-identity witness (local_secret_key). */
+    /** Circuits that need the attester's secret key. */
     attesterGated: string[];
-    /** Circuits requiring the per-call Merkle inclusion proof witnesses. */
+    /** Circuits that need the document's Merkle proof data. */
     merkleWitnessed?: string[];
     hasPrivateState: boolean;
-    /** Content-tree width: provable fields per document (16 default, 32 on attestation-vault-32). */
+    /** Provable fields per document. 16, or 32 for attestation-vault-32. */
     slotWidth: number;
-    /** Inclusion-path depth, log2(slotWidth). */
+    /** Depth of the document's Merkle tree, log2(slotWidth). */
     merkleDepth: number;
 }
 
 export const CONTRACTS: Record<string, ContractBrowserMeta>;
 
-/** Absolute form of a manifest URL (relative ones resolve against manifestUrl, then the page origin). */
+/** Makes a manifest URL absolute, using manifestUrl or else the page's origin. */
 export function resolveManifestUrl(url: string, manifestUrl?: string): string;

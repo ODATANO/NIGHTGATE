@@ -1,7 +1,3 @@
-/**
- * Crawler module, public API and lifecycle management
- */
-
 import { MidnightNodeProvider } from '../providers/MidnightNodeProvider';
 import { installCrawlerFaultGuard } from './crawler-fault-guard';
 import { configBool } from '../utils/config';
@@ -18,7 +14,7 @@ let activeCrawler: MidnightCrawler | null = null;
 let activeNodeProvider: MidnightNodeProvider | null = null;
 
 /**
- * Start the crawler. Idempotent, calling twice is a no-op.
+ * Starts the crawler. Calling it while the crawler runs does nothing.
  */
 export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; requestTimeout?: number }): Promise<void> {
     if (activeCrawler) {
@@ -26,12 +22,12 @@ export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; re
             log.warn('Already running');
             return;
         }
-        // Ended by a permanent ingest failure: release it before starting afresh.
+        // The old crawler stopped after a permanent failure. Release it before starting a new one.
         await stopCrawler();
     }
 
-    // Installed with the crawler, because the crawler is what introduces the
-    // fault class: a node that answers slowly or not at all.
+    // Installed together with the crawler, because only the crawler depends on a node
+    // that may answer slowly or not at all.
     if (configBool('NIGHTGATE_CRAWLER_FAULT_GUARD') !== false) installCrawlerFaultGuard();
 
     const nodeProvider = new MidnightNodeProvider({
@@ -43,7 +39,6 @@ export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; re
     try {
         await crawler.start();
     } catch (err) {
-        // Crawler start can fail after the provider connected; ensure no socket leaks.
         try {
             await nodeProvider.disconnect();
         } catch {
@@ -57,9 +52,6 @@ export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; re
     log.info('Started');
 }
 
-/**
- * Stop the crawler and disconnect the node provider.
- */
 export async function stopCrawler(): Promise<void> {
     if (activeCrawler) {
         await activeCrawler.stop();
@@ -74,7 +66,7 @@ export async function stopCrawler(): Promise<void> {
     log.info('Stopped');
 }
 
-/** True while a crawler instance is ingesting; false after a stop or a permanent ingest failure. */
+/** True while the crawler is indexing. False after a stop or a permanent failure. */
 export function isCrawlerRunning(): boolean {
     return activeCrawler !== null && activeCrawler.isActive();
 }

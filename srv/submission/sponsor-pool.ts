@@ -1,15 +1,15 @@
 /**
- * Sponsor pool leases + failover. A wallet carries ONE dust spend in flight, so
- * concurrency scales with the number of sponsors. In-memory: one instance per
- * wallet set. SPDX-License-Identifier: Apache-2.0
+ * Picks a sponsor wallet from the pool and decides what to do when one fails.
+ * State is kept in memory, so each server process needs its own set of wallets.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { classifySubmitFailure } from '../midnight/submit-error-classification';
 import { findNightgateError } from '../utils/errors';
 
 /**
- * Names the pool instead of one sponsor session. A reserved UUID because every
- * surface carrying it is typed UUID; a plain string fails OData deserialization.
+ * Stands for "any sponsor from the pool" instead of one sponsor session.
+ * It is a UUID because every field that carries it is typed as UUID in OData.
  */
 export const PLATFORM_POOL_SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
 
@@ -30,14 +30,14 @@ function lane(id: string): SponsorLane {
     return s;
 }
 
-/** Sponsors at the sync gate rank first; lagging ones stay candidates behind them. */
+/** True when the sponsor's wallet is synced enough. Such sponsors are tried first, the others after them. */
 export type SponsorAtGate = (sponsorSessionId: string) => boolean;
 
 function gateRank(id: string, atGate?: SponsorAtGate): number {
     return atGate && !atGate(id) ? 1 : 0;
 }
 
-/** Free and not cooling; gate rank first, then least recently used. */
+/** A sponsor that is neither busy nor paused. Prefers synced ones, then the least recently used. */
 export function pickFreeSponsor(poolIds: string[], now: number = Date.now(), atGate?: SponsorAtGate): string | null {
     let best: string | null = null;
     let bestRank = Infinity;
@@ -55,7 +55,6 @@ export function pickFreeSponsor(poolIds: string[], now: number = Date.now(), atG
     return best;
 }
 
-/** Lease a sponsor, waiting up to `waitMs` for one to free up. */
 export async function acquireSponsor(poolIds: string[], waitMs: number, atGate?: SponsorAtGate): Promise<string> {
     if (poolIds.length === 0) throw new Error('sponsor pool is empty (NIGHTGATE_FEE_SPONSOR_SESSION)');
     const deadline = Date.now() + waitMs;
@@ -78,7 +77,7 @@ export function releaseSponsor(id: string): void {
     lane(id).busy = false;
 }
 
-/** Bench a sponsor after a failure so retries move on instead of re-hitting it. */
+/** Pauses a sponsor after a failure, so retries use another one. */
 export function benchSponsor(id: string, cooldownMs: number): void {
     const s = lane(id);
     s.busy = false;
@@ -86,8 +85,8 @@ export function benchSponsor(id: string, cooldownMs: number): void {
 }
 
 /**
- * Failures caused by the sponsor's own state, worth trying the next sponsor.
- * Caller-side failures (policy, deserialization, pool Invalid) must not burn the pool.
+ * True for failures caused by the sponsor's own state, where the next sponsor may succeed.
+ * Failures caused by the caller's transaction return false, so they do not pause every sponsor.
  */
 export function isRetryableSponsorFailure(err: unknown): boolean {
     const coded = findNightgateError(err)?.code;
@@ -96,25 +95,22 @@ export function isRetryableSponsorFailure(err: unknown): boolean {
     const info = classifySubmitFailure(err);
     if (info.code === 'dust-race') return info.ledgerCode !== 'pool-invalid';
     if (info.code !== 'internal') return false;
-    // Sponsor-health failures cross the worker RPC without a code, so match by wording.
+    // These failures arrive from the worker without an error code, so match the message text.
     const msg = String((err as any)?.message ?? err ?? '');
     return /genuine(ly)? sync|not caught up|sync.*(timeout|timed out|stalled)|not synced to tip|No facade for sponsorSessionId|dust.*(stale|validity)|WALLET_SYNCING|Sponsor session/i.test(msg);
 }
 
-/** Transient dust race (1010/170, 1010/196, pool Invalid): rebuild on the SAME sponsor. */
+/** A short-lived dust conflict. Rebuild with the same sponsor. */
 export function isDustRaceFailure(err: unknown): boolean {
     return classifySubmitFailure(err).code === 'dust-race';
 }
 
-/** In a block but the call did not apply: terminal, only the caller can rebuild. */
+/** The tx is in a block but its contract call failed. Final: only the caller can build a new one. */
 export function isCallNotAppliedFailure(err: unknown): boolean {
     return classifySubmitFailure(err).code === 'landed-not-applied';
 }
 
-/**
- * The attempt cannot be on-chain, so clearing the job's hash and rebuilding is
- * safe. Never matches landed-not-applied or ambiguous.
- */
+/** The tx cannot be on chain, so removing its hash from the job and rebuilding is safe. */
 export function isPreInclusionReject(err: unknown): boolean {
     const info = classifySubmitFailure(err);
     if (info.code === 'pre-mempool-reject' || info.code === 'dust-race') return true;
@@ -124,23 +120,23 @@ export function isPreInclusionReject(err: unknown): boolean {
 }
 
 /**
- * The broadcast may still land. Never rebuild (two identifiers, two fees);
- * the job goes to reconciliation_required.
+ * The tx may still land. Never rebuild, or the fee could be paid twice.
+ * The job goes to reconciliation_required.
  */
 export function isAmbiguousSubmitOutcome(err: unknown): boolean {
     return classifySubmitFailure(err).code === 'ambiguous';
 }
 
 /**
- * Uncoded pool Invalid, indistinguishable from an invalid caller tx; each retry
- * costs a sponsor dust proof, so it gets at most one rebuild.
+ * The node rejected the tx without a reason. That looks the same as an invalid caller tx.
+ * Each retry costs the sponsor a dust proof, so it gets at most one rebuild.
  */
 export function isGenericInvalidFailure(err: unknown): boolean {
     const info = classifySubmitFailure(err);
     return info.code === 'dust-race' && info.ledgerCode === 'pool-invalid';
 }
 
-/** One failure table for the finalized and the unbound sponsoring channel. */
+/** What to do after a failed sponsoring attempt. Used for both bound and unbound transactions. */
 export type SponsorFailureDecision = 'ambiguous' | 'landed-not-applied' | 'dust-rebuild' | 'failover' | 'fail';
 
 export function decideSponsorFailure(err: unknown): { decision: SponsorFailureDecision; generic: boolean; preInclusion: boolean } {
@@ -148,15 +144,15 @@ export function decideSponsorFailure(err: unknown): { decision: SponsorFailureDe
     const preInclusion = isPreInclusionReject(err);
     if (info.code === 'ambiguous') return { decision: 'ambiguous', generic: false, preInclusion: false };
     if (info.code === 'landed-not-applied') return { decision: 'landed-not-applied', generic: false, preInclusion: false };
-    // Before failover: a dust race means a healthy sponsor whose dust state lags.
+    // Checked before failover: a dust race means the sponsor is fine, its dust state is just behind.
     if (info.code === 'dust-race') return { decision: 'dust-rebuild', generic: info.ledgerCode === 'pool-invalid', preInclusion };
     if (isRetryableSponsorFailure(err)) return { decision: 'failover', generic: false, preInclusion };
     return { decision: 'fail', generic: false, preInclusion };
 }
 
 /**
- * Candidate order for the unbound path, no lease (the worker locks per backing).
- * Cooling sponsors are excluded, not ranked last.
+ * Sponsor order for unbound transactions. Reserves nothing, since the worker locks single dust notes.
+ * Paused sponsors are left out.
  */
 export function sponsorCandidatesNonExclusive(poolIds: string[], now: number = Date.now(), atGate?: SponsorAtGate): string[] {
     return poolIds
@@ -166,7 +162,7 @@ export function sponsorCandidatesNonExclusive(poolIds: string[], now: number = D
         .map((c) => c.id);
 }
 
-/** Update LRU without taking a lease. */
+/** Marks the sponsor as just used, without reserving it. */
 export function touchSponsor(id: string): void { lane(id).lastUsed = Date.now(); }
 
 /** Test seam. */

@@ -16,6 +16,7 @@ import { pathToFileURL } from 'node:url';
 import { resolveContractPackage } from '@odatano/contract-kit/node';
 import { holderClaimKey, holderEntry, readHolderRegistration } from '../../srv/submission/holder-registry';
 import { holderClaimKey as shippedClaimKey } from '../../src/txbuilder/holder.mjs';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 const ARTIFACT = resolveContractPackage('@odatano/contract-holder-registry', path.resolve(__dirname, '../..')).artifactPath;
 const T = 'ab'.repeat(32);
@@ -24,7 +25,7 @@ const SECRET = '11'.repeat(32);
 describe('holderClaimKey', () => {
     it('is the shipped rule: deterministic, 64 hex, different per secret', () => {
         const k = holderClaimKey(SECRET);
-        expect(k).toMatch(/^[0-9a-f]{64}$/);
+        expect(k).toMatch(HEX64_RE);
         expect(k).toBe(shippedClaimKey(SECRET));
         expect(holderClaimKey('22'.repeat(32))).not.toBe(k);
         expect(() => holderClaimKey('zz')).toThrow();
@@ -39,7 +40,7 @@ describe('readHolderRegistration', () => {
     it('computes the entry with the artifact and finds it in the contract state', async () => {
         const claimKey = holderClaimKey(SECRET);
         const entry = holderEntry(artifact, T, claimKey);
-        expect(entry).toMatch(/^[0-9a-f]{64}$/);
+        expect(entry).toMatch(HEX64_RE);
         // Real ledger state of a fresh deployment (no holders), read back through `ledger()`.
         const rt: any = await import('@midnight-ntwrk/compact-runtime');
         const contract = new artifact.Contract({});

@@ -6,6 +6,7 @@ import { describe, it, expect } from 'vitest';
 import { tokenFactoryIssuerSecret, prepareMint, tokenName } from '../../src/txbuilder/factory.mjs';
 import { deriveRoleSeeds } from '../../srv/utils/wallet-hd';
 import { deriveTokenFactoryIssuerSecret } from '../../srv/submission/contract-witnesses';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
 
@@ -16,7 +17,7 @@ describe('txbuilder: token factory', () => {
         const local = await tokenFactoryIssuerSecret({ seedHex: SEED });
         const { zswap } = await deriveRoleSeeds(new Uint8Array(Buffer.from(SEED, 'hex')), 0);
         expect(local).toBe(Buffer.from(deriveTokenFactoryIssuerSecret(zswap)).toString('hex'));
-        expect(local).toMatch(/^[0-9a-f]{64}$/);
+        expect(local).toMatch(HEX64_RE);
         expect(await tokenFactoryIssuerSecret({ seedHex: SEED, accountIndex: 1 })).not.toBe(local);
     });
     it('refuses a seed that is not 128 hex', async () => {

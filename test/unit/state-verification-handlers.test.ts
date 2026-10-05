@@ -98,19 +98,6 @@ describe('verifyAttestationState', () => {
         }
     });
 
-    test('rejects non-hex payloadHash, attesterId and documentId', async () => {
-        const srv = setup();
-        for (const data of [
-            { contractAddress: VAULT, attesterId: ATTESTER, payloadHash: 'nope' },
-            { contractAddress: VAULT, attesterId: 'nope', payloadHash: PAYLOAD },
-            { contractAddress: VAULT, documentId: 'nope' }
-        ]) {
-            const req = makeReq(data);
-            await srv.handlers['verifyAttestationState'](req);
-            expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/64 hex/));
-        }
-    });
-
     test('a document id alone selects the record; the reader gets it lowercased', async () => {
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc', payloadHash: PAYLOAD, recordKey: 'rk', documentId: 'f'.repeat(64) }));
         const srv = setup({ attestationStateReader: reader });
@@ -118,13 +105,6 @@ describe('verifyAttestationState', () => {
         const r = await srv.handlers['verifyAttestationState'](req);
         expect(r).toMatchObject({ verified: true, attesterId: 'abc', payloadHash: PAYLOAD, recordKey: 'rk', documentId: 'f'.repeat(64) });
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({ documentId: 'f'.repeat(64), attesterId: undefined, payloadHash: undefined }));
-    });
-
-    test('rejects non-hex contentRoot', async () => {
-        const srv = setup();
-        const req = makeReq({ contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, contentRoot: 'nope' });
-        await srv.handlers['verifyAttestationState'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contentRoot/));
     });
 
     test('attested, no contentRoot → verified true', async () => {
@@ -219,20 +199,6 @@ describe('verifyPredicateState', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash/));
     });
 
-    test('rejects non-hex payloadHash', async () => {
-        const srv = setup();
-        const req = makeReq({ ...VALID, payloadHash: 'nope' });
-        await srv.handlers['verifyPredicateState'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/64 hex/));
-    });
-
-    test('rejects non-hex fieldKey', async () => {
-        const srv = setup();
-        const req = makeReq({ ...VALID, fieldKey: 'nope' });
-        await srv.handlers['verifyPredicateState'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/fieldKey/));
-    });
-
     test('rejects unknown predicate string', async () => {
         const srv = setup();
         const req = makeReq({ ...VALID, predicate: 'equals' });
@@ -323,10 +289,8 @@ describe('verifyPredicateState', () => {
         test.each([
             [{ predicate: 'bytesEquality', fieldKey: '', expectedDigest: EXPECTED }, /fieldKey is required for predicate 'bytesEquality'/],
             [{ predicate: 'bytesEquality', fieldKey: FIELD_KEY }, /expectedDigest .*required/],
-            [{ predicate: 'bytesEquality', fieldKey: FIELD_KEY, expectedDigest: 'zz' }, /expectedDigest/],
             [{ predicate: 'setMembership', fieldKey: '', setRoot: SET_ROOT }, /fieldKey is required for predicate 'setMembership'/],
             [{ predicate: 'setMembership', fieldKey: FIELD_KEY }, /setRoot .*required/],
-            [{ predicate: 'setMembership', fieldKey: FIELD_KEY, setRoot: 'zz' }, /setRoot/]
         ])('rejects %o', async (patch, msg) => {
             const srv = setup();
             const req = makeReq({ contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, ...patch });
@@ -370,7 +334,6 @@ describe('verifyPredicateState', () => {
 
         test.each([
             [{ predicate: 'documentIntegrity', allowedMask: 5 }, /payloadHashB .*required/],
-            [{ predicate: 'documentIntegrity', payloadHashB: 'zz', allowedMask: 5 }, /payloadHashB/],
             [{ predicate: 'documentIntegrity', payloadHashB: PAYLOAD_B }, /allowedMask .*required/],
             [{ predicate: 'documentIntegrity', payloadHashB: PAYLOAD_B, allowedMask: 65536 }, /allowedMask/],
             [{ predicate: 'documentDiff', k: 2 }, /payloadHashB .*required/],

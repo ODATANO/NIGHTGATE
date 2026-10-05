@@ -1,8 +1,10 @@
 /**
- * The SDK randomizes each call intent's segment id; the ledger applies by ascending id.
- * The proof provider gets the tx unbound and unproven, the only time `Transaction.intents`
- * is writable, so the wrapper reassigns the existing ids in call order before proving.
+ * Each contract call in a transaction sits in a numbered segment. The SDK picks the
+ * numbers at random, and the ledger applies calls by ascending number.
+ * The proof provider is the last point where the numbers can still be changed,
+ * so the wrapper renumbers the calls into call order there.
  */
+import { errorMessage } from '../utils/errors';
 
 const utf8 = new TextDecoder();
 
@@ -12,8 +14,8 @@ function entryPointName(ep: unknown): string {
     return String(ep ?? '');
 }
 
-// Stages: `g` guaranteed, `f` fallible. The SDK splits by gas cost, so the same
-// circuit moves from `g` to `g+f` as contract state grows.
+// Each call runs in a guaranteed part (`g`), a fallible part (`f`), or both.
+// The SDK splits by gas cost, so a circuit can move from `g` to `g+f` as the contract state grows.
 function gasOf(transcript: any): string {
     const compute = transcript?.gas?.computeTime;
     if (typeof compute !== 'bigint' && typeof compute !== 'number') return '';
@@ -31,7 +33,7 @@ function transcriptStages(action: any): string {
     }
 }
 
-/** Contract calls in apply order; fee/dust intents without an entry point are skipped. */
+/** Contract calls in apply order. Fee and dust parts without a circuit name are skipped. */
 function orderedCalls(tx: any): Array<{ name: string; segId: number; guaranteed: boolean; fallible: boolean }> {
     const intents: Map<number, any> | undefined = tx?.intents;
     if (!intents || typeof intents.entries !== 'function') return [];
@@ -59,7 +61,7 @@ export function callSegments(tx: any): Array<{ segment: number; calls: string[] 
     return [...bySegment.entries()].map(([segment, names]) => ({ segment, calls: names }));
 }
 
-/** Ledger causality: a fallible call must not precede a guaranteed one. Reason, or null. */
+/** Returns why the ledger would reject the order, or null. A fallible call must not come before a guaranteed one. */
 export function findCausalityViolation(tx: any): string | null {
     const calls = orderedCalls(tx);
     for (let i = 0; i < calls.length; i++) {
@@ -83,11 +85,11 @@ export function findCausalityViolation(tx: any): string | null {
 export interface BatchCallStage {
     name: string;
     segId: number;
-    /** `g`, `f`, `g+f` (with gas figures when the SDK exposes them), `-` when the SDK exposes no transcripts. */
+    /** `g`, `f` or `g+f`, with gas figures when known. `-` when the SDK shows no parts. */
     stages: string;
 }
 
-/** The batch's contract calls in APPLY order with their stages; `[]` without an intents map. */
+/** The batch's contract calls in apply order with their stages. Empty when the tx has no intents. */
 export function batchCallStages(tx: any): BatchCallStage[] {
     return orderedCalls(tx).map(c => ({
         name: c.name,
@@ -97,8 +99,8 @@ export function batchCallStages(tx: any): BatchCallStage[] {
 }
 
 /**
- * `calls` lets a consumer split the batch without parsing. The message repeats the list
- * because the SDK's scope wrapper may keep only the message.
+ * `calls` lets a caller split the batch without parsing the message.
+ * The message repeats the list because the SDK may pass on only the message.
  */
 export class BatchCausalityError extends Error {
     readonly code = 'BatchCausalityViolation';
@@ -110,7 +112,7 @@ export class BatchCausalityError extends Error {
     }
 }
 
-/** `circuit=segId[stages]` per intent, in map order; diagnostic logging only. */
+/** `circuit=segId[stages]` for each call, for logging only. */
 export function describeBatchSegments(tx: any): string {
     try {
         const intents: Map<number, any> | undefined = tx?.intents;
@@ -122,20 +124,20 @@ export function describeBatchSegments(tx: any): string {
             })
             .join(' ');
     } catch (e) {
-        return `dump failed: ${(e as Error)?.message ?? e}`;
+        return `dump failed: ${errorMessage(e)}`;
     }
 }
 
 export interface BatchOrderOptions {
-    // The calls past `orderedPrefix` are order-free: group them by stage.
+    // Calls after `orderedPrefix` do not depend on each other, so they may be grouped by stage.
     independentCalls?: boolean;
-    // Leading calls that keep their position even under `independentCalls`.
+    // Number of leading calls that keep their position even with `independentCalls`.
     orderedPrefix?: number;
 }
 
 /**
- * Reassign the matched intents' existing segment ids in call order. On any mismatch
- * returns false and leaves `tx` untouched.
+ * Give the calls the existing segment ids in call order.
+ * Returns false and leaves `tx` unchanged when the calls do not match the list.
  */
 export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: BatchOrderOptions = {}): boolean {
     const intents: Map<number, any> | undefined = tx?.intents;
@@ -184,7 +186,7 @@ export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: Bat
     return true;
 }
 
-/** Proof provider whose `proveTx` orders segments and checks causality before delegating. */
+/** Wraps a proof provider so it puts the calls in order and checks the order before proving. */
 export function withOrderedBatchSegments(
     proofProvider: any,
     circuitsInOrder: string[],
@@ -199,7 +201,7 @@ export function withOrderedBatchSegments(
                 ordered = orderBatchSegments(tx, circuitsInOrder, opts);
             } catch (err) {
                 throw new Error(
-                    `batch segment ordering failed for [${circuitsInOrder.join('+')}]: ${(err as Error)?.message ?? err}; ` +
+                    `batch segment ordering failed for [${circuitsInOrder.join('+')}]: ${errorMessage(err)}; ` +
                     'aborting before proving (nothing submitted) because the deterministic apply order cannot be guaranteed'
                 );
             }
@@ -227,7 +229,7 @@ export function withOrderedBatchSegments(
     return wrapped;
 }
 
-/** Diagnostic wrapper: logs segment ids without rewriting. */
+/** Wraps a proof provider so it only logs the segment ids and changes nothing. */
 export function withObservedBatchSegments(
     proofProvider: any,
     circuitsInOrder: string[]

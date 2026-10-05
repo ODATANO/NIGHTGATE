@@ -1,9 +1,6 @@
 /**
- * Summarises a V8 CPU profile (the `Profiler.stop` payload / a .cpuprofile
- * file) into what an operator needs from `profileWorker`: where the worker
- * thread's time went, by function and by file, without shipping megabytes
- * of raw samples over OData. Pure; the raw profile is kept on disk for a
- * DevTools deep dive.
+ * Turns a V8 CPU profile into a short summary of where a thread spent its time.
+ * The raw profile is megabytes large, so only the summary goes over OData.
  */
 export interface CpuProfileLike {
     nodes: Array<{ id: number; callFrame: { functionName: string; url: string; lineNumber: number }; children?: number[] }>;
@@ -18,11 +15,11 @@ export interface CpuProfileSummary {
     idlePercent: number;
     gcPercent: number;
     wasmPercent: number;
-    /** Self time by function: `functionName  file:line`, share of the sampled window. */
+    /** Own time per function as `functionName  file:line`, in percent of the sampled time. */
     topFunctions: Array<{ label: string; percent: number }>;
-    /** Self time by file (or native bucket). */
+    /** Own time per file. Native code is grouped by function name. */
     topFiles: Array<{ label: string; percent: number }>;
-    /** Inclusive time (a sample counts once per distinct frame on its stack). */
+    /** Time including callees. A sample counts once for each function on its stack. */
     topInclusive: Array<{ label: string; percent: number }>;
 }
 

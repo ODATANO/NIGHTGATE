@@ -1,7 +1,7 @@
 /**
- * Wallet identity (viewing key, addresses, attester id) from a mnemonic or seed, without a session.
- * Derivation must stay identical to the signing path. The seed is never logged or returned;
- * role seeds are zeroed and secret keys cleared after use.
+ * Derives a wallet's viewing key, addresses and attester id from a mnemonic or seed, without a session.
+ * The derivation must match the one used for signing.
+ * The seed is never logged or returned, and all secret material is wiped after use.
  */
 import { persistentHash, CompactTypeBytes } from '@midnight-ntwrk/compact-runtime';
 import { mnemonicToBip39SeedHex, deriveRoleSeeds, type RoleSeeds } from './wallet-hd';
@@ -9,20 +9,20 @@ import { deriveAttestationSecret } from '../submission/contract-witnesses';
 import { loadLedgerV8 } from '../midnight/sdk-loader';
 
 export interface WalletInfo {
-    viewingKey: string;      // 64-hex zswap encryption public key (connectWallet input)
-    shieldedAddress: string; // mn_shield-addr_... (receives shielded assets)
-    nightAddress: string;    // mn_addr_... unshielded NIGHT address (faucet target)
-    dustAddress: string;     // mn_dust_... DUST address (dust-generation receiver)
-    attesterId: string;      // 64-hex AttestationVault attester identity (caller_id)
+    viewingKey: string;      // shielded encryption public key, 64 hex chars, the input of connectWallet
+    shieldedAddress: string; // mn_shield-addr_..., receives shielded tokens
+    nightAddress: string;    // mn_addr_..., the unshielded NIGHT address
+    dustAddress: string;     // mn_dust_..., receives generated dust
+    attesterId: string;      // the wallet's identity in the attestation vault contract, 64 hex chars
     accountIndex: number;
     network: string;
 }
 
 export interface DeriveWalletInfoOptions {
-    mnemonic?: string;
-    seedHex?: string;        // 64-byte BIP39 seed as 128 hex chars
+    mnemonic?: string | null;
+    seedHex?: string | null; // 64-byte BIP39 seed as 128 hex chars
     accountIndex?: number;   // default 0
-    network: string;         // encoding network (preview | preprod | ...)
+    network: string;         // network the addresses are encoded for, for example preprod
 }
 
 let cachedAddressFormat: any;
@@ -39,7 +39,7 @@ async function loadUnshielded(): Promise<any> {
 
 const BIP39_SEED_HEX_RE = /^[0-9a-fA-F]{128}$/;
 
-/** Vault attester id: `persistentHash<Bytes<32>>(deriveAttestationSecret(zswapSeed))`, byte-exact to `caller_id()`. */
+/** The wallet's attester id. It is the same value the vault contract computes with `caller_id()`. */
 export function deriveAttesterId(zswapSeed: Uint8Array): string {
     const secret = deriveAttestationSecret(zswapSeed);
     try {
@@ -49,9 +49,9 @@ export function deriveAttesterId(zswapSeed: Uint8Array): string {
     }
 }
 
-/** Viewing key of one seed account; lets connectWalletForSigning refuse a seed that is not the session's. */
+/** Viewing key of one account of a seed. Used to refuse a seed that does not belong to the session. */
 export async function deriveViewingKeyForAccount(bip39SeedHex: string, accountIndex: number): Promise<string> {
-    // The finally must cover a throwing derivation, so bip39Seed is always zeroed.
+    // The seed is wiped in `finally`, even when derivation throws.
     const bip39Seed = new Uint8Array(Buffer.from(bip39SeedHex, 'hex'));
     let roleSeeds: RoleSeeds | undefined;
     try {
@@ -73,7 +73,6 @@ export async function deriveViewingKeyForAccount(bip39SeedHex: string, accountIn
     }
 }
 
-/** Validated 64-byte BIP39 seed hex from a mnemonic or seed. */
 export function resolveBip39SeedHex(opts: Pick<DeriveWalletInfoOptions, 'mnemonic' | 'seedHex'>): string {
     if (opts.mnemonic) {
         return mnemonicToBip39SeedHex(opts.mnemonic);
@@ -87,7 +86,6 @@ export function resolveBip39SeedHex(opts: Pick<DeriveWalletInfoOptions, 'mnemoni
     throw new Error('either mnemonic or seedHex (64-byte BIP39 seed, 128 hex chars) is required');
 }
 
-/** Viewing key, addresses and attester id of a wallet account. */
 export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<WalletInfo> {
     const accountIndex = opts.accountIndex ?? 0;
     if (!Number.isInteger(accountIndex) || accountIndex < 0) {
@@ -96,7 +94,7 @@ export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<W
     if (!opts.network) throw new Error('network is required');
 
     const bip39SeedHex = resolveBip39SeedHex(opts);
-    // The finally must cover a throwing derivation, so bip39Seed is always zeroed.
+    // The seed is wiped in `finally`, even when derivation throws.
     const bip39Seed = new Uint8Array(Buffer.from(bip39SeedHex, 'hex'));
     let roleSeeds: RoleSeeds | undefined;
     try {
@@ -122,7 +120,7 @@ export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<W
         const keystore = unshielded.createKeystore(roleSeeds.night, opts.network);
         const nightAddress: string = unshielded.PublicKey.fromKeyStore(keystore).address;
 
-        // The `dustReceiverAddress` when another wallet sponsors this wallet's dust generation.
+        // Another wallet that generates dust for this one sends it to this address.
         const dustKey = ledger.DustSecretKey.fromSeed(roleSeeds.dust);
         let dustAddress: string;
         try {
@@ -131,7 +129,7 @@ export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<W
             dustKey.clear?.();
         }
 
-        // Network-independent; known before the wallet's first on-chain call.
+        // The same on every network, and known before the wallet's first transaction.
         const attesterId = deriveAttesterId(roleSeeds.zswap);
 
         return { viewingKey, shieldedAddress, nightAddress, dustAddress, attesterId, accountIndex, network: opts.network };

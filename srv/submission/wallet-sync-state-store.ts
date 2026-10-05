@@ -1,7 +1,7 @@
 /**
- * Encrypted `serializeState()` snapshots of the three sub-wallets. Blobs must stay strings
- * end to end: a Uint8Array fed back into `restore(...)` fails the SDK deserializer.
- * All DB writes run through one global chain; encryption stays outside it.
+ * Stores encrypted snapshots of the three sub-wallets so a wallet can resume its sync.
+ * Snapshots must stay strings: the SDK cannot restore from a Uint8Array.
+ * All database writes run one after another in a single queue.
  */
 
 import crypto from 'crypto';
@@ -14,12 +14,12 @@ import { resolveAccountDek, syncStatePassphraseFromDek, clearAllAccountDeks, DEK
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { isLockContention } from './db-write-retry';
 import { configFlag } from '../utils/config';
+import { errorMessage } from '../utils/errors';
 const log = cds.log('nightgate:sync');
 
 const DEBUG_SYNC = configFlag('NIGHTGATE_DEBUG_WALLET_SYNC');
 const dbgSync = (msg: string): void => { if (DEBUG_SYNC) log.debug(msg); };
 
-/** Sub-state strings from `serializeState()`, passed back to `restore(...)` unchanged. */
 export interface SerializedWalletStates {
     shielded?: string | null;
     unshielded?: string | null;
@@ -47,7 +47,6 @@ export interface LoadedSyncState {
     shielded?: string;
     unshielded?: string;
     dust?: string;
-    /** Row updatedAt of the snapshot. */
     savedAt?: string | null;
 }
 
@@ -64,15 +63,15 @@ async function getDb(): Promise<cds.DatabaseService> {
     return dbPromise;
 }
 
-// ---- Memoized per-account encryption --------------------------------------
+// ---- Per-account encryption keys -------------------------------------------
 
 /**
- * One async PBKDF2 per (accountId, passphrase) per process. The salt is deterministic, which is
- * safe only because the passphrase is a high-entropy per-account secret; blobs still carry it.
- * Keys are zeroed on disconnect and shutdown, so the cache holds connected wallets only.
+ * The encryption key is derived once per account and passphrase, then cached.
+ * A fixed salt is safe here because the passphrase is a strong per-account secret.
+ * Keys are wiped on disconnect and shutdown.
  */
 interface EncryptionCacheEntry {
-    /** Hash of (accountId, effective passphrase) so a changed passphrase or key re-derives. */
+    /** Hash of account id and passphrase. A changed passphrase derives a new key. */
     passHash: string;
     pending: Promise<StorageEncryption>;
 }
@@ -80,20 +79,20 @@ interface EncryptionCacheEntry {
 const encryptionCache = new Map<string, EncryptionCacheEntry>();
 
 /**
- * Blobs are written under a passphrase from the account DEK (account-keys.ts). Legacy blobs
- * (label v2 = ring key + passphrase, v1 = passphrase only) stay readable and are rewritten at the next save.
+ * New snapshots are encrypted with a passphrase from the account's data key (account-keys.ts).
+ * Snapshots in the two older formats stay readable and are re-encrypted at the next save.
  */
 const SYNC_STATE_INFO = 'nightgate/sync-state/v2';
 const SALT_LABEL_V1 = 'nightgate-wallet-sync-salt-v1';
 const SALT_LABEL_V2 = 'nightgate-wallet-sync-salt-v2';
-/** Blobs under the account DEK (account-keys.ts); the row is marked `keyScheme = 'dek1'`. */
+/** Salt label for snapshots under the account data key. Such rows have `keyScheme = 'dek1'`. */
 export const SALT_LABEL_DEK = 'nightgate-wallet-sync-salt-dek1';
 
 function boundPassphrase(ring: KeyRing, keyId: string, passphrase: string): string {
     return deriveBoundSecret(ring, keyId, passphrase, SYNC_STATE_INFO).toString('hex');
 }
 
-/** Salt in the blob header: names the derivation the blob was written with. */
+/** The salt stored in a snapshot's header. It tells which key derivation wrote the snapshot. */
 export function deriveStableSalt(accountId: string, passphrase: string, label: string = SALT_LABEL_V2): Buffer {
     return crypto
         .createHash('sha256')
@@ -101,7 +100,7 @@ export function deriveStableSalt(accountId: string, passphrase: string, label: s
         .digest();
 }
 
-/** Read-only legacy passphrases of a blob (ring keys, active first, then pre-ring); shared with the rewrap tool. */
+/** Older passphrases a snapshot may be encrypted with, for reading only. The re-encryption tool uses it too. */
 export function syncStatePassphraseCandidates(ring: KeyRing, passphrase: string): Array<{ keyId: string | null; passphrase: string; label: string; legacy: boolean }> {
     const out = [ring.activeId, ...ring.ids().filter(i => i !== ring.activeId)].map(id => ({
         keyId: id as string | null, passphrase: boundPassphrase(ring, id, passphrase), label: SALT_LABEL_V2, legacy: false
@@ -122,14 +121,14 @@ function getEncryption(accountId: string, passphrase: string): Promise<StorageEn
     }
     const pending = StorageEncryption.createAsync(passphrase, deriveStableSalt(accountId, passphrase, SALT_LABEL_DEK));
     encryptionCache.set(accountId, { passHash, pending });
-    // A failed derivation must not poison the cache.
+    // A failed key derivation must not stay cached.
     pending.catch(() => {
         if (encryptionCache.get(accountId)?.pending === pending) encryptionCache.delete(accountId);
     });
     return pending;
 }
 
-// Key eviction waits for these: zeroing mid-encrypt would persist undecryptable blobs.
+// Wiping a key waits for these saves. Wiping it mid-encrypt would store unreadable snapshots.
 const inFlightSaves = new Map<string, Set<Promise<void>>>();
 
 function trackInFlightSave(accountId: string, p: Promise<void>): void {
@@ -149,7 +148,7 @@ function trackInFlightSave(accountId: string, p: Promise<void>): void {
     p.then(untrack, untrack);
 }
 
-/** Zero and drop an account's memoized storage key, after its in-flight saves settle. */
+/** Wipes an account's cached key once its running saves have finished. */
 export async function evictEncryptionKey(accountId: string): Promise<void> {
     const pending = inFlightSaves.get(accountId);
     if (pending && pending.size > 0) await Promise.allSettled([...pending]);
@@ -159,27 +158,25 @@ export async function evictEncryptionKey(accountId: string): Promise<void> {
     try {
         (await hit.pending).clear();
     } catch {
-        // Derivation failed; there is no key to zero.
+        // No key was derived, so there is nothing to wipe.
     }
 }
 
-/** Zeroes and drops ALL memoized storage keys (plugin shutdown). */
 export async function clearAllEncryptionKeys(): Promise<void> {
     await Promise.allSettled([...encryptionCache.keys()].map(evictEncryptionKey));
     clearAllAccountDeks();
 }
 
-// ---- Global persist chain -------------------------------------------------
+// ---- Write queue ----------------------------------------------------------
 
 let saveChain: Promise<void> = Promise.resolve();
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// The upsert is idempotent, so write contention is retried in place.
+// Writing the same row twice is harmless, so a write blocked by a lock is simply retried.
 const SAVE_ATTEMPTS = 3;
 const SAVE_BACKOFF_MS = [0, 1500, 4000];
 
-/** Encrypt and upsert the sub-states; serialized through the global chain. */
 export function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
     const p = saveSyncStateInner(args);
     if (args.accountId) trackInFlightSave(args.accountId, p);
@@ -195,7 +192,7 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
     const db = await getDb();
 
     const callId = Math.random().toString(36).slice(2, 8);
-    // Encryption of multi-MB blobs stays outside the chain.
+    // Encrypt before queueing, so large snapshots do not hold up other writes.
     dbgSync(`${callId} resolving encryption key`);
     const t0 = Date.now();
     const ring = getEncryptionKey();
@@ -208,8 +205,8 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
     const dustCipher = states.dust ? enc.encrypt(states.dust) : null;
     dbgSync(`${callId} encrypt done in ${Date.now() - t0}ms`);
 
-    // The row is marked `dek1` as a whole, so untouched legacy blobs are re-encrypted
-    // and unreadable ones dropped (that sub-wallet re-syncs).
+    // The whole row is marked `dek1`, so older snapshots kept from the row are re-encrypted.
+    // Unreadable ones are dropped and that sub-wallet syncs again.
     const carry = (blob: string | null | undefined): string | null => {
         if (!blob) return null;
         const plain = decryptSyncBlob(accountId, blob, passphrase, ring, dekPassphrase);
@@ -268,7 +265,7 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
                 return;
             } catch (e) {
                 lastErr = e;
-                const msg = String((e as Error)?.message ?? e);
+                const msg = errorMessage(e);
                 if (!isLockContention(e)) throw e;
                 dbgSync(`${callId} write contention (attempt ${attempt + 1}): ${msg.slice(0, 60)}`);
             }
@@ -278,12 +275,12 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
 
     dbgSync(`${callId} queued (accountId=${accountId.slice(0, 16)})`);
     const next = saveChain.then(work, work);
-    // One failed save must not wedge the chain.
+    // A failed save must not block the saves queued after it.
     saveChain = next.catch(() => undefined);
     await next;
 }
 
-/** Load and decrypt an account's sub-states; null (cold start) on any mismatch or unreadable blob. */
+/** Loads and decrypts an account's snapshots. Returns null on any mismatch, and the wallet syncs from scratch. */
 export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSyncState | null> {
     const { accountId, passphrase, expectedSdkVersion, expectedNetworkId, expectedSeedFingerprint } = args;
     if (!accountId) throw new Error('loadSyncState: accountId is required');
@@ -316,13 +313,13 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
     }
 
     const ring = getEncryptionKey();
-    // A load never creates the DEK.
+    // Loading never creates the account data key.
     let dekPassphrase: string | undefined;
     try {
         const dek = await resolveAccountDek({ db, ring, accountId, storagePassword: passphrase, create: false });
         if (dek) dekPassphrase = syncStatePassphraseFromDek(dek, accountId);
     } catch (err) {
-        log.warn(`sync state for ${accountId.slice(0, 16)}: ${String((err as Error)?.message ?? err)}; starting from a cold sync`);
+        log.warn(`sync state for ${accountId.slice(0, 16)}: ${errorMessage(err)}; starting from a cold sync`);
         return null;
     }
     const result: LoadedSyncState = { savedAt: row.updatedAt ?? null };
@@ -344,8 +341,8 @@ const legacyBlobNoted = new Set<string>();
 const unreadableBlobNoted = new Set<string>();
 
 /**
- * Open one blob; its header salt selects the derivation (DEK, then legacy). Null means
- * no cached state, never a crash. `underDek`: the blob may be carried over unchanged.
+ * Decrypts one snapshot. The salt in its header picks the key. Returns null when it cannot be read.
+ * `underDek` means the snapshot already uses the current format and can be kept as is.
  */
 function decryptSyncBlob(accountId: string, blob: string, passphrase: string, ring: KeyRing, dekPassphrase?: string): { text: string; underDek: boolean } | null {
     let salt: Buffer;
@@ -377,7 +374,6 @@ function decryptSyncBlob(accountId: string, blob: string, passphrase: string, ri
     return null;
 }
 
-/** Installed wallet-sdk-facade version, pinned at first call. */
 let resolvedSdkVersion: string | undefined;
 
 export function getWalletSdkVersion(): string {
@@ -387,7 +383,7 @@ export function getWalletSdkVersion(): string {
         const fs = require('fs');
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const path = require('path');
-        // The package's `exports` map blocks require.resolve() of package.json; walk the resolution paths.
+        // The package does not export its package.json, so search the module paths by hand.
         let pkgPath: string | undefined;
         const searchDirs = require.resolve.paths('@midnightntwrk/wallet-sdk-facade') ?? [];
         for (const dir of searchDirs) {
@@ -408,7 +404,7 @@ export function __resetDbHandleForTests(): void {
     dbPromise = null;
 }
 
-/** Test-only: synchronously drop all memoized derived keys (zeroing async). */
+/** Test-only: drop all cached keys. The wipe itself runs in the background. */
 export function __resetEncryptionCacheForTests(): void {
     for (const { pending } of encryptionCache.values()) {
         void pending.then(e => e.clear()).catch(() => undefined);
@@ -416,7 +412,7 @@ export function __resetEncryptionCacheForTests(): void {
     encryptionCache.clear();
 }
 
-/** Test-only: number of memoized derived keys. */
+/** Test-only: number of cached keys. */
 export function __getEncryptionCacheSizeForTests(): number {
     return encryptionCache.size;
 }

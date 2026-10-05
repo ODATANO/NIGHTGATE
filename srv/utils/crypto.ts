@@ -1,8 +1,9 @@
 /**
- * At-rest envelope encryption. Ring secrets are HKDF-stretched into KEKs (`ENCRYPTION_KEY` = id `1`).
- * `v3|v2:<keyId>:<wrappedDek>:<iv>:<tag>:<data>`: a fresh DEK per value, wrapped by the KEK; the AAD of
- * both layers is the key id (v2) or key id + purpose + subject (v3). Persisted values are always v3;
- * v2 and legacy v1 (`iv:tag:data`, id `1` only) are read and rewritten by `nightgate-rewrap-keys`.
+ * Encryption of secrets stored in the database.
+ * Each value gets its own random data key, which is itself encrypted with a master key from the key ring.
+ * Several master keys can exist at once, so they can be rotated. `ENCRYPTION_KEY` is the key with id `1`.
+ * New values use format v3, which also binds the value to its column and row.
+ * Older v1 and v2 values can still be read and are converted by `nightgate-rewrap-keys`.
  */
 
 import crypto from 'crypto';
@@ -13,8 +14,8 @@ import { configFlag } from './config';
 const log = cds.log('nightgate:crypto');
 
 const ALGORITHM = 'aes-256-gcm';
-const IV_LENGTH = 12;        // 96 bits, recommended for GCM
-const AUTH_TAG_LENGTH = 16;  // 128 bits
+const IV_LENGTH = 12;
+const AUTH_TAG_LENGTH = 16;
 const DEK_LENGTH = 32;
 const KEK_LENGTH = 32;
 const WRAPPED_DEK_LENGTH = IV_LENGTH + AUTH_TAG_LENGTH + DEK_LENGTH;
@@ -25,17 +26,14 @@ export const LEGACY_KEY_ID = '1';
 /** Secrets shorter than this are refused in production and warned about elsewhere. */
 export const MIN_SECRET_LENGTH = 32;
 
-/** Purpose and row subject of a v3 ciphertext; both enter the AAD, so it cannot be moved or relabelled. */
+/** What a v3 value belongs to. A value copied to another column or row will not decrypt. */
 export interface EnvelopeBinding {
-    /** Kind of material, e.g. `wallet-session/viewing-key`. */
     purpose: string;
-    /** Row identity, e.g. the session id or the job id. */
     subject: string;
 }
 export const KEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,16}$/;
 const KEK_INFO = 'nightgate/kek/v2';
 
-/** Thrown when a ciphertext names a key id the ring does not hold. */
 export class UnknownEncryptionKeyError extends NightgateError {
     readonly keyId: string;
     constructor(keyId: string) {
@@ -44,18 +42,17 @@ export class UnknownEncryptionKeyError extends NightgateError {
     }
 }
 
-/** Serializable ring definition (secrets included): env parse result and worker transport. */
+/** The key ring as plain data, secrets included. Used to pass it to the worker thread. */
 export interface KeyRingSpec {
     activeId: string;
     keys: Array<{ id: string; secret: string }>;
 }
 
-/** Derive the KEK for one ring member. */
 export function deriveKek(id: string, secret: string): Buffer {
     return Buffer.from(crypto.hkdfSync('sha256', secret, id, KEK_INFO, KEK_LENGTH));
 }
 
-/** The v1 key: SHA-256 fold of the secret, no stretching. Reads v1 ciphertexts only. */
+/** The key of the old v1 format. Only used to read v1 values. */
 export function legacyFold(secret: string): Buffer {
     return crypto.createHash('sha256').update(secret).digest();
 }
@@ -80,7 +77,7 @@ export class KeyRing {
         this.spec = { activeId: spec.activeId, keys: spec.keys.map(k => ({ ...k })) };
     }
 
-    /** A ring made of one raw KEK under id `1` (tests, callers holding a Buffer). */
+    /** A ring with a single ready-made key under id `1`. */
     static fromKek(kek: Buffer): KeyRing {
         if (kek.length !== KEK_LENGTH) throw new Error(`encryption key must be ${KEK_LENGTH} bytes, got ${kek.length}`);
         const ring = Object.create(KeyRing.prototype) as KeyRing;
@@ -100,10 +97,9 @@ export class KeyRing {
         return k;
     }
 
-    /** The v1 key for `id`; only id `1` has one. */
     legacyKey(id: string): Buffer | undefined { return this.legacyKeys.get(id); }
 
-    /** Ring definition for transport into the worker thread (`workerData`); undefined for a raw-KEK ring. */
+    /** The ring as plain data for the worker thread. Undefined for a ring built by `fromKek`. */
     toSpec(): KeyRingSpec | undefined {
         return this.spec ? { activeId: this.spec.activeId, keys: this.spec.keys.map(k => ({ ...k })) } : undefined;
     }
@@ -115,9 +111,7 @@ function asRing(key: EncryptionKey): KeyRing {
     return Buffer.isBuffer(key) ? KeyRing.fromKek(key) : key;
 }
 
-// ---- Ring resolution ---------------------------------------------------------
-
-/** Parse the ring from the environment; undefined when no key is set. */
+/** Reads the key ring from the environment. Undefined when no key is set. */
 export function parseKeyRingSpec(env: NodeJS.ProcessEnv = process.env): KeyRingSpec | undefined {
     const keys: Array<{ id: string; secret: string }> = [];
     const list = String(env.ENCRYPTION_KEYS ?? '').trim();
@@ -151,19 +145,18 @@ let pinnedRing: KeyRing | undefined;
 let cachedRing: { snapshot: string; ring: KeyRing } | undefined;
 let devFallback: KeyRing | undefined;
 
-/** Pin the ring; the worker thread receives it from the main thread and never parses its env. */
+/** Sets the key ring directly. The worker thread gets it this way from the main thread. */
 export function setKeyRing(spec: KeyRingSpec | undefined): void {
     pinnedRing = spec ? new KeyRing(spec) : undefined;
 }
 
 /**
- * Resolve the process key ring: pinned ring, else environment, else (never
- * in production) a random per-process dev key that no restart can reproduce.
+ * Returns the key ring: the one set by `setKeyRing`, else the one from the environment.
+ * Outside production, without any key, a random key is used. Its data is unreadable after a restart.
  */
 export function getEncryptionKey(): KeyRing {
     if (pinnedRing) return pinnedRing;
-    // Resolve the profile first: touching cds.env loads the project's .env
-    // into process.env, which the snapshot below must already see.
+    // Must run first: reading cds.env loads the project's .env file into process.env.
     const production = isProduction();
     const snapshot = `${process.env.ENCRYPTION_KEYS ?? ''}\u0000${process.env.ENCRYPTION_KEY_ACTIVE ?? ''}\u0000${process.env.ENCRYPTION_KEY ?? ''}`;
     if (cachedRing && cachedRing.snapshot === snapshot) return cachedRing.ring;
@@ -189,20 +182,18 @@ export function getEncryptionKey(): KeyRing {
     return devFallback;
 }
 
-/** Test-only: drop the memoized rings. */
 export function __resetKeyRingForTests(): void {
     pinnedRing = undefined;
     cachedRing = undefined;
     devFallback = undefined;
 }
 
-// ---- Envelope ----------------------------------------------------------------
-
 function aad(keyId: string): Buffer {
     return Buffer.from(`${ENVELOPE_VERSION}:${keyId}`, 'utf8');
 }
 
-/** v3 AAD: version, key id, purpose and subject, NUL-separated so no field can absorb another. */
+// Fields are separated by NUL, so one field cannot spill into the next.
+
 function boundAad(keyId: string, binding: EnvelopeBinding): Buffer {
     return Buffer.from([BOUND_ENVELOPE_VERSION, keyId, binding.purpose, binding.subject].join('\u0000'), 'utf8');
 }
@@ -233,7 +224,7 @@ function gcmDecrypt(key: Buffer, iv: Buffer, tag: Buffer, data: Buffer, associat
     return Buffer.concat([decipher.update(data), decipher.final()]);
 }
 
-/** Encrypt under the active key: v3 with a binding, v2 without. Persisted material always passes a binding. */
+/** Encrypts with the active key. Always pass a binding for values stored in the database. */
 export function encrypt(plaintext: string, key: EncryptionKey, binding?: EnvelopeBinding): string {
     const ring = asRing(key);
     const keyId = ring.activeId;
@@ -266,7 +257,7 @@ export function inspectCiphertext(combined: string): { version: 1 | 2 | 3; keyId
     throw new Error('Invalid encrypted format: expected v3|v2:keyId:wrappedDek:iv:authTag:ciphertext or iv:authTag:ciphertext');
 }
 
-/** A v1/v2 ciphertext where a bound (v3) one belongs: a row copied from elsewhere would pass as its own. */
+/** An old unbound value where a bound one is expected. Accepting it would let a value copied from another row pass. */
 export class UnboundEnvelopeError extends Error {
     constructor(purpose: string) {
         super(`ciphertext for '${purpose}' is an unbound v1/v2 envelope; run nightgate-rewrap-keys (or set NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES=true until it ran)`);
@@ -275,9 +266,8 @@ export class UnboundEnvelopeError extends Error {
 }
 
 /**
- * Decrypt v3 (needs its binding), v2 or v1. With a binding, v1/v2 are refused unless
- * `allowUnbound` (the rewrap migration) or NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES says otherwise.
- * Throws on authentication failure or an unknown key id.
+ * Decrypts any format. When a binding is given, old unbound values are refused,
+ * unless `allowUnbound` or NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES allows them.
  */
 export function decrypt(combined: string, key: EncryptionKey, binding?: EnvelopeBinding, opts: { allowUnbound?: boolean } = {}): string {
     const ring = asRing(key);
@@ -315,13 +305,12 @@ export function decrypt(combined: string, key: EncryptionKey, binding?: Envelope
     }
 }
 
-/** HKDF of ring key `keyId` and caller material, so the material alone opens nothing. */
+/** Derives a secret from a ring key and the given material. The material alone is not enough to get it. */
 export function deriveBoundSecret(ring: KeyRing, keyId: string, material: string, info: string): Buffer {
     const ikm = Buffer.concat([ring.kek(keyId), Buffer.from(material, 'utf8')]);
     return Buffer.from(crypto.hkdfSync('sha256', ikm, keyId, info, 32));
 }
 
-/** SHA-256 hex of a viewing key, for lookup and dedup. */
 export function hashViewingKey(viewingKey: string): string {
     return crypto.createHash('sha256').update(viewingKey).digest('hex');
 }

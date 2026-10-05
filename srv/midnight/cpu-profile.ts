@@ -1,9 +1,7 @@
 /**
- * Sample the CURRENT thread's V8 isolate for `seconds` with the in-thread
- * inspector, while the thread keeps running its event loop, and return the
- * summary (`cpu-profile-summary.ts`) plus heap and GC figures for the same
- * window. Used by the worker's `cpuProfile` RPC and by the admin action for
- * the main thread. The raw profile is written under `dir` for DevTools.
+ * Profiles the current thread for a few seconds while it keeps working.
+ * Returns a CPU summary plus heap and garbage collection figures.
+ * The raw profile is saved to disk so it can be opened in DevTools.
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -25,7 +23,7 @@ export interface HeapFigures {
 export interface GcFigures {
     count: number;
     totalMs: number;
-    /** perf_hooks GC kinds: minor (scavenge), major (mark-compact), incremental, weakcb. */
+    /** Time per garbage collection kind as reported by perf_hooks. */
     byKind: Record<string, { count: number; ms: number }>;
 }
 
@@ -57,7 +55,7 @@ const GC_KIND: Record<number, string> = { 1: 'minor', 2: 'major', 4: 'incrementa
 /** Where profiles are written; `dir` may only name a folder inside it. */
 export const PROFILE_ROOT = path.join(os.tmpdir(), 'nightgate-profiles');
 
-/** `dir` resolved inside PROFILE_ROOT, the root itself when empty, null when it leaves the root. */
+/** Resolves `dir` inside PROFILE_ROOT. Empty means the root itself. Returns null for a path outside the root. */
 export function resolveProfileDir(dir: string | null | undefined): string | null {
     if (!dir || !dir.trim()) return PROFILE_ROOT;
     const resolved = path.resolve(PROFILE_ROOT, dir.trim());

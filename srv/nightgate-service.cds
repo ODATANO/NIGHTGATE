@@ -1,6 +1,12 @@
 using {midnight} from '../db/schema';
+using { Hex64 } from '../db/types';
 
-/** Midnight chain data, attestations and proofs, wallet sessions, async submission jobs. */
+/**
+ * Midnight chain data, attestations, zero-knowledge proofs, wallet sessions and transaction jobs.
+ * Actions that write to the chain return a `jobId`. Poll `getJobStatus` for the result.
+ * A retry with the same `idempotencyKey` returns the first job. `sponsorSessionId` is a second session that pays the fee.
+ * Amounts are decimal strings in the smallest unit.
+ */
 @path    : '/api/v1/nightgate'
 @requires: 'authenticated-user'
 service NightgateService {
@@ -52,8 +58,6 @@ service NightgateService {
     @readonly
     entity TransactionFees       as projection on midnight.TransactionFees;
 
-    // ---- Smart contracts ----
-
     @readonly
     entity ContractActions       as
         projection on midnight.ContractActions {
@@ -72,19 +76,19 @@ service NightgateService {
     @readonly
     entity ContractBalances      as projection on midnight.ContractBalances;
 
-    /** A contract state as of a block; state and zswapState base64. */
+    /** The state of a contract at a block. `state` and `zswapState` are base64. */
     type ContractStateSnapshot {
         address        : String;
-        height         : Integer64; // block of the action the state comes from; null if unknown locally
+        height         : Integer64; // null if not known locally
         state          : LargeString;
         zswapState     : LargeString;
         stateHash      : String;
         zswapStateHash : String;
         source         : String(10); // history | current | indexer
-        verified       : Boolean; // indexer only: matches the hash stored for that action
+        verified       : Boolean; // only for source indexer: the state matches the hash stored on chain
     }
 
-    /** The newest state per contract. */
+    /** The newest state of each contract. */
     @readonly
     entity ContractStates        as
         projection on midnight.ContractStates {
@@ -92,12 +96,10 @@ service NightgateService {
             contractAction
         }
         actions {
-            // height: the state after the contract's newest action at or below it; omitted = current
+            // height: optional, default the current state
             @cds.odata.bindingparameter.collection
             function stateAt(address: String, height: Integer64) returns ContractStateSnapshot;
         };
-
-    // ---- UTXOs ----
 
     @readonly
     entity UnshieldedUtxos       as
@@ -114,15 +116,11 @@ service NightgateService {
             function unspent()              returns array of UnshieldedUtxos;
         };
 
-    // ---- Ledger events ----
-
     @readonly
     entity ZswapLedgerEvents     as projection on midnight.ZswapLedgerEvents;
 
     @readonly
     entity DustLedgerEvents      as projection on midnight.DustLedgerEvents;
-
-    // ---- Balances ----
 
     /** Unshielded NIGHT balance per address. */
     @readonly
@@ -135,9 +133,7 @@ service NightgateService {
             function getTopHolders(limit: Integer) returns array of NightBalances;
         };
 
-    // ---- Submissions ----
-
-    /** Submissions made by this instance; the crawler marks them `finalized` once indexed. */
+    /** Transactions this server submitted. They become `finalized` once the server has indexed their block. */
     @readonly
     entity PendingSubmissions    as
         projection on midnight.PendingSubmissions
@@ -145,558 +141,483 @@ service NightgateService {
             submitIntentData
         };
 
-    // ---- Document anchoring ----
+    // ---- Documents ----
 
-    /** Anchored documents, owner-scoped. */
+    /** Documents whose hash was recorded on chain. Each user sees only their own. */
     @readonly
     entity Documents             as projection on midnight.Documents;
 
     /**
-     * Anchor a document hash and public metadata (vault `attest`) under
-     * `recordKey(attesterId, sha256)` of the session's attester, which no other
-     * identity can take over. The bytes at `storageRef` are the caller's job.
-     * Async; the Documents row exists at once. Job result
-     * `{ documentId, attestationId, attesterId, txHash, anchoredAt }`.
+     * Records a document hash and its public metadata on chain, signed by the session's wallet.
+     * The server does not store the document itself. Keeping the bytes at `storageRef` is up to you.
      */
-    action   anchorDocument(sha256: String,
+    action   anchorDocument(sha256: Hex64,
                             contentType: String,
                             size: Integer64,
                             storageRef: String,
                             metadata: LargeString, // JSON
                             sessionId: UUID,
-                            contractAddress: String, // AttestationVault deployment to anchor into
-                            compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                            idempotencyKey: String, // optional; dedupes retries
-                            sponsorSessionId: UUID // optional; second session pays the dust fee
-    )                                                                 returns {
+                            contractAddress: String,
+                            compiledArtifactRef: String, // optional, default 'attestation-vault'
+                            idempotencyKey: String, // optional
+                            sponsorSessionId: UUID // optional
+    )                                                                         returns {
         jobId      : UUID;
-        status     : String; // 'pending' | 'succeeded' (idempotent retry)
-        documentId : UUID; // Documents row handle
-        attesterId : String; // 64 hex; with sha256 names the on-chain record
+        status     : String;
+        documentId : UUID;
+        attesterId : Hex64;
     };
 
-    /**
-     * Check `providedSha256` against an anchored document. Invalid input:
-     * 400/404; mismatch or unconfirmed anchor: `verified: false`. Evidence is
-     * the indexed tx, or live vault state (recorded vault, else `contractAddress`).
-     */
+    /** Checks a hash against a recorded document. A mismatch or a record not yet on chain gives `verified: false`. */
     function verifyDocument(documentId: UUID,
-                            providedSha256: String,
-                            contractAddress: String, // optional; enables the live-state check for unrecorded rows
-                            compiledArtifactRef: String // optional, defaults to 'attestation-vault'
-    )                                                                 returns {
-        verified       : Boolean; // attestation stands in live state; without a live provider: included
-        included       : Boolean; // anchoring tx indexed as SUCCESS
-        stateChecked   : Boolean; // false = verdict from the index only
+                            providedSha256: Hex64,
+                            contractAddress: String, // optional; needed only for rows without a stored contract
+                            compiledArtifactRef: String // optional, default 'attestation-vault'
+    )                                                                         returns {
+        verified       : Boolean;
+        included       : Boolean;
+        stateChecked   : Boolean; // false means the answer comes from the local index, not from the contract state
         anchoredTxHash : String;
         anchoredAt     : Timestamp;
-        originalSha256 : String; // the recorded hash on a match, else ''
+        originalSha256 : String; // empty unless the hash matches
     };
 
-    // ---- ZK predicate attestations ----
+    // ---- Zero-knowledge proofs about document fields ----
+    // The inputs come from prepareDocumentProof: payloadHash, contentRoot, schemaId, fieldKey, fieldSalt, siblingsJson, dirsJson.
+    // A contentRoot passed here is recorded on chain first, under the session's own attester only.
 
-    /** Rows from the issue* actions; `provenTxHash`/`provenAt` set on inclusion. Claims are root-bound and immutable. */
+    /** Proofs created by the issue* actions. `provenTxHash` and `provenAt` are set once the proof is on chain. */
     @readonly
     entity PredicateAttestations as projection on midnight.PredicateAttestations;
 
-    /**
-     * Prove the value at `fieldKey` of an anchored content root satisfies
-     * `predicate` against `threshold` (vault `proveFieldPredicate`, Merkle
-     * inclusion). A given `contentRoot` is anchored first. `value` and
-     * `fieldSalt` stay witness, never persisted. Async.
-     */
-    action   issueFieldPredicateAttestation(payloadHash: String, // attestation payload_hash (64 hex)
-                                            attesterId: String, // optional 64 hex; record owner, default the session (contentRoot anchors only under the session's own record)
-                                            fieldKey: String, // 64 hex canonical field id (public)
-                                            value: String, // scaled integer, decimal string (witness only)
-                                            fieldSalt: String, // 64-hex slot salt from prepareDocumentProof (witness)
-                                            contentRoot: String, // optional 64-hex Merkle root to anchor first
-                                            schemaId: String, // 64-hex schema id, required with contentRoot
-                                            siblingsJson: String, // JSON array of 64-hex siblings; depth 4 (width 16) or 5 (width 32)
-                                            dirsJson: String, // JSON array of left-child flags, one per level
+    /** Proves that a numeric document field is at most or at least `threshold`, without revealing the value. */
+    action   issueFieldPredicateAttestation(payloadHash: Hex64,
+                                            attesterId: Hex64, // optional, default the session's attester
+                                            fieldKey: Hex64,
+                                            value: String, // decimal integer, scaled like the prepared field
+                                            fieldSalt: Hex64,
+                                            contentRoot: Hex64, // optional
+                                            schemaId: Hex64, // required with contentRoot
+                                            siblingsJson: String, // JSON array of 64 hex
+                                            dirsJson: String, // JSON array of booleans
                                             predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
-                                            threshold: Integer64, // scaled integer
-                                            unit: String, // optional, informational
+                                            threshold: Integer64, // scaled like the value
+                                            unit: String, // optional
                                             sessionId: UUID,
-                                            contractAddress: String, // AttestationVault deployment
-                                            compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                                            idempotencyKey: String, // optional; dedupes retries
-                                            sponsorSessionId: UUID, // optional; second session pays the dust fee
-                                            validUntil: Integer64 // optional expiry, UNIX seconds; default +1 year (NIGHTGATE_CLAIM_LIFETIME_S), max 5 years
-    )                                                                 returns {
+                                            contractAddress: String,
+                                            compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                            idempotencyKey: String, // optional
+                                            sponsorSessionId: UUID, // optional
+                                            validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+    )                                                                         returns {
         jobId                  : UUID;
         status                 : String;
         predicateAttestationId : UUID;
     };
 
     /**
-     * Prove up to 8 claims on one payload in ONE transaction (7 when
-     * `contentRoot` is anchored in the same batch). `claimsJson` entries,
-     * by `predicate`, each validated like its single action:
-     *   lessOrEqual|greaterOrEqual: `{ fieldKey, value, siblings, dirs, threshold, unit? }`
-     *   bytesEquality: `{ fieldKey, expectedValue|expectedDigest, siblings, dirs }`
-     *   setMembership: `{ fieldKey, value|valueDigest, allowedValues | setRoot+setSiblings+setDirs, siblings, dirs }`
-     *   documentIntegrity|documentDiff: `{ payloadHashB, attesterIdB?, allowedMask|k, schema, openingA, openingB }`
-     * Cross-root: document A = `payloadHash`, B's root must be anchored already.
-     * Duplicate claims are dropped (`droppedDuplicates`). A false claim fails at
-     * local proving, nothing submitted; PARTIAL_SUCCESS on chain fails the job,
-     * so verify per claim. Rate limit counts claims. Async.
+     * Proves up to 8 claims about one document in a single transaction, 7 if `contentRoot` is given.
+     * Each entry in `claimsJson` has the inputs of the matching single action, selected by `predicate`.
+     * If only part of the transaction succeeds on chain, the job fails. Then verify each claim on its own.
      */
-    action   issueFieldPredicateAttestationBatch(payloadHash: String, // shared attestation payload_hash (64 hex)
-                                                 attesterId: String, // optional 64 hex; record owner, default the session (contentRoot anchors only under the session's own record)
-                                                 contentRoot: String, // optional 64-hex Merkle root, anchored in-batch first
-                                                 schemaId: String, // 64-hex schema id (required with contentRoot)
-                                                 claimsJson: LargeString, // JSON array of claims
+    action   issueFieldPredicateAttestationBatch(payloadHash: Hex64,
+                                                 attesterId: Hex64, // optional, default the session's attester
+                                                 contentRoot: Hex64, // optional
+                                                 schemaId: Hex64, // required with contentRoot
+                                                 claimsJson: LargeString, // JSON array
                                                  sessionId: UUID,
-                                                 contractAddress: String, // AttestationVault deployment
-                                                 compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                                                 idempotencyKey: String, // optional; dedupes retries
-                                                 sponsorSessionId: UUID, // optional; second session pays the dust fee
-                                                 validUntil: Integer64 // optional expiry, UNIX seconds; default +1 year (NIGHTGATE_CLAIM_LIFETIME_S), max 5 years
-    )                                                                 returns {
+                                                 contractAddress: String,
+                                                 compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                                 idempotencyKey: String, // optional
+                                                 sponsorSessionId: UUID, // optional
+                                                 validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+    )                                                                         returns {
         jobId             : UUID;
         status            : String;
-        claims            : LargeString; // JSON array of { predicateAttestationId, fieldKey, predicate, threshold, unit }, submission order
+        claims            : LargeString; // JSON array
         droppedDuplicates : Integer;
     };
 
     /**
-     * Prove the 'bytes' field at `fieldKey` holds the value behind the public
-     * `expectedDigest` (vault `proveFieldEquality`). Authenticity, not
-     * confidentiality: a low-entropy value is guessable from its digest. Pass
-     * one of `expectedValue` or `expectedDigest`. A given `contentRoot` is anchored first. Async.
+     * Proves that a text field holds exactly the value behind `expectedDigest`.
+     * This proves authenticity, not secrecy. A short or common value can be guessed from its digest.
      */
-    action   issueFieldEqualityAttestation(payloadHash: String, // attestation payload_hash (64 hex)
-                                           attesterId: String, // optional 64 hex; record owner, default the session (contentRoot anchors only under the session's own record)
-                                           fieldKey: String, // 64 hex canonical field id (public)
-                                           expectedValue: String, // exact string, digested server-side
-                                           expectedDigest: String, // 64-hex blake2b-256 of the exact value string
-                                           fieldSalt: String, // 64-hex slot salt from prepareDocumentProof (witness)
-                                           contentRoot: String, // optional 64-hex Merkle root to anchor first
-                                           schemaId: String, // 64-hex schema id, required with contentRoot
-                                           siblingsJson: String, // JSON array of 64-hex siblings; depth 4 (width 16) or 5 (width 32)
-                                           dirsJson: String, // JSON array of left-child flags, one per level
+    action   issueFieldEqualityAttestation(payloadHash: Hex64,
+                                           attesterId: Hex64, // optional, default the session's attester
+                                           fieldKey: Hex64,
+                                           expectedValue: String,
+                                           expectedDigest: Hex64, // optional; blake2b-256 of expectedValue
+                                           fieldSalt: Hex64,
+                                           contentRoot: Hex64, // optional
+                                           schemaId: Hex64, // required with contentRoot
+                                           siblingsJson: String, // JSON array of 64 hex
+                                           dirsJson: String, // JSON array of booleans
                                            sessionId: UUID,
-                                           contractAddress: String, // AttestationVault deployment
-                                           compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                                           idempotencyKey: String, // optional; dedupes retries
-                                           sponsorSessionId: UUID, // optional; second session pays the dust fee
-                                           validUntil: Integer64 // optional expiry, UNIX seconds; default +1 year (NIGHTGATE_CLAIM_LIFETIME_S), max 5 years
-    )                                                                 returns {
+                                           contractAddress: String,
+                                           compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                           idempotencyKey: String, // optional
+                                           sponsorSessionId: UUID, // optional
+                                           validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+    )                                                                         returns {
         jobId                  : UUID;
         status                 : String;
         predicateAttestationId : UUID;
     };
 
     /**
-     * Prove the hidden 'bytes' value at `fieldKey` is one of a public
-     * allow-list of up to 64 values (vault `proveFieldMembership`; set rule in
-     * `prepareMembershipSet`). Pass one of `value` or `valueDigest` (witness,
-     * never persisted), and `allowedValuesJson` (400 before proving if the value
-     * is not in it) or `setRoot` + set path. Async.
+     * Proves that a hidden text field is one of up to 64 allowed values.
+     * Pass the allowed values as `allowedValuesJson`, or the set from prepareMembershipSet as `setRoot` with its path.
      */
-    action   issueFieldMembershipAttestation(payloadHash: String, // attestation payload_hash (64 hex)
-                                             attesterId: String, // optional 64 hex; record owner, default the session (contentRoot anchors only under the session's own record)
-                                             fieldKey: String, // 64 hex canonical field id (public)
-                                             value: String, // exact string (witness)
-                                             valueDigest: String, // 64-hex blake2b-256 of the exact string (witness)
-                                             allowedValuesJson: LargeString, // JSON array of allowed strings
-                                             setRoot: String, // 64-hex canonical set root
-                                             setSiblingsJson: String, // JSON array of 6 × 64-hex sibling digests
-                                             setDirsJson: String, // JSON array of 6 booleans (left-child flags)
-                                             fieldSalt: String, // 64-hex slot salt from prepareDocumentProof (witness)
-                                             contentRoot: String, // optional 64-hex Merkle root to anchor first
-                                             schemaId: String, // 64-hex schema id, required with contentRoot
-                                             siblingsJson: String, // JSON array of 64-hex siblings; depth 4 (width 16) or 5 (width 32)
-                                             dirsJson: String, // JSON array of left-child flags, one per level
+    action   issueFieldMembershipAttestation(payloadHash: Hex64,
+                                             attesterId: Hex64, // optional, default the session's attester
+                                             fieldKey: Hex64,
+                                             value: String,
+                                             valueDigest: Hex64, // optional; blake2b-256 of value
+                                             allowedValuesJson: LargeString, // JSON array of strings
+                                             setRoot: Hex64,
+                                             setSiblingsJson: String, // JSON array of 6 x 64 hex
+                                             setDirsJson: String, // JSON array of 6 booleans
+                                             fieldSalt: Hex64,
+                                             contentRoot: Hex64, // optional
+                                             schemaId: Hex64, // required with contentRoot
+                                             siblingsJson: String, // JSON array of 64 hex
+                                             dirsJson: String, // JSON array of booleans
                                              sessionId: UUID,
-                                             contractAddress: String, // AttestationVault deployment
-                                             compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                                             idempotencyKey: String, // optional; dedupes retries
-                                             sponsorSessionId: UUID, // optional; second session pays the dust fee
-                                             validUntil: Integer64 // optional expiry, UNIX seconds; default +1 year (NIGHTGATE_CLAIM_LIFETIME_S), max 5 years
-    )                                                                 returns {
+                                             contractAddress: String,
+                                             compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                             idempotencyKey: String, // optional
+                                             sponsorSessionId: UUID, // optional
+                                             validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+    )                                                                         returns {
         jobId                  : UUID;
         status                 : String;
         predicateAttestationId : UUID;
     };
 
     /**
-     * Prove document B differs from A only in slots set in `allowedMask`,
-     * values hidden (vault `proveDocumentComparison` mode 0). Both prepared with
-     * the same proofFields order; both roots anchored (`contentRootA`/`B` anchor
-     * first, one tx each). A change outside the mask fails at local proving.
-     * A != B; (A, B) order is part of the claim key. Async.
+     * Proves that document B differs from document A only in the fields allowed by `allowedMask`, without revealing values.
+     * Both documents must be prepared with the same field list. The order of A and B is part of the proof.
      */
-    action   issueDocumentIntegrityAttestation(payloadHashA: String, // document A payload_hash (64 hex)
-                                               payloadHashB: String, // document B payload_hash (64 hex)
-                                               attesterIdA: String, // optional 64 hex; document A's attester (default: the session's own)
-                                               attesterIdB: String, // optional 64 hex; document B's attester (default attesterIdA)
-                                               allowedMask: Integer64, // width-bit slot mask, bit i = slot i may differ; Int64 so bit 31 fits
-                                               schemaJson: LargeString, // shared schema from prepareDocumentProof, one descriptor per slot
-                                               openingAJson: LargeString, // document A opening { saltSeed, slots[width] } (witness)
-                                               openingBJson: LargeString, // document B opening { saltSeed, slots[width] } (witness)
-                                               contentRootA: String, // optional 64-hex root to anchor for A first
-                                               contentRootB: String, // optional 64-hex root to anchor for B first
-                                               schemaId: String, // 64-hex shared schema id, required when anchoring
+    action   issueDocumentIntegrityAttestation(payloadHashA: Hex64,
+                                               payloadHashB: Hex64,
+                                               attesterIdA: Hex64, // optional, default the session's attester
+                                               attesterIdB: Hex64, // optional, default attesterIdA
+                                               allowedMask: Integer64, // bit i set = field i may differ
+                                               schemaJson: LargeString,
+                                               openingAJson: LargeString,
+                                               openingBJson: LargeString,
+                                               contentRootA: Hex64, // optional
+                                               contentRootB: Hex64, // optional
+                                               schemaId: Hex64, // required with contentRootA or contentRootB
                                                sessionId: UUID,
-                                               contractAddress: String, // AttestationVault deployment
-                                               compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                                               idempotencyKey: String, // optional; dedupes retries
-                                               sponsorSessionId: UUID, // optional; second session pays the dust fee
-                                               validUntil: Integer64 // optional expiry, UNIX seconds; default +1 year (NIGHTGATE_CLAIM_LIFETIME_S), max 5 years
-    )                                                                 returns {
+                                               contractAddress: String,
+                                               compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                               idempotencyKey: String, // optional
+                                               sponsorSessionId: UUID, // optional
+                                               validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+    )                                                                         returns {
         jobId                  : UUID;
         status                 : String;
         predicateAttestationId : UUID;
     };
 
     /**
-     * Prove at least `k` aligned slots differ between two anchored documents,
-     * hiding which (vault `proveDocumentComparison` mode 1). A value or presence
-     * change counts; both-empty and padding slots do not. Witnesses and
-     * anchoring as issueDocumentIntegrityAttestation; fewer than k differences
-     * fail at local proving. (A, B) order is part of the claim key. Async.
+     * Proves that at least `k` fields differ between two documents, without revealing which.
+     * A field present in only one document counts as different. Inputs work as in issueDocumentIntegrityAttestation.
      */
-    action   issueDocumentDiffAttestation(payloadHashA: String, // document A payload_hash (64 hex)
-                                          payloadHashB: String, // document B payload_hash (64 hex)
-                                          attesterIdA: String, // optional 64 hex; document A's attester (default: the session's own)
-                                          attesterIdB: String, // optional 64 hex; document B's attester (default attesterIdA)
-                                          k: Integer, // minimum differing slots, 1..width
-                                          schemaJson: LargeString, // shared schema from prepareDocumentProof, one descriptor per slot
-                                          openingAJson: LargeString, // document A opening { saltSeed, slots[width] } (witness)
-                                          openingBJson: LargeString, // document B opening { saltSeed, slots[width] } (witness)
-                                          contentRootA: String, // optional 64-hex root to anchor for A first
-                                          contentRootB: String, // optional 64-hex root to anchor for B first
-                                          schemaId: String, // 64-hex shared schema id, required when anchoring
+    action   issueDocumentDiffAttestation(payloadHashA: Hex64,
+                                          payloadHashB: Hex64,
+                                          attesterIdA: Hex64, // optional, default the session's attester
+                                          attesterIdB: Hex64, // optional, default attesterIdA
+                                          k: Integer, // 1 to the number of fields; minimum number of differing fields
+                                          schemaJson: LargeString,
+                                          openingAJson: LargeString,
+                                          openingBJson: LargeString,
+                                          contentRootA: Hex64, // optional
+                                          contentRootB: Hex64, // optional
+                                          schemaId: Hex64, // required with contentRootA or contentRootB
                                           sessionId: UUID,
-                                          contractAddress: String, // AttestationVault deployment
-                                          compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                                          idempotencyKey: String, // optional; dedupes retries
-                                          sponsorSessionId: UUID, // optional; second session pays the dust fee
-                                          validUntil: Integer64 // optional expiry, UNIX seconds; default +1 year (NIGHTGATE_CLAIM_LIFETIME_S), max 5 years
-    )                                                                 returns {
+                                          contractAddress: String,
+                                          compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                          idempotencyKey: String, // optional
+                                          sponsorSessionId: UUID, // optional
+                                          validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+    )                                                                         returns {
         jobId                  : UUID;
         status                 : String;
         predicateAttestationId : UUID;
     };
 
-    /**
-     * Verify a PredicateAttestations row: its claim key (recomputed from the
-     * row) is unexpired under the payload's current anchor in live vault state,
-     * or without a live provider the proof tx is indexed as SUCCESS. Unproven,
-     * re-anchored or expired: `verified: false`, not an error. Claim-key
-     * struct layouts (tags 16-20): the vault's Compact source.
-     */
-    function verifyPredicateAttestation(predicateAttestationId: UUID) returns {
-        verified       : Boolean; // unexpired under the current anchor; without a live provider: included
-        included       : Boolean; // proof tx indexed as SUCCESS
-        stateChecked   : Boolean; // false = verdict from the index only
+    /** Checks a stored proof row against the contract on chain. An unproven or expired proof gives `verified: false`. */
+    function verifyPredicateAttestation(predicateAttestationId: UUID)         returns {
+        verified       : Boolean;
+        included       : Boolean;
+        stateChecked   : Boolean; // false means the answer comes from the local index, not from the contract state
         predicate      : String;
-        threshold      : Integer64; // numeric: scaled threshold; documentDiff: k
+        threshold      : Integer64; // for 'documentDiff' this is k
         unit           : String;
-        expectedDigest : String; // bytesEquality
-        setRoot        : String; // setMembership
-        payloadHashB   : String; // cross-root: document B
-        allowedMask    : Integer64; // documentIntegrity: width-bit slot mask
+        expectedDigest : String;
+        setRoot        : String;
+        payloadHashB   : String;
+        allowedMask    : Integer64;
         provenTxHash   : String;
         provenAt       : Timestamp;
     };
 
     /**
-     * Check live contract state for the attester's record of `payloadHash`
-     * (or of a bound `documentId`), optionally matching anchored `contentRoot`
-     * / `schemaId`. An anchor is the attester's own statement: also check
-     * `attesterId` (and `schemaId` for cross-root claims) against what you trust.
-     * Absent record or no live provider: `verified: false`, not an error.
-     * `network` reads another network's public indexer (400 if unknown;
-     * endpoints via `cds.requires.nightgate.networks.<network>`).
+     * Checks on chain whether an attester has attested a payload hash.
+     * Only the attester vouches for its attestation, so check `attesterId` against attesters you trust.
+     * If nothing is found, the result is `verified: false`, not an error.
      */
     function verifyAttestationState(contractAddress: String,
-                                    attesterId: String, // 64 hex; with payloadHash names the record, recordKey(attesterId, payloadHash)
-                                    payloadHash: String, // 64 hex; the attested hash
-                                    documentId: String, // 64 hex; alternative selector (a payloadHash next to it must match)
-                                    contentRoot: String, // optional 64 hex, checked against anchored root
-                                    schemaId: String, // optional 64 hex, checked against anchored schema id
-                                    compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                                    network: String // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
-    )                                                                 returns {
-        verified      : Boolean;
-        attested      : Boolean; // payload_hash present in the attestation map
-        contentRootOk : Boolean; // anchored content root matches (when contentRoot given)
-        schemaOk      : Boolean; // anchored schema id matches (when schemaId given)
-        bindingRegistered : Boolean; // the bound document id is registered to this attester (unregistered ids are first-come-first-served)
-        attesterId    : String; // the record's attester id, if present
-        payloadHash   : String; // the record's payload hash, if present
-        recordKey     : String; // the ledger key the state was read under
-        documentId    : String; // bound document id, if any
+                                    attesterId: Hex64,
+                                    payloadHash: Hex64,
+                                    documentId: Hex64, // instead of attesterId and payloadHash
+                                    contentRoot: Hex64, // optional; must match the stored content root
+                                    schemaId: Hex64, // optional; must match the stored schema id
+                                    compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                    network: String // optional, default the server's network; e.g. 'preprod'
+    )                                                                         returns {
+        verified          : Boolean;
+        attested          : Boolean; // the payload hash is attested
+        contentRootOk     : Boolean; // contentRoot matches
+        schemaOk          : Boolean; // schemaId matches
+        bindingRegistered : Boolean; // documentId belongs to this attester
+        attesterId        : String;
+        payloadHash       : String;
+        recordKey         : String; // the key the attestation is stored under on chain
+        documentId        : String;
     };
 
     /**
-     * Check live contract state for a true predicate result under the claim
-     * key recomputed from the given coordinates; needs no job or DB row.
-     * Cross-root kinds: `payloadHash` is document A, (A, B) order must match
-     * the proving order. `threshold` must be the same scaled integer the
-     * circuit hashed, else `verified: false`. Absent result, unknown contract
-     * or no live provider: `verified: false`. `network` as on verifyAttestationState.
+     * Checks on chain whether a proof about a document field was recorded as true.
+     * The inputs must be exactly those of the proof, otherwise the result is `verified: false`.
+     * For a comparison of two documents, A and B must be in the same order as when proving.
      */
     function verifyPredicateState(contractAddress: String,
-                                  attesterId: String, // 64 hex; the attester whose record of payloadHash carries the claim
-                                  payloadHash: String, // 64 hex (cross-root kinds: document A)
-                                  fieldKey: String, // 64 hex; required for the numeric/bytes kinds
+                                  attesterId: Hex64,
+                                  payloadHash: Hex64, // document A when comparing two documents
+                                  fieldKey: Hex64, // required for single-field predicates
                                   predicate: String, // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership' | 'documentIntegrity' | 'documentDiff'
-                                  threshold: Integer64, // scaled circuit integer (numeric predicates only)
-                                  expectedDigest: String, // 64 hex, required for 'bytesEquality'
-                                  setRoot: String, // 64 hex canonical set root, required for 'setMembership'
-                                  payloadHashB: String, // 64 hex document B, required for the cross-root kinds
-                                  attesterIdB: String, // 64 hex; document B's attester for the cross-root kinds (default attesterId)
-                                  allowedMask: Integer64, // packed width-bit mask, required for 'documentIntegrity'
-                                  k: Integer, // minimum differing slots 1..width, required for 'documentDiff'
-                                  compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                                  network: String // optional network override, e.g. 'preview' | 'preprod' | 'mainnet'
-    )                                                                 returns {
+                                  threshold: Integer64, // required for numeric predicates; the scaled integer used when proving
+                                  expectedDigest: Hex64, // required for 'bytesEquality'
+                                  setRoot: Hex64, // required for 'setMembership'
+                                  payloadHashB: Hex64, // required when comparing two documents; document B
+                                  attesterIdB: Hex64, // optional, default attesterId; attester of document B
+                                  allowedMask: Integer64, // required for 'documentIntegrity'; bit i set = field i may differ
+                                  k: Integer, // required for 'documentDiff'; minimum number of differing fields
+                                  compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                  network: String // optional, default the server's network; e.g. 'preprod'
+    )                                                                         returns {
         verified : Boolean;
-        proven   : Boolean; // a true result is recorded on-chain for the claim key
+        proven   : Boolean; // the proof is recorded on chain as true
     };
 
-    /**
-     * On-chain disclosure grants indexed from the vault `disclosures` map (not
-     * the off-chain DisclosureRoles). `level` 0 public, 1 legitimate interest,
-     * 2 authority; `active` while present on chain.
-     */
+    // ---- Disclosure ----
+
+    /** Disclosure grants read from the contract on chain. `level` is 0 public, 1 legitimate interest, 2 authority. */
     @readonly
     entity DisclosureGrants      as projection on midnight.DisclosureGrants;
 
-    /**
-     * Reconcile DisclosureGrants with the vault `disclosures` map in live state,
-     * e.g. after a wallet-submitted grant or revoke. Idempotent. `active` =
-     * grants on chain afterwards; zero without a live provider.
-     */
+    /** Updates `DisclosureGrants` from the contract on chain, e.g. after a grant submitted outside this server. */
     action   reindexDisclosures(contractAddress: String,
-                                compiledArtifactRef: String // optional, defaults to 'attestation-vault'
-    )                                                                 returns {
+                                compiledArtifactRef: String // optional, default 'attestation-vault'
+    )                                                                         returns {
         contractAddress : String;
         active          : Integer;
         deactivated     : Integer;
         reconciledAt    : Timestamp;
     };
 
-    /**
-     * Grant `grantee` a disclosure `level` (0 public, 1 legitimate interest,
-     * 2 authority) on an attestation (vault `grantDisclosure`); attester-only,
-     * enforced in-circuit. Async; the DisclosureGrants row exists at once,
-     * inactive. Job result `{ disclosureGrantId, payloadHash, grantee, level, txHash }`.
-     */
-    action   grantDisclosure(payloadHash: String, // 64 hex, the attestation
-                             grantee: String, // 64 hex Bytes<32> grantee identifier
-                             level: Integer, // 0 | 1 | 2
+    /** Grants `grantee` a disclosure level on an attestation. Only the attester can grant. */
+    action   grantDisclosure(payloadHash: Hex64,
+                             grantee: Hex64,
+                             level: Integer, // 0 public, 1 legitimate interest, 2 authority
                              sessionId: UUID,
-                             contractAddress: String, // AttestationVault deployment
-                             compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                             idempotencyKey: String, // optional; dedupes retries
-                             sponsorSessionId: UUID // optional; second session pays the dust fee
-    )                                                                 returns {
+                             contractAddress: String,
+                             compiledArtifactRef: String, // optional, default 'attestation-vault'
+                             idempotencyKey: String, // optional
+                             sponsorSessionId: UUID // optional
+    )                                                                         returns {
         jobId             : UUID;
         status            : String;
         disclosureGrantId : UUID;
     };
 
-    /**
-     * Remove a grantee's disclosure on chain (vault `revokeDisclosure`);
-     * attester-only. Async; job result `{ payloadHash, grantee, txHash }`.
-     */
-    action   revokeDisclosure(payloadHash: String, // 64 hex, the attestation
-                              grantee: String, // 64 hex Bytes<32> grantee identifier
+    /** Removes a grantee's disclosure on chain. Only the attester can revoke. */
+    action   revokeDisclosure(payloadHash: Hex64,
+                              grantee: Hex64,
                               sessionId: UUID,
-                              contractAddress: String, // AttestationVault deployment
-                              compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                              idempotencyKey: String, // optional; dedupes retries
-                              sponsorSessionId: UUID // optional; second session pays the dust fee
-    )                                                                 returns {
+                              contractAddress: String,
+                              compiledArtifactRef: String, // optional, default 'attestation-vault'
+                              idempotencyKey: String, // optional
+                              sponsorSessionId: UUID // optional
+    )                                                                         returns {
         jobId  : UUID;
         status : String;
     };
 
     /**
-     * Document id registry (vault `registerDocument`), registrar-only in-circuit.
-     * `mode` 0 assigns `documentId` to `ownerId`, the only attester who may bind
-     * it (re-registering transfers it and releases another attester's binding);
-     * 1 unregisters; 2 hands the registrar role to `ownerId`; 3 and 4 are
-     * recovery-only: 3 re-points the registrar, 4 hands the recovery role over.
-     * Async; job result `{ documentId, ownerId, mode, contractAddress, txHash }`.
+     * Manages which attester may attest a document id. Modes 0 to 2 need the registrar's session, modes 3 and 4 the recovery identity's.
+     * Mode 0 assigns `documentId` to `ownerId`, 1 removes the assignment, 2 hands the registrar role to `ownerId`.
+     * Assigning an id that already has an owner moves it and removes the previous owner's binding.
+     * Mode 3 sets a new registrar, 4 hands the recovery role to `ownerId`.
      */
-    action   registerPassport(documentId: String, // 64 hex Bytes<32> document identifier
-                              passportId: String, // alias of documentId
-                              ownerId: String, // 64 hex Bytes<32> attester id that may bind the document
-                              mode: Integer, // optional; 0 register (default), 1 unregister, 2 transfer registrar, 3 recovery sets registrar, 4 recovery sets recovery
-                              sessionId: UUID, // the registrar (modes 0-2) or the recovery identity (modes 3-4)
-                              contractAddress: String, // AttestationVault deployment
-                              compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                              idempotencyKey: String, // optional; dedupes retries
-                              sponsorSessionId: UUID // optional; second session pays the dust fee
-    )                                                                 returns {
+    action   registerPassport(documentId: Hex64,
+                              passportId: String, // same as documentId
+                              ownerId: Hex64,
+                              mode: Integer, // optional, default 0
+                              sessionId: UUID,
+                              contractAddress: String,
+                              compiledArtifactRef: String, // optional, default 'attestation-vault'
+                              idempotencyKey: String, // optional
+                              sponsorSessionId: UUID // optional
+    )                                                                         returns {
         jobId  : UUID;
         status : String;
     };
 
     /**
-     * Retract a payload (vault `retract` mode 0), owner-only in-circuit: the
-     * attestation, content anchor, disclosure grants and document binding leave
-     * the chain; claims against its root stop verifying. Async; job result
-     * `{ mode, key, contractAddress, txHash }`.
+     * Withdraws an attestation. Only its attester can do this.
+     * Its stored content root, disclosure grants and document binding are removed too, so proofs about the document stop verifying.
      */
-    action   retractAttestation(payloadHash: String, // 64 hex, the attestation
-                                sessionId: UUID, // must own the attestation
-                                contractAddress: String, // AttestationVault deployment
-                                compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                                idempotencyKey: String, // optional; dedupes retries
-                                sponsorSessionId: UUID // optional; second session pays the dust fee
-    )                                                                 returns {
+    action   retractAttestation(payloadHash: Hex64,
+                                sessionId: UUID,
+                                contractAddress: String,
+                                compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                idempotencyKey: String, // optional
+                                sponsorSessionId: UUID // optional
+    )                                                                         returns {
         jobId  : UUID;
         status : String;
     };
 
-    /**
-     * Remove an expired entry (vault `retract`); anyone may call, unexpired
-     * entries are refused. Async; job result `{ mode, key, contractAddress, txHash }`.
-     */
+    /** Removes an expired proof from the contract. Anyone can call it. */
     action   purgeExpired(kind: String, // 'claim'
-                          key: String, // 64 hex claim key
-                          sessionId: UUID, // any wallet session
-                          contractAddress: String, // AttestationVault deployment
-                          compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                          idempotencyKey: String, // optional; dedupes retries
-                          sponsorSessionId: UUID // optional; second session pays the dust fee
-    )                                                                 returns {
+                          key: Hex64,
+                          sessionId: UUID,
+                          contractAddress: String,
+                          compiledArtifactRef: String, // optional, default 'attestation-vault'
+                          idempotencyKey: String, // optional
+                          sponsorSessionId: UUID // optional
+    )                                                                         returns {
         jobId  : UUID;
         status : String;
     };
 
-    /** Principal to on-chain grantee id bindings. */
+    /** Links between users and the grantee ids that disclosure grants name. */
     @readonly
     entity GranteeIdentities     as projection on midnight.GranteeIdentities;
 
     /**
-     * Bind the caller to the Bytes<32> grantee id the vault checks. Per
-     * `cds.requires.nightgate.granteeBinding` (default 'wallet') `bindingInput`
-     * is the coin public key hex ('wallet'), a DID ('did') or the 64-hex id
-     * ('custom'). Idempotent on (user, scope).
+     * Links the caller to a grantee id, the id that disclosure grants name.
+     * `bindingInput` depends on the server setting `cds.requires.nightgate.granteeBinding`.
+     * It is the wallet's coin public key for 'wallet' (default), a DID for 'did', or the 64 hex id for 'custom'.
      */
     action   registerGranteeIdentity(bindingInput: String,
-                                     scope: String // optional; omit for a global binding
-    )                                                                 returns {
+                                     scope: String // optional, default a global link
+    )                                                                         returns {
         ID          : UUID;
         granteeId   : String;
         bindingKind : String;
     };
 
-    /**
-     * Deploy a registered contract. Async; job result `{ submissionId, txHash,
-     * contractAddress, status }` (status = PendingSubmissions lifecycle).
-     */
+    // ---- Contracts ----
+
+    /** Deploys a contract known to the server. */
     action   deployContract(compiledArtifactRef: String,
                             sessionId: UUID,
-                            initialPrivateState: LargeString, // JSON-encoded
-                            idempotencyKey: String, // optional; dedupes retries
-                            sponsorSessionId: UUID, // optional; second session pays the dust fee
-                            recoveryId: String // optional 64 hex; vault family: attester id that may re-point the registrar (registerPassport modes 3/4); absent = no recovery
-    )                                                                 returns {
-        jobId  : UUID;
-        status : String; // 'pending' | 'succeeded' (idempotent retry)
-    };
-
-    /**
-     * Call a circuit on a deployed contract. Missing private state is seeded
-     * from `initialPrivateState` (default `{}`), never overwritten. A
-     * `sponsorSessionId` pays the dust fee and submits; it must be
-     * signing-capable and the caller's own or a platform sponsor
-     * (`NIGHTGATE_FEE_SPONSOR_SESSION` / `feeSponsorSessions`). Async; job
-     * result `{ submissionId, txHash, contractAddress, status }`.
-     */
-    action   submitContractCall(contractAddress: String,
-                                circuit: String,
-                                compiledArtifactRef: String,
-                                sessionId: UUID,
-                                args: LargeString, // JSON-encoded array, may be '[]'
-                                idempotencyKey: String, // optional; dedupes retries
-                                initialPrivateState: LargeString, // optional JSON; seeded on this wallet's first call
-                                sponsorSessionId: UUID // optional; second session pays the dust fee
-    )                                                                 returns {
-        jobId  : UUID;
-        status : String; // 'pending' | 'succeeded' (idempotent retry)
-    };
-
-    /**
-     * Build, prove and sign a call under the caller's identity without
-     * submitting, for a sponsor's sponsorFinalizedTransaction. Async; job
-     * result `{ finalizedTxB64, serializedBytes }`.
-     */
-    action   buildSponsorable(contractAddress: String,
-                              circuit: String,
-                              compiledArtifactRef: String,
-                              sessionId: UUID,
-                              args: LargeString)                      returns {
+                            initialPrivateState: LargeString, // JSON
+                            idempotencyKey: String, // optional
+                            sponsorSessionId: UUID, // optional
+                            recoveryId: Hex64 // optional; the attester that may use registerPassport modes 3 and 4
+    )                                                                         returns {
         jobId  : UUID;
         status : String;
     };
 
     /**
-     * Pay the dust for a caller-finalized, fee-unpaid tx and submit it, within
-     * the sponsor's contract/circuit allow-list. Async; job result
-     * `{ txHash, circuits, contractAddress }`.
+     * Calls a circuit on a deployed contract.
+     * `initialPrivateState` is used only if the wallet has no private state for the contract yet.
+     * A sponsor session must be your own signing session or a platform fee sponsor.
+     */
+    action   submitContractCall(contractAddress: String,
+                                circuit: String,
+                                compiledArtifactRef: String,
+                                sessionId: UUID,
+                                args: LargeString, // JSON array
+                                idempotencyKey: String, // optional
+                                initialPrivateState: LargeString, // JSON; optional, default {}
+                                sponsorSessionId: UUID // optional
+    )                                                                         returns {
+        jobId  : UUID;
+        status : String;
+    };
+
+    /**
+     * Builds, proves and signs a contract call as the caller, without paying the fee and without submitting it.
+     * A sponsor then submits the result with sponsorFinalizedTransaction.
+     */
+    action   buildSponsorable(contractAddress: String,
+                              circuit: String,
+                              compiledArtifactRef: String,
+                              sessionId: UUID,
+                              args: LargeString)                              returns {
+        jobId  : UUID;
+        status : String;
+    };
+
+    /**
+     * Pays the fee for a signed transaction built by someone else and submits it.
+     * The sponsor only pays for contracts and circuits its policy allows.
      */
     action   sponsorFinalizedTransaction(finalizedTxB64: LargeString,
                                          sponsorSessionId: UUID,
-                                         idempotencyKey: String)      returns {
+                                         idempotencyKey: String)              returns { // optional
         jobId     : UUID;
         status    : String;
-        sessionId : UUID; // sponsor session; poll getJobStatus with it
+        sessionId : UUID; // pass it to getJobStatus
     };
 
     /**
-     * Sponsor an unbound (pre-binding) signed tx (txbuilder `bind: false`):
-     * merge a dust spend, bind, submit. Parallel up to the sponsor's free dust
-     * backings; policy as sponsorFinalizedTransaction. Poll with `sessionId`.
+     * Pays the fee for a signed transaction that is not yet sealed and submits it.
+     * Such a transaction comes from the transaction builder with `bind: false`. One sponsor can pay several at once.
      */
     action   sponsorUnboundTransaction(unboundTxB64: LargeString,
                                        sponsorSessionId: UUID,
-                                       idempotencyKey: String)        returns {
+                                       idempotencyKey: String)                returns { // optional
         jobId     : UUID;
         status    : String;
-        sessionId : UUID;
+        sessionId : UUID; // pass it to getJobStatus
     };
 
     /**
-     * Sponsor a shielded swap handed over as its two halves, each a proven
-     * transaction, bound or unbound, as offer file (`swapoffer1...`) or base64:
-     * check, merge, pay dust, submit. A half gives one token type and wants
-     * another, both in the effective `allowedTokenTypes`; the halves mirror
-     * each other. Needs `NIGHTGATE_SPONSOR_ALLOW_SWAPS`.
-     * Job result `{ txHash, swap: { gives, wants } }`. Poll with `sessionId`.
+     * Pays the fee for a shielded token swap and submits it.
+     * The swap comes as two matching halves, each an offer file (`swapoffer1...`) or base64.
+     * Both token types must be allowed for the sponsor, and the server needs `NIGHTGATE_SPONSOR_ALLOW_SWAPS`.
      */
-    action   sponsorSwap(makerHalfB64: LargeString, // or `offerId`
+    action   sponsorSwap(makerHalfB64: LargeString, // required unless offerId is given
                          takerHalfB64: LargeString,
                          sponsorSessionId: UUID,
-                         idempotencyKey: String,
-                         offerId: UUID)                               returns { // optional; the posted maker half to fill
+                         idempotencyKey: String, // optional
+                         offerId: UUID)                                       returns { // optional; a posted offer to use as the maker half
         jobId     : UUID;
         status    : String;
-        sessionId : UUID;
+        sessionId : UUID; // pass it to getJobStatus
     };
 
+    // ---- Swap offer board ----
+
     /**
-     * Post a maker half (offer file or base64) for takers to find. The half is
-     * checked like a sponsored half except for the token allow-list; its terms
-     * are read from it, never from the caller. The offer closes when one of its
-     * input nullifiers lands in a sponsored swap, when `expiresAt` passes, or
-     * when the poster retires it. Intent only: nothing is held or moved.
+     * Posts one half of a swap so that others can find it and complete the swap. Posting holds or moves nothing.
+     * The offer closes when a sponsored swap uses it, when it expires or when the poster retires it.
      */
-    action   postSwapOffer(offer: LargeString,
+    action   postSwapOffer(offer: LargeString, // offer file or base64
                            expiresAt: Timestamp, // optional
-                           tags: LargeString)                         returns { // optional JSON array of strings, at most 8
+                           tags: LargeString)                                 returns { // JSON array of up to 8 strings; optional
         offerId     : UUID;
         status      : String;
-        bound       : Boolean;
+        bound       : Boolean; // the half is already sealed
         givesType   : String;
         givesAmount : String;
         wantsType   : String;
@@ -705,22 +626,19 @@ service NightgateService {
     };
 
     /**
-     * The board: open offers newest first, or with `status` the closed ones
-     * (`filled` | `retired` | `expired`, or `all`) by last change. `since`
-     * narrows to offers changed after it (a change feed when polled with
-     * `status: 'all'`); `mine` to the caller's own posts. Filters are exact.
-     * Never the poster's identity.
+     * Lists offers, by default the open ones, newest first.
+     * With `status: 'all'` and `since`, polling returns every change since the last call.
      */
-    function listSwapOffers(givesType: String,  // optional, 64 hex
-                            wantsType: String,  // optional, 64 hex
-                            tag: String,        // optional
-                            limit: Integer,     // optional, default 50, at most 200
-                            status: String,     // optional; open (default) | filled | retired | expired | all
-                            since: Timestamp,   // optional; offers changed after this instant
-                            mine: Boolean)      returns array of { // optional; only the caller's own posts
+    function listSwapOffers(givesType: Hex64, // optional
+                            wantsType: Hex64, // optional
+                            tag: String, // optional
+                            limit: Integer, // optional, default 50, at most 200
+                            status: String, // optional, default 'open'; 'filled' | 'retired' | 'expired' | 'all'
+                            since: Timestamp, // optional
+                            mine: Boolean)                                    returns array of { // optional; only the caller's own offers
         offerId      : UUID;
         offer        : LargeString;
-        bound        : Boolean;
+        bound        : Boolean; // the half is already sealed
         givesType    : String;
         givesAmount  : String;
         wantsType    : String;
@@ -729,16 +647,16 @@ service NightgateService {
         expiresAt    : Timestamp;
         postedAt     : Timestamp;
         status       : String; // open | filled | retired | expired
-        filledTxHash : String; // the sponsored swap that spent the half; null otherwise
+        filledTxHash : String;
         closedAt     : Timestamp;
         changedAt    : Timestamp;
     };
 
-    /** One offer by id, open or closed, in the board's shape; unknown id 404. */
-    function getSwapOffer(offerId: UUID)                              returns {
+    /** One offer by id, open or closed. An unknown id gives 404. */
+    function getSwapOffer(offerId: UUID)                                      returns {
         offerId      : UUID;
         offer        : LargeString;
-        bound        : Boolean;
+        bound        : Boolean; // the half is already sealed
         givesType    : String;
         givesAmount  : String;
         wantsType    : String;
@@ -746,32 +664,30 @@ service NightgateService {
         tags         : many String;
         expiresAt    : Timestamp;
         postedAt     : Timestamp;
-        status       : String;
+        status       : String; // open | filled | retired | expired
         filledTxHash : String;
         closedAt     : Timestamp;
         changedAt    : Timestamp;
     };
 
-    /** Retire an open offer; only its poster (same user, or the same grant for a token). */
-    action   retireSwapOffer(offerId: UUID)                           returns {
+    /** Closes an open offer. Only the user or agent token that posted it can do this. */
+    action   retireSwapOffer(offerId: UUID)                                   returns {
         offerId : UUID;
         status  : String;
     };
 
+    // ---- Disclosure to token holders ----
+
     /**
-     * Let holders of `tokenType` read a document: a holder registered on the
-     * `holder-registry` deployment at `registryAddress` claims it with the
-     * secret behind its claim key. `content` (optional) is stored encrypted and
-     * must hash to `payloadHash` (blake2b-256 or sha256 of the UTF-8 text).
-     * A second call by the same grantor for the same payload, type and registry
-     * updates the grant.
+     * Lets every holder of `tokenType` read a document. Holders prove their holding through the registry at `registryAddress`.
+     * `content` is stored encrypted and must hash to `payloadHash`, as blake2b-256 or sha256 of the UTF-8 text.
      */
-    action   grantDisclosureToHolders(payloadHash: String,
-                                      tokenType: String,
+    action   grantDisclosureToHolders(payloadHash: Hex64,
+                                      tokenType: Hex64,
                                       registryAddress: String,
                                       content: LargeString, // optional
-                                      contentType: String, // optional, default text/plain
-                                      expiresAt: Timestamp)           returns { // optional
+                                      contentType: String, // optional, default 'text/plain'
+                                      expiresAt: Timestamp)                   returns { // optional
         holderGrantId   : UUID;
         payloadHash     : String;
         tokenType       : String;
@@ -781,22 +697,19 @@ service NightgateService {
         status          : String;
     };
 
-    /** Revoke a holder disclosure; only its grantor. */
-    action   revokeHolderDisclosure(holderGrantId: UUID)               returns {
+    /** Revokes a holder disclosure. Only its grantor can do this. */
+    action   revokeHolderDisclosure(holderGrantId: UUID)                      returns {
         holderGrantId : UUID;
         status        : String;
     };
 
     /**
-     * Prove a registered holding and read what its issuer disclosed to holders.
-     * `claimSecret` is the 32-byte secret (64 hex) whose claim key the holder
-     * registered (`registerHolder` on the holder-registry contract). Reads the
-     * registry live from the indexer. Never an error for a missing entitlement:
-     * `entitled: false` with `reason`.
+     * Proves a token holding and returns what the issuer disclosed to holders.
+     * `claimSecret` is the secret used when registering in the holder registry. Without entitlement the result is `entitled: false`.
      */
-    action   claimDisclosure(payloadHash: String,
-                             tokenType: String,
-                             claimSecret: String)                     returns {
+    action   claimDisclosure(payloadHash: Hex64,
+                             tokenType: Hex64,
+                             claimSecret: Hex64)                              returns {
         entitled        : Boolean;
         reason          : String;
         payloadHash     : String;
@@ -807,81 +720,68 @@ service NightgateService {
         contentHashKind : String;
         content         : LargeString;
         expiresAt       : Timestamp;
-        /** Registry deployments consulted for a negative answer. */
+        /** The registries that were checked, for a negative answer. */
         registries      : array of String;
     };
 
+    // ---- Batches and tokens ----
+
     /**
-     * Run up to 8 calls on one contract as ONE transaction. Apply order = call
-     * order, so dependent calls may be batched (same-name circuits are unordered
-     * among themselves). An error before submit submits nothing; PARTIAL_SUCCESS
-     * on chain fails the job, so verify effects. Seeding, sponsoring and auth as
-     * submitContractCall. Async; job result `{ submissionId, txHash, contractAddress, circuits, status }`.
+     * Runs up to 8 circuit calls on one contract in a single transaction, in the given order.
+     * Calls to the same circuit have no fixed order among themselves.
+     * If only part of the transaction succeeds on chain, the job fails.
      */
     action   submitContractCallBatch(contractAddress: String,
                                      calls: LargeString, // JSON array of { circuit, args }
                                      compiledArtifactRef: String,
                                      sessionId: UUID,
-                                     idempotencyKey: String, // optional; dedupes retries
-                                     initialPrivateState: LargeString, // optional JSON; seeded on this wallet's first call
-                                     sponsorSessionId: UUID, // optional; second session pays the dust fee
-                                     independentCalls: Boolean // optional; calls share no state: order by execution stage instead of call order
-    )                                                                 returns {
+                                     idempotencyKey: String, // optional
+                                     initialPrivateState: LargeString, // JSON; optional, default {}
+                                     sponsorSessionId: UUID, // optional
+                                     independentCalls: Boolean // optional; true lets the server reorder calls that do not depend on each other
+    )                                                                         returns {
         jobId  : UUID;
-        status : String; // 'pending' | 'succeeded' (idempotent retry)
+        status : String;
     };
 
     /**
-     * Mint `amount` units of the caller's token `name` on a `token-factory`
-     * deployment to a Zswap coin public key. The session is the issuer: its
-     * issuer key derives from its seed, so the same name from another session
-     * is another token. The type is known before the job runs. Async; job
-     * result `{ submissionId, txHash, contractAddress, tokenType }`. Grantable
-     * (`mintFactoryToken`; circuit `mint`).
+     * Mints a token on a token factory contract and sends it to a shielded address.
+     * The session is the issuer, so the same `name` from another session is a different token.
      */
     action   mintFactoryToken(contractAddress: String,
                               name: String, // UTF-8, at most 32 bytes
-                              amount: String, // atoms, decimal, Uint<64>
-                              recipientCoinPublicKey: String, // 64 hex
+                              amount: String,
+                              recipientCoinPublicKey: Hex64,
                               sessionId: UUID,
-                              idempotencyKey: String,
-                              sponsorSessionId: UUID)                  returns { // optional; second session pays the dust fee
+                              idempotencyKey: String, // optional
+                              sponsorSessionId: UUID)                         returns { // optional
         jobId     : UUID;
         status    : String;
         name      : String;
         amount    : String;
-        issuerKey : String; // the session's issuer key on the factory
-        domain    : String; // names the token in the factory's ledger
-        tokenType : String; // raw shielded token type, 64 hex
+        issuerKey : String;
+        domain    : String;
+        tokenType : Hex64;
     };
 
-    /**
-     * Mint 100000000 atoms of the bundled `shielded-token` test token (deployed
-     * with `compiledArtifactRef: 'shielded-token'`) to the caller's zswap key;
-     * send it with `sendNight(tokenTypeHex)`. Async; job result
-     * `{ submissionId, txHash, contractAddress, tokenTypeHex, amount }`.
-     */
+    /** Mints 100000000 units of the bundled test token to the caller's shielded address. */
     action   mintShieldedTestToken(contractAddress: String,
                                    sessionId: UUID,
-                                   compiledArtifactRef: String, // optional; defaults to 'shielded-token'
-                                   idempotencyKey: String, // optional; dedupes retries
-                                   sponsorSessionId: UUID // optional; second session pays the dust fee
-    )                                                                 returns {
+                                   compiledArtifactRef: String, // optional, default 'shielded-token'
+                                   idempotencyKey: String, // optional
+                                   sponsorSessionId: UUID // optional
+    )                                                                         returns {
         jobId  : UUID;
-        status : String; // 'pending' | 'succeeded' (idempotent retry)
+        status : String;
     };
 
-    /**
-     * Compute `rawTokenType(domainSeparator, contractAddress)` for a minting
-     * contract, no wallet or chain access. `domainSeparator`: the string the
-     * contract padded, or 64 hex. Feeds `sendNight(tokenTypeHex)`.
-     */
+    /** Computes the token type a contract mints, for use as `tokenTypeHex` in sendNight. */
     function deriveTokenType(contractAddress: String,
-                             domainSeparator: String // optional; string or 64 hex, defaults to the bundled test token's
-    )                                                                 returns {
+                             domainSeparator: String // text or 64 hex; optional, default the bundled test token's
+    )                                                                         returns {
         tokenTypeHex    : String;
         contractAddress : String;
-        domainSeparator : String; // padded 64-hex form used
+        domainSeparator : Hex64;
     };
 
     // ---- Wallet sessions ----
@@ -895,10 +795,10 @@ service NightgateService {
             encryptedSeedKey
         };
 
-    /** Create a read-only session; the viewing key is stored encrypted. */
+    /** Creates a read-only wallet session. The viewing key is stored encrypted. */
     action   connectWallet(viewingKey: String,
-                           label: String // optional, <= 100 chars
-    )                                                                 returns {
+                           label: String // at most 100 characters; optional
+    )                                                                         returns {
         ID          : UUID;
         sessionId   : UUID;
         label       : String;
@@ -907,96 +807,81 @@ service NightgateService {
         isActive    : Boolean;
     };
 
-    /** Close a session and null its encrypted keys. */
+    /** Closes a session and deletes its stored keys. */
     action   disconnectWallet(sessionId: UUID);
 
     /**
-     * Enable signing on a session: store the BIP39 seed encrypted (Lace-exact
-     * HD derivation). 400, fail-closed, unless the seed at `accountIndex` derives
-     * the session's viewing key. Signing works on return; `prewarmJobId` tracks
-     * the wallet sync, which later actions otherwise wait for.
+     * Lets a session sign transactions. The seed is stored encrypted and must belong to the session's viewing key.
+     * Keys are derived from the seed the same way the Lace wallet does, so the addresses match Lace.
+     * The wallet then syncs with the chain in the background, tracked by `prewarmJobId`.
      */
     action   connectWalletForSigning(sessionId: UUID,
-                                     mnemonic: String, // BIP39 phrase; one of mnemonic|seedHex required
-                                     seedHex: String, // optional: 64-byte BIP39 seed as 128 hex chars
-                                     accountIndex: Integer, // optional, default 0; must match the session's viewing-key account
-                                     idempotencyKey: String, // optional; dedupes retries
-                                     prewarm: Boolean // optional; false skips the prewarm job (the wallet syncs on demand)
-    )                                                                 returns {
+                                     mnemonic: String, // BIP39 phrase; required unless seedHex is given
+                                     seedHex: String, // 128 hex; optional
+                                     accountIndex: Integer, // optional, default 0
+                                     idempotencyKey: String, // optional
+                                     prewarm: Boolean // optional, default true; false syncs only when needed
+    )                                                                         returns {
         sessionId      : UUID;
         signingEnabled : Boolean;
         prewarmJobId   : UUID;
-        prewarmStatus  : String; // 'pending' | 'succeeded' (idempotent retry)
+        prewarmStatus  : String;
     };
 
-    /**
-     * Derive a wallet's viewing key, addresses and attester id from a mnemonic
-     * or seed; creates no session, stores and logs nothing. Matches
-     * connectWalletForSigning for the same `accountIndex`.
-     */
-    action   deriveWalletInfo(mnemonic: String, // BIP39 recovery phrase; one of mnemonic|seedHex required
-                              seedHex: String, // optional: 64-byte BIP39 seed as 128 hex chars
+    /** Derives a wallet's viewing key, addresses and attester id from a mnemonic or seed. Stores nothing. */
+    action   deriveWalletInfo(mnemonic: String, // BIP39 phrase; required unless seedHex is given
+                              seedHex: String, // 128 hex; optional
                               accountIndex: Integer // optional, default 0
-    )                                                                 returns {
-        viewingKey      : String; // 64 hex; connectWallet input
-        shieldedAddress : String; // mn_shield-addr_...
-        nightAddress    : String; // mn_addr_...
-        dustAddress     : String; // mn_dust_...; a dustReceiverAddress for registerForDustGeneration
-        attesterId      : String; // 64 hex vault caller id; usable as registerPassport ownerId before any call
+    )                                                                         returns {
+        viewingKey      : Hex64;
+        shieldedAddress : String;
+        nightAddress    : String;
+        dustAddress     : String;
+        attesterId      : Hex64;
         accountIndex    : Integer;
-        network         : String; // the configured network
+        network         : String;
     };
 
-    /**
-     * Register the session's NIGHT UTXOs for DUST (fee token) generation; DUST
-     * accrues 1-2 min after the tx settles. Async; job result
-     * `{ txId, registeredCount, totalNightUtxos, dustReceiverAddress }`.
-     */
+    /** Registers the wallet's NIGHT coins so they generate DUST, the resource that pays transaction fees. */
     action   registerForDustGeneration(sessionId: UUID,
-                                       dustReceiverAddress: String, // optional; defaults to the wallet's own DUST address
-                                       idempotencyKey: String // optional; dedupes retries
-    )                                                                 returns {
+                                       dustReceiverAddress: String, // optional, default the wallet's own DUST address
+                                       idempotencyKey: String // optional
+    )                                                                         returns {
         jobId  : UUID;
-        status : String; // 'pending' | 'succeeded' (idempotent retry)
+        status : String;
     };
 
-    /**
-     * Remove all of the wallet's NIGHT UTXOs from dust generation. Async; job
-     * result `{ txId, deregisteredCount, totalNightUtxos }`.
-     */
+    /** Stops DUST generation for all of the wallet's NIGHT coins. */
     action   deregisterFromDustGeneration(sessionId: UUID,
                                           idempotencyKey: String, // optional
-                                          sponsorSessionId: UUID // optional; second session pays the dust fee (a fully delegated wallet has none)
-    )                                                                 returns {
+                                          sponsorSessionId: UUID // optional
+    )                                                                         returns {
         jobId  : UUID;
-        status : String; // 'pending' | 'succeeded' (idempotent retry)
+        status : String;
     };
 
     /**
-     * Send NIGHT or `tokenTypeHex` to an address. The prefix picks the ledger
-     * (`mn_shield-addr_` shielded, `mn_addr_` unshielded); funds come from the
-     * same ledger. Async; job result `{ txId, toLedger, amount, receiverAddress }`.
+     * Sends NIGHT, or the token `tokenTypeHex`, to an address.
+     * An `mn_shield-addr_` address is paid from the shielded balance, an `mn_addr_` address from the unshielded one.
      */
     action   sendNight(sessionId: UUID,
                        receiverAddress: String,
-                       amount: String, // atoms, decimal string
-                       ttlIso: String, // optional ISO-8601; defaults to +10min
-                       idempotencyKey: String, // optional; dedupes retries
-                       tokenTypeHex: String // optional raw token type (64 hex) instead of NIGHT
-    )                                                                 returns {
+                       amount: String,
+                       ttlIso: String, // ISO 8601; optional, default 10 minutes from now
+                       idempotencyKey: String, // optional
+                       tokenTypeHex: Hex64 // optional, default NIGHT
+    )                                                                         returns {
         jobId  : UUID;
-        status : String; // 'pending' | 'succeeded' (idempotent retry)
+        status : String;
     };
 
-    // ---- Diagnostics (read-only) ----
-
-    /** Wallet balances; amounts are decimal atom strings. */
-    function getWalletBalance(sessionId: UUID)                        returns {
+    /** Wallet balances. */
+    function getWalletBalance(sessionId: UUID)                                returns {
         shieldedNight            : String;
         unshieldedNight          : String;
-        shieldedTokens           : array of { // shielded token types other than NIGHT
-            tokenType : String; // raw token type, 64 hex (see deriveTokenType)
-            amount    : String; // atoms, decimal string
+        shieldedTokens           : array of {
+            tokenType : Hex64;
+            amount    : String;
         };
         dustBalance              : String;
         registeredNightUtxoCount : Integer;
@@ -1007,140 +892,123 @@ service NightgateService {
         dustRestoreCount         : Integer;
     };
 
-    /**
-     * Wallet catch-up progress from the worker's ~15 s snapshot. Healthy while
-     * `appliedIndex` climbs; stuck when it stops or `isConnected` is false.
-     * `known` false = nothing reported yet. Counts are dust ledger events
-     * (decimal strings); `etaSeconds` is an order of magnitude.
-     */
-    function getWalletSyncProgress(sessionId: UUID)                   returns {
+    /** How far the wallet has caught up with the chain. The sync is stuck when `appliedIndex` stops growing. */
+    function getWalletSyncProgress(sessionId: UUID)                           returns {
         known                : Boolean;
         caughtUp             : Boolean;
         appliedIndex         : String;
         streamTip            : String;
-        behindEvents         : String; // streamTip - appliedIndex
-        eventsPerSecond      : Decimal; // null until measurable
-        etaSeconds           : Integer; // null if not derivable
-        blockHeight          : String; // indexer block height
+        behindEvents         : String;
+        eventsPerSecond      : Decimal;
+        etaSeconds           : Integer;
+        blockHeight          : String;
         isConnected          : Boolean;
-        indexerFresh         : Boolean; // indexer tip recent enough to count as tip
-        indexerTipAgeSeconds : Integer; // age of the indexer's newest block; null if the read failed
-        indexerError         : String; // why the indexer tip could not be read ('HTTP 403', 'timeout', ...)
-        elapsedMs            : Integer; // duration of the current sync wait
-        phase                : String; // 'prewarm' | 'balance' | ...
-        updatedAt            : Timestamp; // last worker report
-        lastProgressAt       : Timestamp; // appliedIndex last advanced; null if unreported
-        staleSeconds         : Integer; // now - updatedAt
-        stale                : Boolean; // past NIGHTGATE_SYNC_PROGRESS_STALE_S (60 s): nobody is syncing
-        jobId                : UUID; // latest prewarm job; null if none
+        indexerFresh         : Boolean;
+        indexerTipAgeSeconds : Integer;
+        indexerError         : String;
+        elapsedMs            : Integer;
+        phase                : String; // e.g. 'prewarm' or 'balance'
+        updatedAt            : Timestamp;
+        lastProgressAt       : Timestamp;
+        staleSeconds         : Integer;
+        stale                : Boolean; // no report for longer than NIGHTGATE_SYNC_PROGRESS_STALE_S, default 60 s
+        jobId                : UUID; // the latest prewarm job
         jobStatus            : String;
-        restoredFromSnapshot : Boolean; // false = cold start; null = no facade built
+        restoredFromSnapshot : Boolean; // false means the wallet syncs from the start
         snapshotSavedAt      : Timestamp;
         facadeBuildStartedAt : Timestamp;
-        facadeBuiltAt        : Timestamp; // null while still deserializing
+        facadeBuiltAt        : Timestamp;
     };
 
-    /**
-     * Health of every configured platform fee sponsor. `usable`: spendable dust
-     * notes and dust > 0. Amounts are null unless admin or session owner; an
-     * unreadable sponsor is a row with `lastError`.
-     */
-    function getSponsorPoolStatus()                                   returns array of {
+    /** Health of each platform fee sponsor. Amounts are shown only to admins and the session owner. */
+    function getSponsorPoolStatus()                                           returns array of {
         sessionId            : UUID;
         configured           : Boolean;
         usable               : Boolean;
-        dustBalance          : String; // null unless admin or session owner
-        unshieldedNight      : String; // null unless admin or session owner
+        dustBalance          : String;
+        unshieldedNight      : String;
         totalNightUtxoCount  : Integer;
-        registeredNightUtxos : Integer; // the sponsor's own NIGHT registered for dust generation
-        dustNotes            : Integer; // spendable dust notes = parallel sponsoring capacity
-        pendingDustNotes     : Integer; // > 0: spend in flight, or a leaked note
+        registeredNightUtxos : Integer;
+        dustNotes            : Integer; // how many transactions the sponsor can pay at the same time
+        pendingDustNotes     : Integer;
         dustRestoreCount     : Integer;
         caughtUp             : Boolean;
-        stale                : Boolean;   // true: worker did not answer, figures are the last pushed ones
-        asOf                 : Timestamp; // when the figures were read
+        stale                : Boolean; // the wallet did not answer, the figures are the last known ones
+        asOf                 : Timestamp;
         lastError            : String;
     };
 
-    /** DUST fee estimate (atoms, decimal string) for a sendNight; no proof, no submit. */
+    /** Estimates the DUST fee of a sendNight without proving or submitting anything. */
     function estimateSendNightFee(sessionId: UUID,
                                   receiverAddress: String,
                                   amount: String,
-                                  ttlIso: String, // optional
-                                  tokenTypeHex: String // optional, raw token type instead of NIGHT
-    )                                                                 returns {
+                                  ttlIso: String, // ISO 8601; optional, default 10 minutes from now
+                                  tokenTypeHex: Hex64 // optional, default NIGHT
+    )                                                                         returns {
         fee      : String;
         toLedger : String;
     };
 
-    // ---- Proof preparation, provenance, agent grants, jobs ----
+    // ---- Proof preparation, agent output, agent grants, jobs ----
 
     /**
-     * Hash canonical `documentJson` to `payloadHash` and build the salted
-     * `contentRoot` + `schemaId` over the ordered proof fields (order = leaf
-     * index, keep it stable). `kind` 'uint' (non-negative number x `scale`,
-     * default 1000) or 'bytes' (digest of the exact string); `field` is a dot
-     * path, absent values go to `emptyFields`. Compute-only, nothing persisted.
-     * Store `opening` (losing the seed makes the root unprovable) and
-     * `canonicalDocument` (the hashed byte form).
+     * Prepares a JSON document for the proof actions. Nothing is stored.
+     * Keep the field order of `proofFieldsJson` the same for every document of a kind. `kind` is 'uint' or 'bytes', `scale` defaults to 1000.
+     * Store `opening`. Without it no later proof about this document is possible.
      */
-    action   prepareDocumentProof(documentJson: LargeString, // JSON object: the full document
-                                  proofFieldsJson: LargeString, // ordered JSON array of { field, kind?, scale? }, at most the slot width (16 or 32)
-                                  saltSeed: String, // optional 64-hex salt seed (deterministic re-prepare); random if omitted
-                                  compiledArtifactRef: String // optional, defaults to 'attestation-vault'
-    )                                                                 returns {
-        payloadHash       : String; // blake2b-256 of canonicalDocument (64 hex)
-        canonicalDocument : LargeString; // the exact hashed byte form
-        contentRoot       : String; // 64-hex SALTED Merkle root over the proof fields
-        fields            : LargeString; // JSON array of { field, fieldKey, kind, value?, valueDigest?, salt, siblings, dirs }
-        emptyFields       : LargeString; // JSON array of fields without a value (salted absent leaf)
-        schemaId          : String; // 64-hex schema root of the ordered proof fields
-        schema            : LargeString; // JSON array of slot descriptors { fieldKey, kind, scale } (public)
-        leaves            : LargeString; // JSON array of 64-hex salted leaf hashes (informational)
-        opening           : LargeString; // JSON { saltSeed, slots[width] }: witness bundle, store it
+    action   prepareDocumentProof(documentJson: LargeString, // JSON object
+                                  proofFieldsJson: LargeString, // JSON array of { field, kind, scale }, at most 16 or 32 entries depending on the contract
+                                  saltSeed: Hex64, // optional, default random
+                                  compiledArtifactRef: String // optional, default 'attestation-vault'
+    )                                                                         returns {
+        payloadHash       : Hex64;
+        canonicalDocument : LargeString; // the exact text that was hashed
+        contentRoot       : Hex64;
+        fields            : LargeString; // JSON array
+        emptyFields       : LargeString; // JSON array
+        schemaId          : Hex64;
+        schema            : LargeString; // JSON array
+        leaves            : LargeString; // JSON array of 64 hex
+        opening           : LargeString; // JSON
     };
 
     /**
-     * Build the canonical depth-6 set root of an allow-list (blake2b-256 of each
-     * exact string, dedupe, sort, pad to 64 with the last member). With `value`
-     * or `valueDigest` also its inclusion path (witness; 400 if not a member).
-     * Compute-only.
+     * Builds the set of allowed values for issueFieldMembershipAttestation.
+     * With `value` or `valueDigest` it also returns the path that proves the value is in the set.
      */
-    action   prepareMembershipSet(allowedValuesJson: LargeString, // JSON array of allowed strings (<= 64 distinct)
-                                  value: String, // optional raw member string (pass this OR valueDigest)
-                                  valueDigest: String, // optional 64-hex digest of the member value
-                                  compiledArtifactRef: String // optional, defaults to 'attestation-vault'
-    )                                                                 returns {
-        setRoot         : String; // 64-hex canonical set root
-        memberCount     : Integer; // distinct values in the set
-        setSiblingsJson : String; // JSON array of 6 × 64-hex siblings (only with value/valueDigest)
-        setDirsJson     : String; // JSON array of 6 booleans (only with value/valueDigest)
+    action   prepareMembershipSet(allowedValuesJson: LargeString, // JSON array of up to 64 strings
+                                  value: String, // optional
+                                  valueDigest: Hex64, // optional; blake2b-256 of value
+                                  compiledArtifactRef: String // optional, default 'attestation-vault'
+    )                                                                         returns {
+        setRoot         : Hex64;
+        memberCount     : Integer;
+        setSiblingsJson : String;
+        setDirsJson     : String;
     };
 
     /**
-     * Anchor a canonical provenance envelope `{ v, agentId, inputHash,
-     * outputHash, producedAt, modelId?, policyHash? }` like anchorDocument.
-     * Anyone verifies by re-hashing `envelopeJson` and calling
-     * verifyAttestationState. The attester is the session wallet. Async.
+     * Records on chain that an agent produced an output from an input, signed by the session's wallet.
+     * Anyone can check it by hashing `envelopeJson` and calling verifyAttestationState.
      */
-    action   attestAgentOutput(agentId: String, // agent identity (<= 200 chars), ideally a registered grantee id
-                               inputHash: String, // 64 hex commitment to the agent's input
-                               outputHash: String, // 64 hex commitment to the produced output
-                               modelId: String, // optional model identifier (<= 200 chars)
-                               policyHash: String, // optional 64 hex commitment to the governing policy
-                               producedAt: Timestamp, // optional; defaults to the first call's under the same idempotencyKey, else now
-                               storageRef: String, // optional; where output/envelope live, defaults to agent-output://<agentId>
+    action   attestAgentOutput(agentId: String, // at most 200 characters
+                               inputHash: Hex64,
+                               outputHash: Hex64,
+                               modelId: String, // at most 200 characters; optional
+                               policyHash: Hex64, // optional
+                               producedAt: Timestamp, // optional, default now
+                               storageRef: String, // optional, default 'agent-output://<agentId>'
                                sessionId: UUID,
-                               contractAddress: String, // AttestationVault deployment
-                               compiledArtifactRef: String, // optional, defaults to 'attestation-vault'
-                               idempotencyKey: String, // optional; dedupes retries
-                               sponsorSessionId: UUID // optional; second session pays the dust fee
-    )                                                                 returns {
+                               contractAddress: String,
+                               compiledArtifactRef: String, // optional, default 'attestation-vault'
+                               idempotencyKey: String, // optional
+                               sponsorSessionId: UUID // optional
+    )                                                                         returns {
         jobId        : UUID;
         status       : String;
-        documentId   : UUID; // Documents row handle
-        payloadHash  : String; // blake2b-256 of envelopeJson, the anchored value
-        envelopeJson : LargeString; // canonical envelope; re-hash to verify
+        documentId   : UUID;
+        payloadHash  : Hex64;
+        envelopeJson : LargeString;
     };
 
     /** The caller's agent grants. */
@@ -1152,29 +1020,26 @@ service NightgateService {
         };
 
     /**
-     * Create a revocable bearer token over one of the caller's sessions.
-     * Requests with it in `x-agent-token` run as the caller, limited to
-     * `allowedActions` (attestation/predicate/disclosure only) plus verify and
-     * getJobStatus, the grant's session, `maxJobsPerDay` and a fixed
-     * `sponsorSessionId` (checked now, 4xx if unusable). Lists the platform
-     * sponsor policy leaves nothing of are 400.
+     * Creates a token that lets an agent act as the caller on one wallet session. The agent sends it in the `x-agent-token` header.
+     * The agent may only call `allowedActions`, the verify functions and getJobStatus.
+     * The allowed lists can only narrow what the platform's sponsor policy allows.
      */
     action   createAgentGrant(sessionId: UUID,
                               allowedActions: array of String,
-                              maxJobsPerDay: Integer, // optional; null = unlimited
-                              sponsorSessionId: UUID, // optional; fixed fee-sponsor binding
-                              validUntil: Timestamp, // optional; null = no expiry
-                              agentLabel: String, // optional, informational
-                              allowedContracts: array of String, // optional; sponsorable contracts, effective = platform floor ∩ grant; absent = the floor
-                              allowedCircuits: array of String, // optional; same rule for circuit names
-                              allowDeploy: Boolean, // optional; sponsor pays a caller-built deploy (needs a sponsor* action and NIGHTGATE_SPONSOR_ALLOW_DEPLOY); the address becomes sponsorable
-                              maxDeploys: Integer, // optional lifetime deploy budget; default 1 when allowDeploy
-                              allowedTokenTypes: array of String // optional raw shielded token types (64 hex) whose offers the sponsor pays; floor ∩ grant (NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES)
-    )                                                                 returns {
+                              maxJobsPerDay: Integer, // optional, default unlimited
+                              sponsorSessionId: UUID, // optional
+                              validUntil: Timestamp, // optional, default no expiry
+                              agentLabel: String, // optional
+                              allowedContracts: array of String, // optional, default all the platform allows
+                              allowedCircuits: array of String, // optional, default all the platform allows
+                              allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent, needs NIGHTGATE_SPONSOR_ALLOW_DEPLOY
+                              maxDeploys: Integer, // optional, default 1 when allowDeploy is true
+                              allowedTokenTypes: array of Hex64 // optional, default all the platform allows
+    )                                                                         returns {
         grantId           : UUID;
-        token             : String; // shown once, never stored
+        token             : String; // shown only once
         allowedActions    : array of String;
-        allowedContracts  : array of String; // empty = platform floor
+        allowedContracts  : array of String;
         allowedCircuits   : array of String;
         allowDeploy       : Boolean;
         maxDeploys        : Integer;
@@ -1183,28 +1048,26 @@ service NightgateService {
     };
 
     /**
-     * `count` grants of one shape on one session in one call, each with its own
-     * token (shown once) and label: `labels` (exactly `count`), else
-     * `<agentLabel | 'agent'>-1..n`. Same checks and limits as createAgentGrant;
-     * at most 50 per call.
+     * Creates up to 50 grants with the same settings, each with its own token.
+     * Without `labels` they are named `<agentLabel>-1` to `<agentLabel>-n`.
      */
     action   createAgentGrants(count: Integer,
                                sessionId: UUID,
                                allowedActions: array of String,
                                labels: array of String, // optional; exactly count entries
-                               maxJobsPerDay: Integer, // optional; null = unlimited, per grant
-                               sponsorSessionId: UUID, // optional; fixed fee-sponsor binding
-                               validUntil: Timestamp, // optional; null = no expiry
-                               agentLabel: String, // optional; stem of the generated labels
-                               allowedContracts: array of String, // optional
-                               allowedCircuits: array of String, // optional
-                               allowDeploy: Boolean, // optional
-                               maxDeploys: Integer, // optional; per grant
-                               allowedTokenTypes: array of String // optional
-    )                                                                 returns {
+                               maxJobsPerDay: Integer, // optional, default unlimited
+                               sponsorSessionId: UUID, // optional
+                               validUntil: Timestamp, // optional, default no expiry
+                               agentLabel: String, // optional
+                               allowedContracts: array of String, // optional, default all the platform allows
+                               allowedCircuits: array of String, // optional, default all the platform allows
+                               allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent, needs NIGHTGATE_SPONSOR_ALLOW_DEPLOY
+                               maxDeploys: Integer, // optional, default 1 when allowDeploy is true
+                               allowedTokenTypes: array of Hex64 // optional, default all the platform allows
+    )                                                                         returns {
         grants            : array of {
             grantId    : UUID;
-            token      : String; // shown once, never stored
+            token      : String; // shown only once
             agentLabel : String;
         };
         allowedActions    : array of String;
@@ -1216,18 +1079,12 @@ service NightgateService {
         validUntil        : Timestamp;
     };
 
-    /** Revoke a grant immediately; a foreign grantId is 404. */
-    action   revokeAgentGrant(grantId: UUID)                          returns {
+    /** Revokes a grant at once. A grant of another user gives 404. */
+    action   revokeAgentGrant(grantId: UUID)                                  returns {
         revoked : Boolean;
     };
 
-    /**
-     * Change the given parameters of a grant; `null` clears maxJobsPerDay,
-     * validUntil, agentLabel and the allow-lists. Session, sponsor and token are
-     * immutable; `maxDeploys` >= deploys used. Lists the platform sponsor
-     * policy leaves nothing of are 400. Foreign grant 404, revoked
-     * `409 GRANT_REVOKED`. Never grantable; `NIGHTGATE_GRANT_ADMIN_RATE_LIMIT`.
-     */
+    /** Changes the given settings of a grant. */
     action   updateAgentGrant(grantId: UUID,
                               agentLabel: String,
                               allowedActions: array of String,
@@ -1237,25 +1094,18 @@ service NightgateService {
                               allowedTokenTypes: array of String,
                               allowDeploy: Boolean,
                               maxDeploys: Integer,
-                              validUntil: Timestamp)                     returns {
+                              validUntil: Timestamp)                          returns {
         grantId : UUID;
-        updated : array of String; // applied parameter names
+        updated : array of String;
     };
 
-    /**
-     * Replace the grant's token; the old one is 401 from the next request.
-     * Budgets and deployedContracts survive. Owner-scoped, never grantable.
-     */
-    action   rotateAgentGrantToken(grantId: UUID)                     returns {
+    /** Replaces a grant's token. The old token stops working at once. */
+    action   rotateAgentGrantToken(grantId: UUID)                             returns {
         grantId : UUID;
-        token   : String; // shown once, never stored
+        token   : String; // shown only once
     };
 
-    /**
-     * Grant activity from `since` (default `until` - 30 days) to `until`
-     * (default now), at most 366 days: jobs incl. children, budgets, indexed
-     * DUST fees. Owner-scoped; a token sees only its own grant.
-     */
+    /** What a grant did between `since` and `until`, by default the last 30 days, at most 366 days. */
     function getGrantUsage(grantId: UUID, since: Timestamp, until: Timestamp) returns {
         grantId       : UUID;
         since         : Timestamp;
@@ -1265,22 +1115,22 @@ service NightgateService {
             status : String;
             count  : Integer;
         };
-        landed        : Integer; // chainStatus success
-        failed        : Integer; // status failed or chainStatus failure
+        landed        : Integer; // transactions that succeeded on chain
+        failed        : Integer;
         deploysUsed   : Integer;
         maxDeploys    : Integer;
         jobsUsedToday : Integer;
         maxJobsPerDay : Integer;
-        dustPaid      : String; // decimal DUST atoms; null without the crawler
+        dustPaid      : String;
     };
 
     /**
-     * Status of an async job; poll until `succeeded` or `failed`. `result` is
-     * the action's return value as JSON; `errorCode` a stable classification
-     * (e.g. '1016', 'TxFailed'). Foreign jobs are 404. POST, but side-effect free.
+     * Returns the status of a background job. Poll until `status` is `succeeded` or `failed`.
+     * `result` is the action's result as JSON. This is a POST but changes nothing.
      */
+
     action   getJobStatus(jobId: UUID,
-                          sessionId: UUID)                            returns {
+                          sessionId: UUID)                                    returns {
         jobId               : UUID;
         kind                : String;
         status              : String; // pending | running | external_execution | submitted | reconciliation_required | succeeded | failed
@@ -1291,11 +1141,11 @@ service NightgateService {
         maxAttempts         : Integer;
         submissionId        : UUID;
         txHash              : String;
-        chainStatus         : String; // null | pending | success | failure | dropped (not included before its ttl); independent of status
+        chainStatus         : String; // null | pending | success | failure | dropped
         chainFinalizedAt    : Timestamp;
-        chainBlockHeight    : Integer; // null until confirmed
+        chainBlockHeight    : Integer;
         chainBlockHash      : String;
-        chainSegments       : LargeString; // batches: JSON [{ segment, calls, applied }] once confirmed; null otherwise
+        chainSegments       : LargeString;
         queuedAt            : Timestamp;
         externalExecutionAt : Timestamp;
         submittedAt         : Timestamp;

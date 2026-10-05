@@ -1,7 +1,7 @@
 /**
- * Detects a restored sub-wallet whose offset lags its state: the ledger rejects every
- * replayed event, the SDK only prints it and retries forever. The printed rejection names
- * no wallet, so it is attributed via the facade's own offsets. No worker-module imports.
+ * Detects a restored wallet part (dust or shielded) whose saved position is behind its saved state.
+ * The ledger then rejects every event it replays, and the SDK only prints the error and retries forever.
+ * The printed error names no wallet, so the wallet is found by watching which one stops moving.
  */
 
 export type ReplayKind = 'dust' | 'shielded';
@@ -20,7 +20,7 @@ export interface ReplayRejection {
 /** Last ledger replay rejection seen in this thread, per sub-wallet kind. */
 export const lastReplayRejection: Partial<Record<ReplayKind, ReplayRejection>> = {};
 
-/** The sub-wallet kind whose replayed event the ledger rejected, searched through the cause chain; null for anything else. */
+/** Which wallet part a replay error belongs to, or null when it is no replay error. */
 export function classifyReplayRejection(value: unknown): { kind: ReplayKind; message: string } | null {
     let current: any = value;
     for (let depth = 0; depth < 6 && current != null; depth++) {
@@ -35,7 +35,6 @@ export function classifyReplayRejection(value: unknown): { kind: ReplayKind; mes
     return null;
 }
 
-/** Record every replay rejection among one call's `console.error` arguments. */
 export function noteConsoleErrorArgs(args: unknown[], now: number = Date.now()): void {
     for (const arg of args) {
         const hit = classifyReplayRejection(arg);
@@ -45,7 +44,7 @@ export function noteConsoleErrorArgs(args: unknown[], now: number = Date.now()):
 
 const TAPPED = Symbol.for('nightgate.replayRejectionTap');
 
-/** Wrap `target.error` so replay rejections are recorded; the original still prints. Idempotent. */
+/** Wraps `console.error` to record replay errors. The original still prints. */
 export function installReplayRejectionTap(target: { error: (...args: any[]) => void } = console): void {
     if ((target.error as any)[TAPPED]) return;
     const original = target.error;
@@ -57,7 +56,7 @@ export function installReplayRejectionTap(target: { error: (...args: any[]) => v
     target.error = tapped;
 }
 
-/** A restored sub-wallet's offset over time: where it started, where it is, since when unchanged, whether it ever moved past the start. */
+/** How a restored wallet part's position changes over time. */
 export interface ReplayTrack {
     startIndex: bigint;
     lastIndex: bigint;
@@ -66,8 +65,8 @@ export interface ReplayTrack {
 }
 
 export function observeReplayTrack(track: ReplayTrack | undefined, applied: bigint, now: number): ReplayTrack {
-    // A lower reading right after start restarts the track: the offset the
-    // stream resumes from is the lowest one the sub-wallet reports.
+    // Before any progress, a lower value replaces the start, because the
+    // sync resumes from the lowest position the wallet reports.
     if (!track || (!track.advanced && applied < track.startIndex)) {
         return { startIndex: applied, lastIndex: applied, since: now, advanced: false };
     }
@@ -75,7 +74,7 @@ export function observeReplayTrack(track: ReplayTrack | undefined, applied: bigi
     return { ...track, lastIndex: applied, since: now, advanced: track.advanced || applied > track.startIndex };
 }
 
-/** Replace the sub-wallet only when it is stuck at its restored offset while the stream tip lies beyond it. */
+/** True only when the part is stuck at its restored position while the chain is clearly ahead. */
 export function shouldResetRestoredSubWallet(input: {
     track: ReplayTrack | undefined;
     streamTip: bigint | null;
@@ -91,7 +90,7 @@ export function shouldResetRestoredSubWallet(input: {
     return streamTip != null && streamTip > track.startIndex + tipGap;
 }
 
-/** A sub-wallet's `appliedIndex` from a `facade.state()` emission; null when absent or unreadable. */
+/** A wallet part's `appliedIndex`, or null when it cannot be read. */
 export function appliedIndexOf(state: any, kind: ReplayKind): bigint | null {
     try {
         const progress = state?.[kind]?.progress ?? state?.[kind]?.state?.progress;
@@ -104,10 +103,9 @@ export function appliedIndexOf(state: any, kind: ReplayKind): bigint | null {
 
 export interface SyncStateDescription {
     dustAppliedIndex: string | null;
-    /** The dust local state's synced time (ISO). */
     dustSyncTime: string | null;
     shieldedAppliedIndex: string | null;
-    /** The shielded local state's next free commitment tree index. */
+    /** The next free index in the shielded commitment tree. */
     shieldedFirstFree: string | null;
 }
 
@@ -119,7 +117,7 @@ function readSafely<T>(read: () => T): T | null {
     }
 }
 
-/** The offsets a snapshot resumes from next to the positions of the states it carries. Never throws. */
+/** The positions a saved state resumes from, for logging. Never throws. */
 export function describeSyncState(state: any): SyncStateDescription {
     const syncTime = readSafely(() => state?.dust?.state?.state?.syncTime);
     const firstFree = readSafely(() => state?.shielded?.state?.state?.firstFree);

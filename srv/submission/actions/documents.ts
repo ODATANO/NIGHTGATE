@@ -1,5 +1,5 @@
 /**
- * Document anchoring, verification, passport registration and retraction.
+ * Actions that store document hashes on-chain, verify them, register documents and remove them.
  * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
@@ -8,40 +8,27 @@ import { bytesToHex } from '@noble/hashes/utils';
 import { type NightgateNetwork, VALID_NIGHTGATE_NETWORKS } from '../../utils/nightgate-config';
 import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
-import { SHA256_HEX_RE, DEFAULT_ATTESTATION_VAULT_REF, liveProviderConfigured } from '../verify-state';
+import { DEFAULT_ATTESTATION_VAULT_REF, liveProviderConfigured } from '../verify-state';
 import { agentOutputProducedAt } from '../document-proof';
 import { Documents, Transactions, TransactionResults, type Document, type Transaction } from '#cds-models/midnight';
 import type { Row } from '../../utils/db-types';
-import type { NightgateRequest } from '../../utils/request-types';
+import type { ActionRequest } from '@sap/cds';
 import { anchorRateLimiter, registrarRateLimiter, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
+import { anchorDocument, purgeExpired, registerPassport, retractAttestation, verifyDocument } from '#cds-models/NightgateService';
 
 const { INSERT, UPDATE, SELECT, DELETE } = cds.ql;
 
 export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'attesterIdResolver' | 'contractResolver' | 'verifyDocumentViaState' | 'resolveSponsorForRequest'>): void {
     const { srv, db, walletFactory, attesterIdResolver, contractResolver, verifyDocumentViaState, resolveSponsorForRequest } = ctx;
 
-    srv.on('anchorDocument', async (req: NightgateRequest) => {
-        const data = req.data as {
-            sha256?: string;
-            contentType?: string;
-            size?: number;
-            storageRef?: string;
-            metadata?: string;
-            sessionId?: string;
-            contractAddress?: string;
-            compiledArtifactRef?: string;
-            idempotencyKey?: string;
-            sponsorSessionId?: string;
-        };
+    srv.on(anchorDocument, async (req) => {
+        const data = req.data;
 
         if (!data.sha256) return req.reject(400, 'sha256 is required');
         if (!data.storageRef) return req.reject(400, 'storageRef is required');
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
-        if (!SHA256_HEX_RE.test(data.sha256)) {
-            return req.reject(400, 'sha256 must be 64 hex chars (32 bytes)');
-        }
 
         const metadataStr = data.metadata ?? '';
         const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
@@ -54,11 +41,9 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         const metadataHashBytes = sha256(new TextEncoder().encode(metadataStr));
         const producedAt = agentOutputProducedAt(data.contentType, metadataStr);
 
-        // Row first, so the document id is stable before the job runs.
         const documentId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
-        // verifyDocument trusts only this recorded binding (owner, vault,
-        // network, artifact), never caller-supplied coordinates.
+        // verifyDocument later trusts only what is stored here, never values from its caller.
         const networkId = recordedNetworkId();
         await db.run(INSERT.into(Documents).entries({
             ID: documentId,
@@ -85,8 +70,6 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
-            // The record is keyed by the session's attester id and the hash, so a
-            // plain attest cannot be pre-empted by another identity.
             const attesterId = await attesterIdResolver({ sessionId: data.sessionId!, db, expectedUserId: req.user?.id });
             await db.run(UPDATE.entity(Documents).set({ attesterId }).where({ ID: documentId }));
             const job = await startJob({
@@ -123,28 +106,19 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         });
     });
 
-    srv.on('verifyDocument', async (req: NightgateRequest) => {
-        const { documentId, providedSha256, contractAddress, compiledArtifactRef } = req.data as {
-            documentId?: string;
-            providedSha256?: string;
-            contractAddress?: string;
-            compiledArtifactRef?: string;
-        };
+    srv.on(verifyDocument, async (req) => {
+        const { documentId, providedSha256, contractAddress, compiledArtifactRef } = req.data;
 
         if (!documentId) return req.reject(400, 'documentId is required');
         if (!providedSha256) return req.reject(400, 'providedSha256 is required');
-        if (!SHA256_HEX_RE.test(providedSha256)) {
-            return req.reject(400, 'providedSha256 must be 64 hex chars (32 bytes)');
-        }
 
         const doc: Row<Document, 'ID' | 'sha256'> | undefined = await db.run(
             SELECT.one.from(Documents).where({ ID: documentId })
         );
         if (!doc) return req.reject(404, `Document ${documentId} not found`);
 
-        // Recorded coordinates are authoritative and caller values may only
-        // confirm them: another vault attesting the same public hash must not
-        // verify this document. Rows without them take the caller's values.
+        // The stored contract and network win. Otherwise another contract that attests the same
+        // public hash could verify this document. Old rows without them use the caller's values.
         const recordedContract: string | null = doc.contractAddress ?? null;
         if (recordedContract && contractAddress
             && contractAddress.toLowerCase() !== recordedContract.toLowerCase()) {
@@ -156,7 +130,6 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
             return req.reject(400, 'compiledArtifactRef does not match the artifact this document was anchored with');
         }
         const effectiveArtifact = recordedArtifact ?? compiledArtifactRef;
-        // Read the recorded network's indexer, never silently the configured one.
         const recordedNetwork = doc.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(doc.network)
             ? doc.network as NightgateNetwork
             : undefined;
@@ -164,9 +137,8 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         const hashMatches = doc.sha256?.toLowerCase() === providedSha256.toLowerCase();
         const anchoredOk = Boolean(doc.anchoredTxHash);
 
-        // `included` = indexed inclusion of the anchoring tx; `current` = live
-        // state, which a retract can have changed since. The verdict needs the
-        // live read: an indexed inclusion alone never says the record still stands.
+        // `included` only says the transaction landed. The verdict needs the live state,
+        // because the attestation may have been retracted since.
         let included = false;
         let stateChecked = false;
         let current = false;
@@ -199,35 +171,23 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
             stateChecked,
             anchoredTxHash: doc.anchoredTxHash ?? '',
             anchoredAt: doc.anchoredAt ?? null,
-            // Only echoed back on a match: a document id alone must not reveal the hash.
+            // Only returned on a match, so a document id alone does not reveal the hash.
             originalSha256: hashMatches ? doc.sha256 ?? '' : ''
         };
     });
 
-    srv.on('registerPassport', async (req: NightgateRequest) => {
-        const data = req.data as {
-            passportId?: string;
-            documentId?: string;
-            ownerId?: string;
-            mode?: number | string;
-            sessionId?: string;
-            contractAddress?: string;
-            compiledArtifactRef?: string;
-            idempotencyKey?: string;
-            sponsorSessionId?: string;
-        };
+    srv.on(registerPassport, async (req) => {
+        const data = req.data;
 
-        const mode = data.mode === undefined || data.mode === null || data.mode === '' ? 0 : Number(data.mode);
+        const mode = data.mode ?? 0;
         if (![0, 1, 2, 3, 4].includes(mode)) return req.reject(400, 'mode must be 0 (register), 1 (unregister), 2 (transfer registrar), 3 (recovery: set registrar) or 4 (recovery: set recovery)');
         const zeroId = '00'.repeat(32);
-        // Mode 1 takes no owner, modes 2-4 no id: the unused argument rides as zero.
+        // Mode 1 has no owner and modes 2-4 have no id. The unused argument is sent as zeros.
         if (mode === 1) data.ownerId = zeroId;
         if (mode >= 2) data.passportId = zeroId;
         if (!data.passportId && data.documentId) data.passportId = data.documentId;
         if (!data.passportId) return req.reject(400, 'documentId is required');
-        if (!SHA256_HEX_RE.test(data.passportId)) return req.reject(400, 'documentId must be 64 hex chars (32 bytes)');
         if (!data.ownerId) return req.reject(400, 'ownerId is required');
-        if (!SHA256_HEX_RE.test(data.ownerId)) return req.reject(400, 'ownerId must be 64 hex chars (32 bytes)');
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
@@ -276,9 +236,8 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         });
     });
 
-    /** Shared submit path of the retract circuit (mode 0 payload, 1 claim, 2 commitment). */
-    async function submitRetract(req: NightgateRequest, mode: number, key: string, data: { sessionId?: string; contractAddress?: string; compiledArtifactRef?: string; idempotencyKey?: string; sponsorSessionId?: string }) {
-        if (!SHA256_HEX_RE.test(key)) return req.reject(400, 'key must be 64 hex chars (32 bytes)');
+    /** Submits the retract circuit. Mode 0 removes an attestation, mode 1 an expired claim. */
+    async function submitRetract(req: ActionRequest<unknown, unknown>, mode: number, key: string, data: { sessionId?: string | null; contractAddress?: string | null; compiledArtifactRef?: string | null; idempotencyKey?: string | null; sponsorSessionId?: string | null }) {
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
         const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
@@ -310,17 +269,16 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         });
     }
 
-    // Owner-initiated removal of a payload: attestation, anchor, disclosures
-    // and document binding leave the chain (retract mode 0).
-    srv.on('retractAttestation', async (req: NightgateRequest) => {
-        const data = req.data as { payloadHash?: string; sessionId?: string; contractAddress?: string; compiledArtifactRef?: string; idempotencyKey?: string; sponsorSessionId?: string };
+    // The owner removes an attestation. Its stored root, disclosure grants and document link go with it.
+    srv.on(retractAttestation, async (req) => {
+        const data = req.data;
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
         return submitRetract(req, 0, data.payloadHash, data);
     });
 
-    // Anyone removes an expired claim (`kind` claim, key = claim key).
-    srv.on('purgeExpired', async (req: NightgateRequest) => {
-        const data = req.data as { kind?: string; key?: string; sessionId?: string; contractAddress?: string; compiledArtifactRef?: string; idempotencyKey?: string; sponsorSessionId?: string };
+    // Anyone may remove an expired claim.
+    srv.on(purgeExpired, async (req) => {
+        const data = req.data;
         const mode = data.kind === 'claim' ? 1 : null;
         if (mode === null) return req.reject(400, "kind must be 'claim'");
         if (!data.key) return req.reject(400, 'key is required');

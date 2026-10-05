@@ -15,8 +15,14 @@
 process.env.NO_TELEMETRY = 'true';
 process.env.SKIP_AUTO_INIT = 'true';
 
+import { beforeAll } from 'vitest';
 import cds from '@sap/cds';
 
 if (cds.User && (cds.User as any).Privileged) {
     cds.User.default = (cds.User as any).Privileged as unknown as typeof cds.User.default;
 }
+
+// The generated entity classes resolve against cds.entities, so suites that do not boot a server still need the model.
+beforeAll(async () => {
+    if (typeof cds.load === 'function' && !cds.model) cds.model = cds.compile.for.nodejs(await cds.load(['db', 'srv']));
+});

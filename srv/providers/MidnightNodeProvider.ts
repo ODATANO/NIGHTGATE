@@ -1,6 +1,6 @@
 /**
- * Substrate JSON-RPC 2.0 WebSocket client for a Midnight node: the crawler's
- * data source, independent of the hosted Midnight Indexer.
+ * JSON-RPC client that talks to a Midnight node over WebSocket.
+ * The crawler reads its blocks through it, without depending on the Midnight Indexer.
  */
 
 import WebSocket from 'ws';
@@ -13,7 +13,7 @@ export interface NodeProviderConfig {
     requestTimeout?: number;  // ms, default 30000
     reconnectInterval?: number; // ms, default 5000
     maxReconnectAttempts?: number; // default 10
-    pingInterval?: number; // ms, default 30000; 0 = off. No pong within one interval closes the socket.
+    pingInterval?: number; // ms, default 30000, 0 turns it off. No answer within one interval closes the socket.
 }
 
 export interface BlockHeader {
@@ -69,9 +69,8 @@ interface PendingRequest {
 
 type SubscriptionCallback = (result: any) => void | Promise<void>;
 
-/** Reconnect delay = reconnectInterval x min(attempt, this): 5 s x 12 = one attempt a minute in a long outage. */
+/** Caps the reconnect delay at reconnectInterval times this factor. With the defaults that is one attempt a minute. */
 const MAX_RECONNECT_DELAY_FACTOR = 12;
-// Notifications kept per subscription id not yet registered, and ids kept at all.
 const ORPHAN_NOTIFICATIONS_PER_ID = 16;
 const ORPHAN_SUBSCRIPTIONS_MAX = 32;
 
@@ -156,8 +155,8 @@ export class MidnightNodeProvider {
     }
 
     /**
-     * A half-open socket (dropped by NAT or a proxy without a close) never errors
-     * on its own; terminating it after one silent interval lets the reconnect run.
+     * A connection dropped silently, for example by a proxy, never reports an error.
+     * Closing the socket after one silent interval lets the reconnect start.
      */
     private startHeartbeat(socket: WebSocket): void {
         this.stopHeartbeat();
@@ -211,19 +210,17 @@ export class MidnightNodeProvider {
         this.onReconnectCallback = callback;
     }
 
-    /** Called once per outage when maxReconnectAttempts is exceeded; reconnecting continues. */
+    /** Called once per outage when maxReconnectAttempts is exceeded. Reconnecting goes on. */
     setOnReconnectFailed(callback: () => void): void {
         this.onReconnectFailedCallback = callback;
     }
 
-    /** True once the abandonment signal fired for the current outage (reset on connect). */
     private reconnectAbandonSignalled = false;
 
     private attemptReconnect(): void {
         if (this.reconnecting) return;
-        // Never give up on the node: past maxReconnectAttempts signal once (the
-        // crawler marks the sync errored) and keep retrying at a capped delay.
-        // Stopping would freeze the index while resumeCrawler says "running".
+        // Never give up on the node. After maxReconnectAttempts, report the failure once
+        // and keep retrying. Stopping would freeze the index while the crawler still looks running.
         if (this.reconnectAttempts >= this.config.maxReconnectAttempts && !this.reconnectAbandonSignalled) {
             log.error(`Max reconnect attempts (${this.config.maxReconnectAttempts}) reached`);
             log.error(`Node unreachable after ${this.config.maxReconnectAttempts} attempts; sync marked errored, reconnecting continues every ${this.config.reconnectInterval * MAX_RECONNECT_DELAY_FACTOR}ms`);
@@ -285,7 +282,7 @@ export class MidnightNodeProvider {
         });
     }
 
-    /** Sends the calls as one JSON-RPC batch frame; results in input order, rejects if any call errors. */
+    /** Sends all calls in one JSON-RPC batch. Results come back in input order. Rejects if any call fails. */
     async rpcBatch(requests: Array<{ method: string; params?: unknown[] }>): Promise<any[]> {
         if (!this.ws || !this.connected) {
             throw new Error('Not connected to Midnight Node');
@@ -342,8 +339,8 @@ export class MidnightNodeProvider {
             if (callback) {
                 this.invokeSubscriptionCallback(callback, message.params.result);
             } else {
-                // Substrate replays the current head before subscribe*() knows the
-                // id; buffer it for registerSubscription so it is not dropped.
+                // The node sends the current head before the subscribe call has returned the id.
+                // Buffer it so it is not lost.
                 this.bufferOrphan(message.params.subscription, message.params.result);
             }
             return;
@@ -439,8 +436,8 @@ export class MidnightNodeProvider {
     }
 
     /**
-     * Bounded: late notifications of an id that is never registered (one already
-     * unsubscribed) would otherwise pile up until the next reconnect.
+     * Kept small on purpose. Late notifications for an id that is already unsubscribed
+     * would otherwise pile up until the next reconnect.
      */
     private bufferOrphan(subscriptionId: string, result: any): void {
         let buf = this.orphanNotifications.get(subscriptionId);
@@ -456,7 +453,6 @@ export class MidnightNodeProvider {
         if (buf.length > ORPHAN_NOTIFICATIONS_PER_ID) buf.shift();
     }
 
-    /** Sets the callback, then drains notifications buffered before the id was known. */
     private registerSubscription(subscriptionId: string, callback: SubscriptionCallback): void {
         this.subscriptions.set(subscriptionId, callback);
         const buffered = this.orphanNotifications.get(subscriptionId);

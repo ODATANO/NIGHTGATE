@@ -1,8 +1,7 @@
 /**
- * NIGHTGATE's lanes for `@odatano/cap-auth`: an agent token on the Nightgate
- * service (the grant hook authenticates it, also per `$batch` part) and the
- * optional public verify lane. Both pass under marker principals that own
- * nothing.
+ * Two extra login routes ("lanes") for `@odatano/cap-auth`.
+ * One accepts an agent token on the Nightgate service. The other opens the optional public verify service.
+ * Both let the request through as a placeholder user that owns nothing. The agent grant check verifies the token later.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -22,7 +21,7 @@ export const agentTokenLane: TransportLane = {
     authenticate: () => ({ user: markerUser(AGENT_TOKEN_TRANSPORT_USER) })
 };
 
-/** Any-origin CORS, only on the public verify lane; the verify service rate-limits by address. */
+/** Allows requests from any web origin, only for the public verify service. That service rate-limits by client address. */
 export const publicVerifyLane: TransportLane = {
     name: 'public-verify',
     match: (req) => configFlag('NIGHTGATE_PUBLIC_VERIFY') && inLaneOf(requestPath(req), PUBLIC_VERIFY_LANE_PREFIX),
@@ -40,7 +39,7 @@ export const publicVerifyLane: TransportLane = {
     }
 };
 
-/** Registers both lanes; runs at plugin load. Never throws (a plugin must not take the host down). */
+/** Registers both lanes at plugin load. Never throws, so a failure cannot crash the host app. */
 export function registerNightgateTransportLanes(): void {
     try {
         registerTransportLane(agentTokenLane);

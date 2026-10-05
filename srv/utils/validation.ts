@@ -1,7 +1,3 @@
-/**
- * Input Validation Utilities for Midnight service handlers
- */
-
 const HEX_REGEX = /^[0-9a-fA-F]+$/;
 
 export function validateViewingKey(viewingKey: string | undefined | null): string | undefined {

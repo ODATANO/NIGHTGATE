@@ -1,12 +1,6 @@
 /**
- * In-process keyed async mutex: callers with the same key run strictly one
- * after another, different keys run independently.
- *
- * An in-memory lock is sufficient cross-cutting serialization here because
- * NIGHTGATE enforces a single-instance runtime topology at boot
- * (srv/utils/runtime-topology.ts); there is no second process that could
- * race it. Used to serialize wallet-facade builds against shared-session
- * eviction decisions for the same account.
+ * Async lock per key. Callers with the same key run one after another. Different keys run in parallel.
+ * An in-memory lock is enough because only one NIGHTGATE process may run (see runtime-topology.ts).
  */
 
 const chains = new Map<string, Promise<unknown>>();

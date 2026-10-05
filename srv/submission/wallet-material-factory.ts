@@ -1,6 +1,7 @@
 /**
- * Resolves a WalletSessions row into WalletMaterial. accountId and storage passwords are
- * deterministic per viewing key, so reconnects find the same encrypted state.
+ * Turns a stored wallet session into the keys and providers a job needs.
+ * The account id and storage passwords are derived from the viewing key, so a
+ * reconnect finds the same encrypted state.
  */
 
 import cds from '@sap/cds';
@@ -27,7 +28,7 @@ export class SessionNotFoundError extends NightgateError {
     }
 }
 
-/** Thrown by the adapter's signing methods (not by the factory) for a viewing-key-only session. */
+/** Thrown when a session that holds only a viewing key is asked to sign. */
 export class WalletSigningNotAvailable extends NightgateError {
     constructor(method: string) {
         super('WALLET_SIGNING_NOT_AVAILABLE',
@@ -37,7 +38,7 @@ export class WalletSigningNotAvailable extends NightgateError {
     }
 }
 
-// Not thrown by the factory; exported for the handlers' 501 mapping.
+// Not thrown here. Exported so the handlers can map it to 501.
 export class WalletMaterialUnavailable extends NightgateError {
     constructor(reason: string) {
         super('WALLET_MATERIAL_UNAVAILABLE', `Wallet material unavailable: ${reason}.`);
@@ -48,21 +49,21 @@ export class WalletMaterialUnavailable extends NightgateError {
 
 export interface BuildWalletMaterialOptions {
     sessionId: string;
-    /** Owning principal; scopes the session load, a mismatch reads as SessionNotFound. */
+    /** The user who owns the session. Another user gets SessionNotFound. */
     expectedUserId?: string;
     privateStateBackend?: PrivateStateBackend;
-    /** Test seam; defaults to cds.connect.to('db'). */
+    /** For tests. Defaults to cds.connect.to('db'). */
     db?: DbRunner;
-    /** Test seam; defaults to the process-scoped key from srv/utils/crypto.ts. */
+    /** For tests. Defaults to the process key from srv/utils/crypto.ts. */
     encryptionKey?: Buffer;
-    /** With a seed session: makes the worker facade buildable. Without it only public keys are real. */
+    /** For a session with a seed, lets the worker build the wallet. Without it only the public keys are real. */
     facadeConfig?: Omit<WalletFacadeBuildArgs, 'seedHex'>;
 }
 
 const ACCOUNT_ID_LABEL = 'nightgate-account-id-v1';
 const PRIVATE_STATE_PASSWORD_LABEL = 'nightgate-private-state-password-v1';
 
-/** Resolves a session into a `WalletMaterial` (adapter shape depends on whether the session carries a seed). */
+/** Loads a session as `WalletMaterial`. What the wallet adapter can do depends on whether the session has a seed. */
 export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOptions): Promise<WalletMaterial> {
     const db = opts.db ?? await cds.connect.to('db');
     const where: Record<string, unknown> = { sessionId: opts.sessionId, isActive: true };
@@ -87,17 +88,17 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
     }
 
     const accountId = deriveAccountId(viewingKey);
-    // The DEK is created here on first need; pre-DEK rows are read through the legacy
-    // passwords and rewritten under the DEK by the provider.
+    // The per-account data key is created here when first needed. Data still encrypted
+    // with an older password is read with that password and re-encrypted under the data key.
     const ring = encKey instanceof KeyRing ? encKey : Buffer.isBuffer(encKey) ? KeyRing.fromKek(encKey) : getEncryptionKey();
     const storagePassword = deriveStoragePassword(viewingKey);
     const dek = await resolveAccountDek({ db, ring, accountId, storagePassword });
     if (!dek) throw new SessionNotFoundError(opts.sessionId);
     const password = privateStatePasswordFromDek(dek, accountId);
     const legacyPasswords = privateStatePasswordCandidates(ring, viewingKey).map(c => c.password);
-    // The sync-state store resolves the DEK itself, from the viewing-key form.
+    // The sync-state store finds the data key itself from this password.
     const syncStatePassphrase = storagePassword;
-    // From the session row, never caller input: must match the viewing key's account.
+    // Taken from the session row, never from the caller, so it matches the viewing key's account.
     const accountIndex = session.accountIndex ?? 0;
 
     let walletAndMidnightProvider: any;
@@ -115,7 +116,7 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
                 seedHex,
                 { ...opts.facadeConfig, syncStatePassphrase, accountIndex }
             );
-            // A never-prewarmed or evicted session builds its facade on demand.
+            // Build the wallet on first use if it was never started or was dropped from memory.
             const facadeArgs = { ...opts.facadeConfig, seedHex, syncStatePassphrase, accountIndex };
             ensureFacade = async () => { await getOrBuildWalletFacade(accountId, facadeArgs); };
         } else {
@@ -137,24 +138,27 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
 
 // ---- Determinism helpers --------------------------------------------------
 
-/** Opaque storage scope, deterministic per viewing key (HMAC-SHA256, domain-separated). */
+/** Storage id derived from the viewing key with HMAC-SHA256. */
 export function deriveAccountId(viewingKey: string): string {
     return crypto.createHmac('sha256', ACCOUNT_ID_LABEL).update(viewingKey).digest('hex');
 }
 
-/** Viewing-key-derived storage password; its own label, so it never equals the accountId. */
+/** Storage password derived from the viewing key. It uses its own label, so it never equals the account id. */
 export function deriveStoragePassword(viewingKey: string): string {
     return crypto.createHmac('sha256', PRIVATE_STATE_PASSWORD_LABEL).update(viewingKey).digest('hex');
 }
 
 const PRIVATE_STATE_INFO = 'nightgate/private-state/v2';
 
-/** Legacy (pre-DEK, read-only) private-state password under ring key `keyId`. */
+/** Older private-state password under master key `keyId`. Only used for reading. */
 export function derivePrivateStatePassword(ring: KeyRing, keyId: string, viewingKey: string): string {
     return deriveBoundSecret(ring, keyId, deriveStoragePassword(viewingKey), PRIVATE_STATE_INFO).toString('hex');
 }
 
-/** Read-only legacy private-state passwords (ring keys, active first, then pre-ring); shared with the rewrap tool. */
+/**
+ * All older private-state passwords to try when reading, the active master key first.
+ * Also used by the re-encryption tool.
+ */
 export function privateStatePasswordCandidates(ring: KeyRing, viewingKey: string): Array<{ keyId: string | null; password: string; legacy: boolean }> {
     const out = [ring.activeId, ...ring.ids().filter(i => i !== ring.activeId)].map(id => ({
         keyId: id as string | null, password: derivePrivateStatePassword(ring, id, viewingKey), legacy: false
@@ -165,7 +169,7 @@ export function privateStatePasswordCandidates(ring: KeyRing, viewingKey: string
 
 // ---- Wallet adapter -------------------------------------------------------
 
-/** Adapter for viewing-key-only sessions: every method throws. */
+/** Wallet adapter for a session with only a viewing key. Every method throws. */
 function createReadOnlyWalletAdapter(): any {
     return {
         getCoinPublicKey(): never        { throw new WalletSigningNotAvailable('getCoinPublicKey()'); },
@@ -175,7 +179,7 @@ function createReadOnlyWalletAdapter(): any {
     };
 }
 
-/** Carries the real public keys into the provider bundle; balancing and submission run in the worker. */
+/** Provides the real public keys. Balancing and submitting run in the worker thread. */
 async function createFacadeBackedWalletAdapter(
     accountId: string,
     seedHex: string,
@@ -185,7 +189,8 @@ async function createFacadeBackedWalletAdapter(
         throw new Error('Invalid seed: must be 128 hex characters (64-byte BIP39 seed)');
     }
 
-    // Eager: the WalletProvider key getters are synchronous. Keys come from the Zswap HD role, not the raw seed.
+    // Derive the keys now, because the key getters are synchronous.
+    // They come from the Zswap HD role, not from the raw seed.
     const bip39Seed = new Uint8Array(Buffer.from(seedHex, 'hex'));
     const roleSeeds = await deriveRoleSeeds(bip39Seed, facadeConfig.accountIndex ?? 0);
     const ledger = await loadLedgerV8();
@@ -206,7 +211,7 @@ async function createFacadeBackedWalletAdapter(
     };
 }
 
-/** Adapter for a seed session without a facade config: real public keys, signing throws. */
+/** Wallet adapter for a seed session without worker config. Public keys are real, signing throws. */
 async function createSigningCapableWalletAdapter(seedHex: string, accountIndex: number = 0): Promise<any> {
     if (!/^[0-9a-fA-F]{128}$/.test(seedHex)) {
         throw new Error('Invalid seed: must be 128 hex characters (64-byte BIP39 seed)');
@@ -216,7 +221,6 @@ async function createSigningCapableWalletAdapter(seedHex: string, accountIndex: 
     const roleSeeds = await deriveRoleSeeds(bip39Seed, accountIndex);
     const ledger = await loadLedgerV8();
 
-    // Each key type from its own HD role (wallet-hd.ts).
     const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
     const dustKey   = ledger.DustSecretKey.fromSeed(roleSeeds.dust);
 
@@ -252,7 +256,7 @@ export interface SessionSeedOptions {
 }
 export type AttesterIdForSessionOptions = SessionSeedOptions;
 
-/** Runs `fn` over the session's role seeds and zeroes them afterwards; the session must hold a signing key. */
+/** Runs `fn` with the session's HD role seeds and wipes them afterwards. The session must hold a seed. */
 export async function withSessionRoleSeeds<T>(opts: SessionSeedOptions, fn: (roleSeeds: RoleSeeds) => T | Promise<T>): Promise<T> {
     const db = opts.db ?? await cds.connect.to('db');
     const where: Record<string, unknown> = { sessionId: opts.sessionId, isActive: true };
@@ -279,7 +283,7 @@ export async function withSessionRoleSeeds<T>(opts: SessionSeedOptions, fn: (rol
     }
 }
 
-/** The vault attester id (`caller_id()`) of the session's seed; cached per session, the seed is fixed. */
+/** The session's attester id in the vault contract, as `caller_id()` returns it. Cached per session. */
 export async function attesterIdForSession(opts: AttesterIdForSessionOptions): Promise<string> {
     const cached = attesterIdCache.get(opts.sessionId);
     if (cached) return cached;

@@ -1,7 +1,8 @@
 /**
- * Typed accessors over `config-table.ts`: env, then the CAP block, then the default, at call time.
- * In the wallet worker they answer from the main thread's resolved snapshot, never the worker env.
- * No cds import: the worker loads this module.
+ * Typed getters for the settings listed in `config-table.ts`.
+ * A value comes from the environment first, then from the CAP config, then from the default.
+ * In the wallet worker thread the values come from a copy made by the main thread.
+ * This module does not import `@sap/cds`, because the worker loads it too.
  */
 
 import {
@@ -20,8 +21,8 @@ const warned = new Set<string>();
 let workerDataChecked = false;
 
 /**
- * Pin the snapshot from `workerData` on the first read, whatever the import order. Required
- * lazily: boot tests mock `node:worker_threads`.
+ * In the worker thread, takes the main thread's copy of the settings from `workerData` on first use.
+ * `node:worker_threads` is required lazily because some tests mock it.
  */
 function pinFromWorkerDataOnce(): void {
     if (workerDataChecked) return;
@@ -31,21 +32,21 @@ function pinFromWorkerDataOnce(): void {
         const { workerData } = require('node:worker_threads') as { workerData?: { config?: Record<string, ConfigValue> } };
         if (workerData?.config && pinned === undefined) pinned = { ...workerData.config };
     } catch {
-        // no worker_threads (unusual runtime): the env is read
+        // No worker_threads module available. The environment is used instead.
     }
 }
 
-/** Where parse warnings go (the plugin installs the cds logger). */
+/** Sets where warnings about invalid values go. The plugin installs the cds logger. */
 export function setConfigWarnSink(sink: WarnSink): void {
     warnSink = sink;
 }
 
-/** The CAP host's `cds.requires.nightgate` block, read lazily on every access. */
+/** Sets the source of the host app's `cds.requires.nightgate` config. It is read on every access. */
 export function setConfigOverrideSource(source: (() => Record<string, unknown> | undefined | null) | undefined): void {
     overrideSource = source;
 }
 
-/** Worker thread: answer from the main thread's resolved snapshot. */
+/** Worker thread only: use this copy of the main thread's settings. */
 export function pinResolvedConfig(snapshot: Record<string, ConfigValue> | undefined | null): void {
     pinned = snapshot ? { ...snapshot } : undefined;
 }
@@ -55,7 +56,6 @@ export function isConfigPinned(): boolean {
     return pinned !== undefined;
 }
 
-/** Tests only: forget the pinned snapshot, the override source and the warned set. */
 export function __resetConfigForTests(): void {
     pinned = undefined;
     workerDataChecked = true;
@@ -63,7 +63,7 @@ export function __resetConfigForTests(): void {
     warned.clear();
 }
 
-/** Resolved values for the worker snapshot, secrets excluded (the key ring travels separately). */
+/** All current values, for handing to the worker thread. Secrets are left out and passed separately. */
 export function resolvedConfigSnapshot(env: Record<string, string | undefined> = process.env): Record<string, ConfigValue> {
     const { values, warnings } = resolveConfigTable(env, overrideSource?.());
     for (const w of warnings) warnOnce(w);
@@ -80,7 +80,7 @@ function warnOnce(message: string): void {
 function read(spec: ConfigSpec): ConfigValue {
     pinFromWorkerDataOnce();
     if (pinned) {
-        // A key missing from the snapshot (older main thread) keeps its default.
+        // A key missing from the copy keeps its default.
         return Object.prototype.hasOwnProperty.call(pinned, spec.key) ? pinned[spec.key] : spec.default;
     }
     const { value, warning } = resolveOne(spec, process.env, overrideSource?.());
@@ -88,7 +88,7 @@ function read(spec: ConfigSpec): ConfigValue {
     return value;
 }
 
-/** Whether the key is set at all (env or CAP block); a bare default does not count. */
+/** True when the key is set in the environment or the CAP config. A default value does not count. */
 export function configIsSet(key: string): boolean {
     const spec = configSpec(key);
     pinFromWorkerDataOnce();
@@ -110,7 +110,7 @@ export function configInt(key: string): number | undefined {
     return typeof v === 'number' ? v : undefined;
 }
 
-/** Like `configInt` for keys that carry a default (the type says so). */
+/** Like `configInt`, for keys that have a default and so always have a value. */
 export function configNumber(key: string): number {
     const v = configInt(key);
     if (v === undefined) throw new Error(`config: '${key}' has no value and no default`);
@@ -152,7 +152,7 @@ export function configList(key: string): string[] {
     return Array.isArray(v) ? v : [];
 }
 
-/** For an injectable env map: `process.env` goes through the accessors, any other map is parsed alone. */
+/** Reads from a given env map. For `process.env` this is the same as `configNumber`. Other maps are read on their own. */
 export function configNumberFrom(key: string, env: Record<string, string | undefined>): number {
     if (env === process.env) return configNumber(key);
     const spec = configSpec(key);

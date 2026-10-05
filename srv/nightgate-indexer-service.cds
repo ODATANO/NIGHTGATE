@@ -1,20 +1,12 @@
 using {midnight} from '../db/schema';
 
 /**
- * Indexer sync state, health, probes and reorg history.
+ * Sync state, health checks and reorg history of the block indexer.
  *
- * Auth layout: the SERVICE is `@requires: 'any'` and every element carries its
- * own requirement. CAP authorizes the service before the operation
- * (`authorize` in @sap/cds lib/srv/protocols/http.js): a service without a
- * service-level `@requires` is implicitly `authenticated-user` under
- * NODE_ENV=production, so an anonymous caller got the 401 challenge before
- * getLiveness() was ever looked at (seen live on 0.24.1 behind ODATANO ACCESS:
- * the gateway's credential-free probe answered 401 and had to fall back to
- * operator auth). Opening the service and restricting each element keeps
- * every other operation exactly as guarded as before; the read-only probes
- * (getLiveness, getReadiness, getMetrics, getSyncStatus, getHealth) are public, the
- * way the model always intended them for K8s and Prometheus, the same layout as
- * NightgateVerifyService.
+ * The service is open to anyone and each element sets its own access rule.
+ * This lets health checks call the probes without credentials.
+ * The probes getLiveness, getReadiness, getMetrics, getSyncStatus, getHealth and getBoardStatus are public.
+ * Everything else needs a signed-in user or an admin.
  */
 @path    : '/api/v1/indexer'
 @requires: 'any'
@@ -28,15 +20,11 @@ service NightgateIndexerService {
     @requires: 'authenticated-user'
     entity ReorgLog  as projection on midnight.ReorgLog;
 
-    // Read-only probe, public on purpose (K8s, Prometheus, the ACCESS gateway):
-    // no secrets, no per-session data. Behind api.nightgate.dev the gateway still
-    // wants a key for /api/v1/indexer/*; direct exposure is the box network only.
+    // Public probe. Holds no secrets and no per-user data.
     @requires: 'any'
     function getSyncStatus()                      returns SyncState;
 
-    // Read-only probe, public on purpose (K8s, Prometheus, the ACCESS gateway):
-    // no secrets, no per-session data. Behind api.nightgate.dev the gateway still
-    // wants a key for /api/v1/indexer/*; direct exposure is the box network only.
+    // Public probe. Holds no secrets and no per-user data.
     @requires: 'any'
     function getHealth()                          returns {
         status          : String;
@@ -58,9 +46,7 @@ service NightgateIndexerService {
     @requires: 'authenticated-user'
     function getReorgHistory(limit: Integer)      returns array of ReorgLog;
 
-    // Liveness: 200 while the process is alive. Anonymous on purpose: a probe
-    // carries no credentials (Docker HEALTHCHECK, ODATANO ACCESS upstream
-    // health). Process facts only, no DB, no secrets; readiness stays guarded.
+    // Public probe. Answers 200 while the process runs. Does not touch the database.
     @requires: 'any'
     function getLiveness()                        returns {
         status     : String;
@@ -69,7 +55,7 @@ service NightgateIndexerService {
         instanceId : String;
     };
 
-    // Readiness: 200 only when all subsystems are ready. Public like the other probes.
+    // Public probe. `ready` is true only when every check passes.
     @requires: 'any'
     function getReadiness()                       returns {
         ready              : Boolean;
@@ -89,20 +75,19 @@ service NightgateIndexerService {
         runtimeWarnings    : array of String;
     };
 
-    // Prometheus text format. Public like the other probes.
+    // Public probe. Prometheus text format.
     @requires: 'any'
     function getMetrics()                         returns String;
 
-    // Counts only, no identifiers or amounts: what a market page shows before
-    // anyone signs in. Sponsor readiness is the worker's last pushed reading;
-    // the figures are computed at most every 10 s.
+    // Public. Counts for the swap offer board, without ids or amounts.
+    // The figures are recomputed at most every 10 seconds.
     @requires: 'any'
     function getBoardStatus()                     returns {
         openOffers         : Integer;
-        offersFilledToday  : Integer; // UTC day
-        swapsToday         : Integer; // sponsored swaps that succeeded today (UTC), none a chain failure
+        offersFilledToday  : Integer; // per UTC day
+        swapsToday         : Integer; // per UTC day; sponsored swaps that succeeded on chain
         sponsorsConfigured : Integer;
-        sponsorsReady      : Integer; // at tip with a spendable dust note
+        sponsorsReady      : Integer; // synced and holding DUST to pay a fee
         asOf               : Timestamp;
     };
 
@@ -112,7 +97,7 @@ service NightgateIndexerService {
         version      : String;
         apiVersion   : String;
         network      : String;
-        provingMode  : String; // wasm | server
+        provingMode  : String; // 'wasm' or 'server'
         instanceId   : String;
         runtimeMode  : String;
         databaseKind : String;
@@ -130,7 +115,7 @@ service NightgateIndexerService {
         };
     };
 
-    // Process-level wallet worker health (per session: getWalletSyncProgress)
+    // Health of the thread that runs the wallets. For one session use getWalletSyncProgress.
     @requires: 'authenticated-user'
     function getWorkerStatus()                    returns {
         started       : Boolean;
@@ -164,7 +149,7 @@ service NightgateIndexerService {
         message : String;
     };
 
-    // Roll back indexed data from `height`, then resume the crawler if it was running
+    // Deletes indexed data from `height` up. Resumes the indexer if it was running, so it indexes those blocks again.
     @requires: 'admin'
     action   reindexFromHeight(height: Integer64) returns {
         status                 : String;

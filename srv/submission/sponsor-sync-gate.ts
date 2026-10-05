@@ -1,6 +1,6 @@
 /**
- * Worker-pushed sync gate verdicts read on the main thread; pool selection
- * prefers sponsors at the gate.
+ * The worker regularly reports whether each sponsor wallet is synced and ready.
+ * The main thread reads these reports. Pool selection prefers ready sponsors.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -8,8 +8,7 @@ import { walletGetSyncProgress } from '../midnight/wallet-worker-client';
 import { configMs, configNumber } from '../utils/config';
 
 /**
- * A pushed sync reading counts while the worker's progress watch keeps it
- * fresh: two watch intervals, or the progress stale threshold if longer.
+ * How long a report stays valid: two report intervals, or the stale threshold if that is longer.
  */
 function syncReadingMaxAgeMs(): number {
     return Math.max(configMs('NIGHTGATE_PROGRESS_WATCH_MS') * 2, configNumber('NIGHTGATE_SYNC_PROGRESS_STALE_S') * 1000);
@@ -41,15 +40,14 @@ export function syncGateReading(p: SyncReading, now: number = Date.now()): { cau
     return { caughtUp: false, reason: `sponsor wallet is not at the sync gate: ${p.behindEvents ?? '?'} events behind (${details.join(', ')})` };
 }
 
-// Sponsor session id -> account id, filled by the sponsor resolve (the only
-// place that decrypts the viewing key); unresolved sessions have no entry.
+// Sponsor session id -> account id. Filled when a sponsor is resolved,
+// because only that step decrypts the viewing key.
 const sponsorAccounts = new Map<string, string>();
 
 export function noteSponsorAccount(sponsorSessionId: string, accountId: string): void {
     sponsorAccounts.set(sponsorSessionId, accountId);
 }
 
-/** False when unknown. */
 export function sponsorAtSyncGate(sponsorSessionId: string, now: number = Date.now()): boolean {
     const accountId = sponsorAccounts.get(sponsorSessionId);
     return !!accountId && syncGateReading(walletGetSyncProgress(accountId), now).caughtUp;

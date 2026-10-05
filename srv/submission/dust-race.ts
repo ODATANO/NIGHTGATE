@@ -1,10 +1,11 @@
 /**
- * Single classification of the coded dust race. Substrate `1010 Invalid
- * Transaction` with ledger error `170` (InvalidDustSpendProof: stale merkle
- * root), `171` (OutOfDustValidityWindow: the spend's ctime is ahead of a lagging
- * node's block time) or `196` (nullifier already known: concurrent spend on the
- * same note): the dust spend was built against a dust state the node has
- * moved past. Pre-mempool, fee unspent; heal = rebuild and resubmit, never the same bytes.
+ * Detects a "dust race": the node rejects a transaction because its dust spend
+ * was built against an older dust state. The node reports `1010 Invalid Transaction` with:
+ * - `170`: the dust proof uses an outdated merkle root.
+ * - `171`: the spend's time is ahead of a lagging node's block time.
+ * - `196`: another transaction already spent the same dust note.
+ * The rejection happens before the mempool, so no fee is paid.
+ * The fix is to rebuild the transaction. Resending the same bytes fails again.
  */
 import { classificationHaystack } from '../utils/format-error';
 
@@ -12,16 +13,13 @@ import { classificationHaystack } from '../utils/format-error';
 export const DUST_RACE_LEDGER_CODES: ReadonlySet<string> = new Set(['170', '171', '196']);
 
 /**
- * `'1010/170'` / `'1010/171'` / `'1010/196'` when the error (message or cause chain) is a
- * coded dust-race reject, else null. Same haystack rules as
- * `classifySubmissionError`: stack frames and `:line:col` tokens stripped, the
- * bare number needs the `1010:` shape or the semantic phrase, "priority is too
- * low" (1014) never counts.
+ * Returns a code like `'1010/170'` when the error or one of its causes is a dust race, else null.
+ * Matches the error text the same way `classifySubmissionError` does.
  */
 export function dustRaceLedgerCode(err: unknown): string | null {
     const message = err instanceof Error ? err.message : String(err ?? '');
     const haystack = `${message} ${classificationHaystack(err)}`;
-    // Our own already-classified shape, re-thrown across a boundary.
+    // An error we already classified and that was thrown again further up.
     const own = /\b1010\/(170|171|196)\b/.exec(haystack);
     if (own) return `1010/${own[1]}`;
     if (/priority is too low/i.test(haystack)) return null;

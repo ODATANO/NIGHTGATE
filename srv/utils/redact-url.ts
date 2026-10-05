@@ -1,21 +1,14 @@
 /**
- * Credential redaction for endpoint URLs before they are persisted, logged or
- * exposed over OData (SyncState.nodeUrl, getStatus, startup logging).
- *
- * Node/indexer URLs may embed secrets two ways: userinfo
- * (`wss://user:pass@host/`) and query parameters (`?apikey=...`). The runtime
- * keeps the full URL for connecting; everything user-visible goes through
- * this. Non-URL strings pass through unchanged (they carry no parseable
- * credential shape for us to strip).
+ * Removes credentials from a URL before it is stored, logged or returned over OData.
+ * A URL can carry secrets as `user:pass@` or as query parameters such as `?apikey=`.
+ * Strings that are not valid URLs come back unchanged.
  */
 export function redactUrlCredentials(url: string | undefined | null): string {
     if (!url) return '';
     try {
         const u = new URL(url);
         if (!u.username && !u.password && !u.search) {
-            // Nothing to strip: return the INPUT verbatim (URL#toString
-            // normalizes, e.g. adds a trailing slash, which would churn
-            // persisted values and status output for clean URLs).
+            // Return the input as is. `URL.toString()` would add a trailing slash and change stored values.
             return url;
         }
         u.username = '';

@@ -1,7 +1,7 @@
 /**
- * Main-thread side of the WalletFacade, which lives in the wallet worker (the SDK's
- * scheduler monopolises the microtask queue during a sync). Restores persisted
- * sub-states into the worker and persists the worker's state-save events.
+ * Main-thread side of the wallets that run in the wallet worker thread.
+ * The worker exists because a syncing SDK wallet would block the main thread.
+ * This module hands saved wallet state to the worker and stores the state it sends back.
  */
 
 import {
@@ -36,18 +36,18 @@ export interface WalletFacadeBuildArgs {
     proofServerUrl: string;
     /** Substrate node RPC URL (`relayURL` in the SDK config). */
     relayUrl: string;
-    /** Passphrase of the persisted sub-state blobs; without it restore and save are skipped. */
+    /** Passphrase for the saved wallet state. Without it nothing is restored or saved. */
     syncStatePassphrase?: string;
-    /** BIP32 account the seed signs with (default 0); from `WalletSessions.accountIndex`, never caller input. */
+    /** BIP32 account index, default 0. Comes from `WalletSessions.accountIndex`, never from the caller. */
     accountIndex?: number;
 }
 
 interface SessionRecord {
     passphrase: string;
     accountId: string;
-    /** Persisted with every save: a restore on another network cold-starts. */
+    /** Saved with the state, so a restore on another network starts from scratch. */
     networkId: string;
-    /** Persisted with every save: a restore under another seed cold-starts instead of corrupting. */
+    /** Saved with the state, so a restore with another seed starts from scratch instead of mixing wallets. */
     seedFingerprint: string;
 }
 
@@ -61,18 +61,18 @@ export function seedFingerprintOf(seedHex: string): string {
 }
 
 /**
- * `sessionRegistry`: material a save needs. `residentAccounts`: facades alive in the worker.
- * A worker crash drops residency only; saves it already delivered may still be queued and need the passphrase.
+ * `sessionRegistry` holds what a save needs. `residentAccounts` lists the wallets loaded in the worker.
+ * A worker crash clears only the second: saves it already sent may still be queued and need the passphrase.
  */
 const sessionRegistry = new Map<string, SessionRecord>();
 const residentAccounts = new Set<string>();
 
-/** Whether the resident facade was restored from a snapshot or cold-started; surfaced by getWalletSyncProgress. */
+/** Whether a loaded wallet came from saved state or started from scratch. Shown by getWalletSyncProgress. */
 export interface FacadeOrigin {
     restoredFromSnapshot: boolean;
     snapshotSavedAt: string | null;
     buildStartedAt: string;
-    /** Null while the worker is still deserialising the snapshot. */
+    /** Null while the worker is still loading the saved state. */
     builtAt: string | null;
 }
 const facadeOrigins = new Map<string, FacadeOrigin>();
@@ -81,7 +81,7 @@ export function getFacadeOrigin(cacheKey: string): FacadeOrigin | null {
     return facadeOrigins.get(cacheKey) ?? null;
 }
 
-/** Running state-save handlers; a planned stop drains them. */
+/** Saves in progress. A planned worker stop waits for them. */
 const savesInFlight = new Set<Promise<void>>();
 
 onWorkerGone(async (reason) => {
@@ -89,13 +89,12 @@ onWorkerGone(async (reason) => {
         log.info(`worker ${reason}: dropping ${residentAccounts.size} facade residency claim(s)`);
         residentAccounts.clear();
     }
-    // A stale origin would keep the next build from registering its own.
+    // Clear old entries, otherwise the next build would not record its own.
     facadeOrigins.clear();
     if (reason === 'exit') {
-        // Crash: queued saves still need their passphrases, a dead worker cannot resend.
+        // Crash: keep the passphrases, since queued saves still need them and the worker cannot resend.
         return;
     }
-    // Planned stop: drain the saves, then release the passphrases of closed sessions.
     if (savesInFlight.size > 0) {
         log.info(`worker stop: draining ${savesInFlight.size} state-save(s) before releasing passphrases`);
         await Promise.allSettled([...savesInFlight]);
@@ -107,8 +106,8 @@ onWorkerGone(async (reason) => {
 });
 
 /**
- * Initialise the wallet for `cacheKey` in the worker; idempotent. Runs under the per-account
- * lock so a sweep or disconnect cannot evict a facade that is being built.
+ * Loads the wallet for `cacheKey` into the worker. Safe to call repeatedly.
+ * Holds the account lock, so a disconnect cannot remove a wallet while it is being built.
  */
 export function getOrBuildWalletFacade(
     cacheKey: string,
@@ -145,7 +144,7 @@ async function buildWalletFacadeLocked(
         } else {
             dbgSync(`no usable prior state for ${cacheKey.slice(0, 16)} (cold start)`);
         }
-        // A facade the worker already had keeps the origin of the build that created it.
+        // If the worker already has this wallet, the entry of the first build is kept.
         pendingOrigin = {
             restoredFromSnapshot: !!loaded,
             snapshotSavedAt: loaded?.savedAt ?? null,
@@ -155,8 +154,8 @@ async function buildWalletFacadeLocked(
     } else {
         pendingOrigin = { restoredFromSnapshot: false, snapshotSavedAt: null, buildStartedAt: new Date().toISOString(), builtAt: null };
     }
-    // Registered before the worker init: deserialising a large dust snapshot
-    // takes minutes, and the progress surface reports the origin meanwhile.
+    // Record this before the worker starts. Loading a large dust state takes minutes,
+    // and the progress report should show it in the meantime.
     const earlyRegistered = !facadeOrigins.has(cacheKey);
     if (earlyRegistered) {
         facadeOrigins.set(cacheKey, pendingOrigin);
@@ -199,7 +198,7 @@ async function buildWalletFacadeLocked(
         log.info(`facade ${cacheKey.slice(0, 16)}: built in ${took}s (${current.restoredFromSnapshot ? 'snapshot deserialised' : 'cold'}), catching up now`);
     }
 
-    // Residency is claimed with or without persistence.
+    // The wallet counts as loaded even when its state is not saved.
     residentAccounts.add(cacheKey);
 
     if (args.syncStatePassphrase) {
@@ -213,10 +212,10 @@ async function buildWalletFacadeLocked(
 
 }
 
-/** Tell the worker to drop and final-save the facade for this cacheKey. */
+/** Tells the worker to save one last time and unload the wallet for this cacheKey. */
 export async function evictWalletFacade(cacheKey: string): Promise<void> {
-    // Registry entry is deleted AFTER the evict RPC: the final state-save arrives
-    // during it, and the sink drops saves of unregistered sessions.
+    // Remove the registry entry only after the worker call. The final save arrives
+    // during that call and would be dropped without the entry.
     try {
         await walletEvict(cacheKey);
     } catch (err) {
@@ -225,7 +224,7 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
         residentAccounts.delete(cacheKey);
         facadeOrigins.delete(cacheKey);
         sessionRegistry.delete(cacheKey);
-        // No new save can arrive now; evictEncryptionKey awaits in-flight saves before zeroing.
+        // No new save can arrive now. evictEncryptionKey waits for running saves before wiping the key.
         try {
             await evictEncryptionKey(cacheKey);
             evictAccountDek(cacheKey);
@@ -236,14 +235,13 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
 }
 
 /**
- * Whether a facade for this account is resident; builds nothing. Authoritative, unlike the
- * sync-progress cache, which fills only at the first progress-watch tick.
+ * Whether this account's wallet is loaded in the worker. Builds nothing.
+ * More reliable than the sync-progress cache, which fills only after the first progress check.
  */
 export function hasWalletFacade(cacheKey: string): boolean {
     return residentAccounts.has(cacheKey);
 }
 
-/** Every account with a resident facade (see `hasWalletFacade`). */
 export function listWalletFacades(): string[] {
     return [...residentAccounts];
 }
@@ -253,7 +251,7 @@ export function __getCacheSizeForTests(): number {
     return residentAccounts.size;
 }
 
-/** Test-only: accounts carrying persistence material (independent of residency). */
+/** Test-only: accounts that have a passphrase registered, loaded or not. */
 export function __getPersistenceSizeForTests(): number {
     return sessionRegistry.size;
 }
@@ -265,7 +263,7 @@ export function __clearAllFacadesForTests(): void {
     sessionRegistry.clear();
 }
 
-/** Persist the worker's `state-save` events. Call once at plugin init, after `startWalletWorker()` resolved. */
+/** Stores the state the worker sends. Call once at plugin start, after `startWalletWorker()` resolved. */
 export function wireWorkerStateSaveSink(): void {
     setStateSaveSink(event => {
         const running = handleStateSave(event);
@@ -282,7 +280,7 @@ async function handleStateSave(event: Parameters<Parameters<typeof setStateSaveS
                 `DROPPED save for ${event.sessionId.slice(0, 16)}: ` +
                 `no session in registry (known: [${Array.from(sessionRegistry.keys()).map(k => k.slice(0, 16)).join(',')}])`
             );
-            // Not acked: the worker keeps the blobs unsaved and retries.
+            // Throwing tells the worker the save failed, so it keeps the state and retries.
             throw new Error('state-save dropped: session not registered');
         }
         log.debug(`received save for ${event.sessionId.slice(0, 16)}, persisting...`);
@@ -303,7 +301,7 @@ async function handleStateSave(event: Parameters<Parameters<typeof setStateSaveS
             log.debug(`saved ${event.sessionId.slice(0, 16)} ${sizes}`);
         } catch (err) {
             log.warn(`save failed for ${event.sessionId.slice(0, 16)}:`, formatErr(err));
-            // Not acked: the worker re-pushes on the next tick.
+            // Throwing makes the worker send the state again later.
             throw err;
         }
     }

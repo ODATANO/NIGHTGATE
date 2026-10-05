@@ -1,7 +1,7 @@
 /**
- * Caller cancellation of a worker RPC: the client posts `cancel` on the reply port when
- * its timeout fires, and the call's own wait points stop there. Never past the submit
- * intent (a broadcast may follow), and never inside work other calls share.
+ * Lets the main thread cancel a worker call after its timeout.
+ * The call stops at its next wait point. Once the call announced its tx, it is never
+ * cancelled, because the tx may already be on its way.
  * SPDX-License-Identifier: Apache-2.0
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -21,7 +21,7 @@ export function runInRpcScope<T>(method: string, signal: AbortSignal, fn: () => 
     return scope.run({ method, signal, announced: false }, fn);
 }
 
-/** From the submit intent on, the call runs to its end. */
+/** Called once the tx was announced. From then on the call cannot be cancelled. */
 export function markIntentAnnounced(): void {
     const s = scope.getStore();
     if (s) s.announced = true;
@@ -32,7 +32,7 @@ export function throwIfRpcCancelled(where: string): void {
     if (s && !s.announced && s.signal.aborted) throw new RpcCancelledError(s.method, where);
 }
 
-/** Rejects once the caller cancels (not after the intent); race it against a wait, then `dispose`. */
+/** Rejects when the caller cancels. Race it against a wait, then call `dispose`. */
 export function rpcCancellation(where: string): { promise: Promise<never>; dispose: () => void } {
     const s = scope.getStore();
     if (!s) return { promise: new Promise<never>(() => undefined), dispose: () => undefined };

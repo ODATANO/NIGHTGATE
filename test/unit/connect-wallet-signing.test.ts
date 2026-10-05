@@ -70,7 +70,7 @@ function makeReq(data: Record<string, unknown>, ip?: string) {
     const clientIp = ip ?? `test-ip-${++__ipCounter}`;
     return {
         data,
-        _: { req: { ip: clientIp } },
+        http: { req: { ip: clientIp } },
         // Sessions are user-bound; handlers read req.user.id.
         user: { id: TEST_USER_ID },
         reject: vi.fn((status: number, message: string) => {

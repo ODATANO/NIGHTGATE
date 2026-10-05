@@ -1,6 +1,7 @@
 /**
- * Per-contract witness factories. Inputs are primitives only, so they cross the
- * worker boundary; contracts without a factory get vacant witnesses.
+ * Builds the witnesses (private inputs) for each contract.
+ * Inputs are plain values only, so they can be passed to the worker thread.
+ * Contracts without a builder get empty witnesses.
  */
 import {
     buildAttestationVaultWitnesses as buildVaultWitnesses,
@@ -23,22 +24,21 @@ export type SchemaDescriptorWire = SchemaDescriptor;
 export type SlotOpeningWire = SlotOpening;
 export type DocPairBundle = DocPair;
 
-/** 32-byte vault secret for `local_secret_key()`, domain-separated from the seed by a v1 label. */
+/** 32-byte vault secret for `local_secret_key()`, derived from the seed with a fixed label. */
 export function deriveAttestationSecret(seedBytes: Uint8Array): Uint8Array {
     return deriveVaultSecret(seedBytes);
 }
 
-/** 32-byte issuer secret for the factory's `issuerSecret()` witness; the rule is the kit's, shared with the txbuilder. */
+/** Issuer secret for the factory. The rule comes from the contract kit, so the txbuilder derives the same bytes. */
 export function deriveTokenFactoryIssuerSecret(seedBytes: Uint8Array): Uint8Array {
     return deriveFactorySecret(seedBytes);
 }
 
-/** Vault witnesses; the single implementation (shared with browser and txbuilder) lives in the kit. */
 export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any {
     return buildVaultWitnesses(input);
 }
 
-/** Factory witnesses over the session's issuer secret; `burn` reads none, `mint` throws by name without one. */
+/** `burn` needs no secret. `mint` throws if the secret is missing. */
 export function buildTokenFactoryWitnesses(input: WitnessFactoryInput): any {
     const issuerSecret = input.issuerSecret;
     return tokenFactoryWitnesses(() => ({ issuerSecret }));
@@ -55,7 +55,8 @@ const FACTORIES: Record<string, WitnessFactory> = {
 export function getContractWitnessFactory(contractName: string): WitnessFactory | undefined {
     const exact = FACTORIES[contractName];
     if (exact) return exact;
-    // Vault aliases share the witness shape; vacant witnesses would break owner-gated calls.
+    // Vault contracts registered under another name use the same witnesses.
+    // Empty witnesses would break owner-only calls.
     if (contractName.startsWith('attestation-vault')) return buildAttestationVaultWitnesses;
     if (contractName.startsWith('token-factory')) return buildTokenFactoryWitnesses;
     return undefined;

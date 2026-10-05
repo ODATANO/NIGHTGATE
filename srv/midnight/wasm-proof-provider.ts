@@ -1,7 +1,7 @@
 /**
- * In-process ProofProvider (NIGHTGATE_PROVING_MODE=wasm): answers the ledger's per-circuit
- * prove callbacks with zkir-v2 locally, keys from the contract's zkConfig, else the SDK's
- * standard key-material provider. Proving blocks the calling thread.
+ * Proof provider that proves in this process instead of on a proof server (NIGHTGATE_PROVING_MODE=wasm).
+ * Keys come from the contract's files, or from the SDK for the standard circuits.
+ * Proving blocks the calling thread.
  */
 
 interface WasmProofDeps {
@@ -29,20 +29,20 @@ async function loadDeps(): Promise<WasmProofDeps> {
                 fallbackKeys: (proverEffect as any).WasmProver.makeDefaultKeyMaterialProvider()
             };
         })();
-        // A failed import must not poison the process; let the next call retry.
+        // Forget a failed import so the next call tries again.
         cachedDeps.catch(() => { cachedDeps = undefined; });
     }
     return cachedDeps;
 }
 
-/** Process-wide standard-circuit key provider, shared so wallet and contract proving use one download cache. */
+/** Key provider for the standard circuits, shared so wallet and contract proving use one download cache. */
 export async function getSharedKeyMaterialProvider(): Promise<{ lookupKey(loc: string): Promise<any>; getParams(k: number): Promise<Uint8Array> }> {
     return (await loadDeps()).fallbackKeys;
 }
 
 import { runtimeConfigEnum } from './runtime-config';
 
-/** Reads through runtime-config: this file ships in the slim package, which has no config table. */
+/** Uses runtime-config because this file also ships in the nightgate-tx package, which has no server config. */
 export function isWasmProvingMode(): boolean {
     return runtimeConfigEnum('NIGHTGATE_PROVING_MODE') === 'wasm';
 }
@@ -57,8 +57,7 @@ export async function buildWasmProofProvider(zkConfigProvider: any): Promise<{ p
             try {
                 return zkConfigToProvingKeyMaterial(await zkConfigProvider.get(keyLocation));
             } catch (err) {
-                // Expected for standard circuits; kept so a real zkConfig
-                // failure is named if the fallback misses too.
+                // Normal for standard circuits. Kept so the error can name it if the fallback fails too.
                 zkConfigError = err;
             }
             const material = await fallbackKeys.lookupKey(keyLocation);

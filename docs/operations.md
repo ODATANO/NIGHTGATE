@@ -183,6 +183,37 @@ docker exec odatano-nightgate node scripts/apply-schema-delta.mjs   # in the ima
 Without it the startup preflight names the missing objects and NIGHTGATE
 stays offline; the host process keeps running.
 
+### PostgreSQL: NOT NULL columns and removed columns
+
+The image runs `cds deploy` on every boot. Two kinds of change need a step by
+hand first.
+
+A column that becomes `NOT NULL` fails the deploy while a row holds NULL in it.
+Check before the upgrade; every count must be 0. For 0.30.4:
+
+```sql
+SELECT count(*) FROM midnight_backgroundjobs WHERE status IS NULL OR attempt IS NULL OR maxattempts IS NULL;
+SELECT count(*) FROM midnight_pendingsubmissions WHERE status IS NULL;
+```
+
+CAP's schema evolution never drops a column and refuses a model that removed
+one. Remove the element from the stored model before the first boot of the new
+image, then drop the column once it is up. For 0.30.4 (`Transactions.proofHash`):
+
+```sql
+-- before the first boot
+UPDATE cds_model SET csn = (
+  SELECT jsonb_set(s.m, '{definitions}', jsonb_object_agg(d.k, CASE WHEN d.v->'elements' ? 'proofHash'
+      THEN jsonb_set(d.v, '{elements}', (d.v->'elements') - 'proofHash') ELSE d.v END))::text
+  FROM (SELECT cds_model.csn::jsonb AS m) s, jsonb_each(s.m->'definitions') AS d(k, v)
+  GROUP BY s.m);
+-- after the boot
+ALTER TABLE midnight_Transactions DROP COLUMN proofHash;
+```
+
+SQLite: `nightgate-schema-delta` sets NULL rows of a `NOT NULL` column to its
+default and leaves a removed column in place.
+
 ### Contract state from before the hash layout
 
 Earlier releases stored the full contract state on every `ContractActions`

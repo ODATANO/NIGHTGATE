@@ -1,11 +1,11 @@
 /**
- * Job dispatch: concurrency classes, detached execution, the command poller and lease reclaim.
+ * Starts background jobs, limits how many run at once, and picks up jobs left behind.
  * SPDX-License-Identifier: Apache-2.0
  */
 import { SponsorAttemptBookkeepingPendingError } from './job-execution-context';
 import { isBackgroundFenced } from '../utils/instance-lease';
 import cds from '@sap/cds';
-import { BackgroundJobs } from '#cds-models/midnight';
+import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
 import { classifySubmissionError } from './TransactionSubmitter';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
 import { runInJobExecutionContext } from './job-execution-context';
@@ -13,8 +13,10 @@ import { isCallNotAppliedFailure } from './sponsor-pool';
 import { configMs } from '../utils/config';
 import type { DbRunner } from '../utils/db-types';
 import { jobKindTraits, executePersistedCommand, undeclaredOrUnregisteredJobKinds, processors, processorKey } from './job-registry';
-import { WorkflowReconciliationRequiredError, runWithoutAmbientTx, getJobById, STATUS_WRITE_ATTEMPTS, markRunning, markSucceeded, markFailed, markReconciliationRequired, startLeaseHeartbeat, markJobExternalExecution, markJobBroadcastOn, markJobSubmissionRejectedOn, markJobSubmitted, BackgroundJobRow, withStatusWriteRetry, affectedRows } from './job-store';
+import { WorkflowReconciliationRequiredError, runWithoutAmbientTx, getJobById, markRunning, markSucceeded, markFailed, markReconciliationRequired, startLeaseHeartbeat, markJobExternalExecution, markJobBroadcastOn, markJobSubmissionRejectedOn, markJobSubmitted, affectedRows } from './job-store';
 import { BROADCAST_UNCONFIRMED, BROADCAST_NOT_INCLUDED, markChainFailureAfterBroadcast, settleRejectedSponsorAttempts, triggerChainConfirmPass, reconcileBackgroundJobs, refreshSucceededChainOutcomes, SCAN_PAGE_SIZE } from './job-reconciliation';
+import { errorMessage } from '../utils/errors';
+import { LOCK_CONTENTION_ATTEMPTS, withLockContentionRetry } from './db-write-retry';
 
 const { SELECT, UPDATE } = cds.ql;
 
@@ -31,7 +33,6 @@ class Semaphore {
             return;
         }
         await new Promise<void>(resolve => this.waiters.push(resolve));
-        // Slot transferred directly from release(); inFlight already counted.
     }
 
     release(): void {
@@ -43,7 +44,6 @@ class Semaphore {
         }
     }
 
-    /** Slots a new dispatch would get without waiting. */
     available(): number {
         return Math.max(0, this.max - this.inFlight - this.waiters.length);
     }
@@ -52,9 +52,9 @@ class Semaphore {
 const semaphores: Map<string, Semaphore> = new Map();
 
 /**
- * Heavy kinds share ONE pool (the proofs compete for the same prover); workflow
- * parents get their own, since a parent waits on heavy children and must never
- * hold a slot they need. Serial and light caps stay per kind.
+ * All heavy jobs share one limit, since their proofs compete for the same prover.
+ * Workflow parents get their own limit: a parent waits for heavy child jobs and
+ * must not take a slot the children need.
  */
 function concurrencyClass(kind: string): { key: string; cap: 'heavy' | 'light' | 'serial' } {
     const traits = jobKindTraits(kind);
@@ -90,9 +90,8 @@ function getNetwork(): 'preprod' | 'testnet' | 'mainnet' {
 }
 
 /**
- * Dispatch after commit: must use the same `cds.context` check as startJob's
- * insert, so a row on the caller's tx dispatches on 'succeeded' (never on
- * rollback). A lost hook is recovered by the command poller.
+ * Starts the job once the request's transaction has committed, never on rollback.
+ * Must use the same `cds.context` check as startJob's insert. The poller catches any job missed here.
  */
 export function scheduleJob(jobId: string, kind: string, legacyWork?: () => Promise<unknown>): void {
     const ctx = cds.context as { on?: (event: string, handler: () => void) => void } | undefined;
@@ -101,23 +100,23 @@ export function scheduleJob(jobId: string, kind: string, legacyWork?: () => Prom
         ctx.on('succeeded', () => dispatchJob(jobId, kind, legacyWork));
         return;
     }
-    // No commit signal (only mock contexts lack `.on`): dispatch now. An
-    // uncommitted row is not claimable; the poller picks it up after commit.
+    // Only test contexts lack `.on`. A row that is not committed yet cannot be claimed,
+    // so the poller starts it later.
     cds.log('nightgate').warn(
         `startJob(${kind}): ambient context without lifecycle events; dispatching job ${jobId} immediately (its row may not be committed yet)`
     );
     dispatchJob(jobId, kind, legacyWork);
 }
 
-// Dispatches in flight in this process; the poller skips them (once per lease, not per tick).
+// Jobs this process is already starting. The poller skips them.
 const dispatching = new Set<string>();
 
-/** Queued this long with a free slot: the claim path was slow, log it. */
+/** Warn when a job waited this long even though a slot was free. */
 const CLAIM_LATENCY_WARN_MS = 15_000;
 
 function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unknown>): void {
     if (dispatching.has(jobId)) return;
-    // The row stays pending for the process that holds the lease now.
+    // Another process holds the instance lease and will run the job.
     if (isBackgroundFenced()) return;
     dispatching.add(jobId);
     const semaphore = getSemaphore(kind);
@@ -165,7 +164,7 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                         cds.log('nightgate').info(`markSucceeded(${jobId}): job was superseded mid-run; discarding its result`);
                     } else {
                         cds.log('nightgate').error(
-                            `markSucceeded(${jobId}): could not persist the result after ${STATUS_WRITE_ATTEMPTS} attempts; marking failed:RESULT_PERSIST_FAILED`,
+                            `markSucceeded(${jobId}): could not persist the result after ${LOCK_CONTENTION_ATTEMPTS} attempts; marking failed:RESULT_PERSIST_FAILED`,
                             persistErr
                         );
                         await markFailed(jobId, {
@@ -192,20 +191,20 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                 } else if (current?.submissionId) {
                     cds.log('nightgate').warn(`Job ${jobId} (${current.kind}) failed after an announced attempt was closed: ${classification.code}: ${classification.message.slice(0, 300)}`);
                 }
-                // Only a recorded txHash can mean an on-chain effect; without one
-                // the job fails plainly (a false predicate must not need an operator).
+                // Only a job with a recorded txHash can have changed the chain.
+                // Without one it simply fails and needs no operator.
                 if (current?.status === 'failed' && current.errorCode === 'SUPERSEDED') {
                     cds.log('nightgate').info(
                         `Job ${jobId} errored after being superseded mid-run; keeping SUPERSEDED (dropped: ${classification.code})`
                     );
                 } else if (current?.txHash && jobKindTraits(current.kind).identifierKeyed && isCallNotAppliedFailure(err)) {
-                    // Outcome proven via the indexer: terminal, no transient reconciliation state.
+                    // The indexer proved the outcome, so fail the job for good.
                     await markChainFailureAfterBroadcast(jobId, current, err);
                 } else if (err instanceof SponsorAttemptBookkeepingPendingError && current?.txHash) {
-                    // Park under the code settleRejectedSponsorAttempts looks for; the indexer never resolves it.
+                    // settleRejectedSponsorAttempts looks for this code. The indexer will never resolve it.
                     await markReconciliationRequired(jobId, { code: err.code, message: err.message });
                 } else if (current?.txHash && classification.code === 'SubmitAmbiguous') {
-                    // Not a failure yet: the confirmer ends it from chain evidence or absence past the ttl.
+                    // Not failed yet. The confirmer settles it once the tx shows up or its validity window ends.
                     await markReconciliationRequired(jobId, {
                         code: BROADCAST_UNCONFIRMED,
                         message: `Broadcast of ${current.txHash} is unconfirmed: ${classification.message}. The job ends succeeded or failed once the indexer shows the transaction, or failed/${BROADCAST_NOT_INCLUDED} once the indexer tip is past its validity window; a new attempt needs a new idempotencyKey either way.`
@@ -231,8 +230,8 @@ let commandPollTimer: ReturnType<typeof setInterval> | undefined;
 let commandPollActive = false;
 
 /**
- * Start the durable command poller after processors and the wallet worker are
- * ready. The atomic `pending -> running` claim is the final duplicate guard.
+ * Starts the job poller. Call after the processors and the wallet worker are ready.
+ * The atomic `pending -> running` update keeps a job from running twice.
  */
 export async function startBackgroundJobProcessor(): Promise<void> {
     if (commandPollTimer) return;
@@ -246,7 +245,7 @@ export async function startBackgroundJobProcessor(): Promise<void> {
     await refreshSucceededChainOutcomes();
     triggerChainConfirmPass();
     commandPollTimer = setInterval(() => void pollPersistedCommands().catch(err => {
-        cds.log('nightgate').warn(`Background-job poll failed: ${String((err as Error)?.message ?? err)}`);
+        cds.log('nightgate').warn(`Background-job poll failed: ${errorMessage(err)}`);
     }), 2000);
     commandPollTimer.unref?.();
 }
@@ -257,25 +256,25 @@ export function stopBackgroundJobProcessor(): void {
 }
 
 /**
- * Only `running` leases are reclaimable: past the external-effect boundary a
- * second dispatch could spend a second fee, reconciliation resolves those.
+ * Only `running` jobs are re-queued. A job that may already have submitted could
+ * pay a second fee if run again, so reconciliation handles those.
  */
 const JOB_LEASE_TTL_MS = configMs('NIGHTGATE_JOB_LEASE_TTL_MS');
 
-/** Fail instead of re-queue after this many reclaims: a crash loop must end. */
+/** After this many re-queues the job fails, so a crash loop ends. */
 const MAX_LEASE_RECLAIMS = 3;
 
-/** Re-queue silent `running` jobs; the CAS includes heartbeatAt, so a late heartbeat keeps the lease. */
+/** Re-queues `running` jobs without a recent heartbeat. A heartbeat that arrives meanwhile keeps the job. */
 export async function reclaimExpiredLeases(existingDb?: DbRunner): Promise<number> {
     const db = existingDb ?? await cds.connect.to('db');
     const cutoff = new Date(Date.now() - JOB_LEASE_TTL_MS).toISOString();
     const columns = ['ID', 'kind', 'attempt', 'leaseOwner', 'heartbeatAt', 'startedAt', 'commandVersion'];
     const silent = await db.run(
         SELECT.from(BackgroundJobs).columns(...columns).where({ status: 'running', heartbeatAt: { '<': cutoff } }).limit(SCAN_PAGE_SIZE)
-    ) as BackgroundJobRow[];
+    ) as BackgroundJob[];
     const neverBeat = await db.run(
         SELECT.from(BackgroundJobs).columns(...columns).where({ status: 'running', heartbeatAt: null, startedAt: { '<': cutoff } }).limit(SCAN_PAGE_SIZE)
-    ) as BackgroundJobRow[];
+    ) as BackgroundJob[];
     let reclaimed = 0;
     for (const row of [...(silent ?? []), ...(neverBeat ?? [])]) {
         const guard = { ID: row.ID, status: 'running', leaseOwner: row.leaseOwner ?? null, heartbeatAt: row.heartbeatAt ?? null };
@@ -292,7 +291,7 @@ export async function reclaimExpiredLeases(existingDb?: DbRunner): Promise<numbe
                 finishedAt: new Date().toISOString(), leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null
             }
             : { status: 'pending', attempt, startedAt: null, leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null };
-        const affected = await withStatusWriteRetry(`reclaimLease(${row.ID})`, () => db.run(
+        const affected = await withLockContentionRetry(`reclaimLease(${row.ID})`, () => db.run(
             UPDATE.entity(BackgroundJobs).set(patch).where(guard)
         ));
         if (affectedRows(affected) !== 1) continue;
@@ -317,7 +316,6 @@ async function pollPersistedCommands(): Promise<void> {
                 .orderBy('createdAt asc')
                 .limit(100)
         );
-        // Dispatch only up to free capacity; the rest waits for the next tick.
         const budget = new Map<Semaphore, number>();
         for (const row of rows as Array<{ ID: string; kind: string; commandVersion: number }>) {
             if (dispatching.has(row.ID)) continue;
@@ -339,7 +337,7 @@ async function pollPersistedCommands(): Promise<void> {
 
 export function __pollOnceForTests(): Promise<void> { return pollPersistedCommands(); }
 
-/** Test hook: stop the poller, drop semaphores and in-flight dispatch marks. */
+/** Test hook. */
 export function __resetSchedulerForTests(): void {
     dispatching.clear();
     stopBackgroundJobProcessor();

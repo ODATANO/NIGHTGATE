@@ -103,8 +103,9 @@ function makeReq(
         event: opts.event ?? 'createAgentGrant',
         user: 'user' in opts ? opts.user : { id: TEST_USER_ID },
         reject: vi.fn((code: number, message: string) => ({ __rejected: true, code, message })),
-        _: { req: { ip: opts.ip ?? nextIp(), headers: opts.headers ?? {} } }
+        _: { req: { headers: opts.headers ?? {} } }
     };
+    req.http = { req: { ip: opts.ip ?? nextIp() } };
     return req;
 }
 

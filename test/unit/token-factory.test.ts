@@ -19,6 +19,7 @@ import {
     loadTokenFactoryPureCircuits, MAX_FACTORY_MINT_AMOUNT, __resetFactoryIssuerCacheForTests
 } from '../../srv/submission/token-factory';
 import { deriveTokenFactoryIssuerSecret } from '../../srv/submission/contract-witnesses';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 const FACTORY = 'd96fcca18b3ca748af0c0934d88a47113bb52e586afe334f3d9f5e66e5aea02c';
 
@@ -80,7 +81,7 @@ describe('token-factory issuer and token', () => {
         const expectedSecret = deriveTokenFactoryIssuerSecret(seedState.zswap);
         const [calledWith] = registryState.pure.issuerKey.mock.calls[0];
         expect(Buffer.from(calledWith).equals(Buffer.from(expectedSecret))).toBe(true);
-        expect(key).toMatch(/^[0-9a-f]{64}$/);
+        expect(key).toMatch(HEX64_RE);
         expect(await factoryIssuerKeyForSession({ sessionId: 's1' })).toBe(key);
         expect(seedState.calls).toBe(1);
     });
@@ -89,8 +90,8 @@ describe('token-factory issuer and token', () => {
         const issuerKey = '2c'.repeat(32);
         const a = await describeFactoryToken({ issuerKey, name: 'CREDIT', contractAddress: FACTORY });
         expect(a.issuerKey).toBe(issuerKey);
-        expect(a.domain).toMatch(/^[0-9a-f]{64}$/);
-        expect(a.tokenType).toMatch(/^[0-9a-f]{64}$/);
+        expect(a.domain).toMatch(HEX64_RE);
+        expect(a.tokenType).toMatch(HEX64_RE);
         const b = await describeFactoryToken({ issuerKey, name: 'GOLD', contractAddress: FACTORY });
         expect(b.domain).not.toBe(a.domain);
         expect(b.tokenType).not.toBe(a.tokenType);

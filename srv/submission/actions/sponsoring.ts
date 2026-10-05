@@ -11,23 +11,21 @@ import { startJob } from '../background-jobs';
 import { PLATFORM_POOL_SENTINEL } from '../sponsor-pool';
 import { resolveSponsorPolicyForRequest } from '../sponsor-policy';
 import { getConfiguredFeeSponsorSessions } from '../fee-sponsor';
-import type { NightgateRequest } from '../../utils/request-types';
 import { sponsorRateLimiter, facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import { NightgateError } from '../../utils/errors';
 import { transactionBytesOf } from '../../utils/offer-file';
 import { expireSwapOffers, isSwapOfferOpen, loadSwapOffer } from '../swap-offers';
 import type { SubmissionContext } from './context';
+import { sponsorFinalizedTransaction, sponsorSwap, sponsorUnboundTransaction } from '#cds-models/NightgateService';
 
 export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | 'db'>): void {
     const { srv, db } = ctx;
 
-    // Sponsoring phase 2: policy check, dust from the sponsor, submit.
-    srv.on('sponsorFinalizedTransaction', async (req: NightgateRequest) => {
-        const { finalizedTxB64, sponsorSessionId, idempotencyKey } = req.data as {
-            finalizedTxB64?: string; sponsorSessionId?: string; idempotencyKey?: string;
-        };
+    srv.on(sponsorFinalizedTransaction, async (req) => {
+        const { finalizedTxB64, sponsorSessionId, idempotencyKey } = req.data;
         if (!finalizedTxB64) return req.reject(400, 'finalizedTxB64 is required');
-        // The pool sentinel defers the concrete sponsor to execution (failover).
+        // With the pool placeholder, the job picks a sponsor wallet when it runs.
+        // If one wallet fails, another can take over.
         const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
         let effectiveSponsor = sponsorSessionId;
         if (!effectiveSponsor || effectiveSponsor === PLATFORM_POOL_SENTINEL) {
@@ -42,26 +40,25 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
-            // Explicit sponsor: row-level check only (the slow facade restore is the
-            // executor's). Pool jobs check nothing and key under the sentinel, so a
-            // broken member cannot block admission and the idempotency key is stable.
+            // A named sponsor is checked here only against its database row.
+            // Loading its wallet is slow and happens when the job runs.
+            // Pool jobs skip this check, so one broken pool wallet cannot block new requests.
             if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
                 await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: req.user?.id, config: getNightgatePluginConfig() });
             }
-            // Floor narrowed by the grant; an empty intersection or unusable policy
-            // file refuses before a job exists.
+            // The server policy, narrowed by the agent grant. Refuses here, before a job exists.
             const { allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes } = resolveSponsorPolicyForRequest(req);
-            // A sponsored deploy's address is recorded onto this grant.
+            // If this is a deploy, the new contract address is stored on this grant.
             const grantId: string | undefined = req.agentGrant?.ID ? String(req.agentGrant.ID) : undefined;
-            // Per-caller key: sponsors are shared, so a raw key would let one
-            // caller's key dedupe or block another's.
+            // Sponsors are shared by many callers. Mixing the caller into the key
+            // stops one caller's key from colliding with another's.
             const caller = String(req.user?.id ?? 'anonymous');
             const scopedIdempotencyKey = idempotencyKey
                 ? bytesToHex(sha256(Buffer.from(`${caller}\u0000${idempotencyKey}`, 'utf8')))
                 : undefined;
             const job = await startJob({
                 kind: 'sponsorFinalizedTransaction', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
-                // Fingerprint the content: equal-size txs under one key must not dedupe.
+                // Hash the content, so two different transactions of equal size are not treated as one.
                 request: {
                     feeSponsor: effectiveSponsor,
                     caller,
@@ -72,16 +69,13 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
                 grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
                 command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes, grantId }
             });
-            // Keyed by the sponsor session, which the caller needs to poll.
+            // The job belongs to the sponsor session. The caller needs it to poll the job.
             return { ...job, sessionId: effectiveSponsor };
         });
     });
 
-    // As sponsorFinalizedTransaction, for an unbound caller tx.
-    srv.on('sponsorUnboundTransaction', async (req: NightgateRequest) => {
-        const { unboundTxB64, sponsorSessionId, idempotencyKey } = req.data as {
-            unboundTxB64?: string; sponsorSessionId?: string; idempotencyKey?: string;
-        };
+    srv.on(sponsorUnboundTransaction, async (req) => {
+        const { unboundTxB64, sponsorSessionId, idempotencyKey } = req.data;
         if (!unboundTxB64) return req.reject(400, 'unboundTxB64 is required');
         const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
         let effectiveSponsor = sponsorSessionId;
@@ -119,15 +113,11 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         });
     });
 
-    // A shielded swap as two proven, unbound halves; checked and merged in the worker.
-    srv.on('sponsorSwap', async (req: NightgateRequest) => {
-        const { takerHalfB64, sponsorSessionId, idempotencyKey, offerId } = req.data as {
-            makerHalfB64?: string; takerHalfB64?: string; sponsorSessionId?: string; idempotencyKey?: string; offerId?: string;
-        };
+    srv.on(sponsorSwap, async (req) => {
+        const { takerHalfB64, sponsorSessionId, idempotencyKey, offerId } = req.data;
         let makerHalfB64 = req.data.makerHalfB64 as string | undefined;
         if (offerId && makerHalfB64) return req.reject(400, 'makerHalfB64 and offerId: one or the other');
         if (offerId) {
-            // The board's half is the maker half; a closed offer is refused before anything is parsed.
             await expireSwapOffers(db);
             const row = await loadSwapOffer(db, String(offerId));
             if (!row) return req.reject(404, 'swap offer not found');
@@ -136,7 +126,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         }
         if (!makerHalfB64) return req.reject(400, 'makerHalfB64 is required');
         if (!takerHalfB64) return req.reject(400, 'takerHalfB64 is required');
-        // An offer file is checked and unpacked here; the job carries base64 either way.
+        // Each half may be an offer file or plain base64. The job always stores base64.
         const halves: Record<'makerHalfB64' | 'takerHalfB64', string> = { makerHalfB64: '', takerHalfB64: '' };
         for (const [name, value] of [['makerHalfB64', makerHalfB64], ['takerHalfB64', takerHalfB64]] as const) {
             try { halves[name] = Buffer.from(await transactionBytesOf(value)).toString('base64'); }

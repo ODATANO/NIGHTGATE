@@ -1,10 +1,9 @@
 /**
- * Wallet session jobs (prewarm, dust registration, sends) and the shared-facade eviction rule.
  * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
 import { JOB_KINDS, jobKindOp, jobKindsOf } from '../submission/job-kinds';
-import { WalletSessions, type WalletSession } from '#cds-models/midnight';
+import { WalletSessions, type WalletSession, type BackgroundJob } from '#cds-models/midnight';
 import { getEncryptionKey, decrypt } from '../utils/crypto';
 import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../utils/envelope-bindings';
 import { evictWalletFacade } from '../submission/wallet-facade-builder';
@@ -16,18 +15,19 @@ import { ensureNetworkId } from '../midnight/providers';
 import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
 import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
-import { runWithoutAmbientTx, type BackgroundJobRow } from '../submission/background-jobs';
+import { runWithoutAmbientTx } from '../submission/background-jobs';
 import { reportExternalExecution, reportBroadcastOn, reportSubmissionRejectedOn } from '../submission/job-execution-context';
 import { isPreInclusionReject } from '../submission/sponsor-pool';
 import { resolveFeeSponsor, ensureFeeSponsorFacade } from '../submission/fee-sponsor';
 import { isSessionExpired } from '../utils/session-expiry';
 import { configMs } from '../utils/config';
 import type { DbRunner, Row } from '../utils/db-types';
+import { errorMessage } from '../utils/errors';
 
 const { SELECT } = cds.ql;
 const log = cds.log('nightgate:sessions');
 
-// Absolute ceiling for the prewarm wait; the primary bound is lack of progress.
+// Hard upper limit for the prewarm wait. Normally the wait ends earlier when sync stops making progress.
 const PREWARM_SYNC_TIMEOUT_MS = configMs('NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS');
 
 const PREWARM_STALL_MS = configMs('NIGHTGATE_PREWARM_STALL_MS');
@@ -40,7 +40,7 @@ type WalletCommand =
 
 export const WALLET_COMMAND_KINDS: readonly string[] = jobKindsOf('wallet');
 
-export async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, db: DbRunner): Promise<unknown> {
+export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db: DbRunner): Promise<unknown> {
     const command = raw as WalletCommand;
     if (!command || typeof command.op !== 'string' || !job.sessionId || !job.requestedBy) {
         throw new Error(`Invalid persisted wallet command for job ${job.ID}`);
@@ -77,8 +77,8 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, 
         await walletWaitForSyncedState(accountId, PREWARM_SYNC_TIMEOUT_MS, PREWARM_STALL_MS);
         return { ready: true };
     }
-    // Record each announced identifier on the job before broadcast; a pre-inclusion
-    // reject takes it off again, so the job's txHash is the one that may be on chain.
+    // Store each transaction id on the job before it is sent. If the node rejects it
+    // before inclusion, the id is removed again. So the job's txHash may be on chain.
     let announced: string | null = null;
     const onSubmitIntent = async (txHash: string) => { await reportBroadcastOn(db, { txHash, firstBoundary: false }); announced = txHash; };
     const withRejectBookkeeping = async <T>(work: () => Promise<T>): Promise<T> => {
@@ -91,7 +91,7 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, 
                     await reportSubmissionRejectedOn(db, { txHash: rejected });
                     announced = null;
                 } catch (e) {
-                    cds.log('nightgate').warn(`rejected identifier ${rejected.slice(0, 16)} could not be taken off job ${job.ID}; it stays for reconciliation: ${String((e as Error)?.message ?? e)}`);
+                    cds.log('nightgate').warn(`rejected identifier ${rejected.slice(0, 16)} could not be taken off job ${job.ID}; it stays for reconciliation: ${errorMessage(e)}`);
                 }
             }
             throw err;
@@ -124,16 +124,16 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJobRow, 
 }
 
 /**
- * Active signing session -> accountId, owner-scoped (foreign reads as 404). Read
- * outside the request tx: callers then await the worker, and an open tx would pin
- * a pool connection. No read-your-own-write.
+ * Returns the accountId of an active signing session owned by the user. Another user's session reads as 404.
+ * Reads outside the request transaction, so no database connection is held while callers wait for the worker.
+ * As a result it does not see writes the request has not committed yet.
  */
 export async function loadSigningSessionAccountId(
     db: DbRunner,
     sessionId: string,
-    /** `undefined` drops the owner constraint: ONLY for a configured platform sponsor, never a request's id. */
+    /** `undefined` skips the owner check. Use it only for a configured platform fee sponsor. */
     userId: string | undefined,
-    /** ONLY for a configured platform sponsor, which does not expire. */
+    /** Use only for a configured platform fee sponsor, which does not expire. */
     ignoreExpiry = false
 ): Promise<{ ok: true; accountId: string } | { ok: false; status: number; msg: string }> {
     const where: Record<string, unknown> = { sessionId, isActive: true };
@@ -157,10 +157,9 @@ export async function loadSigningSessionAccountId(
 }
 
 /**
- * A live session that keeps this wallet's facade: one of this user's, or
- * another user's that holds the signing key. A viewing-only session of another
- * user never keeps the owner's keys warm. Callers MUST deactivate their own
- * rows first, so "any live row" means another live session.
+ * True if another live session still needs this wallet in memory. That is any session
+ * of the same user, or another user's session with a signing key. Another user's
+ * view-only session does not count. Callers must deactivate their own rows first.
  */
 async function hasLiveSessionForWallet(
     db: DbRunner,
@@ -168,7 +167,7 @@ async function hasLiveSessionForWallet(
     userId: string | null | undefined
 ): Promise<boolean> {
     if (!viewingKeyHash || !userId) return false;
-    // Expiry decided in JS, not SQL: SQL does not know that platform sponsors never expire.
+    // Expiry is checked in code, because platform fee sponsors never expire and SQL cannot tell.
     const rows: WalletSession[] = await runWithoutAmbientTx(() => db.run(
         SELECT.from(WalletSessions)
             .columns('sessionId', 'expiresAt', 'userId', 'encryptedSeedKey')
@@ -179,9 +178,8 @@ async function hasLiveSessionForWallet(
 }
 
 /**
- * Evict the account's facade unless a sibling session still uses it. Call AFTER
- * deactivating the own rows (else two concurrent disconnects both skip); the
- * account lock guards against a concurrent rebuild. Never throws.
+ * Drops the wallet from memory unless another session still uses it. Never throws.
+ * Call it after deactivating your own rows, otherwise two parallel disconnects both keep it.
  */
 export async function evictFacadeUnlessShared(
     db: DbRunner,

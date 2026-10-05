@@ -1,5 +1,3 @@
-// Typed call-input helpers for the AttestationVault (browser path); the
-// implementation lives in @odatano/contract-kit.
 export {
     DEFAULT_CLAIM_LIFETIME_S,
     prepareRevokeDisclosure,

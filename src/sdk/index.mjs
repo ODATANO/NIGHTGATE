@@ -1,14 +1,10 @@
-// `@odatano/nightgate-tx`: the NIGHTGATE client SDK.
+// `@odatano/nightgate-tx`, the NIGHTGATE client SDK. It has two parts.
+//   - connect() calls a hosted NIGHTGATE server. Each server action is a function.
+//   - createTxBuilder() builds, proves and signs a transaction on your machine with your own key.
+//     You then send only the finished bytes to the server, which pays the fee.
 //
-// Two halves, one import:
-//   - connect(): every capability of a HOSTED NIGHTGATE as a function
-//     (verification, document ingestion, ZK attestations, disclosure,
-//     tokens, fee sponsoring, job polling)
-//   - createTxBuilder(): build + prove + sign a transaction LOCALLY with
-//     your own key, then hand only the bytes to the hosted sponsor
-//
-// The `prepare*` call builders live in './calls', the compiled vault class in
-// './attestation-vault', the canonical membership-set rule in './set-root'.
+// Call input helpers are in './calls', the compiled vault contract in './attestation-vault',
+// and the allow-list hashing rule in './set-root'.
 //
 // SPDX-License-Identifier: Apache-2.0
 

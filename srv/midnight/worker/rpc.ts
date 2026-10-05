@@ -1,8 +1,5 @@
 /**
- * RPC dispatcher: the method table and the
- * message handler the thread entry attaches to `parentPort`. Submitting
- * methods get the reply port for the submit-intent handshake, hold the
- * rotation drain and run under the per-session locks.
+ * Receives calls from the main thread and runs the matching method.
  */
 
 import { type MessagePort } from 'node:worker_threads';
@@ -19,7 +16,6 @@ import { sponsorHandlers } from './sponsor';
 import { rotationHandlers, rotationState, rotateIfDue } from './rotation';
 import { retainGeneration } from './artifacts';
 
-/** The authoritative RPC method list. */
 export const handlers: Record<string, (args: any) => Promise<unknown>> = {
     ...facadeHandlers,
     ...rotationHandlers,
@@ -28,10 +24,8 @@ export const handlers: Record<string, (args: any) => Promise<unknown>> = {
     ...sponsorHandlers
 };
 
-/** One message from the main thread: a state-save ack or an RPC on its own port. */
 export async function handleMessage(msg: any): Promise<void> {
     if (msg?.kind === 'state-save-ack') {
-        // Main thread confirmed it persisted save `seq`
         resolveSaveAckWaiter(msg.seq);
         const entry = facades.get(String(msg.sessionId ?? ''));
         if (entry) applySaveAck(entry, msg.seq);
@@ -47,22 +41,20 @@ export async function handleMessage(msg: any): Promise<void> {
 
 async function dispatch(method: string, args: unknown, port: MessagePort): Promise<void> {
     if (rotationState.draining) {
-        // Admission is closed for the rotation; the client retries on the respawn.
         port.postMessage({ ok: false, error: { name: WORKER_ROTATING, message: 'wallet worker is rotating (artifact generation budget); retry on the respawned worker' } } as RpcErr);
         port.close();
         return;
     }
-    // Only a call that may broadcast holds a rotation drain open
+    // Only a call that may send a tx delays a planned restart.
     const submitting = isSubmittingMethod(method);
     try {
         const fn = handlers[method];
         if (!fn) throw new Error(`Unknown method: ${method}`);
-        // Every submitting method gets the reply port for its pre-broadcast
+        // Submitting methods get the reply port to announce their tx before sending.
         const callArgs = submitting ? { ...(args as object), __replyPort: port } : args;
-        // A contract job holds its artifact generation for the whole call.
+        // Keeps the contract's files from being cleaned up while the call runs.
         const releaseGeneration = retainGeneration((args as any)?.registration?.artifactDigest);
         if (submitting) rotationState.inflight++;
-        // The client posts `cancel` when its timeout fires; the call's wait points stop there.
         const cancel = new AbortController();
         const onCancel = (m: any): void => { if (m?.kind === 'cancel') cancel.abort(); };
         port.on('message', onCancel);
@@ -78,7 +70,6 @@ async function dispatch(method: string, args: unknown, port: MessagePort): Promi
         }
         port.postMessage({ ok: true, result } as RpcOk);
     } catch (err: unknown) {
-        // Carry the nested cause chain across the thread boundary
         const payload: RpcErrorPayload = {
             name: errorName(err),
             message: formatErrWithCauses(err),
@@ -86,7 +77,7 @@ async function dispatch(method: string, args: unknown, port: MessagePort): Promi
         };
         const coded = findNightgateError(err);
         if (coded) payload.nightgate = coded.toPayload();
-        // Submitting methods: classify HERE, against the SDK objects, once.
+        // Classify here, where the original SDK error objects are still available.
         if (submitting) {
             const info = classifySubmitFailure(err);
             payload.code = info.code;

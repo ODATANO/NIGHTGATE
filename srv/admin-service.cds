@@ -4,35 +4,35 @@ using { midnight } from '../db/schema';
 @requires: 'admin'
 service NightgateAdminService {
 
-    /** Writes only through actions (a generic PATCH/DELETE would skip facade eviction). */
+    /** Read-only. Change sessions through the actions, which also drop the wallet from memory. */
     @readonly
     entity WalletSessions as projection on midnight.WalletSessions excluding {
         encryptedViewingKey,
         encryptedSeedKey
     };
 
-    /** Read-only: roles change only through grantRole/revokeRole (authority-gated); a grant ends at validUntil. */
+    /** Read-only. Roles change through grantRole and revokeRole. A role ends at `validUntil`. */
     @readonly
     entity DisclosureRoles as projection on midnight.DisclosureRoles;
 
     /**
-     * Job workflow metadata without payloads. A SQL view: on an existing
-     * database it appears only after `cds deploy` or `nightgate-schema-delta`.
+     * Background jobs without their payloads.
+     * This is a database view. An existing database gets it only after `cds deploy` or `nightgate-schema-delta`.
      */
     @readonly
     entity BackgroundJobs  as
         projection on midnight.BackgroundJobs
         excluding {
-            command, // encrypted at rest
+            command,
             request,
             result
         };
 
-    /** Token types learned from landed sponsored mints (see `shareMintedTokenTypes`). */
+    /** Shielded token types minted by sponsored calls on this server. */
     @readonly
     entity LearnedTokenTypes as projection on midnight.LearnedTokenTypes;
 
-    /** The offer board with its posters; the public reads never show them. */
+    /** All swap offers, including who posted them. Public reads hide the poster. */
     @readonly
     entity SwapOffers as projection on midnight.SwapOffers;
 
@@ -40,9 +40,9 @@ service NightgateAdminService {
     action invalidateAllSessions();
 
     /**
-     * Export a contract's maintenance signing key from its deploying session,
-     * sealed under `password` (16+ chars); restore with `importSigningKeys`.
-     * Whoever holds it can replace the contract's verifier keys.
+     * Exports the key that may upgrade a contract, taken from the session that deployed it.
+     * The export is encrypted with `password`, at least 16 characters. Restore it with `importSigningKeys`.
+     * Whoever holds this key can change how the contract verifies proofs.
      */
     action exportContractSigningKey(sessionId: UUID, contractAddress: String, password: String) returns {
         format          : String;
@@ -53,12 +53,13 @@ service NightgateAdminService {
     };
 
     /**
-     * Config and runtime-registered contracts. `artifactDigest` pins persisted
-     * jobs; `hasProverKeys` false = deploy/verify only, no proving here.
+     * Lists the contracts from the config and those registered at runtime.
+     * `artifactDigest` identifies the exact build. Saved jobs only run on that build.
+     * When `hasProverKeys` is false, this server can deploy and verify but not create proofs.
      */
     function listContracts() returns array of {
         name           : String;
-        source         : String; // 'config' | 'runtime'
+        source         : String; // 'config' or 'runtime'
         artifactPath   : String;
         zkConfigPath   : String;
         privateStateId : String;
@@ -68,16 +69,15 @@ service NightgateAdminService {
     };
 
     /**
-     * Register a contract artifact at runtime; paths must lie inside
-     * `NIGHTGATE_CONTRACTS_DIR`. Validated first, persisted, reloaded at boot.
-     * Config names: 409. A new artifact under the same name is a new
-     * generation; jobs pinned to the old one refuse.
+     * Registers a compiled contract at runtime. It is checked first, saved, and loaded again on every start.
+     * Both paths must lie inside `NIGHTGATE_CONTRACTS_DIR`. A name from the config answers 409.
+     * Registering a new build under an existing name makes saved jobs for the old build fail.
      */
     action registerContract(name: String,
                             artifactPath: String,
                             zkConfigPath: String,
                             privateStateId: String,
-                            slotWidth: Integer // optional; 16 | 32, default 16
+                            slotWidth: Integer // optional; default 16; 16 or 32 document fields
     ) returns {
         name           : String;
         source         : String;
@@ -89,18 +89,18 @@ service NightgateAdminService {
         hasProverKeys  : Boolean;
     };
 
-    /** Remove a runtime registration (memory + table). Config names refuse with 409. */
+    /** Removes a runtime registration. A name from the config answers 409. */
     action unregisterContract(name: String) returns {
         removed : Boolean;
     };
 
     /**
-     * CPU-profile a live thread for `seconds` (1..120, default 20) and summarize
-     * where time went. The .cpuprofile is written to OS temp `nightgate-profiles/`,
-     * or a folder `dir` inside it; `file` names it.
+     * Records a CPU profile of a running thread and summarizes where the time went.
+     * `seconds` is 1 to 120, default 20. `thread` is 'worker', the default, or 'main'.
+     * The .cpuprofile file goes to `nightgate-profiles/` in the OS temp folder, or to the subfolder `dir`.
      */
     action profileWorker(seconds: Integer, dir: String, thread: String) returns {
-        thread        : String; // 'worker' (default) | 'main'
+        thread        : String;
         seconds       : Integer;
         file          : String;
         facadeCount   : Integer;
@@ -113,18 +113,18 @@ service NightgateAdminService {
         topInclusive  : array of { label: String; percent: Double };
         heapBefore    : { usedMb: Integer; totalMb: Integer; limitMb: Integer; externalMb: Integer; mallocedMb: Integer; rssMb: Integer; arrayBuffersMb: Integer };
         heapAfter     : { usedMb: Integer; totalMb: Integer; limitMb: Integer; externalMb: Integer; mallocedMb: Integer; rssMb: Integer; arrayBuffersMb: Integer };
-        gc            : { count: Integer; totalMs: Integer; byKind: String }; // byKind: JSON { kind: { count, ms } }
+        gc            : { count: Integer; totalMs: Integer; byKind: String }; // byKind is JSON: count and ms per GC kind
     };
 
     /**
-     * The sponsor policy in force: platform lists, where they come from, and with
-     * `grantId` what is left of them for that grant (`effectiveError` says why nothing is).
+     * Shows what the fee sponsor may pay for. `floor` holds the platform lists.
+     * With `grantId`, `effective` holds what the grant may use. `effectiveError` says why it may use nothing.
      */
     function getSponsorPolicy(grantId: UUID) returns {
-        source         : String; // 'file' | 'env'
+        source         : String; // 'file' or 'env'
         path           : String;
-        loadedAt       : Timestamp; // policy file only
-        ignoredEnv     : array of String; // env settings the policy file replaces
+        loadedAt       : Timestamp; // null = no policy file
+        ignoredEnv     : array of String; // environment settings the policy file overrides
         floorError     : String;
         floor          : {
             allowedContracts   : array of String; // empty = any
@@ -143,7 +143,7 @@ service NightgateAdminService {
             deployedContracts : array of String;
             mintedTokenTypes  : array of String;
             allowDeploy       : Boolean;
-            allowSwaps        : Boolean; // `sponsorSwap` is in the grant's allowedActions
+            allowSwaps        : Boolean;
             maxDeploys        : Integer;
             deploysUsed       : Integer;
         };
@@ -152,7 +152,7 @@ service NightgateAdminService {
             allowedCircuits    : array of String;
             allowedTokenTypes  : array of String;
             ownContracts       : array of String;
-            ownTokenTypes      : array of String; // minted under the grant; part of allowedTokenTypes
+            ownTokenTypes      : array of String;
             allowDeploy        : Boolean;
             allowContractMints : Boolean;
             allowSwaps         : Boolean;
@@ -160,7 +160,7 @@ service NightgateAdminService {
         effectiveError : String;
     };
 
-    /** Job counts per status and top error codes over `windowHours` (default 24, max 720). */
+    /** Job counts per status and the most frequent error codes. `windowHours` defaults to 24, max 720. */
     function getJobStats(windowHours: Integer) returns {
         windowHours         : Integer;
         since               : Timestamp;
@@ -177,25 +177,23 @@ service NightgateAdminService {
     };
 
     /**
-     * NightBalances rows that differ from the figures the indexed UTXOs imply; changes nothing.
-     * One `address`, or a page of up to `limit` (max 500) addresses after `after`.
+     * Finds NightBalances rows that do not match the indexed UTXOs. Changes nothing.
+     * Checks one `address`, or up to `limit` addresses after `after`. `limit` is at most 500.
      */
     function reconcileNightBalances(address: String, after: String, limit: Integer) returns {
         checked : Integer;
-        next    : String; // pass as `after`; null = done
+        next    : String; // null = done; pass as `after` for the next page
         drifted : array of {
             address  : String;
-            field    : String; // figure name, or 'row'
+            field    : String; // column name, or 'row'
             stored   : String;
             computed : String;
         };
     };
 
     /**
-     * Decode the ledger payloads again from `height` up: the decode pass replays
-     * the range and rewrites what it reads from them (`txType` of call-free
-     * transactions, `isShielded`, `hasProof`, counts, circuit names). The cursor
-     * is only lowered; `changed` is false when it already stood below `height`.
+     * Decodes the stored transactions again from `height` up and rewrites the fields taken from them.
+     * The decoder never moves forward this way. `changed` is false when it already stood below `height`.
      */
     action redecodeFromHeight(height: Integer64) returns {
         fromHeight            : Integer64;
@@ -204,7 +202,7 @@ service NightgateAdminService {
         changed               : Boolean;
     };
 
-    // Grant a disclosure tier; the caller also needs disclosureRole 'authority'.
+    // Grants a disclosure role. The caller also needs the disclosure role 'authority'.
     action grantRole(
         userId:     String,
         role:       String,
@@ -212,7 +210,7 @@ service NightgateAdminService {
         validUntil: Timestamp
     );
 
-    // End the caller-named grants now (validUntil = now, rows kept); returns how many ended.
+    // Ends the matching roles now and returns how many ended. The rows are kept.
     action revokeRole(
         userId: String,
         role:   String,

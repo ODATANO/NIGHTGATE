@@ -1,10 +1,7 @@
 /**
- * The pass that fills what a block does not carry, from the Midnight indexer.
- *
- * Deliberately a second source with its own cursor rather than a wider crawl:
- * the crawler reads a node and owes nothing to an indexer, and this pass can be
- * off without any of that changing. Rows are joined on `Transactions.ledgerTxHash`,
- * the hash the pallet reports and the indexer keys its transactions by.
+ * Background pass that adds data from the Midnight indexer that the node's blocks do not contain.
+ * It has its own cursor, and the crawler works the same whether it runs or not.
+ * Rows are matched on `Transactions.ledgerTxHash`, the hash the indexer uses for transactions.
  */
 
 import cds from '@sap/cds';
@@ -12,7 +9,7 @@ import {
     createIndexerClient, isIndexerRateLimit, type IndexerClient, type SupplementBlock,
     type SupplementTransaction, type SupplementLedgerEvent, type SupplementDustEvent
 } from './indexer-supplement';
-import { readCapBinary } from './cap-binary';
+import { readCapBinary, capBinaryInput } from './cap-binary';
 import {
     DEFAULT_CONTRACT_STATE_POLICY, digestOfBase64, keepsStateHistory, upsertCurrentState,
     type ContractStatePolicy
@@ -21,7 +18,7 @@ import { lockReorgGeneration } from '../submission/reorg-generation';
 import type { DbRunner, Row } from '../utils/db-types';
 import { Blocks, Transactions, TransactionResults, TransactionSegments, TransactionFees, ContractActions, ContractBalances, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, SyncState, type Block, type Transaction, type ContractAction } from '#cds-models/midnight';
 
-/** Where a pass started: both have to still hold when it writes its cursor. */
+/** Cursor and rollback counter at the start of a pass. Both must be unchanged when the pass saves its cursor. */
 interface PassPosition {
     cursor: number | null;
     generation: number;
@@ -34,19 +31,15 @@ export interface IndexerSupplementConfig {
     url: string;
     batchSize: number;
     intervalMs: number;
-    /** Stay this far below the indexed tip: the indexer trails the node. */
+    /** Distance to the indexed tip, because the indexer is behind the node. */
     lagBlocks: number;
     requestTimeoutMs: number;
-    /**
-     * Indexer requests per second, paced per request (one request is one
-     * block), so the batch size no longer sets the rate. 0 or unset = unpaced.
-     */
+    /** Indexer requests per second, one block per request. 0 or unset means no limit. */
     maxBlocksPerSecond?: number;
-    /** Which actions keep their full contract state; default none (hash and size only). */
     contractState?: ContractStatePolicy;
 }
 
-/** First wait after the indexer refused (403/429); doubles per refusal up to RATE_LIMIT_MAX_MS. */
+/** First wait after a 403 or 429. Doubles with each refusal, up to RATE_LIMIT_MAX_MS. */
 export const RATE_LIMIT_BACKOFF_MS = 60_000;
 export const RATE_LIMIT_MAX_MS = 15 * 60_000;
 
@@ -70,17 +63,12 @@ export class IndexerSupplement {
     private client!: IndexerClient;
     private running = false;
     private loop: Promise<void> | null = null;
-    /** Set by stop(): the pass in flight ends after the block it is on. */
     private stopping = false;
-    /** Resolves the sleep in progress, set while one is; stop() calls it. */
     private wake: (() => void) | null = null;
-    /** Last parameters written, so an unchanged set is not stored again. */
     private lastLedgerParameters: string | null = null;
-    /** The generation that cache belongs to; a rollback can delete its block. */
+    /** Rollback counter the cache belongs to. A rollback can delete the block holding the cached parameters. */
     private cachedGeneration: number | null = null;
-    /** When the last indexer request went out, for the pacing. */
     private lastRequestAt = 0;
-    /** Refusals (403/429) in a row; reset by the next pass that gets through. */
     private refusals = 0;
 
     constructor(private readonly config: IndexerSupplementConfig, client?: IndexerClient) {
@@ -105,9 +93,7 @@ export class IndexerSupplement {
                     delay = progressed > 0 ? this.config.intervalMs : this.config.intervalMs * 4;
                 } catch (err) {
                     if (isIndexerRateLimit(err)) {
-                        // The edge blocks the host IP, not this request, and
-                        // every retry keeps the block alive: wait minutes, not
-                        // the four seconds a passing outage gets.
+                        // The indexer blocks the whole host IP and every retry extends the block, so wait minutes.
                         this.refusals += 1;
                         delay = Math.min(RATE_LIMIT_BACKOFF_MS * 2 ** (this.refusals - 1), RATE_LIMIT_MAX_MS);
                         log.warn(`indexer supplement refused (${(err as Error).message}); backing off ${Math.round(delay / 1000)} s`);
@@ -131,13 +117,10 @@ export class IndexerSupplement {
         }
     }
 
-    /** One pass over the next batch of blocks above the cursor. */
     async runOnce(): Promise<SupplementRunResult> {
         const sync: any = await this.db.run(
-            // One read of the singleton: a rollback between separate reads of
-            // the cursor and the generation would hand this pass the old chain
-            // position under the new generation, which the final check then
-            // accepts as its own.
+            // Read cursor and rollback counter together. With two reads, a rollback in between
+            // could pair an old cursor with a new counter, and the final check would not notice.
             SELECT.one.from(SyncState)
                 .columns('lastSupplementedHeight', 'lastIndexedHeight', 'reorgGeneration')
                 .where({ ID: 'SINGLETON' })
@@ -149,9 +132,7 @@ export class IndexerSupplement {
         const from = cursor == null ? 0 : cursor + 1;
         const generation = Number(sync.reorgGeneration ?? 0);
         const start: PassPosition = { cursor, generation: Number.isFinite(generation) ? generation : 0 };
-        // A rollback can remove the block the cached parameters were written
-        // to, and then "unchanged" would leave the replacement block empty
-        // with nothing below it to fall back on. Re-read after a reorg.
+        // A rollback can delete the block that stored the cached parameters, so the cache is cleared.
         if (this.cachedGeneration !== start.generation) {
             this.lastLedgerParameters = null;
             this.cachedGeneration = start.generation;
@@ -175,8 +156,7 @@ export class IndexerSupplement {
             if (this.stopping) return this.endBefore(start, blocks, index, result);
             const answer = await this.client.fetchBlock(height);
             if (!answer) {
-                // The indexer has not reached this height yet: stop here and
-                // retry the same block, rather than moving the cursor past it.
+                // The indexer has not reached this height yet. Retry this block next time instead of skipping it.
                 return this.endBefore(start, blocks, index, result);
             }
             await this.applyBlockFields(block.ID, height, answer);
@@ -201,12 +181,7 @@ export class IndexerSupplement {
         return result;
     }
 
-    /**
-     * The block's ledger parameters, which the node does not serve. Written
-     * only when they differ from the last set stored below this height: they
-     * are 724 bytes and hold for thousands of blocks, so storing them per
-     * block would be gigabytes of duplicates on a full chain.
-     */
+    /** Ledger parameters rarely change, so they are stored only on blocks where they differ from the previous ones. */
     private async applyBlockFields(blockId: string, height: number, answer: SupplementBlock): Promise<void> {
         if (!answer.ledgerParameters) return;
         if (this.lastLedgerParameters === null) {
@@ -214,12 +189,11 @@ export class IndexerSupplement {
         }
         if (this.lastLedgerParameters === answer.ledgerParameters) return;
         await this.db.run(
-            UPDATE.entity(Blocks).set({ ledgerParameters: answer.ledgerParameters as any }).where({ ID: blockId })
+            UPDATE.entity(Blocks).set({ ledgerParameters: capBinaryInput(answer.ledgerParameters) }).where({ ID: blockId })
         );
         this.lastLedgerParameters = answer.ledgerParameters;
     }
 
-    /** The parameters in force below `height`, for the first block of a pass. */
     private async readParametersBelow(height: number): Promise<string> {
         const row: Block | undefined = await this.db.run(
             SELECT.one.from(Blocks).columns('ledgerParameters')
@@ -256,11 +230,11 @@ export class IndexerSupplement {
         return result;
     }
 
-    /** The crawler writes a zero fee from the envelope; this is the real one. */
+    /** The crawler stores a zero fee, because the block does not contain the fee. */
     private async applyFee(dbTx: DbRunner, transactionId: string, tx: SupplementTransaction): Promise<number> {
         if (tx.fee == null) return 0;
         const changed = await dbTx.run(
-            UPDATE.entity(TransactionFees).set({ paidFees: tx.fee as any }).where({ transaction_ID: transactionId })
+            UPDATE.entity(TransactionFees).set({ paidFees: tx.fee }).where({ transaction_ID: transactionId })
         );
         return Number(changed ?? 0) > 0 ? 1 : 0;
     }
@@ -281,13 +255,7 @@ export class IndexerSupplement {
         return tx.segments.length;
     }
 
-    /**
-     * Records the state hash and size on the contract actions the node already
-     * recorded, makes each state the contract's current one, keeps the full
-     * state per action only under the history policy, and replaces their
-     * balances. Actions the node does not have, a call in a failed segment
-     * above all, are the indexer's declared set and are not invented here.
-     */
+    /** Updates only actions the crawler stored. Actions it does not have, such as a failed call, are not created. */
     private async applyContractState(dbTx: DbRunner, transactionId: string, height: number, tx: SupplementTransaction): Promise<number> {
         if (tx.contractActions.length === 0) return 0;
         const actions: ContractAction[] = await dbTx.run(
@@ -296,11 +264,9 @@ export class IndexerSupplement {
         ) || [];
         if (actions.length === 0) return 0;
 
-        // Two calls on one contract carry different state, so a match by
-        // address alone would give both the first one's. They are paired in
-        // order, and only when both sides report the same number: a partial
-        // success leaves the indexer with actions that never applied, and
-        // guessing which of ours they belong to would be worse than no state.
+        // Two calls on one contract have different states, so actions are paired in order,
+        // and only if both sides have the same count. After a partial success the counts differ,
+        // and no state is better than a wrong one.
         const ours = new Map<string, any[]>();
         for (const action of actions) {
             const key = `${action.address}:${action.actionType}`;
@@ -369,7 +335,6 @@ export class IndexerSupplement {
         return balances;
     }
 
-    /** Replaces a transaction's zswap event rows wholesale, so a re-run is idempotent. */
     private async replaceZswapEvents(
         dbTx: DbRunner,
         transactionId: string,
@@ -387,7 +352,6 @@ export class IndexerSupplement {
         return events.length;
     }
 
-    /** Same, for the DUST stream, which carries its kind and the backing nonce. */
     private async replaceDustEvents(
         dbTx: DbRunner,
         transactionId: string,
@@ -407,7 +371,7 @@ export class IndexerSupplement {
         return events.length;
     }
 
-    /** Registration binds the address, so the flag can turn on after the UTXO exists. */
+    /** DUST registration applies to the address, so the flag can turn on after the UTXO was created. */
     private async applyDustFlags(dbTx: DbRunner, tx: SupplementTransaction): Promise<number> {
         let updated = 0;
         for (const output of tx.dustRegisteredOutputs) {
@@ -422,16 +386,9 @@ export class IndexerSupplement {
     }
 
     /**
-     * Advances the cursor only when it still holds what this pass started
-     * from. A reorg lowers it while a pass is in flight, and writing the
-     * pass's own height over that would skip every re-indexed block.
-     */
-    /**
-     * Advances the cursor only when neither the cursor nor the rollback
-     * generation moved since this pass started. The generation is the decisive
-     * one: a rollback to exactly the cursor's height leaves the cursor alone,
-     * so comparing values would miss it and the replacement blocks would be
-     * skipped. The lock serialises this against a rollback's bump.
+     * Saves the cursor only if cursor and rollback counter are unchanged since the pass started.
+     * Otherwise a reorg during the pass would be overwritten and re-indexed blocks skipped.
+     * The counter is needed because a rollback to exactly the cursor height leaves the cursor unchanged.
      */
     private async setCursor(expected: PassPosition, height: number): Promise<boolean> {
         let advanced = false;
@@ -456,7 +413,6 @@ export class IndexerSupplement {
         return advanced;
     }
 
-    /** Ends the pass before `blocks[index]`: the cursor records the blocks done, the rest wait for the next pass. */
     private async endBefore(start: PassPosition, blocks: any[], index: number, result: SupplementRunResult): Promise<SupplementRunResult> {
         if (index === 0) return EMPTY_RUN;
         result.blocks = index;
@@ -464,7 +420,6 @@ export class IndexerSupplement {
         return result;
     }
 
-    /** Holds the next indexer request until its slot at `maxBlocksPerSecond` has come. */
     private async pace(): Promise<void> {
         const cap = this.config.maxBlocksPerSecond ?? 0;
         if (cap <= 0) return;
@@ -477,7 +432,7 @@ export class IndexerSupplement {
         return Date.now();
     }
 
-    /** Sleeps `ms`, or until stop() wakes it: a backoff can be minutes long and must not hold a shutdown or pause. */
+    /** stop() can wake this early, because a backoff can last minutes and must not delay a shutdown. */
     private sleep(ms: number): Promise<void> {
         return new Promise(resolve => {
             const done = () => {

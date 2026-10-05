@@ -1,7 +1,6 @@
 /**
- * The one wallet-session expiry predicate; configured platform sponsors never
- * expire. Imports only config: it sits below fee-sponsor and
- * wallet-material-factory, which import each other.
+ * Decides when a wallet session has expired. Sessions configured as platform fee sponsors never expire.
+ * This module imports only config code, so modules that import each other can both use it.
  */
 
 import { getNightgatePluginConfig, type NightgatePluginConfig } from './nightgate-config';
@@ -21,15 +20,14 @@ export function getConfiguredFeeSponsorSessions(config?: NightgatePluginConfig):
     return raw.split(',').map(s => s.trim()).filter(Boolean);
 }
 
-/** Is this session id listed as platform fee-sponsor infrastructure? */
 export function isConfiguredPlatformSponsor(sessionId: string | undefined | null, config?: NightgatePluginConfig): boolean {
     if (!sessionId) return false;
     return getConfiguredFeeSponsorSessions(config ?? getNightgatePluginConfig()).includes(sessionId);
 }
 
 /**
- * Expired when `expiresAt` is past, unless the session is a configured sponsor.
- * Pass the PUBLIC `sessionId` (what the config lists), not the row ID.
+ * Expired when `expiresAt` is in the past, unless the session is a configured sponsor.
+ * Pass the public `sessionId` that the config lists, not the database row ID.
  */
 export function isSessionExpired(
     sessionId: string | undefined | null,

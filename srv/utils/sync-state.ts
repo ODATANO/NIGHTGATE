@@ -8,7 +8,6 @@ import { redactUrlCredentials } from './redact-url';
 import { formatErr } from './format-error';
 import { configString } from './config';
 
-/** The database is bound to another network than the configured one. */
 export class SyncStateNetworkMismatchError extends NightgateError {
     constructor(public readonly storedNetwork: string, public readonly configuredNetwork: string) {
         super('SYNC_STATE_NETWORK_MISMATCH',
@@ -32,8 +31,8 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
         if (existing.networkId && existing.networkId !== network) {
             throw new SyncStateNetworkMismatchError(existing.networkId, network);
         }
-        // No networkId: bind an empty index in place; a populated one needs
-        // NIGHTGATE_ASSUME_DB_NETWORK, else a missing binding would be a bypass.
+        // No network stored yet. An empty database gets the configured network.
+        // A database with blocks needs NIGHTGATE_ASSUME_DB_NETWORK, so data from another chain cannot slip in.
         if (!existing.networkId) {
             const anyBlock = await db.run(SELECT.one.from(Blocks));
             const assumed = configString('NIGHTGATE_ASSUME_DB_NETWORK');
@@ -48,7 +47,7 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
             }
             await db.run(UPDATE.entity(SyncState).set({ networkId: network }).where({ ID: 'SINGLETON' }));
         }
-        // SyncState is OData-readable: strip URL credentials from existing rows.
+        // SyncState can be read over OData, so remove credentials from the stored URL.
         const redacted = redactUrlCredentials(existing.nodeUrl);
         if (existing.nodeUrl && redacted !== existing.nodeUrl) {
             await db.run(UPDATE.entity(SyncState).set({ nodeUrl: redacted }).where({ ID: 'SINGLETON' }));
@@ -66,13 +65,13 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
                 networkId: network,
                 lastIndexedHeight: 0,
                 syncStatus: 'stopped',
-                // OData-readable: never persist URL credentials.
+                // Readable over OData, so never store URL credentials.
                 nodeUrl: redactUrlCredentials(nodeUrl || configuredNodeUrl || ''),
                 chainHeight: 0,
                 consecutiveErrors: 0
             }));
         } catch (err: unknown) {
-            // Another caller inserted first (SQLite / PostgreSQL wording).
+            // Another caller inserted the row first.
             if (!/unique constraint|duplicate key/i.test(formatErr(err))) throw err;
         }
     }

@@ -1,14 +1,11 @@
 /**
- * Reads the per-extrinsic facts out of one block's decoded `System.Events`.
+ * Reads the result of each extrinsic from a block's decoded `System.Events`.
  *
- * The Midnight pallet reports the applied result of a ledger transaction:
- * which unshielded UTxOs it consumed and produced, which contracts it touched,
- * and whether every segment applied. That is the only place a block carries it;
- * the extrinsic itself holds the serialized ledger transaction, which states
- * intent, not outcome.
+ * The Midnight pallet reports what a ledger transaction actually did.
+ * That covers the unshielded UTXOs it spent and created, the contracts it touched, and whether all of it succeeded.
+ * The extrinsic itself only holds what the transaction asked for, not the result.
  */
 
-/** One entry of a `Midnight.UnshieldedTokens` spent/created list. */
 export interface UtxoEvent {
     /** Raw 32-byte owner, lower-case hex without `0x`. */
     address: string;
@@ -19,27 +16,24 @@ export interface UtxoEvent {
 }
 
 /**
- * A contract action that APPLIED. The pallet stays silent about one whose
- * fallible segment failed, so a partial success reports fewer actions than the
- * transaction declared.
+ * A contract action that was applied. The pallet reports no event for a failed action,
+ * so a partly successful transaction reports fewer actions than it contains.
  */
 export interface ContractEvent {
     actionType: 'DEPLOY' | 'CALL' | 'UPDATE';
-    /** Bare 32-byte address, the form the indexer and the submission side use. */
+    /** Plain 32-byte address, as used by the Midnight indexer and the submission code. */
     address: string;
 }
 
 export interface ExtrinsicEvents {
     outcome?: 'SUCCESS' | 'FAILURE';
     /**
-     * Hash of the ledger transaction inside the extrinsic, as the pallet
-     * reports it. Not the extrinsic hash: this is what the Midnight indexer
-     * keys a transaction by.
+     * Hash of the ledger transaction inside the extrinsic.
+     * This is not the extrinsic hash. The Midnight indexer identifies transactions by this hash.
      */
     ledgerTxHash?: string;
-    /** `TxApplied` or `TxPartialSuccess`: the pallet reported on this extrinsic. */
     applied: boolean;
-    /** `TxPartialSuccess`: applied, but not every segment succeeded. */
+    /** True on `TxPartialSuccess`: the transaction was applied, but not every part succeeded. */
     partialSuccess: boolean;
     created: UtxoEvent[];
     spent: UtxoEvent[];
@@ -52,7 +46,7 @@ const CONTRACT_ACTION_BY_METHOD: Record<string, ContractEvent['actionType']> = {
     ContractMaintain: 'UPDATE'
 };
 
-/** `toHuman()` renders integers with thousands separators. */
+/** `toHuman()` writes integers with thousands separators. */
 function toBigInt(value: unknown): bigint {
     if (typeof value === 'bigint') return value;
     if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.trunc(value));
@@ -70,11 +64,7 @@ function hex(value: unknown): string {
     return String(value ?? '').replace(/^0x/i, '').toLowerCase();
 }
 
-/**
- * Contract addresses reach the event as `midnight:contract-address[vN]:` plus
- * the 32 bytes; every other surface (indexer, submission side) uses the bytes
- * alone.
- */
+/** Events carry `midnight:contract-address[vN]:` plus the 32 bytes. Everywhere else only the 32 bytes are used. */
 export function stripContractAddressPrefix(rawHex: string): string {
     const clean = hex(rawHex);
     if (clean.length <= 64 || clean.length % 2 !== 0) return clean;
@@ -108,11 +98,7 @@ function emptyEvents(): ExtrinsicEvents {
     return { applied: false, partialSuccess: false, created: [], spent: [], contracts: [] };
 }
 
-/**
- * Per-extrinsic events of one block, keyed by extrinsic index. `records` is a
- * decoded `Vec<EventRecord>`; a record whose payload does not read is skipped
- * rather than failing the block.
- */
+/** A record that cannot be read is skipped, so the rest of the block is still processed. */
 export function readBlockEvents(records: Iterable<any>): Map<number, ExtrinsicEvents> {
     const byExtrinsic = new Map<number, ExtrinsicEvents>();
 
@@ -129,7 +115,7 @@ export function readBlockEvents(records: Iterable<any>): Map<number, ExtrinsicEv
         const method = String(record.event?.method ?? '');
 
         if (section === 'system') {
-            // A failure wins: the extrinsic did not apply at all.
+            // A failure always wins, because then the extrinsic did not apply at all.
             if (method === 'ExtrinsicFailed') at(index).outcome = 'FAILURE';
             else if (method === 'ExtrinsicSuccess' && at(index).outcome !== 'FAILURE') at(index).outcome = 'SUCCESS';
             continue;
@@ -166,10 +152,7 @@ export function readBlockEvents(records: Iterable<any>): Map<number, ExtrinsicEv
     return byExtrinsic;
 }
 
-/**
- * The transaction type an event set implies. Contract activity outranks a token
- * movement: a contract call that also moves unshielded tokens is a call.
- */
+/** Contract activity wins over a token transfer, so a contract call that also moves tokens counts as a call. */
 export function txTypeFromEvents(events: ExtrinsicEvents | undefined): string | null {
     if (!events) return null;
     for (const { actionType } of events.contracts) {
@@ -183,7 +166,7 @@ export function txTypeFromEvents(events: ExtrinsicEvents | undefined): string | 
     return null;
 }
 
-/** All-zero raw token type: unshielded NIGHT. */
+/** The raw token type of unshielded NIGHT, which is all zeros. */
 export const NIGHT_RAW_TOKEN_TYPE = '0'.repeat(64);
 
 export interface TransferProjection {
@@ -193,10 +176,8 @@ export interface TransferProjection {
 }
 
 /**
- * Sender, receiver and moved NIGHT of a transfer, in the raw address form.
- * Only an unambiguous one-to-one movement projects: with several funding or
- * several receiving addresses the columns stay null rather than naming one
- * participant as "the" sender.
+ * Filled only for a transfer from one address to one other address.
+ * With several senders or receivers the fields stay null, because no single one is "the" sender.
  */
 export function projectTransfer(events: ExtrinsicEvents | undefined): TransferProjection {
     const none: TransferProjection = { senderAddress: null, receiverAddress: null, nightAmount: null };

@@ -1,7 +1,7 @@
 /**
- * Submit-failure classification into the closed code set of `wallet-worker-protocol.ts`.
- * The worker attaches the code to its RPC reply; the main thread re-runs this only for
- * errors that never crossed the RPC. Downstream decisions key on the code, never on wording.
+ * Sorts a failed submit into one of the codes in `wallet-worker-protocol.ts`.
+ * The worker sends the code along with its error reply.
+ * Later decisions use only the code, never the message text.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -12,7 +12,7 @@ import {
     carriedSubmitFailure, type BatchCallStageInfo, type SubmitFailureInfo
 } from './wallet-worker-protocol';
 
-/** A sponsor shape or allow-list refusal raised by the worker's inspection. */
+/** The worker refused to pay fees for a transaction, because of its content or the allow list. */
 export class SponsorRefusalError extends NightgateError {
     constructor(message: string) {
         super('SPONSOR_REFUSED', message);
@@ -21,7 +21,7 @@ export class SponsorRefusalError extends NightgateError {
 
 const MAX_CHAIN = 8;
 
-/** The error and its `cause` chain, outermost first, bounded and cycle-safe. */
+/** The error followed by its nested causes, outermost first. Stops at a loop or after a few entries. */
 export function errorChain(err: unknown): unknown[] {
     const out: unknown[] = [];
     const seen = new Set<unknown>();
@@ -44,16 +44,15 @@ function nameOf(e: unknown): string {
 }
 
 /**
- * Reconstruct the per-call stage list from the causality message when the
- * SDK's scope wrapper dropped the error object (it keeps only the text):
- * `Stages in apply order: attest=1158[f] anchor=1159[g]`.
+ * Reads the call list back out of a batch order error message.
+ * Needed because the SDK sometimes passes on only the message text.
+ * Example: `Stages in apply order: callA=1158[f] callB=1159[g]`.
  */
 export function parseBatchCallStages(text: string): BatchCallStageInfo[] {
     const at = text.indexOf('Stages in apply order:');
     if (at < 0) return [];
     const calls: BatchCallStageInfo[] = [];
-    // Consecutive `name=segId[stages]` tokens only: the list ends at the first
-    // token of another shape (the inspected text repeats the message).
+    // The list ends at the first word of another shape, because the text may repeat the message.
     for (const token of text.slice(at + 'Stages in apply order:'.length).trim().split(/\s+/)) {
         const hit = /^(\S+?)=(\d+)\[([^\]]*)\]$/.exec(token);
         if (!hit) break;
@@ -62,17 +61,17 @@ export function parseBatchCallStages(text: string): BatchCallStageInfo[] {
     return calls;
 }
 
-// A connection that failed or closed: the request may never have left, the
-// worker probes the indexer for the identifier before it resends the same bytes.
+// The connection failed or closed, so the request may never have been sent.
+// The worker asks the indexer whether the transaction exists before it sends it again.
 const TRANSPORT_RE = /disconnected from|Normal Closure|Abnormal Closure|WebSocket is not connected|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket hang up|Unable to connect/i;
-// Sent, no reply: the tx may be pooled or landed, so never resend (1013 duplicate)
-// or rebuild; reconciliation resolves the identifier.
+// Sent but no reply. The tx may already be in the mempool or in a block, so never send it
+// again (that fails with 1013, duplicate) and never rebuild it. A later check looks it up.
 const NO_REPLY_RE = /TimeoutError|TimeoutException|timed? ?out|no reply|no response|request timeout/i;
 
-/** Our own coded failures; decided on the code, never on the wording. */
+/** Maps our own error codes to a submit failure. */
 function codedSubmitFailure(err: NightgateError | undefined): SubmitFailureInfo | undefined {
     switch (err?.code) {
-        // Before any build: nothing was sent, another wallet or a later retry may succeed.
+        // Nothing was built or sent yet, so another wallet or a later retry may succeed.
         case 'WALLET_NOT_SYNCED': return { code: 'transport', ledgerCode: 'wallet-not-synced', retryable: true };
         case 'SUBMIT_INTENT_TIMEOUT': return { code: 'pre-mempool-reject', ledgerCode: 'intent-timeout', retryable: false };
         case 'SUBMIT_INTENT_REJECTED': return { code: 'pre-mempool-reject', ledgerCode: 'intent-rejected', retryable: false };
@@ -82,8 +81,8 @@ function codedSubmitFailure(err: NightgateError | undefined): SubmitFailureInfo 
 }
 
 /**
- * Order matters: carried code, then outcome-shaped errors, our coded failures, node
- * rejects, connection wording, and no-reply last (a watch timeout also says "timed out").
+ * The checks run in a fixed order and the first match wins.
+ * The "no reply" check comes last because other errors also contain "timed out".
  */
 export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     const carried = carriedSubmitFailure(err);
@@ -94,18 +93,18 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     const message = formatErr(err);
     const haystack = `${message} ${classificationHaystack(err)}`;
 
-    // The SDK's scope wrapper may keep only the message, hence the parse fallback.
+    // The SDK may pass on only the message, so the message text is also checked.
     const causality = chain.find((e: any) => e?.code === 'BatchCausalityViolation' || nameOf(e) === 'BatchCausalityError');
     if (causality || /violates the ledger's causality constraint/.test(haystack)) {
         const own = Array.isArray((causality as any)?.calls) ? (causality as any).calls as BatchCallStageInfo[] : undefined;
         return { code: 'causality', retryable: false, calls: own?.length ? own : parseBatchCallStages(haystack) };
     }
-    // An earlier send of the same bytes is unresolved: whatever the later attempt said, the
-    // identifier may still land. Checked before the phase and reject rules, which sit in its cause.
+    // An earlier send of the same transaction has no known outcome, so it may still land.
+    // This wins over the checks below, which would match its nested causes.
     if (names.includes('SubmitOutcomeUnknownError')) return { code: 'ambiguous', ledgerCode: 'unresolved-send', retryable: false };
     const coded = codedSubmitFailure(findNightgateError(err));
     if (coded) return coded;
-    // Only a connect-phase failure is safe to resend; request and watch may have reached the node.
+    // Only a failure while connecting is safe to resend. Later failures may have reached the node.
     const phased = chain.find((e: any) => nameOf(e) === 'SubmitPhaseError' && typeof e?.phase === 'string') as any;
     if (phased) {
         if (phased.phase === 'connect') return { code: 'transport', ledgerCode: 'not-sent', retryable: true };
@@ -116,7 +115,7 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
         return { code: 'ambiguous', retryable: false };
     }
     if (names.includes('TxFailedError') || /did NOT apply|but did not apply/i.test(haystack)) {
-        // Block height = rollback coordinate; without it the job parks for the indexer confirmer.
+        // The block height lets a chain rollback find the job. Without it the job waits for the indexer check.
         const blockHeight = errorChain(err).map(e => (e as any)?.blockHeight).find(v => Number.isInteger(v) && v >= 0);
         return { code: 'landed-not-applied', retryable: false, ...(Number.isInteger(blockHeight) ? { blockHeight } : {}) };
     }
@@ -132,14 +131,14 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     const dustRace = dustRaceLedgerCode(err);
     if (dustRace) return { code: 'dust-race', ledgerCode: dustRace, retryable: true };
     if (/InvalidDustSpendProof/i.test(haystack)) return { code: 'dust-race', ledgerCode: '1010/170', retryable: true };
-    // Pool status Invalid without a ledger code: the loser of a note race, or a
-    // caller transaction that is structurally allowed but invalid. One rebuild.
+    // The node marked the tx invalid without a ledger code. Usually another tx spent the
+    // same dust first. It can also be a caller tx that is invalid. One rebuild is allowed.
     if (/TransactionInvalidError|Transaction is invalid and was rejected by the node/i.test(haystack)) {
         return { code: 'dust-race', ledgerCode: 'pool-invalid', retryable: true };
     }
-    // Our own closing socket: nothing was broadcast.
+    // We sent on a socket we were closing ourselves, so nothing was sent.
     if (/closing socket/i.test(haystack)) return { code: 'transport', ledgerCode: 'closing-socket', retryable: true };
-    // "priority is too low" first: its "(X vs Y)" numbers must not be misread as a 1010 code.
+    // Checked before 1010, because the numbers in this message could be misread as a 1010 code.
     if (/priority is too low|\b1014\s*:/i.test(haystack)) {
         return { code: 'pre-mempool-reject', ledgerCode: '1014', retryable: false };
     }

@@ -1,7 +1,6 @@
 /**
- * Submission: dust wedge protection, the submit-intent handshake, the one send path (a
- * dedicated phased client per submit, same-transaction resend on a transport failure) and the
- * wallet providers that route a build through it.
+ * Sends transactions from the worker. Every tx is announced to the main thread before it is sent,
+ * and every send uses its own node connection.
  */
 
 import { configNumber, configMs, configEnum } from '../../utils/config';
@@ -9,15 +8,15 @@ import { markIntentAnnounced } from './cancellation';
 import { callSegments } from '../batch-segment-order';
 import { classifySubmitFailure, isPreMempoolFailure } from '../submit-error-classification';
 import { classificationHaystack, formatErr, formatErrWithCauses, safeDeepInspect } from '../../utils/format-error';
-import { NightgateError } from '../../utils/errors';
+import { NightgateError, errorMessage } from '../../utils/errors';
 import { type MessagePort } from 'node:worker_threads';
 import { FacadeEntry, loadSdk, loadNodeClientSdk, log, loadLedger } from './context';
 import { createPhasedSubmitService, createSdkNodeAdapter, submitPhaseOf, type PhasedSubmitService } from './phased-submit';
 import { BALANCE_SYNC_TIMEOUT_MS, pushStateSaveAcked, restoreSaveAckTimeoutMs, waitForGenuineSync } from './facades';
 
 /**
- * Dust sections per intent. A DustActions section with no spends and no registrations is the
- * node's 1010/117 NotNormalized. Never throws.
+ * Describes the dust parts of a tx for logging. Never throws.
+ * An empty dust part makes the node reject the tx with 1010/117 (NotNormalized).
  */
 export function describeTxDust(tx: any): { summary: string; emptyDustActions: boolean } {
     try {
@@ -41,11 +40,11 @@ export function describeTxDust(tx: any): { summary: string; emptyDustActions: bo
         }
         return { summary: parts.join(' | ') || 'no intents', emptyDustActions: empty };
     } catch (e) {
-        return { summary: `dump failed: ${(e as Error)?.message ?? e}`, emptyDustActions: false };
+        return { summary: `dump failed: ${errorMessage(e)}`, emptyDustActions: false };
     }
 }
 
-/** Best-effort revert of a built-but-never-submitted recipe (or finalized tx). */
+/** Frees the coins a built but unsent tx reserved. Never throws. */
 export async function revertRecipeBestEffort(facade: any, txOrRecipe: any, site: string): Promise<void> {
     if (!txOrRecipe) return;
     try {
@@ -55,7 +54,6 @@ export async function revertRecipeBestEffort(facade: any, txOrRecipe: any, site:
     }
 }
 
-/** Fee of a recipe built only for pricing; the recipe is always reverted. */
 export async function feeOfDiscardedRecipe(facade: any, recipe: any, site: string): Promise<bigint> {
     try {
         return await facade.calculateTransactionFee(recipe.transaction);
@@ -64,20 +62,18 @@ export async function feeOfDiscardedRecipe(facade: any, recipe: any, site: strin
     }
 }
 
-// ---- Dust wedge protection ------------------------------------------------
-// A pre-mempool reject leaks the spent dust note (the SDK revert drops the pending marker but
-// never reclaims the note), wedging a single-note wallet. So dust is snapshotted before each
-// build and restored on a pre-mempool reject: nothing reached the chain, the snapshot is valid.
+// When the node rejects a tx before the mempool, the SDK still treats its dust as spent.
+// A wallet with a single dust note is then stuck. So the dust state is saved before each build
+// and restored after such a reject. Nothing reached the chain, so the saved state is still valid.
 
-/** Rejects that provably never entered the mempool; never 1013 (that tx is in the pool). */
+/** True for rejects that surely never reached the mempool. Not 1013, which means the tx is already there. */
 export function isPreMempoolReject(err: unknown): boolean {
     return isPreMempoolFailure(classifySubmitFailure(err));
 }
 
 /**
- * An earlier attempt may have reached the node and the indexer has not shown it, so a later
- * failure cannot say more than "unknown": the earlier bytes may still land. The main thread
- * keeps the identifier and never rebuilds (two identifiers, two fees).
+ * An earlier send may still land, so a later failure means the outcome is unknown.
+ * The main thread keeps the tx id and never rebuilds, which could pay the fee twice.
  */
 export class SubmitOutcomeUnknownError extends Error {
     readonly identifier: string;
@@ -88,7 +84,7 @@ export class SubmitOutcomeUnknownError extends Error {
     }
 }
 
-/** Marks a submit failure whose attempts all ended before a send; the dust guard restores on it. */
+/** Marks a failure where no attempt sent anything, so the dust state may be restored. */
 function markNothingSent(err: unknown): void {
     if (err && typeof err === 'object') (err as any).nothingSent = true;
 }
@@ -101,7 +97,7 @@ export function isNothingSent(err: unknown): boolean {
     return false;
 }
 
-/** Arm the wedge protection before the build; a failed snapshot only disarms it for this tx. */
+/** Saves the dust state before a build. If saving fails, only this tx goes without the protection. */
 export async function captureDustSnapshot(entry: FacadeEntry, site: string): Promise<void> {
     try {
         entry.preSubmitDustSnapshot = await entry.facade.dust.serializeState();
@@ -112,9 +108,9 @@ export async function captureDustSnapshot(entry: FacadeEntry, site: string): Pro
 }
 
 /**
- * Safe mid-life: everything reaches the sub-wallet via `facade.dust` at call time and submits
- * serialize per facade. The unbound sponsor path runs outside that lock but never books a spend
- * here nor arms this snapshot. The old wallet stops only after the restored one started.
+ * Replaces the running dust wallet with one restored from the saved state.
+ * Safe while the wallet is in use, because all code reaches it through `facade.dust`
+ * and submits of one wallet run one at a time.
  */
 export async function restoreDustFromSnapshot(entry: FacadeEntry, site: string): Promise<void> {
     const snapshot = entry.preSubmitDustSnapshot;
@@ -127,11 +123,10 @@ export async function restoreDustFromSnapshot(entry: FacadeEntry, site: string):
         const old = entry.facade.dust;
         entry.facade.dust = fresh;
         try { await old.stop(); } catch { /* already dead is fine */ }
-        // The save tick may have persisted the wedged state while proving. Persist the snapshot
-        // now under a bumped epoch, so neither a late tick push nor a stale ack wins over it.
+        // A periodic save may have stored the broken state meanwhile. Save the restored state now
+        // and raise the epoch, so no older save can overwrite it.
         entry.dustEpoch = (entry.dustEpoch ?? 0) + 1;
         log('info', `${site}: dust sub-wallet restored from pre-build snapshot after pre-mempool reject (leaked in-flight spend discarded, snapshot re-persisted)`);
-        // Counted as persisted only after the main thread's ack.
         try {
             await pushStateSaveAcked(entry.sessionId, entry, { dust: snapshot }, restoreSaveAckTimeoutMs());
             entry.dustRestoresPersisted = (entry.dustRestoresPersisted ?? 0) + 1;
@@ -144,7 +139,7 @@ export async function restoreDustFromSnapshot(entry: FacadeEntry, site: string):
     }
 }
 
-/** Pre-submit size and ledger cost, so a block-limit reject shows which dimension overflowed. Never throws. */
+/** Logs the tx size and cost, so a block limit reject shows which limit was hit. Never throws. */
 export async function logTxCost(tx: any, site: string): Promise<void> {
     try {
         const bytes = typeof tx?.serialize === 'function' ? tx.serialize() : undefined;
@@ -166,10 +161,9 @@ export async function logTxCost(tx: any, site: string): Promise<void> {
     }
 }
 
-// ---- Same-transaction resend on a transport failure -----------------------
-// A failed SEND leaves the proven bytes valid, so the same tx object is resent. A lost reply may
-// still have reached the node, so the indexer is probed before every resend and after a refused
-// resend. Node rejects are never resent.
+// After a connection failure the same tx is sent again, because it is still valid.
+// The send may have reached the node anyway, so the indexer is asked first.
+// A tx the node rejected is never sent again.
 export function submitTransportRetries(): number {
     return configNumber('NIGHTGATE_SUBMIT_TRANSPORT_RETRIES');
 }
@@ -180,12 +174,10 @@ export function submitLandedProbeMs(): number {
     return configMs('NIGHTGATE_SUBMIT_LANDED_PROBE_MS');
 }
 
-/** The send itself failed; never a node reject. */
 export function isSubmitTransportFailure(err: unknown): boolean {
     return classifySubmitFailure(err).code === 'transport';
 }
 
-/** Poll the indexer for the identifier for up to `windowMs`; null when it is not there. */
 export async function waitLandedOnIndexer(entry: FacadeEntry, identifier: string, windowMs: number) {
     const deadline = Date.now() + windowMs;
     for (; ;) {
@@ -197,26 +189,26 @@ export async function waitLandedOnIndexer(entry: FacadeEntry, identifier: string
 }
 
 /**
- * Bound-channel handshake: the main thread persists the identifier as the job's external-effect
- * boundary and acks. Without an ack nothing is broadcast, so no landed tx is unknown to its job.
+ * Before sending, the main thread stores the tx id on the job and confirms.
+ * Without that confirmation nothing is sent, so every landed tx belongs to a known job.
  */
 export interface BoundSubmitIntent {
     replyPort?: MessagePort;
     contractAddress?: string;
     circuits?: string[];
     note?: string;
-    /** Set by the balancing provider: the ttl it balanced with (ISO). */
+    /** The tx expiry the wallet provider used, as ISO time. */
     ttl?: string;
 }
 
 /**
- * Restores the dust snapshot only on a pre-mempool reject: a tx that may have reached the pool,
- * or failed on chain, has spent its dust fee.
+ * Restores the saved dust state only when the tx surely never reached the mempool.
+ * A tx that may have reached it has spent its dust fee.
  */
 export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: string, intent?: BoundSubmitIntent): Promise<any> {
     if (intent?.replyPort) {
         try {
-            // Fail closed: an unannounced tx could never be reconciled.
+            // A tx that was not announced could never be traced, so refuse to send it.
             if (typeof tx?.identifiers !== 'function') throw new Error(`${site}: transaction exposes no identifiers(); refusing to broadcast unannounced`);
             await announceSubmitIntent(intent.replyPort, {
                 txHash: String(tx.identifiers().at(-1)),
@@ -224,7 +216,7 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
                 segments: callSegments(tx)
             });
         } catch (e) {
-            // Not broadcast: free booked spends and dust (the SDK reverts only on a failed submit).
+            // Not sent, so free the reserved coins and dust. The SDK does this only after a failed submit.
             await revertRecipeBestEffort(entry.facade, tx, `${site} intent`);
             await restoreDustFromSnapshot(entry, `${site} intent`);
             throw e;
@@ -238,7 +230,6 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
         if (isPreMempoolReject(e) || isNothingSent(e)) {
             await restoreDustFromSnapshot(entry, site);
         } else {
-            // A tx that may have reached the pool keeps its booked spends.
             log('info', `${site}: submit failed, NOT classified pre-mempool (dust guard disarmed): ${safeDeepInspect(e, 512).slice(0, 600)}`);
             entry.preSubmitDustSnapshot = undefined;
         }
@@ -246,26 +237,25 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
     }
 }
 
-// ---- Dedicated submission clients (parallel sponsor path) ------------------
-// The SDK node client disconnects its shared socket after every submission stream, so concurrent
-// submits on one client kill each other: each gets an exclusive pooled client. `disconnect()`
-// returns before the socket closes, so a slot is ready only a settle window after creation
-// and each use; a send that dies on that closing socket never left and is retried once.
+// The SDK's node client closes its connection after every submit, so parallel submits on one
+// client break each other. Each submit therefore gets a client of its own from a pool.
+// The SDK's disconnect returns before the socket is closed, so a client is reused only after a
+// short wait. A send that fails on such a closing socket was never sent and is retried once.
 export let SUBMIT_CLIENT_POOL_MAX = 8;
 let submitClientSettleMs = 2500;
-/** Bound on closing an abandoned client: its SDK close waits for the client's own initialisation, which may be what hung. */
+/** Limit for closing a stuck client. The SDK's close waits for the client's start, which may be what hangs. */
 export const SUBMIT_CLOSE_TIMEOUT_MS = 5000;
 export type SubmitClientSlot = { svc: any; busy: Promise<unknown> | null; readyAt: number };
 export const submitClientPools = new Map<string, SubmitClientSlot[]>();
-export const submitClientWaiters = new Map<string, number>(); // callers currently acquiring, per relay
+export const submitClientWaiters = new Map<string, number>(); // callers waiting for a client, per node URL
 export type SubmitServiceFactory = (relayURL: URL) => Promise<PhasedSubmitService> | PhasedSubmitService;
-/** The adapter is created lazily so the connect phase covers the client's own initialisation. */
+/** Creates the client lazily, so the connect timeout also covers its start. */
 const defaultSubmitServiceFactory: SubmitServiceFactory = (relayURL) => createPhasedSubmitService({
     adapter: () => createSdkNodeAdapter(relayURL, { connectTimeoutMs: SUBMIT_CONNECT_TIMEOUT_MS, sdk: loadNodeClientSdk }),
     timeouts: { connectMs: SUBMIT_CONNECT_TIMEOUT_MS, requestMs: SUBMIT_REQUEST_TIMEOUT_MS, watchMs: SUBMIT_WATCH_TIMEOUT_MS, closeMs: SUBMIT_CLOSE_TIMEOUT_MS, lateGraceMs: SUBMIT_LATE_GRACE_MS }
 });
 let submitServiceFactory: SubmitServiceFactory = defaultSubmitServiceFactory;
-// Test seams: pool cap and introspection, service factory.
+// Test only.
 export const __submitClientPoolForTests = {
     setMax: (n: number) => { SUBMIT_CLIENT_POOL_MAX = n; },
     setSettleMs: (ms: number) => { submitClientSettleMs = ms; },
@@ -290,8 +280,8 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
             const free = pool.filter((s) => s.busy === null);
             slot = free.find((s) => s.readyAt <= now);
             if (slot) break;
-            // Create only when free slots cannot cover the waiters, up to the cap. Reserved
-            // synchronously, before any await, so concurrent callers cannot over-create.
+            // Create a client only when the free ones cannot serve all waiters. The slot is reserved
+            // before any await, so concurrent callers cannot create too many.
             const waiters = submitClientWaiters.get(key) ?? 1;
             if (pool.length < SUBMIT_CLIENT_POOL_MAX && free.length < waiters) {
                 const created: SubmitClientSlot = { svc: null, busy: null, readyAt: Number.POSITIVE_INFINITY };
@@ -303,14 +293,14 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
                     pool.splice(pool.indexOf(created), 1);
                     throw e;
                 }
-                continue; // the new slot is ready after its settle window
+                continue; // the new client is ready after a short wait
             }
             const settling = free.filter((s) => Number.isFinite(s.readyAt));
             if (settling.length > 0) {
                 const wait = Math.max(0, Math.min(...settling.map((s) => s.readyAt)) - Date.now());
                 await new Promise((r) => setTimeout(r, wait));
             } else if (free.length > 0) {
-                await new Promise((r) => setTimeout(r, 100)); // a slot is being created by another caller
+                await new Promise((r) => setTimeout(r, 100)); // another caller is creating a client
             } else {
                 await Promise.race(pool.map((s) => s.busy!.catch(() => undefined)));
             }
@@ -321,8 +311,7 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
     const run = fn(slot.svc);
     slot.busy = run.catch(() => undefined);
     const label = opts.label ?? 'submit';
-    // Evict a slot whose client state is unknown. Bounded close: it waits for the client's
-    // own initialisation, which may be what hung.
+    // Drop a client whose state is unknown.
     const evict = async (): Promise<void> => {
         const idx = pool!.indexOf(slot!);
         if (idx >= 0) pool!.splice(idx, 1);
@@ -336,14 +325,14 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
         try {
             return await run;
         } catch (e) {
-            // After a request/watch failure the client keeps listening; no new submit may use it.
+            // After a timeout the client keeps listening for a while, so no other submit may use it.
             if (submitPhaseOf(e) !== null) await evict();
             throw e;
         } finally {
             if (pool.includes(slot)) { slot.busy = null; slot.readyAt = Date.now() + submitClientSettleMs; }
         }
     }
-    // Backstop only (the phased service bounds each phase): abandon, evict, the caller asks the indexer.
+    // Last resort only, since each step has its own timeout. On timeout, drop the client and let the caller ask the indexer.
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new SubmitWatchTimeoutError(opts.abandonAfterMs!)), opts.abandonAfterMs); });
     try {
@@ -366,8 +355,8 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
 }
 
 /**
- * Indexer lookup by identifier with the ledger apply result (a tx in a block whose call did not
- * apply is not a success). Null when unknown or unreachable.
+ * Looks up a tx on the indexer, with the ledger result. A tx in a block whose call failed is not a success.
+ * Null when the tx is unknown or the indexer is unreachable.
  */
 export async function indexerBlockOfIdentifier(indexerHttpUrl: string, identifier: string): Promise<{ height: string; status: string | null; failedSegments: number[] } | null> {
     try {
@@ -387,8 +376,8 @@ export async function indexerBlockOfIdentifier(indexerHttpUrl: string, identifie
 }
 
 /**
- * In a block but the call did not apply (fee spent). Named like the SDK's error so the main
- * thread classifies it the same way; the block height is the rollback coordinate.
+ * The tx is in a block but its call did not apply, and the fee is spent.
+ * Named like the SDK's error so the main thread handles both the same way.
  */
 export class TxNotAppliedError extends NightgateError {
     readonly blockHeight: number | null;
@@ -399,25 +388,24 @@ export class TxNotAppliedError extends NightgateError {
         this.blockHeight = Number.isInteger(h) && h >= 0 ? h : null;
     }
 }
-/** A landed transaction counts only with ledger result SUCCESS. */
 export function assertApplied(found: { height: string; status: string | null; failedSegments: number[] }, identifier: string): void {
     if (found.status && found.status !== 'SUCCESS') throw new TxNotAppliedError(identifier, found.height, found.status, found.failedSegments);
 }
-// Keep above the node client's own 60 s request timeout, or an unanswered send and a
-// watch timeout (answered, not included) become indistinguishable.
+// Keep above the node client's own 60 s request timeout. Otherwise "no answer" and
+// "answered but not in a block" cannot be told apart.
 export const SUBMIT_WATCH_TIMEOUT_MS = configMs('NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS');
 export const SUBMIT_CONNECT_TIMEOUT_MS = configMs('NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS');
 export const SUBMIT_REQUEST_TIMEOUT_MS = configMs('NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS');
 export const SUBMIT_LATE_GRACE_MS = configMs('NIGHTGATE_SUBMIT_LATE_GRACE_MS');
 export const SUBMIT_WATCH_CONFIRM_MS = 90_000;
-/** The outer backstop of a dedicated-client submit: every phase budget plus room for the phased service's own bookkeeping. */
+/** Overall limit of a submit: all step timeouts plus some room. */
 export function submitBackstopMs(): number { return SUBMIT_CONNECT_TIMEOUT_MS + SUBMIT_REQUEST_TIMEOUT_MS + SUBMIT_WATCH_TIMEOUT_MS + Math.min(10_000, SUBMIT_WATCH_TIMEOUT_MS); }
-// InBlock is safe for the unbound sponsor path: the indexer confirmer checks the chain
-// outcome afterwards, so a reorg shows as a failed chain status, not a lost job.
+// Waiting only for InBlock is safe, because a later indexer check still verifies the result.
+// A chain reorganization then shows as a failed status, not as a lost job.
 export function sponsorSubmitWaitStage(): 'InBlock' | 'Finalized' { return configEnum('NIGHTGATE_SPONSOR_WAIT') === 'finalized' ? 'Finalized' : 'InBlock'; }
-// After the wanted status, wait until the indexer has the tx and check the ledger result there:
-// a caller building its next call reads contract state on the indexer, and neither InBlock nor
-// Finalized says whether the call applied.
+// Wait until the indexer has the tx and check its ledger result there.
+// The caller's next call reads contract state from the indexer, and the node's
+// InBlock or Finalized status does not say whether the call applied.
 export async function waitIndexerVisible(indexerHttpUrl: string, identifier: string, site: string): Promise<void> {
     const windowMs = configMs('NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS');
     if (windowMs === 0) return;
@@ -434,28 +422,26 @@ export async function waitIndexerVisible(indexerHttpUrl: string, identifier: str
     log('warn', `${site}: transaction in block but not visible on the indexer after ${windowMs}ms; reporting landed anyway`);
 }
 
-/** What the worker knows about the transaction it is about to broadcast. */
 export interface SubmitIntent {
     txHash: string;
-    /** Inspected from the caller transaction (shape check), not from the allow-list. */
+    /** Read from the caller's tx itself, not from the allow list. */
     contractAddress?: string;
     circuits?: string[];
-    /** Unbound channel: the dust backing the sponsor pays from. */
+    /** For unbound sponsoring: the NIGHT UTXO whose dust pays the fee. */
     note?: string;
-    /** The sponsor ACCOUNT paying (the facade's account id). */
+    /** The sponsor account that pays. */
     sponsorAccountId?: string;
-    /** Addresses of contract deploy actions in the tx; the main thread reserves the grant's deploy budget on them before acking. */
+    /** Contracts this tx deploys. The main thread counts them against the grant's deploy limit before it confirms. */
     deployed?: string[];
-    /** End of the validity window (ISO): once the indexer tip is past it, the tx is provably not on chain. */
+    /** When the tx expires, as ISO time. Once the chain is past it, the tx can no longer land. */
     ttl?: string;
-    /** Batches: call names per segment, so the confirmed outcome can say which calls applied. */
+    /** For batches: the calls in each segment, so the result can say which calls applied. */
     segments?: Array<{ segment: number; calls: string[] }>;
-    /** Raw token types the transaction's calls mint; recorded on the grant once it landed. */
+    /** Raw token types the calls mint. Recorded on the grant once the tx landed. */
     minted?: string[];
 }
-/** An ack slower than this is logged: the main thread's boundary write was slow. */
 const INTENT_ACK_WARN_MS = 10_000;
-/** Resolves on the main thread's ack; without one the job fails before broadcasting. No-op without a port. */
+/** Waits for the main thread to confirm the tx id. Without a confirmation the tx is not sent. Does nothing without a port. */
 export async function announceSubmitIntent(port: MessagePort | undefined, intent: SubmitIntent): Promise<void> {
     if (!port) return;
     markIntentAnnounced();
@@ -478,12 +464,12 @@ export async function announceSubmitIntent(port: MessagePort | undefined, intent
     });
 }
 
-/** The send itself died on the client's own lagging close (see settle window). */
+/** The send failed on a socket the client was still closing, so nothing was sent. */
 export function isClosingSocketReject(err: unknown): boolean {
     return /disconnected from \S*:\s*1000\s*::\s*Normal Closure/i.test(classificationHaystack(err));
 }
 
-/** Books the spends with the facade's pending service, as the facade's own submit does. */
+/** Marks the tx's coins as spent, like the SDK's own submit does. */
 async function bookPending(entry: FacadeEntry, tx: any, site: string): Promise<void> {
     const svc = entry.facade?.pendingTransactionsService;
     if (typeof svc?.addPendingTransaction !== 'function') {
@@ -494,11 +480,10 @@ async function bookPending(entry: FacadeEntry, tx: any, site: string): Promise<v
 }
 
 /**
- * The one send path: a dedicated phased client per submit (the facade's shared socket
- * disconnects after each submission and its submit promise settles only when that socket
- * closes). `book` = the facade's own bookkeeping around a send: pend before, revert on failure.
- * A connect failure or a send that died is resent (same bytes, the indexer probed first); a
- * request or watch timeout is looked up on the indexer; node rejects are never resent.
+ * Every tx is sent through here, on a node connection of its own.
+ * With `book`, its coins are marked as spent before sending and freed again on failure.
+ * A connection failure leads to a resend of the same tx. A timeout leads to an indexer lookup.
+ * A tx the node rejected is never sent again.
  */
 export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site: string, opts: { book?: boolean } = {}): Promise<any> {
     await logTxCost(tx, site);
@@ -507,8 +492,7 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
     const label = `${site} ${identifier.slice(0, 16)}`;
     const retries = submitTransportRetries();
     const waitFor = sponsorSubmitWaitStage();
-    // Set once any attempt got past the connect phase without the indexer showing the tx: from
-    // then on the bytes may be on the node and no later failure is definitive.
+    // Set once an attempt may have reached the node. From then on no later failure is final.
     let maybeSent = false;
     const unknownOutcome = (e: unknown): Error => new SubmitOutcomeUnknownError(identifier, e);
     const landed = async (windowMs: number, how: string): Promise<boolean> => {
@@ -539,7 +523,7 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
                 if (phase === 'connect') {
                     if (resends >= retries) {
                         if (earlierUnresolved) throw unknownOutcome(e);
-                        // Every attempt failed before a send: the dust note was never spent anywhere.
+                        // No attempt sent anything, so the dust was never spent.
                         markNothingSent(e);
                         throw e;
                     }
@@ -553,7 +537,6 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
                     throw e;
                 }
                 if (isSubmitTransportFailure(e)) {
-                    // The send died mid-stream: it may or may not have reached the node.
                     if (await landed(submitLandedProbeMs(), 'although the submit reply was lost')) return identifier;
                     maybeSent = true;
                     if (resends >= retries) throw unknownOutcome(e);
@@ -561,7 +544,7 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
                     await resend(`submit transport failure (send ${resends}/${retries + 1}): ${formatErrWithCauses(e).slice(0, 300)}; the indexer does not have ${identifier.slice(0, 16)}`);
                     continue;
                 }
-                // A refused resend: the first send may have landed, making these bytes a replay.
+                // A resend was refused. The first send may have landed, so check the indexer.
                 if (resends > 0 && await landed(submitLandedProbeMs(), 'although the resend was refused')) return identifier;
                 if (earlierUnresolved) throw unknownOutcome(e);
                 log('info', `${site}: submit failed (${isPreMempoolReject(e) ? 'pre-mempool reject' : 'not pre-mempool'}): ${safeDeepInspect(e, 512).slice(0, 600)}`);
@@ -569,20 +552,20 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
             }
         }
     } catch (e) {
-        // The facade's own rule: a failed submit frees the booked spends (the dust guard decides about the note).
+        // Free the reserved coins, like the SDK does after a failed submit.
         if (opts.book) await revertRecipeBestEffort(entry.facade, tx, `${site} pending`);
         throw e;
     }
 }
 
-/** A facade as the SDK's WalletProvider & MidnightProvider. */
+/** The wallet as the SDK's WalletProvider and MidnightProvider. */
 export function buildWorkerWalletProvider(entry: FacadeEntry, intent?: BoundSubmitIntent): any {
     return {
         getCoinPublicKey(): string { return entry.zswapKeys.coinPublicKey; },
         getEncryptionPublicKey(): string { return entry.zswapKeys.encryptionPublicKey; },
         async balanceTx(tx: any, ttl?: Date): Promise<any> {
             await waitForGenuineSync(entry, BALANCE_SYNC_TIMEOUT_MS, 'balance');
-            // Arm the dust-wedge protection BEFORE the build books the spend.
+            // Save the dust state before the build marks the dust as spent.
             await captureDustSnapshot(entry, 'balance');
             const effectiveTtl = ttl ?? new Date(Date.now() + 60 * 60 * 1000);
             if (intent) intent.ttl = effectiveTtl.toISOString();
@@ -595,7 +578,7 @@ export function buildWorkerWalletProvider(entry: FacadeEntry, intent?: BoundSubm
             try {
                 finalized = await entry.facade.finalizeRecipe(recipe);
             } catch (e) {
-                // On prove failure the SDK reverts only the balancing tx of an unbound recipe.
+                // On a failed proof the SDK frees only part of the reserved coins, so free them here.
                 await revertRecipeBestEffort(entry.facade, recipe, 'balance');
                 throw e;
             }
@@ -623,9 +606,12 @@ export function buildWorkerWalletProvider(entry: FacadeEntry, intent?: BoundSubm
     };
 }
 
-/** Two-phase provider: the caller balances (non-dust), signs and finalizes; the sponsor balances dust and submits. */
+/**
+ * Wallet provider for a sponsored tx. The caller pays everything except the fee, signs and finalizes.
+ * The sponsor then adds the dust fee and sends.
+ */
 export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: FacadeEntry, intent?: BoundSubmitIntent): any {
-    // The caller-side finalized tx of the LAST successful balanceTx
+    // The caller's finalized tx from the last successful balanceTx, freed if the submit fails.
     let lastCallerFinalized: any;
     return {
         getCoinPublicKey(): string { return caller.zswapKeys.coinPublicKey; },
@@ -652,13 +638,13 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
                 const signed = await caller.facade.signRecipe(recipe, callerSign);
                 callerFinalized = await caller.facade.finalizeRecipe(signed);
             } catch (e) {
-                // No SDK revert covers sign failures; prove failures revert only the balancing part.
+                // The SDK frees nothing after a failed signature and only part after a failed proof.
                 await revertRecipeBestEffort(caller.facade, recipe, 'sponsored-balance caller');
                 throw e;
             }
 
             try {
-                // Phase 2 books the sponsor's dust spend: arm its protection first.
+                // The next step spends the sponsor's dust, so save the sponsor's dust state first.
                 await captureDustSnapshot(sponsor, 'sponsored-balance sponsor');
                 const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(
                     callerFinalized,
@@ -687,7 +673,7 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
                 lastCallerFinalized = callerFinalized;
                 return finalized;
             } catch (e) {
-                // The caller's finalized tx will never be submitted: free its coins now.
+                // The caller's tx will never be sent, so free its coins now.
                 await revertRecipeBestEffort(caller.facade, callerFinalized, 'sponsored-balance caller');
                 throw e;
             }
@@ -711,12 +697,12 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
     };
 }
 
-/** Thrown by the build-only provider to stop the SDK's callTx at submit time. */
+/** Thrown to stop the SDK's callTx right before it sends. */
 export class BuildOnlyStop extends Error {
     constructor() { super('build-only: captured finalized tx, stopping before submit'); this.name = 'BuildOnlyStop'; }
 }
 
-/** Caller phase 1 only (balance, sign, finalize); captures the tx and stops instead of submitting. */
+/** Builds, signs and finalizes as the caller, then keeps the tx in `holder` instead of sending it. */
 export function buildBuildOnlyWalletProvider(caller: FacadeEntry, holder: { captured?: any }): any {
     return {
         getCoinPublicKey(): string { return caller.zswapKeys.coinPublicKey; },

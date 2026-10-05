@@ -1,7 +1,6 @@
 /**
- * Prover keys on demand: missing keys are fetched on first need and verified
- * against `keys/manifest.json`. The digest covers the manifest, not the keys,
- * so fetching changes no generation.
+ * Downloads missing prover keys when first needed and checks them against `keys/manifest.json`.
+ * The contract's digest covers the manifest but not the keys, so a download does not change the digest.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -18,7 +17,7 @@ import {
     type ZkAssetLayout
 } from '@odatano/contract-kit/node';
 import { configStringFrom } from '../utils/config';
-import { NightgateError } from '../utils/errors';
+import { NightgateError, errorMessage } from '../utils/errors';
 
 export { readProverKeyManifest, verifierCircuits, missingProverKeys, hasAllProverKeys };
 export type { ProverKeyManifest, ZkAssetLayout };
@@ -32,22 +31,21 @@ export class ProverKeysUnavailableError extends NightgateError {
     }
 }
 
-/** Where a registration's prover keys come from: an installed lineage package names its release assets. */
+/** Where a contract's prover keys are downloaded from. An installed contract package names its release files. */
 export interface ProverKeySourceInput {
     zkConfigPath: string;
     package?: { zkAssetUrl?: string; zkAssetLayout?: ZkAssetLayout };
 }
 
 export interface ZkAssetSource {
-    /** Base URL; keys resolve by `layout`. */
+    /** Base URL. `layout` says how key paths are built from it. */
     base: string;
     layout: ZkAssetLayout;
 }
 
 /**
- * `NIGHTGATE_ZK_ASSET_URL` base (a `/zk-config` layout, per contract name), else
- * the installed package's release assets; null when disabled (none/off) or a
- * foreign artifact has no source.
+ * Uses `NIGHTGATE_ZK_ASSET_URL` if set, else the release files of the installed contract package.
+ * Null when downloads are turned off or no source is known.
  */
 export function resolveZkAssetSource(
     name: string,
@@ -69,7 +67,7 @@ export interface EnsureProverKeysOptions {
 
 const inFlight = new Map<string, Promise<{ fetched: string[]; source: string | null }>>();
 
-/** Each key is verified before it lands; concurrent callers for one artifact share the download. */
+/** Each key is checked before it is saved. Parallel callers for one contract share one download. */
 export function ensureProverKeys(
     name: string,
     reg: ProverKeySourceInput,
@@ -124,7 +122,7 @@ async function ensureProverKeysNow(
             res = await doFetch(url);
         } catch (e) {
             throw new ProverKeysUnavailableError(
-                `contract '${name}': fetching ${url} failed: ${String((e as Error)?.message ?? e)}`, name, [circuit], true);
+                `contract '${name}': fetching ${url} failed: ${errorMessage(e)}`, name, [circuit], true);
         }
         if (!res.ok) {
             throw new ProverKeysUnavailableError(

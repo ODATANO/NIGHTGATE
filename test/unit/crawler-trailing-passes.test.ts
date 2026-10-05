@@ -168,9 +168,9 @@ describe('LedgerPayloadDecoder', () => {
         const blockId = await seedBlock(10, '0xd6');
         const shielded = await seedTransaction(blockId, { transactionId: 0, raw: midnightExtrinsicBase64(20) });
         const call = await seedTransaction(blockId, { transactionId: 1, raw: midnightExtrinsicBase64(21) });
-        // A pallet-map flag and a stale proof hash: the decoded payload overrules both.
+        // A pallet-map flag: the decoded payload overrules it.
         const transfer = await seedTransaction(blockId, {
-            transactionId: 2, raw: midnightExtrinsicBase64(22), isShielded: true, hasProof: true, proofHash: '0xold'
+            transactionId: 2, raw: midnightExtrinsicBase64(22), isShielded: true, hasProof: true
         });
         await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
         const none = { zswapInputCount: 0, zswapOutputCount: 0, zswapTransientCount: 0 };
@@ -185,7 +185,7 @@ describe('LedgerPayloadDecoder', () => {
         const read = (ID: string) => db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ ID }));
         expect(await read(shielded)).toEqual(expect.objectContaining({ isShielded: true, hasProof: true }));
         expect(await read(call)).toEqual(expect.objectContaining({ isShielded: false, hasProof: true }));
-        expect(await read(transfer)).toEqual(expect.objectContaining({ isShielded: false, hasProof: false, proofHash: null }));
+        expect(await read(transfer)).toEqual(expect.objectContaining({ isShielded: false, hasProof: false }));
     });
 
     it('replaces the pallet default type of a call-free transaction, and only that', async () => {

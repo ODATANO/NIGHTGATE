@@ -1,5 +1,3 @@
-// Types for the NIGHTGATE client SDK. See client.mjs.
-
 export declare class NightgateApiError extends Error {
     status: number;
     code: string | undefined;
@@ -8,31 +6,31 @@ export declare class NightgateApiError extends Error {
 /** Server error codes a client may retry unchanged. */
 export declare const RETRYABLE_ERROR_CODES: ReadonlySet<string>;
 
-/** Whether a failed call may be retried unchanged (code first, then status, then network errors). */
+/** Whether a failed call may be retried unchanged. Checks the error code, then the HTTP status, then network errors. */
 export declare function isRetryable(err: unknown): boolean;
 
 export declare class NightgateJobError extends Error {
     job: JobStatus & { jobId: string };
 }
 
-/** OData Int64 URL literal, precision-safe beyond Number.MAX_SAFE_INTEGER. */
+/** A 64-bit integer for a function URL. Keeps full precision for values above Number.MAX_SAFE_INTEGER. */
 export interface Int64Literal { $int64: string; }
 export declare function int64(value: string | number | bigint): Int64Literal;
 
 export interface ConnectOptions {
-    /** e.g. https://nightgate.example */
+    /** For example https://nightgate.example */
     baseUrl: string;
-    /** default '/api/v1/nightgate' */
+    /** Defaults to '/api/v1/nightgate'. */
     servicePath?: string;
-    /** agent-grant token (ngat_...), sent as x-agent-token */
+    /** Agent token (ngat_...). Sent in the x-agent-token header. */
     agentToken?: string;
     /** Bearer token */
     token?: string;
     username?: string;
     password?: string;
-    /** per-request timeout, default 120000 */
+    /** Timeout per request in ms. Defaults to 120000. */
     timeoutMs?: number;
-    /** waitForJob poll interval, default 2000 */
+    /** How often waitForJob polls, in ms. Defaults to 2000. */
     pollMs?: number;
     fetchFn?: typeof fetch;
 }
@@ -47,7 +45,7 @@ export interface JobStatus {
 
 export type Params = Record<string, string | number | bigint | boolean | Int64Literal | undefined>;
 export type ActionParams = Record<string, unknown>;
-/** Job result parsed from JSON, plus jobId/txHash. */
+/** The parsed job result, plus the job id and the transaction hash. */
 export type JobResult = Record<string, unknown> & { jobId: string; txHash?: string };
 
 export interface NightgateClient {
@@ -55,10 +53,10 @@ export interface NightgateClient {
     callFunction(name: string, params?: Params): Promise<any>;
     /** POST <service>/<name> */
     callAction(name: string, params?: ActionParams): Promise<any>;
-    /** Polls getJobStatus; transient poll failures (429/502/503/504, network, timeout) are retried for up to pollGraceMs (default 5 min) of consecutive failures. */
+    /** Polls getJobStatus until the job ends. Temporary poll errors are retried until they last longer than pollGraceMs, default 5 minutes. */
     waitForJob(input: { jobId: string; sessionId?: string; pollMs?: number; timeoutMs?: number; pollGraceMs?: number }): Promise<JobResult>;
 
-    // crawler-free verification
+    // checks that read the chain directly
     verifyAttestation(p: Params): Promise<any>;
     verifyPredicate(p: Params): Promise<any>;
     verifyPredicateAttestation(p: Params): Promise<any>;
@@ -66,7 +64,7 @@ export interface NightgateClient {
     deriveTokenType(p: Params): Promise<any>;
     getHealth(): Promise<any>;
 
-    // compute-only preparation
+    // input preparation, no transaction
     prepareDocumentProof(p: ActionParams): Promise<any>;
     prepareMembershipSet(p: ActionParams): Promise<any>;
 
@@ -78,7 +76,7 @@ export interface NightgateClient {
     getWalletBalance(p: Params): Promise<any>;
     getWalletSyncProgress(p: Params): Promise<any>;
 
-    // anchoring + ZK attestations (submit + wait, returns the job result)
+    // documents and zero-knowledge proofs. Each submits a job, waits, and returns its result.
     anchorDocument(p: ActionParams): Promise<JobResult>;
     attestAgentOutput(p: ActionParams): Promise<JobResult>;
     proveFieldPredicate(p: ActionParams): Promise<JobResult>;
@@ -92,7 +90,10 @@ export interface NightgateClient {
     grantDisclosure(p: ActionParams): Promise<JobResult>;
     revokeDisclosure(p: ActionParams): Promise<JobResult>;
     registerPassport(p: ActionParams): Promise<JobResult>;
-    /** Same action as registerPassport; takes `documentId` and `mode` (0 register, 1 unregister, 2 transfer registrar, 3/4 recovery re-points registrar/recovery). */
+    /**
+     * Same action as registerPassport. Takes `documentId` and `mode`.
+     * Modes: 0 register, 1 unregister, 2 transfer the registrar, 3 recovery sets the registrar, 4 recovery sets the recovery key.
+     */
     registerDocument(p: ActionParams): Promise<JobResult>;
     retractAttestation(p: ActionParams): Promise<JobResult>;
     purgeExpired(p: ActionParams): Promise<JobResult>;
@@ -104,10 +105,13 @@ export interface NightgateClient {
     mintShieldedTestToken(p: ActionParams): Promise<JobResult>;
     sendNight(p: ActionParams): Promise<JobResult>;
 
-    // cross-server fee sponsoring
+    // the server pays the fee for a transaction built elsewhere
     sponsorFinalized(p: ActionParams): Promise<JobResult>;
     sponsorUnbound(p: ActionParams): Promise<JobResult>;
-    /** `{ makerHalfB64, takerHalfB64, sponsorSessionId?, idempotencyKey? }`; a half is offer file text (`swapoffer1...`) or base64. */
+    /**
+     * Takes `makerHalfB64`, `takerHalfB64`, and optionally `sponsorSessionId` and `idempotencyKey`.
+     * Each half is either offer file text (`swapoffer1...`) or base64.
+     */
     sponsorSwap(p: ActionParams): Promise<JobResult>;
     buildSponsorable(p: ActionParams): Promise<JobResult>;
 }

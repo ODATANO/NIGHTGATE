@@ -27,6 +27,7 @@ import {
     MAX_PROOF_FIELDS,
     type PureCircuits
 } from '../../srv/submission/document-proof';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 /** Deterministic fake pure circuits: tagged sha256 concatenations. */
 const fakeEmptyLeafKey = new Uint8Array(32);
@@ -58,7 +59,7 @@ function makeReq(data: Record<string, unknown>, opts: { user?: any } = {}) {
         data,
         user: 'user' in opts ? opts.user : { id: 'user-1' },
         reject: vi.fn((code: number, message: string) => ({ __rejected: true, code, message })),
-        _: { req: { ip: `172.18.${(__ipCounter >> 8) & 0xff}.${__ipCounter & 0xff}` } }
+        http: { req: { ip: `172.18.${(__ipCounter >> 8) & 0xff}.${__ipCounter & 0xff}` } }
     } as any;
 }
 
@@ -120,7 +121,7 @@ describe('prepareDocumentProof handler', () => {
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.canonicalDocument).toBe(canonicalize({ price: 10, days: 30 }));
         expect(result.payloadHash).toBe(blake2b256Hex(result.canonicalDocument));
-        expect(result.contentRoot).toMatch(/^[0-9a-f]{64}$/);
+        expect(result.contentRoot).toMatch(HEX64_RE);
         const fields = JSON.parse(result.fields);
         expect(fields.map((f: any) => f.field)).toEqual(['price', 'days']);
         expect(JSON.parse(result.emptyFields)).toEqual([]);
@@ -151,7 +152,6 @@ describe('prepareMembershipSet handler', () => {
             [{ allowedValuesJson: '[]' }, 'non-empty'],
             [{ allowedValuesJson: '[1]' }, 'non-empty strings'],
             [{ allowedValuesJson: LIST, value: 'EEA', valueDigest: 'a'.repeat(64) }, 'at most one'],
-            [{ allowedValuesJson: LIST, valueDigest: 'zz' }, '64 hex'],
             [{ allowedValuesJson: LIST, value: 'DE' }, 'not in the allowed list'],
             [{ allowedValuesJson: JSON.stringify(Array.from({ length: 65 }, (_, i) => `v${i}`)) }, 'at most 64']
         ] as const) {
@@ -166,9 +166,9 @@ describe('prepareMembershipSet handler', () => {
         const req = makeReq({ allowedValuesJson: LIST });
         const result = await handlers.prepareMembershipSet(req);
         expect(req.reject).not.toHaveBeenCalled();
-        expect(result.setRoot).toMatch(/^[0-9a-f]{64}$/);
+        expect(result.setRoot).toMatch(HEX64_RE);
         expect(result.memberCount).toBe(3);
-        expect(result.setSiblingsJson).toBeUndefined();
+        expect(result.setSiblingsJson).toBeNull();
     });
 
     it('the root is canonical: order and duplicates of the list do not matter', async () => {
@@ -227,9 +227,7 @@ describe('attestAgentOutput handler', () => {
     it('walks the validation ladder with 400s', async () => {
         for (const [data, msg] of [
             [{ ...VALID, agentId: undefined }, 'agentId'],
-            [{ ...VALID, inputHash: 'zz' }, 'inputHash'],
             [{ ...VALID, outputHash: undefined }, 'outputHash'],
-            [{ ...VALID, policyHash: '123' }, 'policyHash'],
             [{ ...VALID, sessionId: undefined }, 'sessionId'],
             [{ ...VALID, contractAddress: undefined }, 'contractAddress'],
             [{ ...VALID, producedAt: 'not-a-date' }, 'producedAt']

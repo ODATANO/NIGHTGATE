@@ -1,17 +1,16 @@
 /**
- * How contract state is stored.
+ * Stores contract state without keeping a full copy for every action.
  *
- * A contract's state is hundreds of kilobytes and changes with every call, so a
- * full copy per action grows faster than everything else in the index. Every
- * action keeps a sha256 and the size of its state; the newest state per
- * contract lives in `ContractStates`; the full per-action state is kept only
- * for the history the operator asks for. Older states are read from the
- * indexer on demand and checked against the stored hash.
+ * Contract state is large and changes with every call, so full copies would quickly fill the database.
+ * Every action stores only a sha256 hash and the size of its state.
+ * `ContractStates` holds the latest full state of each contract.
+ * Full states per action are kept only for contracts the operator configured.
+ * Older states are fetched from the indexer when needed and checked against the stored hash.
  */
 
 import { createHash } from 'node:crypto';
 import cds from '@sap/cds';
-import { readCapBinary } from './cap-binary';
+import { readCapBinary, capBinaryInput } from './cap-binary';
 import { ContractActions, ContractStates, SyncState, type ContractAction } from '#cds-models/midnight';
 import type { DbRunner, DbService, Row } from '../utils/db-types';
 
@@ -21,9 +20,8 @@ export const CONTRACT_STATE_HISTORY_MODES = ['none', 'watched', 'all'] as const;
 export type ContractStateHistory = typeof CONTRACT_STATE_HISTORY_MODES[number];
 
 export interface ContractStatePolicy {
-    /** Which actions keep their full state: none, the watched contracts, or all. */
     history: ContractStateHistory;
-    /** Normalized addresses (lowercase hex, no 0x) for `watched`. */
+    /** Watched contract addresses as lowercase hex without `0x`. */
     watched: ReadonlySet<string>;
 }
 
@@ -60,7 +58,7 @@ export function digestOfBase64(value: string | null | undefined): StateDigest {
     return digestOf(value == null ? null : Buffer.from(value, 'base64'));
 }
 
-export interface CurrentStateRow {
+export interface CurrentStateInput {
     address: string;
     height: number;
     state: string | null;
@@ -71,11 +69,11 @@ export interface CurrentStateRow {
 }
 
 /**
- * Makes `row` the contract's current state unless a state from a higher block
- * is stored. The same height replaces: within a block the supplement applies
- * the transactions in order, so the last action wins, and a re-run is idempotent.
+ * Stores `row` as the contract's current state, unless a state from a later block is already stored.
+ * A state from the same block is replaced. Transactions are applied in order, so the last action of a block wins.
+ * Running it again with the same row changes nothing.
  */
-export async function upsertCurrentState(tx: DbRunner, row: CurrentStateRow): Promise<boolean> {
+export async function upsertCurrentState(tx: DbRunner, row: CurrentStateInput): Promise<boolean> {
     const address = normalizeContractAddress(row.address);
     const existing: any = await tx.run(
         SELECT.one.from(ContractStates).columns('height').where({ address })
@@ -83,8 +81,8 @@ export async function upsertCurrentState(tx: DbRunner, row: CurrentStateRow): Pr
     if (existing && Number(existing.height) > row.height) return false;
     const values = {
         height: row.height,
-        state: row.state as any,
-        zswapState: row.zswapState as any,
+        state: row.state === null ? null : capBinaryInput(row.state),
+        zswapState: row.zswapState === null ? null : capBinaryInput(row.zswapState),
         stateHash: row.stateHash,
         zswapStateHash: row.zswapStateHash,
         contractAction_ID: row.contractActionId
@@ -101,14 +99,13 @@ export interface ContractStateSnapshot {
     address: string;
     /** Block of the action the state comes from. */
     height: number | null;
-    /** base64 */
     state: string | null;
     zswapState: string | null;
     stateHash: string | null;
     zswapStateHash: string | null;
-    /** `history` (stored per action), `current` (ContractStates) or `indexer`. */
+    /** Where the state came from: the stored action, the `ContractStates` table, or the indexer. */
     source: 'history' | 'current' | 'indexer';
-    /** For `indexer`: the fetched bytes match the hash stored for that action. Null when there is none to compare. */
+    /** For `indexer` only: true if the fetched state matches the stored hash. Null if there is no hash to compare. */
     verified: boolean | null;
 }
 
@@ -122,10 +119,9 @@ function base64Of(bytes: Buffer | null): string | null {
 }
 
 /**
- * The contract's state as of `height` (its newest action at or below it), or
- * its current state when `height` is null. Served from the database when it
- * holds that state, otherwise fetched from the indexer and verified against
- * the stored hash. Null when neither knows an action of the contract.
+ * The contract's state at `height`, or its current state when `height` is null.
+ * Read from the database if stored there, otherwise fetched from the indexer and checked against the stored hash.
+ * Returns null if neither source knows an action of the contract.
  */
 export async function contractStateAt(
     db: DbService,
@@ -153,8 +149,8 @@ export async function contractStateAt(
 
     if (height == null && current) return fromCurrent();
 
-    // The crawler records every action up to its tip, supplemented or not; above
-    // it a newer action may be missing, so no local row speaks for that height.
+    // The database has every action up to the indexed height.
+    // Above that height a newer action may be missing, so local rows cannot be trusted there.
     const sync: any = height == null ? null : await db.run(
         SELECT.one.from(SyncState).columns('lastIndexedHeight').where({ ID: 'SINGLETON' })
     );
@@ -212,11 +208,9 @@ export interface CompactionReport {
 }
 
 /**
- * Moves stored per-action states to the layout above: the newest state per
- * contract into ContractStates, a hash and size onto every action, the full
- * state cleared unless the policy keeps it. Idempotent; run with the server
- * (or at least its supplement pass) stopped. The freed space returns to the
- * file system only after `VACUUM FULL` (PostgreSQL) or `VACUUM` (SQLite).
+ * Converts full states stored per action to the compact layout described at the top of this file.
+ * Safe to run more than once. Run it while the server, or at least its indexer pass, is stopped.
+ * The disk space is freed only after `VACUUM FULL` on PostgreSQL or `VACUUM` on SQLite.
  */
 export async function compactStoredContractState(
     db: DbService,
@@ -261,7 +255,7 @@ export async function compactStoredContractState(
 
     let last: string | undefined;
     for (;;) {
-        // A dry run only counts: it need not pull every stored state through.
+        // A dry run only counts rows, so it does not need to load the states.
         const columns = opts.dryRun ? ['ID', 'address'] : ['ID', 'address', 'state', 'zswapState'];
         let query = SELECT.from(ContractActions)
             .columns(...columns)

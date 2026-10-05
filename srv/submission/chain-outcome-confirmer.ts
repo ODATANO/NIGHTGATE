@@ -1,17 +1,17 @@
 /**
- * Resolves a submitted tx's chain outcome through the Indexer, so `chainStatus`
- * advances without the crawler. One-shot fetch, not `watchForTxData`: its
- * watchQuery poll would leak for every dropped tx.
+ * Asks the Midnight indexer whether a submitted transaction landed, so `chainStatus`
+ * updates without our own crawler. Uses a single fetch rather than `watchForTxData`,
+ * whose polling would never stop for a transaction that was dropped.
  */
 
-/** Indexer `TransactionResultStatus` -> `chainStatus`; an unknown (future) status is null, never a verdict. */
+/** Maps the indexer's result status to `chainStatus`. An unknown status gives null, never a result. */
 export function mapIndexerStatus(status: string): 'success' | 'failure' | null {
     if (status === 'SUCCESS') return 'success';
     if (status === 'FAILURE' || status === 'PARTIAL_SUCCESS') return 'failure';
     return null;
 }
 
-/** A number or digit string as a non-negative integer; anything else (`null`, `''`) is null, not 0. */
+/** Parses a number or digit string as a non-negative integer. Anything else, like `null` or `''`, gives null, not 0. */
 export function nonNegativeInteger(raw: unknown): number | null {
     if (typeof raw === 'number') return Number.isInteger(raw) && raw >= 0 ? raw : null;
     if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) {
@@ -22,30 +22,30 @@ export function nonNegativeInteger(raw: unknown): number | null {
 }
 
 /**
- * A confirmed outcome with its inclusion coordinates. The block height is the
- * only key a reorg rollback can correlate a job on (identifier, indexer hash
- * and extrinsic hash all differ), so an outcome never exists without it.
+ * A confirmed result with the block it landed in. A chain reorg can only match
+ * a job by block height, because the three transaction hashes all differ.
+ * So a result always carries a block height.
  */
 export type ChainOutcome = {
     status: 'success' | 'failure';
     blockHeight: number;
     blockHash?: string | null;
-    /** The indexer's own transaction hash (not the identifier, not the extrinsic hash). */
+    /** The indexer's own transaction hash. It differs from the identifier and the node's extrinsic hash. */
     indexerTxHash?: string | null;
-    /** The indexer's result; PARTIAL_SUCCESS maps to `failure` in `status`. */
+    /** The indexer's raw result. PARTIAL_SUCCESS counts as `failure` in `status`. */
     result?: 'SUCCESS' | 'PARTIAL_SUCCESS' | 'FAILURE';
-    /** Segments the indexer reports as not applied. */
+    /** Parts of the transaction that the indexer reports as not applied. */
     failedSegments?: number[];
 };
 
 /**
- * The indexer has no such transaction: unlike `null` (indexed, not confirmable
- * yet), evidence that a broadcast never landed. `asOfMs` is the tip from the
- * same answer (a separate tip query may hit a fresher replica); null = no verdict.
+ * The indexer does not know the transaction, which suggests it never landed.
+ * `null` instead means it is known but has no final result yet.
+ * `asOfMs` is the time of the indexer's latest block in the same answer. null means no conclusion.
  */
 export type ChainAbsent = { status: 'absent'; asOfMs: number | null };
 export function chainAbsent(asOfMs: number | null): ChainAbsent { return { status: 'absent', asOfMs }; }
-/** Absence without a tip: never a verdict (tests, fallbacks). */
+/** Not found, with no block time. This never counts as a conclusion. */
 export const CHAIN_ABSENT: ChainAbsent = Object.freeze(chainAbsent(null)) as ChainAbsent;
 export type ChainLookup = ChainOutcome | ChainAbsent | null;
 export function isChainOutcome(lookup: ChainLookup): lookup is ChainOutcome {
@@ -57,12 +57,12 @@ export function isChainAbsent(lookup: ChainLookup): lookup is ChainAbsent {
 
 export interface IndexerTxConfirmerConfig {
     indexerHttpUrl: string;
-    /** Per-lookup fetch deadline; default 8000. */
+    /** Timeout per lookup in ms. Default 8000. */
     timeoutMs?: number;
     fetchFn?: typeof fetch;
 }
 
-// The latest block is in the SAME request: it is the tip an absence is as of.
+// Ask for the latest block in the same request. A "not found" answer is only valid as of that block.
 const TX_STATUS_QUERY =
     'query NightgateTxStatus($offset: TransactionOffset!) {' +
     ' transactions(offset: $offset) {' +
@@ -85,8 +85,8 @@ interface IndexedTxSlice {
 }
 
 /**
- * Look a tx up by identifier, then hash: outcome, absent, or null (indexed but
- * not confirmable yet; never absence). Throws on transport/HTTP/GraphQL errors.
+ * Looks a transaction up by identifier, then by hash.
+ * Returns the result, "absent", or null when it is known but not final. Throws on network or query errors.
  */
 export function createHttpTxConfirmer(
     cfg: IndexerTxConfirmerConfig
@@ -95,8 +95,8 @@ export function createHttpTxConfirmer(
     const doFetch = cfg.fetchFn ?? fetch;
     const timeoutMs = cfg.timeoutMs ?? 8000;
 
-    // The stored `txHash` is the ledger transaction identifier (`offset.identifier`);
-    // `offset.hash` is only tried for rows that stored a hash.
+    // The stored `txHash` is usually the ledger transaction identifier.
+    // The lookup by hash covers rows that stored a hash instead.
     type Lookup = { present: false; asOfMs: number | null; keyInvalid: boolean } | { present: true; slice: IndexedTxSlice | null };
     const lookup = async (offset: Record<string, string>): Promise<Lookup> => {
         const res = await doFetch(cfg.indexerHttpUrl, {
@@ -108,7 +108,7 @@ export function createHttpTxConfirmer(
         if (!res.ok) throw new Error(`Indexer tx lookup HTTP ${res.status}`);
         const body: any = await res.json();
         if (body?.errors?.length) {
-            // A value invalid for this key: no evidence, let the other key try.
+            // The value has the wrong form for this lookup. That proves nothing, so try the other one.
             if (/invalid transaction (hash|identifier)|cannot convert/i.test(String(body.errors[0]?.message))) return { present: false, asOfMs: null, keyInvalid: true };
             throw new Error(`Indexer tx lookup GraphQL error: ${body.errors[0]?.message ?? 'unknown'}`);
         }
@@ -116,7 +116,7 @@ export function createHttpTxConfirmer(
         if (!tx || typeof tx !== 'object') return { present: false, asOfMs: tipMsOf(body), keyInvalid: false };
         const status = tx?.transactionResult?.status;
         if (typeof status !== 'string') return { present: true, slice: null };
-        // No height, no confirmation: evidence a reorg rollback cannot revert must not be recorded.
+        // Without a block height a reorg could not undo the result, so do not confirm it.
         const height = nonNegativeInteger(tx?.block?.height);
         if (height === null) return { present: true, slice: null };
         return {
@@ -137,8 +137,8 @@ export function createHttpTxConfirmer(
         if (byId.present) return outcomeOf(byId.slice);
         const byHash = await lookup({ hash: txHash });
         if (byHash.present) return outcomeOf(byHash.slice);
-        // The two answers may come from different replicas: the joint absence is
-        // as of the older tip, and a missing tip means no verdict. Rejected keys do not count.
+        // The two answers may come from different indexer servers, so use the older block time.
+        // A missing time means no conclusion. Lookups with a wrong value form are ignored.
         const tips = [byId, byHash].filter((l) => !l.keyInvalid).map((l) => l.asOfMs);
         const asOfMs = tips.length === 0 || tips.some((t) => t === null) ? null : Math.min(...(tips as number[]));
         return chainAbsent(asOfMs);
@@ -154,4 +154,3 @@ export function createHttpTxConfirmer(
     }
 }
 
-export const buildIndexerTxConfirmer = createHttpTxConfirmer;

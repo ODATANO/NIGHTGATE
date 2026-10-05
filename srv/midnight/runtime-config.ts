@@ -1,11 +1,7 @@
 /**
- * NIGHTGATE_* settings for code that runs inside the server AND ships in the
- * slim `@odatano/nightgate-tx` package (wasm-proof-provider, batch-call-scope).
- *
- * Inside the server the config table answers (defaults, validation,
- * worker_threads propagation). The package does not carry
- * `srv/utils/config`, so it must not be imported statically from those
- * files: there the environment decides.
+ * Reads NIGHTGATE_* settings for code that also ships in the `@odatano/nightgate-tx` package.
+ * Inside the server the settings come from the server config.
+ * The package has no server config, so it reads the environment directly.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -25,7 +21,7 @@ function serverConfig(): ConfigModule | null {
     return table;
 }
 
-/** The setting as the server resolves it, else the raw environment value (empty = unset). */
+/** The server's value for the setting, or the raw environment value outside the server. An empty value counts as unset. */
 export function runtimeConfigEnum<T extends string>(key: string): T | undefined {
     const t = serverConfig();
     if (t) return t.configEnum<T>(key);

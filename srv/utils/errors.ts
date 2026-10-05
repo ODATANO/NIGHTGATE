@@ -1,19 +1,18 @@
 /**
- * One error model: NightgateError carries a stable `code`, the HTTP `status`, `retryable`
- * and JSON-safe `info`; ERROR_CODES is the registry the docs table is generated from.
- * No cds import: the wallet worker loads this module.
+ * The error type used across NIGHTGATE. Every error has a fixed code, an HTTP status and a retryable flag.
+ * ERROR_CODES lists all codes. The error table in the docs is generated from it.
+ * This module does not import `@sap/cds`, because the wallet worker loads it too.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 export interface ErrorCodeSpec {
     status: number;
     retryable?: boolean;
-    /** One line for docs/reference.md. */
     doc: string;
 }
 
 export const ERROR_CODES = {
-    // Status classes: a reject without a specific code.
+    // Generic codes, used when a reject names only an HTTP status.
     INVALID_ARGUMENT: { status: 400, doc: 'A parameter is missing, malformed or out of range.' },
     UNAUTHENTICATED: { status: 401, doc: 'No or unknown principal, or a session the caller does not own.' },
     FORBIDDEN: { status: 403, doc: 'The principal may not perform this operation.' },
@@ -76,7 +75,7 @@ export const ERROR_CODES = {
 
 export type ErrorCode = keyof typeof ERROR_CODES;
 
-/** Code for a reject that names only a status. */
+/** The generic code for each HTTP status. */
 export const STATUS_CLASS_CODES: Readonly<Record<number, ErrorCode>> = {
     400: 'INVALID_ARGUMENT', 401: 'UNAUTHENTICATED', 403: 'FORBIDDEN', 404: 'NOT_FOUND', 409: 'CONFLICT',
     410: 'GONE', 412: 'PRECONDITION_FAILED', 413: 'PAYLOAD_TOO_LARGE', 429: 'RATE_LIMITED', 500: 'INTERNAL',
@@ -88,13 +87,13 @@ export function statusClassCode(status: number): ErrorCode {
 }
 
 export interface NightgateErrorOptions {
-    /** Overrides the registry status (one code, several sites). */
+    /** Overrides the default status of the code. */
     status?: number;
     retryable?: boolean;
-    /** JSON-safe, no secrets; travels across the worker boundary. */
+    /** Extra details. Must be JSON-safe and contain no secrets, because it is sent between threads. */
     info?: Record<string, unknown>;
     cause?: unknown;
-    /** Keep the message on a 5xx in production (CAP withholds it otherwise). */
+    /** Keep the message of a server error in production, where CAP would hide it. */
     exposeMessage?: boolean;
 }
 
@@ -108,7 +107,7 @@ export interface NightgateErrorPayload {
 }
 
 export class NightgateError extends Error {
-    /** Marker instead of instanceof: survives module duplication. */
+    /** Used instead of `instanceof`, which fails when the module is loaded twice. */
     readonly isNightgateError = true as const;
     readonly code: ErrorCode;
     status: number;
@@ -134,12 +133,17 @@ export class NightgateError extends Error {
     }
 }
 
+/** The message of a thrown value, or the value itself as text. */
+export function errorMessage(err: unknown): string {
+    return String((err as Error)?.message ?? err);
+}
+
 export function isNightgateError(err: unknown): err is NightgateError {
     return !!err && typeof err === 'object' && (err as { isNightgateError?: unknown }).isNightgateError === true
         && typeof (err as { code?: unknown }).code === 'string';
 }
 
-/** First NightgateError in the cause chain (bounded). */
+/** The first NightgateError in the chain of causes, if any. */
 export function findNightgateError(err: unknown, depth = 8): NightgateError | undefined {
     let cur: unknown = err;
     const seen = new Set<unknown>();
@@ -151,7 +155,7 @@ export function findNightgateError(err: unknown, depth = 8): NightgateError | un
     return undefined;
 }
 
-/** Rebuilds an error that crossed a thread boundary; keeps the original `name`. */
+/** Rebuilds an error that was sent from another thread. Keeps the original `name`. */
 export function nightgateErrorFromPayload(p: NightgateErrorPayload): NightgateError {
     const code = (p.code in ERROR_CODES ? p.code : statusClassCode(p.status)) as ErrorCode;
     const err = new NightgateError(code, p.message, { status: p.status, retryable: p.retryable, info: p.info });

@@ -1,7 +1,3 @@
-/**
- * Nightgate Service: OData V4 read API
- */
-
 import cds from '@sap/cds';
 
 import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/wallet-sessions';
@@ -16,14 +12,13 @@ import { fetchContractState } from './crawler/indexer-supplement';
 import { getNightgatePluginConfig, resolveNightgateRuntimeConfig } from './utils/nightgate-config';
 import { RateLimiter } from './utils/rate-limiter';
 
-// Shared by every caller: the public indexers block the whole host IP under load.
+// One limit for all callers: the public indexer blocks the host's IP when it gets too many requests.
 const stateAtIndexerLimiter = new RateLimiter({ windowMs: 1000, maxRequests: 2 });
 
 class IndexerBudgetExhausted extends Error {
     constructor(readonly retryAfterMs: number) { super('indexer request budget exhausted'); }
 }
 
-/** Reads a contract state from the supplement's indexer, then the submission side's if that one fails. */
 function fetchContractStateFromIndexers(): ContractStateFetcher {
     const { crawlerConfig, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
     const urls = [...new Set([String(crawlerConfig.indexerUrl || ''), submissionEndpoints.indexerHttpUrl].filter(Boolean))];
@@ -43,8 +38,9 @@ function fetchContractStateFromIndexers(): ContractStateFetcher {
 }
 
 import { Blocks, Transactions, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions, type WalletSession } from '#cds-models/midnight';
-import type { NightgateRequest } from './utils/request-types';
 import { normalizeHttpError } from './utils/http-errors';
+import { getJobStatus } from '#cds-models/NightgateService';
+import { Block, ContractAction, ContractState, NightBalance, Transaction, UnshieldedUtxo } from '#cds-models/NightgateService';
 
 
 export default class NightgateService extends cds.ApplicationService {
@@ -56,14 +52,12 @@ export default class NightgateService extends cds.ApplicationService {
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
-        // Agent-token enforcement MUST be the first before-hook
+        // The agent-token check must be the first before-hook.
         attachAgentGrantEnforcement(this, this.db);
 
-        // Write actions are refused with a retryable 503 while the runtime is down 
         attachRuntimeGate(this);
 
-        // Blocks
-        this.on('READ', 'Blocks', async (req: NightgateRequest) => {
+        this.on('READ', 'Blocks', async (req) => {
             return await this.db.run(req.query) || [];
         });
 
@@ -73,20 +67,16 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        this.on('byHeight', 'Blocks', async (req: NightgateRequest) => {
-            const { height } = req.data as { height: number };
+        this.on(Block.actions.byHeight, 'Blocks', async (req) => {
+            const { height } = req.data;
             if (height == null) return req.reject(400, 'height is required');
             return this.db.run(
                 cds.ql.SELECT.one.from(Blocks).where({ height })
             );
         });
 
-        this.on('range', 'Blocks', async (req: NightgateRequest) => {
-            const { startHeight, endHeight, limit } = req.data as {
-                startHeight?: number;
-                endHeight?: number;
-                limit?: number;
-            };
+        this.on(Block.actions.range, 'Blocks', async (req) => {
+            const { startHeight, endHeight, limit } = req.data;
 
             if (startHeight == null || endHeight == null) {
                 return req.reject(400, 'startHeight and endHeight are required');
@@ -101,7 +91,7 @@ export default class NightgateService extends cds.ApplicationService {
             }
 
             const effectiveLimit = Math.min(Math.max(limit || 100, 1), 5000);
-            // use a tagged-template predicate for the range window
+            // A tagged template, because '>=' and '<=' on one column in an object silently lose a condition.
             return this.db.run(
                 cds.ql.SELECT.from(Blocks)
                     .where`height >= ${startHeight} and height <= ${endHeight}`
@@ -110,19 +100,18 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        // Transactions
-        this.on('READ', 'Transactions', async (req: NightgateRequest) => {
+        this.on('READ', 'Transactions', async (req) => {
             return await this.db.run(req.query) || [];
         });
 
-        this.on('byHash', 'Transactions', async (req: NightgateRequest) => {
-            const { hash } = req.data as { hash: string };
+        this.on(Transaction.actions.byHash, 'Transactions', async (req) => {
+            const { hash } = req.data;
             if (!hash) return req.reject(400, 'hash is required');
             return this.db.run(cds.ql.SELECT.from(Transactions).where({ hash }));
         });
 
-        this.on('byType', 'Transactions', async (req: NightgateRequest) => {
-            const { txType, limit } = req.data as { txType?: string; limit?: number };
+        this.on(Transaction.actions.byType, 'Transactions', async (req) => {
+            const { txType, limit } = req.data;
             if (!txType) return req.reject(400, 'txType is required');
 
             const effectiveLimit = Math.min(Math.max(limit || 100, 1), 2000);
@@ -134,21 +123,20 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        // Contracts
-        this.on('READ', 'ContractActions', async (req: NightgateRequest) => {
+        this.on('READ', 'ContractActions', async (req) => {
             return await this.db.run(req.query) || [];
         });
 
-        this.on('byAddress', 'ContractActions', async (req: NightgateRequest) => {
-            const { address } = req.data as { address: string };
+        this.on(ContractAction.actions.byAddress, 'ContractActions', async (req) => {
+            const { address } = req.data;
             if (!address) return req.reject(400, 'address is required');
             return this.db.run(
                 cds.ql.SELECT.from(ContractActions).where({ address })
             );
         });
 
-        this.on('history', 'ContractActions', async (req: NightgateRequest) => {
-            const { address } = req.data as { address: string };
+        this.on(ContractAction.actions.history, 'ContractActions', async (req) => {
+            const { address } = req.data;
             if (!address) return req.reject(400, 'address is required');
             return this.db.run(
                 cds.ql.SELECT.from(ContractActions)
@@ -158,12 +146,12 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        this.on('READ', 'ContractStates', async (req: NightgateRequest) => {
+        this.on('READ', 'ContractStates', async (req) => {
             return await this.db.run(req.query) || [];
         });
 
-        this.on('stateAt', 'ContractStates', async (req: NightgateRequest) => {
-            const { address, height } = req.data as { address?: string; height?: number | null };
+        this.on(ContractState.actions.stateAt, 'ContractStates', async (req) => {
+            const { address, height } = req.data;
             if (!address || !/^(0x)?[0-9a-fA-F]+$/.test(address)) return req.reject(400, 'address (hex) is required');
             if (height != null && (!Number.isInteger(Number(height)) || Number(height) < 0)) {
                 return req.reject(400, 'height must be a non-negative integer');
@@ -184,13 +172,12 @@ export default class NightgateService extends cds.ApplicationService {
             }
         });
 
-        // UTXOs
-        this.on('READ', 'UnshieldedUtxos', async (req: NightgateRequest) => {
+        this.on('READ', 'UnshieldedUtxos', async (req) => {
             return await this.db.run(req.query) || [];
         });
 
-        this.on('byOwner', 'UnshieldedUtxos', async (req: NightgateRequest) => {
-            const { owner } = req.data as { owner: string };
+        this.on(UnshieldedUtxo.actions.byOwner, 'UnshieldedUtxos', async (req) => {
+            const { owner } = req.data;
             if (!owner) return req.reject(400, 'owner is required');
             return this.db.run(cds.ql.SELECT.from(UnshieldedUtxos).where({ owner }));
         });
@@ -201,18 +188,16 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        // Balance & Token Tracking
-
-        this.on('getBalance', 'NightBalances', async (req: NightgateRequest) => {
-            const { address } = req.data as { address: string };
+        this.on(NightBalance.actions.getBalance, 'NightBalances', async (req) => {
+            const { address } = req.data;
             if (!address) return req.reject(400, 'address is required');
             return this.db.run(
                 cds.ql.SELECT.one.from(NightBalances).where({ address })
             );
         });
 
-        this.on('getTopHolders', 'NightBalances', async (req: NightgateRequest) => {
-            const { limit } = req.data as { limit?: number };
+        this.on(NightBalance.actions.getTopHolders, 'NightBalances', async (req) => {
+            const { limit } = req.data;
             const effectiveLimit = Math.min(Math.max(limit || 10, 1), 1000);
             return this.db.run(
                 cds.ql.SELECT.from(NightBalances)
@@ -221,11 +206,9 @@ export default class NightgateService extends cds.ApplicationService {
             );
         });
 
-        // Wallet Sessions (delegated)
-
         registerWalletSessionHandlers(this, this.db);
 
-        this.before('READ', 'WalletSessions', async (req: NightgateRequest) => {
+        this.before('READ', 'WalletSessions', async (req) => {
             await awaitAgentPrincipal(req);
             const user = req.user;
             if (user?.is?.('admin')) return;
@@ -234,10 +217,9 @@ export default class NightgateService extends cds.ApplicationService {
             (req.query as any).where({ userId });
         });
 
-        // Agent grants (delegated); owner-scoped read like WalletSessions
         registerAgentGrantHandlers(this, this.db);
 
-        this.before('READ', 'AgentGrants', async (req: NightgateRequest) => {
+        this.before('READ', 'AgentGrants', async (req) => {
             await awaitAgentPrincipal(req);
             const user = req.user;
             if (user?.is?.('admin')) return;
@@ -246,9 +228,8 @@ export default class NightgateService extends cds.ApplicationService {
             (req.query as any).where({ userId });
         });
 
-        // Owner-scoped like WalletSessions
         for (const entity of ['Documents', 'GranteeIdentities'] as const) {
-            this.before('READ', entity, async (req: NightgateRequest) => {
+            this.before('READ', entity, async (req) => {
                 await awaitAgentPrincipal(req);
                 const user = req.user;
                 if (user?.is?.('admin')) return;
@@ -258,10 +239,7 @@ export default class NightgateService extends cds.ApplicationService {
             });
         }
 
-        // Submission actions: deployContract, submitContractCall
-
-        // Owner-scoped like WalletSessions
-        this.on('READ', 'PendingSubmissions', async (req: NightgateRequest) => {
+        this.on('READ', 'PendingSubmissions', async (req) => {
             const user = req.user;
             if (!user?.is?.('admin')) {
                 const userId = user?.id;
@@ -279,9 +257,8 @@ export default class NightgateService extends cds.ApplicationService {
         registerSubmissionHandlers(this, this.db);
         registerDocumentProofHandlers(this);
 
-        // Background Jobs
-        this.on('getJobStatus', async (req: NightgateRequest) => {
-            const { jobId, sessionId } = req.data as { jobId?: string; sessionId?: string };
+        this.on(getJobStatus, async (req) => {
+            const { jobId, sessionId } = req.data;
             if (!jobId) return req.reject(400, 'jobId is required');
             if (!sessionId) return req.reject(400, 'sessionId is required');
 
@@ -290,7 +267,7 @@ export default class NightgateService extends cds.ApplicationService {
                 return req.reject(404, 'Job not found');
             }
 
-            // FAIL-CLOSED ownership 
+            // 404 rather than 403, so callers cannot probe for other users' jobs.
             const user = req.user;
             if (!user?.is?.('admin')) {
                 const requesterId = user?.id;
@@ -332,7 +309,6 @@ export default class NightgateService extends cds.ApplicationService {
             };
         });
 
-        // Session cleanup timer
         this._cleanupTimer = startSessionCleanup(this.db);
         cds.on('shutdown', () => {
             if (this._cleanupTimer) {

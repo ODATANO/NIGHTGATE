@@ -14,7 +14,6 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../../srv/submission/background-jobs')>()),
     startJob: vi.fn(async () => ({ jobId: 'j', status: 'pending' })),
     runChildCommand: vi.fn(),
-    withLockContentionRetry: async (_label: string, fn: () => Promise<unknown>) => fn(),
     // (kind, version, [traits,] processor): the processor is the last argument.
     registerBackgroundJobProcessor: (kind: string, version: number, ...rest: unknown[]) => registeredProcessors.set(`${kind}\0${version}`, rest[rest.length - 1] as (command: unknown, row: any) => Promise<unknown>),
     registerBackgroundJobReconciliationFinalizer: () => undefined

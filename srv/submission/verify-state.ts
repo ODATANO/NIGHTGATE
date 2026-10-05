@@ -1,10 +1,11 @@
 /**
- * Crawler-free state verification from LIVE contract state. Neither handler
- * reads the principal: they are registered authenticated and anonymously.
+ * Verify functions that read the live contract state from the public indexer.
+ * They never look at the caller, because they are also served anonymously.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { Request } from '@sap/cds';
+import cds, { type ActionRequest } from '@sap/cds';
+import { verifyAttestationState, verifyPredicateState } from '#cds-models/NightgateService';
 import { resolveContract, ContractNotRegisteredError, getContractRegistration, slotWidthOf } from './contract-registry';
 import { CoercionError } from './arg-coercion';
 import { readAttestationStateForContract } from './attestation-state';
@@ -18,42 +19,40 @@ import {
     getNightgatePluginConfig
 } from '../utils/nightgate-config';
 
-export const SHA256_HEX_RE = /^[0-9a-fA-F]{64}$/;
 
 export const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
 
 /**
- * Slot count, path depth and mask bound of a vault artifact. JS bitwise ops
- * are exact for bits 0..31, so widths up to 32 fit a Number mask.
+ * Field count, Merkle path depth and largest field mask of a vault contract.
+ * JS bit operations work up to 32 bits, so a width of 32 still fits a number.
  */
-export function vaultDims(compiledRef: string | undefined): { width: number; depth: number; maxMask: number } {
+export function vaultDims(compiledRef: string | null | undefined): { width: number; depth: number; maxMask: number } {
     const width = slotWidthOf(getContractRegistration(compiledRef?.length ? compiledRef : DEFAULT_ATTESTATION_VAULT_REF));
     return { width, depth: Math.log2(width), maxMask: width === 32 ? 0xffffffff : (1 << width) - 1 };
 }
 
-// The circuits take Uint<64>; overflow would otherwise surface only as an
-// opaque proving-time failure.
+// The circuits take Uint<64>. Checking early avoids an unclear failure during proving.
 export const UINT64_MAX = (1n << 64n) - 1n;
 
 export type PredicateKind = 'numeric' | 'equality' | 'membership' | 'integrity' | 'diff';
 
 /**
- * The only predicate-literal parser, so an unknown literal cannot mint a wrong
- * claim key. `opCode` is set for numeric predicates only.
+ * The single parser for predicate names, so an unknown name never yields a wrong claim.
+ * `opCode` is set for numeric predicates only.
  */
-export function parsePredicate(literal: unknown): { kind: PredicateKind; opCode: number | null } | null {
-    if (literal === 'lessOrEqual') return { kind: 'numeric', opCode: 0 };
-    if (literal === 'greaterOrEqual') return { kind: 'numeric', opCode: 1 };
-    if (literal === 'bytesEquality') return { kind: 'equality', opCode: null };
-    if (literal === 'setMembership') return { kind: 'membership', opCode: null };
-    if (literal === 'documentIntegrity') return { kind: 'integrity', opCode: null };
-    if (literal === 'documentDiff') return { kind: 'diff', opCode: null };
+export function parsePredicate(literal: unknown): { predicate: string; kind: PredicateKind; opCode: number | null } | null {
+    if (literal === 'lessOrEqual') return { predicate: literal, kind: 'numeric', opCode: 0 };
+    if (literal === 'greaterOrEqual') return { predicate: literal, kind: 'numeric', opCode: 1 };
+    if (literal === 'bytesEquality') return { predicate: literal, kind: 'equality', opCode: null };
+    if (literal === 'setMembership') return { predicate: literal, kind: 'membership', opCode: null };
+    if (literal === 'documentIntegrity') return { predicate: literal, kind: 'integrity', opCode: null };
+    if (literal === 'documentDiff') return { predicate: literal, kind: 'diff', opCode: null };
     return null;
 }
 
 /**
- * CAP delivers Integer64 (the mask type, since bit 31 overflows Int32) as a
- * string; coerce to a number, null when not an integer.
+ * CAP returns Integer64 values as strings. The mask needs Integer64 because bit 31 does not fit Int32.
+ * Returns a number, or null when the value is not an integer.
  */
 export function coerceMask(raw: unknown): number | null {
     const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
@@ -61,8 +60,8 @@ export function coerceMask(raw: unknown): number | null {
 }
 
 /**
- * True when an indexer is configured for the (possibly overridden) network;
- * when false the verify surfaces return a clean negative instead of a 5xx.
+ * True when an indexer is configured for the requested network.
+ * When false, the verify functions answer "not verified" instead of an error.
  */
 export function liveProviderConfigured(networkOverride?: NightgateNetwork): boolean {
     const { network, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
@@ -73,7 +72,6 @@ export function liveProviderConfigured(networkOverride?: NightgateNetwork): bool
     return Boolean(submissionEndpoints.indexerHttpUrl && submissionEndpoints.indexerWsUrl);
 }
 
-/** Contract-only provider config (no wallet) for read-side reindexing. */
 export function contractProvidersConfigFromEnv(zkConfigPath: string): ContractProvidersConfig {
     const { submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
     return {
@@ -85,8 +83,8 @@ export function contractProvidersConfigFromEnv(zkConfigPath: string): ContractPr
 }
 
 /**
- * Contract-only provider config for a per-call `network` override: only the
- * indexer endpoints swap (artifacts are network-agnostic, the read path never proves).
+ * Provider config for a call that names another network.
+ * Only the indexer endpoints change. Reading never proves, and contracts are the same on every network.
  */
 export function contractProvidersConfigForNetwork(
     zkConfigPath: string,
@@ -100,10 +98,10 @@ export function contractProvidersConfigForNetwork(
     return { ...base, indexerHttpUrl: eps.indexerHttpUrl, indexerWsUrl: eps.indexerWsUrl };
 }
 
-/** The optional `network` param: an unknown value is a 400, never a silent fallback. */
+/** Parses the optional `network` parameter. An unknown value is rejected, never replaced by the default. */
 export function parseVerifyNetworkOverride(
-    raw: string | undefined,
-    req: Request
+    raw: string | null | undefined,
+    req: ActionRequest<unknown, unknown>
 ): { ok: boolean; network?: NightgateNetwork } {
     if (!raw) return { ok: true };
     if (!(VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(raw)) {
@@ -118,11 +116,10 @@ export interface VerifyStateDeps {
     attestationStateReader?: typeof readAttestationStateForContract;
     predicateStateReader?: typeof readPredicateStateForContract;
     /** Runs first; false means the gate already rejected the request. */
-    gate?: (req: Request) => Promise<boolean> | boolean;
+    gate?: (req: ActionRequest<unknown, unknown>) => Promise<boolean> | boolean;
 }
 
-/** The read path's error mapping: bad arg encoding 400, unknown contract 404. */
-async function runVerify(req: Request, op: () => Promise<unknown>): Promise<unknown> {
+async function runVerify<T>(req: ActionRequest<unknown, unknown>, op: () => Promise<T>): Promise<T> {
     try {
         return await op();
     } catch (err) {
@@ -133,44 +130,20 @@ async function runVerify(req: Request, op: () => Promise<unknown>): Promise<unkn
 }
 
 /** Register both state-verification functions on `srv`. */
-export function registerVerifyStateHandlers(srv: any, deps: VerifyStateDeps = {}): void {
+export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: VerifyStateDeps = {}): void {
     const contractResolver = deps.contractResolver ?? resolveContract;
     const attestationStateReader = deps.attestationStateReader ?? readAttestationStateForContract;
     const predicateStateReader = deps.predicateStateReader ?? readPredicateStateForContract;
     const gate = deps.gate;
 
-    srv.on('verifyAttestationState', async (req: Request) => {
+    srv.on(verifyAttestationState, async (req) => {
         if (gate && !(await gate(req))) return;
-        const data = req.data as {
-            contractAddress?: string;
-            attesterId?: string;
-            payloadHash?: string;
-            documentId?: string;
-            contentRoot?: string;
-            schemaId?: string;
-            compiledArtifactRef?: string;
-            network?: string;
-        };
+        const data = req.data;
 
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
-        // A payloadHash or attesterId next to a documentId must match the bound record.
+        // With a documentId, a given payloadHash or attesterId must match the document's attestation.
         if (!data.documentId && !(data.attesterId && data.payloadHash)) {
             return req.reject(400, 'attesterId and payloadHash (the record), or documentId (a bound document id), are required');
-        }
-        if (data.payloadHash && !SHA256_HEX_RE.test(data.payloadHash)) {
-            return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        }
-        if (data.attesterId && !SHA256_HEX_RE.test(data.attesterId)) {
-            return req.reject(400, 'attesterId must be 64 hex chars (32 bytes)');
-        }
-        if (data.documentId && !SHA256_HEX_RE.test(data.documentId)) {
-            return req.reject(400, 'documentId must be 64 hex chars (32 bytes)');
-        }
-        if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
-            return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
-        }
-        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
-            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
         }
         const netParsed = parseVerifyNetworkOverride(data.network, req);
         if (!netParsed.ok) return;
@@ -190,8 +163,8 @@ export function registerVerifyStateHandlers(srv: any, deps: VerifyStateDeps = {}
                 attesterId: data.attesterId ? data.attesterId.toLowerCase() : undefined,
                 payloadHash: data.payloadHash ? data.payloadHash.toLowerCase() : undefined,
                 documentId: data.documentId ? data.documentId.toLowerCase() : undefined,
-                contentRoot: data.contentRoot,
-                schemaId: data.schemaId,
+                contentRoot: data.contentRoot ?? undefined,
+                schemaId: data.schemaId ?? undefined,
                 artifactPath: resolved.artifactPath,
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
             });
@@ -215,46 +188,19 @@ export function registerVerifyStateHandlers(srv: any, deps: VerifyStateDeps = {}
         });
     });
 
-    srv.on('verifyPredicateState', async (req: Request) => {
+    srv.on(verifyPredicateState, async (req) => {
         if (gate && !(await gate(req))) return;
-        const data = req.data as {
-            contractAddress?: string;
-            attesterId?: string;
-            payloadHash?: string;
-            attesterIdB?: string;
-            fieldKey?: string;
-            predicate?: string;
-            threshold?: number | string;
-            expectedDigest?: string;
-            setRoot?: string;
-            payloadHashB?: string;
-            allowedMask?: number | string;
-            k?: number;
-            compiledArtifactRef?: string;
-            network?: string;
-        };
+        const data = req.data;
 
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
         if (!data.attesterId) return req.reject(400, 'attesterId is required (the attester whose record carries the claim)');
-        if (!SHA256_HEX_RE.test(data.attesterId)) {
-            return req.reject(400, 'attesterId must be 64 hex chars (32 bytes)');
-        }
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
-        if (!SHA256_HEX_RE.test(data.payloadHash)) {
-            return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        }
-        if (data.attesterIdB && !SHA256_HEX_RE.test(data.attesterIdB)) {
-            return req.reject(400, 'attesterIdB must be 64 hex chars (32 bytes)');
-        }
-        if (data.fieldKey && !SHA256_HEX_RE.test(data.fieldKey)) {
-            return req.reject(400, 'fieldKey must be 64 hex chars (32 bytes)');
-        }
 
         const parsed = parsePredicate(data.predicate);
         if (!parsed) return req.reject(400, "predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'");
 
-        // A wrong coordinate would silently yield verified: false (the claim
-        // key is recomputed from it), so validate shapes per kind here.
+        // The claim is looked up from these inputs, so a bad input would just answer false.
+        // Validate them per predicate kind to give a clear error instead.
         let thresholdBig: bigint | undefined;
         let op: number | undefined;
         let expectedDigest: string | undefined;
@@ -264,8 +210,8 @@ export function registerVerifyStateHandlers(srv: any, deps: VerifyStateDeps = {}
         let k: number | undefined;
         if (parsed.kind === 'integrity' || parsed.kind === 'diff') {
             const { width: verifyWidth, maxMask: verifyMaxMask } = vaultDims(data.compiledArtifactRef);
-            if (!data.payloadHashB || !SHA256_HEX_RE.test(data.payloadHashB)) {
-                return req.reject(400, `payloadHashB (64 hex chars) is required for predicate '${data.predicate}'`);
+            if (!data.payloadHashB) {
+                return req.reject(400, `payloadHashB is required for predicate '${data.predicate}'`);
             }
             payloadHashB = data.payloadHashB.toLowerCase();
             if (parsed.kind === 'integrity') {
@@ -291,14 +237,14 @@ export function registerVerifyStateHandlers(srv: any, deps: VerifyStateDeps = {}
             op = parsed.opCode!;
         } else if (parsed.kind === 'equality') {
             if (!data.fieldKey) return req.reject(400, "fieldKey is required for predicate 'bytesEquality'");
-            if (!data.expectedDigest || !SHA256_HEX_RE.test(data.expectedDigest)) {
-                return req.reject(400, "expectedDigest (64 hex chars) is required for predicate 'bytesEquality'");
+            if (!data.expectedDigest) {
+                return req.reject(400, "expectedDigest is required for predicate 'bytesEquality'");
             }
             expectedDigest = data.expectedDigest.toLowerCase();
         } else {
             if (!data.fieldKey) return req.reject(400, "fieldKey is required for predicate 'setMembership'");
-            if (!data.setRoot || !SHA256_HEX_RE.test(data.setRoot)) {
-                return req.reject(400, "setRoot (64 hex chars) is required for predicate 'setMembership'");
+            if (!data.setRoot) {
+                return req.reject(400, "setRoot is required for predicate 'setMembership'");
             }
             setRoot = data.setRoot.toLowerCase();
         }
@@ -334,7 +280,6 @@ export function registerVerifyStateHandlers(srv: any, deps: VerifyStateDeps = {}
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
             });
 
-            // null (no on-chain state) and false both read as not proven.
             return { verified: proven === true, proven: proven === true };
         });
     });

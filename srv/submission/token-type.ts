@@ -1,9 +1,10 @@
 /**
- * Raw token type = rawTokenType(domainSeparator, minting contract address);
- * `sendNight` needs it to spend a minted token.
+ * A minted token's type is rawTokenType(domainSeparator, address of the minting contract).
+ * `sendNight` needs it to send a minted token.
  * SPDX-License-Identifier: Apache-2.0
  */
-import { NightgateError } from '../utils/errors';
+import { NightgateError, errorMessage } from '../utils/errors';
+import { HEX64_ANY_CASE_RE, HEX64_RE } from '../utils/hex-patterns';
 
 /** Bundled `contracts/shielded-token` test token. */
 export const SHIELDED_TEST_TOKEN_DOMAIN_SEP = 'nightgate:zswap-e2e';
@@ -20,15 +21,15 @@ export class TokenTypeError extends NightgateError {
 }
 
 /**
- * The 32 bytes of `pad(32, input)` (UTF-8, zero right-padded), or 64 hex
- * verbatim. Exactly 64 hex chars read as hex: such a string cannot fit pad(32).
+ * 64 hex characters are read as hex. Anything else is UTF-8, padded with zeros to 32 bytes.
+ * A 64-character string would not fit into 32 bytes as text anyway.
  */
-export function padDomainSeparator(input?: string): Uint8Array {
+export function padDomainSeparator(input?: string | null): Uint8Array {
     const value = input ?? SHIELDED_TEST_TOKEN_DOMAIN_SEP;
     if (typeof value !== 'string' || value.length === 0) {
         throw new TokenTypeError('domainSeparator must be a non-empty string');
     }
-    if (/^[0-9a-fA-F]{64}$/.test(value)) {
+    if (HEX64_ANY_CASE_RE.test(value)) {
         const bytes = new Uint8Array(32);
         for (let i = 0; i < 32; i++) bytes[i] = parseInt(value.slice(i * 2, i * 2 + 2), 16);
         return bytes;
@@ -46,8 +47,7 @@ export function domainSeparatorHex(bytes: Uint8Array): string {
     return Buffer.from(bytes).toString('hex');
 }
 
-/** Lowercase hex; the runtime validates `contractAddress` itself. */
-export async function deriveRawTokenType(contractAddress: string, domainSeparator?: string): Promise<{
+export async function deriveRawTokenType(contractAddress: string, domainSeparator?: string | null): Promise<{
     tokenTypeHex: string;
     contractAddress: string;
     domainSeparator: string;
@@ -62,12 +62,12 @@ export async function deriveRawTokenType(contractAddress: string, domainSeparato
     try {
         raw = rt.rawTokenType(sep, contractAddress);
     } catch (e) {
-        throw new TokenTypeError(`rawTokenType failed for '${contractAddress}': ${(e as Error)?.message ?? e}`);
+        throw new TokenTypeError(`rawTokenType failed for '${contractAddress}': ${errorMessage(e)}`);
     }
     const tokenTypeHex = typeof raw === 'string'
         ? raw.toLowerCase()
         : Buffer.from(raw as Uint8Array).toString('hex');
-    if (!/^[0-9a-f]{64}$/.test(tokenTypeHex)) {
+    if (!HEX64_RE.test(tokenTypeHex)) {
         throw new TokenTypeError(`rawTokenType returned an unexpected shape: ${String(raw).slice(0, 80)}`);
     }
     return { tokenTypeHex, contractAddress, domainSeparator: domainSeparatorHex(sep) };

@@ -13,6 +13,7 @@ import { privateStateStableSalt } from '../../srv/midnight/CapDbPrivateStateProv
 import { deriveAccountId, deriveStoragePassword } from '../../srv/submission/wallet-material-factory';
 import { resolveAccountDek, privateStatePasswordFromDek, clearAllAccountDeks, DEK_SCHEME } from '../../srv/submission/account-keys';
 import { exportContractSigningKeyForSession, SigningKeyExportError } from '../../srv/submission/signing-key-export';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 cds.test(__dirname + '/../..');
 
@@ -56,7 +57,7 @@ describe('contract signing key export', () => {
         expect(out.format).toBe('midnight-signing-key-export');
         expect(out.contractAddress).toBe(CONTRACT);
         expect(out.accountId).toBe(accountId);
-        expect(out.salt).toMatch(/^[0-9a-f]{64}$/);
+        expect(out.salt).toMatch(HEX64_RE);
         const payload = JSON.parse(decryptWithPassword(out.encryptedPayload, PASSWORD));
         expect(payload).toEqual({ version: 1, keyCount: 1, keys: { [CONTRACT]: SIGNING_KEY } });
         expect(() => decryptWithPassword(out.encryptedPayload, 'not-the-export-password')).toThrow();

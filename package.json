@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.30.3",
+  "version": "0.30.4",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -137,7 +137,7 @@
     "sync:probe": "node scripts/probe-indexer.mjs",
     "cds:watch": "cds watch",
     "cds:serve": "cds-serve",
-    "cds:types": "cds-typer \"*\" --outputDirectory @cds-models --outputDTsFiles false",
+    "cds:types": "cds-typer \"*\" --outputDirectory @cds-models",
     "build:types": "npm run cds:types",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "deploy": "cds deploy --to sqlite:db/midnight.db",
@@ -171,7 +171,7 @@
     "wasm-contract:e2e": "node --env-file=.env scripts/run-wasm-contract-e2e.mjs",
     "wasm-zswap:e2e": "node --env-file=.env scripts/run-wasm-zswap-e2e.mjs",
     "test:pg-idempotency": "node scripts/test-postgres-idempotency.mjs",
-    "lint": "eslint .",
+    "lint": "eslint . && node scripts/check-any-baseline.mjs && node scripts/check-conventions.mjs",
     "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:schema-delta && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports",
     "check:release:full": "npm run check:release && npm run integration:postgres",
     "prepack": "npm run build:plugin",
@@ -318,7 +318,9 @@
       "version": "v4"
     },
     "typer": {
-      "outputDirectory": "@cds-models"
+      "outputDirectory": "@cds-models",
+      "propertiesOptional": false,
+      "IEEE754Compatible": true
     }
   },
   "directories": {

@@ -56,6 +56,10 @@ function fakeDb(existingRow: any): any {
 }
 
 describe('ensureSyncStateSingleton network guard', () => {
+    // A local .env must not change the configured network.
+    beforeEach(() => { vi.stubEnv('NIGHTGATE_NETWORK', ''); });
+    afterEach(() => { vi.unstubAllEnvs(); });
+
     it('throws fail-closed when the stored networkId differs from the configured network', async () => {
         const db = fakeDb({ ID: 'SINGLETON', networkId: 'preview', nodeUrl: 'ws://x' });
         await expect(ensureSyncStateSingleton(db)).rejects.toThrow(SyncStateNetworkMismatchError);

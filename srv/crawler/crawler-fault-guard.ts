@@ -1,20 +1,14 @@
 /**
- * Keeps a crawler transport fault from taking the server down with it.
+ * Keeps a lost or slow node connection in the crawler from shutting down the whole server.
  *
- * CAP registers `process.on('unhandledRejection', shutdown)` and the same for
- * `uncaughtException`, so ANY unhandled rejection ends the process. The crawler
- * talks to a node that is sometimes slow or incomplete, and it already answers
- * that with retries, a re-queue, a poison latch and `syncStatus: 'error'`. A
- * timeout there is an operating condition, not a reason to drop the submission
- * side: every restart costs each sponsor facade its warm-up.
+ * By default CAP ends the process on any unhandled rejection or uncaught exception.
+ * The crawler already handles node timeouts with its own retries.
+ * A restart would also cost every sponsor wallet its long warm-up.
  *
- * Node calls every listener, so a second listener cannot outvote CAP's, and
- * CAP registers its own only once the server starts listening, which is after
- * the hook this is installed from. Capturing them is therefore not possible.
- * The policy is taken over instead: CAP's blanket switch is turned off before
- * it is read, and this handler decides. A node transport fault is logged and
- * counted; everything else goes to `cds.shutdown`, the same function CAP would
- * have registered.
+ * CAP's own handler cannot be overruled by adding a second one, because Node calls all listeners.
+ * So this module turns off CAP's shutdown switch before CAP reads it and installs its own handler.
+ * Node connection faults from the crawler are logged and counted.
+ * Every other fault still goes to `cds.shutdown`, as CAP would have done.
  */
 
 import cds from '@sap/cds';
@@ -25,11 +19,8 @@ type FaultEvent = 'unhandledRejection' | 'uncaughtException';
 const EVENTS: FaultEvent[] = ['unhandledRejection', 'uncaughtException'];
 
 /**
- * A fault this guard absorbs. BOTH signals are required: the message has to
- * read like the node transport AND the stack has to come from the crawler or
- * its provider. Either alone is too wide: a TypeError thrown inside the
- * crawler is a defect, not a transport fault, and an ECONNRESET can just as
- * well come from the submission side, which must keep shutting down.
+ * A fault is ignored only if the message looks like a connection error AND the stack comes from the crawler or node provider.
+ * A TypeError inside the crawler is a bug, and an ECONNRESET from the submission code must still shut down.
  */
 const TRANSPORT_MESSAGE = /RPC timeout|Not connected to Midnight Node|Connection closed|WebSocket closed|socket hang up|ECONNRESET|ECONNREFUSED|ETIMEDOUT/i;
 const CRAWLER_FRAME = /[/\\]srv[/\\](crawler|providers)[/\\]/;
@@ -40,13 +31,9 @@ let previousShutdownFlag: unknown;
 let absorbed = 0;
 
 /**
- * Ends the process the way CAP would have, and lets anything that was already
- * listening see the fault first.
- *
- * A captured listener is not assumed to end anything: error reporters register
- * here too, and CAP's own handler is off. So the reporters run, and then
- * `cds.shutdown` is called anyway, unless one of them WAS `cds.shutdown` (a
- * late install, where CAP had already registered) and has ended it already.
+ * Ends the process the way CAP would have.
+ * The listeners that were registered before run first, for example error reporters.
+ * Then `cds.shutdown` is called, unless one of those listeners already was `cds.shutdown`.
  */
 function shutDown(event: FaultEvent, reason: unknown, rest: unknown[]): void {
     const captured = delegates[event] ?? [];
@@ -55,8 +42,8 @@ function shutDown(event: FaultEvent, reason: unknown, rest: unknown[]): void {
 
     for (const listener of captured) {
         if (typeof shutdown === 'function' && listener === shutdown) alreadyShutDown = true;
-        // A reporter that throws must not cost the shutdown.
-        try { listener(reason, ...rest); } catch { /* reported best-effort */ }
+        // A listener that throws must not prevent the shutdown.
+        try { listener(reason, ...rest); } catch { /* ignored, the shutdown follows */ }
     }
     if (alreadyShutDown) return;
 
@@ -68,7 +55,7 @@ function shutDown(event: FaultEvent, reason: unknown, rest: unknown[]): void {
     process.exit(1);
 }
 
-/** Faults absorbed since start; surfaced by getMetrics so this stays visible. */
+/** Number of ignored crawler faults since start. Reported by getMetrics. */
 export function absorbedCrawlerFaults(): number {
     return absorbed;
 }
@@ -79,14 +66,14 @@ export function isCrawlerTransportFault(reason: unknown): boolean {
 }
 
 /**
- * Takes over the process-level fault listeners. Call it once the server is up,
- * so CAP's own listeners are registered and can be captured as the delegates.
+ * Replaces the process-level fault listeners with this guard.
+ * Listeners that already exist are kept and called for faults the guard does not ignore.
  */
 export function installCrawlerFaultGuard(): void {
     if (installed) return;
     installed = true;
 
-    // Read by cds serve when the server starts listening, after this runs.
+    // cds serve reads this flag when the server starts listening, which happens after this call.
     const server: any = (cds.env as any).server ?? ((cds.env as any).server = {});
     previousShutdownFlag = server.shutdown_on_uncaught_errors;
     server.shutdown_on_uncaught_errors = false;
@@ -112,7 +99,7 @@ export function installCrawlerFaultGuard(): void {
     log.info('crawler fault guard installed: a node transport fault no longer shuts the server down');
 }
 
-/** Test seam: restores the listeners that were in place before. */
+/** For tests: restores the listeners that were in place before. */
 export function uninstallCrawlerFaultGuard(): void {
     if (!installed) return;
     for (const event of EVENTS) {

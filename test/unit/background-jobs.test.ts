@@ -8,6 +8,7 @@
  */
 
 import { AsyncLocalStorage } from 'async_hooks';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 // ---- In-memory store -------------------------------------------------------
 
@@ -284,11 +285,11 @@ import {
     SponsorAttemptBookkeepingPendingError,
     registerChainOutcomeConfirmer,
     __resetForTests,
-    __setStatusWriteBackoffForTests,
     __workflowParentKindsForTests,
     declareJobKind
 } from '../../srv/submission/background-jobs';
 import { JOB_KIND_TRAITS, LIGHT_KIND } from '../../srv/submission/job-kinds';
+import { __setLockContentionBackoffForTests } from '../../srv/submission/db-write-retry';
 import { encrypt as encryptAtRest, getEncryptionKey } from '../../srv/utils/crypto';
 import { jobCommandBinding } from '../../srv/utils/envelope-bindings';
 import { reportExternalExecution, reportExternalSubmission } from '../../srv/submission/job-execution-context';
@@ -488,7 +489,7 @@ describe('startJob: insert row + return jobId', () => {
         expect(row.kind).toBe('sendNight');
         expect(row.sessionId).toBe('sess-1');
         expect(row.request).toBe(JSON.stringify({ receiverAddress: 'addr', amount: '100' }));
-        expect(row.payloadFingerprint).toMatch(/^[0-9a-f]{64}$/);
+        expect(row.payloadFingerprint).toMatch(HEX64_RE);
         // Work has NOT started yet; spawn dispatches via setImmediate.
         expect(work).not.toHaveBeenCalled();
     });
@@ -1883,7 +1884,7 @@ describe('recoverInterruptedJobs', () => {
     });
 
     test('survives transient lock contention on the recovery UPDATE', async () => {
-        __setStatusWriteBackoffForTests([0, 0, 0, 0, 0]);
+        __setLockContentionBackoffForTests([0, 0, 0, 0, 0]);
         const now = new Date().toISOString();
         rows.set('p1', { ID: 'p1', kind: 'sendNight', sessionId: 's', status: 'pending', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: null, finishedAt: null, createdAt: now, modifiedAt: now });
 
@@ -1907,7 +1908,7 @@ describe('recoverInterruptedJobs', () => {
 describe('status-write contention hardening', () => {
     beforeEach(() => {
         // Backoff without waiting; the schedule only skips zero entries.
-        __setStatusWriteBackoffForTests([0, 0, 0, 0, 0]);
+        __setLockContentionBackoffForTests([0, 0, 0, 0, 0]);
     });
 
     test('the ADMISSION insert survives transient lock contention (job still starts)', async () => {
@@ -2004,7 +2005,7 @@ describe('status-write contention hardening', () => {
 
     test('markSucceeded exhausted: job ends failed:RESULT_PERSIST_FAILED instead of stranded running', async () => {
         // Lost races enough to exhaust the succeeded write (the budget is
-        // STATUS_WRITE_ATTEMPTS); the fallback markFailed write (status
+        // LOCK_CONTENTION_ATTEMPTS); the fallback markFailed write (status
         // 'failed') must go through.
         lockInjector.failUpdates = 5;
         lockInjector.matchStatus = 'succeeded';

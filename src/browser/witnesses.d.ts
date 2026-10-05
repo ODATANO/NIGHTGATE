@@ -1,4 +1,3 @@
-/** Browser witness + attester-secret helpers; see @odatano/contract-kit. */
 export {
     deriveAttestationSecret,
     generateAttestationSecret,

@@ -15,6 +15,7 @@ import {
     InvalidExportFormatError,
     ImportConflictError
 } from '../../srv/midnight/CapDbPrivateStateProvider';
+import { HEX64_ANY_CASE_RE } from '../../srv/utils/hex-patterns';
 
 // ---- In-memory fake CAP DB --------------------------------------------------
 
@@ -292,7 +293,7 @@ describe('CapDbPrivateStateProvider: export / import', () => {
         const exported = await provider.exportPrivateStates();
         expect(exported.format).toBe('midnight-private-state-export');
         expect(exported.encryptedPayload).toMatch(/^[A-Za-z0-9+/=]+$/);
-        expect(exported.salt).toMatch(/^[0-9a-fA-F]{64}$/);
+        expect(exported.salt).toMatch(HEX64_ANY_CASE_RE);
     });
 
     test('export → import round-trip into a fresh provider (different account)', async () => {

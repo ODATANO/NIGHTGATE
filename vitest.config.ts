@@ -14,7 +14,7 @@ export default defineConfig({
             // cds-typer models; mirrors the tsconfig `#cds-models/*` path.
             {
                 find: /^#cds-models\/(.*)$/,
-                replacement: path.resolve(__dirname, '@cds-models') + '/$1/index.ts'
+                replacement: path.resolve(__dirname, '@cds-models') + '/$1/index.js'
             }
         ]
     },

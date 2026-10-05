@@ -1,25 +1,22 @@
 /**
- * Shared by the transport auth (`agent-token-auth.ts`) and the grant hook
- * (`sessions/agent-grants.ts`), so neither side can drift.
+ * Constants shared by the transport authentication and the agent grant check, so both use the same values.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/** Request header carrying an `ngat_` agent grant token. */
 export const AGENT_TOKEN_HEADER = 'x-agent-token';
 
 /**
- * Marker principal of a token request between transport auth and the grant
- * hook. Owns nothing; a handler reached under this id is NOT authenticated.
+ * Placeholder user for a request with an agent token, until the grant check has verified the token.
+ * It owns nothing. A handler that sees this id is not authenticated.
  */
 export const AGENT_TOKEN_TRANSPORT_USER = 'agent-token-transport';
 
-/** Marker principal of an anonymous public-verify request; owns nothing, refused elsewhere. */
+/** Placeholder user for an anonymous request to the public verify service. It owns nothing and is refused elsewhere. */
 export const PUBLIC_VERIFY_TRANSPORT_USER = 'public-verify-transport';
 
-/** Service path of the public verify lane. */
 export const PUBLIC_VERIFY_LANE_PREFIX = '/api/v1/verify';
 
-/** Principal ids that identify no one; a rate limit keys them by client address. */
+/** User ids that identify no real user. Rate limits count these by client address instead. */
 export const MARKER_PRINCIPALS: ReadonlySet<string> = new Set([
     AGENT_TOKEN_TRANSPORT_USER,
     PUBLIC_VERIFY_TRANSPORT_USER,

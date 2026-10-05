@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.30.4 - 2026-10-05
+
+### Changes
+
+- 32-byte hex parameters are typed `Hex64`: CAP rejects a malformed value with
+  `400 ASSERT_FORMAT` ("must be 64 hex characters") before the handler runs.
+  Also `anchorDocument.sha256` and `verifyDocument.providedSha256`.
+- Results carry every declared field, `null` where it does not apply (was left out):
+  `prepareMembershipSet` without a member, `claimDisclosure`, `getSponsorPolicy`
+  (unset lists are `[]`).
+- `estimateSendNightFee` rejects a missing `amount` like `sendNight`.
+
+### Schema
+
+- `Transactions.proofHash` removed. PostgreSQL needs a step before and after the
+  first boot, see `docs/operations.md` (Schema upgrades).
+- `NOT NULL` with their defaults: `BackgroundJobs.status`, `attempt`, `maxAttempts`,
+  `PendingSubmissions.status`. `nightgate-schema-delta` fills NULL rows with the default.
+- Enums on unchanged columns: `SwapOffers.status`, `BackgroundJobs.chainStatus`
+  (incl. `dropped`), `BackgroundJobs.commandEncoding`.
+
+### Development
+
+- cds-typer in its default output with `propertiesOptional: false` and
+  `IEEE754Compatible: true`; handlers register with the generated action constants.
+- `npm run lint`: `no-explicit-any` is an error outside a shrinking per-file
+  baseline; `scripts/check-conventions.mjs` guards typed models and comments.
+- `@odatano/nightgate-tx` 0.10.3: doc comments, ships `srv/utils/errors.js`.
+
 ## 0.30.3 - 2026-10-03
 
 ### Fixes

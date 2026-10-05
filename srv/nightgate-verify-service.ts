@@ -1,6 +1,6 @@
 /**
- * The public verify lane (`/api/v1/verify`): the Nightgate service's
- * state-verification handlers behind a feature flag and a per-address rate limit.
+ * Public verification endpoint at `/api/v1/verify`.
+ * It serves the same verify handlers as the main service, behind a feature flag and a rate limit.
  */
 
 import cds from '@sap/cds';
@@ -8,8 +8,8 @@ import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { registerVerifyStateHandlers } from './submission/verify-state';
 import { RateLimiter, principalRateKey } from './utils/rate-limiter';
 import { configFlag, configNumber } from './utils/config';
-import type { NightgateRequest } from './utils/request-types';
 import { normalizeHttpError } from './utils/http-errors';
+import type { Request } from '@sap/cds';
 
 let limiter: RateLimiter | undefined;
 function publicVerifyLimiter(): RateLimiter {
@@ -25,10 +25,10 @@ export function __resetPublicVerifyLimiterForTests(): void {
 }
 
 /**
- * 404 while the lane is off (a host without the image's transport middleware
- * still serves the path), 429 over the per-address budget.
+ * Rejects with 404 while the feature is off and with 429 when the caller is over its rate limit.
+ * The 404 matters for hosts that serve this path without the image's auth middleware.
  */
-export async function publicVerifyGate(req: NightgateRequest): Promise<boolean> {
+export async function publicVerifyGate(req: Request): Promise<boolean> {
     if (!configFlag('NIGHTGATE_PUBLIC_VERIFY')) {
         req.reject({ status: 404, code: 'PUBLIC_VERIFY_DISABLED', message: 'public verification is not enabled on this server' } as any);
         return false;

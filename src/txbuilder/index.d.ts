@@ -1,49 +1,44 @@
-// Types for `@odatano/nightgate/txbuilder`: build a sponsorable transaction
-// locally, with your own key, without running a NIGHTGATE server.
+// Types for `@odatano/nightgate/txbuilder`. It builds a transaction on your machine,
+// with your own key, for a NIGHTGATE server to pay the fee and submit.
 
-/** A call prepared by the browser export's `prepare*` helpers. */
+/** A call prepared by one of the `prepare*` helpers. */
 export interface PreparedCall {
     circuitId: string;
     args: Array<Uint8Array | bigint | boolean[]>;
-    /** The contract's witness functions. Optional on a batch entry when the batch carries shared `witnesses`. */
+    /** The functions that supply the call's private inputs. Optional in a batch that passes shared `witnesses`. */
     witnesses?: object;
-    /** Runs immediately before this call is proven (single call and batch entry alike), to swap per-call state in the shared witnesses. */
+    /** Runs right before this call is proven. Use it to set per-call data in shared witnesses. */
     before?: () => void;
-    /**
-     * Raw proof bundle passthrough (proof helpers only): the batch path
-     * rebinds it through a shared witness holder. Absent on the
-     * attester-gated helpers (attest, anchor, ...), which need no bundle.
-     */
+    /** The document's Merkle proof data. Only set by the proof helpers. */
     merkleProof?: object;
-    /** Content-tree width the call was prepared for (16 default, 32 for attestation-vault-32). */
+    /** Number of document fields the call was prepared for. 16 by default, 32 for attestation-vault-32. */
     slotWidth?: number;
 }
 
 export interface ZkAssetResult {
     cacheDir: string;
-    /** Files downloaded on this run; 0 with `zkConfigDir`. */
+    /** Files downloaded on this run. */
     fetched: number;
-    /** Files already present in the cache. With `zkConfigDir`: the verified files, i.e. every circuit's verifier key plus prover key and bzkir of the circuits to prove. */
+    /** Files that were already there. */
     cached: number;
-    /** `'remote'`: a public `/zk-config`; `'local'`: `zkConfigDir`; `'package'`: an installed lineage package. */
+    /** Where the files came from: a server, a local directory or a contract package. */
     source?: 'remote' | 'local' | 'package';
 }
 
 export interface EnsureZkAssetsInput {
-    /** A public `/zk-config/<contract>` base URL. Required unless `package` is given. */
+    /** A server's `/zk-config/<contract>` URL. Required unless `package` is given. */
     zkConfigBaseUrl?: string;
     cacheDir?: string;
     /**
-     * An installed lineage package (`@odatano/contract-<name>`): its verifier keys and zkir ship
-     * with it; missing prover keys are fetched from its release assets into its keys directory,
-     * each verified against `keys/manifest.json`.
+     * An installed contract package (`@odatano/contract-<name>`).
+     * Its missing prover keys are downloaded into the package and checked against its `keys/manifest.json`.
      */
     package?: string;
-    /** Directory the package resolves from; default `process.cwd()`. */
+    /** Directory to resolve the package from. Defaults to `process.cwd()`. */
     from?: string;
-    /** Restricts only the HEAVY prover keys + zkir; verifier keys are always fetched for verifierCircuits. */
+    /** Circuits to fetch the large prover keys for. */
     circuits?: string[];
-    /** Full circuit list of the contract (verifier keys are needed for ALL of them). */
+    /** All circuits of the contract. Verifier keys are needed for every one of them. */
     verifierCircuits?: string[];
     fetchFn?: typeof fetch;
     onProgress?: (e: Record<string, unknown>) => void;
@@ -56,76 +51,66 @@ export interface CreateTxBuilderInput {
     accountIndex?: number;
     indexerHttpUrl: string;
     indexerWsUrl: string;
-    /** Substrate RPC the wallet SDK talks to (its `relayURL`). */
+    /** Node RPC URL. */
     nodeUrl: string;
-    /** Unused unless `provingMode: 'server'` (only the SDK's config type asks for it otherwise). */
+    /** Only used with `provingMode: 'server'`. */
     proofServerUrl?: string;
     /**
-     * 'wasm' (default): prove the contract circuit in-process; nothing leaves
-     * the process. 'server': prove on `proofServerUrl`, which then RECEIVES THE
-     * WITNESSES (native, multi-threaded, several times faster on the big
-     * circuits): only ever a proof server you run yourself, never the
-     * sponsor's. Explicit opt-in on purpose.
+     * 'wasm' (default) proves in this process.
+     * 'server' proves on `proofServerUrl`, which is faster for large circuits.
+     * The proof server sees your private inputs, so only use one you run yourself.
      */
     provingMode?: 'wasm' | 'server';
     /**
-     * Server proving only: HTTP timeout of one proof request, ms (default the
-     * SDK's 300000). The SDK re-requests a timed-out proof up to three times,
-     * so set it above your slowest circuit. Positive integer.
+     * Server proving only. Timeout of one proof request in ms, default 300000.
+     * The SDK retries a timed-out proof, so set it above your slowest circuit.
      */
     proofTimeoutMs?: number;
-    /** A public `/zk-config/<contract>`; assets are fetched once and cached. Optional when `zkConfigDir` is given. */
+    /** A server's `/zk-config/<contract>` URL. Files are downloaded once and cached. */
     zkConfigBaseUrl?: string;
     /**
-     * Local directory holding `keys/` and `zkir/` (a contract the sponsor does not serve).
-     * Nothing is fetched; the verifier keys must cover every circuit of `contractClass`.
+     * A local directory with `keys/` and `zkir/`. Nothing is downloaded.
+     * It needs verifier keys for every circuit of the contract.
      */
     zkConfigDir?: string;
     /**
-     * An installed lineage package (`@odatano/contract-<name>`): supplies `contractClass`,
-     * `contractName`, `privateStateId` and, without `zkConfigBaseUrl` or `zkConfigDir`, the keys
-     * directory inside the package (missing prover keys are fetched from its release assets
-     * into it). An explicit option still wins: with `zkConfigBaseUrl` the keys come from that
-     * server into `cacheDir`.
+     * An installed contract package (`@odatano/contract-<name>`).
+     * It supplies the contract class, names and proving files. Explicit options win over it.
      */
     package?: string;
-    /** Directory the package resolves from; default `process.cwd()`. */
+    /** Directory to resolve the package from. Defaults to `process.cwd()`. */
     from?: string;
-    /** The fetch used for prover keys (tests, proxies); default global `fetch`. */
+    /** Defaults to the global `fetch`. */
     fetchFn?: typeof fetch;
-    /** The compiled contract class, e.g. from `@odatano/nightgate/browser/attestation-vault`. Not needed with `package`. */
+    /** The compiled contract class. Not needed with `package`. */
     contractClass?: Function;
     contractName?: string;
     privateStateId?: string;
     cacheDir?: string;
-    /** Circuits to fetch prover keys + zkir for; verifier keys cover the whole contract. Default: every circuit of `contractClass`, else the vault's set. */
+    /** Circuits you will call. Defaults to all circuits of the contract. */
     circuits?: string[];
-    /** Transaction TTL in minutes (default 30): the sponsor must submit within it. */
+    /** How long the transaction stays valid, default 30. The sponsor must submit it in that time. */
     ttlMinutes?: number;
     attestationSecret?: Uint8Array;
     /**
-     * `true` (default): the wallet syncs from genesis against the indexer on
-     * the calling thread for the life of the builder (a full core while it
-     * catches up). `false`: no sync. A call that moves no value (every vault
-     * circuit) needs no wallet state to build, prove and sign; a call that
-     * does move value then fails at balancing instead of building wrong.
-     * `'shielded'`: only the shielded coins sync, enough for a call that moves
-     * shielded value while a sponsor pays the fee.
+     * `true` (default) syncs the wallet. This reads the whole chain and keeps a CPU core busy until it catches up.
+     * `false` skips the sync. Calls that move no tokens, like all vault calls, work without it.
+     * `'shielded'` syncs only the private coins, which is enough when a sponsor pays the fee.
      */
     walletSync?: boolean | 'shielded';
-    /** From `serializeWalletState()`: the sub-wallets named in it resume instead of syncing from genesis. */
+    /** Saved state from `serializeWalletState()`, to skip a full sync. */
     walletState?: WalletState;
     onProgress?: (e: Record<string, unknown>) => void;
 }
 
-/** Serialized sub-wallet states, as the wallet SDK writes them. They hold the wallet's coins: store them like a key. */
+/** Saved wallet state. It contains the wallet's coins, so keep it as safe as a key. */
 export interface WalletState {
     shielded?: string;
     unshielded?: string;
     dust?: string;
 }
 
-/** The public shielded keys of a wallet: what a sender needs to create a coin for it. */
+/** The public keys a sender needs to send a private coin to a wallet. */
 export interface ShieldedPublicKeys {
     /** 64 hex */
     coinPublicKey: string;
@@ -136,22 +121,22 @@ export interface ShieldedPublicKeys {
 export interface DeriveIdentityInput {
     /** 128 hex chars (64-byte BIP39 seed). */
     seedHex: string;
-    /** Default `preprod`; only the NIGHT address format depends on it. */
+    /** Defaults to `preprod`. Only the address format depends on it. */
     networkId?: string;
     accountIndex?: number;
-    /** Bring your own, else derived from the seed. */
+    /** Defaults to a secret derived from the seed. */
     attestationSecret?: Uint8Array;
 }
 
 export interface Identity {
-    /** hex, `persistentHash` of the attestation secret */
+    /** Hex. A hash of the attestation secret. */
     attesterId: string;
     attestationSecret: Uint8Array;
     addresses: { night: string; shielded: string };
     shieldedKeys: ShieldedPublicKeys;
 }
 
-/** Tracks the sockets a `ws` class opens; `closeAll()` terminates them. */
+/** Remembers the sockets a `ws` class opens. `closeAll()` ends them. */
 export interface TrackingWebSocket {
     WebSocket: Function;
     readonly size: number;
@@ -160,62 +145,52 @@ export interface TrackingWebSocket {
 
 export interface BuildSponsorableInput {
     contractAddress: string;
-    /** ONE call (mutually exclusive with `calls`). */
+    /** A single call. Use either `call` or `calls`. */
     call?: PreparedCall;
     /**
-     * Batch: up to 8 calls in one transaction. Apply order = array order, segment
-     * ordering fail-closed, causality pre-check aborts before proving with
-     * `code: 'BatchCausalityViolation'`: put the most expensive call last.
-     * One witnesses object serves the batch: the `witnesses` input, else the
-     * object every entry carries when it is the same one, else (attestation-vault
-     * family only) the builder's own; anything else is refused up front. Per-call
-     * state goes through the entries' `before` hooks; every batched vault call
-     * must be prepared with the same secret. Same-named calls are unordered among
-     * themselves: group them. On a 1010/104 reject rebuild the batch, do not
-     * resubmit identical bytes. `bind: false` refuses a value-moving batch; every
-     * circuit must be on the sponsor's allow-list.
+     * Up to 8 calls in one transaction, run in array order.
+     * If the ledger would reject the order, it fails before proving with `code: 'BatchCausalityViolation'`.
+     * Putting the most expensive call last usually helps.
+     * Every circuit must be allowed by the sponsor.
      */
     calls?: PreparedCall[];
     /**
-     * Batch only: one shared witnesses object for any contract (a Compact instance
-     * binds its witnesses once); per-call state goes through the entries' `before` hooks.
+     * Batch only. One witnesses object for all calls, because a contract instance takes its witnesses once.
+     * Use each call's `before` hook for what differs per call.
      */
     witnesses?: object;
-    /** Batch only (vault family): overrides the builder's own secret for the shared witnesses. */
+    /** Batch only, attestation vault only. Replaces the builder's own attestation secret. */
     attestationSecret?: Uint8Array;
     /**
-     * Batch only: the calls past `orderedPrefix` share no state (a proof cart of
-     * distinct claims). They are grouped by execution stage before proving,
-     * guaranteed-only calls first, call order within a group: on a grown contract
-     * the same circuit lands in different stages for different keys, and call
-     * order alone then fails the causality pre-check although a valid order
-     * exists. Leave unset for dependent batches (apply order = array order).
+     * Batch only. Set it when the calls after `orderedPrefix` do not depend on each other.
+     * They may then be reordered to an order the ledger accepts.
      */
     independentCalls?: boolean;
-    /** Batch only, with `independentCalls`: leading calls that keep their position (an in-batch anchor the proofs read). */
+    /** Batch only, with `independentCalls`. The number of leading calls that keep their position. */
     orderedPrefix?: number;
     /**
-     * Wallets besides the builder's own that a call creates a shielded coin for
-     * (a mint to another wallet). Without the recipient's keys here the build
-     * fails: the coin's ciphertext cannot be encrypted.
+     * Other wallets that a call sends a private coin to, for example when minting for someone else.
+     * Without their keys the build fails, because the coin cannot be encrypted for them.
      */
     recipients?: ShieldedPublicKeys[];
     initialPrivateState?: unknown;
-    /** true (default): FINALIZED handover (sponsorFinalizedTransaction).
-     *  false: UNBOUND handover (sponsorUnboundTransaction, parallel). */
+    /**
+     * `true` (default) returns a sealed transaction for sponsorFinalizedTransaction.
+     * `false` returns an unsealed one for sponsorUnboundTransaction, which lets a sponsor pay for several at once.
+     */
     bind?: boolean;
 }
 export interface BuildSponsorableBoundInput extends BuildSponsorableInput { bind?: true; }
 export interface BuildSponsorableUnboundInput extends BuildSponsorableInput { bind: false; }
 
-/** Bound handover (bind omitted or true): base64 of the fee-unpaid finalized tx -> sponsorFinalizedTransaction. */
+/** A sealed transaction without a fee, as base64. Send it to sponsorFinalizedTransaction. */
 export interface BuiltBoundTransaction {
     finalizedTxB64: string;
     unboundTxB64?: undefined;
     serializedBytes: number;
     bound: true;
 }
-/** Unbound handover (bind:false): base64 of the pre-binding signed tx -> sponsorUnboundTransaction. */
+/** A signed but unsealed transaction without a fee, as base64. Send it to sponsorUnboundTransaction. */
 export interface BuiltUnboundTransaction {
     unboundTxB64: string;
     finalizedTxB64?: undefined;
@@ -225,48 +200,42 @@ export interface BuiltUnboundTransaction {
 export type BuiltTransaction = BuiltBoundTransaction | BuiltUnboundTransaction;
 
 export interface TxBuilder {
-    /** 'wasm' (in-process, default) or 'server' (proofServerUrl given). */
     provingMode: 'wasm' | 'server';
-    /** Feed this to the browser export's `prepare*` helpers. */
+    /** Pass this to the `prepare*` helpers. */
     attestationSecret: Uint8Array;
-    /** The identity every attestation built here will carry (hex). */
+    /** The attester id (hex) that every attestation built here carries. */
     attesterId: string;
     zkAssets: ZkAssetResult;
     addresses: { night: string; shielded: string };
-    /** What another builder lists under `recipients` to create a coin for this wallet. */
+    /** Another builder lists these under `recipients` to send this wallet a private coin. */
     shieldedKeys: ShieldedPublicKeys;
-    /** Which sub-wallets sync. */
     walletSync: 'all' | 'shielded' | 'none';
-    /** Resolves once the syncing sub-wallets have caught up with the indexer. */
+    /** Resolves once the wallet has caught up with the chain. */
     waitForSync(): Promise<void>;
-    /** The state of the syncing sub-wallets, for `createTxBuilder({ walletState })`. */
+    /** Saves the wallet state for `createTxBuilder({ walletState })`. */
     serializeWalletState(): Promise<WalletState>;
     buildSponsorable(input: BuildSponsorableUnboundInput): Promise<BuiltUnboundTransaction>;
     buildSponsorable(input: BuildSponsorableBoundInput): Promise<BuiltBoundTransaction>;
     buildSponsorable(input: BuildSponsorableInput): Promise<BuiltTransaction>;
     /**
-     * Build + prove + sign a contract deploy without submitting; the caller's
-     * key signs it, a sponsor pays the dust. Sponsoring needs
-     * `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` on the server and, for a token caller,
-     * `allowDeploy` with budget left on the grant. The landed address is recorded
-     * in the grant's `deployedContracts` and sponsorable on top of the allow-list.
-     * `contractAddress` is read off the deploy action before anything is submitted.
+     * Builds, proves and signs a contract deploy without submitting it. A sponsor pays the fee.
+     * The server must allow sponsored deploys, and an agent token needs `allowDeploy` with budget left.
      */
     buildDeploySponsorable(input: BuildDeploySponsorableUnboundInput): Promise<BuiltUnboundDeploy>;
     buildDeploySponsorable(input?: BuildDeploySponsorableBoundInput): Promise<BuiltBoundDeploy>;
     buildDeploySponsorable(input: BuildDeploySponsorableInput): Promise<BuiltDeploy>;
-    /** Stops the wallet sync and ends the indexer sockets. Call it; the sync otherwise runs until the process exits. */
+    /** Stops the wallet sync and closes connections. Without it the sync runs until the process exits. */
     close(): Promise<void>;
 }
 
 export interface BuildDeploySponsorableInput {
-    /** Initial private state for `privateStateId`; lives in this process only. */
+    /** Stays in this process only. */
     initialPrivateState?: unknown;
-    /** Public constructor arguments of the contract, in declaration order. */
+    /** The contract's constructor arguments, in order. */
     constructorArgs?: unknown[];
-    /** Witnesses the constructor needs; vacant when omitted. */
+    /** Witnesses the constructor needs, if any. */
     witnesses?: object;
-    /** Wallets besides the builder's own that the constructor creates a shielded coin for. */
+    /** Other wallets the constructor sends a private coin to. */
     recipients?: ShieldedPublicKeys[];
     bind?: boolean;
 }
@@ -275,149 +244,144 @@ export interface BuildDeploySponsorableUnboundInput extends BuildDeploySponsorab
 export interface BuiltBoundDeploy extends BuiltBoundTransaction { contractAddress: string; }
 export interface BuiltUnboundDeploy extends BuiltUnboundTransaction { contractAddress: string; }
 export type BuiltDeploy = BuiltBoundDeploy | BuiltUnboundDeploy;
-/** `{ timeout }` for the SDK's proof provider when `proofTimeoutMs` is set, else undefined. */
+/** Options for the SDK's proof provider. Undefined without `proofTimeoutMs`. */
 export declare function proofProviderConfig(opts: { proofTimeoutMs?: number } | undefined): { timeout: number } | undefined;
-/** The contract address a built deploy transaction creates; throws unless exactly one deploy action is present. */
+/** Returns the address of the contract a deploy transaction creates. Throws unless it deploys exactly one contract. */
 export declare function readDeployAddress(tx: unknown): string;
 
-// ---- self-funded submission (pay your own dust, submit to the node yourself)
+// ---- paying your own fee and submitting to the node directly
 
-/** A deserialized ledger transaction; opaque here (the ledger package owns the type). */
+/** A decoded ledger transaction. */
 export interface LedgerTransaction {
     serialize(): Uint8Array;
     identifiers(): Iterable<unknown>;
 }
 
-/** Deserializes bytes or base64 into a ledger `Transaction` (bound tags first, then pre-binding). */
+/** Decodes a transaction from bytes or base64. Accepts sealed and unsealed transactions. */
 export declare function deserializeTransaction(bytesOrB64: Uint8Array | string): Promise<LedgerTransaction>;
-/** The transaction's identifiers; the LAST one is what the indexer's `transactions(offset:{identifier})` takes. */
+/** The transaction's identifiers. Use the last one to look it up in the indexer. */
 export declare function txIdentifiers(tx: LedgerTransaction): string[];
 
 export interface SubmitOptions {
-    /** The node WebSocket RPC, e.g. `wss://rpc.preprod.midnight.network/`. */
+    /** Node WebSocket URL, for example `wss://rpc.preprod.midnight.network/`. */
     nodeUrl: string;
-    /** HTTP RPC for the extrinsic encoding; derived from `nodeUrl` by protocol swap when omitted. */
+    /** Node HTTP URL. Derived from `nodeUrl` when omitted. */
     nodeHttpUrl?: string;
-    /** One-shot submit timeout, default 30000 ms. On timeout the transaction MAY be in the mempool: probe before resending. */
+    /** Default 30000 ms. After a timeout the transaction may still have arrived, so check before resending. */
     timeoutMs?: number;
-    /** Test seam / custom WebSocket class; defaults to `ws`. */
+    /** Defaults to `ws`. */
     WebSocketImpl?: Function;
 }
 
 /**
- * Submit a finalized (bound, fee-paid) transaction: encodes the
- * `midnight.sendMnTransaction` extrinsic over HTTP, submits over a one-shot
- * WebSocket (the node's HTTP gateway 403s bodies over ~14 KB). Returns the
- * extrinsic hash. Needs `@polkadot/api` (optional peer dependency).
+ * Submits a sealed transaction with its fee paid and returns the extrinsic hash.
+ * Needs the optional dependency `@polkadot/api`.
  */
 export declare function submitFinalized(tx: LedgerTransaction | Uint8Array | string, opts: SubmitOptions): Promise<string>;
-/** The WebSocket half of `submitFinalized`, for an already-encoded extrinsic. */
+/** Submits an already encoded extrinsic and returns its hash. */
 export declare function submitExtrinsic(extrinsicHex: string, opts: SubmitOptions): Promise<string>;
-/** `wss://` -> `https://` (and ws -> http); http(s) passes through. */
+/** Turns a ws(s):// node URL into the matching http(s):// URL. */
 export declare function nodeHttpUrlFor(nodeUrl: string): string;
 
 export interface NodeRejectClassification {
     /**
-     * 'stale-dust-proof' (170/171/196): re-sync the dust wallet, rebuild, resubmit; the wallet is NOT out of dust.
-     * 'funds' (138/173, "could not balance dust"): the wallet cannot pay; retrying buys nothing.
-     * 'sequencing' (219-224, 188): split the batch into single-call transactions.
-     * 'malformed' (117): neither waiting nor an identical rebuild fixes it.
-     * 'stale-transcript' (104): the call no longer fits the current contract state (another transaction on it landed first); build it again, never resend the bytes.
-     * 'unknown': a 1010 this table does not know, or not a coded reject.
+     * 'stale-dust-proof' (170, 171, 196): the fee was proven against an outdated state. Sync, rebuild, submit again.
+     * 'funds' (138, 173): the wallet cannot pay. Retrying does not help.
+     * 'sequencing' (219-224, 188): the batch order is not allowed. Send the calls separately.
+     * 'malformed' (117): retrying does not help.
+     * 'stale-transcript' (104): another transaction changed the contract first. Build the call again.
+     * 'unknown': any other rejection.
      */
     kind: 'stale-dust-proof' | 'funds' | 'sequencing' | 'malformed' | 'stale-transcript' | 'unknown';
     subCode: number | null;
 }
 
-/** What a node reject means, from the ledger sub-code in the error's message or cause chain. */
+/** Explains a node rejection by its ledger error code. */
 export declare function classifyNodeReject(err: unknown): NodeRejectClassification;
 export interface StaleTranscriptRebuildOptions {
-    /** Further attempts after the first refusal; default 2. */
+    /** Retries after the first rejection. Defaults to 2. */
     retries?: number;
-    /** Pause before each rebuild, so the indexer serves the new state; default 15000. */
+    /** Pause before each retry in ms, so the indexer shows the new state. Defaults to 15000. */
     backoffMs?: number;
-    /** Called before each rebuild with the retry number (1-based) and the refusal. */
+    /** Called before each retry with the retry number, starting at 1, and the error. */
     onRetry?: (retry: number, err: unknown) => void;
-    /** Injectable pause, for tests. */
+    /** Replaces the pause, for tests. */
     sleep?: (ms: number) => Promise<void>;
 }
-/** Runs `attempt(retry)` again on a `stale-transcript` refusal (104); `attempt` must build fresh bytes each time. Other errors and the last refusal rethrow. */
+/** Runs `attempt` again after a 'stale-transcript' rejection. `attempt` must build a new transaction each time. */
 export declare function rebuildOnStaleTranscript<T>(attempt: (retry: number) => Promise<T>, opts?: StaleTranscriptRebuildOptions): Promise<T>;
-/** 1010/1014/1016: the transaction provably never entered the mempool (fee unspent). NOT 1013 (already imported). */
+/** Whether the node refused the transaction before the mempool (1010, 1014, 1016). No fee was spent. */
 export declare function isPreMempoolReject(err: unknown): boolean;
-/** The SEND failed (socket closed/reset, no reply): probe the indexer, then resend the SAME bytes; never rebuild on transport alone. */
+/** Whether the connection failed while sending. Check with `probeLanded`, then resend the same bytes. Never rebuild. */
 export declare function isTransportFailure(err: unknown): boolean;
-/** 1013 Transaction Already Imported: the transaction IS in the pool. Expected after a resend whose first reply was lost; go to the confirmation loop, never treat it as a failure. */
+/** Whether the transaction is already in the pool (1013). After a resend this means the first send worked. */
 export declare function isAlreadyImported(err: unknown): boolean;
 
 export interface LandedProbeResult {
     height: string;
     status: string;
     failedSegments: number[];
-    /** true only for ledger result SUCCESS; false: in a block but the call did NOT apply (fee spent, rebuild against current state). */
+    /** false means the transaction is in a block but its call failed. The fee was still spent. */
     applied: boolean;
 }
 
-/** Ask the indexer whether the transaction with this identifier landed; null while unknown (not indexed yet, an HTTP/GraphQL error, or a partial answer without a transaction result). Confirm by identifier, never by watching the contract address. */
+/** Asks the indexer whether a transaction landed. Returns null while this is not known yet. */
 export declare function probeLanded(identifier: string, opts: { indexerHttpUrl: string, fetchFn?: typeof fetch, timeoutMs?: number }): Promise<LandedProbeResult | null>;
-/** `probeLanded` in a bounded loop (one probe minimum; `timeoutMs` default 30000, `pollMs` default 5000). Run it before trusting the refusal of a RESEND: any reject of resent bytes can mean the first send landed while the indexer still lags. */
+/** Calls `probeLanded` until the transaction is found or `timeoutMs` has passed. Use it when a resend is rejected. */
 export declare function waitLanded(identifier: string, opts: { indexerHttpUrl: string, timeoutMs?: number, pollMs?: number, fetchFn?: typeof fetch }): Promise<LandedProbeResult | null>;
 
 export interface DustGuardOptions {
-    /** The configuration object the facade was created with. */
+    /** The configuration the facade was created with. */
     configuration: object;
-    /** The dust secret key the facade runs on. */
+    /** The facade's DUST secret key. */
     dustKey: unknown;
-    /** Your own `(configuration) => DustWallet`; defaults to the SDK's. */
+    /** Defaults to the SDK's DustWallet. */
     dustWalletFactory?: (configuration: object) => { restore(snapshot: unknown): { start(dustKey: unknown): Promise<unknown> } };
 }
 
 /**
- * Dust wedge protection around ONE dust-spending build + submit: snapshots the
- * facade's dust sub-wallet before `fn` and, on a pre-mempool reject, swaps in
- * a wallet restored from the snapshot (the rethrown error carries
- * `dustRestored: true`). The caller owns persistence: never persist a
- * post-reject dust state. One guarded build per facade at a time.
+ * Runs `fn`, which builds and submits one transaction that pays its own fee.
+ * If the node rejects it before the mempool, the DUST wallet is restored, because the SDK would keep the fee reserved.
  */
 export declare function withDustGuard<T>(facade: { dust: object }, opts: DustGuardOptions, fn: () => Promise<T>): Promise<T>;
 
 export declare const ATTESTATION_VAULT_CIRCUITS: string[];
 export declare function ensureZkAssets(input: EnsureZkAssetsInput): Promise<ZkAssetResult>;
-/** What `createTxBuilder({ package })` reads from an installed lineage package. */
+/** What the builder loads from an installed contract package. */
 export interface BuilderPackage {
     package: { name: string; version: string; root: string };
     contractClass: Function;
     contractName: string;
     privateStateId: string;
     zkConfigDir: string;
-    /** Every circuit of the artifact (its verifier keys). */
+    /** All circuits of the contract. */
     circuits: string[];
 }
 export declare function resolveBuilderPackage(input: { package: string; from?: string }): Promise<BuilderPackage>;
-/** Checks a local keys/ + zkir/ directory and describes it as a `ZkAssetResult` (`source: 'local'`, nothing fetched). */
+/** Checks that a local directory has all proving files. Downloads nothing. */
 export declare function describeLocalZkAssets(zkConfigDir: string, circuits?: string[], proveCircuits?: string[]): Promise<ZkAssetResult>;
 export declare function createTxBuilder(opts: CreateTxBuilderInput): Promise<TxBuilder>;
-/** The identity a seed yields (attester id, attestation secret, NIGHT address) without a builder, a wallet or the network. */
+/** Derives the attester id, attestation secret and addresses of a seed. Needs no network. */
 export declare function deriveIdentity(opts: DeriveIdentityInput): Promise<Identity>;
-/** The attester's record key for a payload (hex): persistentHash(AttestRecordKey{tag 21, owner, payload_hash}). */
+/** The key under which the vault stores an attester's attestation of a payload, as hex. */
 export declare function computeRecordKey(attesterId: string, payloadHash: string): string;
 export declare function trackingWebSocket(WebSocketImpl: Function): TrackingWebSocket;
-/** The per-role seeds of a BIP39 seed (128 hex), by the derivation the builder and Lace use. Key material. */
+/** Derives the night, zswap and dust seeds from a BIP39 seed. These are secret keys. */
 export declare function deriveRoleSeeds(seedHex: string, accountIndex?: number): Promise<{ night: Uint8Array; zswap: Uint8Array; dust: Uint8Array }>;
-/** `recipients` as the SDK's map from coin public key to encryption public key; undefined when empty. */
+/** Converts `recipients` into the SDK's key map. Undefined when empty. */
 export declare function recipientKeyMap(recipients: ShieldedPublicKeys[] | undefined | null): Map<string, string> | undefined;
 
-// ---- shielded swaps
+// ---- private token swaps
 
-/** Prefix of an offer file: bech32m text of a serialized transaction. */
+/** Prefix of an offer file, the text form of a swap half. */
 export declare const SWAP_OFFER_PREFIX: 'swapoffer';
 
-/** One side of a swap: a raw token type (64 hex) and an amount in atoms. */
+/** One side of a swap: a token type (64 hex) and an amount in the smallest unit. */
 export interface SwapLeg {
     tokenType: string;
     amount: bigint;
 }
-/** A leg as input: the amount may be a bigint, an integer or a decimal string. */
+/** Like SwapLeg, but the amount may also be a number or a decimal string. */
 export interface SwapLegInput {
     tokenType: string;
     amount: bigint | number | string;
@@ -431,23 +395,18 @@ export interface SwapTermsInput {
     gives: SwapLegInput;
     wants: SwapLegInput;
 }
-/** Terms read from a transaction, with the coins the half carries. */
+/** Terms read from a transaction, plus how many coins the half spends and creates. */
 export interface ReadSwapTerms extends SwapTerms {
     inputs: number;
     outputs: number;
 }
 
-/**
- * What one half of a swap gives and wants, read from the transaction itself.
- * Throws for anything but a plain shielded swap half: an offer and nothing
- * else, one token type given, one other wanted.
- */
+/** Reads what a swap half gives and wants. Throws unless it is a plain swap half. */
 export declare function readSwapTerms(tx: LedgerTransaction): ReadSwapTerms;
-/** True when `terms` say exactly what `expect` says. */
 export declare function sameSwapTerms(terms: SwapTermsInput, expect: SwapTermsInput): boolean;
-/** Offer file text (`swapoffer1...`) of a transaction or of its serialized bytes. */
+/** Encodes a transaction as offer file text (`swapoffer1...`). */
 export declare function encodeOffer(txOrBytes: LedgerTransaction | Uint8Array): Promise<string>;
-/** An offer file, base64 or bytes as a ledger transaction; `bound` is the form it arrived in. */
+/** Decodes an offer file, base64 or bytes. `bound` tells whether the transaction is sealed. */
 export declare function decodeOffer(input: string | Uint8Array): Promise<{ tx: LedgerTransaction; bound: boolean; bytes: Uint8Array }>;
 
 export interface CreateSwapWalletInput {
@@ -457,104 +416,92 @@ export interface CreateSwapWalletInput {
     accountIndex?: number;
     indexerHttpUrl: string;
     indexerWsUrl: string;
-    /** Not used for swapping; passed to the wallet when given. */
+    /** Not needed for swapping. */
     nodeUrl?: string;
     /**
-     * 'wasm' (default): halves are proven in-process. 'server': on `proofServerUrl`,
-     * which then SEES THE COINS YOU SPEND; several times faster, only ever a proof
-     * server you run yourself.
+     * 'wasm' (default) proves in this process. 'server' proves on `proofServerUrl`, which is faster.
+     * The proof server sees the coins you spend, so only use one you run yourself.
      */
     provingMode?: 'wasm' | 'server';
     proofServerUrl?: string;
-    /** From `serializeState()`: resume instead of syncing from genesis. */
+    /** Saved state from `serializeState()`, to skip a full sync. */
     walletState?: string;
     /**
-     * Most coins one half spends; default 4, the sponsor's default
-     * (`NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS`). Every coin adds about 5 kB to the
-     * half, so a sponsor that accepts more also needs a larger byte budget.
+     * Most coins one half may spend. Defaults to 4, the sponsor's default.
+     * Each coin makes the half larger, so a sponsor that accepts more coins also needs a larger size limit.
      */
     maxInputs?: number;
 }
 
 export interface BuiltSwapHalf {
-    /** base64 of the serialized half: `makerHalfB64` / `takerHalfB64` of `sponsorSwap`. */
+    /** The half as base64, for `sponsorSwap`. */
     halfB64: string;
-    /** Offer file text; present on a bound half only. */
+    /** Offer file text. Only for a sealed half. */
     offer?: string;
     bound: boolean;
     serializedBytes: number;
     terms: ReadSwapTerms;
-    /** Releases the coins of a half that is not going to be handed over. */
+    /** Releases the half's coins if the half will not be used. */
     revert(): Promise<void>;
 }
 
 export interface TakenOffer {
     makerHalfB64: string;
     takerHalfB64: string;
-    /** The form of both halves: the taker's half is built in the offer's form. */
+    /** Whether both halves are sealed. The taker's half matches the offer. */
     bound: boolean;
     /** The offer's terms, from the maker's side. */
     terms: ReadSwapTerms;
-    /** Releases the taker's coins when the swap is not going to be handed over. */
+    /** Releases the taker's coins if the swap will not be submitted. */
     revert(): Promise<void>;
 }
 
 export interface SwapWallet {
     provingMode: 'wasm' | 'server';
-    /** Shielded address (bech32m). */
+    /** Shielded address. */
     address: string;
     coinPublicKey: string;
     encryptionPublicKey: string;
-    /** Resolves once the wallet has caught up with the indexer. */
+    /** Resolves once the wallet has caught up with the chain. */
     sync(): Promise<void>;
-    /** Most coins one half spends. */
     maxInputs: number;
-    /** Shielded balance per raw token type, in atoms. */
+    /** Balance per token type, in the smallest unit. */
     balances(): Promise<Record<string, bigint>>;
-    /** The free coins, smallest first. */
+    /** The unreserved coins, smallest first. */
     coins(): Promise<SwapLeg[]>;
-    /** The most one half can give of a token type: what the `maxInputs` largest free coins hold. */
+    /** The most one half can give of a token type. */
     spendable(tokenType: string): Promise<bigint>;
     /**
-     * One half of a swap: spends `give`, creates `want` and the change for this
-     * wallet, proves it. It spends the smallest coins that still fit `maxInputs`,
-     * so trading merges small coins; more than `spendable(tokenType)` is refused
-     * before anything is proven. `bind: true` (default) returns it bound with its
-     * offer file; `bind: false` unbound, base64 only. Its coins stay pending until the
-     * swap lands or `revert()` is called. A half refers to a recent state of the
-     * coin tree: build and hand over close together.
+     * Builds and proves one half of a swap that gives `give` and receives `want`.
+     * Its coins stay reserved until the swap lands or `revert()` is called.
+     * Hand the half over soon after building it, because it refers to the current chain state.
      */
     buildHalf(input: { give: SwapLegInput; want: SwapLegInput; bind?: boolean }): Promise<BuiltSwapHalf>;
-    /**
-     * Takes an offer: reads its terms from the transaction, compares them with
-     * `expect` when given, builds the mirror half in the offer's form and
-     * returns both halves for `sponsorSwap`.
-     */
+    /** Accepts an offer and returns both halves for `sponsorSwap`. Checks the terms against `expect` if given. */
     takeOffer(input: { offer: string | Uint8Array; expect?: SwapTermsInput }): Promise<TakenOffer>;
-    /** The wallet's state as text, for `createSwapWallet({ walletState })`. It holds the wallet's coins: store it like a key. */
+    /** Saves the wallet state. It contains the wallet's coins, so keep it as safe as a key. */
     serializeState(): Promise<string>;
-    /** Stops the sync. */
     close(): Promise<void>;
 }
 
-/** Most inputs one half carries by default. */
+/** Default limit of coins one half may spend. */
 export declare const SWAP_MAX_INPUTS: 4;
 /** A coin as the wallet SDK lists it. */
 export interface SwapCoin { type: string; value: bigint; }
-/** What the `maxInputs` largest coins of a token type hold. */
+/** The sum of the `maxInputs` largest coins of a token type. */
 export declare function spendableWithin(coins: readonly SwapCoin[], tokenType: string, maxInputs?: number): bigint;
-/** The next coin of a half: the smallest one that still lets the remaining slots cover the rest. Updates `plan`. */
+/** Picks the next coin for a half: the smallest that still lets the remaining slots cover the rest. Updates `plan`. */
 export declare function chooseSwapCoin<C extends SwapCoin>(coins: readonly C[], tokenType: string, plan: { remaining: bigint; slots: number }): C | undefined;
 
-/** A shielded wallet for swapping: it syncs the shielded coins of the seed and nothing else. */
+/** Creates a wallet for swapping. It syncs only the private coins of the seed. */
 export declare function createSwapWallet(opts: CreateSwapWalletInput): Promise<SwapWallet>;
 
-/** The holder-registry circuits, for `ensureZkAssets({ circuits })`. */
+/** The circuits of the holder registry contract. */
 export declare const HOLDER_REGISTRY_CIRCUITS: readonly ['registerHolder', 'unregisterHolder'];
-/** blake2b-256 over `nightgate/holder-claim/v1` and the 32-byte secret (64 hex): the `claim_key` of `registerHolder`. */
+/** The claim key to pass to `registerHolder`, computed from a secret you keep (64 hex). */
 export declare function holderClaimKey(claimSecretHex: string): string;
 
-/** The token factory's helpers of `@odatano/contract-kit`: the issuer rule, names, types, `prepareMint` / `prepareBurn`. */
+/** Token factory helpers from `@odatano/contract-kit`. */
 export { deriveTokenFactoryIssuerSecret, tokenName, nameOf, issuerKeyOf, domainOf, tokenTypeOf, prepareMint, prepareBurn, tokenFactoryWitnesses, TOKEN_FACTORY_CIRCUITS } from '@odatano/contract-kit';
-/** The issuer secret of a seed (64 hex): the factory issuer rule over its zswap role seed; a server session on the same seed is the same issuer. */
+/** Derives the token issuer secret from a wallet seed. A server session on the same seed gets the same issuer. */
 export declare function tokenFactoryIssuerSecret(opts: { seedHex: string; accountIndex?: number }): Promise<string>;

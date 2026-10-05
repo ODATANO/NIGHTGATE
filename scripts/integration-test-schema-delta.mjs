@@ -1,8 +1,8 @@
 // Legacy-migration integration test for scripts/apply-schema-delta.mjs.
 //
 // Builds a synthetic legacy database shape (PredicateAttestations with
-// NOT NULL op/threshold, which the target schema relaxed -> forces the
-// rebuild path) plus an operator-added index, trigger and a data row, runs
+// NOT NULL op/threshold, which the target schema relaxed, and job tables
+// with NULL rows in columns it tightened -> both rebuild paths) plus an operator-added index, trigger and a data row, runs
 // the real migration CLI against it, and asserts:
 //   1. the later columns exist (payloadHashB, allowedMask, network,
 //      compiledArtifactRef),
@@ -196,7 +196,8 @@ CREATE TABLE midnight_PendingSubmissions (
     status TEXT DEFAULT 'pending'
 );
 INSERT INTO midnight_PendingSubmissions (ID, txHash, actionType, submittedAt, status)
-VALUES ('sub-legacy', '00identifier', 'CALL', '2026-09-01T00:00:00Z', 'included');
+VALUES ('sub-legacy', '00identifier', 'CALL', '2026-09-01T00:00:00Z', 'included'),
+       ('sub-null', NULL, 'CALL', '2026-09-01T00:00:00Z', NULL);
 CREATE TABLE midnight_BackgroundJobs (
     ID TEXT NOT NULL PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -205,7 +206,8 @@ CREATE TABLE midnight_BackgroundJobs (
     chainStatus TEXT
 );
 INSERT INTO midnight_BackgroundJobs (ID, kind, status, txHash, chainStatus)
-VALUES ('job-legacy', 'submitContractCall', 'succeeded', '00identifier', 'pending');
+VALUES ('job-legacy', 'submitContractCall', 'succeeded', '00identifier', 'pending'),
+       ('job-null', 'submitContractCall', NULL, NULL, NULL);
 
 -- A 0.23-shaped DisclosureGrants: unique key without the attester.
 CREATE TABLE midnight_DisclosureGrants (
@@ -409,6 +411,20 @@ ok('delta 0.23: the legacy submission row survived with null coordinates',
     // so the envelope-derived cleanup above drops its UTXO rows on purpose.
     ok('delta 0.25: the pre-0.23.0 UTXO row was cleared for a re-index',
         after.prepare("SELECT count(*) AS n FROM midnight_UnshieldedUtxos").get()?.n === 0);
+}
+
+{
+    const notNull = (table, col) => after.prepare(`PRAGMA table_info("${table}")`).all().find(r => r.name === col)?.notnull === 1;
+    ok('delta: tightened status/attempt/maxAttempts are NOT NULL on an EXISTING BackgroundJobs table',
+        ['status', 'attempt', 'maxAttempts'].every(c => notNull('midnight_BackgroundJobs', c)));
+    const job = after.prepare("SELECT status, attempt, maxAttempts FROM midnight_BackgroundJobs WHERE ID = 'job-null'").get();
+    ok('delta: a NULL job row takes the column defaults',
+        job?.status === 'pending' && job?.attempt === 0 && job?.maxAttempts === 1, JSON.stringify(job));
+    ok('delta: a set job status survives the tightening',
+        after.prepare("SELECT status FROM midnight_BackgroundJobs WHERE ID = 'job-legacy'").get()?.status === 'succeeded');
+    ok('delta: PendingSubmissions.status is NOT NULL, a NULL row reads pending',
+        notNull('midnight_PendingSubmissions', 'status')
+        && after.prepare("SELECT status FROM midnight_PendingSubmissions WHERE ID = 'sub-null'").get()?.status === 'pending');
 }
 
 const jobsView = after.prepare(

@@ -1,7 +1,3 @@
-/**
- * NightgateAdminService: wallet-session management + role grants.
- */
-
 import cds from '@sap/cds';
 const { SELECT, UPDATE, INSERT } = cds.ql;
 
@@ -29,24 +25,22 @@ import { redecodeFromHeight, RedecodeError } from './crawler/redecode';
 import { describeSponsorPolicy } from './sessions/agent-grants';
 import { formatErr } from './utils/format-error';
 import { NightgateError } from './utils/errors';
-import type { NightgateRequest } from './utils/request-types';
 import type { Row } from './utils/db-types';
 import { normalizeHttpError } from './utils/http-errors';
+import { exportContractSigningKey, getJobStats, getSponsorPolicy, grantRole, invalidateSession, profileWorker, registerContract, revokeRole, unregisterContract, reconcileNightBalances as reconcileNightBalancesAction, redecodeFromHeight as redecodeFromHeightAction } from '#cds-models/NightgateAdminService';
 
 /**
- * Drop the in-memory WalletFacade (live secret keys) cached for a session, so a
- * forced invalidation removes secrets from RAM, not just the DB.
- * Best-effort: eviction failures never block the invalidation.
+ * Drops the cached in-memory wallet of a session, so its secret keys leave RAM too.
+ * Errors are ignored, they never block the invalidation.
  */
 async function evictSessionFacade(session: { sessionId: string; encryptedViewingKey?: string | null }): Promise<void> {
     try {
         if (session.encryptedViewingKey) {
             const vk = decrypt(session.encryptedViewingKey, getEncryptionKey(), walletSessionViewingKeyBinding(session.sessionId));
             const accountId = deriveAccountId(vk);
-            // Deliberately account-wide (operator tool: forced invalidation
-            // must drop secrets even if other sessions share the wallet).
+            // Drops the wallet for the whole account, even if other sessions share it.
             cds.log('nightgate:admin').info('force-evicting facade', accountId.slice(0, 16));
-            // The build lock: an evict that lands mid-build would find nothing and the build re-insert it.
+            // Takes the build lock. Otherwise a build in progress could put the wallet back right after the evict.
             await withKeyedLock(accountId, () => evictWalletFacade(accountId));
         }
     } catch { /* best-effort */ }
@@ -60,16 +54,16 @@ export default class NightgateAdminService extends cds.ApplicationService {
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
-        this.on('reconcileNightBalances', async (req: NightgateRequest) => {
-            const { address, after, limit } = req.data as { address?: string | null; after?: string | null; limit?: number | null };
+        this.on(reconcileNightBalancesAction, async (req) => {
+            const { address, after, limit } = req.data;
             if (limit !== undefined && limit !== null && (!Number.isInteger(limit) || limit < 1)) {
                 return req.reject(400, 'limit must be a positive integer');
             }
             return reconcileNightBalances(this.db, { address, after, limit });
         });
 
-        this.on('redecodeFromHeight', async (req: NightgateRequest) => {
-            const { height } = req.data as { height?: unknown };
+        this.on(redecodeFromHeightAction, async (req) => {
+            const { height } = req.data;
             try {
                 return await redecodeFromHeight(this.db, height);
             } catch (err) {
@@ -78,15 +72,15 @@ export default class NightgateAdminService extends cds.ApplicationService {
             }
         });
 
-        this.on('getSponsorPolicy', async (req: NightgateRequest) => {
-            const { grantId } = req.data as { grantId?: string | null };
+        this.on(getSponsorPolicy, async (req) => {
+            const { grantId } = req.data;
             const described = await describeSponsorPolicy(this.db, grantId ?? null);
             if (!described) return req.reject(404, 'Grant not found');
             return described;
         });
 
-        this.on('getJobStats', async (req: NightgateRequest) => {
-            const { windowHours } = req.data as { windowHours?: number };
+        this.on(getJobStats, async (req) => {
+            const { windowHours } = req.data;
             const hours = Math.min(Math.max(Number(windowHours) || 24, 1), 720);
             const since = new Date(Date.now() - hours * 3600_000).toISOString();
 
@@ -135,14 +129,10 @@ export default class NightgateAdminService extends cds.ApplicationService {
             };
         });
 
-        // Runtime contract registration on top of the config floor; the
-        // service-level @requires 'admin' gates the caller.
         this.on('listContracts', async () => listContracts());
 
-        // Worker CPU profile: bounded sampling window, runs while the worker
-        // keeps serving; the caller waits for the result (up to seconds + 60 s).
-        this.on('profileWorker', async (req: NightgateRequest) => {
-            const data = req.data as { seconds?: number | null; dir?: string | null; thread?: string | null };
+        this.on(profileWorker, async (req) => {
+            const data = req.data;
             const seconds = Number(data.seconds ?? 20);
             if (!Number.isFinite(seconds) || seconds < 1 || seconds > 120) {
                 return req.reject(400, 'seconds must be between 1 and 120');
@@ -162,8 +152,8 @@ export default class NightgateAdminService extends cds.ApplicationService {
             }
         });
 
-        this.on('registerContract', async (req: NightgateRequest) => {
-            const data = req.data as { name?: string; artifactPath?: string; zkConfigPath?: string; privateStateId?: string; slotWidth?: number | null };
+        this.on(registerContract, async (req) => {
+            const data = req.data;
             for (const field of ['name', 'artifactPath', 'zkConfigPath', 'privateStateId'] as const) {
                 if (typeof data[field] !== 'string' || !data[field]!.trim()) return req.reject(400, `${field} is required`);
             }
@@ -173,7 +163,6 @@ export default class NightgateAdminService extends cds.ApplicationService {
                     privateStateId: data.privateStateId!, slotWidth: data.slotWidth ?? null
                 }, {
                     registeredBy: req.user?.id,
-                    // The resolved plugin network (env, then cds.requires.nightgate.network), not the env alone.
                     networkId: getConfiguredNightgateNetwork((cds as any).env?.requires?.nightgate) ?? undefined
                 });
             } catch (err) {
@@ -182,8 +171,8 @@ export default class NightgateAdminService extends cds.ApplicationService {
             }
         });
 
-        this.on('unregisterContract', async (req: NightgateRequest) => {
-            const { name } = req.data as { name?: string };
+        this.on(unregisterContract, async (req) => {
+            const { name } = req.data;
             if (typeof name !== 'string' || !name.trim()) return req.reject(400, 'name is required');
             try {
                 return await unregisterContractAtRuntime(this.db, name.trim());
@@ -193,8 +182,8 @@ export default class NightgateAdminService extends cds.ApplicationService {
             }
         });
 
-        this.on('invalidateSession', async (req: NightgateRequest) => {
-            const { sessionId } = req.data as { sessionId: string };
+        this.on(invalidateSession, async (req) => {
+            const { sessionId } = req.data;
 
             if (!sessionId) {
                 return req.reject(400, 'sessionId is required');
@@ -212,20 +201,20 @@ export default class NightgateAdminService extends cds.ApplicationService {
                 return req.reject(409, `Session ${sessionId} is already inactive`);
             }
 
-            // Deactivate first: a job still running for the session must not rebuild after the evict.
+            // Deactivate first, so a job still running for the session cannot rebuild the wallet after the evict.
             await this.db.run(
                 UPDATE.entity(WalletSessions).set({
                     isActive: false,
                     disconnectedAt: new Date().toISOString(),
                     encryptedViewingKey: null,
-                    encryptedSeedKey: null  // Clear BOTH secrets, not just the viewing key
+                    encryptedSeedKey: null
                 }).where({ sessionId })
             );
             await evictSessionFacade(session);
         });
 
-        this.on('exportContractSigningKey', async (req: NightgateRequest) => {
-            const { sessionId, contractAddress, password } = req.data as { sessionId?: string; contractAddress?: string; password?: string };
+        this.on(exportContractSigningKey, async (req) => {
+            const { sessionId, contractAddress, password } = req.data;
             try {
                 const out = await exportContractSigningKeyForSession(this.db, getEncryptionKey(), String(sessionId ?? ''), String(contractAddress ?? ''), String(password ?? ''));
                 cds.log('nightgate:admin').info('signing key exported', out.contractAddress.slice(0, 16), 'account', out.accountId.slice(0, 16), 'by', req.user?.id);
@@ -237,7 +226,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
         });
 
         this.on('invalidateAllSessions', async () => {
-            // Viewing keys read before they are nulled, facades evicted after the deactivation.
+            // Read the viewing keys before they are cleared. Evict the wallets after the deactivation.
             const active: Row<WalletSession, 'sessionId'>[] = (await this.db.run(
                 SELECT.from(WalletSessions).columns('sessionId', 'encryptedViewingKey').where({ isActive: true })
             )) || [];
@@ -247,23 +236,17 @@ export default class NightgateAdminService extends cds.ApplicationService {
                     isActive: false,
                     disconnectedAt: new Date().toISOString(),
                     encryptedViewingKey: null,
-                    encryptedSeedKey: null  // Clear BOTH secrets for every session
+                    encryptedSeedKey: null
                 }).where({ isActive: true })
             );
             for (const s of active) await evictSessionFacade(s);
             return result;
         });
 
-        // @requires:'admin' gates CAP auth; additionally require the caller to
-        // hold the 'authority' disclosure tier so a sysadmin who is not a
-        // regulator cannot grant data-tier access.
-        this.on('grantRole', async (req: NightgateRequest) => {
-            const { userId, role, scope, validUntil } = req.data as {
-                userId?: string;
-                role?: string;
-                scope?: string;
-                validUntil?: string;
-            };
+        // Besides the admin role, the caller needs the 'authority' disclosure role.
+        // An admin without it must not be able to hand out access to data.
+        this.on(grantRole, async (req) => {
+            const { userId, role, scope, validUntil } = req.data;
 
             if (!userId) return req.reject(400, 'userId is required');
             if (!role) return req.reject(400, 'role is required');
@@ -295,8 +278,8 @@ export default class NightgateAdminService extends cds.ApplicationService {
         });
 
         // Ends matching grants by setting validUntil, so the grant history stays readable.
-        this.on('revokeRole', async (req: NightgateRequest) => {
-            const { userId, role, scope } = req.data as { userId?: string; role?: string; scope?: string };
+        this.on(revokeRole, async (req) => {
+            const { userId, role, scope } = req.data;
 
             if (!userId) return req.reject(400, 'userId is required');
             if (!role) return req.reject(400, 'role is required');

@@ -1,7 +1,11 @@
-/** Worker rotation and shutdown: admission drain, evict-all with acked final saves. */
+/**
+ * Planned worker restart and shutdown.
+ * Node never frees an imported module, so after loading many contract versions the worker
+ * stops taking calls, saves and unloads its wallets, and the main thread starts a new one.
+ */
 
-// First import on purpose: the worker modules import each other in cycles and
-// a module-level read must resolve before the cycle re-enters.
+// Must stay the first import. The worker modules import each other in a cycle,
+// and config is read at load time.
 import { configNumber } from '../../utils/config';
 import { WORKER_ROTATING } from '../wallet-worker-protocol';
 import { formatErr } from '../../utils/format-error';
@@ -9,12 +13,8 @@ import { parentPort } from 'node:worker_threads';
 import { facades, log } from './context';
 import { evict } from './facades';
 
-/**
- * Node's ESM cache keeps every imported generation for the thread's life, so
- * after NIGHTGATE_WORKER_MAX_GENERATIONS the worker exits when idle and is respawned.
- */
 export const importedGenerations = new Set<string>();
-/** One object so the dispatcher can count in-flight RPCs from its own module. */
+/** One shared object, so the dispatcher in another module can update it. */
 export const rotationState = { pending: false, draining: false, inflight: 0, finalizing: false };
 export { WORKER_ROTATING };
 
@@ -22,7 +22,7 @@ export function maxGenerationsBeforeRotation(): number {
     return configNumber('NIGHTGATE_WORKER_MAX_GENERATIONS');
 }
 
-/** Records an imported generation; returns true once a rotation is due. */
+/** Records a loaded contract version. Returns true once a restart is due. */
 export function noteGenerationImported(digest: string): boolean {
     if (!digest) return rotationState.pending;
     importedGenerations.add(digest);
@@ -43,8 +43,7 @@ export function __resetRotationForTests(): void {
 }
 
 /**
- * Runs on every RPC completion and when a rotation becomes due: close admission
- * first, exit once nothing is in flight. An admitted call always completes.
+ * Stops taking new calls and finishes once no call is running. A call already accepted always completes.
  */
 export function rotateIfDue(): void {
     if (!rotationState.pending) return;
@@ -62,7 +61,7 @@ export function rotateIfDue(): void {
     })();
 }
 
-/** Evict every facade with an acked final save; an unconfirmed save is counted, the eviction still proceeds. */
+/** Unloads every wallet after a final save. An unconfirmed save is counted as failed, but the wallet is still unloaded. */
 export async function evictAllFacades(site: string): Promise<{ evicted: number; failed: number }> {
     const ids = [...facades.keys()];
     const results = await Promise.allSettled(ids.map(sessionId => evict({ sessionId, awaitSaveAck: true })));
@@ -84,8 +83,8 @@ export function __admitRpcForTests(): boolean { return !rotationState.draining; 
 
 
 /**
- * Process shutdown: close admission, evict every facade (else a SIGTERM loses a
- * save interval). Each eviction waits for its session lock, so an in-flight submit completes.
+ * Saves and unloads every wallet so a shutdown loses no sync progress.
+ * Each unload waits for its session lock, so a running submit completes first.
  */
 export async function shutdown() {
     rotationState.draining = true;

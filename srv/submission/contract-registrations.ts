@@ -1,7 +1,7 @@
 /**
- * Runtime contract registrations, persisted and reloaded at boot; config names
- * are an immutable floor. Importing executes the module, so paths must stay
- * inside `NIGHTGATE_CONTRACTS_DIR`. Validation completes before anything changes.
+ * Contracts registered while the server runs. They are saved and loaded again at boot.
+ * Contracts named in the config cannot be changed or removed this way.
+ * Loading a contract runs its code, so paths must stay inside `NIGHTGATE_CONTRACTS_DIR`.
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -23,7 +23,7 @@ import { effectiveModuleFormat, runtimeNodeModulesDir } from './artifact-digest'
 import { hasAllProverKeys } from './prover-keys';
 import { configString } from '../utils/config';
 import type { DbRunner } from '../utils/db-types';
-import { NightgateError } from '../utils/errors';
+import { NightgateError, errorMessage } from '../utils/errors';
 
 const log = cds.log('nightgate:contracts');
 
@@ -78,7 +78,7 @@ function insideRoots(absolute: string, roots: string[]): boolean {
 
 function resolveInsideRoots(what: string, p: string, roots: string[]): string {
     if (typeof p !== 'string' || !p.trim()) throw new ContractRegistrationError(400, `${what} is required`);
-    // Containment is checked on the real path, so a symlink out of the roots fails.
+    // Check the resolved path, so a symlink pointing outside the allowed folders is refused.
     const candidates = path.isAbsolute(p) ? [path.resolve(p)] : roots.map(r => path.resolve(r, p));
     let real: string | null = null;
     for (const candidate of candidates) {
@@ -95,8 +95,8 @@ function resolveInsideRoots(what: string, p: string, roots: string[]): string {
 }
 
 /**
- * Import a copy of the artifact in a throwaway worker (the main process keeps no
- * module instance), next to a node_modules link so its runtime import resolves.
+ * Load a copy of the compiled contract in a short-lived worker, so the main process never loads it.
+ * A node_modules link next to the copy lets its runtime import resolve.
  */
 export function probeArtifactModule(artifactPath: string, timeoutMs = 60_000): Promise<{ ok: boolean; hasContract: boolean; error?: string }> {
     let probeDir: string | null = null;
@@ -109,7 +109,7 @@ export function probeArtifactModule(artifactPath: string, timeoutMs = 60_000): P
         fs.copyFileSync(artifactPath, importPath);
     } catch (e) {
         cleanup();
-        return Promise.resolve({ ok: false, hasContract: false, error: String((e as Error)?.message ?? e) });
+        return Promise.resolve({ ok: false, hasContract: false, error: errorMessage(e) });
     }
     return probeCopiedModule(importPath, timeoutMs).finally(cleanup);
 }
@@ -135,16 +135,16 @@ function probeCopiedModule(artifactPath: string, timeoutMs: number): Promise<{ o
         try {
             w = new Worker(code, { eval: true, workerData: { artifactPath } });
         } catch (e) {
-            return done({ ok: false, hasContract: false, error: String((e as Error)?.message ?? e) });
+            return done({ ok: false, hasContract: false, error: errorMessage(e) });
         }
         timer = setTimeout(() => { done({ ok: false, hasContract: false, error: `import did not finish within ${timeoutMs}ms` }); void w.terminate(); }, timeoutMs);
         w.once('message', (m: any) => { done({ ok: !!m?.ok, hasContract: !!m?.hasContract, error: m?.error }); void w.terminate(); });
-        w.once('error', (e) => done({ ok: false, hasContract: false, error: String((e as Error)?.message ?? e) }));
+        w.once('error', (e) => done({ ok: false, hasContract: false, error: errorMessage(e) }));
         w.once('exit', (code) => done({ ok: false, hasContract: false, error: `validation worker exited with code ${code} before reporting` }));
     });
 }
 
-/** Validate without touching the registry; returns the absolute registration. */
+/** Validate without changing the registry. Returns the registration with absolute paths. */
 export async function validateRuntimeRegistration(input: RuntimeRegistrationInput): Promise<ContractRegistration & { hasProverKeys: boolean }> {
     const name = String(input.name ?? '').trim();
     if (!NAME_RE.test(name)) {
@@ -193,14 +193,14 @@ export async function validateRuntimeRegistration(input: RuntimeRegistrationInpu
     };
 }
 
-/** Re-registering a name is a new generation: jobs recorded against the old one refuse. */
+/** Registering a name again replaces the contract. Jobs created for the old version then refuse to run. */
 export async function registerContractAtRuntime(
     db: DbRunner,
     input: RuntimeRegistrationInput,
     ctx: { registeredBy?: string; networkId?: string } = {}
 ): Promise<ContractListing> {
     const name = String(input.name ?? '').trim();
-    // Registry entry, digest and persisted row must belong to one generation.
+    // Lock per name, so the registry entry, its digest and the saved row always match.
     return withKeyedLock(registrationLockKey(name), () => registerContractAtRuntimeLocked(db, name, input, ctx));
 }
 
@@ -225,7 +225,7 @@ async function registerContractAtRuntimeLocked(
         artifactDigest = getArtifactGenerationDigest(name);
     } catch (e) {
         if (previous) registerContract(name, { ...previous }); else unregisterContract(name);
-        throw new ContractRegistrationError(400, `artifact generation digest failed: ${String((e as Error)?.message ?? e)}`);
+        throw new ContractRegistrationError(400, `artifact generation digest failed: ${errorMessage(e)}`);
     }
 
     const { UPSERT } = cds.ql as any;
@@ -267,15 +267,15 @@ export async function unregisterContractAtRuntime(
     });
 }
 
-/** Boot, after the config. Invalid or shadowing rows are skipped and kept. Never throws. */
+/** Runs at boot, after the config. Skips invalid rows and rows that clash with the config, but keeps them. Never throws. */
 export async function loadPersistedRegistrations(db: DbRunner): Promise<string[]> {
     const { SELECT } = cds.ql as any;
     let rows: any[] = [];
     try {
         rows = (await db.run(SELECT.from('midnight.ContractRegistrations'))) as any[] ?? [];
     } catch (e) {
-        // Table missing until the schema delta ran.
-        log.warn(`runtime contract registrations not loaded: ${String((e as Error)?.message ?? e)}`);
+        // The table does not exist until the schema update has run.
+        log.warn(`runtime contract registrations not loaded: ${errorMessage(e)}`);
         return [];
     }
     const loaded: string[] = [];
@@ -294,7 +294,7 @@ export async function loadPersistedRegistrations(db: DbRunner): Promise<string[]
             if (!hasProverKeys) log.warn(`contract '${name}': no prover keys under ${registration.zkConfigPath}/keys`);
             loaded.push(name);
         } catch (e) {
-            log.warn(`runtime registration '${name}' skipped: ${String((e as Error)?.message ?? e)}`);
+            log.warn(`runtime registration '${name}' skipped: ${errorMessage(e)}`);
         }
     }
     if (loaded.length) log.info(`Runtime-registered contracts: ${loaded.join(', ')}`);

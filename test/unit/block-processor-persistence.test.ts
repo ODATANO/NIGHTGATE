@@ -304,7 +304,6 @@ describe('BlockProcessor persistence paths', () => {
         expect(txRows.map((t: any) => t.isShielded)).toEqual([false, null, null, null, true]);
         expect(txRows.map((t: any) => t.size)).toEqual([4, 4, 4, 4, 4]);
         expect(txRows.map((t: any) => t.hasProof)).toEqual([false, null, null, null, true]);
-        expect(txRows.every((t: any) => t.proofHash === null)).toBe(true);
         expect(txRows.map((t: any) => t.circuitName)).toEqual(['0:0', '10:0', '10:1', '10:2', '15:0']);
         // No contract address is minted from the extrinsic hash: the ledger
         // payload is not decoded, so the column is null for every row.

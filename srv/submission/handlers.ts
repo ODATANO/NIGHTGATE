@@ -1,6 +1,6 @@
 /**
- * Submission action handlers: validation, rate limits, artifact/session/sponsor
- * resolution and job admission. The SDK call itself lives in TransactionSubmitter.
+ * OData handlers for the submit actions. They validate and start jobs.
+ * The SDK calls happen in TransactionSubmitter.
  */
 
 import cds from '@sap/cds';
@@ -78,7 +78,7 @@ export function registerSubmissionHandlers(
 
     const executors: Record<Exclude<JobExecutor, 'wallet'>, BackgroundJobProcessor> = {
         contract: executeContractCommand,
-        // The result adds the token type, without which the minted coin cannot be spent.
+        // Add the token type to the result. Without it the minted coin cannot be spent.
         mintShieldedTestToken: async (raw, job) => {
             const result = await executeContractCommand(raw, job) as Record<string, unknown> | undefined;
             // The executor already rejected any op but 'call' for this kind.
@@ -86,8 +86,8 @@ export function registerSubmissionHandlers(
             const token = await deriveRawTokenType(String(command?.contractAddress ?? ''));
             return { ...(result ?? {}), tokenTypeHex: token.tokenTypeHex, amount: SHIELDED_TEST_TOKEN_AMOUNT.toString() };
         },
-        // A landed factory mint is a platform mint: its type is learned, and the
-        // minting grant may have offers in it sponsored.
+        // Record the confirmed mint, so its token type is known to the server
+        // and the minting grant may get swap offers in it sponsored.
         mintFactoryToken: async (raw, job) => {
             const result = await executeContractCommand(raw, job) as Record<string, unknown> | undefined;
             const command = raw as Extract<ContractCommandV1, { op: 'call' }>;

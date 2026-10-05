@@ -1,6 +1,6 @@
 import { inspect } from 'node:util';
 
-/** Error to log string; plain objects without `.message` (Effect, some SDK errors) go through JSON.stringify. */
+/** Turns an error into a log string. Objects without a `.message`, as some SDK errors are, become JSON. */
 export function formatErr(err: unknown): string {
     if (err instanceof Error) return err.message;
     if (err == null) return String(err);
@@ -9,16 +9,14 @@ export function formatErr(err: unknown): string {
     catch { return String(err); }
 }
 
-/** `err.name` when it is a string, else 'Error'. */
 export function errorName(err: unknown): string {
     const name = (err as { name?: unknown } | null | undefined)?.name;
     return typeof name === 'string' ? name : 'Error';
 }
 
 /**
- * Deep inspect that never throws, since classifying an error must not raise a new one.
- * Custom inspectors stay on first (reject classification reads Effect's cause chain
- * rendering); only if they throw retry without them, then formatErr.
+ * Renders an error in full depth and never throws.
+ * Custom inspectors run first, because they print the nested causes. If they throw, it retries without them.
  */
 export function safeDeepInspect(err: unknown, maxStringLength = 2048): string {
     const opts = { depth: 8, maxStringLength, breakLength: Infinity } as const;
@@ -30,8 +28,8 @@ export function safeDeepInspect(err: unknown, maxStringLength = 2048): string {
 }
 
 /**
- * `safeDeepInspect` for reject classification: stack frames and `:line:col` are
- * stripped so `wallet.js:1010:27` never reads as a Substrate reject code.
+ * Error text for matching node reject codes. Stack frames and `:line:col` are removed,
+ * so that `wallet.js:1010:27` is not mistaken for reject code 1010.
  */
 export function classificationHaystack(err: unknown): string {
     return safeDeepInspect(err)
@@ -40,9 +38,9 @@ export function classificationHaystack(err: unknown): string {
 }
 
 /**
- * `formatErr` plus the bounded cause chain, for errors crossing a string-only boundary:
- * the node's reject sits in the innermost cause. Effect's FiberFailure has no `cause`
- * property, so rendered `[cause]:` lines, then a bare `10xx:` line, are fallbacks.
+ * Like `formatErr`, but also appends the nested causes, up to six.
+ * Used where an error is passed on as a string. The node's reject reason is often in the innermost cause.
+ * Some SDK errors have no `cause` property, so the rendered text is searched instead.
  */
 export function formatErrWithCauses(err: unknown): string {
     const head = formatErr(err);

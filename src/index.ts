@@ -30,7 +30,7 @@ import { ensureIndexes } from '../srv/utils/db-indexes';
 import { installPostgresOrderNulls } from '../srv/utils/pg-order-nulls';
 import { assertStoredKeyIdsKnown } from '../srv/utils/encryption-rewrap';
 import { recoverInterruptedJobs, dropPendingJobsForClosedSessions, startBackgroundJobProcessor, stopBackgroundJobProcessor, registerChainOutcomeConfirmer } from '../srv/submission/background-jobs';
-import { buildIndexerTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
+import { createHttpTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
 import { TransactionResults } from '#cds-models/midnight';
 import {
     assertSupportedRuntimeTopology,
@@ -65,7 +65,6 @@ export interface NightgateIndexerStatus {
 }
 
 let initialized = false;
-// Lease holder id: the topology's instance plus the pid, so two processes on one host differ.
 let leaseHolder: string | undefined;
 let stopLeaseHeartbeat: (() => void) | undefined;
 let lastStatus: NightgateIndexerStatus = {
@@ -74,8 +73,7 @@ let lastStatus: NightgateIndexerStatus = {
     mode: 'idle'
 };
 
-// Single write path: also publishes to srv/'s runtime-state holder, since srv/
-// cannot import this module without an import cycle.
+// Always set the status here. It is also copied to srv/, which cannot import this module.
 function setLastStatus(next: NightgateIndexerStatus): void {
     lastStatus = next;
     publishRuntimeState({ initialized: next.initialized, mode: next.mode, lastError: next.lastError });
@@ -115,7 +113,7 @@ function resolveDbPath(): string {
     return dbCfg.database || dbCfg.url || 'db.sqlite';
 }
 
-// Probes tables and columns only, never deploys: the operator migrates explicitly.
+// Only checks that tables and columns exist. It never changes the schema.
 async function ensureSchemaDeployed(): Promise<void> {
     const requiredTables: Array<{ table: string; columns?: string[] }> = [
         { table: 'midnight.Blocks' },
@@ -152,13 +150,12 @@ async function ensureSchemaDeployed(): Promise<void> {
     }
 
     const dbKind = String((cds.env as any).requires?.db?.kind ?? '');
-    // ORDER BY without a NULLS clause on key / NOT NULL columns, so the indexes
-    // below serve `$top`, `$orderby` and latest() (srv/utils/pg-order-nulls.ts).
+    // Lets PostgreSQL use the indexes below for sorted queries. See srv/utils/pg-order-nulls.ts.
     if (/postgres/i.test(dbKind)) installPostgresOrderNulls();
     const created = await ensureIndexes(db as any, dbKind, msg => log.warn(msg));
     log.debug(`ensured ${created} secondary index(es)`);
 
-    // Fail closed: an unreadable seed must not pass as a missing one.
+    // Stop if a stored seed was encrypted with an unknown key, instead of treating it as missing.
     await assertStoredKeyIdsKnown(db as any);
 
     const removed = await db.run(
@@ -169,8 +166,8 @@ async function ensureSchemaDeployed(): Promise<void> {
 }
 
 /**
- * Initialize Nightgate; idempotent. Status is "offline" when a startup step
- * failed, "idle" when the crawler is disabled.
+ * Starts NIGHTGATE. Calling it again does nothing.
+ * The status is "offline" if a startup step failed and "idle" if block indexing is turned off.
  */
 export async function initialize(): Promise<NightgateIndexerStatus> {
     await ensureNightgateModelLoaded();
@@ -260,7 +257,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         throw err;
     }
 
-    // Network/database binding: fail closed, before anything reads or writes jobs.
+    // Refuse to start if the database was filled from another network.
     try {
         const db = await cds.connect.to('db');
         await ensureSyncStateSingleton(db);
@@ -279,7 +276,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         throw err;
     }
 
-    // One process per database runs recovery, sessions cleanup, job loops and crawler.
+    // Only one process per database may run jobs and indexing. This lease makes sure of that.
     try {
         const db = await cds.connect.to('db');
         const ttlMs = configMs('NIGHTGATE_INSTANCE_LEASE_TTL_MS');
@@ -307,7 +304,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         throw err;
     }
 
-    // Asymmetric: only commands interrupted before the external boundary requeue.
+    // Jobs stopped before they sent anything are queued again. The others are checked against the chain.
     try {
         const recovered = await recoverInterruptedJobs();
         if (recovered > 0) {
@@ -318,8 +315,8 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         log.warn(`Background-job recovery skipped: ${msg}`);
     }
 
-    // An ungraceful stop leaks sessions for their full TTL; close them so no
-    // seed material outlives the process that authorised it.
+    // After a crash, wallet sessions of the old process would stay open until they expire.
+    // Close them so no wallet seed outlives the process it was given to.
     if (isCloseSessionsOnRestartEnabled(nightgateConfig)) {
         try {
             const db = await cds.connect.to('db');
@@ -345,7 +342,6 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         if (refs.length) {
             log.info(`Registered contracts: ${refs.join(', ')}`);
         }
-        // Runtime registrations go on top of the config floor.
         await loadPersistedRegistrations(cds.db || await cds.connect.to('db'));
         const learned = await refreshLearnedTokenTypes(cds.db || await cds.connect.to('db'));
         if (learned.length) log.info(`Learned token types: ${learned.length}`);
@@ -354,7 +350,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         log.warn(`Contract registry load warning: ${msg}`);
     }
 
-    // Pinned into the env before the worker spawns: the worker reads only env.
+    // Set in the environment so the worker thread reads the same values.
     const provingMode = resolveEffectiveProvingMode(nightgateConfig);
     process.env.NIGHTGATE_PROVING_MODE = provingMode;
     const proofTimeoutMs = resolveProofTimeoutMs(nightgateConfig);
@@ -367,8 +363,8 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         await startWalletWorker();
         wireWorkerStateSaveSink();
         await startBackgroundJobProcessor();
-        // The only chain-evidence path for submitted jobs: always registered.
-        registerChainOutcomeConfirmer(buildIndexerTxConfirmer({ indexerHttpUrl: submissionEndpoints.indexerHttpUrl }));
+        // The only way submitted jobs learn whether they landed on chain.
+        registerChainOutcomeConfirmer(createHttpTxConfirmer({ indexerHttpUrl: submissionEndpoints.indexerHttpUrl }));
         warnIfCrawlerlessChainConfirmSet(nightgateConfig);
         log.info(`Indexer chain-outcome confirmation enabled${crawlerEnabled ? ' (alongside the crawler)' : ' (crawler off)'}`);
         log.info('Wallet worker thread ready');
@@ -448,8 +444,8 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
 }
 
 /**
- * Another process took the lease over: no dispatch, no write action and no broadcast
- * from here on (in-flight calls stop at their boundary check); the process stays up offline.
+ * Called when another process took over the lease.
+ * This process then stops all jobs and writes but keeps running, in offline mode.
  */
 function onInstanceLeaseLost(holder: string): void {
     fenceBackgroundWork();
@@ -459,7 +455,7 @@ function onInstanceLeaseLost(holder: string): void {
     setLastStatus({ ...lastStatus, mode: 'offline', lastError: 'instance lease taken over by another process' });
 }
 
-/** Shut down Nightgate; idempotent. Status is "idle" afterwards. */
+/** Stops NIGHTGATE. Calling it again does nothing. */
 export async function shutdown(): Promise<void> {
     stopBackgroundJobProcessor();
     stopLeaseHeartbeat?.();
@@ -491,7 +487,7 @@ export async function shutdown(): Promise<void> {
         clearActiveLease();
     }
     try {
-        // After the worker stop: no save can arrive that needs a key.
+        // Only after the worker stopped, because the worker may still save encrypted state.
         await clearAllEncryptionKeys();
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -505,7 +501,7 @@ export async function shutdown(): Promise<void> {
     });
 }
 
-/** Last known status, node URL credentials redacted. */
+/** The last known status, with credentials removed from the node URL. */
 export function getStatus(): NightgateIndexerStatus {
     return { ...lastStatus, nodeUrl: redactUrlCredentials(lastStatus.nodeUrl) || undefined };
 }

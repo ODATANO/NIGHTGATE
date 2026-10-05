@@ -35,8 +35,7 @@ function makeReq(data: Record<string, unknown> = {}, ip = '203.0.113.7', user: a
         user,
         event: 'verifyAttestationState',
         reject: vi.fn((a: any, b?: any) => ({ __rejected: true, a, b })),
-        _: { req: { ip } },
-        http: { res }
+        http: { req: { ip }, res }
     } as any;
 }
 
@@ -80,10 +79,10 @@ describe('publicVerifyGate', () => {
 
 describe('principalRateKey: marker principals fall through to the address', () => {
     test.each([PUBLIC_VERIFY_TRANSPORT_USER, AGENT_TOKEN_TRANSPORT_USER, 'anonymous'])('%s keys by address', id => {
-        expect(principalRateKey({ user: { id }, _: { req: { ip: '10.1.1.1' } } }, 'scope')).toBe('ip=10.1.1.1:scope');
+        expect(principalRateKey({ user: { id }, http: { req: { ip: '10.1.1.1' } } }, 'scope')).toBe('ip=10.1.1.1:scope');
     });
     test('a real user still keys by id, a grant by its id', () => {
-        expect(principalRateKey({ user: { id: 'nightgate' }, _: { req: { ip: '10.1.1.1' } } }, 'scope')).toBe('user=nightgate:scope');
+        expect(principalRateKey({ user: { id: 'nightgate' }, http: { req: { ip: '10.1.1.1' } } }, 'scope')).toBe('user=nightgate:scope');
         expect(principalRateKey({ agentGrant: { ID: 'g1' }, user: { id: 'nightgate' } }, 'scope')).toBe('grant=g1:scope');
     });
 });
@@ -123,10 +122,10 @@ describe('registerVerifyStateHandlers: one implementation behind both services',
         }
     });
 
-    test('input validation is shared too: a malformed payloadHash is 400 on both', async () => {
+    test('input validation is shared too: a missing record selector is 400 on both', async () => {
         const { srv, handlers } = stubService();
         registerVerifyStateHandlers(srv, { attestationStateReader: attestationStateReader as any, contractResolver, gate: async () => true });
-        const req = makeReq({ contractAddress: 'c', attesterId: 'b'.repeat(64), payloadHash: 'nope' });
+        const req = makeReq({ contractAddress: 'c', attesterId: 'b'.repeat(64) });
         await handlers.verifyAttestationState(req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('payloadHash'));
         expect(attestationStateReader).not.toHaveBeenCalled();

@@ -1,12 +1,12 @@
 /**
- * Which calls a fee sponsor pays for. Floor = env or `NIGHTGATE_SPONSOR_POLICY_FILE`
- * (fail-closed: last good policy, else refuse); effective = floor ∩ grant.
- * Empty floor list = unrestricted, empty grant list = inherit.
+ * Decides which calls a fee sponsor pays for. The platform policy comes from env
+ * or from `NIGHTGATE_SPONSOR_POLICY_FILE`. An agent grant can only narrow it further.
+ * An empty platform list allows everything. An empty grant list takes the platform list.
  */
 import fs from 'node:fs';
 import cds from '@sap/cds';
 import { configList, configFlag, configString, configIsSet } from '../utils/config';
-import { NightgateError } from '../utils/errors';
+import { NightgateError, errorMessage } from '../utils/errors';
 import { HEX64_RE } from '../utils/hex';
 import { sharedLearnedTokenTypes } from './learned-token-types';
 
@@ -15,24 +15,24 @@ const log = cds.log('nightgate:sponsor-policy');
 export interface SponsorPolicy {
     allowedContracts: string[];
     allowedCircuits: string[];
-    /** Sponsor caller-built deploys; floor and (for a token caller) grant must both allow it. */
+    /** Sponsor deploys built by the caller. The platform and, for an agent, the grant must both allow it. */
     allowDeploy?: boolean;
     /**
-     * Addresses deployed under the grant. Exempt from `allowedCircuits`, which
-     * names the shared contracts' circuits; the byte ceiling still applies.
+     * Contracts deployed under the grant. `allowedCircuits` does not apply to them,
+     * because it names circuits of the shared contracts. The size limit still applies.
      */
     ownContracts?: string[];
-    /** Raw token types (64 hex) whose zswap offers are sponsored; empty = none. */
+    /** Raw token types (64 hex) whose zswap offers are sponsored. Empty means none. */
     allowedTokenTypes?: string[];
     /** Also sponsor the offer of a token a sponsorable contract mints in the same transaction. */
     allowContractMints?: boolean;
-    /** Sponsor shielded swaps handed over as two halves; floor and (for a token caller) grant must both allow it. */
+    /** Sponsor shielded swaps sent in as two halves. The platform and, for an agent, the grant must both allow it. */
     allowSwaps?: boolean;
-    /** Types minted under any grant of this platform count as listed for every grant (needs `allowContractMints`). */
+    /** Token types minted under any grant count as allowed for every grant. Needs `allowContractMints`. */
     shareMintedTokenTypes?: boolean;
-    /** Types minted under the grant: part of `allowedTokenTypes`, listed or not. */
+    /** Token types minted under the grant. They are always part of `allowedTokenTypes`. */
     ownTokenTypes?: string[];
-    /** Types learned platform-wide that are part of `allowedTokenTypes`. */
+    /** Token types minted anywhere on the platform that are part of `allowedTokenTypes`. */
     sharedTokenTypes?: string[];
 }
 
@@ -40,21 +40,21 @@ export interface GrantPolicyInput {
     allowedContracts?: string[] | null;
     allowedCircuits?: string[] | null;
     allowDeploy?: boolean | null;
-    /** Addresses deployed under this grant; sponsorable on top of `floor ∩ grant`. */
+    /** Contracts deployed under this grant. They are sponsored in addition to the narrowed lists. */
     deployedContracts?: string[] | null;
     allowedTokenTypes?: string[] | null;
-    /** Raw types minted under this grant; sponsorable on top of `floor ∩ grant` while the floor sponsors contract mints. */
+    /** Token types minted under this grant. Sponsored in addition to the narrowed list while the platform sponsors contract mints. */
     mintedTokenTypes?: string[] | null;
     allowSwaps?: boolean | null;
 }
 
-/** Upper bound per list; a grant is one consumer, not a registry. */
+/** Maximum entries per list. A grant serves one consumer and does not need more. */
 export const MAX_POLICY_ENTRIES = 256;
 const MAX_ENTRY_LENGTH = 130;
 
 /**
- * Validate an operator allow-list: trimmed, de-duplicated. Malformed entries
- * throw rather than silently never matching.
+ * Validates an allow-list, trimmed and without duplicates.
+ * A malformed entry throws, so it cannot sit in the list and silently never match.
  */
 export function validatePolicyList(name: string, raw: unknown): string[] {
     if (raw === undefined || raw === null) return [];
@@ -72,7 +72,7 @@ export function validatePolicyList(name: string, raw: unknown): string[] {
     return out;
 }
 
-/** Validate raw token types (as in offer `deltas`): lowercase, no 0x, de-duplicated. */
+/** Validates raw token types as they appear in offer `deltas`. Lowercase, no 0x, no duplicates. */
 export function validateTokenTypeList(name: string, raw: unknown): string[] {
     if (raw === undefined || raw === null) return [];
     if (!Array.isArray(raw)) throw new Error(`${name} must be an array of strings`);
@@ -81,20 +81,20 @@ export function validateTokenTypeList(name: string, raw: unknown): string[] {
     for (const entry of raw) {
         if (typeof entry !== 'string') throw new Error(`${name} entries must be strings`);
         const v = entry.trim().toLowerCase().replace(/^0x/, '');
-        if (!/^[0-9a-f]{64}$/.test(v)) throw new Error(`${name} entry '${entry.trim().slice(0, 32)}' is not a raw token type (64 hex; use deriveTokenType)`);
+        if (!HEX64_RE.test(v)) throw new Error(`${name} entry '${entry.trim().slice(0, 32)}' is not a raw token type (64 hex; use deriveTokenType)`);
         if (!out.includes(v)) out.push(v);
     }
     return out;
 }
 
-// ---- Platform floor --------------------------------------------------------
+// ---- Platform policy -------------------------------------------------------
 
 function envPolicy(): SponsorPolicy {
     let allowedTokenTypes: string[];
     try {
         allowedTokenTypes = validateTokenTypeList('NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES', configList('NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES'));
     } catch (e) {
-        // Fail closed rather than sponsor under a list that silently lost an entry.
+        // Refuse to sponsor rather than use a list that silently lost an entry.
         throw new SponsorPolicyUnavailableError(`${(e as Error).message}; refusing to sponsor`);
     }
     return {
@@ -112,7 +112,7 @@ interface FileCache {
     path: string;
     mtimeMs: number;
     size: number;
-    policy: SponsorPolicy | null; // null = the current file is unusable
+    policy: SponsorPolicy | null;
     lastGood: SponsorPolicy | null;
     loadedAt: string | null; // when `lastGood` was read
 }
@@ -169,7 +169,7 @@ export function shadowedSponsorEnvKeys(): string[] {
     return SHADOWED_ENV_KEYS.filter(k => configIsSet(k));
 }
 
-/** Current platform floor: env, or the policy file re-read on mtime/size change. */
+/** The current platform policy. From env, or from the policy file, re-read when its time or size changes. */
 export function getGlobalSponsorPolicy(): SponsorPolicy {
     const filePath = configString('NIGHTGATE_SPONSOR_POLICY_FILE');
     if (!filePath) return envPolicy();
@@ -187,19 +187,19 @@ export function getGlobalSponsorPolicy(): SponsorPolicy {
         && fileCache.mtimeMs === stat.mtimeMs && fileCache.size === stat.size;
     if (unchanged) {
         if (fileCache!.policy) return fileCache!.policy;
-        // Already logged for this mtime; keep the fail-closed decision.
+        // This file version was already logged as bad. Keep the same answer.
         if (fileCache!.lastGood) return fileCache!.lastGood;
         throw new SponsorPolicyUnavailableError(`sponsor policy file ${filePath} is unusable and no policy was loaded before; refusing to sponsor`);
     }
 
     const lastGood = fileCache?.path === filePath ? fileCache.lastGood : null;
     if (!stat) {
-        // Still missing: log once, not per request.
+        // The file is still missing. Log it once, not on every request.
         if (fileCache?.path === filePath && fileCache.mtimeMs === -1) {
             if (lastGood) return lastGood;
             throw new SponsorPolicyUnavailableError(`sponsor policy file ${filePath} cannot be read and no policy was loaded before; refusing to sponsor`);
         }
-        log.error(`sponsor policy file ${filePath} cannot be read (${String((statError as Error)?.message ?? statError)}); ` +
+        log.error(`sponsor policy file ${filePath} cannot be read (${errorMessage(statError)}); ` +
             (lastGood ? 'keeping the last good policy' : 'no policy loaded yet, refusing every sponsored call'));
         fileCache = { path: filePath, mtimeMs: -1, size: -1, policy: null, lastGood, loadedAt: lastGood ? fileCache?.loadedAt ?? null : null };
         if (lastGood) return lastGood;
@@ -217,7 +217,7 @@ export function getGlobalSponsorPolicy(): SponsorPolicy {
             (policy.shareMintedTokenTypes ? ', minted types shared' : ''));
         return policy;
     } catch (e) {
-        log.error(`sponsor policy file ${filePath} is invalid (${String((e as Error)?.message ?? e)}); ` +
+        log.error(`sponsor policy file ${filePath} is invalid (${errorMessage(e)}); ` +
             (lastGood ? 'keeping the last good policy' : 'no policy loaded yet, refusing every sponsored call'));
         fileCache = { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size, policy: null, lastGood, loadedAt: lastGood ? fileCache?.loadedAt ?? null : null };
         if (lastGood) return lastGood;
@@ -236,8 +236,8 @@ export class SponsorPolicyEmptyError extends NightgateError {
 }
 
 function intersect(floor: string[], grant: string[] | null | undefined, what: string): string[] {
-    if (!grant || grant.length === 0) return floor;      // inherit the floor
-    if (floor.length === 0) return grant;                // floor unrestricted: the grant is the policy
+    if (!grant || grant.length === 0) return floor;      // no grant list: take the platform list
+    if (floor.length === 0) return grant;                // platform allows all: the grant list applies
     const both = grant.filter(g => floor.includes(g));
     if (both.length === 0) {
         throw new SponsorPolicyEmptyError(
@@ -248,25 +248,25 @@ function intersect(floor: string[], grant: string[] | null | undefined, what: st
 }
 
 /**
- * The floor narrowed by the grant; an empty intersection throws before a job exists.
- * `shared` = the platform's learned types; they join the floor's token list while the
- * floor shares minted types, so a grant inherits them or narrows to them.
+ * The platform policy narrowed by the grant. If nothing is left, it throws before a job is created.
+ * `shared` holds token types minted anywhere on the platform. They are added to the platform's
+ * token list while the platform shares minted types.
  */
 export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicyInput | null, shared: string[] = sharedLearnedTokenTypes()): SponsorPolicy {
     const contracts = intersect(floor.allowedContracts, grant?.allowedContracts, 'allowedContracts');
-    // Deployed addresses join after the intersection; an empty (unrestricted) list stays empty.
+    // Contracts deployed under the grant are added after narrowing. An empty list means "all" and stays empty.
     const deployed = [...new Set((grant?.deployedContracts ?? []).filter(a => typeof a === 'string' && a.length > 0))];
     const withDeployed = contracts.length === 0 || deployed.length === 0
         ? contracts
         : [...contracts, ...deployed.filter(a => !contracts.includes(a))];
-    // An empty token list means no offers at all, so an empty intersection
-    // narrows to that instead of stopping the grant's other calls.
+    // An empty token list means no offers at all. So an empty overlap just disables
+    // offers instead of blocking the grant's other calls.
     const sharing = floor.allowContractMints === true && floor.shareMintedTokenTypes === true;
     const sharedTypes = sharing ? [...new Set(shared.filter(t => typeof t === 'string' && HEX64_RE.test(t)))] : [];
     const floorTokens = floorTokenTypes(floor, sharedTypes);
     const grantTokens = (grant?.allowedTokenTypes ?? []).filter(t => typeof t === 'string' && t.length > 0);
     const listed = grantTokens.length === 0 ? floorTokens : grantTokens.filter(t => floorTokens.includes(t));
-    // What the grant minted joins after the intersection, like its deployed contracts.
+    // Token types the grant minted are added after narrowing, like its deployed contracts.
     const minted = floor.allowContractMints === true
         ? [...new Set((grant?.mintedTokenTypes ?? []).filter(t => typeof t === 'string' && HEX64_RE.test(t)))]
         : [];
@@ -284,15 +284,14 @@ export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicy
     };
 }
 
-/** The floor's listed types plus the shared learned ones. */
 function floorTokenTypes(floor: SponsorPolicy, sharedTypes: string[]): string[] {
     const listed = floor.allowedTokenTypes ?? [];
     return sharedTypes.length ? [...listed, ...sharedTypes.filter(t => !listed.includes(t))] : listed;
 }
 
 /**
- * Why a grant's lists cannot work under the floor, or null. For the write of a
- * grant; the check at sponsor time stays, since the floor can shrink later.
+ * Why a grant's lists cannot work under the platform policy, or null. Used when a grant is written.
+ * Sponsoring checks again later, because the platform policy can shrink.
  */
 export function grantPolicyConflict(floor: SponsorPolicy, grant: GrantPolicyInput, shared: string[] = sharedLearnedTokenTypes()): string | null {
     let effective: SponsorPolicy;
@@ -317,11 +316,9 @@ export interface SponsorPolicyDescription {
     /** Env settings the policy file replaces. */
     ignoredEnv: string[];
     floor: SponsorPolicy | null;
-    /** Why there is no floor; null when there is one. */
     floorError: string | null;
 }
 
-/** The floor in force and where it comes from. */
 export function describeGlobalSponsorPolicy(): SponsorPolicyDescription {
     const path = configString('NIGHTGATE_SPONSOR_POLICY_FILE') || null;
     let floor: SponsorPolicy | null = null;
@@ -342,7 +339,6 @@ export function describeGlobalSponsorPolicy(): SponsorPolicyDescription {
     };
 }
 
-/** For the OData handlers: the current floor, narrowed by `req.agentGrant`. */
 export function resolveSponsorPolicyForRequest(req: { agentGrant?: GrantPolicyInput | null }): SponsorPolicy {
     const grant = req?.agentGrant as GrantPolicyInput | undefined;
     return effectiveSponsorPolicy(getGlobalSponsorPolicy(), grant, sharedLearnedTokenTypes());

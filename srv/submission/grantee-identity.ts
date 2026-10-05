@@ -1,29 +1,29 @@
 /**
- * Maps a principal to the 32-byte `grantee` disclosure grants are keyed by.
- * Proving ownership of the DID/wallet before a row is written is the consumer's job.
+ * Maps a user to the 32-byte grantee id that disclosure grants use.
+ * This module does not prove that the user owns the DID or wallet. The deployment must do that.
  */
 import cds from '@sap/cds';
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
-import { GranteeIdentities } from '#cds-models/midnight';
+import { GranteeIdentities, type GranteeIdentity } from '#cds-models/midnight';
 import { type GranteeBinding } from '../utils/nightgate-config';
 import { hexToBytes } from '../utils/hex';
 import type { DbRunner } from '../utils/db-types';
+import { HEX64_ANY_CASE_RE } from '../utils/hex-patterns';
 
 const { SELECT } = cds.ql;
 
-const HEX64_RE = /^[0-9a-fA-F]{64}$/;
 
 /**
- * custom: the 64-hex id; wallet: sha256(coin pubkey bytes); did: sha256(utf8).
- * Grant issuers must use the same scheme or the ids will not match.
+ * custom uses the 64-hex id as is. wallet hashes the coin public key with sha256. did hashes the UTF-8 text.
+ * Grant issuers must use the same rule, or the ids will not match.
  */
 export function deriveGranteeId(kind: GranteeBinding, input: string): string {
     if (input == null || input === '') {
         throw new Error('grantee-identity: input is required');
     }
     if (kind === 'custom') {
-        if (!HEX64_RE.test(input)) {
+        if (!HEX64_ANY_CASE_RE.test(input)) {
             throw new Error('grantee-identity: custom granteeId must be 64 hex chars (32 bytes)');
         }
         return input.toLowerCase();
@@ -34,21 +34,15 @@ export function deriveGranteeId(kind: GranteeBinding, input: string): string {
         }
         return bytesToHex(sha256(hexToBytes(input)));
     }
-    // 'did'
     return bytesToHex(sha256(new TextEncoder().encode(input)));
 }
 
 export interface ResolveGranteeIdOptions {
-    /** Matching and global rows apply; omitted = global rows only. */
+    /** Rows of this scope and global rows apply. Without a scope, only global rows apply. */
     scope?: string;
 }
 
-interface GranteeIdentityRow {
-    granteeId: string;
-    scope?: string | null;
-}
-
-/** The principal's granteeId or null; an exactly scoped row wins over a global one. */
+/** A row for the exact scope wins over a global row. */
 export async function resolveGranteeId(
     req: cds.Request,
     db: DbRunner,
@@ -57,7 +51,7 @@ export async function resolveGranteeId(
     const userId = req.user?.id;
     if (!userId) return null;
 
-    const rows: GranteeIdentityRow[] =
+    const rows: GranteeIdentity[] =
         (await db.run(SELECT.from(GranteeIdentities).where({ userId }))) || [];
     if (rows.length === 0) return null;
 

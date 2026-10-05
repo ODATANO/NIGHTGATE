@@ -1,7 +1,7 @@
 /**
- * Resolves and guards the fee-sponsor session (main thread). Cross-user
- * sponsoring only for platform-listed sessions: otherwise a guessed or leaked
- * session id could drain a foreign wallet's dust.
+ * Loads and checks the wallet session that pays fees for other users.
+ * Only sessions listed in the platform config may pay for other users.
+ * Otherwise a guessed or leaked session id could spend someone else's dust.
  */
 
 import type { NightgatePluginConfig } from '../utils/nightgate-config';
@@ -16,14 +16,13 @@ import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
 import { NightgateError } from '../utils/errors';
 
 /**
- * Per-sponsor sync-to-tip wait during prewarm (0 = build only). Sequential,
- * because all facades share one worker thread and parallel catch-up starves each.
+ * How long startup waits for each sponsor wallet to sync to the chain tip. 0 means build only.
+ * Sponsors sync one after another, because all wallets share one worker thread.
  */
 export function prewarmSyncBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
     return configNumberFrom('NIGHTGATE_SPONSOR_PREWARM_SYNC_MS', env);
 }
 
-/** Carries the OData status the handlers reject with. */
 export class FeeSponsorError extends NightgateError {
     constructor(status: number, message: string) {
         super('FEE_SPONSOR_UNUSABLE', message, { status });
@@ -33,19 +32,18 @@ export class FeeSponsorError extends NightgateError {
 }
 
 export interface ResolvedFeeSponsor {
-    /** The OData session id the caller passed (audit surface). */
     sponsorSessionId: string;
-    /** Worker facade key derived from the sponsor's viewing key. */
+    /** Key of the sponsor's wallet in the worker, derived from its viewing key. */
     accountId: string;
-    /** Decrypted BIP39 seed hex; needed to (re)initialise the facade. */
+    /** Decrypted BIP39 seed in hex. Needed to build the wallet in the worker. */
     seedHex: string;
     /** Sync-state passphrase derived from the sponsor's viewing key. */
     syncStatePassphrase: string;
-    /** BIP32 account level the sponsor seed signs with (WalletSessions.accountIndex). */
+    /** BIP32 account index the sponsor seed signs with, from WalletSessions.accountIndex. */
     accountIndex: number;
 }
 
-/** Re-export; lives in session-expiry.ts so modules below this one can use it. */
+/** Re-exported. It lives in session-expiry.ts so lower-level modules can import it too. */
 export { getConfiguredFeeSponsorSessions } from '../utils/session-expiry';
 import { getConfiguredFeeSponsorSessions, isSessionExpired } from '../utils/session-expiry';
 import { configNumberFrom } from '../utils/config';
@@ -55,21 +53,21 @@ import type { DbRunner } from '../utils/db-types';
 export interface ResolveFeeSponsorOptions {
     db: DbRunner;
     sponsorSessionId: string;
-    /** Required unless the sponsor id is platform-listed. */
+    /** Required unless the sponsor is listed in the platform config. */
     requestingUserId?: string;
     config?: NightgatePluginConfig;
-    /** Test seam; defaults to the process-scoped key from srv/utils/crypto.ts. */
+    /** For tests. Defaults to the process key from srv/utils/crypto.ts. */
     encryptionKey?: Buffer;
 }
 
-/** Loads, authorises and decrypts the sponsor session; never leaks whether a foreign id exists. */
+/** Loads, authorizes and decrypts the sponsor session. Never reveals whether another user's session id exists. */
 export async function resolveFeeSponsor(opts: ResolveFeeSponsorOptions): Promise<ResolvedFeeSponsor> {
     const platformSponsors = getConfiguredFeeSponsorSessions(opts.config);
     const isPlatformSponsor = platformSponsors.includes(opts.sponsorSessionId);
 
     const where: Record<string, unknown> = { sessionId: opts.sponsorSessionId, isActive: true };
     if (!isPlatformSponsor) {
-        // Scoped to the caller, so a foreign id reads back as not-found.
+        // Only the caller's own sessions are found, so another user's id looks like not found.
         if (!opts.requestingUserId) {
             throw new FeeSponsorError(403, 'sponsorSessionId requires an authenticated caller');
         }
@@ -114,13 +112,13 @@ export async function resolveFeeSponsor(opts: ResolveFeeSponsorOptions): Promise
     };
 }
 
-/** Idempotent: builds the sponsor's worker facade before a sponsored submission. */
+/** Builds the sponsor's wallet in the worker before a sponsored submission. Safe to call again. */
 export async function ensureFeeSponsorFacade(
     sponsor: ResolvedFeeSponsor,
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex' | 'syncStatePassphrase'>
 ): Promise<void> {
-    // accountIndex AFTER the spread: facadeConfig may carry the CALLING
-    // session's account; the sponsor facade must derive the sponsor's own.
+    // Set accountIndex after the spread. facadeConfig may hold the caller's account,
+    // but the sponsor wallet must use the sponsor's own.
     await getOrBuildWalletFacade(sponsor.accountId, {
         ...facadeConfig,
         seedHex: sponsor.seedHex,
@@ -130,8 +128,8 @@ export async function ensureFeeSponsorFacade(
 }
 
 /**
- * Warm the platform sponsor pool after boot, one facade at a time (one worker
- * thread). A failing sponsor is logged and skipped; pool failover covers it.
+ * Starts the platform sponsor wallets after boot, one at a time.
+ * A failing sponsor is logged and skipped. The pool then uses the other sponsors.
  */
 export async function prewarmFeeSponsorPool(opts: {
     db: DbRunner;

@@ -1,11 +1,11 @@
-/** Handlers for the abstract `AttestationService` CDS mixin; row-level visibility is out of scope. */
+/** Access checks for the `AttestationService` base service. They decide per view, not per row. */
 import type cds from '@sap/cds';
 import {
     attachDisclosureRole,
     meetsDisclosure,
     DisclosureRoleValue
 } from '../../srv/middleware/disclosure-role';
-import type { NightgateRequest } from '../../srv/utils/request-types';
+import type { Request } from '@sap/cds';
 
 export type AttestationTier = 'Public' | 'Disclosed' | 'Authority';
 
@@ -16,8 +16,8 @@ const REQUIRED: Record<AttestationTier, DisclosureRoleValue> = {
 };
 
 /**
- * Call from `init()`: sets `req.disclosureRole` on every request and answers reads
- * of `Disclosed`/`Authority` below the required tier with 403, not an empty set.
+ * Call this from `init()`. It sets `req.disclosureRole` on every request.
+ * A read of a view the caller's role does not allow fails with 403 instead of returning nothing.
  */
 export function registerAttestationServiceHandlers(
     srv: cds.ApplicationService,
@@ -27,14 +27,14 @@ export function registerAttestationServiceHandlers(
         await attachDisclosureRole(req, db);
     });
 
-    // CAP runs before-handlers in parallel: the gate cannot rely on the '*' hook.
+    // CAP runs before-handlers in parallel, so the role may not be set yet when these checks run.
     (srv as any).before('READ', 'Disclosed', makeTierGate('Disclosed', db));
     (srv as any).before('READ', 'Authority', makeTierGate('Authority', db));
 }
 
 function makeTierGate(tier: AttestationTier, db: cds.DatabaseService) {
     const required = REQUIRED[tier];
-    return async (req: NightgateRequest) => {
+    return async (req: Request) => {
         let actual = req.disclosureRole;
         if (actual === undefined) {
             actual = await attachDisclosureRole(req, db);
@@ -46,23 +46,23 @@ function makeTierGate(tier: AttestationTier, db: cds.DatabaseService) {
 }
 
 /**
- * Portable Attestation Credential proof envelope; field names are a public contract.
- * `proofValue` is the proving tx hash: Midnight proofs are not verifiable standalone.
+ * A proof result in a portable format. The field names are public and must not change.
+ * `proofValue` is the hash of the transaction that carried the proof. Midnight proofs can only be checked on chain.
  */
 export interface PredicateAttestationEnvelope {
     digestMultibase: string | null;
     claim: {
         predicate: string;            // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership'
-        threshold: string | null;     // scaled integer as a string; null for the bytes kinds
+        threshold: string | null;     // scaled integer as a string. null for bytesEquality and setMembership.
         unit: string | null;
-        expectedDigest?: string;      // bytesEquality: public expected value digest
-        setRoot?: string;             // setMembership: canonical allow-list set root
+        expectedDigest?: string;      // bytesEquality only. Hash of the expected value.
+        setRoot?: string;             // setMembership only. Hash of the allow-list.
     };
     proof: {
         system: 'midnight-compact';
-        circuit: string;              // proving circuit, derived from the predicate kind
+        circuit: string;              // the contract function that made the proof
         verificationMethod: string;   // AttestationVault contract address
-        proofValue: string;           // proving tx hash
+        proofValue: string;           // hash of the transaction that carried the proof
     };
 }
 
@@ -73,7 +73,7 @@ function circuitForPredicate(predicate: string): string {
     return 'proveFieldPredicate';
 }
 
-/** A `PredicateAttestations` row or issue* job result as a PAC envelope; pure, needs no service context. */
+/** Converts a `PredicateAttestations` row or a proof job result into the portable format. */
 export function toPredicateEnvelope(row: {
     predicate: string;
     threshold?: number | string | null;

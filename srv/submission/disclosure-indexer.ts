@@ -1,7 +1,7 @@
 /**
- * Materializes the vault's on-chain `disclosures` map into `DisclosureGrants`.
- * Snapshots are read at a block height and never overwrite a row with a newer
- * `changedAtHeight`, so a stale read cannot revive a revoke or roll a level back.
+ * Copies the vault contract's on-chain disclosure grants into `DisclosureGrants`.
+ * The chain state is read at a block height. A row changed at a later height is
+ * never overwritten, so an old read cannot undo a revoke or lower a level.
  */
 import cds from '@sap/cds';
 import { DisclosureGrants, type DisclosureGrant } from '#cds-models/midnight';
@@ -14,7 +14,7 @@ function hex(b: Uint8Array): string {
     return Buffer.from(b).toString('hex');
 }
 
-/** Minimal shape of the compiled artifact's `ledger(state)` return we rely on. */
+/** The part of the contract's decoded state that this module reads. */
 export interface DisclosureLedger {
     attestations: Iterable<[Uint8Array, { payload_hash: Uint8Array; owner: Uint8Array }]>;
     disclosures: {
@@ -30,7 +30,7 @@ export interface DisclosureGrantRecord {
     level: number;
 }
 
-/** Every active grant; enumerates keys via `attestations` since the outer `disclosures` map is not iterable. */
+/** All active grants. The `disclosures` map cannot be iterated, so its keys come from `attestations`. */
 export function enumerateGrants(led: DisclosureLedger): DisclosureGrantRecord[] {
     const rows: DisclosureGrantRecord[] = [];
     for (const [recordKey, record] of led.attestations) {
@@ -50,34 +50,29 @@ export function enumerateGrants(led: DisclosureLedger): DisclosureGrantRecord[] 
 export interface ReindexDeps {
     db: DbRunner;
     contractAddress: string;
-    /** The compiled artifact's `ledger` decoder. */
     ledger: (state: any) => DisclosureLedger;
-    /** publicDataProvider.queryContractState; with a height, the state as of that block. */
     queryContractState: (contractAddress: string, atHeight?: number) => Promise<any | null>;
-    /** Landed height of the change that triggered this reindex; the state is read as of it. */
+    /** Block height where the triggering change landed. The state is read at this height. */
     atHeight?: number | null;
-    /** Latest indexed block height; used when `atHeight` is not given. */
+    /** Latest indexed block height. Used when `atHeight` is not given. */
     queryTipHeight?: () => Promise<number | null>;
     /**
-     * Rows without a recorded height modified within this window (default 10 min)
-     * are not swept: the queried state may predate a just-submitted grant.
+     * Rows without a height that changed within this window (default 10 min) stay active.
+     * The chain state read may be older than a grant that was just submitted.
      */
     sweepGraceMs?: number;
 }
 
 export interface ReindexResult {
-    /** Grants found on-chain for this contract. */
     indexed: number;
-    /** Previously-active rows flipped to inactive (revoked on-chain). */
+    /** Active rows set inactive because the grant is gone on-chain. */
     deactivated: number;
-    /** Block height the snapshot was read at; null when unknown. */
     snapshotHeight: number | null;
 }
 
 export const DEFAULT_SWEEP_GRACE_MS = 10 * 60 * 1000;
 
-// One reindex per contract at a time: two interleaved passes could write
-// each other's older snapshot last.
+// One reindex per contract at a time. Two parallel runs could let the older state win.
 const reindexChains = new Map<string, Promise<unknown>>();
 
 function heightOf(row: any): number | null {
@@ -88,8 +83,8 @@ function heightOf(row: any): number | null {
 }
 
 /**
- * Idempotent upsert of one contract's grants (keeps the handler's `grantedTxHash`);
- * active rows missing on-chain are swept inactive. Serialized per contract.
+ * Writes one contract's grants into the table and marks active rows that are gone on-chain inactive.
+ * Safe to repeat. Keeps an existing `grantedTxHash`.
  */
 export function reindexDisclosures(deps: ReindexDeps): Promise<ReindexResult> {
     const key = deps.contractAddress.toLowerCase();
@@ -112,7 +107,7 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
     const state = await queryContractState(contractAddress, height ?? undefined);
     if (!state) return { indexed: 0, deactivated: 0, snapshotHeight: height };
 
-    // ContractState carries the ledger in `.data`; `ledger()` also takes a bare StateValue.
+    // The state may come wrapped with the ledger in `.data`, or bare.
     const led = ledger(state.data ?? state);
     const onChain = enumerateGrants(led);
 
@@ -129,12 +124,11 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
         );
         if (existing) {
             const rowHeight = heightOf(existing);
-            // Newer than the snapshot: the row already reflects a later change.
+            // The row already holds a later change than this state.
             if (height !== null && rowHeight !== null && rowHeight > height) continue;
-            // Unordered snapshot: a confirmed revoke is never revived by it.
+            // Without a height we cannot order this state, so it never undoes a confirmed revoke.
             if (height === null && rowHeight !== null && existing.revokedTxHash) continue;
-            // Compare-and-set on the height read above: a revoke confirmed in
-            // between carries a newer height and must not be overwritten.
+            // Only update if the height is unchanged. A revoke confirmed meanwhile has a newer height.
             await db.run(UPDATE.entity(DisclosureGrants)
                 .set({ level: g.level, active: true, revokedTxHash: null, modifiedAt: now, ...stamp })
                 .where({ ID: existing.ID, changedAtHeight: rowHeight }));
@@ -156,7 +150,7 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
         }
     }
 
-    // Rows with a height are ordered against the snapshot; without, the grace window applies.
+    // Rows with a height are compared by height. Rows without one use the grace window.
     const activeRows: DisclosureGrant[] = (await db.run(
         SELECT.from(DisclosureGrants).where({ contractAddress, active: true })
     )) || [];
@@ -181,7 +175,7 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
     return { indexed: onChain.length, deactivated, snapshotHeight: height };
 }
 
-/** Indexer tip height, or null: a failure leaves the reindex unordered rather than failing it. */
+/** Latest indexer block height, or null on failure. The reindex then runs without a height. */
 export async function queryIndexerTipHeight(indexerHttpUrl: string, fetchFn: typeof fetch = fetch): Promise<number | null> {
     try {
         const r = await fetchFn(indexerHttpUrl, {
@@ -201,16 +195,14 @@ export async function queryIndexerTipHeight(indexerHttpUrl: string, fetchFn: typ
 export interface ReindexForContractArgs {
     db: DbRunner;
     contractAddress: string;
-    /** Compiled contract artifact (`.../contract/index.js`). */
     artifactPath: string;
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
-    /** Landed height of the change this reindex follows; the snapshot is read as of it. */
     atHeight?: number | null;
 }
 
 /**
- * Reindex with real providers and the artifact's `ledger`. Callers treat it as
- * best-effort: an indexing failure must not fail the grant/revoke submission.
+ * Reindexes one contract using the real providers.
+ * Callers treat a failure as non-fatal, it must not fail the grant or revoke.
  */
 export async function reindexDisclosuresForContract(
     args: ReindexForContractArgs

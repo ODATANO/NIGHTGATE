@@ -52,8 +52,13 @@ import { publishRuntimeState } from '../../srv/utils/runtime-state';
 describe('NightgateIndexerService health', () => {
     let service: NightgateIndexerService;
 
+    // A local .env must not change what these tests read.
+    afterEach(() => { vi.unstubAllEnvs(); });
+
     beforeEach(async () => {
         vi.clearAllMocks();
+        vi.stubEnv('NIGHTGATE_CRAWLER_ENABLED', '');
+        vi.stubEnv('NIGHTGATE_NETWORK', '');
         // Readiness requires a completed initialisation; initialize() never
         // runs here, so publish the state the builder reads.
         publishRuntimeState({ initialized: true, mode: 'idle' });

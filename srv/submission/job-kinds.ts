@@ -1,52 +1,51 @@
 /**
- * Every durable background-job kind, defined once: its traits, the persisted command
- * operation its executor accepts, the executor and the reconciliation finalizer. The
- * runner's lists and the processor registrations derive from this table, so they
- * cannot drift: a kind without traits, or without a processor, fails at boot.
+ * The one table of all background job kinds and how each one runs.
+ * The job runner and the processor registrations are built from it.
+ * A kind missing here, or without a processor, fails at startup.
  */
 export interface JobKindTraits {
-    /** Runs a full ZK proof: all heavy kinds share one concurrency cap (one proof server saturates at four). */
+    /** Runs a full ZK proof. All heavy kinds share one limit on how many run at once. */
     heavy: boolean;
-    /** Drives child commands; the parent row has no txHash and reconciles from its children. */
+    /** Runs other jobs as its steps. It has no txHash of its own, its state follows from the steps. */
     workflowParent: boolean;
-    /** `txHash` is the ledger identifier, which only the indexer resolves (never the crawler). */
+    /** `txHash` holds the ledger transaction identifier, which only the indexer can look up, not the crawler. */
     identifierKeyed: boolean;
-    /** One job at a time: its work serializes on the worker thread anyway, parallel runs only delay the first result. */
+    /** One job at a time. The work queues on the worker thread anyway, so parallel runs only delay the first result. */
     serial?: boolean;
-    /** Its product dies with the process (warm facade): pending/running rows end at restart, never re-queue. */
+    /** Its result is an in-memory wallet that is lost on restart. Open jobs end at restart and are never re-run. */
     sessionBound?: boolean;
 }
 
-/** Which executor runs a kind; `wallet` kinds are registered by the wallet-session module. */
+/** Which executor runs a kind. `wallet` kinds are registered by the wallet session module. */
 export type JobExecutor = 'wallet' | 'contract' | 'mintShieldedTestToken' | 'mintFactoryToken' | 'sponsorFinalized' | 'sponsorUnbound' | 'reindexDisclosures';
 
-/** Reconciliation finalizer run once a parked job's inclusion is proven. */
+/** Bookkeeping that runs once a job whose outcome was unclear is confirmed on-chain. */
 export type JobFinalizer = 'contractProjection' | 'sponsoredSubmission' | 'factoryMint';
 
 export interface JobKindDefinition {
     traits: JobKindTraits;
     executor: JobExecutor;
-    /** The one persisted `command.op` the executor accepts; absent where the executor checks its own shape. */
+    /** The stored `command.op` this kind accepts. Absent when the executor checks the command itself. */
     op?: string;
     finalizer?: JobFinalizer;
 }
 
 export const LIGHT_KIND: JobKindTraits = { heavy: false, workflowParent: false, identifierKeyed: false };
 export const HEAVY_KIND: JobKindTraits = { heavy: true, workflowParent: false, identifierKeyed: false };
-/** A proving workflow parent: its own executor proves nothing, but it holds a heavy slot while its children run. */
+/** A workflow that proves through its steps. It holds a heavy slot while the steps run. */
 export const WORKFLOW_PARENT_KIND: JobKindTraits = { heavy: true, workflowParent: true, identifierKeyed: false };
 
 const contract = (op: string, traits: JobKindTraits = HEAVY_KIND, finalizer?: JobFinalizer): JobKindDefinition =>
     ({ traits, executor: 'contract', op, ...(finalizer ? { finalizer } : {}) });
 
 export const JOB_KINDS: Readonly<Record<string, JobKindDefinition>> = {
-    // wallet lifecycle (srv/sessions/wallet-session-lifecycle.ts)
+    // Wallet jobs, see srv/sessions/wallet-session-lifecycle.ts.
     connectWalletForSigning: { traits: { ...LIGHT_KIND, serial: true, sessionBound: true }, executor: 'wallet', op: 'prewarm' },
     registerForDustGeneration: { traits: HEAVY_KIND, executor: 'wallet', op: 'registerDust' },
     deregisterFromDustGeneration: { traits: HEAVY_KIND, executor: 'wallet', op: 'deregisterDust' },
     sendNight: { traits: HEAVY_KIND, executor: 'wallet', op: 'sendNight' },
 
-    // contracts (srv/submission/actions/)
+    // Contract jobs, see srv/submission/actions/.
     deployContract: contract('deploy'),
     submitContractCall: contract('call'),
     submitContractCallBatch: contract('callBatch', HEAVY_KIND, 'contractProjection'),
@@ -57,10 +56,10 @@ export const JOB_KINDS: Readonly<Record<string, JobKindDefinition>> = {
     revokeDisclosure: contract('revokeDisclosure', HEAVY_KIND, 'contractProjection'),
     registerPassport: contract('registerPassport', HEAVY_KIND, 'contractProjection'),
     retract: contract('retract', HEAVY_KIND, 'contractProjection'),
-    // projection catch-up after a post-submit reindex failed; no chain effect
+    // Retries a failed table update after a submit. Sends nothing to the chain.
     reindexDisclosures: { traits: LIGHT_KIND, executor: 'reindexDisclosures', op: 'reindexDisclosures' },
 
-    // proving workflows and their child steps
+    // Proof workflows and their steps.
     issueFieldPredicateAttestation: contract('fieldPredicateWorkflow', WORKFLOW_PARENT_KIND),
     issueFieldPredicateAttestationBatch: contract('fieldPredicateBatchWorkflow', WORKFLOW_PARENT_KIND),
     issueFieldEqualityAttestation: contract('fieldEqualityWorkflow', WORKFLOW_PARENT_KIND),
@@ -75,17 +74,17 @@ export const JOB_KINDS: Readonly<Record<string, JobKindDefinition>> = {
     documentIntegrityProof: contract('call'),
     documentDiffProof: contract('call'),
 
-    // cross-server sponsoring; the unbound sponsor proves its dust spend per job
+    // Paying fees for transactions built elsewhere. An unbound sponsor job proves its own dust spend.
     buildSponsorableTx: contract('buildSponsorable'),
     sponsorFinalizedTransaction: {
         traits: { heavy: false, workflowParent: false, identifierKeyed: true }, executor: 'sponsorFinalized', finalizer: 'sponsoredSubmission'
     },
-    // Runs in parallel: the worker proves and submits unbound jobs outside the per-facade
-    // submit lock, so N jobs overlap on N dust backings.
+    // Runs in parallel. The worker proves and submits these outside the per-wallet lock,
+    // so several jobs can run at once, each on its own dust source.
     sponsorUnboundTransaction: {
         traits: { heavy: true, workflowParent: false, identifierKeyed: true }, executor: 'sponsorUnbound', finalizer: 'sponsoredSubmission'
     },
-    // Two swap halves instead of one caller transaction; the same channel from the merge on.
+    // Takes two swap halves instead of one transaction. After merging them it runs like the job above.
     sponsorSwap: {
         traits: { heavy: true, workflowParent: false, identifierKeyed: true }, executor: 'sponsorUnbound', finalizer: 'sponsoredSubmission'
     }
@@ -99,7 +98,7 @@ export function jobKindsOf(executor: JobExecutor): string[] {
     return Object.entries(JOB_KINDS).filter(([, def]) => def.executor === executor).map(([kind]) => kind);
 }
 
-/** The persisted operation `kind` accepts; undefined for an unknown kind or one that checks its own shape. */
+/** The stored operation `kind` accepts. Undefined for an unknown kind or one that checks the command itself. */
 export function jobKindOp(kind: string): string | undefined {
     return Object.prototype.hasOwnProperty.call(JOB_KINDS, kind) ? JOB_KINDS[kind].op : undefined;
 }

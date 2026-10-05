@@ -1,5 +1,5 @@
 /**
- * Shared context of the submission handlers: collaborators plus the helpers the actions and executors use.
+ * Shared helpers and collaborators for the submission actions and job executors.
  * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
@@ -10,21 +10,21 @@ import { resolveFeeSponsor, type ResolvedFeeSponsor } from '../fee-sponsor';
 import { loadCircuitArgTypes } from '../arg-coercion';
 import { resolveNightgateRuntimeConfig, type NightgateNetwork, VALID_NIGHTGATE_NETWORKS, getConfiguredPrivateStateBackend, getNightgatePluginConfig } from '../../utils/nightgate-config';
 import { type ContractProvidersConfig } from '../../midnight/providers';
-import { startJob, type BackgroundJobRow } from '../background-jobs';
+import { startJob } from '../background-jobs';
 import { reindexDisclosuresForContract } from '../disclosure-indexer';
 import { readAttestationStateForContract } from '../attestation-state';
 import { DEFAULT_ATTESTATION_VAULT_REF, vaultDims, contractProvidersConfigFromEnv, contractProvidersConfigForNetwork } from '../verify-state';
 import { readPredicateStateForContract } from '../predicate-state';
 import { loadPureCircuitsFromRegistry } from '../document-proof';
-import { DisclosureGrants } from '#cds-models/midnight';
+import { DisclosureGrants, type BackgroundJob } from '#cds-models/midnight';
 import { configMs } from '../../utils/config';
 import type { DbRunner } from '../../utils/db-types';
 import type { TokenFactoryOps } from '../token-factory';
-import type { NightgateRequest } from '../../utils/request-types';
+import type { ActionRequest } from '@sap/cds';
+import { errorMessage } from '../../utils/errors';
 
 const { UPDATE } = cds.ql;
 
-/** Collaborators of the submission handlers; tests override them. */
 export interface SubmissionDeps {
     srv: cds.ApplicationService;
     db: DbRunner;
@@ -40,19 +40,19 @@ export interface SubmissionDeps {
     tokenFactory: TokenFactoryOps;
 }
 
-/** Crawler-free checks of recorded evidence against live contract state. */
+/** Checks stored proofs against the live contract state, without the local block index. */
 export function createStateVerifiers(deps: Pick<SubmissionDeps, 'contractResolver' | 'attestationStateReader' | 'predicateStateReader'>) {
     const { contractResolver, attestationStateReader, predicateStateReader } = deps;
 
     /**
-     * Crawler-free evidence for verifyDocument: the attester's record of the
-     * sha256 in live state. Any error is a clean false, never a 5xx.
+     * True when the live contract holds the attester's entry for this document hash.
+     * Any error returns false instead of a server error.
      */
     async function verifyDocumentViaState(
         contractAddress: string,
         attesterId: string,
         payloadHash: string,
-        compiledArtifactRef?: string,
+        compiledArtifactRef?: string | null,
         networkOverride?: NightgateNetwork,
         recordedArtifactDigest?: string | null
     ): Promise<boolean> {
@@ -60,8 +60,8 @@ export function createStateVerifiers(deps: Pick<SubmissionDeps, 'contractResolve
             const compiledRef = compiledArtifactRef && compiledArtifactRef.length > 0
                 ? compiledArtifactRef
                 : DEFAULT_ATTESTATION_VAULT_REF;
-            // Atomic digest check: a re-pointed alias or overwritten asset throws
-            // and yields false, never a false "verified".
+            // The resolver throws if the contract files no longer match the recorded digest.
+            // That returns false, so a changed contract never reports a false match.
             const resolved = await contractResolver(compiledRef, recordedArtifactDigest ?? undefined);
             const state = await attestationStateReader({
                 contractAddress,
@@ -77,13 +77,13 @@ export function createStateVerifiers(deps: Pick<SubmissionDeps, 'contractResolve
     }
 
     /**
-     * Crawler-free evidence for verifyPredicateAttestation: the row's recomputed
-     * claim key holds true on-chain. Any error is a clean false, never a 5xx.
+     * True when the claim stored in this row is set on-chain.
+     * Any error returns false instead of a server error.
      */
     async function verifyPredicateViaState(row: any): Promise<boolean> {
         try {
-            // The artifact, digest and network recorded at proving time, so a
-            // redeploy or re-pointed alias cannot change what a stored claim verifies.
+            // Use the contract and network recorded when the proof was made.
+            // A later re-registration then cannot change the result.
             const rowRef = row.compiledArtifactRef || DEFAULT_ATTESTATION_VAULT_REF;
             const resolved = await contractResolver(rowRef, row.artifactDigest ?? undefined);
             const recordedNetwork = row.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(row.network)
@@ -120,27 +120,22 @@ export function createStateVerifiers(deps: Pick<SubmissionDeps, 'contractResolve
 
 export type StateVerifiers = ReturnType<typeof createStateVerifiers>;
 
-/** The disclosure projection: confirmed levels, height stamps and the reindex after a submit. */
+/** Keeps the DisclosureGrants table in line with the chain after a grant or revoke lands. */
 export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'contractResolver' | 'disclosureReindexer'>) {
     const { db, contractResolver, disclosureReindexer } = deps;
 
-    /**
-     * Grant columns once the chain took the level. `active` is left to the
-     * disclosure indexer, which re-materialises it from ledger state right after.
-     */
+    /** `active` is not set here. The reindex reads it from the ledger right after. */
     function confirmedDisclosureLevel(level: number, txHash: string, changedAt: string, landedHeight: number | null): Record<string, unknown> {
         return { level, pendingLevel: null, grantedTxHash: txHash, revokedTxHash: null, modifiedAt: changedAt, ...heightStamp(landedHeight) };
     }
 
-    /** The row's `changedAtHeight` column value for a change that landed at `height` (nothing when unknown). */
     function heightStamp(height: number | null): Record<string, unknown> {
         return Number.isInteger(height) && (height as number) >= 0 ? { changedAtHeight: height } : {};
     }
 
     /**
-     * A confirmation that landed at `height` only writes rows nothing ordered has
-     * touched since: unstamped rows, or rows stamped strictly below it. Same-block
-     * and unknown-height writes defer to the reindex, which reads the ledger.
+     * Limits an update to rows not changed at or after `height`, so an older
+     * confirmation never overwrites a newer one. Without a height only unstamped rows match.
      */
     function notNewerThan(query: any, height: number | null): any {
         return Number.isInteger(height) && (height as number) >= 0
@@ -149,8 +144,8 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
     }
 
     /**
-     * Drop the pending marker of a level request the chain did not take; matching
-     * on `pendingLevel` leaves a newer request untouched.
+     * Clears the pending level after the chain rejected it.
+     * Matching on `pendingLevel` leaves a newer request untouched.
      */
     async function clearPendingDisclosureLevel(disclosureGrantId: string, level: number): Promise<void> {
         try {
@@ -158,14 +153,10 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
                 .set({ pendingLevel: null, modifiedAt: new Date().toISOString() })
                 .where({ ID: disclosureGrantId, pendingLevel: level }));
         } catch {
-            /* best-effort; the marker is never read by the ACL */
+            /* Best effort. Access checks never read this marker. */
         }
     }
 
-    /**
-     * Best-effort reindex as of the landed height (the snapshot cannot predate the
-     * change); a failure never fails the submission, a later reindex reconciles.
-     */
     function runDisclosureReindex(contractAddress: string, resolved: ResolvedContract, atHeight: number | null): Promise<unknown> {
         return disclosureReindexer({
             db,
@@ -177,16 +168,15 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
     }
 
     /**
-     * Projection catch-up after a landed grant, revoke or retract. The
-     * confirmation write is already in; a failed reindex is retried by a durable
-     * `reindexDisclosures` job under the originating job's session.
+     * Runs the reindex after a landed grant or revoke.
+     * If it fails, a `reindexDisclosures` job retries it under the same session.
      */
-    async function reindexAfterSubmit(contractAddress: string, resolved: ResolvedContract, atHeight: number | null, origin: BackgroundJobRow, compiledArtifactRef: string): Promise<void> {
+    async function reindexAfterSubmit(contractAddress: string, resolved: ResolvedContract, atHeight: number | null, origin: BackgroundJob, compiledArtifactRef: string): Promise<void> {
         try {
             await runDisclosureReindex(contractAddress, resolved, atHeight);
             return;
         } catch (err) {
-            cds.log('nightgate').warn(`disclosure reindex of ${contractAddress.slice(0, 16)} after job ${origin.ID} failed, queuing a retry job: ${String((err as Error)?.message ?? err).slice(0, 200)}`);
+            cds.log('nightgate').warn(`disclosure reindex of ${contractAddress.slice(0, 16)} after job ${origin.ID} failed, queuing a retry job: ${errorMessage(err).slice(0, 200)}`);
         }
         try {
             await startJob({
@@ -200,12 +190,11 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
                 command: { op: 'reindexDisclosures', contractAddress, compiledArtifactRef, atHeight }
             });
         } catch (err) {
-            cds.log('nightgate').error(`could not queue the reindexDisclosures retry for ${contractAddress.slice(0, 16)}; run reindexDisclosures by hand: ${String((err as Error)?.message ?? err).slice(0, 200)}`);
+            cds.log('nightgate').error(`could not queue the reindexDisclosures retry for ${contractAddress.slice(0, 16)}; run reindexDisclosures by hand: ${errorMessage(err).slice(0, 200)}`);
         }
     }
 
-    /** Retries the reindex with backoff until it lands or the retry window closes. */
-    async function executeReindexDisclosures(raw: unknown, job: BackgroundJobRow): Promise<unknown> {
+    async function executeReindexDisclosures(raw: unknown, job: BackgroundJob): Promise<unknown> {
         const command = raw as { op: string; contractAddress: string; compiledArtifactRef: string; atHeight: number | null; artifactDigest?: string };
         if (!command || command.op !== 'reindexDisclosures') throw new Error(`Persisted command operation '${(command as any)?.op}' is incompatible with ${job.kind}`);
         const resolved = await contractResolver(command.compiledArtifactRef, command.artifactDigest);
@@ -224,7 +213,7 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
             if (elapsed + backoff > windowMs) break;
             await new Promise(resolve => setTimeout(resolve, backoff));
         }
-        throw Object.assign(new Error(`disclosure reindex of ${command.contractAddress.slice(0, 16)} still failing after ${Math.round((Date.now() - startedAt) / 1000)} s; run reindexDisclosures once the indexer answers: ${String((lastError as Error)?.message ?? lastError).slice(0, 200)}`), { code: 'DISCLOSURE_REINDEX_FAILED', retryable: false });
+        throw Object.assign(new Error(`disclosure reindex of ${command.contractAddress.slice(0, 16)} still failing after ${Math.round((Date.now() - startedAt) / 1000)} s; run reindexDisclosures once the indexer answers: ${errorMessage(lastError).slice(0, 200)}`), { code: 'DISCLOSURE_REINDEX_FAILED', retryable: false });
     }
 
     return { confirmedDisclosureLevel, heightStamp, notNewerThan, clearPendingDisclosureLevel, runDisclosureReindex, reindexAfterSubmit, executeReindexDisclosures };
@@ -232,15 +221,14 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
 
 export type DisclosureProjection = ReturnType<typeof createDisclosureProjection>;
 
-/** What admission needs besides the collaborators: the attester, submitter deps and the fee sponsor. */
 export function createSubmissionSupport(deps: Pick<SubmissionDeps, 'db' | 'attesterIdResolver'>) {
     const { db, attesterIdResolver } = deps;
 
     /**
-     * The attester an issue action proves against: the session's own unless named.
-     * A content root anchors only under the own record (the circuit keys by caller).
+     * The attester id an issue action uses: the session's own unless the caller names one.
+     * A new content root can only be stored under the session's own id, since the contract keys it by caller.
      */
-    async function resolveAttester(req: NightgateRequest, sessionId: string | undefined, requested: string | undefined, anchorsRoot: boolean): Promise<string | null> {
+    async function resolveAttester(req: ActionRequest<unknown, unknown>, sessionId: string | null | undefined, requested: string | null | undefined, anchorsRoot: boolean): Promise<string | null> {
         let own: string;
         try {
             own = await attesterIdResolver({ sessionId: sessionId!, db, expectedUserId: req.user?.id });
@@ -282,10 +270,9 @@ export function createSubmissionSupport(deps: Pick<SubmissionDeps, 'db' | 'attes
         };
     }
 
-    /** The optional per-tx fee sponsor; null when none was requested. */
     async function resolveSponsorForRequest(
-        req: NightgateRequest,
-        sponsorSessionId: string | undefined
+        req: ActionRequest<unknown, unknown>,
+        sponsorSessionId: string | null | undefined
     ): Promise<ResolvedFeeSponsor | null> {
         if (!sponsorSessionId) return null;
         return resolveFeeSponsor({

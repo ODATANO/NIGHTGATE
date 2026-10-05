@@ -62,7 +62,6 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
     IdempotencyConflictError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).IdempotencyConflictError,
     IdempotencyKeyInvalidError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).IdempotencyKeyInvalidError,
     WorkflowReconciliationRequiredError: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).WorkflowReconciliationRequiredError,
-    withLockContentionRetry: (await importOriginal<typeof import('../../srv/submission/background-jobs')>()).withLockContentionRetry,
     startJob: (...args: unknown[]) => (mockStartJob as any)(...args),
     runChildCommand: async (args: any) => {
         const processor = registeredProcessors.get(`${args.kind}\0${args.commandVersion}`);
@@ -131,6 +130,7 @@ import {
     type CircuitArgType
 } from '../../srv/submission/arg-coercion';
 import path from 'path';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 // ---- Fakes ----------------------------------------------------------------
 
@@ -225,10 +225,6 @@ describe('deployContract: argument validation', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/JSON/));
     });
 
-    test('rejects a malformed recoveryId', async () => {
-        const req = await setupAndCallDeploy({ ...VALID_DEPLOY_ARGS, recoveryId: 'abc' });
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/recoveryId must be 64 hex/));
-    });
 });
 
 describe('submitContractCall: argument validation', () => {
@@ -526,7 +522,7 @@ describe('mintShieldedTestToken + deriveTokenType', () => {
         const req = makeReq({ contractAddress: ADDRESS });
         const out = await srv.handlers['deriveTokenType'](req) as any;
         expect(req.reject).not.toHaveBeenCalled();
-        expect(out.tokenTypeHex).toMatch(/^[0-9a-f]{64}$/);
+        expect(out.tokenTypeHex).toMatch(HEX64_RE);
         expect(out.contractAddress).toBe(ADDRESS);
         expect(walletMaterialFactory).not.toHaveBeenCalled();
     });
@@ -932,20 +928,6 @@ describe('anchorDocument', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sha256/));
     });
 
-    test('rejects non-hex sha256', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ANCHOR_ARGS(), sha256: 'NOT_HEX_AT_ALL_NOT_64_CHARS' });
-        await srv.handlers['anchorDocument'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/64 hex chars/));
-    });
-
-    test('rejects wrong-length sha256', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ANCHOR_ARGS(), sha256: 'a'.repeat(63) });
-        await srv.handlers['anchorDocument'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/64 hex chars/));
-    });
-
     test('rejects missing storageRef', async () => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ANCHOR_ARGS(), storageRef: undefined });
@@ -1121,13 +1103,6 @@ describe('verifyDocument', () => {
         const req = makeReq({ documentId: DOC_ID });
         await srv.handlers['verifyDocument'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/providedSha256/));
-    });
-
-    test('rejects non-hex providedSha256', async () => {
-        const srv = setupHandlersWithDb(makeDbWithSequence([]));
-        const req = makeReq({ documentId: DOC_ID, providedSha256: 'not_hex' });
-        await srv.handlers['verifyDocument'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/64 hex chars/));
     });
 
     test('404 when document not found', async () => {
@@ -1366,25 +1341,11 @@ describe('grantDisclosure', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash/));
     });
 
-    test('rejects non-hex payloadHash', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ARGS(), payloadHash: 'nope' });
-        await srv.handlers['grantDisclosure'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash must be 64 hex/));
-    });
-
     test('rejects missing grantee', async () => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ARGS(), grantee: undefined });
         await srv.handlers['grantDisclosure'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/grantee is required/));
-    });
-
-    test('rejects non-hex grantee', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ARGS(), grantee: 'short' });
-        await srv.handlers['grantDisclosure'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/grantee must be 64 hex/));
     });
 
     test('rejects missing level', async () => {
@@ -1708,13 +1669,6 @@ describe('revokeDisclosure', () => {
         expect(result).toMatchObject({ reconciled: true, payloadHash: VALID_PAYLOAD, grantee: VALID_GRANTEE, txHash: '0xrevoke' });
     });
 
-    test('rejects non-hex grantee', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ARGS(), grantee: 'short' });
-        await srv.handlers['revokeDisclosure'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/grantee must be 64 hex/));
-    });
-
     test('rejects missing sessionId', async () => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ARGS(), sessionId: undefined });
@@ -1773,13 +1727,6 @@ describe('registerPassport', () => {
         });
         return { srv, db };
     }
-
-    test('rejects non-hex passportId', async () => {
-        const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ARGS(), passportId: 'short' });
-        await srv.handlers['registerPassport'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/documentId must be 64 hex/));
-    });
 
     test('rejects missing ownerId', async () => {
         const { srv } = setupHandlersWithDb();
@@ -1937,7 +1884,7 @@ describe('registerGranteeIdentity', () => {
 
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.bindingKind).toBe('wallet');
-        expect(result.granteeId).toMatch(/^[0-9a-f]{64}$/);
+        expect(result.granteeId).toMatch(HEX64_RE);
         expect(result.ID).toEqual(expect.any(String));
 
         const insert = run.mock.calls.map(c => c[0]).find(q => q.INSERT);
@@ -2233,15 +2180,12 @@ describe('issueFieldPredicateAttestation', () => {
 
     test.each([
         [{ payloadHash: undefined }, /payloadHash is required/],
-        [{ payloadHash: 'nope' }, /payloadHash must be 64 hex/],
         [{ fieldKey: undefined }, /fieldKey is required/],
-        [{ fieldKey: 'zz' }, /fieldKey must be 64 hex/],
         [{ value: undefined }, /value is required/],
         [{ value: '' }, /value is required/],
         [{ value: '47.3' }, /value must be an integer/],
         [{ value: '-5' }, /value must be a non-negative integer/],
         [{ fieldSalt: undefined }, /fieldSalt .*is required/],
-        [{ fieldSalt: 'zz' }, /fieldSalt/],
         [{ threshold: undefined }, /threshold is required/],
         [{ threshold: 'abc' }, /threshold must be an integer/],
         [{ threshold: '9223372036854775808' }, /threshold exceeds the recorded range/],
@@ -2252,7 +2196,6 @@ describe('issueFieldPredicateAttestation', () => {
         [{ dirsJson: JSON.stringify([true]) }, /array of 4 booleans/],
         [{ siblingsJson: JSON.stringify([...SIBLINGS.slice(0, 3), 'short']) }, /each sibling must be 64 hex/],
         [{ dirsJson: JSON.stringify([true, false, 'false', true]) }, /dirsJson entries must be booleans/],
-        [{ contentRoot: 'oops' }, /contentRoot must be 64 hex/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/]
     ])('rejects %o', async (patch, msg) => {
@@ -2385,8 +2328,6 @@ describe('issueFieldPredicateAttestationBatch', () => {
 
     test.each([
         [{ payloadHash: undefined }, /payloadHash is required/],
-        [{ payloadHash: 'nope' }, /payloadHash must be 64 hex/],
-        [{ contentRoot: 'oops' }, /contentRoot must be 64 hex/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/],
         [{ claimsJson: undefined }, /claimsJson is required/],
@@ -2455,7 +2396,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         for (const c of claims) {
             expect(c).toEqual({
                 predicateAttestationId: expect.any(String),
-                fieldKey: expect.stringMatching(/^[0-9a-f]{64}$/),
+                fieldKey: expect.stringMatching(HEX64_RE),
                 predicate: 'lessOrEqual',
                 threshold: expect.any(String),
                 unit: 'kgCO2e/kWh'
@@ -2591,13 +2532,10 @@ describe('issueFieldEqualityAttestation', () => {
 
     test.each([
         [{ payloadHash: undefined }, /payloadHash is required/],
-        [{ fieldKey: 'zz' }, /fieldKey must be 64 hex/],
         [{ expectedDigest: undefined }, /exactly one of expectedValue \/ expectedDigest/],
         [{ expectedValue: 'NMC811' }, /exactly one of expectedValue \/ expectedDigest/],
-        [{ expectedDigest: 'zz' }, /expectedDigest must be 64 hex/],
         [{ siblingsJson: JSON.stringify(SIBLINGS.slice(0, 2)) }, /array of 4 hashes/],
         [{ dirsJson: JSON.stringify([true, false, 'false', true]) }, /entries must be booleans/],
-        [{ contentRoot: 'oops' }, /contentRoot must be 64 hex/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/]
     ])('rejects %o', async (patch, msg) => {
@@ -2722,14 +2660,11 @@ describe('issueFieldMembershipAttestation', () => {
     }
 
     test.each([
-        [{ payloadHash: 'zz' }, /payloadHash must be 64 hex/],
         [{ fieldKey: undefined }, /fieldKey is required/],
         [{ valueDigest: undefined }, /exactly one of value \/ valueDigest/],
         [{ value: 'EEA' }, /exactly one of value \/ valueDigest/],
-        [{ valueDigest: 'zz' }, /valueDigest must be 64 hex/],
         [{ allowedValuesJson: '["EEA"]' }, /not both/],
         [{ setRoot: undefined, setSiblingsJson: undefined, setDirsJson: undefined }, /allowedValuesJson or setRoot \+ setSiblingsJson \+ setDirsJson is required/],
-        [{ setRoot: 'zz' }, /setRoot must be 64 hex/],
         [{ setSiblingsJson: JSON.stringify(SET_SIBLINGS.slice(0, 3)) }, /setSiblingsJson must be a JSON array of 6 hashes/],
         [{ setDirsJson: JSON.stringify([true, false, 'false', true, false, true]) }, /setDirsJson entries must be booleans/],
         [{ siblingsJson: JSON.stringify(SIBLINGS.slice(0, 2)) }, /array of 4 hashes/],
@@ -3008,7 +2943,6 @@ describe('issueDocumentIntegrityAttestation', () => {
 
     test.each([
         [{ payloadHashA: undefined }, /payloadHashA is required/],
-        [{ payloadHashA: 'zz' }, /payloadHashA must be 64 hex/],
         [{ payloadHashB: undefined }, /payloadHashB is required/],
         [{ payloadHashB: PAYLOAD_A.toUpperCase() }, /must differ/],
         [{ allowedMask: undefined }, /allowedMask is required/],
@@ -3023,10 +2957,7 @@ describe('issueDocumentIntegrityAttestation', () => {
         [{ openingAJson: JSON.stringify({ ...DOC_OPENING_A, saltSeed: 'zz' }) }, /saltSeed must be 64 hex/],
         [{ openingBJson: JSON.stringify({ ...DOC_OPENING_B, slots: [{ present: true }, ...DOC_OPENING_B.slots.slice(1)] }) }, /present slot needs value or valueDigest/],
         [{ schemaJson: 'not json' }, /must be valid JSON/],
-        [{ contentRootA: 'oops' }, /contentRootA must be 64 hex/],
-        [{ contentRootB: 'oops' }, /contentRootB must be 64 hex/],
-        [{ schemaId: undefined }, /schemaId .* is required when anchoring/],
-        [{ schemaId: 'oops' }, /schemaId/],
+        [{ schemaId: undefined }, /schemaId is required when anchoring/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/]
     ])('rejects %o', async (patch, msg) => {

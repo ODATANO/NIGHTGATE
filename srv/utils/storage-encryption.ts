@@ -1,13 +1,14 @@
 /**
- * Byte-exact wire format of the Midnight SDK's LevelDB private-state encryption, for cross-import:
- * base64(version 2 | salt 32 | iv 12 | tag 16 | AES-256-GCM ciphertext), key = PBKDF2-SHA256(password, salt, 600k).
+ * The same encryption format the Midnight SDK uses for its LevelDB private state, so data can move between both.
+ * Layout, base64 encoded: version byte, 32-byte salt, 12-byte IV, 16-byte tag, then AES-256-GCM ciphertext.
+ * The key is PBKDF2-SHA256 over the password and salt with 600,000 rounds.
  */
 
 import crypto from 'crypto';
 
 export const ALGORITHM                  = 'aes-256-gcm';
-export const KEY_LENGTH                 = 32;   // AES-256
-export const IV_LENGTH                  = 12;   // GCM standard
+export const KEY_LENGTH                 = 32;
+export const IV_LENGTH                  = 12;
 export const AUTH_TAG_LENGTH            = 16;
 export const SALT_LENGTH                = 32;
 export const PBKDF2_ITERATIONS_V2       = 600_000;
@@ -17,7 +18,7 @@ export const CURRENT_ENCRYPTION_VERSION = ENCRYPTION_VERSION_V2;
 const VERSION_PREFIX_LENGTH = 1;
 const HEADER_LENGTH         = VERSION_PREFIX_LENGTH + SALT_LENGTH + IV_LENGTH + AUTH_TAG_LENGTH;
 
-/** Mirrors the SDK's StorageEncryption; one instance per (password, salt). */
+/** Same behaviour as the SDK's StorageEncryption. One instance per password and salt. */
 export class StorageEncryption {
     readonly salt: Buffer;
     private readonly encryptionKey: Buffer;
@@ -28,7 +29,7 @@ export class StorageEncryption {
         this.encryptionKey = precomputedKey ?? deriveKey(password, this.salt);
     }
 
-    /** Zero the derived key; encrypt/decrypt throw afterwards instead of emitting garbage. */
+    /** Wipes the key from memory. Encrypt and decrypt throw afterwards. */
     clear(): void {
         this.encryptionKey.fill(0);
         this.cleared = true;
@@ -38,13 +39,12 @@ export class StorageEncryption {
         if (this.cleared) throw new Error('StorageEncryption: key has been cleared');
     }
 
-    /** Construct with PBKDF2 on the libuv threadpool instead of the event loop. */
+    /** Creates an instance without blocking the event loop while the key is derived. */
     static async createAsync(password: string, salt: Buffer): Promise<StorageEncryption> {
         const key = await deriveKeyAsync(password, salt);
         return new StorageEncryption(password, salt, key);
     }
 
-    /** Encrypts `data` (UTF-8 string) and returns base64-encoded SDK wire format. */
     encrypt(data: string): string {
         this.assertUsable();
         const plaintext = Buffer.from(data, 'utf-8');
@@ -56,7 +56,7 @@ export class StorageEncryption {
         return Buffer.concat([version, this.salt, iv, authTag, encrypted]).toString('base64');
     }
 
-    /** Decrypt an SDK-format payload; its salt must match this instance's. */
+    /** Decrypts data in the SDK format. Its salt must match this instance's salt. */
     decrypt(encryptedData: string): string {
         this.assertUsable();
         const data = Buffer.from(encryptedData, 'base64');
@@ -78,7 +78,7 @@ export function deriveKey(password: string, salt: Buffer): Buffer {
     return crypto.pbkdf2Sync(password, salt, PBKDF2_ITERATIONS_V2, KEY_LENGTH, 'sha256');
 }
 
-/** Same derivation as `deriveKey`, on the libuv threadpool (non-blocking). */
+/** Same as `deriveKey`, but does not block the event loop. */
 export function deriveKeyAsync(password: string, salt: Buffer): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         crypto.pbkdf2(password, salt, PBKDF2_ITERATIONS_V2, KEY_LENGTH, 'sha256',
@@ -111,7 +111,7 @@ export function extractEncryptedComponents(data: Buffer): EncryptedComponents {
     };
 }
 
-/** Decrypt an SDK-format payload, deriving the key from its embedded salt. */
+/** Decrypts data in the SDK format, using the salt stored inside it. */
 export function decryptWithPassword(encryptedData: string, password: string): string {
     const data = Buffer.from(encryptedData, 'base64');
     const { version, salt, iv, authTag, encrypted } = extractEncryptedComponents(data);

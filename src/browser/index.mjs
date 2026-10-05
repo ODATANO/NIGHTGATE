@@ -1,13 +1,8 @@
-// `@odatano/nightgate/browser`: browser entry for the wallet-connector path.
+// `@odatano/nightgate/browser`, the entry point for browser apps that use a Midnight wallet.
+// Everything here runs in a browser. Nothing depends on CAP or Node.
 //
-// Browser-safe surface ONLY: no @sap/cds, no worker, no Node-only providers.
-// Heavy contract artifacts are exposed via per-contract subpaths so consumers
-// import just what they need and the barrel stays light:
+// The compiled contracts are large, so each has its own import path:
 //   import { Contract, ledger } from '@odatano/nightgate/browser/attestation-vault';
-//
-// This barrel re-exports the witness/attester-secret helpers, a small
-// metadata map, provider wiring (connector -> midnight-js providers), and
-// typed call helpers.
 
 export {
     deriveAttestationSecret,
@@ -17,7 +12,6 @@ export {
     buildAttestationVaultWitnesses
 } from './witnesses.mjs';
 
-// Providers + typed call helpers.
 export { FetchZkConfigProvider } from './zk-config.mjs';
 export { InMemoryPrivateStateProvider } from './private-state.mjs';
 export { createNightgateConnectorProviders, buildProofProvider, resolveManifestUrl } from './providers.mjs';
@@ -43,32 +37,27 @@ export {
 } from './attestation-vault-calls.mjs';
 
 /**
- * Static metadata for the contracts NIGHTGATE ships browser artifacts for.
- * The deployed address + zk-config URL come at runtime from the NIGHTGATE
- * `/contract-manifest` endpoint, NOT hard-coded here.
+ * Fixed facts about the contracts this package ships for the browser.
+ * The deployed address and the key URL come from the server's `/contract-manifest` route.
  */
 export const CONTRACTS = {
     'attestation-vault': {
         name: 'attestation-vault',
         artifactSubpath: '@odatano/nightgate/browser/attestation-vault',
         circuits: ['attest', 'retract', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
-        // Circuits that need the attester-identity witness (local_secret_key).
-        // The proof circuits are NOT in here: holders prove without the secret.
+        // Circuits that need the attester's secret key.
+        // The proof circuits are not listed, because a document holder can prove without it.
         attesterGated: ['attest', 'retract', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'bindDocument', 'anchorContentRoot'],
-        // Circuits that need the per-call proof bundle witnesses
-        // (proveFieldEquality: path only; proveFieldMembership: digest + set
-        // path; proveDocumentComparison: docPair leaf layers).
+        // Circuits that need the document's Merkle proof data as private input.
         merkleWitnessed: ['proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
         hasPrivateState: false,
-        // Content-tree dimensions: provable fields per document and the
-        // inclusion-path depth. Pass `slotWidth` to the prepare* helpers /
-        // buildAttestationVaultWitnesses when targeting a non-16 variant.
+        // A document has up to `slotWidth` provable fields, stored as a Merkle tree of depth `merkleDepth`.
+        // For a vault with another width, pass `slotWidth` to the prepare helpers and to buildAttestationVaultWitnesses.
         slotWidth: 16,
         merkleDepth: 4
     },
-    // 32-slot width variant: same circuit set and semantics, tree width 32
-    // (panels of 17-32 provable fields under ONE root). Cross-root proofs
-    // only work between documents of the SAME width.
+    // The same contract for documents with up to 32 provable fields.
+    // A proof that compares two documents only works when both use the same width.
     'attestation-vault-32': {
         name: 'attestation-vault-32',
         artifactSubpath: '@odatano/nightgate/browser/attestation-vault-32',

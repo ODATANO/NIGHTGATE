@@ -1,7 +1,6 @@
 /**
- * Document proofs: the prepare handlers and agent-output provenance over a
- * vault's pure circuits. Canonical JSON, content roots, schema ids and the
- * membership-set rule live in `@odatano/contract-kit` and are re-exported here.
+ * Actions that prepare document proofs and record AI agent outputs on-chain.
+ * The hashing rules live in `@odatano/contract-kit` and are re-exported here.
  */
 import cds from '@sap/cds';
 import { randomBytes } from 'node:crypto';
@@ -35,8 +34,8 @@ import {
 } from '@odatano/contract-kit';
 import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
 import { formatErr } from '../utils/format-error';
-import type { NightgateRequest } from '../utils/request-types';
 import { NightgateError } from '../utils/errors';
+import { attestAgentOutput, prepareDocumentProof, prepareMembershipSet } from '#cds-models/NightgateService';
 
 export {
     blake2b256Hex,
@@ -56,14 +55,13 @@ export type { PureCircuits, ProofFieldSpec, PreparedField, SchemaDescriptorWire,
 
 const log = cds.log('nightgate:document-proof');
 
-const HEX64_RE = /^[0-9a-fA-F]{64}$/;
 const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
 
 export function slotWidthForRef(compiledRef: string): number {
     return slotWidthOf(getContractRegistration(compiledRef));
 }
 
-// Compute-only, but each call imports the artifact and hashes a full tree.
+// These actions send nothing, but each call loads the contract and hashes a full tree.
 const prepareRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 120 });
 
 // ---- Pure-circuit loading -------------------------------------------------
@@ -88,8 +86,8 @@ export class PureCircuitsUnavailableError extends NightgateError {
 
 export const AGENT_OUTPUT_CONTENT_TYPE = 'application/vnd.nightgate.agent-output.v1+json';
 
-/** `producedAt` of an agent-output envelope, recorded in the anchor job's request. */
-export function agentOutputProducedAt(contentType: string | undefined, metadata: string): string | null {
+/** Reads `producedAt` from agent-output metadata, so the job request records it. */
+export function agentOutputProducedAt(contentType: string | null | undefined, metadata: string): string | null {
     if (contentType !== AGENT_OUTPUT_CONTENT_TYPE) return null;
     try {
         const producedAt = JSON.parse(metadata)?.producedAt;
@@ -111,29 +109,26 @@ async function recordedProducedAt(sessionId: string, idempotencyKey: string, use
 }
 
 export interface DocumentProofHandlerDeps {
-    /** Test seam; defaults to the registry-backed artifact import. */
+    /** For tests. Defaults to loading the registered contract. */
     loadPure?: (compiledRef: string) => Promise<PureCircuits>;
-    /** Test seam; defaults to the `producedAt` recorded by the anchor job under the same key. */
+    /** For tests. Defaults to the `producedAt` stored by the earlier job with the same idempotency key. */
     findProducedAt?: (sessionId: string, idempotencyKey: string, userId: string | undefined) => Promise<string | null>;
 }
 
-export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandlerDeps = {}): void {
+export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps: DocumentProofHandlerDeps = {}): void {
     const loadPure = deps.loadPure ?? loadPureCircuitsFromRegistry;
     const findProducedAt = deps.findProducedAt ?? recordedProducedAt;
 
-    srv.on('prepareDocumentProof', async (req: NightgateRequest) => {
-        const clientKey = req?._?.req?.ip || 'global';
+    srv.on(prepareDocumentProof, async (req) => {
+        const clientKey = req.http?.req?.ip || 'global';
         const rate = prepareRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
         }
 
-        const data = req.data as { documentJson?: string; proofFieldsJson?: string; saltSeed?: string; compiledArtifactRef?: string };
+        const data = req.data;
         if (!data.documentJson) return req.reject(400, 'documentJson is required');
         if (!data.proofFieldsJson) return req.reject(400, 'proofFieldsJson is required');
-        if (data.saltSeed !== undefined && data.saltSeed !== null && data.saltSeed !== '' && !HEX64_RE.test(data.saltSeed)) {
-            return req.reject(400, 'saltSeed must be 64 hex chars (32 bytes)');
-        }
 
         let document: Record<string, unknown>;
         try {
@@ -185,8 +180,9 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
 
         const canonicalDocument = canonicalize(document);
         const payloadHash = blake2b256Hex(canonicalDocument);
-        // Random for dictionary resistance; caller-supplied to re-prepare an anchored payload.
-        const saltSeed = data.saltSeed && HEX64_RE.test(data.saltSeed)
+        // Random by default, so field hashes cannot be guessed by trying values.
+        // A caller passes the old seed to rebuild a document already on-chain.
+        const saltSeed = data.saltSeed
             ? fromHex32(data.saltSeed)
             : randomBytes(32);
         let built: BuiltContentRoot;
@@ -195,7 +191,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         } catch (err) {
             return req.reject(400, (err as Error).message);
         }
-        // Never log the response: it carries witness material.
+        // Never log the response. It holds the private proof inputs.
         log.info(`prepared document proof: ${specs.length} fields, ${built.emptyFields.length} empty`);
 
         return {
@@ -207,22 +203,20 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
             fields: JSON.stringify(built.fields),
             emptyFields: JSON.stringify(built.emptyFields),
             leaves: JSON.stringify(built.leaves),
-            // Losing the seed makes the anchored root unprovable; leaking it
-            // makes shared leaf hashes dictionary-testable.
+            // Holds the salt seed. Without it nothing can be proven about the stored root.
+            // If it leaks, field values can be guessed by trying candidates.
             opening: JSON.stringify(built.opening)
         };
     });
 
-    srv.on('prepareMembershipSet', async (req: NightgateRequest) => {
-        const clientKey = req?._?.req?.ip || 'global';
+    srv.on(prepareMembershipSet, async (req) => {
+        const clientKey = req.http?.req?.ip || 'global';
         const rate = prepareRateLimiter.check(clientKey);
         if (!rate.allowed) {
             return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
         }
 
-        const data = req.data as {
-            allowedValuesJson?: string; value?: string; valueDigest?: string; compiledArtifactRef?: string;
-        };
+        const data = req.data;
         if (!data.allowedValuesJson) return req.reject(400, 'allowedValuesJson is required');
         let allowed: unknown;
         try {
@@ -231,15 +225,12 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         if (!Array.isArray(allowed) || allowed.length === 0 || allowed.some(v => typeof v !== 'string' || v.length === 0)) {
             return req.reject(400, 'allowedValuesJson must be a non-empty JSON array of non-empty strings');
         }
-        // Raw cap: dedupe to 64 runs after hashing every entry.
+        // Every entry is hashed before duplicates are removed, so limit the raw list size.
         if (allowed.length > 1024) {
             return req.reject(400, 'allowedValuesJson exceeds 1024 raw entries');
         }
         if (data.value !== undefined && data.valueDigest !== undefined) {
             return req.reject(400, 'pass at most one of value / valueDigest');
-        }
-        if (data.valueDigest !== undefined && !HEX64_RE.test(data.valueDigest)) {
-            return req.reject(400, 'valueDigest must be 64 hex chars (32 bytes)');
         }
 
         const compiledRef = data.compiledArtifactRef?.length ? data.compiledArtifactRef : DEFAULT_ATTESTATION_VAULT_REF;
@@ -255,12 +246,12 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
             const values = allowed as string[];
             if (data.value === undefined && data.valueDigest === undefined) {
                 const { setRoot, digests } = buildMembershipSet(values, pure);
-                return { setRoot, memberCount: digests.length };
+                return { setRoot, memberCount: digests.length, setSiblingsJson: null, setDirsJson: null };
             }
             const memberDigest = data.valueDigest ?? blake2b256Hex(data.value!);
             const path = membershipPathFor(values, memberDigest, pure);
             if (!path) return req.reject(400, 'value is not in the allowed list');
-            // Never log the path: which slot matched narrows the hidden value.
+            // Never log the path. It reveals which list entry matched.
             return {
                 setRoot: path.setRoot,
                 memberCount: canonicalSetDigests(values).length,
@@ -272,13 +263,8 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         }
     });
 
-    srv.on('attestAgentOutput', async (req: NightgateRequest) => {
-        const data = req.data as {
-            agentId?: string; inputHash?: string; outputHash?: string;
-            modelId?: string; policyHash?: string; producedAt?: string; storageRef?: string;
-            sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
-            idempotencyKey?: string; sponsorSessionId?: string;
-        };
+    srv.on(attestAgentOutput, async (req) => {
+        const data = req.data;
 
         if (!data.agentId || data.agentId.length > 200) {
             return req.reject(400, 'agentId is required (at most 200 characters)');
@@ -292,7 +278,6 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
                 if (required) return req.reject(400, `${name} is required`);
                 continue;
             }
-            if (!HEX64_RE.test(value)) return req.reject(400, `${name} must be 64 hex chars (32 bytes)`);
         }
         if (data.modelId && data.modelId.length > 200) return req.reject(400, 'modelId must be at most 200 characters');
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
@@ -303,13 +288,13 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
             if (Number.isNaN(t.getTime())) return req.reject(400, 'producedAt must be a valid ISO-8601 timestamp');
             producedAt = t.toISOString();
         } else {
-            // A retry under the same key re-derives the first call's envelope.
+            // A retry with the same key reuses the first call's time, so the hash stays the same.
             producedAt = (data.idempotencyKey
                 ? await findProducedAt(data.sessionId, data.idempotencyKey, req.user?.id)
                 : null) ?? new Date().toISOString();
         }
 
-        // Hashes only; agentId/modelId are public. Verifiers re-hash the canonical form.
+        // Only hashes go on-chain. agentId and modelId are public.
         const envelope: Record<string, unknown> = {
             v: 1,
             agentId: data.agentId,
@@ -322,7 +307,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
         const envelopeJson = canonicalize(envelope);
         const payloadHash = blake2b256Hex(envelopeJson);
 
-        // The envelope is the anchor's metadata blob, so the on-chain metadata hash commits to it.
+        // The envelope is sent as metadata, so its hash is stored on-chain.
         try {
             const anchored = await srv.send({
                 event: 'anchorDocument',
@@ -338,7 +323,7 @@ export function registerDocumentProofHandlers(srv: any, deps: DocumentProofHandl
                     sponsorSessionId: data.sponsorSessionId
                 },
                 user: req.user,
-                // Checked on this request already; the anchor job is recorded under the same grant.
+                // Already checked for this request. The job is recorded under the same grant.
                 agentGrant: req.agentGrant
             } as any);
             return { ...anchored, payloadHash, envelopeJson };

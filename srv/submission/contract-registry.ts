@@ -1,7 +1,7 @@
 /**
- * Maps a `compiledArtifactRef` name to its compiled module, `privateStateId` and
- * `zkConfigPath`. In-memory; loaded from `cds.requires.nightgate.contracts`,
- * where an entry names an installed lineage package or the paths of a foreign artifact.
+ * In-memory map from a contract name (`compiledArtifactRef`) to its compiled module,
+ * `privateStateId` and `zkConfigPath`. Filled from `cds.requires.nightgate.contracts`.
+ * A "generation digest" identifies the exact build behind a name: module, keys and settings.
  */
 
 import type { NightgatePluginConfig } from '../utils/nightgate-config';
@@ -16,7 +16,6 @@ import { ensureProverKeys, missingProverKeys, ZK_ASSET_URL_ENV } from './prover-
 import { configMs } from '../utils/config';
 import { NightgateError } from '../utils/errors';
 
-/** A relative path of a foreign artifact resolves against baseDir. */
 function resolveContractPath(p: string, baseDir: string): string {
     return path.isAbsolute(p) ? p : path.join(baseDir, p);
 }
@@ -28,15 +27,13 @@ export interface ContractRegistration {
     /** Directory containing `keys/` and `zkir/`. */
     zkConfigPath: string;
     /**
-     * Provable fields per document of a vault-family artifact (default 16); must
-     * match the artifact's witness shapes. Non-default widths enter the digest.
+     * Number of provable fields per document in a vault contract, 16 by default.
+     * Must match the compiled contract. A non-default value is part of the digest.
      */
     slotWidth?: number;
-    /** The installed lineage package the paths point into, when there is one. */
     package?: ContractPackageRef;
 }
 
-/** Identity and key source of an installed lineage package. */
 export interface ContractPackageRef {
     name: string;
     version: string;
@@ -44,18 +41,17 @@ export interface ContractPackageRef {
     zkAssetLayout?: ZkAssetLayout;
 }
 
-/** A registration's content-tree width, defaulting to the classic 16. */
 export function slotWidthOf(reg: Pick<ContractRegistration, 'slotWidth'> | undefined): number {
     return reg?.slotWidth ?? 16;
 }
 
 export interface ResolvedContract {
-    /** Main-thread CompiledContract wrapper; only with `{ compile: true }`. Jobs compile in the worker. */
+    /** CompiledContract for the main thread, only set with `{ compile: true }`. Jobs compile in the worker. */
     compiledContract?: unknown;
     privateStateId: string;
     zkConfigPath: string;
     slotWidth?: number;
-    /** The worker re-imports the module from here; compiledContract does not cross threads. */
+    /** The worker imports the module again from this path, because compiledContract cannot be sent to another thread. */
     artifactPath: string;
     artifactDigest: string;
 }
@@ -67,21 +63,21 @@ export function registerContract(name: string, reg: ContractRegistration): void 
     if (!name || !reg.artifactPath || !reg.privateStateId || !reg.zkConfigPath) {
         throw new Error('registerContract: all fields are required');
     }
-    // No 64: masks use 32-bit JS bitwise ops and a signed Integer64 column.
+    // 64 is not allowed. Field masks use 32-bit JS bit operations and a signed Integer64 column.
     if (reg.slotWidth !== undefined
         && (![16, 32].includes(reg.slotWidth))) {
         throw new Error(`registerContract: slotWidth must be 16 or 32 (got ${String(reg.slotWidth)})`);
     }
-    // Frozen clone: mutating the caller's object must not re-point the alias
-    // behind the generation digest's back.
+    // Store a frozen copy, so a later change to the caller's object cannot
+    // change the registration without updating its digest.
     registry.set(name, Object.freeze({ ...reg }));
     generationDigests.delete(name);
     currentDigestCache.delete(name);
 }
 
 /**
- * Cached digest of the registration a name resolves to (module, privateStateId,
- * zk assets). Persisted commands and evidence record it; resolves compare fail-closed.
+ * Cached digest of the build a name points to. Stored jobs and proof results record it,
+ * and loading a contract refuses to run when it no longer matches.
  */
 export function getArtifactGenerationDigest(name: string): string {
     const cached = generationDigests.get(name);
@@ -97,8 +93,8 @@ export function getArtifactGenerationDigest(name: string): string {
 const CURRENT_DIGEST_MAX_AGE_MS = configMs('NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS');
 
 /**
- * Stat-only change detector. Inode and ctime join size and mtime because a
- * replace or restore can preserve mtime and size, but not inode or ctime.
+ * Cheap change check from file stats only. Inode and ctime are included because
+ * replacing or restoring a file can keep its mtime and size.
  */
 function statFingerprint(reg: ContractRegistration): string {
     const parts: string[] = [];
@@ -118,7 +114,7 @@ function statFingerprint(reg: ContractRegistration): string {
         let files: string[] = [];
         try {
             files = fs.readdirSync(dir).sort();
-        } catch { /* asset-less artifacts */ }
+        } catch { /* contracts without zk assets */ }
         for (const f of files) add(path.join(dir, f));
     }
     return crypto.createHash('sha256').update(parts.join('\n')).digest('hex');
@@ -127,8 +123,8 @@ function statFingerprint(reg: ContractRegistration): string {
 const currentDigestCache = new Map<string, { fingerprint: string; digest: string; computedAt: number }>();
 
 /**
- * Digest of the registration's files as they are on disk now (the per-alias
- * cache reports what was loaded). Memoised behind a stat fingerprint with a max age.
+ * Digest of the files as they are on disk right now, unlike the cached digest of what was loaded.
+ * Reused while the file stats are unchanged and the value is not too old.
  */
 export function getCurrentArtifactDigest(name: string): string {
     const reg = registry.get(name);
@@ -144,13 +140,12 @@ export function getCurrentArtifactDigest(name: string): string {
     return digest;
 }
 
-/** Uncached digest over a registration snapshot's current bytes. */
 function computeGenerationDigest(reg: ContractRegistration): string {
     return computeArtifactGenerationDigest(reg);
 }
 
 const legacyDigestNoted = new Set<string>();
-/** A legacy digest form (see artifact-digest.ts) names the same generation. */
+/** An older digest format can still describe the same build. See artifact-digest.ts. */
 function acceptsLegacyDigest(name: string, recorded: string): boolean {
     const reg = registry.get(name);
     if (!reg || artifactGenerationMatch(reg, recorded) !== 'legacy') return false;
@@ -161,7 +156,7 @@ function acceptsLegacyDigest(name: string, recorded: string): boolean {
     return true;
 }
 
-/** Fail-closed generation check for persisted commands and stored evidence. */
+/** Throws unless a stored job or result was created for the build the name points to today. */
 export function assertArtifactGeneration(name: string, recorded: string | undefined, what: string): void {
     const current = getArtifactGenerationDigest(name);
     if (!recorded) {
@@ -192,8 +187,8 @@ export function clearRegistry(): void {
 }
 
 /**
- * Names from `cds.requires.nightgate.contracts`: the immutable floor. Runtime
- * registrations may add names but never re-point or remove one.
+ * Names from `cds.requires.nightgate.contracts`. They are fixed: registrations at
+ * runtime may add names but never change or remove one of these.
  */
 const configNames = new Set<string>();
 
@@ -205,22 +200,13 @@ export function listRegisteredContracts(): string[] {
     return Array.from(registry.keys());
 }
 
-/**
- * The frozen stored registration, without importing the artifact. Only
- * registered contracts are servable by the zk-config route.
- */
 export function getContractRegistration(name: string): Readonly<ContractRegistration> | undefined {
     return registry.get(name);
 }
 
-// This file lives at <root>/srv/submission/; the lineage packages are this package's dependencies.
+// This file lives at <root>/srv/submission/. The contract packages are dependencies of this package.
 const PLUGIN_ROOT = path.resolve(__dirname, '..', '..');
 
-/**
- * A `{ package }` config entry: the installed lineage package (resolved from
- * this plugin's own install first, then from baseDir), its contract.json
- * verified against the files.
- */
 export function registrationFromPackage(packageName: string, baseDir = process.cwd()): ContractRegistration {
     let pkg;
     try {
@@ -244,10 +230,7 @@ export function registrationFromPackage(packageName: string, baseDir = process.c
     };
 }
 
-/**
- * Load `cds.requires.nightgate.contracts`. Idempotent. An entry is either
- * `{ package }` (an installed lineage package) or `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`.
- */
+/** An entry is either `{ package }` or `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`. */
 export function loadRegistryFromConfig(config?: NightgatePluginConfig, baseDir = process.cwd()): void {
     const contracts = config?.contracts;
     if (!contracts || typeof contracts !== 'object') return;
@@ -255,7 +238,6 @@ export function loadRegistryFromConfig(config?: NightgatePluginConfig, baseDir =
         const r = reg as Partial<ContractRegistration> & { package?: string };
         let resolved: ContractRegistration;
         if (typeof r?.package === 'string' && r.package) {
-            // One broken entry leaves the others registered; the alias itself stays unknown.
             try {
                 resolved = registrationFromPackage(r.package, baseDir);
             } catch (err) {
@@ -280,7 +262,6 @@ export function loadRegistryFromConfig(config?: NightgatePluginConfig, baseDir =
     }
 }
 
-/** Missing prover keys are fetched on first need; said once at boot for offline installs. */
 function warnOnMissingProverKeys(name: string, zkConfigPath: string): void {
     const missing = missingProverKeys(zkConfigPath);
     if (missing.length === 0) return;
@@ -292,8 +273,8 @@ function warnOnMissingProverKeys(name: string, zkConfigPath: string): void {
 }
 
 /**
- * Resolve a contract, optionally pinned to `expectedDigest`. The snapshot is
- * captured once and checked before any import, so a concurrent re-registration cannot swap it.
+ * Resolves a contract, optionally only if it matches `expectedDigest`. The registration is read
+ * once and checked before any import, so a parallel re-registration cannot swap it.
  */
 export async function resolveContract(name: string, expectedDigest?: string, opts: { compile?: boolean } = {}): Promise<ResolvedContract> {
     const reg = registry.get(name);
@@ -303,8 +284,8 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
     }
     let digest: string | undefined;
     if (expectedDigest !== undefined) {
-        // A job imports nothing here (the worker hashes its snapshot), so the
-        // fingerprinted digest suffices; a main-thread import checks its bytes uncached.
+        // For a job nothing is imported here and the worker hashes its own copy, so the cheap
+        // cached digest is enough. A main-thread import hashes the files fresh.
         const current = opts.compile ? computeGenerationDigest(reg) : getCurrentArtifactDigest(name);
         digest = current;
         if (current !== expectedDigest && artifactGenerationMatch(reg, expectedDigest) !== 'legacy') {
@@ -316,12 +297,12 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
     }
     digest ??= getArtifactGenerationDigest(name);
     if (expectedDigest !== undefined && !opts.compile) {
-        // The worker snapshots these files, so prover keys must be on disk first;
-        // after the generation check, so a stale job never triggers a download.
+        // The worker copies these files, so prover keys must be on disk first.
+        // This runs after the digest check, so an outdated job never starts a download.
         const { fetched } = await ensureProverKeys(name, reg, { log: (m) => cds.log('nightgate').info(m) });
         if (fetched.length) cds.log('nightgate').info(`contract '${name}': ${fetched.length} prover key(s) fetched on first need`);
     }
-    // No main-thread import for jobs: it would stay in Node's module cache.
+    // Jobs never import on the main thread, because the module would stay in Node's cache.
     let compiledContract: unknown;
     if (opts.compile) {
         const mod: any = await importArtifactGeneration(reg.artifactPath, digest);
@@ -347,7 +328,7 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
     };
 }
 
-/** file:// URL keyed by generation: Node caches ESM per URL, so each revision is its own instance. */
+/** file:// URL with the digest in the query. Node caches ESM per URL, so each build loads as its own module. */
 export function artifactImportSpec(artifactPath: string, generation: string): string {
     if (!path.isAbsolute(artifactPath)) return artifactPath;
     const url = pathToFileURL(artifactPath);
@@ -355,7 +336,6 @@ export function artifactImportSpec(artifactPath: string, generation: string): st
     return url.href;
 }
 
-/** Import a registered artifact pinned to its loaded generation (main-thread readers). */
 export async function importRegisteredArtifact(name: string): Promise<any> {
     const reg = registry.get(name);
     if (!reg) throw new ContractNotRegisteredError(name, listRegisteredContracts());
@@ -371,15 +351,15 @@ export async function importArtifactByPath(artifactPath: string): Promise<any> {
 }
 
 /**
- * Import an artifact pinned to a generation. Node caches CommonJS by filename
- * regardless of the query, so the CJS cache entry is dropped first.
+ * Imports the module of one specific build. Node caches CommonJS by file name and
+ * ignores the query, so the CommonJS cache entry is removed first.
  */
 export async function importArtifactGeneration(artifactPath: string, generation: string): Promise<any> {
     if (path.isAbsolute(artifactPath)) {
         try {
             const resolved = require.resolve(artifactPath);
             delete require.cache[resolved];
-        } catch { /* not resolvable as CJS (fine for ESM) */ }
+        } catch { /* not a CommonJS module, fine for ESM */ }
     }
     return import(artifactImportSpec(artifactPath, generation));
 }

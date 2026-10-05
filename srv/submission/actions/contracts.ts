@@ -5,30 +5,22 @@
 import { coerceCircuitArgs } from '../arg-coercion';
 import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
-import { SHA256_HEX_RE, vaultDims } from '../verify-state';
+import { vaultDims } from '../verify-state';
 import { SET_DEPTH } from '../set-root';
-import type { NightgateRequest } from '../../utils/request-types';
 import { deployRateLimiter, callRateLimiter, buildRateLimiter, MerkleProofBundle, validateSchemaSlots, validateOpening, facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
+import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
+import { buildSponsorable, deployContract, submitContractCall, submitContractCallBatch } from '#cds-models/NightgateService';
 
 export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'contractResolver' | 'argTypesLoader' | 'resolveSponsorForRequest'>): void {
     const { srv, db, walletFactory, contractResolver, argTypesLoader, resolveSponsorForRequest } = ctx;
 
-    srv.on('deployContract', async (req: NightgateRequest) => {
-        const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey, sponsorSessionId } = req.data as {
-            compiledArtifactRef?: string;
-            sessionId?: string;
-            initialPrivateState?: string;
-            idempotencyKey?: string;
-            sponsorSessionId?: string;
-        };
-        const recoveryId = typeof (req.data as any).recoveryId === 'string' && (req.data as any).recoveryId.length > 0
-            ? String((req.data as any).recoveryId).toLowerCase()
-            : undefined;
+    srv.on(deployContract, async (req) => {
+        const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey, sponsorSessionId } = req.data;
+        const recoveryId = req.data.recoveryId ? req.data.recoveryId.toLowerCase() : undefined;
 
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
         if (!sessionId) return req.reject(400, 'sessionId is required');
-        if (recoveryId !== undefined && !SHA256_HEX_RE.test(recoveryId)) return req.reject(400, 'recoveryId must be 64 hex chars (32 bytes)');
 
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(deployRateLimiter, sessionId, req)) return;
@@ -64,17 +56,8 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         });
     });
 
-    srv.on('submitContractCall', async (req: NightgateRequest) => {
-        const { contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey, initialPrivateState, sponsorSessionId } = req.data as {
-            contractAddress?: string;
-            circuit?: string;
-            compiledArtifactRef?: string;
-            sessionId?: string;
-            args?: string;
-            idempotencyKey?: string;
-            initialPrivateState?: string;
-            sponsorSessionId?: string;
-        };
+    srv.on(submitContractCall, async (req) => {
+        const { contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey, initialPrivateState, sponsorSessionId } = req.data;
 
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
         if (!circuit) return req.reject(400, 'circuit is required');
@@ -132,12 +115,10 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         });
     });
 
-    // Sponsoring phase 1, server-side: build, sign and finalize under the
-    // caller's identity; the job result is the fee-unpaid tx.
-    srv.on('buildSponsorable', async (req: NightgateRequest) => {
-        const { contractAddress, circuit, compiledArtifactRef, sessionId, args } = req.data as {
-            contractAddress?: string; circuit?: string; compiledArtifactRef?: string; sessionId?: string; args?: string;
-        };
+    // Builds and signs the transaction with the caller's wallet but pays no fee.
+    // A sponsor pays the fee later through sponsorFinalizedTransaction.
+    srv.on(buildSponsorable, async (req) => {
+        const { contractAddress, circuit, compiledArtifactRef, sessionId, args } = req.data;
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
         if (!circuit) return req.reject(400, 'circuit is required');
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
@@ -164,17 +145,8 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         });
     });
 
-    srv.on('submitContractCallBatch', async (req: NightgateRequest) => {
-        const { contractAddress, calls, compiledArtifactRef, sessionId, idempotencyKey, initialPrivateState, sponsorSessionId, independentCalls } = req.data as {
-            contractAddress?: string;
-            calls?: string;
-            compiledArtifactRef?: string;
-            sessionId?: string;
-            idempotencyKey?: string;
-            initialPrivateState?: string;
-            sponsorSessionId?: string;
-            independentCalls?: boolean;
-        };
+    srv.on(submitContractCallBatch, async (req) => {
+        const { contractAddress, calls, compiledArtifactRef, sessionId, idempotencyKey, initialPrivateState, sponsorSessionId, independentCalls } = req.data;
 
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
@@ -184,8 +156,8 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(callRateLimiter, sessionId, req)) return;
 
-        // Bounded: each call carries a proof, and one rejected call discards the
-        // whole scope before submission.
+        // The batch size is limited: each call carries a proof,
+        // and one rejected call fails the whole batch.
         const { depth: rawBatchDepth, width: rawBatchWidth } = vaultDims(compiledArtifactRef);
         let parsedCalls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
         try {
@@ -202,7 +174,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                 // Validated here so a malformed proof is a 400, not a failed job.
                 let merkleProof: MerkleProofBundle | undefined;
                 if (entry.merkleProof !== undefined && entry.merkleProof?.docPair !== undefined) {
-                    // Cross-root witnesses: no inclusion path.
+                    // A comparison of two documents carries no inclusion path.
                     const dp = entry.merkleProof.docPair;
                     if (!dp || typeof dp !== 'object') throw new Error(`calls[${i}].merkleProof.docPair must be an object`);
                     merkleProof = {
@@ -224,14 +196,14 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                     }
                     let fieldDigest: string | undefined;
                     if (mp.fieldDigest !== undefined) {
-                        if (typeof mp.fieldDigest !== 'string' || !SHA256_HEX_RE.test(mp.fieldDigest)) {
+                        if (typeof mp.fieldDigest !== 'string' || !HEX64_ANY_CASE_RE.test(mp.fieldDigest)) {
                             throw new Error(`calls[${i}].merkleProof.fieldDigest must be 64 hex chars (32 bytes)`);
                         }
                         fieldDigest = mp.fieldDigest.toLowerCase();
                     }
                     let fieldSalt: string | undefined;
                     if (mp.fieldSalt !== undefined) {
-                        if (typeof mp.fieldSalt !== 'string' || !SHA256_HEX_RE.test(mp.fieldSalt)) {
+                        if (typeof mp.fieldSalt !== 'string' || !HEX64_ANY_CASE_RE.test(mp.fieldSalt)) {
                             throw new Error(`calls[${i}].merkleProof.fieldSalt must be 64 hex chars (32 bytes)`);
                         }
                         fieldSalt = mp.fieldSalt.toLowerCase();
@@ -240,7 +212,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                         throw new Error(`calls[${i}].merkleProof.siblings must be a JSON array of ${rawBatchDepth} hashes`);
                     }
                     for (const s of mp.siblings) {
-                        if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) throw new Error(`calls[${i}].merkleProof.siblings entries must be 64 hex chars (32 bytes)`);
+                        if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) throw new Error(`calls[${i}].merkleProof.siblings entries must be 64 hex chars (32 bytes)`);
                     }
                     if (!Array.isArray(mp.dirs) || mp.dirs.length !== rawBatchDepth) {
                         throw new Error(`calls[${i}].merkleProof.dirs must be a JSON array of ${rawBatchDepth} booleans`);
@@ -256,7 +228,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                             throw new Error(`calls[${i}].merkleProof.setProof.siblings must be a JSON array of ${SET_DEPTH} hashes`);
                         }
                         for (const s of sp.siblings) {
-                            if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) throw new Error(`calls[${i}].merkleProof.setProof.siblings entries must be 64 hex chars (32 bytes)`);
+                            if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) throw new Error(`calls[${i}].merkleProof.setProof.siblings entries must be 64 hex chars (32 bytes)`);
                         }
                         if (!Array.isArray(sp.dirs) || sp.dirs.length !== SET_DEPTH) {
                             throw new Error(`calls[${i}].merkleProof.setProof.dirs must be a JSON array of ${SET_DEPTH} booleans`);
@@ -292,8 +264,8 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
             await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledArtifactRef);
 
-            // Validate-coerce every call now so a bad arg is a 400 here, not a
-            // failed job later. Raw args are persisted; the executor re-coerces.
+            // Check every call now, so a bad argument is a 400 and not a failed job.
+            // The raw args are saved. The executor converts them again.
             for (const c of parsedCalls) {
                 const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
                 coerceCircuitArgs(c.args, argTypes);

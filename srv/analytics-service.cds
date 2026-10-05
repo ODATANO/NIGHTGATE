@@ -4,7 +4,7 @@ using { midnight } from '../db/schema';
 @requires: 'authenticated-user'
 service NightgateAnalyticsService {
 
-    /** One row per block; the transaction count is a subquery per returned row, so read by page. */
+    /** One row per block with its transaction count. Each row costs a count query, so read page by page. */
     @readonly
     @cds.query.limit: { default: 100, max: 1000 }
     entity BlockStatistics as select from midnight.Blocks as b {
@@ -14,7 +14,7 @@ service NightgateAnalyticsService {
         (select count(*) from midnight.Transactions as t where t.block.ID = b.ID) as transactionCount : Integer
     };
 
-    /** Contract action counts per action type (not per contract). */
+    /** Number of contract actions per action type, over all contracts. */
     @readonly
     entity ContractStatistics as select from midnight.ContractActions {
         key actionType,

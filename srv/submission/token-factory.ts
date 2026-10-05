@@ -1,7 +1,7 @@
 /**
- * Server-side minting on the `token-factory` lineage: the session is the
- * issuer. Its issuer secret is derived from the session's seed, so the token
- * behind a name is fixed per session and nobody else mints more of it.
+ * Server-side minting with the `token-factory` contract. The wallet session is the issuer.
+ * Its issuer secret comes from the session's seed. So each token name belongs
+ * to one session, and nobody else can mint more of it.
  * SPDX-License-Identifier: Apache-2.0
  */
 import { issuerKeyOf, tokenTypeOf } from '@odatano/contract-kit';
@@ -26,7 +26,7 @@ export class TokenFactoryUnavailableError extends NightgateError {
     constructor(message: string) { super('TOKEN_FACTORY_UNAVAILABLE', message); }
 }
 
-/** The registered factory artifact's pure circuits (names, domains); throws when the lineage is not registered. */
+/** Helper functions of the registered factory contract. Throws if no factory contract is registered. */
 export async function loadTokenFactoryPureCircuits(ref: string = TOKEN_FACTORY_REF): Promise<TokenFactoryPureCircuits> {
     if (!getContractRegistration(ref)) {
         throw new TokenFactoryUnavailableError(`contract '${ref}' is not registered; add the token-factory lineage to cds.requires.nightgate.contracts`);
@@ -39,7 +39,7 @@ export async function loadTokenFactoryPureCircuits(ref: string = TOKEN_FACTORY_R
     return pure as TokenFactoryPureCircuits;
 }
 
-/** A token name as the circuit takes it: UTF-8, 1 to 32 bytes, zero-padded; `nameHex` is the padded form. */
+/** A token name in the form the contract expects: 1 to 32 UTF-8 bytes, padded with zeros. */
 export function parseFactoryTokenName(raw: unknown): { ok: true; name: string; nameHex: string } | { ok: false; message: string } {
     if (typeof raw !== 'string' || raw.length === 0) return { ok: false, message: 'name is required' };
     const utf8 = Buffer.from(raw, 'utf8');
@@ -74,7 +74,7 @@ export interface FactoryToken {
     tokenType: string;
 }
 
-/** The session's issuer key on the factory; cached per session, the seed is fixed. */
+/** The session's issuer key on the factory. Cached per session, because the seed never changes. */
 const issuerKeyCache = new Map<string, string>();
 
 export interface TokenFactoryOps {
@@ -98,7 +98,7 @@ export async function factoryIssuerKeyForSession(opts: SessionSeedOptions): Prom
     return issuerKey;
 }
 
-/** Domain and raw token type of `name` under `issuerKey` on the factory at `contractAddress`. */
+/** The token type of `name` minted by `issuerKey` on the factory at `contractAddress`. */
 export async function describeFactoryToken(input: FactoryTokenInput): Promise<FactoryToken> {
     if (!HEX64_RE.test(input.contractAddress)) throw new TokenFactoryUnavailableError('contractAddress must be 64 hex characters');
     const pure = await loadTokenFactoryPureCircuits();

@@ -1,7 +1,7 @@
 /**
- * Submit with separate connect / request (until first status) / watch deadlines: a timeout on
- * the SDK's single `submitTransaction` promise cannot tell whether the tx was ever sent.
- * Only a connect failure is known unsent; late statuses are logged under the identifier.
+ * Sends a tx in three steps, each with its own timeout: connect, wait for the first status, wait for the block.
+ * A single timeout around the SDK's submit cannot tell whether the tx was sent at all.
+ * Only a failure while connecting means the tx was surely not sent.
  */
 import { log as workerLog } from './context';
 import { NightgateError } from '../../utils/errors';
@@ -19,11 +19,9 @@ export type NodeSubmitEvent = {
 
 export type SocketEvent = { kind: 'connected' | 'disconnected' | 'error'; detail?: string };
 
-/** The node side of a phased submit; the SDK wrapper and the test fake implement it. */
 export interface SubmitNodeAdapter {
-    /** Bring the socket up (idempotent); rejects when the adapter's own connect fails. */
     connect(): Promise<void>;
-    /** Settles when the subscription ends: stream end (Finalized), node error, or `signal` abort. */
+    /** Settles when the node stops sending statuses, on a node error, or when `signal` aborts. */
     send(bytes: Uint8Array, onEvent: (ev: NodeSubmitEvent) => void, signal: AbortSignal): Promise<void>;
     onSocket(cb: (ev: SocketEvent) => void): void;
     close(): Promise<void>;
@@ -33,16 +31,15 @@ export interface PhasedSubmitTimeouts {
     connectMs: number;
     requestMs: number;
     watchMs: number;
-    /** Bound on `close()`: a client whose initialisation hangs must not hang the timeout handling itself. */
+    /** Limit for `close()`, so a hanging client cannot block the timeout handling. */
     closeMs: number;
-    /** How long a timed-out attempt keeps its subscription open for a late status or reject (logged, never acted on). */
+    /** How long a timed-out attempt keeps listening. A late status is only logged. */
     lateGraceMs: number;
 }
 
 export interface SubmitContext {
-    /** Ledger transaction identifier (what the job stores); the log key. */
+    /** The tx id the job stores. Used in log lines. */
     identifier?: string;
-    /** Call site / job correlation. */
     correlation?: string;
 }
 
@@ -65,7 +62,7 @@ export class SubmitPhaseError extends NightgateError {
     }
 }
 
-/** The phase of a failure, walking the cause chain; null when no phased submit was involved. */
+/** The step a submit failed in, searched through the nested causes. Null when none is found. */
 export function submitPhaseOf(err: unknown): SubmitPhase | null {
     let cur: any = err;
     for (let depth = 0; cur && depth < 8; depth++) {
@@ -96,14 +93,14 @@ export function createPhasedSubmitService(opts: {
 }): PhasedSubmitService {
     const log = opts.log ?? workerLog;
     let adapterP: Promise<SubmitNodeAdapter> | null = null;
-    let socketLog: SubmitTimelineEntry[] | null = null; // the timeline of the attempt in flight, for socket events
+    let socketLog: SubmitTimelineEntry[] | null = null; // where socket events of the running attempt are recorded
     const getAdapter = (): Promise<SubmitNodeAdapter> => {
         if (!adapterP) {
             adapterP = opts.adapter().then((a) => {
                 a.onSocket((ev) => socketLog?.push({ at: Date.now(), event: `socket-${ev.kind}`, detail: ev.detail }));
                 return a;
             });
-            adapterP.catch(() => { adapterP = null; }); // a failed creation is retried by the next attempt
+            adapterP.catch(() => { adapterP = null; }); // the next attempt tries again
         }
         return adapterP;
     };
@@ -119,7 +116,7 @@ export function createPhasedSubmitService(opts: {
         const fail = (phase: SubmitPhase, message: string, cause?: unknown): SubmitPhaseError =>
             new SubmitPhaseError(phase, `${message} [${key}: ${formatTimeline(timeline, t0)}]`, { identifier, timeline, elapsedMs: Date.now() - t0, cause });
 
-        // connect: client creation + socket, one budget
+        // Creating the client and connecting share one timeout.
         let adapter: SubmitNodeAdapter;
         try {
             adapter = await withTimeout(getAdapter().then(async (a) => { mark('client-ready'); await a.connect(); return a; }), opts.timeouts.connectMs);
@@ -132,7 +129,7 @@ export function createPhasedSubmitService(opts: {
             throw err;
         }
 
-        // request + watch: one subscription, two deadlines
+        // The last two steps share one subscription with two timeouts.
         const bytes = tx.serialize();
         const ac = new AbortController();
         let settled = false;
@@ -151,17 +148,15 @@ export function createPhasedSubmitService(opts: {
         };
         mark('request-sent');
         const done = adapter.send(bytes, onEvent, ac.signal);
-        // A subscription rejection ends the attempt in whichever phase it is in.
         const streamFailure = done.then(() => { throw new StreamEnded(); });
-        streamFailure.catch(() => undefined); // must not surface as unhandled after the attempt settled
+        streamFailure.catch(() => undefined); // avoid an unhandled rejection after the attempt ended
         const phaseLine = (phase: SubmitPhase, outcome: string) =>
             `submit-phases ${key} phase=${phase} ${outcome} connect=${timelineDur(timeline, t0, 'connected')} request=${firstAt ? `${firstAt - requestSentAt(timeline, t0)}ms` : 'n/a'} total=${Date.now() - t0}ms statuses=${formatTimeline(timeline.filter((e) => e.event.startsWith('status-') || e.event.startsWith('socket-')), t0) || 'none'}`;
-        // A timed-out attempt keeps listening for `lateGraceMs` so a late outcome is logged.
         const keepListening = () => {
             const t = setTimeout(() => ac.abort(), opts.timeouts.lateGraceMs);
             t.unref?.();
             lateWindows.add(t);
-            // Not `.finally()`: its derived promise would reject unhandled on a late reject.
+            // Not `.finally()`, because its new promise would reject unhandled on a late error.
             const clear = () => { clearTimeout(t); lateWindows.delete(t); };
             done.then(clear, clear);
         };
@@ -176,12 +171,12 @@ export function createPhasedSubmitService(opts: {
                 }
                 if (e instanceof StreamEnded) throw fail('request', `submit stream ended without any status`);
                 log('warn', phaseLine('request', `FAILED: ${describe(e)}`));
-                throw e; // the node's own answer, classified by its text
+                throw e; // the node's own error, classified later by its text
             }
             try {
                 const ev = await withTimeout(Promise.race([wanted, streamFailure]), opts.timeouts.watchMs);
                 settled = true;
-                if (waitFor === 'InBlock') ac.abort(); // done watching: unsubscribe + disconnect
+                if (waitFor === 'InBlock') ac.abort(); // stop listening
                 log('info', phaseLine('watch', `OK ${waitFor} after ${Date.now() - firstAt}ms`));
                 return ev;
             } catch (e) {
@@ -197,7 +192,7 @@ export function createPhasedSubmitService(opts: {
         } finally {
             settled = true;
             if (socketLog === timeline) socketLog = null;
-            // Log the subscription's end after settle; our own abort is not a result.
+            // Log anything the node says after the attempt ended. Our own abort is not logged.
             void done.then(
                 () => { if (!ac.signal.aborted) log('info', `submit-late ${key}: subscription ended after the attempt settled (last status ${(last as NodeSubmitEvent | null)?.tag ?? 'none'})`); },
                 (err) => { if (!ac.signal.aborted) log('warn', `submit-late ${key}: node reported after the attempt settled: ${describe(err)}`); }
@@ -205,7 +200,7 @@ export function createPhasedSubmitService(opts: {
         }
     };
 
-    // Timed-out attempts still listening; close() waits for them, bounded.
+    // Timed-out attempts still listening. close() waits for them, up to a limit.
     const lateWindows = new Set<NodeJS.Timeout>();
 
     return {
@@ -237,8 +232,6 @@ function timelineDur(timeline: readonly SubmitTimelineEntry[], t0: number, event
     return at ? `${at - t0}ms` : 'n/a';
 }
 
-// The real adapter: the SDK's PolkadotNodeClient through its effect API.
-
 export interface NodeClientSdk {
     PolkadotNodeClient: any;
     SerializedTransaction: any;
@@ -248,8 +241,7 @@ export interface NodeClientSdk {
 export async function createSdkNodeAdapter(relayURL: URL, opts: { connectTimeoutMs: number; sdk: () => Promise<NodeClientSdk> }): Promise<SubmitNodeAdapter> {
     const { PolkadotNodeClient, SerializedTransaction, Effect, Scope, Exit, Stream, Duration } = await opts.sdk();
     const scope = Effect.runSync(Scope.make());
-    // The SDK's default reconnection budget is infinite; the connect phase
-    // needs a bound, and this is the only place the SDK takes one.
+    // By default the SDK reconnects forever. This is the only place to set a limit.
     const client: any = await Effect.runPromise(
         PolkadotNodeClient.make({ nodeURL: relayURL, reconnectionTimeout: Duration.millis(opts.connectTimeoutMs) })
             .pipe(Effect.provideService(Scope.Scope, scope))

@@ -1,52 +1,33 @@
 /**
- * Field predicate, equality, membership and cross-root proof actions.
+ * Actions that prove facts about document fields, and comparisons between two documents.
  * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
 import { type NightgateNetwork, VALID_NIGHTGATE_NETWORKS } from '../../utils/nightgate-config';
 import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
-import { SHA256_HEX_RE, DEFAULT_ATTESTATION_VAULT_REF, UINT64_MAX, vaultDims, parsePredicate, coerceMask, liveProviderConfigured } from '../verify-state';
+import { DEFAULT_ATTESTATION_VAULT_REF, UINT64_MAX, vaultDims, parsePredicate, coerceMask, liveProviderConfigured } from '../verify-state';
 import { blake2b256Hex, PureCircuitsUnavailableError } from '../document-proof';
 import { membershipPathFor, SET_DEPTH } from '../set-root';
 import { Transactions, TransactionResults, PredicateAttestations, type Transaction } from '#cds-models/midnight';
-import type { NightgateRequest } from '../../utils/request-types';
 import { predicateRateLimiter, parseValidUntil, SchemaSlotWire, OpeningWire, parseInclusionPath, validateSchemaSlots, validateOpening, isVacuousMask, INT64_MAX, parseDocPairInputs, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
+import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
+import { issueDocumentDiffAttestation, issueDocumentIntegrityAttestation, issueFieldEqualityAttestation, issueFieldMembershipAttestation, issueFieldPredicateAttestation, issueFieldPredicateAttestationBatch, verifyPredicateAttestation } from '#cds-models/NightgateService';
 
 const { INSERT, SELECT, DELETE } = cds.ql;
 
 export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'contractResolver' | 'pureCircuitsLoader' | 'verifyPredicateViaState' | 'resolveAttester' | 'resolveSponsorForRequest'>): void {
     const { srv, db, walletFactory, contractResolver, pureCircuitsLoader, verifyPredicateViaState, resolveAttester, resolveSponsorForRequest } = ctx;
 
-    srv.on('issueFieldPredicateAttestation', async (req: NightgateRequest) => {
-        const data = req.data as {
-            validUntil?: number | string;
-            payloadHash?: string; attesterId?: string;
-            fieldKey?: string;
-            value?: string;
-            fieldSalt?: string;
-            contentRoot?: string; schemaId?: string;
-            siblingsJson?: string;
-            dirsJson?: string;
-            predicate?: string;
-            threshold?: number | string;
-            unit?: string;
-            sessionId?: string;
-            contractAddress?: string;
-            compiledArtifactRef?: string;
-            idempotencyKey?: string;
-            sponsorSessionId?: string;
-        };
+    srv.on(issueFieldPredicateAttestation, async (req) => {
+        const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
         if (validUntilError) return req.reject(400, validUntilError);
 
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
-        if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        if (data.attesterId && !SHA256_HEX_RE.test(data.attesterId)) return req.reject(400, 'attesterId must be 64 hex chars (32 bytes)');
         if (!data.fieldKey) return req.reject(400, 'fieldKey is required');
-        if (!SHA256_HEX_RE.test(data.fieldKey)) return req.reject(400, 'fieldKey must be 64 hex chars (32 bytes)');
         if (data.value === undefined || data.value === null || data.value === '') {
             return req.reject(400, 'value is required');
         }
@@ -54,8 +35,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         try { valueBig = BigInt(data.value); } catch { return req.reject(400, 'value must be an integer (decimal string)'); }
         if (valueBig < 0n) return req.reject(400, 'value must be a non-negative integer');
         if (valueBig > UINT64_MAX) return req.reject(400, 'value exceeds Uint<64>');
-        if (!data.fieldSalt || !SHA256_HEX_RE.test(data.fieldSalt)) {
-            return req.reject(400, 'fieldSalt (64 hex chars) is required (v4 salted leaves; prepareDocumentProof returns it per field)');
+        if (!data.fieldSalt) {
+            return req.reject(400, 'fieldSalt is required (v4 salted leaves; prepareDocumentProof returns it per field)');
         }
 
         if (data.threshold === undefined || data.threshold === null) return req.reject(400, 'threshold is required');
@@ -78,25 +59,20 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!Array.isArray(siblings) || siblings.length !== depth) return req.reject(400, `siblingsJson must be a JSON array of ${depth} hashes`);
         if (!Array.isArray(dirs) || dirs.length !== depth) return req.reject(400, `dirsJson must be a JSON array of ${depth} booleans`);
         for (const s of siblings) {
-            if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) return req.reject(400, 'each sibling must be 64 hex chars (32 bytes)');
+            if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) return req.reject(400, 'each sibling must be 64 hex chars (32 bytes)');
         }
         for (const d of dirs) {
-            // Strict: Boolean("false") is true and would corrupt the path.
+            // Only real booleans. Boolean("false") is true and would give a wrong path.
             if (typeof d !== 'boolean') return req.reject(400, 'dirsJson entries must be booleans');
         }
         const dirsBool = dirs as boolean[];
 
-        if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
-            return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
-        }
-        if (data.contentRoot && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
-            return req.reject(400, 'schemaId (64 hex chars) is required when contentRoot is supplied (anchorContentRoot anchors both)');
-        }
-        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
-            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        if (data.contentRoot && !data.schemaId) {
+            return req.reject(400, 'schemaId is required when contentRoot is supplied (anchorContentRoot anchors both)');
         }
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
-        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+        const contractAddress = data.contractAddress;
+        if (!contractAddress) return req.reject(400, 'contractAddress is required');
 
         const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
             ? data.compiledArtifactRef
@@ -105,7 +81,6 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        // Row up-front, before the job exists.
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
         if (!attesterId) return;
         const predicateAttestationId = cds.utils.uuid();
@@ -114,12 +89,12 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             ID: predicateAttestationId,
             payloadHash: data.payloadHash.toLowerCase(),
             attesterId,
-            contractAddress: data.contractAddress,
-            predicate: data.predicate,
+            contractAddress,
+            predicate: parsedPredicate.predicate,
             op,
-            threshold: data.threshold as any,
+            threshold: data.threshold,
             unit: data.unit ?? null,
-            // Lets the crawler-free verify path recompute the claim key.
+            // The verify functions need it to look up the claim on-chain.
             fieldKey: data.fieldKey.toLowerCase(),
             network: recordedNetworkId(),
             compiledArtifactRef: compiledRef,
@@ -180,47 +155,28 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on('issueFieldEqualityAttestation', async (req: NightgateRequest) => {
-        const data = req.data as {
-            validUntil?: number | string;
-            payloadHash?: string; attesterId?: string; fieldKey?: string;
-            expectedValue?: string; expectedDigest?: string; fieldSalt?: string;
-            contentRoot?: string; schemaId?: string; siblingsJson?: string; dirsJson?: string;
-            sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
-            idempotencyKey?: string; sponsorSessionId?: string;
-        };
+    srv.on(issueFieldEqualityAttestation, async (req) => {
+        const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
         if (validUntilError) return req.reject(400, validUntilError);
 
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
-        if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        if (data.attesterId && !SHA256_HEX_RE.test(data.attesterId)) return req.reject(400, 'attesterId must be 64 hex chars (32 bytes)');
         if (!data.fieldKey) return req.reject(400, 'fieldKey is required');
-        if (!SHA256_HEX_RE.test(data.fieldKey)) return req.reject(400, 'fieldKey must be 64 hex chars (32 bytes)');
 
         const hasValue = typeof data.expectedValue === 'string' && data.expectedValue.length > 0;
         const hasDigest = typeof data.expectedDigest === 'string' && data.expectedDigest.length > 0;
         if (hasValue === hasDigest) return req.reject(400, 'pass exactly one of expectedValue / expectedDigest');
-        if (hasDigest && !SHA256_HEX_RE.test(data.expectedDigest!)) {
-            return req.reject(400, 'expectedDigest must be 64 hex chars (32 bytes)');
-        }
-        // The exact string, untrimmed, as prepareDocumentProof encodes bytes leaves.
+        // Hash the exact string, untrimmed, the same way prepareDocumentProof hashes text fields.
         const expectedDigest = hasDigest ? data.expectedDigest!.toLowerCase() : blake2b256Hex(data.expectedValue!);
-        if (!data.fieldSalt || !SHA256_HEX_RE.test(data.fieldSalt)) {
-            return req.reject(400, 'fieldSalt (64 hex chars) is required (v4 salted leaves; prepareDocumentProof returns it per field)');
+        if (!data.fieldSalt) {
+            return req.reject(400, 'fieldSalt is required (v4 salted leaves; prepareDocumentProof returns it per field)');
         }
 
         const path = parseInclusionPath(req, data.siblingsJson, data.dirsJson, vaultDims(data.compiledArtifactRef).depth, { siblings: 'siblingsJson', dirs: 'dirsJson' });
         if (!path) return;
-        if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
-            return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
-        }
-        if (data.contentRoot && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
-            return req.reject(400, 'schemaId (64 hex chars) is required when contentRoot is supplied (anchorContentRoot anchors both)');
-        }
-        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
-            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        if (data.contentRoot && !data.schemaId) {
+            return req.reject(400, 'schemaId is required when contentRoot is supplied (anchorContentRoot anchors both)');
         }
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
@@ -232,7 +188,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        // No op/threshold: the expected digest is the statement.
+        // No operator or threshold here. The claim is the expected digest itself.
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
         if (!attesterId) return;
         const predicateAttestationId = cds.utils.uuid();
@@ -306,36 +262,21 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on('issueFieldMembershipAttestation', async (req: NightgateRequest) => {
-        const data = req.data as {
-            validUntil?: number | string;
-            payloadHash?: string; attesterId?: string; fieldKey?: string;
-            value?: string; valueDigest?: string;
-            allowedValuesJson?: string; setRoot?: string; setSiblingsJson?: string; setDirsJson?: string;
-            fieldSalt?: string;
-            contentRoot?: string; schemaId?: string; siblingsJson?: string; dirsJson?: string;
-            sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
-            idempotencyKey?: string; sponsorSessionId?: string;
-        };
+    srv.on(issueFieldMembershipAttestation, async (req) => {
+        const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
         if (validUntilError) return req.reject(400, validUntilError);
 
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
-        if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        if (data.attesterId && !SHA256_HEX_RE.test(data.attesterId)) return req.reject(400, 'attesterId must be 64 hex chars (32 bytes)');
         if (!data.fieldKey) return req.reject(400, 'fieldKey is required');
-        if (!SHA256_HEX_RE.test(data.fieldKey)) return req.reject(400, 'fieldKey must be 64 hex chars (32 bytes)');
 
         const hasValue = typeof data.value === 'string' && data.value.length > 0;
         const hasDigest = typeof data.valueDigest === 'string' && data.valueDigest.length > 0;
         if (hasValue === hasDigest) return req.reject(400, 'pass exactly one of value / valueDigest');
-        if (hasDigest && !SHA256_HEX_RE.test(data.valueDigest!)) {
-            return req.reject(400, 'valueDigest must be 64 hex chars (32 bytes)');
-        }
         const valueDigest = hasDigest ? data.valueDigest!.toLowerCase() : blake2b256Hex(data.value!);
-        if (!data.fieldSalt || !SHA256_HEX_RE.test(data.fieldSalt)) {
-            return req.reject(400, 'fieldSalt (64 hex chars) is required (v4 salted leaves; prepareDocumentProof returns it per field)');
+        if (!data.fieldSalt) {
+            return req.reject(400, 'fieldSalt is required (v4 salted leaves; prepareDocumentProof returns it per field)');
         }
 
         const hasList = typeof data.allowedValuesJson === 'string' && data.allowedValuesJson.length > 0;
@@ -349,14 +290,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         const path = parseInclusionPath(req, data.siblingsJson, data.dirsJson, vaultDims(data.compiledArtifactRef).depth, { siblings: 'siblingsJson', dirs: 'dirsJson' });
         if (!path) return;
-        if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
-            return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
-        }
-        if (data.contentRoot && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
-            return req.reject(400, 'schemaId (64 hex chars) is required when contentRoot is supplied (anchorContentRoot anchors both)');
-        }
-        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
-            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        if (data.contentRoot && !data.schemaId) {
+            return req.reject(400, 'schemaId is required when contentRoot is supplied (anchorContentRoot anchors both)');
         }
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
@@ -365,8 +300,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             ? data.compiledArtifactRef
             : DEFAULT_ATTESTATION_VAULT_REF;
 
-        // Resolve the set lane BEFORE the rate gate: a value-not-in-list 400
-        // must not consume proving budget.
+        // Build the set before the rate limit check, so a value missing from the list costs no budget.
         let setRoot: string;
         let setSiblings: string[];
         let setDirs: boolean[];
@@ -376,8 +310,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             if (!Array.isArray(allowed) || allowed.length === 0 || allowed.some(v => typeof v !== 'string' || v.length === 0)) {
                 return req.reject(400, 'allowedValuesJson must be a non-empty JSON array of non-empty strings');
             }
-            // Every RAW entry is digested before dedupe; cap the raw list so an
-            // oversized duplicate-heavy list cannot buy unbounded hashing.
+            // Every entry is hashed before duplicates are removed, so limit the raw list size.
             if (allowed.length > 1024) {
                 return req.reject(400, 'allowedValuesJson supports at most 1024 raw entries (64 distinct values)');
             }
@@ -399,7 +332,6 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             setSiblings = member.setSiblings;
             setDirs = member.setDirs;
         } else {
-            if (!SHA256_HEX_RE.test(data.setRoot!)) return req.reject(400, 'setRoot must be 64 hex chars (32 bytes)');
             const setPath = parseInclusionPath(req, data.setSiblingsJson, data.setDirsJson, SET_DEPTH, { siblings: 'setSiblingsJson', dirs: 'setDirsJson' });
             if (!setPath) return;
             setRoot = data.setRoot!.toLowerCase();
@@ -410,7 +342,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        // The set root is public; value digest and paths stay witness material.
+        // Only the set root is public. The value digest and the paths stay private proof inputs.
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
         if (!attesterId) return;
         const predicateAttestationId = cds.utils.uuid();
@@ -486,25 +418,14 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on('issueDocumentIntegrityAttestation', async (req: NightgateRequest) => {
-        const data = req.data as {
-            validUntil?: number | string;
-            payloadHashA?: string; payloadHashB?: string; attesterIdA?: string; attesterIdB?: string; allowedMask?: number | string;
-            schemaJson?: string; openingAJson?: string; openingBJson?: string;
-            contentRootA?: string; contentRootB?: string; schemaId?: string;
-            sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
-            idempotencyKey?: string; sponsorSessionId?: string;
-        };
+    srv.on(issueDocumentIntegrityAttestation, async (req) => {
+        const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
         if (validUntilError) return req.reject(400, validUntilError);
 
         if (!data.payloadHashA) return req.reject(400, 'payloadHashA is required');
-        if (!SHA256_HEX_RE.test(data.payloadHashA)) return req.reject(400, 'payloadHashA must be 64 hex chars (32 bytes)');
         if (!data.payloadHashB) return req.reject(400, 'payloadHashB is required');
-        if (!SHA256_HEX_RE.test(data.payloadHashB)) return req.reject(400, 'payloadHashB must be 64 hex chars (32 bytes)');
-        if (data.attesterIdA && !SHA256_HEX_RE.test(data.attesterIdA)) return req.reject(400, 'attesterIdA must be 64 hex chars (32 bytes)');
-        if (data.attesterIdB && !SHA256_HEX_RE.test(data.attesterIdB)) return req.reject(400, 'attesterIdB must be 64 hex chars (32 bytes)');
         if (data.payloadHashA.toLowerCase() === data.payloadHashB.toLowerCase()) {
             return req.reject(400, 'payloadHashA and payloadHashB must differ (a document is trivially unchanged against itself)');
         }
@@ -522,14 +443,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (isVacuousMask(allowedMask, docPair.schema)) {
             return req.reject(400, 'allowedMask frees every real (non-padding) schema slot; the claim would be vacuous');
         }
-        for (const [name, root] of [['contentRootA', data.contentRootA], ['contentRootB', data.contentRootB]] as const) {
-            if (root && !SHA256_HEX_RE.test(root)) return req.reject(400, `${name} must be 64 hex chars (32 bytes)`);
-        }
-        if ((data.contentRootA || data.contentRootB) && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
-            return req.reject(400, 'schemaId (64 hex chars) is required when anchoring a content root (anchorContentRoot anchors both)');
-        }
-        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
-            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        if ((data.contentRootA || data.contentRootB) && !data.schemaId) {
+            return req.reject(400, 'schemaId is required when anchoring a content root (anchorContentRoot anchors both)');
         }
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
@@ -541,7 +456,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        // Document A rides in the payloadHash column.
+        // Document A is stored in the payloadHash column.
         const attesterIdA = await resolveAttester(req, data.sessionId, data.attesterIdA, Boolean(data.contentRootA));
         if (!attesterIdA) return;
         const attesterIdB = await resolveAttester(req, data.sessionId, data.attesterIdB ?? attesterIdA, Boolean(data.contentRootB));
@@ -626,25 +541,14 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on('issueDocumentDiffAttestation', async (req: NightgateRequest) => {
-        const data = req.data as {
-            validUntil?: number | string;
-            payloadHashA?: string; payloadHashB?: string; attesterIdA?: string; attesterIdB?: string; k?: number;
-            schemaJson?: string; openingAJson?: string; openingBJson?: string;
-            contentRootA?: string; contentRootB?: string; schemaId?: string;
-            sessionId?: string; contractAddress?: string; compiledArtifactRef?: string;
-            idempotencyKey?: string; sponsorSessionId?: string;
-        };
+    srv.on(issueDocumentDiffAttestation, async (req) => {
+        const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
         if (validUntilError) return req.reject(400, validUntilError);
 
         if (!data.payloadHashA) return req.reject(400, 'payloadHashA is required');
-        if (!SHA256_HEX_RE.test(data.payloadHashA)) return req.reject(400, 'payloadHashA must be 64 hex chars (32 bytes)');
         if (!data.payloadHashB) return req.reject(400, 'payloadHashB is required');
-        if (!SHA256_HEX_RE.test(data.payloadHashB)) return req.reject(400, 'payloadHashB must be 64 hex chars (32 bytes)');
-        if (data.attesterIdA && !SHA256_HEX_RE.test(data.attesterIdA)) return req.reject(400, 'attesterIdA must be 64 hex chars (32 bytes)');
-        if (data.attesterIdB && !SHA256_HEX_RE.test(data.attesterIdB)) return req.reject(400, 'attesterIdB must be 64 hex chars (32 bytes)');
         if (data.payloadHashA.toLowerCase() === data.payloadHashB.toLowerCase()) {
             return req.reject(400, 'payloadHashA and payloadHashB must differ (a document has no differences against itself)');
         }
@@ -655,14 +559,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         }
         const docPair = parseDocPairInputs(req, data.schemaJson, data.openingAJson, data.openingBJson, diffWidth);
         if (!docPair) return;
-        for (const [name, root] of [['contentRootA', data.contentRootA], ['contentRootB', data.contentRootB]] as const) {
-            if (root && !SHA256_HEX_RE.test(root)) return req.reject(400, `${name} must be 64 hex chars (32 bytes)`);
-        }
-        if ((data.contentRootA || data.contentRootB) && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
-            return req.reject(400, 'schemaId (64 hex chars) is required when anchoring a content root (anchorContentRoot anchors both)');
-        }
-        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
-            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        if ((data.contentRootA || data.contentRootB) && !data.schemaId) {
+            return req.reject(400, 'schemaId is required when anchoring a content root (anchorContentRoot anchors both)');
         }
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
@@ -674,7 +572,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
 
-        // k rides in the threshold column.
+        // k is stored in the threshold column.
         const attesterIdA = await resolveAttester(req, data.sessionId, data.attesterIdA, Boolean(data.contentRootA));
         if (!attesterIdA) return;
         const attesterIdB = await resolveAttester(req, data.sessionId, data.attesterIdB ?? attesterIdA, Boolean(data.contentRootB));
@@ -688,7 +586,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             contractAddress: data.contractAddress,
             predicate: 'documentDiff',
             op: null,
-            threshold: data.k as any,
+            threshold: data.k,
             unit: null,
             fieldKey: null,
             expectedDigest: null,
@@ -759,42 +657,25 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on('issueFieldPredicateAttestationBatch', async (req: NightgateRequest) => {
-        const data = req.data as {
-            validUntil?: number | string;
-            payloadHash?: string; attesterId?: string;
-            contentRoot?: string; schemaId?: string;
-            claimsJson?: string;
-            sessionId?: string;
-            contractAddress?: string;
-            compiledArtifactRef?: string;
-            idempotencyKey?: string;
-            sponsorSessionId?: string;
-        };
+    srv.on(issueFieldPredicateAttestationBatch, async (req) => {
+        const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
         if (validUntilError) return req.reject(400, validUntilError);
 
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
-        if (!SHA256_HEX_RE.test(data.payloadHash)) return req.reject(400, 'payloadHash must be 64 hex chars (32 bytes)');
-        if (data.attesterId && !SHA256_HEX_RE.test(data.attesterId)) return req.reject(400, 'attesterId must be 64 hex chars (32 bytes)');
-        if (data.contentRoot && !SHA256_HEX_RE.test(data.contentRoot)) {
-            return req.reject(400, 'contentRoot must be 64 hex chars (32 bytes)');
-        }
-        if (data.contentRoot && (!data.schemaId || !SHA256_HEX_RE.test(data.schemaId))) {
-            return req.reject(400, 'schemaId (64 hex chars) is required when contentRoot is supplied (anchorContentRoot anchors both)');
-        }
-        if (data.schemaId && !SHA256_HEX_RE.test(data.schemaId)) {
-            return req.reject(400, 'schemaId must be 64 hex chars (32 bytes)');
+        if (data.contentRoot && !data.schemaId) {
+            return req.reject(400, 'schemaId is required when contentRoot is supplied (anchorContentRoot anchors both)');
         }
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
-        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+        const contractAddress = data.contractAddress;
+        if (!contractAddress) return req.reject(400, 'contractAddress is required');
         if (!data.claimsJson) return req.reject(400, 'claimsJson is required');
 
-        // 8 calls per transaction; an in-batch anchor occupies one.
+        // At most 8 calls per transaction. Storing the contentRoot in the same batch uses one of them.
         const maxClaims = data.contentRoot ? 7 : 8;
-        // `allowedValues` is a membership claim's raw list before set resolution.
-        // Document kinds carry no fieldKey/path; document A is the batch payloadHash.
+        // `allowedValues` is the raw list of a membership claim, before the set is built.
+        // Document comparisons have no fieldKey or path. Document A is the batch payloadHash.
         interface BatchClaim {
             fieldKey?: string; siblings?: string[]; dirs?: boolean[];
             predicate: string; unit?: string;
@@ -813,13 +694,13 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 throw new Error(`claims[${i}].${sibName} must be a JSON array of ${depth} hashes`);
             }
             for (const s of sibs) {
-                if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) throw new Error(`claims[${i}].${sibName} entries must be 64 hex chars (32 bytes)`);
+                if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) throw new Error(`claims[${i}].${sibName} entries must be 64 hex chars (32 bytes)`);
             }
             if (!Array.isArray(ds) || ds.length !== depth) {
                 throw new Error(`claims[${i}].${dirName} must be a JSON array of ${depth} booleans`);
             }
             for (const d of ds) {
-                // Strict: Boolean("false") is true and would corrupt the path.
+                // Only real booleans. Boolean("false") is true and would give a wrong path.
                 if (typeof d !== 'boolean') throw new Error(`claims[${i}].${dirName} entries must be booleans`);
             }
             return { siblings: sibs.map((s: string) => s.toLowerCase()), dirs: ds as boolean[] };
@@ -838,12 +719,12 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 if (!parsed) throw new Error(`claims[${i}].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'`);
 
                 if (parsed.kind === 'integrity' || parsed.kind === 'diff') {
-                    // An in-batch contentRoot anchor is A's root; B's must already be anchored.
-                    if (typeof entry.payloadHashB !== 'string' || !SHA256_HEX_RE.test(entry.payloadHashB)) {
+                    // A contentRoot sent with the batch belongs to document A. Document B's root must already be on-chain.
+                    if (typeof entry.payloadHashB !== 'string' || !HEX64_ANY_CASE_RE.test(entry.payloadHashB)) {
                         throw new Error(`claims[${i}].payloadHashB must be 64 hex chars (32 bytes)`);
                     }
                     const payloadHashB = entry.payloadHashB.toLowerCase();
-                    if (entry.attesterIdB !== undefined && (typeof entry.attesterIdB !== 'string' || !SHA256_HEX_RE.test(entry.attesterIdB))) {
+                    if (entry.attesterIdB !== undefined && (typeof entry.attesterIdB !== 'string' || !HEX64_ANY_CASE_RE.test(entry.attesterIdB))) {
                         throw new Error(`claims[${i}].attesterIdB must be 64 hex chars (32 bytes)`);
                     }
                     const attesterIdB = typeof entry.attesterIdB === 'string' ? entry.attesterIdB.toLowerCase() : undefined;
@@ -877,11 +758,11 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     };
                 }
 
-                if (typeof entry.fieldKey !== 'string' || !SHA256_HEX_RE.test(entry.fieldKey)) {
+                if (typeof entry.fieldKey !== 'string' || !HEX64_ANY_CASE_RE.test(entry.fieldKey)) {
                     throw new Error(`claims[${i}].fieldKey must be 64 hex chars (32 bytes)`);
                 }
                 const contentPath = parsePath(entry, i, batchDepth, 'siblings', 'dirs');
-                if (typeof entry.salt !== 'string' || !SHA256_HEX_RE.test(entry.salt)) {
+                if (typeof entry.salt !== 'string' || !HEX64_ANY_CASE_RE.test(entry.salt)) {
                     throw new Error(`claims[${i}].salt must be 64 hex chars (32 bytes; v4 salted leaves)`);
                 }
                 const base = {
@@ -897,7 +778,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     const hasVal = typeof entry.expectedValue === 'string' && entry.expectedValue.length > 0;
                     const hasDig = typeof entry.expectedDigest === 'string' && entry.expectedDigest.length > 0;
                     if (hasVal === hasDig) throw new Error(`claims[${i}]: pass exactly one of expectedValue / expectedDigest`);
-                    if (hasDig && !SHA256_HEX_RE.test(entry.expectedDigest)) throw new Error(`claims[${i}].expectedDigest must be 64 hex chars (32 bytes)`);
+                    if (hasDig && !HEX64_ANY_CASE_RE.test(entry.expectedDigest)) throw new Error(`claims[${i}].expectedDigest must be 64 hex chars (32 bytes)`);
                     return { ...base, expectedDigest: hasDig ? entry.expectedDigest.toLowerCase() : blake2b256Hex(entry.expectedValue) };
                 }
 
@@ -905,7 +786,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     const hasVal = typeof entry.value === 'string' && entry.value.length > 0;
                     const hasDig = typeof entry.valueDigest === 'string' && entry.valueDigest.length > 0;
                     if (hasVal === hasDig) throw new Error(`claims[${i}]: pass exactly one of value / valueDigest`);
-                    if (hasDig && !SHA256_HEX_RE.test(entry.valueDigest)) throw new Error(`claims[${i}].valueDigest must be 64 hex chars (32 bytes)`);
+                    if (hasDig && !HEX64_ANY_CASE_RE.test(entry.valueDigest)) throw new Error(`claims[${i}].valueDigest must be 64 hex chars (32 bytes)`);
                     const valueDigest = hasDig ? entry.valueDigest.toLowerCase() : blake2b256Hex(entry.value);
                     const hasAllowed = Array.isArray(entry.allowedValues);
                     const hasSetPath = !!(entry.setRoot || entry.setSiblings || entry.setDirs);
@@ -922,12 +803,11 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     if (!(entry.setRoot && entry.setSiblings && entry.setDirs)) {
                         throw new Error(`claims[${i}]: allowedValues or setRoot + setSiblings + setDirs is required`);
                     }
-                    if (typeof entry.setRoot !== 'string' || !SHA256_HEX_RE.test(entry.setRoot)) throw new Error(`claims[${i}].setRoot must be 64 hex chars (32 bytes)`);
+                    if (typeof entry.setRoot !== 'string' || !HEX64_ANY_CASE_RE.test(entry.setRoot)) throw new Error(`claims[${i}].setRoot must be 64 hex chars (32 bytes)`);
                     const setPath = parsePath(entry, i, SET_DEPTH, 'setSiblings', 'setDirs');
                     return { ...base, valueDigest, setRoot: entry.setRoot.toLowerCase(), setSiblings: setPath.siblings, setDirs: setPath.dirs };
                 }
 
-                // numeric
                 if (entry.value === undefined || entry.value === null || entry.value === '') {
                     throw new Error(`claims[${i}].value is required`);
                 }
@@ -950,8 +830,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             ? data.compiledArtifactRef
             : DEFAULT_ATTESTATION_VAULT_REF;
 
-        // Before dedup (its keys need the set root) and the rate gate (a
-        // not-in-list 400 must not consume budget).
+        // Build the sets first. Duplicate removal needs the set root, and a value
+        // missing from the list must not count against the rate limit.
         if (claims.some(c => c.allowedValues)) {
             let pure;
             try {
@@ -977,8 +857,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             }
         }
 
-        // Duplicates only waste proving (claim keys are idempotent on-chain); the
-        // tuple mirrors each kind's on-chain claim struct.
+        // Drop duplicate claims. Proving one twice only costs time.
+        // The tuple has the same fields as the claim stored on-chain.
         const seenTuples = new Set<string>();
         const uniqueClaims: BatchClaim[] = [];
         for (const c of claims) {
@@ -994,10 +874,9 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         const droppedDuplicates = claims.length - uniqueClaims.length;
 
         if (rejectIfMainnetBlocked(req)) return;
-        // N claims count as N, so batching is no rate-limit bypass.
+        // Each claim counts against the rate limit, so a batch cannot bypass it.
         if (!checkRate(predicateRateLimiter, data.sessionId, req, uniqueClaims.length)) return;
 
-        // One row per claim; on success all share one provenTxHash.
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
         if (!attesterId) return;
         const insertedAt = new Date().toISOString();
@@ -1006,7 +885,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             ID: c.predicateAttestationId,
             payloadHash: data.payloadHash!.toLowerCase(),
             attesterId,
-            contractAddress: data.contractAddress,
+            contractAddress,
             predicate: c.predicate,
             op: c.opCode ?? null,
             threshold: (c.predicate === 'documentDiff' ? c.k : c.threshold ?? null) as any,
@@ -1095,8 +974,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 }
             });
 
-            // Idempotent retry: the rows created for THIS request are orphans;
-            // the original request's rows (and IDs) are authoritative.
+            // A repeated request reuses the first job. Delete the rows made for this
+            // request and return the rows of the first one.
             if (job.deduplicated) {
                 await db.run(DELETE.from(PredicateAttestations).where({ ID: { in: rowedClaims.map(c => c.predicateAttestationId) } }));
             }
@@ -1111,8 +990,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on('verifyPredicateAttestation', async (req: NightgateRequest) => {
-        const { predicateAttestationId } = req.data as { predicateAttestationId?: string };
+    srv.on(verifyPredicateAttestation, async (req) => {
+        const { predicateAttestationId } = req.data;
         if (!predicateAttestationId) return req.reject(400, 'predicateAttestationId is required');
 
         const row: any = await db.run(
@@ -1121,8 +1000,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!row) return req.reject(404, `PredicateAttestation ${predicateAttestationId} not found`);
 
         const provenOk = Boolean(row.provenTxHash);
-        // As in verifyDocument: the verdict needs the live read; an indexed
-        // inclusion never shortcuts an expiry, purge or retract.
+        // Inclusion in a block is only reported. The verdict comes from the live state,
+        // because a claim can expire or be removed after it landed.
         let included = false;
         if (provenOk) {
             const txRow: Transaction | undefined = await db.run(
@@ -1137,7 +1016,6 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             }
         }
 
-        // Live state of the recorded network and artifact.
         const rowNetwork = row.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(row.network)
             ? row.network as NightgateNetwork
             : undefined;
@@ -1158,7 +1036,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             expectedDigest: row.expectedDigest ?? '',
             setRoot: row.setRoot ?? '',
             payloadHashB: row.payloadHashB ?? '',
-            // Integer64 column: some DB drivers hand the value back as a string
+            // Some database drivers return Integer64 columns as strings.
             allowedMask: row.allowedMask === null || row.allowedMask === undefined ? null : coerceMask(row.allowedMask),
             provenTxHash: row.provenTxHash ?? '',
             provenAt: row.provenAt ?? null

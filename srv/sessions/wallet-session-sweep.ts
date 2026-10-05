@@ -1,5 +1,4 @@
 /**
- * Session sweeps: close the previous process's sessions at boot, expire sessions periodically.
  * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
@@ -11,13 +10,13 @@ import { evictFacadeUnlessShared } from './wallet-session-lifecycle';
 
 const { SELECT, UPDATE } = cds.ql;
 
-/** Rows per UPDATE, within the driver's parameter limit. */
+/** Rows per UPDATE, small enough for the database driver's parameter limit. */
 const SESSION_CLOSE_CHUNK = 200;
 
 /**
- * At init, close viewing-only sessions of the previous process; returns their ids
- * so their queued jobs can be dropped. Assumes one replica. Platform sponsors and
- * sessions holding a signing key are kept (closing revokes the key for good).
+ * At startup, closes the view-only sessions left by the previous process.
+ * Returns their ids so their queued jobs can be dropped. Assumes a single server instance.
+ * Platform fee sponsors and sessions with a signing key stay open, because closing deletes the key.
  */
 export async function closeSessionsFromPreviousProcess(db: DbRunner, config?: NightgatePluginConfig): Promise<string[]> {
     const exempt = new Set(getConfiguredFeeSponsorSessions(config));
@@ -47,13 +46,12 @@ export async function closeSessionsFromPreviousProcess(db: DbRunner, config?: Ni
     return stale;
 }
 
-/** Periodic cleanup of expired wallet sessions; returns the timer handle. */
 export function startSessionCleanup(db: DbRunner): ReturnType<typeof setInterval> {
     const SESSION_CLEANUP_INTERVAL = 15 * 60 * 1000;
     const timer = setInterval(async () => {
         try {
             const now = new Date().toISOString();
-            // Platform sponsors never expire; never deactivate or wipe them.
+            // Platform fee sponsors never expire, so they are never closed or wiped.
             const platformSponsors = new Set(getConfiguredFeeSponsorSessions(getNightgatePluginConfig()));
             const expiring: Row<WalletSession, 'sessionId'>[] = ((await db.run(
                 SELECT.from(WalletSessions)
@@ -61,8 +59,8 @@ export function startSessionCleanup(db: DbRunner): ReturnType<typeof setInterval
                     .where({ isActive: true, expiresAt: { '<': now } })
             )) || []).filter((s: Row<WalletSession, 'sessionId'>) => !platformSponsors.has(s.sessionId));
             if (expiring.length === 0) return;
-            // Deactivate FIRST and only the selected rows: a row expiring in between
-            // would otherwise never get its eviction decision.
+            // Deactivate exactly the selected rows first. A row that expires in the meantime
+            // is left for the next run, so every closed row gets its eviction check.
             await db.run(
                 UPDATE.entity(WalletSessions)
                     .set({ isActive: false, encryptedViewingKey: null, encryptedSeedKey: null })
@@ -72,7 +70,6 @@ export function startSessionCleanup(db: DbRunner): ReturnType<typeof setInterval
             for (const s of expiring) {
                 if (!s.encryptedViewingKey) continue;
                 if (s.viewingKeyHash) {
-                    // One decision per wallet, not per row.
                     if (decidedHashes.has(s.viewingKeyHash)) continue;
                     decidedHashes.add(s.viewingKeyHash);
                 }
@@ -83,7 +80,7 @@ export function startSessionCleanup(db: DbRunner): ReturnType<typeof setInterval
         } catch { /* ignore cleanup errors */ }
     }, SESSION_CLEANUP_INTERVAL);
 
-    // Tests mock setInterval with a bare object.
+    // Tests replace setInterval with a plain object that has no unref().
     if (typeof timer.unref === 'function') {
         timer.unref();
     }

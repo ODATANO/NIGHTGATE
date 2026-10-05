@@ -1,5 +1,5 @@
-// Holder registry, the caller's side; the claim-key rule lives in
-// @odatano/contract-kit.
+// Helpers to register as a token holder, so the holder can later read data shared with all holders.
+// They come from @odatano/contract-kit.
 //
 //   import { holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from '@odatano/nightgate-tx/txbuilder';
 //

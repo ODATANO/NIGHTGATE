@@ -1,46 +1,44 @@
 /**
- * Reconciliation finalizers: record the projection once inclusion is proven.
+ * Writes a job's database results once its transaction is proven to be on chain.
  * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
 import { assertArtifactGeneration } from '../contract-registry';
-import type { BackgroundJobRow, ReconciliationEvidence } from '../job-store';
-import { Documents, DisclosureGrants, PendingSubmissions } from '#cds-models/midnight';
+import type { ReconciliationEvidence } from '../job-store';
+import { Documents, DisclosureGrants, PendingSubmissions, type PendingSubmission, type BackgroundJob } from '#cds-models/midnight';
+import { parseSubmitIntent } from '../submit-intent';
 import { recordDeployedContracts } from '../../sessions/agent-grants';
 import { recordPlatformMint } from '../platform-mints';
 import { closeSwapOffer, closeSwapOffersByNullifiers } from '../swap-offers';
 import { ContractCommandV1, ContractCommandV1WithProvenance } from '../actions/common';
 import type { SubmissionContext } from '../actions/context';
+import { errorMessage } from '../../utils/errors';
 
 const { UPDATE, SELECT } = cds.ql;
 
+/** Result writers for jobs whose transaction landed but whose send outcome was lost. */
 export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db' | 'contractResolver' | 'confirmedDisclosureLevel' | 'heightStamp' | 'notNewerThan' | 'reindexAfterSubmit'>) {
+
     const { db, contractResolver, confirmedDisclosureLevel, heightStamp, notNewerThan, reindexAfterSubmit } = ctx;
 
-    /**
-     * Reconciliation finalizer for both sponsoring channels: records deployed
-     * addresses and minted token types from the attempt row once inclusion is proven. A reconciled chain
-     * failure keeps its reservation; refunds only cover txs that never reached the chain.
-     */
-    const finalizeSponsoredSubmission = async (raw: unknown, _job: BackgroundJobRow, evidence: ReconciliationEvidence): Promise<unknown> => {
+    const finalizeSponsoredSubmission = async (raw: unknown, _job: BackgroundJob, evidence: ReconciliationEvidence): Promise<unknown> => {
         const command = raw as { grantId?: string; sponsorSessionId?: string };
-        const submission: any = evidence.submissionId
+        const submission: PendingSubmission | undefined = evidence.submissionId
             ? await db.run(SELECT.one.from(PendingSubmissions).where({ ID: evidence.submissionId }))
             : await db.run(SELECT.one.from(PendingSubmissions).where({ txHash: evidence.txHash }));
-        let coordinates: any = {};
-        try { coordinates = submission?.submitIntentData ? JSON.parse(submission.submitIntentData) : {}; } catch { coordinates = {}; }
+        const coordinates = parseSubmitIntent(submission?.submitIntentData);
         const deployed: string[] = Array.isArray(coordinates.deployed) ? coordinates.deployed.map(String) : [];
         const grantId = coordinates.deployReservation?.grantId ?? command?.grantId;
         if (deployed.length && grantId) await recordDeployedContracts(db, String(grantId), deployed);
         const minted: string[] = Array.isArray(coordinates.minted) ? coordinates.minted.map(String) : [];
         if (minted.length) await recordPlatformMint(db, minted, { grantId: grantId ? String(grantId) : null, sponsorSessionId: command?.sponsorSessionId ?? null, txHash: evidence.txHash ?? null });
         const nullifiers: string[] = Array.isArray(coordinates.nullifiers) ? coordinates.nullifiers.map(String) : [];
-        // The swap is on chain; a failed bookkeeping write must not fail the reconciliation.
+        // The swap is already on chain. A failed write to the offer board must not fail the job.
         try {
             if (coordinates.offerId) await closeSwapOffer(db, String(coordinates.offerId), 'filled', evidence.txHash ?? null);
             if (nullifiers.length) await closeSwapOffersByNullifiers(db, nullifiers, evidence.txHash ?? null);
         } catch (e) {
-            cds.log('nightgate').warn(`swap offers of ${evidence.txHash ?? 'the reconciled swap'} not closed: ${String((e as Error)?.message ?? e)}`);
+            cds.log('nightgate').warn(`swap offers of ${evidence.txHash ?? 'the reconciled swap'} not closed: ${errorMessage(e)}`);
         }
         return {
             reconciled: true, ...evidence, status: 'finalized',
@@ -52,8 +50,7 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         };
     };
 
-    /** A factory mint proven by the indexer after a lost broadcast: the same bookkeeping as the inline path. */
-    const finalizeFactoryMint = async (raw: unknown, job: BackgroundJobRow, evidence: ReconciliationEvidence): Promise<unknown> => {
+    const finalizeFactoryMint = async (raw: unknown, job: BackgroundJob, evidence: ReconciliationEvidence): Promise<unknown> => {
         const command = raw as Extract<ContractCommandV1, { op: 'call' }>;
         const tokenType = command?.mintedTokenType;
         if (tokenType) await recordPlatformMint(db, [tokenType], { grantId: job.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: evidence.txHash ?? null });
@@ -65,18 +62,13 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         };
     };
 
-    const finalizeContractProjection = async (
-        raw: unknown,
-        _job: BackgroundJobRow,
-        evidence: ReconciliationEvidence
-    ): Promise<unknown> => {
-        const command = raw as ContractCommandV1;
-        // Same provenance gate as the executor: reconciliation can run long after
-        // submission, against a re-pointed alias.
-        if (typeof (command as any).compiledArtifactRef === 'string') {
+    const finalizeContractProjection = async (raw: unknown, _job: BackgroundJob, evidence: ReconciliationEvidence): Promise<unknown> => {
+        const command = raw as ContractCommandV1WithProvenance;
+
+        if (typeof command.compiledArtifactRef === 'string') {
             assertArtifactGeneration(
-                (command as any).compiledArtifactRef,
-                (command as ContractCommandV1WithProvenance).artifactDigest,
+                command.compiledArtifactRef,
+                command.artifactDigest,
                 `Reconciled '${command.op}' command of job ${_job.ID}`);
         }
         const changedAt = evidence.finalizedAt ?? new Date().toISOString();
@@ -107,7 +99,6 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
                     grantee: command.grantee
                 }), landed));
             }
-            // Atomic generation binding, as in the executor.
             const resolved = await contractResolver(
                 command.compiledArtifactRef,
                 (command as ContractCommandV1WithProvenance).artifactDigest);
@@ -127,7 +118,7 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         }
         if (command.op === 'retract') {
             if (command.mode === 0) {
-                // Same projection as the executor; idempotent.
+                // Same database update the executor makes after a normal submit.
                 const changedAt = new Date().toISOString();
                 const landed = evidence.blockHeight ?? null;
                 await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ active: false, revokedTxHash: evidence.txHash, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.key, active: true }), landed));
@@ -143,7 +134,6 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
             };
         }
         if (command.op === 'callBatch') {
-            // The generic recovery result would miss `circuits`.
             return {
                 reconciled: true,
                 submissionId: evidence.submissionId,
@@ -154,7 +144,8 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
                 ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
             };
         }
-        throw new Error(`Unsupported projection finalizer operation '${(command as any)?.op}'`);
+        throw new Error(`Unsupported projection finalizer operation '${String((raw as { op?: unknown } | null)?.op)}'`);
     };
+
     return { finalizeSponsoredSubmission, finalizeContractProjection, finalizeFactoryMint };
 }

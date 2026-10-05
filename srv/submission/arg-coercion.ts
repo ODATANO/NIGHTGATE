@@ -1,7 +1,7 @@
 /**
- * Coerces JSON circuit args to the Uint8Array/BigInt shapes Compact guards
- * demand. A `$bytes`/`$uint` tag wins; otherwise contract-info.json types drive
- * it; untagged args without metadata are rejected rather than passed through.
+ * Converts JSON circuit arguments into the byte arrays and bigints that Compact circuits expect.
+ * A `$bytes` or `$uint` tag decides first. Otherwise the types in contract-info.json decide.
+ * Untagged arguments without type info are rejected.
  */
 
 import fs from 'fs';
@@ -76,7 +76,7 @@ function toBigInt(value: unknown, index: number, maxval?: number): bigint {
     if (v < 0n) {
         throw new CoercionError(index, `Uint value must be non-negative (got ${v})`);
     }
-    // Larger maxvals lost precision in JSON.parse; the circuit enforces the true bound.
+    // Larger limits lose precision in JSON.parse. The circuit checks the exact limit.
     if (maxval !== undefined && maxval <= Number.MAX_SAFE_INTEGER && v > BigInt(maxval)) {
         throw new CoercionError(index, `Uint value ${v} exceeds maximum ${maxval}`);
     }
@@ -171,7 +171,7 @@ function mapArgType(node: RawArgTypeNode | undefined, name: string): CircuitArgT
     return { name, kind: 'other' };
 }
 
-// Keyed by stat identity too: a recompile under the same path must not reuse the old map.
+// The cache key includes file stats, so a recompiled contract at the same path is read again.
 const argTypeCache = new Map<string, Map<string, CircuitArgType[]> | null>();
 
 function contractInfoKey(infoPath: string): string {
@@ -204,7 +204,7 @@ function loadContractInfo(zkConfigPath: string): Map<string, CircuitArgType[]> |
     return byCircuit;
 }
 
-/** Undefined when metadata or circuit is missing; coercion then accepts tagged values only. */
+/** Undefined when the type info or the circuit is missing. Then only tagged values are accepted. */
 export function loadCircuitArgTypes(zkConfigPath: string, circuit: string): CircuitArgType[] | undefined {
     const byCircuit = loadContractInfo(zkConfigPath);
     return byCircuit?.get(circuit);

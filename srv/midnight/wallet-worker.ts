@@ -1,7 +1,7 @@
 /**
- * Wallet worker thread entry. The SDK's Effect scheduler monopolises the
- * microtask queue during a sync, so it runs here, off the cds-serve thread.
- * Composition root only; the pieces live under `worker/` (methods: worker/rpc.ts).
+ * Entry point of the wallet worker thread.
+ * A wallet sync keeps the SDK busy for long stretches, so it runs here and not on the server thread.
+ * The worker's code lives in `worker/`. The callable methods are in `worker/rpc.ts`.
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
@@ -26,9 +26,9 @@ export { handlers, handleMessage } from './worker/rpc';
 if (!parentPort) {
     throw new Error('wallet-worker must be loaded as a worker_threads worker (no parentPort)');
 }
-// Key ring and config come from the main thread (workerData), never the worker's env.
+// The encryption keys come from the main thread, never from the worker's environment.
 if (workerData?.encryptionKeyRing) setKeyRing(workerData.encryptionKeyRing);
-// The SDK only prints a rejected sync apply; checkSnapshotReplay needs it recorded.
+// The SDK only prints a failed sync update. checkSnapshotReplay needs it recorded.
 installReplayRejectionTap();
 
 parentPort.on('message', (msg: any) => { void handleMessage(msg); });

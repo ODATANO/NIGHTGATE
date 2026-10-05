@@ -12,6 +12,7 @@ import {
     encrypt, decrypt, hashViewingKey, getEncryptionKey, inspectCiphertext, parseKeyRingSpec, KeyRing,
     UnknownEncryptionKeyError, UnboundEnvelopeError, legacyFold, deriveKek, deriveBoundSecret, setKeyRing, __resetKeyRingForTests, LEGACY_KEY_ID
 } from '../../srv/utils/crypto';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 const ENV_KEYS = ['ENCRYPTION_KEY', 'ENCRYPTION_KEYS', 'ENCRYPTION_KEY_ACTIVE', 'NODE_ENV'] as const;
 let savedEnv: Record<string, string | undefined> = {};
@@ -279,7 +280,7 @@ describe('v3 bound envelopes', () => {
 
 describe('hashViewingKey: SHA-256', () => {
     it('produces consistent 64-char hex output', () => {
-        expect(hashViewingKey('a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6')).toMatch(/^[0-9a-f]{64}$/);
+        expect(hashViewingKey('a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6')).toMatch(HEX64_RE);
     });
 
     it('same input produces same hash, different inputs differ', () => {

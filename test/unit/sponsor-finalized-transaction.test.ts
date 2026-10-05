@@ -26,8 +26,7 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
     startJob: vi.fn(async (args: any) => { startJobCalls.push(args); return { jobId: 'job-1', status: 'pending' }; }),
     runChildCommand: vi.fn(),
     registerBackgroundJobProcessor: vi.fn((kind: string, v: number, _traits: unknown, fn: any) => { processors.set(kind, fn); processorVersions.set(kind, v); }),
-    registerBackgroundJobReconciliationFinalizer: vi.fn((kind: string, v: number, fn: any) => { finalizers.set(kind, fn); }),
-    withLockContentionRetry: (_label: string, fn: () => Promise<unknown>) => fn()
+    registerBackgroundJobReconciliationFinalizer: vi.fn((kind: string, v: number, fn: any) => { finalizers.set(kind, fn); })
 }));
 const unboundWorkerCalls = vi.hoisted(() => [] as any[]);
 const unboundWorkerImpl = vi.hoisted(() => ({ fn: async (_args: any): Promise<any> => ({ txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' }) }));

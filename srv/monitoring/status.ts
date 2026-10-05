@@ -1,4 +1,4 @@
-/** Status builders behind the NightgateIndexerService probe functions. */
+/** Builds the answers of the health, readiness, metrics and status functions of the indexer service. */
 
 import cds from '@sap/cds';
 const { SELECT } = cds.ql;
@@ -22,16 +22,15 @@ import { getWalletWorkerStatus } from '../midnight/wallet-worker-client';
 import { listWalletFacades } from '../submission/wallet-facade-builder';
 import { readRuntimeState } from '../utils/runtime-state';
 import { absorbedCrawlerFaults } from '../crawler/crawler-fault-guard';
+import type { DbRunner } from '../utils/db-types';
+import type { getReadiness, getRuntimeInfo } from '#cds-models/NightgateIndexerService';
 
 export const metricPrefix = 'odatano_nightgate';
 
-/** Process start, module load time. Imported by the service so uptime agrees. */
 export const processStartTime = Date.now();
 
 const OPEN_JOB_STATUSES = ['pending', 'running', 'external_execution', 'submitted', 'reconciliation_required'];
 
-// Structural, so both `cds.db` and a test stub fit.
-type Db = { run: (...args: any[]) => Promise<any> };
 
 export function buildLiveness(): Record<string, unknown> {
     const topology = getRuntimeTopology(getNightgatePluginConfig());
@@ -43,7 +42,7 @@ export function buildLiveness(): Record<string, unknown> {
     };
 }
 
-export async function buildHealth(db: Db): Promise<Record<string, unknown>> {
+export async function buildHealth(db: DbRunner): Promise<Record<string, unknown>> {
     const topology = getRuntimeTopology(getNightgatePluginConfig());
     const syncState = await db.run(SELECT.one.from(SyncState).where({ ID: 'SINGLETON' }));
 
@@ -66,7 +65,7 @@ export async function buildHealth(db: Db): Promise<Record<string, unknown>> {
         };
     }
 
-    // Integer64/Decimal read back as strings (ieee754compatible): coerce.
+    // Large integers and decimals come back from the database as strings.
     const chainHeight = Number(syncState.chainHeight || 0);
     const indexedHeight = Number(syncState.lastIndexedHeight || 0);
     const finalizedHeight = Number(syncState.lastFinalizedHeight || 0);
@@ -94,14 +93,13 @@ export async function buildHealth(db: Db): Promise<Record<string, unknown>> {
     };
 }
 
-export async function buildReadiness(db: Db): Promise<Record<string, unknown>> {
+export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<ReturnType<typeof getReadiness>>>> {
     const pluginConfig = getNightgatePluginConfig();
     const topology = getRuntimeTopology(pluginConfig);
-    // A disabled crawler is not a readiness failure: its checks pass as not applicable.
+    // A disabled crawler does not make the server unready. Its checks simply pass.
     const crawlerEnabled = (resolveNightgateRuntimeConfig(pluginConfig).crawlerConfig as any)?.enabled !== false;
 
-    // Both conditions needed: initialize() sets `initialized` even when it ends
-    // 'offline', and 'idle' is reported both before init and after a good start.
+    // Both conditions are needed. `initialized` is also set when startup ended offline.
     const runtime = readRuntimeStatus();
     const initialisationOk = runtime?.initialized === true && runtime.mode !== 'offline';
 
@@ -126,7 +124,7 @@ export async function buildReadiness(db: Db): Promise<Record<string, unknown>> {
             }
         }
     } catch {
-        // database unavailable: checks.database stays false
+        // Database unavailable: checks.database stays false.
     }
 
     return {
@@ -147,8 +145,8 @@ export async function buildReadiness(db: Db): Promise<Record<string, unknown>> {
 }
 
 /**
- * Sanitised reason: the raw `lastError` can carry the database path and SQL,
- * and this payload is public (getReadiness is anonymous).
+ * Turns the startup error into a short public reason.
+ * The raw error can contain the database path and SQL, and anyone can call getReadiness.
  */
 function summariseInitFailure(runtime: { mode?: string; lastError?: string } | null): string {
     if (!runtime || runtime.mode === 'idle') {
@@ -171,7 +169,6 @@ function readRuntimeStatus(): { mode?: string; lastError?: string; initialized?:
     return readRuntimeState();
 }
 
-/** Pool gauges summed over the database service's pools (one per tenant); null when none. */
 export function dbPoolGauges(db: unknown): { size: number; available: number; borrowed: number; pending: number } | null {
     const pools = (db as { pools?: unknown } | null | undefined)?.pools;
     if (!pools || typeof pools !== 'object') return null;
@@ -182,7 +179,7 @@ export function dbPoolGauges(db: unknown): { size: number; available: number; bo
     return { size: sum('size'), available: sum('available'), borrowed: sum('borrowed'), pending: sum('pending') };
 }
 
-export async function buildMetricsText(db: Db): Promise<string> {
+export async function buildMetricsText(db: DbRunner): Promise<string> {
     const syncState = await db.run(SELECT.one.from(SyncState).where({ ID: 'SINGLETON' }));
 
     const lines: string[] = [];
@@ -194,7 +191,7 @@ export async function buildMetricsText(db: Db): Promise<string> {
     const uptimeSec = Math.floor((Date.now() - processStartTime) / 1000);
     const syncStatus = syncState?.syncStatus || 'stopped';
     const topology = getRuntimeTopology(getNightgatePluginConfig());
-    // Aggregate in SQL: loading job rows would cost most exactly under a backlog.
+    // Count in SQL. Loading the job rows would be most expensive exactly when many jobs are queued.
     const jobCounts = new Map<string, number>();
     let oldestQueuedSeconds = 0;
     try {
@@ -214,7 +211,7 @@ export async function buildMetricsText(db: Db): Promise<string> {
         const oldestMs = oldestRows[0]?.oldest ? new Date(oldestRows[0].oldest).getTime() : NaN;
         if (Number.isFinite(oldestMs)) oldestQueuedSeconds = Math.max(0, (Date.now() - oldestMs) / 1000);
     } catch {
-        // Metrics must stay available during schema rollout/degraded DB states.
+        // Metrics must keep working while the schema is being updated or the database has problems.
     }
     const countOf = (...statuses: string[]) =>
         statuses.reduce((sum, status) => sum + (jobCounts.get(status) ?? 0), 0);
@@ -309,10 +306,10 @@ export async function buildMetricsText(db: Db): Promise<string> {
 }
 
 /**
- * Version, network, proving mode and artifact digests per contract: shows why
- * the generation guard refuses writes after artifacts changed under the server.
+ * Version, network, proving mode and a hash of each contract's compiled files.
+ * The hashes show why writes are refused after contract files changed on disk.
  */
-export function buildRuntimeInfo(): Record<string, unknown> {
+export function buildRuntimeInfo(): NonNullable<Awaited<ReturnType<typeof getRuntimeInfo>>> {
     const config = getNightgatePluginConfig();
     const topology = getRuntimeTopology(config);
 
@@ -321,7 +318,7 @@ export function buildRuntimeInfo(): Record<string, unknown> {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         version = String((require('../../package.json') as { version?: string }).version ?? 'unknown');
     } catch {
-        // Packaged layouts may not expose it; the rest of the payload stands.
+        // Some package layouts do not ship package.json. The rest of the answer still works.
     }
 
     const contracts = listRegisteredContracts().map(name => {
@@ -330,8 +327,6 @@ export function buildRuntimeInfo(): Record<string, unknown> {
         let currentDigest: string | null = null;
         let digestError: string | null = null;
         try {
-            // Loaded generation (stamped on commands) vs the files on disk now
-            // (what resolveContract compares); only both expose a stale alias.
             artifactDigest = getArtifactGenerationDigest(name);
             currentDigest = getCurrentArtifactDigest(name);
         } catch (err) {
@@ -341,7 +336,7 @@ export function buildRuntimeInfo(): Record<string, unknown> {
             name,
             artifactDigest,
             currentDigest,
-            // Disk differs from the loaded generation: writes fail until restart.
+            // The files on disk changed after loading. Writes fail until a restart.
             digestStale: Boolean(artifactDigest && currentDigest && artifactDigest !== currentDigest),
             digestError,
             package: registration?.package?.name ?? null,
@@ -354,7 +349,7 @@ export function buildRuntimeInfo(): Record<string, unknown> {
     return {
         version,
         apiVersion: version.split('.').slice(0, 2).join('.'),
-        network: getConfiguredNightgateNetwork(config),
+        network: getConfiguredNightgateNetwork(config) ?? null,
         provingMode: resolveEffectiveProvingMode(config),
         instanceId: topology.instanceId,
         runtimeMode: topology.runtimeMode,
@@ -365,17 +360,16 @@ export function buildRuntimeInfo(): Record<string, unknown> {
 }
 
 /**
- * Wallet worker health, deliberately not a readiness check: `ready` would
- * drop a pod whenever the worker is merely busy.
+ * Wallet worker health. On purpose not part of readiness, which would take the server
+ * out of service whenever the worker is only busy.
  */
 export function buildWorkerStatus(isAdmin = false): Record<string, unknown> {
     const worker = getWalletWorkerStatus();
-    // The facade registry is authoritative; the worker's progress cache fills
-    // only after the first watch tick, so it merely adds detail.
+    // The main thread's list is the truth. The worker's progress data fills in later.
     const bySession = new Map(worker.facades.map(f => [f.sessionId, f]));
     const facades = listWalletFacades().map(sessionId => bySession.get(sessionId)
         ?? { sessionId, label: null, caughtUp: null, updatedAt: null });
-    // Keep stale snapshots: they show a facade the worker still thinks it has.
+    // Keep wallets that only the worker still reports. They show a mismatch worth seeing.
     for (const f of worker.facades) if (!facades.some(x => x.sessionId === f.sessionId)) facades.push(f);
     return {
         started: worker.started,
@@ -387,8 +381,8 @@ export function buildWorkerStatus(isAdmin = false): Record<string, unknown> {
         lastExitAt: worker.lastExitAt,
         rpcTimeoutMs: worker.rpcTimeoutMs,
         facadeCount: facades.length,
-        // Admin only: sessionId is a wallet-derived accountId, stable across
-        // sessions, so the list would leak which wallets this process holds.
+        // Admin only. The sessionId here is derived from the wallet and stays the same across sessions,
+        // so the list would reveal which wallets this server holds.
         facades: isAdmin ? facades : []
     };
 }

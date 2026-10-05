@@ -1,4 +1,3 @@
-// Declaration twin for `import ... from './witnesses.mjs'` (NodeNext resolves
-// an .mjs import to .d.mts). The declarations live in witnesses.d.ts, which
-// index.d.ts also consumes.
+// Types for imports of './witnesses.mjs'. TypeScript looks for them in a `.d.mts` file.
+// The actual declarations are in witnesses.d.ts.
 export * from './witnesses.js';

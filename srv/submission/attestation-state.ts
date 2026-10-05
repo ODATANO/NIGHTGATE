@@ -1,6 +1,6 @@
 /**
- * Crawler-free attestation reader over live vault state. A record is addressed
- * by record key (attester id + payload hash) or a bound document id.
+ * Reads an attestation directly from the live vault contract, without the crawler.
+ * An attestation is found by attester id plus payload hash, or by a document id bound to it.
  */
 import { hexToBytes } from '../utils/hex';
 import { importArtifactByPath } from './contract-registry';
@@ -24,16 +24,16 @@ export interface AttestationLedger {
     document_owners:   { member(key: Uint8Array): boolean; lookup(key: Uint8Array): Uint8Array };
 }
 
-/** Hex fields are '' when absent; the *Ok flags are false when nothing was supplied. */
+/** Hex fields are '' when absent. The *Ok flags are false when no value was given to compare. */
 export interface AttestationStateResult {
     attested: boolean;
     contentRootOk: boolean;
     schemaOk: boolean;
-    /** The bound document id is registered to the record's attester (an unregistered id is first-come-first-served). */
+    /** The document id is registered to this attester. An unregistered id can be taken by anyone first. */
     bindingRegistered: boolean;
     attesterId: string;
     payloadHash: string;
-    /** '' when a document id resolved to nothing. */
+    /** Key of the attestation entry. '' when the document id was not found. */
     recordKey: string;
     documentId: string;
     contentRoot: string;
@@ -42,10 +42,9 @@ export interface AttestationStateResult {
 
 export interface ReadAttestationStateDeps {
     contractAddress: string;
-    /** With `payloadHash` it names the record. */
     attesterId?: string;
     payloadHash?: string;
-    /** Resolves the record through `document_bindings`. */
+    /** Finds the attestation through the contract's `document_bindings` map. */
     documentId?: string;
     contentRoot?: string;
     schemaId?: string;
@@ -56,8 +55,8 @@ export interface ReadAttestationStateDeps {
 const ZERO_ID = '00'.repeat(32);
 
 /**
- * A supplied payloadHash or attesterId must match the resolved record. Null without
- * contract state, so callers return a clean negative rather than a 5xx.
+ * A given payloadHash or attesterId must match the attestation found.
+ * Returns null when the contract has no state, so callers answer "not found" instead of a server error.
  */
 export async function readAttestationState(
     deps: ReadAttestationStateDeps
@@ -123,7 +122,7 @@ export interface ReadAttestationStateForContractArgs {
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
 }
 
-/** Dynamic imports keep the ESM-only SDK out of CJS load. */
+/** Dynamic imports, because the SDK is ESM-only and this project is CommonJS. */
 export async function readAttestationStateForContract(
     args: ReadAttestationStateForContractArgs
 ): Promise<AttestationStateResult | null> {

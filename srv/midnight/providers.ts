@@ -1,4 +1,4 @@
-/** Midnight provider bundle assembly: wallet-free providers, plus wallet-bound ones when a session exists. */
+/** Builds the set of Midnight SDK providers a contract needs. Wallet providers are added when a wallet is available. */
 
 import WebSocket from 'ws';
 import { loadMidnightSdk } from './sdk-loader';
@@ -6,7 +6,7 @@ import { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
 import { isWasmProvingMode, buildWasmProofProvider } from './wasm-proof-provider';
 import { proofRequestTimeoutMs } from '../utils/proof-timeout';
 
-/** Sets the SDK's process-global network id; call before any SDK invocation. */
+/** Sets the SDK's network id for the whole process. Call it before any other SDK call. */
 let lastSetNetworkId: string | undefined;
 export async function ensureNetworkId(network: string): Promise<void> {
     if (lastSetNetworkId === network) return;
@@ -25,24 +25,23 @@ export interface ContractProvidersConfig {
 }
 
 export interface WalletMaterial {
-    accountId: string; // scopes private-state storage
+    accountId: string; // keeps each account's private contract state apart
     privateStoragePasswordProvider: () => Promise<string> | string;
-    /** Older derivations of that passphrase, read-only: a row found under one is rewritten under the current. */
+    /** Older forms of the password, used only for reading. Data found with one is saved again under the current password. */
     privateStoragePasswordFallbacks?: () => Promise<string[]> | string[];
     walletAndMidnightProvider: any;
     privateStateBackend?: PrivateStateBackend; // default 'cap-db'
-    // Idempotent
+    // Safe to call more than once.
     ensureFacade?: () => Promise<void>;
 }
 
-/** Provider bundle without wallet-bound components. Safe to assemble eagerly. */
 export interface ContractProviderBundle {
     publicDataProvider: any;
     zkConfigProvider: any;
     proofProvider: any;
 }
 
-/** Full bundle as `deployContract` / `findDeployedContract` expect it. */
+/** All providers that `deployContract` and `findDeployedContract` expect. */
 export interface MidnightProviderBundle extends ContractProviderBundle {
     privateStateProvider: any;
     walletProvider: any;
@@ -68,8 +67,8 @@ export async function buildContractProviders(cfg: ContractProvidersConfig): Prom
 }
 
 /**
- * LevelDB storage password: the SDK's rules (3 classes, no runs or sequences) reject
- * raw hex, so byte pairs are joined by '-' plus a mixed-case suffix. Stable per input.
+ * The SDK's password rules for LevelDB storage reject a plain hex string.
+ * This turns the hex into an accepted password. The same input always gives the same result.
  */
 export function levelStoragePassword(password: string): string {
     const pairs = password.match(/.{1,2}/g) ?? [password];

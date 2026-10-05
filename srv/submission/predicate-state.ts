@@ -1,7 +1,7 @@
 /**
- * Crawler-free claim reader over the live contract state. Claim keys and the
- * ledger read live in `@odatano/contract-kit`; this module adds the provider
- * wiring and the per-kind key selection.
+ * Checks proven claims directly in the live contract state, without the crawler.
+ * A claim key is the map key under which the contract stores one proven claim.
+ * `@odatano/contract-kit` computes the keys. This module picks the right key for each claim type.
  */
 import {
     CLAIM_TAG,
@@ -38,7 +38,7 @@ export type { PredicateLedger, PredicateResultKind, ReadPredicateResultDeps };
 
 export interface ReadPredicateStateForContractArgs {
     contractAddress: string;
-    /** The attester whose record of `payloadHash` carries the claim. */
+    /** The attester under whose entry for `payloadHash` the claim is stored. */
     attesterId: string;
     payloadHash: string;
     /** Numeric predicates only. */
@@ -48,15 +48,15 @@ export interface ReadPredicateStateForContractArgs {
     fieldKey?: string;
     expectedDigest?: string;
     setRoot?: string;
-    /** Cross-root claims: document B. */
+    /** Claims that compare two documents: the second document. */
     payloadHashB?: string;
     /** Defaults to `attesterId`. */
     attesterIdB?: string;
-    /** Integrity claim (with payloadHashB). */
+    /** Set for an integrity claim: the two documents differ only in these fields. */
     allowedMask?: number;
-    /** Diff claim (with payloadHashB). */
+    /** Set for a difference claim: at least k fields differ between the two documents. */
     k?: number;
-    /** Default 16; only the integrity claim key depends on it. */
+    /** Number of field slots, default 16. Only the integrity claim key uses it. */
     slotWidth?: number;
     artifactPath: string;
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
@@ -65,8 +65,8 @@ export interface ReadPredicateStateForContractArgs {
 }
 
 /**
- * Recompute the claim key from the record's current anchor(s) and read it. A
- * claim made under a former anchor misses the map by construction.
+ * Recompute the claim key from the document root stored on chain right now, then look it up.
+ * A claim made against an older root of the same document is therefore not found.
  */
 export async function readPredicateStateForContract(
     args: ReadPredicateStateForContractArgs
@@ -93,7 +93,7 @@ export async function readPredicateStateForContract(
         const recordKeyB = await computeRecordKey(args.attesterIdB ?? args.attesterId, args.payloadHashB!);
         const anchorB = anchorOf(led, recordKeyB);
         if (anchorB === null) return false;
-        // A comparison holds only under one shared schema.
+        // Two documents can only be compared if they use the same field layout.
         if (anchorA.schema !== anchorB.schema) return false;
         if (kind === 'integrity') {
             claimKey = await computeDocumentIntegrityClaimKey(recordKeyA, anchorA.root, recordKeyB, anchorB.root, anchorA.schema, args.allowedMask!, args.slotWidth ?? 16);

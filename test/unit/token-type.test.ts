@@ -11,6 +11,7 @@ import {
     padDomainSeparator, domainSeparatorHex, deriveRawTokenType, TokenTypeError,
     SHIELDED_TEST_TOKEN_DOMAIN_SEP, SHIELDED_TEST_TOKEN_AMOUNT
 } from '../../srv/submission/token-type';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 // A real preprod contract address (32 bytes, 64 hex). The runtime parses the
 // address and rejects anything else, so this cannot be an invented string.
@@ -47,7 +48,7 @@ describe('padDomainSeparator', () => {
 describe('deriveRawTokenType', () => {
     test('derives 64 lowercase hex through the real runtime', async () => {
         const r = await deriveRawTokenType(ADDRESS);
-        expect(r.tokenTypeHex).toMatch(/^[0-9a-f]{64}$/);
+        expect(r.tokenTypeHex).toMatch(HEX64_RE);
         expect(r.contractAddress).toBe(ADDRESS);
         expect(r.domainSeparator).toBe(domainSeparatorHex(padDomainSeparator(SHIELDED_TEST_TOKEN_DOMAIN_SEP)));
     });

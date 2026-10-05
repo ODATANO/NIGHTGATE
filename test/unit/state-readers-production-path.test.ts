@@ -36,6 +36,7 @@ import {
     readPredicateStateForContract
 } from '../../srv/submission/predicate-state';
 import { readAttestationStateForContract } from '../../srv/submission/attestation-state';
+import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 const ARTIFACT = path.resolve(__dirname, '../fixtures/fake-vault-artifact.mjs');
 const CFG = {
@@ -102,13 +103,13 @@ describe('claim-key recomputation (real compact-runtime)', () => {
     it('equality and membership keys differ for identical coordinates (type tags)', async () => {
         const eq = await computeFieldEqualityClaimKey(PAYLOAD, ROOT, SCHEMA, FIELD_KEY, 'e5'.repeat(32));
         const mem = await computeFieldMembershipClaimKey(PAYLOAD, ROOT, SCHEMA, FIELD_KEY, 'e5'.repeat(32));
-        expect(eq).toMatch(/^[0-9a-f]{64}$/);
+        expect(eq).toMatch(HEX64_RE);
         expect(mem).not.toBe(eq);
     });
 
     it('is sensitive to every coordinate (record, root, schema, threshold, op, fieldKey)', async () => {
         const base = await computeFieldPredicateClaimKey(PAYLOAD, ROOT, SCHEMA, FIELD_KEY, 42000n, 0);
-        expect(base).toMatch(/^[0-9a-f]{64}$/);
+        expect(base).toMatch(HEX64_RE);
         await expect(computeFieldPredicateClaimKey('ff'.repeat(32), ROOT, SCHEMA, FIELD_KEY, 42000n, 0)).resolves.not.toBe(base);
         await expect(computeFieldPredicateClaimKey(PAYLOAD, 'ee'.repeat(32), SCHEMA, FIELD_KEY, 42000n, 0)).resolves.not.toBe(base);
         await expect(computeFieldPredicateClaimKey(PAYLOAD, ROOT, 'ed'.repeat(32), FIELD_KEY, 42000n, 0)).resolves.not.toBe(base);

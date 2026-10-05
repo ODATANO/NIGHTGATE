@@ -1,15 +1,8 @@
 /**
- * CAP's built-in connection pool (@cap-js/db-service 3.0.x) loses a pooled
- * connection whenever it dispenses one to a request that already timed out
- * (`generic-pool.js` `#dispense`, non-pending branch: neither loaned nor
- * returned). Under load the pool empties and every request fails with
- * "Pool resource could not be acquired". The `generic-pool` package (a
- * dependency of this plugin) does not have the defect, and CAP selects it via
- * `features.use_generic_pool`. The flag is read when db-service loads, so it
- * has to be set at plugin registration, before any db connect.
- *
- * Applied only when the host has not decided: an explicit `true`/`false` in
- * the host's config stays.
+ * Makes CAP use the `generic-pool` package for database connections.
+ * CAP's built-in pool loses a connection each time a request times out while waiting, until no connection is left.
+ * CAP reads this flag when its database layer loads, so it is set when the plugin loads.
+ * A value the host app sets itself is kept.
  */
 export function applyPoolDefault(env: { features?: Record<string, unknown> }): boolean {
     const features = (env.features ??= {});

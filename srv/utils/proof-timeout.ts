@@ -1,12 +1,8 @@
 /**
- * HTTP timeout of ONE proof request to the proof server (server proving mode).
- * midnight-js' `httpClientProofProvider` defaults to 5 min and re-requests a
- * timed-out proof up to three times, so under a too-short timeout a slow proof
- * (large custom relation, cold SRS, busy server) fails the job and then proves
- * three more times.
- * `initialize()` pins the effective value into `NIGHTGATE_PROOF_TIMEOUT_MS`
- * before the wallet worker spawns; worker and provider sites read it here.
- * No cds import: the worker thread loads this module too.
+ * HTTP timeout for one request to the proof server.
+ * The client retries a timed-out proof up to three times, so a timeout that is too short makes slow proofs fail and repeat.
+ * `initialize()` writes the value into `NIGHTGATE_PROOF_TIMEOUT_MS` before the wallet worker starts.
+ * This module does not import `@sap/cds`, because the worker thread loads it too.
  */
 export const DEFAULT_PROOF_TIMEOUT_MS = 300_000;
 

@@ -1,7 +1,7 @@
 /**
- * Artifact generation digest and key-manifest checks; the implementation
- * lives in `@odatano/contract-kit/node` (dependency-free, so the worker
- * thread and the contracts repository compute the same bytes).
+ * Digest of a compiled contract build and checks of its prover key list.
+ * The code lives in `@odatano/contract-kit/node`. It has no dependencies,
+ * so the worker thread and the contracts repository compute the same digest.
  */
 export {
     computeArtifactGenerationDigest,

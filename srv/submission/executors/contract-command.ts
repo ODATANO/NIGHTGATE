@@ -1,5 +1,5 @@
 /**
- * Job executor for contract commands (deploy, calls, batches, proof children).
+ * Runs contract jobs: deploys, circuit calls, batches and the proof steps of workflows.
  * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
@@ -9,7 +9,6 @@ import { coerceCircuitArgs } from '../arg-coercion';
 import { getNightgatePluginConfig } from '../../utils/nightgate-config';
 import { ensureNetworkId } from '../../midnight/providers';
 import { runChildCommand } from '../background-jobs';
-import type { BackgroundJobRow } from '../job-store';
 import { jobKindOp } from '../job-kinds';
 import { vaultDims } from '../verify-state';
 import { expandAllowedMask, computeRecordKey } from '../predicate-state';
@@ -24,7 +23,7 @@ const { UPDATE, SELECT } = cds.ql;
 export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' | 'walletFactory' | 'contractResolver' | 'submitterFactory' | 'argTypesLoader' | 'confirmedDisclosureLevel' | 'heightStamp' | 'notNewerThan' | 'clearPendingDisclosureLevel' | 'reindexAfterSubmit' | 'buildSubmitterDeps'>) {
     const { db, walletFactory, contractResolver, submitterFactory, argTypesLoader, confirmedDisclosureLevel, heightStamp, notNewerThan, clearPendingDisclosureLevel, reindexAfterSubmit, buildSubmitterDeps } = ctx;
 
-    const executeContractCommand = async (raw: unknown, job: BackgroundJobRow): Promise<unknown> => {
+    const executeContractCommand = async (raw: unknown, job: BackgroundJob): Promise<unknown> => {
         const command = raw as ContractCommandV1;
         if (!command || job.commandVersion !== 1 || !job.sessionId || !job.requestedBy) {
             throw new Error(`Invalid persisted contract command for job ${job.ID}`);
@@ -34,8 +33,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
             throw new Error(`Persisted command operation '${command.op}' is incompatible with ${job.kind}`);
         }
 
-        // The alias is mutable: refuse a different artifact generation than the
-        // command was created for, and refuse digest-less commands.
+        // A contract name can later point to another build. Refuse to run if the build
+        // differs from the one the command was created for, or if no digest was stored.
         {
             const cmd = command as ContractCommandV1WithProvenance;
             if (typeof (cmd as any).compiledArtifactRef === 'string') {
@@ -45,8 +44,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                     `Persisted '${command.op}' command of job ${job.ID}`);
             }
         }
-        // A grant is re-read when the job RUNS (children carry the parent's), so a
-        // revoke, an expiry or a narrowed scope after admission stops a queued job.
+        // Read the agent grant again when the job runs. Step jobs carry the parent's grant.
+        // A grant revoked, expired or narrowed after the job was queued stops it.
         if (job.grantId) {
             const grant = await currentGrantRow(db, String(job.grantId));
             if (!grant) {
@@ -62,8 +61,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 throw Object.assign(new Error(`agent grant ${job.grantId}: ${scope}; the job was not executed`), { code: 'AGENT_GRANT_SCOPE', retryable: false });
             }
         }
-        // Children inherit the parent's digest, so an alias re-pointed between
-        // steps fails the child instead of mixing generations in one workflow.
+        // Step jobs get the parent's contract digest. If the name changes between steps,
+        // the step fails instead of mixing two contract builds in one workflow.
         const parentArtifactDigest = (command as ContractCommandV1WithProvenance).artifactDigest;
         const runChild = <T,>(args: Parameters<typeof runChildCommand>[0]): Promise<T> => runChildCommand<T>({
             ...args,
@@ -109,7 +108,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                     command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
-            // The digest is public (a circuit arg); only the path is witness material.
+            // The digest is a public circuit argument. Only the Merkle path stays private.
             const proof: any = await runChild<any>({
                 parent: job, kind: 'fieldEqualityProof', step: 'proveFieldEquality', commandVersion: 1,
                 request: { circuit: 'proveFieldEquality', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
@@ -162,8 +161,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         }
 
         if (command.op === 'documentIntegrityWorkflow' || command.op === 'documentDiffWorkflow') {
-            // Each optional anchor is its own transaction; the batch action's
-            // document kinds do it in one.
+            // Each optional contentRoot is stored in its own transaction.
+            // The batch action does everything in one transaction.
             if (command.contentRootA) {
                 await runChild({
                     parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRootA', commandVersion: 1,
@@ -181,8 +180,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
             const recordKeyA = await computeRecordKey(command.attesterIdA, command.payloadHashA);
             const recordKeyB = await computeRecordKey(command.attesterIdB, command.payloadHashB);
             const isIntegrity = command.op === 'documentIntegrityWorkflow';
-            // One mode-switched circuit for both kinds (each verifier key costs
-            // deploy bytes); the inactive statement gets a neutral dummy (mask 0 / k 1).
+            // One circuit serves both comparisons through a mode argument, because each circuit
+            // adds deploy size. The unused mode gets harmless values, mask 0 or k 1.
             const proof: any = isIntegrity
                 ? await runChild<any>({
                     parent: job, kind: 'documentIntegrityProof', step: 'proveDocumentComparison-integrity', commandVersion: 1,
@@ -216,8 +215,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         }
 
         if (command.op === 'fieldPredicateBatchWorkflow') {
-            // One transaction: an optional anchor first, then one proof call per
-            // claim with its own witness bundle. A false claim fails at local proving.
+            // One transaction. First the optional contentRoot, then one proof call per claim
+            // with its own private inputs. A false claim fails during local proving.
             const calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }> = [];
             const recordKey = await computeRecordKey(command.attesterId, command.payloadHash);
             if (command.contentRoot) {
@@ -263,11 +262,11 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
             const proof: any = await runChild<any>({
                 parent: job, kind: 'fieldPredicateBatchProof', step: 'proveFieldPredicateBatch', commandVersion: 1,
                 request: { circuits: calls.map(c => c.circuit), payloadHash: command.payloadHash, claimCount: command.claims.length },
-                // The claims are a set (distinct claim keys, no shared cell); only
-                // an in-batch anchor is a dependency and stays first.
+                // The claims do not depend on each other, so their order is free.
+                // Only a contentRoot call in the batch must stay first.
                 command: { op: 'callBatch', contractAddress: command.contractAddress, calls, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId, independentCalls: true, orderedPrefix: calls[0]?.circuit === 'anchorContentRoot' ? 1 : 0 }
             });
-            // One statement: the tx is on chain, a partial projection must be impossible.
+            // Update all rows in one statement. The transaction is on chain, so no row may be missed.
             const provenAtBatch = new Date().toISOString();
             await recordProven(job.ID, proof.txHash, () => db.run(UPDATE.entity(PredicateAttestations)
                 .set({ provenTxHash: proof.txHash, provenAt: provenAtBatch, modifiedAt: provenAtBatch })
@@ -291,8 +290,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         }
         const facadeCfg = facadeConfigFromEnv();
         await ensureNetworkId(facadeCfg.networkId);
-        // Atomic: the resolver checks the digest against the snapshot it imports,
-        // closing the window against a concurrent registerContract or overwrite.
+        // The resolver checks the digest against the exact copy it loads,
+        // so a parallel registerContract cannot swap the contract in between.
         const resolved = await contractResolver(
             command.compiledArtifactRef,
             (command as ContractCommandV1WithProvenance).artifactDigest);
@@ -346,7 +345,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                     sessionId: job.sessionId
                 });
             } catch (err) {
-                // Not taken by the chain: the confirmed level stays.
+                // The chain did not take the change, so the confirmed level stays.
                 if (isGrant) await clearPendingDisclosureLevel(command.disclosureGrantId, command.level);
                 throw err;
             }
@@ -364,8 +363,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         }
 
         if (command.op === 'registerPassport') {
-            // Mode 0 assigns the id, 1 unregisters it, 2 transfers the registrar role,
-            // 3 and 4 are the recovery identity re-pointing registrar / recovery.
+            // Mode 0 registers the id, 1 removes it, 2 hands the registrar role to someone else.
+            // In modes 3 and 4 the recovery identity sets a new registrar or a new recovery identity.
             const result = await submitter.call({
                 contractAddress: command.contractAddress,
                 circuit: 'registerDocument',
@@ -387,7 +386,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 sessionId: job.sessionId
             });
             if (command.mode === 0) {
-                // The payload's grants left the chain with the attestation.
+                // Retracting the attestation also removed its disclosure grants on-chain.
                 const changedAt = new Date().toISOString();
                 const landed = result.blockHeight ?? null;
                 await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ active: false, revokedTxHash: result.txHash, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.key, active: true }), landed));
@@ -397,7 +396,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         }
 
         if (command.op === 'callBatch') {
-            // Raw JSON args were persisted; coerce per entry like the single-call tail.
+            // The stored args are raw JSON. Convert each call's args like the single call below.
             const coercedCalls = command.calls.map(c => {
                 if (job.kind === 'fieldPredicateBatchProof') {
                     const args = c.circuit === 'anchorContentRoot'
@@ -427,7 +426,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         }
 
         if ((command as { op: string }).op === 'buildSponsorable') {
-            // Build, sign and finalize under the caller's identity; no sponsor, no submit.
+            // Build, sign and finalize with the caller's keys. No sponsor and no submit.
             const c = command as unknown as { contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[] };
             const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
             const coerced = coerceCircuitArgs(c.args, argTypes);
@@ -448,7 +447,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         } else if (job.kind === 'fieldEqualityProof' || job.kind === 'fieldMembershipProof') {
             coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), hexToBytes(String(command.args[2])), BigInt(String(command.args[3]))];
         } else if (job.kind === 'documentIntegrityProof' || job.kind === 'documentDiffProof') {
-            // The Vector<width, Boolean> mask arg expands from the packed integer.
+            // The circuit takes the mask as Vector<width, Boolean>, built from the integer.
             coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), expandAllowedMask(Number(command.args[3]), vaultDims(command.compiledArtifactRef).width), BigInt(String(command.args[4])), BigInt(String(command.args[5]))];
         } else {
             const argTypes = argTypesLoader(resolved.zkConfigPath, command.circuit);

@@ -1,65 +1,25 @@
 /**
- * Background job rows: status writes (CAS on status and lease), leases, idempotency and admission errors.
+ * Database access for background job rows: status changes, leases and job admission errors.
  * SPDX-License-Identifier: Apache-2.0
  */
-import { withLockContentionRetry as withDbLockRetry, LOCK_CONTENTION_ATTEMPTS, __setLockContentionBackoffForTests } from './db-write-retry';
+import { withLockContentionRetry, LOCK_CONTENTION_ATTEMPTS } from './db-write-retry';
 import cds from '@sap/cds';
 import crypto from 'crypto';
 import { AsyncResource } from 'async_hooks';
-import { BackgroundJobs } from '#cds-models/midnight';
+import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
 import { type SubmissionErrorClassification } from './TransactionSubmitter';
 import { configString } from '../utils/config';
 import type { DbRunner } from '../utils/db-types';
-import { NightgateError } from '../utils/errors';
+import { NightgateError, errorMessage } from '../utils/errors';
 
 const { SELECT, UPDATE } = cds.ql;
 
-// Created at module load, outside any request: running work through it leaves
-// CAP's request/tx AsyncLocalStorage scope.
+// Created at load time, outside any request. Code run through it is not tied to
+// the current request's database transaction.
 const detachedJobScope = new AsyncResource('nightgate.detached-job-work');
 
 export function safeStringify(value: unknown): string {
     return JSON.stringify(value, (_, v) => typeof v === 'bigint' ? v.toString() : v);
-}
-
-export interface BackgroundJobRow {
-    ID: string;
-    kind: string;
-    sessionId: string | null;
-    status: 'pending' | 'running' | 'external_execution' | 'submitted' | 'reconciliation_required' | 'succeeded' | 'failed';
-    idempotencyKey: string | null;
-    request: string | null;
-    payloadFingerprint: string | null;
-    commandVersion: number | null;
-    command: string | null;
-    commandEncoding: 'json-v1' | 'aes-gcm-v1' | null;
-    requestedBy: string | null;
-    grantId?: string | null;
-    parentJobId: string | null;
-    workflowStep: string | null;
-    result: string | null;
-    errorCode: string | null;
-    errorMessage: string | null;
-    startedAt: string | null;
-    queuedAt: string | null;
-    externalExecutionAt: string | null;
-    submittedAt: string | null;
-    finishedAt: string | null;
-    attempt: number;
-    maxAttempts: number;
-    leaseOwner: string | null;
-    leaseExpiresAt: string | null;
-    heartbeatAt: string | null;
-    submissionId: string | null;
-    txHash: string | null;
-    chainStatus: 'pending' | 'success' | 'failure' | null;
-    chainFinalizedAt: string | null;
-    chainBlockHeight?: number | null;
-    chainBlockHash?: string | null;
-    indexerTxHash?: string | null;
-    chainSegments?: string | null;
-    createdAt: string;
-    modifiedAt: string;
 }
 
 export interface ReconciliationEvidence {
@@ -78,31 +38,31 @@ export class WorkflowReconciliationRequiredError extends Error {
 }
 
 /**
- * Run `fn` outside the ambient CAP tx: its db calls autocommit and pin no pool
- * connection. They cannot see the request tx's uncommitted writes, so use it before the handler writes.
+ * Runs `fn` outside the request's transaction, so each query commits on its own.
+ * It cannot see the request's uncommitted writes, so call it before the handler writes.
  */
 export function runWithoutAmbientTx<T>(fn: () => Promise<T>): Promise<T> {
     return detachedJobScope.runInAsyncScope(fn);
 }
 
-export async function getJobById(jobId: string): Promise<BackgroundJobRow | null> {
+export async function getJobById(jobId: string): Promise<BackgroundJob | null> {
     if (!jobId) return null;
     const db = await cds.connect.to('db');
     const row = await db.run(SELECT.one.from(BackgroundJobs).where({ ID: jobId }));
-    return (row as BackgroundJobRow | undefined) || null;
+    return (row as BackgroundJob | undefined) || null;
 }
 
 /**
- * Fail pending jobs whose signing session the restart cleanup closed. Must run
- * before the job processor starts: a replay could no longer decrypt its keys.
+ * Fails pending jobs whose wallet session was closed at restart.
+ * Must run before jobs start, since such a job could no longer decrypt its keys.
  */
 export async function dropPendingJobsForClosedSessions(sessionIds: string[]): Promise<number> {
     if (sessionIds.length === 0) return 0;
     const db = await cds.connect.to('db');
     let dropped = 0;
-    await withStatusWriteRetry('dropPendingJobsForClosedSessions', async () => {
+    await withLockContentionRetry('dropPendingJobsForClosedSessions', async () => {
         dropped = 0;
-        // Chunked: stay within the driver's parameter limit.
+        // In chunks, to stay within the driver's parameter limit.
         for (let i = 0; i < sessionIds.length; i += 200) {
             const affected = await db.run(
                 UPDATE.entity(BackgroundJobs)
@@ -123,7 +83,6 @@ export async function dropPendingJobsForClosedSessions(sessionIds: string[]): Pr
     return dropped;
 }
 
-/** Latest job of one kind for a session; detached read (must not hold a request tx). */
 export async function findLatestJob(kind: string, sessionId: string): Promise<{ ID: string; status: string } | null> {
     const db = await cds.connect.to('db');
     const row = await runWithoutAmbientTx(() => db.run(
@@ -135,9 +94,9 @@ export async function findLatestJob(kind: string, sessionId: string): Promise<{ 
 }
 
 /**
- * Mark queued/running jobs of `kind` for the session SUPERSEDED (status only: a
- * running one continues, its result is discarded). Uses the ambient request tx
- * when present: atomic with the successor insert, and no second pool connection.
+ * Marks older pending or running jobs of `kind` for the session as SUPERSEDED.
+ * A running job keeps running, but its result is ignored. Inside a request this
+ * uses the request's transaction, so it commits together with the new job.
  */
 export async function supersedeQueuedJobs(kind: string, sessionId: string, excludeJobId?: string): Promise<number> {
     const db = await cds.connect.to('db');
@@ -158,8 +117,8 @@ export async function supersedeQueuedJobs(kind: string, sessionId: string, exclu
     let affected: unknown;
     if (cds.context) {
         const runner: DbRunner = db.tx(cds.context);
-        // No retry inside the tx; the savepoint keeps a failed statement from
-        // aborting the caller's PostgreSQL tx.
+        // No retry inside the transaction. The savepoint keeps a failed statement
+        // from aborting the caller's PostgreSQL transaction.
         const sp = 'nightgate_supersede_sweep';
         await runner.run(`SAVEPOINT ${sp}`);
         try {
@@ -171,7 +130,7 @@ export async function supersedeQueuedJobs(kind: string, sessionId: string, exclu
         }
         await runner.run(`RELEASE SAVEPOINT ${sp}`);
     } else {
-        affected = await withStatusWriteRetry(
+        affected = await withLockContentionRetry(
             `supersedeQueuedJobs(${kind})`,
             () => db.run(buildUpdate())
         );
@@ -187,12 +146,10 @@ export async function supersedeQueuedJobs(kind: string, sessionId: string, exclu
 
 export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-export const STATUS_WRITE_ATTEMPTS = LOCK_CONTENTION_ATTEMPTS;
 
 /** The `BackgroundJobs.idempotencyKey` column width. */
 export const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 
-/** A key longer than the column: refused before anything is written (400). */
 export class IdempotencyKeyInvalidError extends NightgateError {
     constructor() {
         super('IDEMPOTENCY_KEY_INVALID', `idempotencyKey must be at most ${IDEMPOTENCY_KEY_MAX_LENGTH} characters`);
@@ -201,7 +158,6 @@ export class IdempotencyKeyInvalidError extends NightgateError {
     get httpStatus(): number { return this.status; }
 }
 
-/** An idempotency key reused with a different payload: the caller's error, never retryable as is. */
 export class IdempotencyConflictError extends NightgateError {
     constructor(idempotencyKey: string) {
         super('IDEMPOTENCY_KEY_CONFLICT', `Idempotency key '${idempotencyKey}' was already used with a different request payload.`);
@@ -210,7 +166,7 @@ export class IdempotencyConflictError extends NightgateError {
     get httpStatus(): number { return this.status; }
 }
 
-/** Admission refused on a busy database: nothing written or submitted, the caller may resend (503). */
+/** The database was too busy to accept the job. Nothing was written, the caller may resend (503). */
 export class JobAdmissionBusyError extends NightgateError {
     /** `Retry-After`, seconds. */
     readonly retryAfterSeconds = 2;
@@ -223,16 +179,13 @@ export class JobAdmissionBusyError extends NightgateError {
 
 export { isUniqueViolation } from '../utils/db-errors';
 
-export const withStatusWriteRetry = <T>(label: string, write: () => Promise<T>): Promise<T> =>
-    withDbLockRetry(label, write, (msg: string) => cds.log('nightgate').warn(msg));
-
 export function affectedRows(value: unknown): number {
     return typeof value === 'number' ? value : Number((value as any)?.changes ?? value ?? 0);
 }
 
 export async function markRunning(jobId: string): Promise<boolean> {
     const db = await cds.connect.to('db');
-    const affected = await withStatusWriteRetry(`markRunning(${jobId})`, async () => {
+    const affected = await withLockContentionRetry(`markRunning(${jobId})`, async () => {
         return db.tx(async (tx) => {
             return tx.run(
                 UPDATE.entity(BackgroundJobs)
@@ -252,7 +205,7 @@ export async function markRunning(jobId: string): Promise<boolean> {
 
 export async function markSucceeded(jobId: string, result: unknown): Promise<void> {
     const db = await cds.connect.to('db');
-    await withStatusWriteRetry(`markSucceeded(${jobId})`, async () => {
+    await withLockContentionRetry(`markSucceeded(${jobId})`, async () => {
         await db.tx(async (tx) => {
             const affected = await tx.run(
                 UPDATE.entity(BackgroundJobs)
@@ -278,7 +231,7 @@ export async function markSucceeded(jobId: string, result: unknown): Promise<voi
 export async function markFailed(jobId: string, classification: SubmissionErrorClassification): Promise<void> {
     const db = await cds.connect.to('db');
     try {
-        await withStatusWriteRetry(`markFailed(${jobId})`, async () => {
+        await withLockContentionRetry(`markFailed(${jobId})`, async () => {
             await db.tx(async (tx) => {
                 const affected = await tx.run(
                     UPDATE.entity(BackgroundJobs)
@@ -301,9 +254,9 @@ export async function markFailed(jobId: string, classification: SubmissionErrorC
             });
         });
     } catch (err) {
-        // Nothing upstream can act on it: log the real classification for the operator.
+        // No caller can handle this, so log the real error for the operator.
         cds.log('nightgate').error(
-            `markFailed(${jobId}): could not persist the failure status after ${STATUS_WRITE_ATTEMPTS} attempts; ` +
+            `markFailed(${jobId}): could not persist the failure status after ${LOCK_CONTENTION_ATTEMPTS} attempts; ` +
             `job row stays non-terminal until restart recovery. Unpersisted error: ${classification.code}: ${classification.message}`,
             err
         );
@@ -313,7 +266,7 @@ export async function markFailed(jobId: string, classification: SubmissionErrorC
 export async function markReconciliationRequired(jobId: string, classification: { code: string; message: string }): Promise<void> {
     const db = await cds.connect.to('db');
     try {
-        await withStatusWriteRetry(`markReconciliationRequired(${jobId})`, async () => {
+        await withLockContentionRetry(`markReconciliationRequired(${jobId})`, async () => {
             await db.tx(async (tx) => {
                 const affected = await tx.run(
                     UPDATE.entity(BackgroundJobs)
@@ -336,7 +289,7 @@ export async function markReconciliationRequired(jobId: string, classification: 
         });
     } catch (writeErr) {
         cds.log('nightgate').error(
-            `markReconciliationRequired(${jobId}): could not persist the safety status after ${STATUS_WRITE_ATTEMPTS} attempts; ` +
+            `markReconciliationRequired(${jobId}): could not persist the safety status after ${LOCK_CONTENTION_ATTEMPTS} attempts; ` +
             `job row stays non-terminal until restart recovery. Unpersisted error: ${classification.code}: ${classification.message}`,
             writeErr
         );
@@ -370,19 +323,19 @@ export function startLeaseHeartbeat(jobId: string): () => void {
                     })
                     .where({ ID: jobId, status: { in: ['running', 'external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId() })
             );
-        }).catch(err => cds.log('nightgate').warn(`heartbeat(${jobId}) failed: ${String((err as Error)?.message ?? err)}`));
+        }).catch(err => cds.log('nightgate').warn(`heartbeat(${jobId}) failed: ${errorMessage(err)}`));
     }, JOB_HEARTBEAT_MS);
     timer.unref?.();
     return () => clearInterval(timer);
 }
 
 /**
- * Mark the single `running -> external_execution` crossing. Not re-entrant: restart
- * recovery reasons about one external effect per job, so split multi-submit work.
+ * Moves a job from `running` to `external_execution`, the point after which it may have
+ * changed the chain. Allowed once per job: restart recovery assumes one submission per job.
  */
 export async function markJobExternalExecution(jobId: string, submission: { submissionId?: string }): Promise<void> {
     const db = await cds.connect.to('db');
-    const affected = await withStatusWriteRetry(`markJobExternalExecution(${jobId})`, async () => db.run(
+    const affected = await withLockContentionRetry(`markJobExternalExecution(${jobId})`, async () => db.run(
         UPDATE.entity(BackgroundJobs)
             .set({
                 status: 'external_execution',
@@ -394,7 +347,7 @@ export async function markJobExternalExecution(jobId: string, submission: { subm
             .where({ ID: jobId, status: 'running', leaseOwner: getRuntimeWorkerId() })
     ));
     if (affectedRows(affected) === 1) return;
-    // Still ours but past `running`: a second submission, not a lost lease.
+    // The job is still ours but already past `running`: this is a second submission.
     const current = await getJobById(jobId);
     if (current && current.leaseOwner === getRuntimeWorkerId()
         && (current.status === 'external_execution' || current.status === 'submitted')) {
@@ -404,8 +357,8 @@ export async function markJobExternalExecution(jobId: string, submission: { subm
 }
 
 /**
- * Boundary crossing + identifier in one statement on the caller's transaction.
- * `firstBoundary` = running -> submitted; a rebuild moves an already-crossed job.
+ * Marks the job submitted with its tx hash, inside the caller's transaction.
+ * `firstBoundary` means the job comes from `running`. A rebuild updates a job already past it.
  */
 export async function markJobBroadcastOn(
     runner: { run: (q: unknown) => Promise<unknown> },
@@ -434,7 +387,7 @@ export async function markJobBroadcastOn(
     throw new Error(`Lease lost before markJobBroadcastOn(${jobId})${first ? '' : ' (rebuild attempt)'}`);
 }
 
-/** Take a rejected identifier off the job on the caller's transaction, CAS on lease and hash. */
+/** Removes a rejected tx hash from the job, inside the caller's transaction. Matches only if lease and hash are unchanged. */
 export async function markJobSubmissionRejectedOn(
     runner: { run: (q: unknown) => Promise<unknown> },
     jobId: string,
@@ -456,11 +409,10 @@ export async function markJobSubmissionRejectedOn(
     throw new Error(`Lease lost (or hash already moved) before markJobSubmissionRejectedOn(${jobId})`);
 }
 
-export const withLockContentionRetry = withStatusWriteRetry;
 
 export async function markJobSubmitted(jobId: string, submission: { submissionId?: string; txHash?: string }): Promise<void> {
     const db = await cds.connect.to('db');
-    const affected = await withStatusWriteRetry(`markJobSubmitted(${jobId})`, async () => {
+    const affected = await withLockContentionRetry(`markJobSubmitted(${jobId})`, async () => {
         return db.run(
             UPDATE.entity(BackgroundJobs)
                 .set({
@@ -476,10 +428,6 @@ export async function markJobSubmitted(jobId: string, submission: { submissionId
         );
     });
     if (affectedRows(affected) !== 1) throw new Error(`Lease lost before markJobSubmitted(${jobId})`);
-}
-
-export function __setStatusWriteBackoffForTests(ms: readonly number[]): void {
-    __setLockContentionBackoffForTests(ms);
 }
 
 /** Test hook: forget the worker id. */

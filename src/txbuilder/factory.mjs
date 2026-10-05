@@ -1,5 +1,5 @@
-// Token factory, the caller's side. The issuer rule, names, types and the
-// call inputs live in @odatano/contract-kit; this adds the seed-level entry.
+// Helpers to mint tokens with the token factory contract from your own process.
+// Most helpers come from @odatano/contract-kit. This file adds the issuer secret derived from a seed.
 //
 //   import { createTxBuilder, tokenFactoryIssuerSecret, prepareMint, tokenTypeOf } from '@odatano/nightgate-tx/txbuilder';
 //
@@ -18,8 +18,8 @@ export { deriveTokenFactoryIssuerSecret, tokenName, nameOf, issuerKeyOf, domainO
 const require = createRequire(import.meta.url);
 
 /**
- * The issuer secret of a seed (64 hex): the kit's rule over the seed's zswap
- * role seed, so a session on the same seed is the same issuer on the server.
+ * Derives the token issuer secret from a wallet seed, as hex.
+ * A server session on the same seed gets the same issuer.
  */
 export async function tokenFactoryIssuerSecret({ seedHex, accountIndex = 0 } = {}) {
     if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) throw new Error('tokenFactoryIssuerSecret: seedHex must be 128 hex chars (64-byte BIP39 seed)');

@@ -1,5 +1,4 @@
-// First import on purpose: the header mask must exist before `./index` and
-// its dependencies are evaluated, since they may log (cap-log-mask-boot.ts).
+// Must stay the first import. It hides the agent token in logs, and the modules below may already log.
 import './cap-log-mask-boot';
 import cds from '@sap/cds';
 import path from 'path';
@@ -17,8 +16,7 @@ let registered = false;
 
 function registerModels(): void {
     cds.env.roots = [...(cds.env.roots || []), pluginRoot];
-    // Connection pool: CAP's built-in one leaks under acquire timeouts, see
-    // cap-pool-default.ts. Must run before db-service loads.
+    // Must run before CAP's database layer loads. See cap-pool-default.ts.
     if (applyPoolDefault(cds.env as { features?: Record<string, unknown> })) {
         log.info('features.use_generic_pool defaulted to true (the built-in @cap-js/db-service pool loses connections on acquire timeouts); set it explicitly in the host config to override');
     }
@@ -38,8 +36,7 @@ function registerModels(): void {
 
 function registerConnectorRoutes(): void {
     cds.on('bootstrap', (app: any) => {
-        // HTTP policy belongs to the consuming CAP host. NIGHTGATE only owns
-        // these connector endpoints and does not install global middleware.
+        // Only these routes are added. HTTP policy and global middleware are left to the host app.
         mountZkConfigRoute(app);
         mountContractManifestRoute(app);
     });
@@ -51,9 +48,8 @@ function registerLifecycle(): void {
         try {
             await initialize();
         } catch (err) {
-            // A plugin must not terminate the CAP host process. Keep Nightgate
-            // offline (initialize() records the error state) and let the host's
-            // readiness/deployment policy decide whether the process is viable.
+            // A plugin must not crash the host app. NIGHTGATE stays offline
+            // and the host's readiness check decides what happens next.
             if (err instanceof SchemaNotDeployedError) {
                 log.error(
                     `Nightgate remains offline because its schema is not deployed. ` +
@@ -61,7 +57,6 @@ function registerLifecycle(): void {
                 );
                 return;
             }
-            // Anything else: surface Error but don't kill the server.
             const msg = err instanceof Error ? err.message : String(err);
             log.error(`initialize() failed: ${msg}`);
         }
@@ -74,8 +69,6 @@ function registerLifecycle(): void {
 
 if (!registered) {
     registerModels();
-    // Lanes for a host running @odatano/cap-auth as its auth impl (the
-    // standalone image does); must precede CAP building its middlewares.
     registerNightgateTransportLanes();
     registerConnectorRoutes();
     registerLifecycle();

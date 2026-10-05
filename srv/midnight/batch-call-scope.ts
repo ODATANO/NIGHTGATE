@@ -26,8 +26,8 @@ export interface BatchScopeResult {
 }
 
 /**
- * Run `calls` in one `withContractScopedTransaction` scope on `found`; the ledger
- * applies them in call order (or stage-grouped with `orderOpts.independentCalls`).
+ * Run several circuit calls on one contract as a single transaction.
+ * The ledger applies them in call order unless `orderOpts.independentCalls` is set.
  */
 export async function runBatchInScope(
     contracts: any,
@@ -55,9 +55,9 @@ export async function runBatchInScope(
     }
 
     const circuits = calls.map(c => c.circuit);
-    // The ledger applies merged intents by ascending segment id, which the SDK
-    // randomizes; the wrapper permutes them into call order before proving.
-    // `observe` mode only logs them, so dependent batches apply in random order.
+    // Each call gets a random segment id from the SDK, and the ledger applies calls by
+    // ascending id. The wrapper renumbers them into call order before proving.
+    // In `observe` mode it only logs the ids, so the apply order stays random.
     const providersAny = providers as any;
     const mode = runtimeConfigEnum<'observe' | 'rewrite'>('NIGHTGATE_BATCH_SEGMENT_MODE') ?? 'rewrite';
     const wrapSegments = mode === 'observe' ? withObservedBatchSegments : withOrderedBatchSegments;

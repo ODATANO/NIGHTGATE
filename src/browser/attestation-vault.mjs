@@ -1,4 +1,3 @@
-// `@odatano/nightgate/browser/attestation-vault`: the compiled class now ships
-// as @odatano/contract-attestation-vault; this subpath re-exports it for one
-// release line.
+// Re-exports the compiled contract from @odatano/contract-attestation-vault.
+// This import path is kept for compatibility and will be removed later.
 export * from '@odatano/contract-attestation-vault';

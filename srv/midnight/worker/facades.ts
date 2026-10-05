@@ -1,10 +1,10 @@
 /**
- * Facade registry lifecycle: build, sync waits, periodic state save with
- * main-thread acks, idle progress watch, per-session submit locks, evict.
+ * Loads, syncs, saves and unloads the wallets (facades) of the worker.
+ * Wallet state is saved through the main thread, which confirms each save.
  */
 
-// First import on purpose: the worker modules import each other in cycles, and a
-// module-level read must come from an import resolved before the cycle re-enters.
+// Must stay the first import. The worker modules import each other in a cycle,
+// and config is read at load time.
 import { configMs, configNumber, configFlag } from '../../utils/config';
 import { rpcCancellation, throwIfRpcCancelled } from './cancellation';
 import { profileCurrentThread } from '../cpu-profile';
@@ -22,10 +22,10 @@ import {
     observeReplayTrack, shouldResetRestoredSubWallet
 } from './sync-replay';
 
-// Pre-balance sync bound: a stalled indexer subscription fails the job instead of hanging it.
+// Limit for the sync wait before building a tx, so a stuck indexer fails the job instead of hanging it.
 export const BALANCE_SYNC_TIMEOUT_MS = configMs('NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS');
 
-/** `facade.waitForSyncedState()` never resolves against an indexer that is not caught up, so it is always bounded. */
+/** `facade.waitForSyncedState()` never returns while the indexer lags, so it always gets a timeout. */
 export async function waitForSyncedStateBounded(entry: FacadeEntry, site: string, timeoutMs?: number): Promise<any> {
     const bound = timeoutMs && timeoutMs > 0 ? timeoutMs : BALANCE_SYNC_TIMEOUT_MS;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -42,58 +42,51 @@ export async function waitForSyncedStateBounded(entry: FacadeEntry, site: string
     }
 }
 
-// Slack to the dust stream tip, in ledger EVENTS: their ids advance independently of block height.
+// How many dust ledger events the wallet may lag and still count as synced. Event ids are not block heights.
 export const SYNC_TIP_GAP = BigInt(configNumber('NIGHTGATE_SYNC_TIP_GAP'));
-// Max age of the indexer's latest block: syncing to a stale tip spends dust whose
-// merkle roots have pruned out of the node's root_history (117).
+// Max age of the indexer's latest block. Syncing to an old block makes the wallet spend dust
+// against tree roots the node no longer knows, which fails with error 117.
 export const SYNC_FRESHNESS_MS = configMs('NIGHTGATE_SYNC_FRESHNESS_MS');
 export const SYNC_POLL_MS = 3000;
-// How often the catch-up loop reports progress (log line + snapshot refresh).
 export const SYNC_PROGRESS_LOG_MS = 15_000;
-// Max age of the rate anchor, so the rate reflects current throughput.
+// The sync rate is measured over at most this window, so it reflects the current speed.
 export const SYNC_RATE_WINDOW_MS = 60_000;
-// A sync whose appliedIndex has not moved for this long is stalled; a sync still
-// applying events is slow and runs up to the absolute ceiling. <= 0 disables.
+// A sync that made no progress for this long is stuck. A sync that still moves is only slow
+// and may run up to the ceiling. 0 or less turns this off.
 export const SYNC_STALL_MS = configMs('NIGHTGATE_PREWARM_STALL_MS');
-// Absolute ceiling for the prewarm wait when the caller passes none; SYNC_STALL_MS is the primary limit.
+// Upper limit for the initial sync wait when the caller sets none.
 export const SYNC_CEILING_MS = 12 * 60 * 60 * 1000;
 export const wsleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 /**
- * Catch-up progress of one facade, PUSHED to the main thread: an RPC would stall exactly
- * while this thread is busy catching up. Event ids are decimal strings (bigint precision).
+ * Sync progress of one wallet. The worker pushes it to the main thread, because the worker
+ * cannot answer calls while it is busy syncing. Event ids are decimal strings.
  */
 export interface SyncProgressSnapshot {
-    /** The facade key this snapshot belongs to (the caller's accountId). */
     sessionId: string;
-    /** Ledger events applied by the dust sub-wallet so far. '-1' when unknown. */
+    /** Dust ledger events applied so far. '-1' when unknown. */
     appliedIndex: string;
-    /** Current tip of the dust ledger-event stream. '-1' when the probe failed. */
+    /** Latest dust ledger event on the chain. '-1' when it could not be read. */
     streamTip: string;
-    /** streamTip - appliedIndex, or null when either side is unknown. */
     behindEvents: string | null;
-    /** Applied events per second over the last ~minute; null until measurable. */
+    /** Events per second over about the last minute. Null until known. */
     eventsPerSecond: number | null;
-    /** Seconds to reach the tip at the current rate; null when not derivable. */
     etaSeconds: number | null;
-    /** Indexer block height, for correlating with the chain. */
     blockHeight: string | null;
     isConnected: boolean;
-    /** The indexer's latest block is recent enough to count as tip. */
+    /** The indexer's latest block is recent enough. */
     indexerFresh: boolean;
-    /** Age of the indexer's newest block; null when the read failed. */
+    /** Null when the read failed. */
     indexerTipAgeMs?: number | null;
-    /** Why the indexer tip could not be read; null when it was. */
     indexerError?: string | null;
     caughtUp: boolean;
-    /** Milliseconds this wait has been running. */
     elapsedMs: number;
-    /** The wait that produced this snapshot ('prewarm', 'balance', ...). */
+    /** The kind of wait that produced this, such as 'prewarm' or 'balance'. */
     label: string;
     updatedAt: string;
-    /** When `appliedIndex` last advanced; unchanged while `updatedAt` moves = stalled, not slow. */
+    /** When `appliedIndex` last moved. If only `updatedAt` moves, the sync is stuck, not slow. */
     lastProgressAt: string;
-    /** Dust figures at push time; the status read falls back to them while this thread is busy. */
+    /** Dust figures at push time, shown while the worker is too busy to answer. */
     dust?: SyncDustFigures;
 }
 
@@ -107,7 +100,7 @@ export interface SyncDustFigures {
     at: string;
 }
 
-/** Same counting as `getBalance`; undefined when the state carries no dust wallet or the read throws. */
+/** Counts like `getBalance`. Undefined when the state has no dust wallet or cannot be read. */
 export function dustFiguresOf(state: any, entry: Pick<FacadeEntry, 'dustRestoresPersisted'>, now: number = Date.now()): SyncDustFigures | undefined {
     try {
         const dust = state?.dust;
@@ -136,13 +129,13 @@ export function pushSyncProgress(snapshot: SyncProgressSnapshot, dust?: SyncDust
     parentPort?.postMessage({ kind: 'sync-progress', sessionId: snapshot.sessionId, snapshot });
 }
 
-/** The indexer's latest indexed block (height + timestamp, ms epoch). */
+/** The indexer's latest block. */
 export interface IndexerTip {
     height: bigint | null;
     timestampMs: number | null;
-    /** Why this read failed: `HTTP 403`, `timeout`, ...; null when it succeeded. */
+    /** Why the read failed, such as `HTTP 403` or `timeout`. Null on success. */
     error: string | null;
-    /** `cached`: the read failed and the values are the last successful read's (grace window). */
+    /** `cached` means the read failed and the values come from the last successful read. */
     via: 'http' | 'ws' | 'cached' | null;
 }
 
@@ -156,7 +149,7 @@ async function readIndexerTipHttp(indexerHttpUrl: string): Promise<IndexerTip> {
             body: JSON.stringify({ query: BLOCK_TIP_QUERY }),
             signal: AbortSignal.timeout(15_000)
         });
-        // A refusal from the indexer's edge is HTML, not JSON.
+        // A refusal from the indexer's proxy is HTML, not JSON.
         const j: any = await r.json().catch(() => null);
         const b = j?.data?.block;
         if (b?.timestamp == null) {
@@ -169,7 +162,6 @@ async function readIndexerTipHttp(indexerHttpUrl: string): Promise<IndexerTip> {
     }
 }
 
-// The `blocks` subscription emits the newest block first.
 async function readIndexerTipWs(indexerHttpUrl: string): Promise<IndexerTip | null> {
     const b: any = await oneShotSubscription(indexerHttpUrl, 'subscription { blocks { height timestamp } }', (data) => data?.blocks ?? null);
     if (b?.timestamp == null) return null;
@@ -179,15 +171,15 @@ async function readIndexerTipWs(indexerHttpUrl: string): Promise<IndexerTip | nu
 export const indexerTipCache = new Map<string, { tip: IndexerTip; at: number }>();
 const indexerTipVia = new Map<string, IndexerTip['via']>();
 
-/** A failed tip read (HTTP query and `blocks` subscription) reuses the last successful read within this window (`NIGHTGATE_INDEXER_TIP_GRACE_MS`, 0 = off). */
+/** How long a failed read may reuse the last successful one. 0 turns this off. */
 export function indexerTipGraceMs(): number {
     return configMs('NIGHTGATE_INDEXER_TIP_GRACE_MS');
 }
 
 /**
- * The indexer's newest block: HTTP query, else the `blocks` subscription (the two paths fail
- * independently at the indexer's edge), else the last successful read within the grace window,
- * whose timestamp still ages against the freshness bound.
+ * Reads the indexer's latest block over HTTP, else over a websocket subscription, because the two
+ * can fail independently. As a last resort it reuses a recent successful read. Its timestamp
+ * is kept, so it still counts as old when it is old.
  */
 export async function getIndexerTip(indexerHttpUrl: string): Promise<IndexerTip> {
     const http = await readIndexerTipHttp(indexerHttpUrl);
@@ -213,7 +205,6 @@ export async function getIndexerTip(indexerHttpUrl: string): Promise<IndexerTip>
     return tip;
 }
 
-/** Age of the indexer's newest block; null when the tip read failed. */
 export function indexerTipAgeMs(tip: IndexerTip, now: number = Date.now()): number | null {
     return tip.timestampMs != null ? Math.max(0, now - tip.timestampMs) : null;
 }
@@ -221,20 +212,18 @@ export function indexerTipAgeMs(tip: IndexerTip, now: number = Date.now()): numb
 export type LedgerEventStream = 'dust' | 'zswap';
 const STREAM_FIELD: Record<LedgerEventStream, string> = { dust: 'dustLedgerEvents', zswap: 'zswapLedgerEvents' };
 
-// One stream-tip probe per few seconds is plenty for a 3s poll loop.
 export const streamTipCache = new Map<LedgerEventStream, { tip: bigint; at: number }>();
 
-/** A failed read reuses the last read within this window (`NIGHTGATE_STREAM_TIP_GRACE_MS`, 0 = off). */
+/** How long a failed read may reuse the last successful one. 0 turns this off. */
 export function streamTipGraceMs(): number {
     return configMs('NIGHTGATE_STREAM_TIP_GRACE_MS');
 }
 
 /**
- * Stream tip = `maxId` of the first event of a one-shot ws subscription; the only valid target for
- * `appliedIndex` (`progress.highestIndex` stays 0 on public indexers, block end-indices are another
- * series). A failed read falls back to the last read while that is within the grace window: an
- * unknown tip fails the sync gate, and the public indexer drops a few percent of these
- * subscriptions. Null once the fallback has aged out too.
+ * The latest dust ledger event id on the chain. This is the only correct target for `appliedIndex`,
+ * because `progress.highestIndex` stays 0 on public indexers.
+ * The public indexer drops some of these requests, so a failed read reuses a recent one.
+ * Null when nothing recent is known.
  */
 export function getDustStreamTip(indexerHttpUrl: string): Promise<bigint | null> {
     return getLedgerEventStreamTip(indexerHttpUrl, 'dust');
@@ -253,7 +242,6 @@ export async function getLedgerEventStreamTip(indexerHttpUrl: string, stream: Le
     return staleStreamTip(stream, cached);
 }
 
-// One import per thread; concurrent probes share it.
 let wsModule: Promise<any> | undefined;
 function loadWs(): Promise<any> {
     wsModule ??= import('ws').catch((e) => { wsModule = undefined; throw e; });
@@ -261,8 +249,8 @@ function loadWs(): Promise<any> {
 }
 
 /**
- * First `next` payload of a graphql-transport-ws subscription on the indexer's ws endpoint, or
- * null on no answer within 10 s, an error frame, a closed socket or a failed `pick`.
+ * Opens a GraphQL subscription on the indexer and returns its first answer.
+ * Null on any error or when no answer comes within 10 s.
  */
 async function oneShotSubscription<T>(indexerHttpUrl: string, query: string, pick: (data: any) => T | null): Promise<T | null> {
     const wsUrl = deriveIndexerWsUrl(indexerHttpUrl);
@@ -305,12 +293,12 @@ function staleStreamTip(stream: LedgerEventStream, cached: { tip: bigint; at: nu
     return cached.tip;
 }
 
-/** The sync gate's verdict for one reading: connected, a known stream tip, within SYNC_TIP_GAP of it, and a fresh indexer. */
+/** True when the wallet is connected, close enough to the latest event, and the indexer is current. */
 export function isGenuinelyCaughtUp(r: { connected: boolean; applied: bigint; streamTip: bigint; indexerFresh: boolean }): boolean {
     return r.connected && r.streamTip > 0n && r.applied >= 0n && r.applied >= r.streamTip - SYNC_TIP_GAP && r.indexerFresh;
 }
 
-/** One emission of the non-blocking `facade.state()` observable, or null on timeout/error. Never blocks on `waitForSyncedState()`. */
+/** The wallet's current state without waiting for a sync, or null on timeout or error. */
 export async function peekFacadeState(facade: any, timeoutMs: number): Promise<any | null> {
     let sub: any;
     let timer: NodeJS.Timeout | undefined;
@@ -330,21 +318,20 @@ export async function peekFacadeState(facade: any, timeoutMs: number): Promise<a
     }
 }
 
-/** Registered NIGHT UTXOs in a facade state's full unshielded coin set (`totalCoins`). */
 export function countRegisteredNightUtxos(state: any): number {
     const all: any[] = state?.unshielded?.totalCoins ?? [];
     return all.filter((c: any) => c?.meta?.registeredForDustGeneration === true).length;
 }
 
-/** Every unshielded NIGHT UTXO, registered or not; `fallback` while the state carries no coin set yet. */
+/** All NIGHT UTXOs, registered or not. Returns `fallback` while the state has no coin list yet. */
 export function countAllNightUtxos(state: any, fallback: number): number {
     const all: any[] | undefined = state?.unshielded?.totalCoins;
     return Array.isArray(all) ? all.length : fallback;
 }
 
 /**
- * Polls until `isGenuinelyCaughtUp`; `waitForSyncedState()` is not trusted. Fails after `stallMs`
- * without progress or at `timeoutMs`.
+ * Waits until the wallet is really synced, because the SDK's `waitForSyncedState()` cannot be trusted.
+ * Fails after `stallMs` without progress or after `timeoutMs` in total.
  */
 export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, label: string, stallMs: number = SYNC_STALL_MS): Promise<void> {
     const { facade, indexerHttpUrl, sessionId } = entry;
@@ -353,7 +340,6 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
     let lastLog = 0;
     let lastApplied = -1n;
     let lastHighest = -1n;
-    // The first observation seeds the index without counting as progress.
     let progressApplied = -1n;
     let lastProgressAt = startedAt;
     let anchor: { applied: bigint; at: number } | null = null;
@@ -371,7 +357,7 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
             } else if (now - anchor.at >= SYNC_POLL_MS) {
                 const seconds = (now - anchor.at) / 1000;
                 const delta = Number(applied - anchor.applied);
-                // A restored facade can report a lower index right after start.
+                // A restored wallet can report a lower index right after start.
                 if (delta >= 0) eventsPerSecond = delta / seconds;
                 if (now - anchor.at >= SYNC_RATE_WINDOW_MS) anchor = { applied, at: now };
             }
@@ -404,7 +390,6 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
     while (Date.now() < deadline) {
         throwIfRpcCancelled(`${label} sync wait`);
         const tip = await getIndexerTip(indexerHttpUrl);
-        // Non-blocking state() observable: it emits the current state immediately.
         let state: any;
         let sub: any;
         let peekTimer: NodeJS.Timeout | undefined;
@@ -420,12 +405,12 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
         } catch {
             peekFailed = true;
         } finally {
-            // Release on every path: on a stalled indexer the timeout wins each poll.
+            // Always unsubscribe. With a stuck indexer the timeout wins every time.
             try { sub && sub.unsubscribe(); } catch { /* already closed */ }
             if (peekTimer) clearTimeout(peekTimer);
         }
         if (peekFailed) {
-            // An unreadable state counts as no progress for the stall bound.
+            // An unreadable state counts as no progress.
             if (stallMs > 0 && Date.now() - lastProgressAt > stallMs) {
                 const last = syncProgress.get(sessionId);
                 throw new NightgateError('WALLET_NOT_SYNCED', `wallet sync stalled: no progress for ${Math.round((Date.now() - lastProgressAt) / 60_000)} min and the wallet state is not readable (state peek timed out or failed on every poll; last snapshot: dust appliedIndex=${last?.appliedIndex ?? lastApplied}, streamTip=${last?.streamTip ?? lastHighest}, isConnected=${last?.isConnected ?? '?'}, elapsed=${Math.round((Date.now() - startedAt) / 1000)}s)`);
@@ -457,7 +442,7 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
             const behind = snapshot.behindEvents ?? '?';
             throw new NightgateError('WALLET_NOT_SYNCED', `wallet sync stalled: no progress for ${Math.round((Date.now() - lastProgressAt) / 60_000)} min (dust appliedIndex stuck at ${applied}, streamTip=${highest}, ${behind} events behind, blockHeight=${tip.height}, isConnected=${connected}, indexerFresh=${fresh}, elapsed=${Math.round(snapshot.elapsedMs / 1000)}s)`);
         }
-        // INFO: without it a long catch-up is indistinguishable from a hang.
+        // Logged at info level so a long sync can be told apart from a hang.
         if (Date.now() - lastLog > SYNC_PROGRESS_LOG_MS) {
             pushSyncProgress(snapshot);
             const rate = snapshot.eventsPerSecond != null ? snapshot.eventsPerSecond.toFixed(1) : '?';
@@ -469,19 +454,16 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
     }
     const tip = await getIndexerTip(indexerHttpUrl);
     const behind = lastHighest >= 0n && lastApplied >= 0n ? (lastHighest - lastApplied).toString() : '?';
-    // The last snapshot stays in `syncProgress` so a caller can tell slow from stalled.
     const rate = syncProgress.get(sessionId)?.eventsPerSecond;
     throw new NightgateError('WALLET_NOT_SYNCED', `wallet not synced to tip after ${timeoutMs}ms (absolute ceiling): still ${behind} events behind at ${rate != null ? rate.toFixed(1) : '?'} events/s, dust appliedIndex=${lastApplied} streamTip=${lastHighest}, blockHeight=${tip.height}; the sync was moving (no stall detected), raise NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS or wait for a quieter machine`);
 }
-
-// ---- Facade construction --------------------------------------------------
 
 export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     const sdk = await loadSdk();
     await ensureNetworkId(args.networkId, sdk);
 
-    // Each key type comes from its own HD role, as in Lace (wallet-hd.ts); accountIndex
-    // must match the session's WalletSessions.accountIndex.
+    // Each key type comes from its own HD path, as in the Lace wallet.
+    // accountIndex must match the session's WalletSessions.accountIndex.
     const bip39Seed = new Uint8Array(Buffer.from(args.seedHex, 'hex'));
     const roleSeeds = await deriveRoleSeeds(bip39Seed, args.accountIndex ?? 0);
     const zswapKeys = sdk.ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
@@ -503,8 +485,8 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
             indexerWsUrl: args.indexerWsUrl
         },
         txHistoryStorage,
-        // additionalFeeOverhead >= 1n keeps the dust balancer off an empty recipe (fee 0 ->
-        // 1010/117 NotNormalized). feeBlocksMargin 1 sits on the 0/1-atom edge on quiet networks.
+        // A fee of 0 makes the SDK build an empty dust part, which the node rejects with 1010/117.
+        // additionalFeeOverhead of at least 1 prevents that. feeBlocksMargin 1 is too tight on quiet networks.
         costParameters: { additionalFeeOverhead: 1n, feeBlocksMargin: 5 }
     };
 
@@ -516,7 +498,7 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
 
     const provingMode = resolveProvingMode();
     const proving = provingMode === 'wasm' ? await loadProvingSdk() : undefined;
-    // One shared key provider per worker, else every session re-downloads the keys.
+    // Shared by all wallets, so the keys are downloaded only once.
     const sharedKeys = provingMode === 'wasm' ? await getSharedKeyMaterialProvider() : undefined;
     if (provingMode === 'wasm') {
         log('info', 'proving mode: wasm (in-process prover; proof server not used for wallet proving)');
@@ -524,7 +506,6 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
 
     const facade = await sdk.facade.WalletFacade.init({
         configuration,
-        // Without provingService the facade uses the server prover at provingServerUrl.
         ...(proving ? { provingService: () => proving.makeWasmProvingService({ keyMaterialProvider: sharedKeys }) } : {}),
         shielded: () => restore?.shielded
             ? ShieldedWallet(configuration).restore(restore.shielded)
@@ -532,8 +513,8 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
         unshielded: () => restore?.unshielded
             ? UnshieldedWallet(configuration).restore(restore.unshielded)
             : UnshieldedWallet(configuration).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
-        // Restored dust state can carry roots pruned from the node's root_history (unspendable,
-        // 117); NIGHTGATE_DUST_COLD_START syncs dust fresh instead.
+        // A restored dust state can refer to tree roots the node has forgotten, so its dust cannot be
+        // spent (error 117). NIGHTGATE_DUST_COLD_START syncs the dust wallet from scratch instead.
         dust: () => (restore?.dust && !configFlag('NIGHTGATE_DUST_COLD_START'))
             ? DustWallet(configuration).restore(restore.dust)
             : DustWallet(configuration).startWithSecretKey(dustKey, dustParameters)
@@ -561,12 +542,10 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     };
 }
 
-// ---- Periodic state save (pushed to main thread) -------------------------
-
 export let saveSeqCounter = 0;
 
-// Keyed by save seq and resolved independently of the facade lookup, so an
-// eviction between push and ack cannot strand a waiter.
+// Keyed by save number and not by wallet, so a wallet unloaded before the
+// confirmation arrives does not leave a waiter hanging.
 export const saveAckWaiters = new Map<number, () => void>();
 
 export function resolveSaveAckWaiter(seq: number): void {
@@ -574,21 +553,21 @@ export function resolveSaveAckWaiter(seq: number): void {
 }
 
 /**
- * `lastSavedBlobs` advances only on the ack, so a dropped persist is re-pushed next tick.
- * `beforePost` runs before posting, so an ack waiter registers race-free.
+ * `lastSavedBlobs` changes only on confirmation, so a lost save is sent again on the next tick.
+ * `beforePost` runs before sending, so a waiter is registered before any confirmation can arrive.
  */
 export function pushStateSave(sessionId: string, entry: FacadeEntry, blobs: { shielded?: string; unshielded?: string; dust?: string }, beforePost?: (seq: number) => void): number {
     const seq = ++saveSeqCounter;
     entry.pendingSaves ??= new Map();
     entry.pendingSaves.set(seq, blobs);
-    // Serialize epoch per push, so applySaveAck ignores acks from before a restore or replacement.
+    // Remember the epoch, so applySaveAck can ignore saves of a wallet that was replaced since.
     if (blobs.dust !== undefined) {
         (entry.dustSaveEpochs ??= new Map()).set(seq, entry.dustEpoch ?? 0);
     }
     if (blobs.shielded !== undefined) {
         (entry.shieldedSaveEpochs ??= new Map()).set(seq, entry.shieldedEpoch ?? 0);
     }
-    // Bound the in-flight map when main never acks.
+    // Keep the map small when the main thread never confirms.
     if (entry.pendingSaves.size > 4) {
         const oldest = Math.min(...entry.pendingSaves.keys());
         entry.pendingSaves.delete(oldest);
@@ -607,11 +586,10 @@ export function pushStateSave(sessionId: string, entry: FacadeEntry, blobs: { sh
 }
 
 export function restoreSaveAckTimeoutMs(): number {
-    // Read per call so tests can shrink the window.
     return configMs('NIGHTGATE_RESTORE_SAVE_ACK_TIMEOUT_MS');
 }
 
-/** Resolves on the ack for this seq; rejects after `timeoutMs` (there is no nack: a sink failure never acks). */
+/** Resolves when the main thread confirms the save. Rejects after `timeoutMs`, because a failed save is never confirmed. */
 export function pushStateSaveAcked(sessionId: string, entry: FacadeEntry, blobs: { shielded?: string; unshielded?: string; dust?: string }, timeoutMs: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
         pushStateSave(sessionId, entry, blobs, (seq) => {
@@ -630,8 +608,8 @@ export function pushStateSaveAcked(sessionId: string, entry: FacadeEntry, blobs:
 }
 
 /**
- * Merges, since pushes carry only changed sub-blobs. A blob acked under a stale epoch is dropped:
- * after a restore or replacement only its own push is a valid baseline.
+ * Merges, because a save carries only the parts that changed.
+ * A part saved before its wallet was replaced is ignored.
  */
 export function applySaveAck(entry: FacadeEntry, seq: number): void {
     const blobs = entry.pendingSaves?.get(seq);
@@ -651,7 +629,7 @@ export function applySaveAck(entry: FacadeEntry, seq: number): void {
     entry.shieldedSaveEpochs?.delete(seq);
 }
 
-/** Idle progress watch: `waitForGenuineSync` publishes only while a job waits. */
+/** Reports sync progress while no job waits, because `waitForGenuineSync` reports only during a wait. */
 export const PROGRESS_WATCH_MS = configMs('NIGHTGATE_PROGRESS_WATCH_MS');
 
 export function startProgressWatch(sessionId: string, entry: FacadeEntry): void {
@@ -672,8 +650,8 @@ export function startProgressWatch(sessionId: string, entry: FacadeEntry): void 
 }
 
 /**
- * Replay check first, then the snapshot; skipped while a genuine-sync wait refreshed it
- * within the interval, and after a replacement.
+ * Checks for a stuck restored wallet first, then reports progress.
+ * Skips the report when a sync wait reported recently, and after a wallet part was replaced.
  */
 export async function progressWatchTick(sessionId: string, entry: FacadeEntry, now: number = Date.now()): Promise<void> {
     if (facades.get(sessionId) !== entry) return;
@@ -710,14 +688,14 @@ export async function progressWatchTick(sessionId: string, entry: FacadeEntry, n
     }
 }
 
-/** Replacement window of a restored sub-wallet whose replay the ledger rejects (`NIGHTGATE_SNAPSHOT_REPLAY_RESET_MS`, 0 = off). */
+/** How long a restored wallet part may be stuck before it is replaced. 0 turns this off. */
 export function snapshotReplayResetMs(): number {
     return configMs('NIGHTGATE_SNAPSHOT_REPLAY_RESET_MS');
 }
 
 /**
- * Replaces a restored sub-wallet stuck at its offset for the window while the ledger rejected a
- * replay of its kind and the stream tip lies beyond (sync-replay.ts). Returns whether one was replaced.
+ * Replaces a restored wallet part that is stuck while the ledger rejects its events.
+ * Returns whether one was replaced.
  */
 export async function checkSnapshotReplay(sessionId: string, entry: FacadeEntry, state: any, now: number = Date.now()): Promise<boolean> {
     const windowMs = snapshotReplayResetMs();
@@ -749,9 +727,9 @@ export async function checkSnapshotReplay(sessionId: string, entry: FacadeEntry,
 }
 
 /**
- * In-place swap under the submit lock (facade methods resolve sub-wallets at call time). The fresh
- * state is persisted with ack and the save epoch bumped, so neither a restart nor a late ack brings
- * back the rejected state. False when the facade is gone or the fresh sub-wallet does not start.
+ * Replaces a wallet part with a fresh one that syncs from the start. Runs under the submit lock.
+ * The fresh state is saved and the epoch raised, so neither a restart nor an old save brings back
+ * the broken state. Returns false when the wallet is gone or the fresh part does not start.
  */
 export async function resetRestoredSubWallet(entry: FacadeEntry, kind: ReplayKind, reason: string): Promise<boolean> {
     return withSessionLocks([entry.sessionId], async () => {
@@ -797,12 +775,11 @@ export async function resetRestoredSubWallet(entry: FacadeEntry, kind: ReplayKin
     });
 }
 
-/** Interval of the `sync-state` INFO line (`NIGHTGATE_SYNC_STATE_LOG_MS`, 0 = off). */
 export function syncStateLogMs(): number {
     return configMs('NIGHTGATE_SYNC_STATE_LOG_MS');
 }
 
-/** Logs the offsets the saved blobs carry, so a lagging offset shows before a restart depends on it. */
+/** Logs the positions the saved state resumes from, so a problem shows before a restart needs them. */
 export async function maybeLogSyncState(sessionId: string, entry: FacadeEntry, now: number = Date.now()): Promise<void> {
     const interval = syncStateLogMs();
     if (interval <= 0 || now - (entry.lastSyncStateLogAt ?? 0) < interval) return;
@@ -813,8 +790,8 @@ export async function maybeLogSyncState(sessionId: string, entry: FacadeEntry, n
 }
 
 /**
- * Each tick serializes multi-MB blobs and dust changes nearly every block, so a short interval
- * becomes GC load; the interval only bounds the sync work redone after a crash.
+ * Each save serializes several MB, and dust changes almost every block, so a short interval
+ * costs a lot of garbage collection. The interval only limits how much sync is redone after a crash.
  */
 export function saveIntervalMs(): number {
     return configMs('NIGHTGATE_SAVE_INTERVAL_MS');
@@ -828,7 +805,7 @@ export function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
     entry.saveTimer = setInterval(async () => {
         tickCount++;
         const tickStart = Date.now();
-        // Logged before the first await: serializeState() can hang.
+        // Logged before the first await, because serializeState() can hang.
         log('debug', `save-tick #${tickCount} fired, calling collectSerializedStates...`);
         try {
             const collectStart = Date.now();
@@ -836,7 +813,7 @@ export function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
             const shieldedEpochAtCollect = entry.shieldedEpoch ?? 0;
             const blobs = await collectSerializedStates(entry.facade);
             if ((entry.dustEpoch ?? 0) !== epochAtCollect && blobs.dust) {
-                // Swapped during collect: the blob may be the old wallet's; the swap persisted its own.
+                // The dust wallet was replaced meanwhile, so this blob may be the old one's. The replacement saved its own.
                 delete blobs.dust;
                 log('debug', `save-tick #${tickCount} dropped dust blob (dust sub-wallet swapped during collect)`);
             }
@@ -854,8 +831,7 @@ export function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
 
             if (!hasAnyBlob(blobs)) return;
             await maybeLogSyncState(sessionId, entry);
-            // Only sub-blobs that differ from the last ACKED save (the sink keeps absent keys),
-            // so a failed persist stays marked unsaved.
+            // Send only the parts that differ from the last confirmed save, so a failed save is retried.
             const changed = diffAgainstConfirmed(entry, blobs);
             if (!hasAnyBlob(changed)) {
                 log('debug', `save-tick #${tickCount} unchanged, skipping push`);
@@ -888,14 +864,14 @@ export async function collectSerializedStates(facade: any): Promise<{ shielded?:
                 if (typeof blob === 'string') out[key] = blob;
             }
         } catch {
-            // Best effort: one missing blob must not block the others.
+            // One missing part must not block the others.
         }
     };
     await Promise.all([tryOne('shielded'), tryOne('unshielded'), tryOne('dust')]);
     return out;
 }
 
-// Fallback reasons are logged once per reason, not on every save tick.
+// Each reason is logged once, not on every save.
 const dustCollapseNoted = new Set<string>();
 
 function firstEmission(observable: any, timeoutMs: number): Promise<any> {
@@ -909,7 +885,7 @@ function firstEmission(observable: any, timeoutMs: number): Promise<any> {
     });
 }
 
-/** As `serializeState()`, from one emitted state, with foreign generation leaves collapsed. */
+/** Like `serializeState()`, but with the dust tree shrunk (see dust-collapse.ts). */
 async function collapsedDustBlob(dust: any): Promise<string> {
     const [walletState, sdk] = await Promise.all([firstEmission(dust.state, 30_000), loadSdk()]);
     const t0 = Date.now();
@@ -932,7 +908,6 @@ export function hasAnyBlob(b: { shielded?: string; unshielded?: string; dust?: s
     return !!(b.shielded || b.unshielded || b.dust);
 }
 
-/** Sub-blobs that differ from the last save the main thread acked. */
 export function diffAgainstConfirmed(
     entry: FacadeEntry,
     blobs: { shielded?: string; unshielded?: string; dust?: string }
@@ -945,11 +920,8 @@ export function diffAgainstConfirmed(
     return changed;
 }
 
-// ---- Per-facade serialization ---------------------------------------------
-
-// Submits serialize per facade: concurrent balancing on one wallet double-selects inputs.
-// Sponsored submits lock both keys; the dust snapshot/restore relies on this lock.
-// `sponsorUnboundTx` locks only around its own build.
+// Submits of one wallet run one at a time, because parallel builds would pick the same coins.
+// Sponsored submits lock both wallets. Saving and restoring the dust state relies on this lock.
 export const sessionChains = new Map<string, Promise<unknown>>();
 
 export function submitLockKeys(args: any): string[] {
@@ -957,7 +929,7 @@ export function submitLockKeys(args: any): string[] {
         .filter((k): k is string => typeof k === 'string' && k.length > 0);
 }
 
-/** Exclusive slot on every key; no slot is held while waiting for another, so it cannot deadlock. */
+/** Runs `fn` while holding all given locks. All locks are taken at once, so this cannot deadlock. */
 export async function withSessionLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
     const ordered = [...new Set(keys)].sort();
     if (ordered.length === 0) return fn();
@@ -970,8 +942,7 @@ export async function withSessionLocks<T>(keys: string[], fn: () => Promise<T>):
         return await fn();
     } finally {
         release();
-        // Drop a facade-less session's chain only while our gate is last: deleting a
-        // later locker's gate would let the next one skip the wait.
+        // Clean up the lock of an unloaded wallet, but only if no later caller is queued on it.
         for (const k of ordered) {
             if (sessionChains.get(k) === gate && !facades.has(k)) sessionChains.delete(k);
         }
@@ -979,9 +950,9 @@ export async function withSessionLocks<T>(keys: string[], fn: () => Promise<T>):
 }
 
 
-// A build outlives the main thread's RPC timeout; a retry joins it instead of starting a second one.
+// A wallet build can outlast the main thread's timeout. A retry joins it instead of starting another.
 const buildsInFlight = new Map<string, Promise<FacadeEntry>>();
-// Sessions evicted while their build ran: the finished entry is torn down, never registered.
+// Sessions unloaded while their build ran. The finished wallet is discarded.
 const evictedWhileBuilding = new Set<string>();
 
 export async function init(args: InitArgs, build: (args: InitArgs) => Promise<FacadeEntry> = buildFacade) {
@@ -1029,7 +1000,6 @@ async function zeroEntry(entry: FacadeEntry, sessionId: string): Promise<void> {
     }
 }
 
-/** CPU profile of this worker thread via the in-thread inspector; the raw .cpuprofile stays on disk. */
 export async function cpuProfile({ seconds, dir }: { seconds?: number; dir?: string }) {
     const p = await profileCurrentThread(seconds ?? 20, { dir, filePrefix: 'worker' });
     log('info', `cpuProfile: ${p.seconds}s sampled, idle ${p.idlePercent}%, gc ${p.gcPercent}% (${p.gc.count} collections, ${p.gc.totalMs}ms), wasm ${p.wasmPercent}%, heap ${p.heapAfter.usedMb}/${p.heapAfter.limitMb} MB, external ${p.heapAfter.externalMb} MB, top: ${p.topFunctions.slice(0, 3).map((f: { label: string; percent: number }) => `${f.label.split('  ')[0]} ${f.percent}%`).join(', ')}`);
@@ -1039,12 +1009,12 @@ export async function cpuProfile({ seconds, dir }: { seconds?: number; dir?: str
 export async function waitForSyncedState({ sessionId, timeoutMs, stallMs }: { sessionId: string; timeoutMs?: number; stallMs?: number }) {
     const entry = facades.get(sessionId);
     if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
-    // isSynced is trivially true when highestIndex=0; bounded by stall, ceiling as backstop.
+    // The SDK's isSynced is always true when highestIndex is 0, so use our own check.
     await waitForGenuineSync(entry, timeoutMs ?? SYNC_CEILING_MS, 'prewarm', stallMs ?? SYNC_STALL_MS);
     return { synced: true };
 }
 
-/** `awaitSaveAck`: reply only after the final save was acked; off by default for fake-timer tests. */
+/** With `awaitSaveAck`, replies only after the final save was confirmed. */
 export async function evict({ sessionId, awaitSaveAck }: { sessionId: string; awaitSaveAck?: boolean }) {
     const entry = facades.get(sessionId);
     if (!entry) {
@@ -1052,17 +1022,16 @@ export async function evict({ sessionId, awaitSaveAck }: { sessionId: string; aw
         evictedWhileBuilding.add(sessionId);
         return { evicted: true, saved: false };
     }
-    // `saved`: the final save was pushed (and, with awaitSaveAck, acked).
     let saved = true;
-    // Remove from the map first so no NEW submit can resolve this facade.
+    // Remove it first so no new submit can find this wallet.
     facades.delete(sessionId);
     syncProgress.delete(sessionId);
     if (entry.saveTimer) clearInterval(entry.saveTimer);
     if (entry.progressTimer) clearInterval(entry.progressTimer);
-    // Teardown under the submit lock so it cannot zero keys under an in-flight submit.
+    // Runs under the submit lock so the keys are not wiped during a running submit.
     await withSessionLocks([sessionId], async () => {
-        // Acked before replying: the reply lets main drop the session, after which
-        // the sink would drop the save. Bounded; on timeout eviction proceeds.
+        // Wait for the confirmation before replying, because after the reply the main thread
+        // no longer stores saves for this session. On timeout the unload continues.
         try {
             const blobs = await collectSerializedStates(entry.facade);
             const changed = diffAgainstConfirmed(entry, blobs);
@@ -1074,7 +1043,6 @@ export async function evict({ sessionId, awaitSaveAck }: { sessionId: string; aw
             saved = false;
             log('warn', `evict final-save failed for ${sessionId.slice(0, 16)}: ${formatErr(err)}`);
         }
-        // Zero every secret held by the entry, not just the zswap keys.
         await zeroEntry(entry, sessionId);
     });
     return { evicted: true, saved };

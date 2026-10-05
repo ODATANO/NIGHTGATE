@@ -1,15 +1,13 @@
 using {midnight} from '../../db/schema';
 
 /**
- * Abstract service with three disclosure-tier projections over
- * `midnight.Attestations`. Extend it and call
- * `registerAttestationServiceHandlers(this, this.db)` in `init()`; that
- * helper enforces per-tier access from the caller's disclosure role. Every
- * tier requires an authenticated user, also in a projection that forgot the helper.
+ * Base service with three views of `midnight.Attestations`, each showing more data.
+ * Extend it and call `registerAttestationServiceHandlers(this, this.db)` in `init()`.
+ * That helper checks the caller's disclosure role. All views need a logged-in user even without it.
  *
- *   Public:    any authenticated caller (level 0), existence only.
- *   Disclosed: `legitimate_interest` or higher (level 1), adds attester and metadata.
- *   Authority: `authority` only (level 2), full row incl. payload cipher.
+ *   Public:    any logged-in user. Shows only that an attestation exists.
+ *   Disclosed: role `legitimate_interest` or higher. Adds the attester and metadata.
+ *   Authority: role `authority` only. Shows the full row, including the encrypted payload.
  */
 @abstract
 service AttestationService {

@@ -1,13 +1,10 @@
 /**
- * Custody export of one contract's signing key (the contract's maintenance
- * authority, sampled by midnight-js at deploy time and stored in
- * `ContractSigningKeys` under the account DEK).
+ * Exports the signing key of one deployed contract.
+ * midnight-js creates this key at deploy time. Whoever holds it can update the contract.
+ * The key is stored in `ContractSigningKeys`, encrypted with the account's data key.
  *
- * The key is read through the session that deployed the contract: the ring
- * opens the session's viewing key, the viewing key names the account, the
- * account DEK opens the row. The result is the same `midnight-signing-key-export`
- * envelope the private-state provider produces for a whole account, sealed
- * under a caller-chosen export password, so `importSigningKeys` restores it.
+ * The export is sealed under a password the caller chooses. It uses the same
+ * format as the private-state provider's export, so `importSigningKeys` can restore it.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -37,10 +34,8 @@ export interface ContractSigningKeyExport extends SigningKeyExport {
 }
 
 /**
- * Export the signing key of `contractAddress` held by the account behind
- * `sessionId`. Fails closed: an inactive session, a session without a
- * viewing key, a missing key row, a row still under a pre-DEK derivation
- * (a session read migrates it) and a short export password are all refused.
+ * Export the signing key of `contractAddress` from the account behind `sessionId`.
+ * A key row in the older encryption format is refused. Opening the session once upgrades it.
  */
 export async function exportContractSigningKeyForSession(
     db: Runner,

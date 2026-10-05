@@ -1,7 +1,8 @@
 /**
- * Every environment knob with kind, default and bounds. Empty = unset; an unparseable value or one
- * below `min` warns and takes the default (never NaN); above `max` is clamped. Env wins over the CAP
- * `<camelCase>` key, which wins over the default. No cds import: the worker loads this module.
+ * All settings with their type, default and limits.
+ * The environment wins over the CAP config key in camelCase, which wins over the default.
+ * An invalid value or one below `min` logs a warning and uses the default. A value above `max` is capped.
+ * This module does not import `@sap/cds`, because the worker loads it too.
  */
 
 export type ConfigKind = 'int' | 'ms' | 'bool' | 'string' | 'enum' | 'list' | 'url' | 'path' | 'secret';
@@ -9,15 +10,14 @@ export type ConfigKind = 'int' | 'ms' | 'bool' | 'string' | 'enum' | 'list' | 'u
 export interface ConfigSpec {
     key: string;
     kind: ConfigKind;
-    /** Applies when the variable is unset or unparseable; `undefined` = no default. */
+    /** Used when the value is unset or invalid. */
     default?: number | string | boolean;
     min?: number;
     max?: number;
-    /** `enum` only: accepted values (matched case-insensitively, reported in this spelling). */
+    /** `enum` only: the accepted values. Matched ignoring case. */
     values?: readonly string[];
-    /** Read inside the wallet worker: travels in the resolved snapshot. */
+    /** Read inside the wallet worker, so the value is copied to it. */
     worker?: boolean;
-    /** One line for docs/reference.md. */
     doc: string;
 }
 
@@ -153,21 +153,21 @@ export function isConfigKey(key: string): boolean {
     return BY_KEY.has(key);
 }
 
-/** Keys that never come from a CAP host's `cds.requires.nightgate` block. */
+/** Keys that are only read from the environment, never from the CAP config. */
 export function isEnvOnlyKey(key: string): boolean {
     return key.startsWith('ENCRYPTION_');
 }
 
 export interface ParsedConfigValue {
     value: ConfigValue;
-    /** Set when the raw value was rejected or clamped; the caller logs it once. */
+    /** Set when the value was rejected or capped. */
     warning?: string;
 }
 
 const TRUE_WORDS = new Set(['true', '1', 'yes', 'on']);
 const FALSE_WORDS = new Set(['false', '0', 'no', 'off']);
 
-/** Parse an env string or CAP value under its spec; undefined, null and '' mean unset. */
+/** Parses a raw value. undefined, null and '' count as unset. */
 export function parseConfigValue(spec: ConfigSpec, raw: unknown): ParsedConfigValue {
     if (raw === undefined || raw === null) return { value: spec.default };
     if (typeof raw === 'string' && raw.trim() === '') return { value: spec.default };
@@ -182,7 +182,6 @@ export function parseConfigValue(spec: ConfigSpec, raw: unknown): ParsedConfigVa
             const n = typeof text === 'number' ? text : (typeof text === 'string' && /^[+-]?\d+$/.test(text) ? Number(text) : NaN);
             if (!Number.isInteger(n)) return fallback(`'${String(raw)}' is not an integer`);
             const v = n;
-            // Below min is invalid (default applies); above max is clamped.
             if (spec.min !== undefined && v < spec.min) return fallback(`${v} is below the minimum ${spec.min}`);
             if (spec.max !== undefined && v > spec.max) {
                 return { value: spec.max, warning: `${spec.key}: ${v} is above the maximum ${spec.max}; clamped to ${spec.max}` };
@@ -216,7 +215,6 @@ export function parseConfigValue(spec: ConfigSpec, raw: unknown): ParsedConfigVa
     }
 }
 
-/** Resolve every key (env, CAP block, default) with the parse warnings. */
 export function resolveConfigTable(
     env: Record<string, string | undefined>,
     overrides?: Record<string, unknown> | null
@@ -245,7 +243,7 @@ export function resolveOne(
     return { value: spec.default };
 }
 
-/** One markdown row per key, the block `docs/reference.md` carries verbatim. */
+/** The settings table in docs/reference.md is generated from these rows. */
 export function configTableMarkdownRows(): string[] {
     const fmtDefault = (spec: ConfigSpec): string => {
         if (spec.default === undefined) return '';

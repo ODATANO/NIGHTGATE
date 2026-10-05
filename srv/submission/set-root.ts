@@ -1,6 +1,6 @@
 /**
- * The canonical membership-set rule, public under `@odatano/nightgate/set-root`;
- * the implementation lives in `@odatano/contract-kit`.
+ * How an allow-list of values is turned into one set root, public under
+ * `@odatano/nightgate/set-root`. The code lives in `@odatano/contract-kit`.
  */
 export {
     SET_DEPTH,

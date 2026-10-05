@@ -1,4 +1,4 @@
-/** Main-thread wrappers mapping `sendNight` and wallet diagnostics onto worker RPCs. */
+/** Main-thread functions that forward `sendNight` and wallet diagnostics to the wallet worker thread. */
 
 import {
     walletTransferNight,
@@ -10,19 +10,18 @@ import {
 // ---- sendNight ------------------------------------------------------------
 
 export interface SendNightArgs {
-    /** Worker facade key (the accountId). */
+    /** The account id. The worker keeps one wallet per account under this key. */
     cacheKey: string;
     /** Shielded (`mn_shield-addr_...`) or unshielded (`mn_addr_...`). */
     receiverAddress: string;
     /** NIGHT atoms, decimal string. */
     amount: string;
-    /** Defaults to +10 min in the worker. */
+    /** Transaction expiry. Defaults to 10 minutes from now. */
     ttlIso?: string;
-    /** Undefined waits indefinitely. */
     syncTimeoutMs?: number;
     /** Raw token type (64 hex) to send instead of NIGHT. */
     tokenTypeHex?: string;
-    /** Pre-broadcast handshake: persist the announced identifier, then the worker sends. */
+    /** Called before the broadcast. It saves the transaction id, and only then the worker sends. */
     onSubmitIntent?: SubmitIntentHook;
 }
 
@@ -49,23 +48,20 @@ export async function sendNight(args: SendNightArgs): Promise<SendNightResult> {
 export interface GetWalletBalanceArgs {
     cacheKey: string;
     syncTimeoutMs?: number;
-    /** Bounds the worker RPC itself, so an abandoned read cannot linger. */
     rpcTimeoutMs?: number;
 }
 
 export interface WalletBalanceSnapshot {
     shieldedNight: string;
     unshieldedNight: string;
-    /** Non-NIGHT shielded tokens with a non-zero balance: raw 64-hex type, atoms. */
     shieldedTokens: Array<{ tokenType: string; amount: string }>;
     dustBalance: string;
     registeredNightUtxoCount: number;
     totalNightUtxoCount: number;
     dustUtxoCount: number;
-    /** DUST spends in flight, awaiting confirmation. */
     dustPendingCount: number;
     dustPendingValue: string;
-    /** Dust sub-wallet restores from a pre-build snapshot in this process. */
+    /** How often this process restored the dust wallet from a snapshot taken before a build. */
     dustRestoreCount: number;
 }
 

@@ -1,8 +1,9 @@
 /**
- * Retry a short database write that lost a lock. Only status-style writes go
- * through here, never job work (double-submit risk).
+ * Retry a short database write that lost a lock.
+ * Use it only for status updates, never for job work, which could then submit twice.
  * SPDX-License-Identifier: Apache-2.0
  */
+import { errorMessage } from '../utils/errors';
 
 export const LOCK_CONTENTION_ATTEMPTS = 5;
 const DEFAULT_BACKOFF_MS: readonly number[] = [0, 500, 1500, 4000, 8000];
@@ -16,7 +17,7 @@ const PG_RETRY_SQLSTATES = new Set(['40001', '40P01', '55P03', '57014']);
 export function isLockContention(err: unknown): boolean {
     const code = String((err as any)?.code ?? '');
     if (PG_RETRY_SQLSTATES.has(code) || code === 'SQLITE_BUSY') return true;
-    const msg = String((err as Error)?.message ?? err);
+    const msg = errorMessage(err);
     return /database is locked|SQLITE_BUSY|could not serialize access|deadlock detected|lock timeout|canceling statement due to lock timeout|ResourceRequest timed out/i.test(msg);
 }
 
@@ -24,7 +25,7 @@ export function lockContentionBackoffMs(): readonly number[] {
     return backoffMs;
 }
 
-/** Retry `write` on lock contention only; any other error propagates at once. */
+/** Retries only on lock conflicts. Any other error is thrown at once. */
 export async function withLockContentionRetry<T>(label: string, write: () => Promise<T>, warn: (msg: string) => void = defaultWarn): Promise<T> {
     let lastErr: unknown;
     for (let attempt = 0; attempt < LOCK_CONTENTION_ATTEMPTS; attempt++) {
@@ -41,7 +42,7 @@ export async function withLockContentionRetry<T>(label: string, write: () => Pro
 }
 
 function defaultWarn(msg: string): void {
-    // Lazy require keeps this module usable without a booted CAP runtime.
+    // Required lazily, so this module also works without a running CAP server.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     try { require('@sap/cds').log('nightgate').warn(msg); } catch { /* no logger */ }
 }

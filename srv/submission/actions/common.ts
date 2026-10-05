@@ -1,37 +1,39 @@
 /**
- * Module-level helpers, command types and rate limits of the submission handlers.
+ * Shared helpers, command types and rate limits for the submission handlers.
  * SPDX-License-Identifier: Apache-2.0
  */
 import { getArtifactGenerationDigest } from '../contract-registry';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../../utils/nightgate-config';
 import { RateLimiter, principalRateKey } from '../../utils/rate-limiter';
-import { withLockContentionRetry, WorkflowReconciliationRequiredError } from '../background-jobs';
-import { SHA256_HEX_RE, UINT64_MAX } from '../verify-state';
+import { WorkflowReconciliationRequiredError } from '../background-jobs';
+import { UINT64_MAX } from '../verify-state';
 import { effectiveSponsorPolicy, getGlobalSponsorPolicy, type SponsorPolicy } from '../sponsor-policy';
 import { currentGrantPolicy } from '../../sessions/agent-grants';
 import { formatErr } from '../../utils/format-error';
 import { configInt } from '../../utils/config';
 import type { DbRunner, TxCapableDb } from '../../utils/db-types';
-import type { NightgateRequest } from '../../utils/request-types';
-import { isNightgateError, NightgateError } from '../../utils/errors';
+import type { ActionRequest } from '@sap/cds';
+import { isNightgateError, NightgateError, errorMessage } from '../../utils/errors';
+import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
+import { withLockContentionRetry } from '../db-write-retry';
 
 /**
- * Records a workflow step that is on chain. A write that still fails parks the parent for
- * reconciliation: the re-run reuses the landed child and repeats only this write.
+ * Records a workflow step whose transaction is already on chain.
+ * If the write keeps failing, the parent job is parked. Its re-run reuses the landed transaction and repeats only this write.
  */
 export async function recordProven(parentJobId: string, txHash: string, write: () => Promise<unknown>): Promise<void> {
     try {
         await withLockContentionRetry(`recordProven(${parentJobId})`, write);
     } catch (err) {
         throw new WorkflowReconciliationRequiredError(
-            `Workflow step of job ${parentJobId} is on chain (${txHash}) but recording it failed: ${(err as Error)?.message ?? err}`
+            `Workflow step of job ${parentJobId} is on chain (${txHash}) but recording it failed: ${errorMessage(err)}`
         );
     }
 }
 
 /**
- * The sponsor policy resolved when the job RUNS, so a revoke or narrowed floor
- * applies to queued jobs. Revoked grant: permanent failure; unreadable policy file: retryable.
+ * Reads the sponsor policy when the job runs, not when it was queued.
+ * So a revoked grant or a tightened policy also applies to jobs already waiting.
  */
 export async function liveSponsorPolicyForJob(db: DbRunner, command: { grantId?: string | null }): Promise<SponsorPolicy> {
     const grant = command.grantId ? await currentGrantPolicy(db, command.grantId) : null;
@@ -41,7 +43,7 @@ export async function liveSponsorPolicyForJob(db: DbRunner, command: { grantId?:
     return effectiveSponsorPolicy(getGlobalSponsorPolicy(), grant);
 }
 
-// Rate limits are keyed by principal plus a scope (session, or contract for reindex).
+// Each limit counts per caller and per scope. The scope is a session, or a contract for reindex.
 export const deployRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 5 });
 export const callRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
 export const anchorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
@@ -49,14 +51,14 @@ export const predicateRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, 
 export const disclosureRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
 export const registrarRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
 export const reindexRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
-// Per caller, not per session: the sponsor pool pays the dust of every job.
+// Counted per caller only, because the shared sponsor pool pays the dust for every job.
 export const sponsorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 120 });
 export const swapOfferRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
 export const swapListRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 600 });
 export const holderClaimRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
 export const buildRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
 
-/** The vault asserts `valid_until` lies in (block time, block time + 5 years]. */
+/** The vault contract only accepts a `valid_until` after the block time and at most 5 years ahead. */
 export const CLAIM_MAX_LIFETIME_S = 5 * 365 * 24 * 60 * 60;
 export function claimDefaultLifetimeS(): number {
     const configured = configInt('NIGHTGATE_CLAIM_LIFETIME_S') ?? 365 * 24 * 60 * 60;
@@ -65,7 +67,7 @@ export function claimDefaultLifetimeS(): number {
 export function claimValidUntil(requested?: number): bigint {
     return BigInt(requested ?? Math.floor(Date.now() / 1000) + claimDefaultLifetimeS());
 }
-/** Parses an optional caller `validUntil`; returns an error text for the 400. */
+/** Parses an optional caller `validUntil`. On bad input it returns the error text for a 400. */
 export function parseValidUntil(raw: unknown): { validUntil?: number; error?: string } {
     if (raw === undefined || raw === null || raw === '') return {};
     const v = Number(raw);
@@ -77,12 +79,12 @@ export function parseValidUntil(raw: unknown): { validUntil?: number; error?: st
 }
 
 /**
- * Per-call proof witness bundle. The cross-root circuits (`docPair`) need no
- * inclusion path, so `siblings`/`dirs` may be absent alongside it.
+ * Private proof inputs for one circuit call. Proofs that compare two documents
+ * use `docPair` and need no Merkle path, so `siblings` and `dirs` may be missing.
  */
 export type MerkleProofBundle = {
     fieldValue?: string;
-    /** Per-slot salt, 64 hex; required by every single-field proof. */
+    /** Salt of the field, 64 hex chars. Every single-field proof needs it. */
     fieldSalt?: string;
     fieldDigest?: string;
     siblings?: string[];
@@ -91,23 +93,21 @@ export type MerkleProofBundle = {
     docPair?: DocPairBundle;
 };
 
-/** One slot of the shared schema (wire form; matches document-proof.ts). */
+/** Same shape as in document-proof.ts. */
 export type SchemaSlotWire = { fieldKey: string; kind: number; scale: string };
-/** One document's cross-root opening (wire form; witness material). */
+/** The private field values of one document, used to prove a comparison of two documents. */
 export type OpeningWire = { saltSeed: string; slots: Array<{ present: boolean; value?: string; valueDigest?: string }> };
 
-/** Cross-root witness bundle: shared schema + both documents' openings. */
 export type DocPairBundle = {
     schema?: SchemaSlotWire[]; openingA?: OpeningWire; openingB?: OpeningWire;
 };
 
-/** One batch claim; `predicate` discriminates the kind. */
 export type BatchClaimCommand = {
     predicateAttestationId: string; predicate: string; unit?: string;
     validUntil?: number;
-    /** Absent only for the cross-root document kinds. */
+    /** Missing only for the claims that compare two documents. */
     fieldKey?: string;
-    /** Per-slot salt; required for the single-field kinds. */
+    /** Salt of the field. Required for single-field claims. */
     salt?: string;
     // numeric ('lessOrEqual' | 'greaterOrEqual')
     threshold?: string; opCode?: number; value?: string;
@@ -115,7 +115,7 @@ export type BatchClaimCommand = {
     expectedDigest?: string;
     // 'setMembership'
     setRoot?: string; valueDigest?: string; setSiblings?: string[]; setDirs?: boolean[];
-    // 'documentIntegrity' / 'documentDiff' (document A = the batch payloadHash)
+    // 'documentIntegrity' and 'documentDiff'. Document A is the batch payloadHash.
     payloadHashB?: string; attesterIdB?: string; allowedMask?: number; k?: number;
     schema?: SchemaSlotWire[]; openingA?: OpeningWire; openingB?: OpeningWire;
     siblings?: string[]; dirs?: boolean[];
@@ -135,20 +135,21 @@ export type ContractCommandV1 =
     | { op: 'grantDisclosure'; disclosureGrantId: string; payloadHash: string; attesterId: string; grantee: string; level: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'revokeDisclosure'; payloadHash: string; attesterId: string; grantee: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
     | { op: 'registerPassport'; passportId: string; ownerId: string; mode?: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
-    // retract mode 0 = payload (owner; attesterId = the session's, for the local projection), 1 = expired claim
+    // Retract mode 0 removes the owner's own attestation. attesterId is the session's and is used for the local database update.
+    // Mode 1 removes an expired claim.
     | { op: 'retract'; mode: number; key: string; attesterId?: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string };
 
 /**
- * The artifact generation stamped by startJob, verified fail-closed before
- * execution: the registry name alone is a mutable alias.
+ * A command plus the digest of the exact contract build it was created for.
+ * The registered name can later point to a different build, so the digest is checked before running.
  */
 export type ContractCommandV1WithProvenance = ContractCommandV1 & { artifactDigest?: string };
 
-/** Parse a JSON Merkle inclusion path of fixed depth; rejects 400 and returns null on violation. */
+/** Parses a JSON Merkle path of fixed depth. On bad input it rejects with 400 and returns null. */
 export function parseInclusionPath(
-    req: NightgateRequest,
-    siblingsJson: string | undefined,
-    dirsJson: string | undefined,
+    req: ActionRequest<unknown, unknown>,
+    siblingsJson: string | null | undefined,
+    dirsJson: string | null | undefined,
     depth: number,
     names: { siblings: string; dirs: string }
 ): { siblings: string[]; dirs: boolean[] } | null {
@@ -163,7 +164,7 @@ export function parseInclusionPath(
         req.reject(400, `${names.dirs} must be a JSON array of ${depth} booleans`); return null;
     }
     for (const s of siblings) {
-        if (typeof s !== 'string' || !SHA256_HEX_RE.test(s)) {
+        if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) {
             req.reject(400, `each ${names.siblings} entry must be 64 hex chars (32 bytes)`); return null;
         }
     }
@@ -174,14 +175,13 @@ export function parseInclusionPath(
     return { siblings: (siblings as string[]).map(s => s.toLowerCase()), dirs: dirs as boolean[] };
 }
 
-/** Validate a schema descriptor list; throws a user-facing message. */
 export function validateSchemaSlots(schema: unknown, name: string, width = 16): SchemaSlotWire[] {
     if (!Array.isArray(schema) || schema.length !== width) {
         throw new Error(`${name} must be a JSON array of exactly ${width} slot descriptors`);
     }
     return schema.map((d: any, i: number) => {
         if (!d || typeof d !== 'object') throw new Error(`${name}[${i}] must be an object`);
-        if (typeof d.fieldKey !== 'string' || !SHA256_HEX_RE.test(d.fieldKey)) {
+        if (typeof d.fieldKey !== 'string' || !HEX64_ANY_CASE_RE.test(d.fieldKey)) {
             throw new Error(`${name}[${i}].fieldKey must be 64 hex chars (32 bytes)`);
         }
         if (d.kind !== 0 && d.kind !== 1 && d.kind !== 2) {
@@ -194,11 +194,10 @@ export function validateSchemaSlots(schema: unknown, name: string, width = 16): 
     });
 }
 
-/** Validate a cross-root document opening; throws a user-facing message. */
 export function validateOpening(opening: unknown, name: string, width = 16): OpeningWire {
     const o = opening as any;
     if (!o || typeof o !== 'object') throw new Error(`${name} must be an object`);
-    if (typeof o.saltSeed !== 'string' || !SHA256_HEX_RE.test(o.saltSeed)) {
+    if (typeof o.saltSeed !== 'string' || !HEX64_ANY_CASE_RE.test(o.saltSeed)) {
         throw new Error(`${name}.saltSeed must be 64 hex chars (32 bytes)`);
     }
     if (!Array.isArray(o.slots) || o.slots.length !== width) {
@@ -215,7 +214,7 @@ export function validateOpening(opening: unknown, name: string, width = 16): Ope
             out.value = v.toString();
         }
         if (s.valueDigest !== undefined) {
-            if (typeof s.valueDigest !== 'string' || !SHA256_HEX_RE.test(s.valueDigest)) {
+            if (typeof s.valueDigest !== 'string' || !HEX64_ANY_CASE_RE.test(s.valueDigest)) {
                 throw new Error(`${name}.slots[${i}].valueDigest must be 64 hex chars (32 bytes)`);
             }
             out.valueDigest = s.valueDigest.toLowerCase();
@@ -229,22 +228,22 @@ export function validateOpening(opening: unknown, name: string, width = 16): Ope
 }
 
 /**
- * True when the mask frees every real (non-padding) slot. The circuit rejects
- * such a claim; this gives a 400 before proving.
+ * True when the mask allows every real field to change, which makes the claim empty.
+ * The circuit rejects such a claim, so this answers with a 400 before proving.
  */
 export function isVacuousMask(allowedMask: number, schema: SchemaSlotWire[]): boolean {
     return schema.every((s, i) => s.kind === 2 || (allowedMask & (1 << i)) !== 0);
 }
 
-/** Parse a JSON schema/opening pair; rejects 400 and returns null on violation. */
-/** `PredicateAttestations.threshold` is Integer64: a recorded claim's threshold stays below 2^63. */
+/** `PredicateAttestations.threshold` is an Integer64 column, so a stored threshold must stay below 2^63. */
 export const INT64_MAX = 9223372036854775807n;
 
+/** Parses the schema and both document inputs. On bad input it rejects with 400 and returns null. */
 export function parseDocPairInputs(
-    req: NightgateRequest,
-    schemaJson: string | undefined,
-    openingAJson: string | undefined,
-    openingBJson: string | undefined,
+    req: ActionRequest<unknown, unknown>,
+    schemaJson: string | null | undefined,
+    openingAJson: string | null | undefined,
+    openingBJson: string | null | undefined,
     width = 16
 ): { schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire } | null {
     try {
@@ -261,8 +260,8 @@ export function parseDocPairInputs(
 }
 
 /**
- * WalletFacade config. Fail-closed on an invalid network: the CAP host stays
- * online after a rejected init, so this must refuse the fallback network itself.
+ * WalletFacade config. Throws on an invalid network name.
+ * The server keeps running after a failed init, so this must not fall back to a default network.
  */
 export function facadeConfigFromEnv() {
     const nightgateConfig = getNightgatePluginConfig();
@@ -281,18 +280,16 @@ export function facadeConfigFromEnv() {
     };
 }
 
-/** Network id recorded on evidence rows; null when config is unresolvable. */
 export function recordedNetworkId(): string | null {
     try { return facadeConfigFromEnv().networkId ?? null; } catch { return null; }
 }
 
-/** Artifact-generation digest recorded on evidence rows; null for an unregistered alias. */
 export function artifactDigestOrNull(compiledRef: string): string | null {
     try { return getArtifactGenerationDigest(compiledRef); } catch { return null; }
 }
 
-/** Mainnet gate: rejects 403 and returns true when submission is not allowed. Call before any work. */
-export function rejectIfMainnetBlocked(req: NightgateRequest): boolean {
+/** Rejects with 403 and returns true when mainnet submission is not allowed. Call it before any work. */
+export function rejectIfMainnetBlocked(req: ActionRequest<unknown, unknown>): boolean {
     const reason = mainnetSubmissionBlockReason(getNightgatePluginConfig());
     if (reason) {
         req.reject?.(403, reason);
@@ -302,15 +299,15 @@ export function rejectIfMainnetBlocked(req: NightgateRequest): boolean {
 }
 
 /**
- * Principal first, then the scope: the scope is caller input checked before
- * ownership, so alone it would let any user spend another's budget.
+ * The key starts with the caller's identity. The scope comes from the request and is not yet
+ * checked for ownership, so a scope-only key would let one user use up another user's budget.
  */
-export function rateKey(req: NightgateRequest, scope: string): string {
+export function rateKey(req: ActionRequest<unknown, unknown>, scope: string): string {
     return principalRateKey(req, scope);
 }
 
-export function checkRate(limiter: RateLimiter, scope: string, req: NightgateRequest, count = 1): boolean {
-    // checkMany is all-or-nothing: a rejected batch consumes NO budget.
+export function checkRate(limiter: RateLimiter, scope: string, req: ActionRequest<unknown, unknown>, count = 1): boolean {
+    // checkMany counts all or nothing. A rejected batch uses up no budget.
     const r = limiter.checkMany(rateKey(req, scope), count);
     if (!r.allowed) {
         req.reject?.(429, `Rate limited. Retry after ${Math.ceil(r.retryAfterMs / 1000)}s`);
@@ -328,13 +325,11 @@ export async function runInOneTransaction<T>(db: TxCapableDb, fn: (tx: DbRunner)
     return fn(db);
 }
 
-/** `Retry-After` on a retryable 503. `req.http` is absent outside an HTTP request (tests, programmatic calls). */
-export function setRetryAfter(req: NightgateRequest, seconds: number): void {
+export function setRetryAfter(req: ActionRequest<unknown, unknown>, seconds: number): void {
     try { req.http?.res?.set?.('Retry-After', String(seconds)); } catch { /* header is a courtesy */ }
 }
 
-/** Coded errors answer with their own status and code; anything else is a 500. */
-export async function runSubmission(req: NightgateRequest, op: () => Promise<unknown>): Promise<unknown> {
+export async function runSubmission<T>(req: ActionRequest<unknown, unknown>, op: () => Promise<T>): Promise<T> {
     try {
         return await op();
     } catch (err) {

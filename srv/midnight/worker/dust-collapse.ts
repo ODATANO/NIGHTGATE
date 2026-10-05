@@ -1,8 +1,9 @@
 /**
- * Dust snapshot without foreign generation leaves. The ledger re-expands a foreign leaf on
- * every dtime update and never collapses it again, so the snapshot and its restore time grow
- * with the chain. Only leaves behind `night_indices` (the wallet's own backing nights) are
- * needed to spend; collapsed subtrees keep their hash, so roots and spend paths are unchanged.
+ * Shrinks the saved dust state.
+ * The dust state holds a tree with an entry for every NIGHT UTXO that generates dust, including
+ * those of other wallets. The ledger keeps expanding the other wallets' entries and never shrinks
+ * them, so the saved state grows with the chain. Only the wallet's own entries are needed to spend.
+ * Collapsed parts keep their hash, so the tree roots stay the same.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -10,7 +11,7 @@ import { formatErr } from '../../utils/format-error';
 
 export interface OwnGeneration {
     firstFree: bigint;
-    /** Backing night (hex) -> generation index. */
+    /** The wallet's own NIGHT UTXOs (hex) and their position in the tree. */
     nightIndices: Map<string, bigint>;
 }
 
@@ -28,7 +29,7 @@ export function parseOwnGeneration(text: string): OwnGeneration | null {
     return { firstFree: BigInt(ff[1]), nightIndices };
 }
 
-/** Inclusive index ranges in [0, firstFree) that hold none of `keep`. */
+/** Index ranges below `firstFree` that contain none of `keep`. Both ends are included. */
 export function foreignRanges(keep: Iterable<bigint>, firstFree: bigint): Array<[bigint, bigint]> {
     const sorted = [...new Set(keep)].filter(i => i >= 0n && i < firstFree).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     const out: Array<[bigint, bigint]> = [];
@@ -41,8 +42,8 @@ export function foreignRanges(keep: Iterable<bigint>, firstFree: bigint): Array<
 }
 
 /**
- * Collapses every foreign leaf. Throws when an own UTXO's backing night is not in the parsed
- * `night_indices`: collapsing its leaf would make `generationInfo` panic inside the wasm.
+ * Collapses every entry of other wallets.
+ * Throws when one of our own dust UTXOs has no entry, because collapsing it would crash the ledger wasm later.
  */
 export function collapseForeignGeneration(state: any): { state: any; ranges: number; ownLeaves: number } {
     const own = parseOwnGeneration(state.toString(true));
@@ -58,9 +59,8 @@ export function collapseForeignGeneration(state: any): { state: any; ranges: num
 }
 
 /**
- * The SDK snapshot of `walletState` (a DustWalletState) with its dust state collapsed, or the
- * SDK snapshot unchanged when the collapsed state does not restore to the same roots, balance
- * and UTXOs. Blob, state and offset all come from the one `walletState`.
+ * Returns the saved dust wallet state with the tree collapsed.
+ * Returns it unchanged when the collapsed state would not restore to the same roots, balance and UTXOs.
  */
 export function collapsedDustSnapshot(walletState: any, DustLocalState: any): { blob: string; collapsed: boolean; fullBytes: number; bytes: number; reason?: string } {
     const blob: string = walletState.serialize();

@@ -1,8 +1,9 @@
 /**
- * Offer files: a serialized ledger transaction as bech32m text (BIP-350) under
- * the prefix `swapoffer`, without the 90-character limit of address strings.
+ * Offer files: a serialized swap transaction written as bech32m text with the prefix `swapoffer`.
+ * Unlike addresses, they have no 90-character limit.
  * SPDX-License-Identifier: Apache-2.0
  */
+import { errorMessage } from './errors';
 
 export const OFFER_FILE_HRP = 'swapoffer';
 
@@ -28,8 +29,8 @@ function loadBech32m(): Promise<Bech32m> {
 }
 
 /**
- * True for text that is meant as an offer file, valid or not: it starts with
- * the prefix, or it has bech32 shape in one case (base64 of a transaction mixes case).
+ * True for text that is meant as an offer file, even an invalid one.
+ * It starts with the prefix or has the bech32 shape. Bech32 uses one case only, base64 mixes cases.
  */
 export function looksLikeOfferFile(text: unknown): boolean {
     if (typeof text !== 'string') return false;
@@ -39,15 +40,14 @@ export function looksLikeOfferFile(text: unknown): boolean {
     return /^[a-z0-9_-]{1,83}1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{6,}$/.test(s.toLowerCase());
 }
 
-/** The library quotes the whole string in its messages. */
-const reason = (e: unknown): string => String((e as Error)?.message ?? e).split(/[:"]| in /)[0].trim().slice(0, 120);
+/** Short reason from a decode error. The library would repeat the whole input in its message. */
+const reason = (e: unknown): string => errorMessage(e).split(/[:"]| in /)[0].trim().slice(0, 120);
 
 export async function encodeOfferFile(bytes: Uint8Array): Promise<string> {
     const bech32m = await loadBech32m();
     return bech32m.encode(OFFER_FILE_HRP, bech32m.toWords(bytes), false);
 }
 
-/** The transaction bytes of an offer file; throws on a wrong prefix, character or checksum. */
 export async function decodeOfferFile(text: string): Promise<Uint8Array> {
     const bech32m = await loadBech32m();
     let decoded: { prefix: string; words: number[] };
@@ -66,7 +66,7 @@ export async function decodeOfferFile(text: string): Promise<Uint8Array> {
     }
 }
 
-/** Transaction bytes handed over as an offer file or as base64. */
+/** Accepts transaction bytes as an offer file or as base64. */
 export async function transactionBytesOf(input: string): Promise<Uint8Array> {
     if (looksLikeOfferFile(input)) return decodeOfferFile(input);
     const compact = String(input ?? '').replace(/\s+/g, '');

@@ -18,15 +18,16 @@ import {
 
 import { RateLimiter } from './utils/rate-limiter';
 import { principalRateKey } from './utils/rate-limiter';
-import type { NightgateRequest } from './utils/request-types';
 import { normalizeHttpError } from './utils/http-errors';
 import { buildBoardStatus } from './submission/board-status';
+import { getBoardStatus, getReadiness, getReorgHistory, getRuntimeInfo, reindexFromHeight, resumeCrawler } from '#cds-models/NightgateIndexerService';
+import type { Request } from '@sap/cds';
 
 const log = cds.log('nightgate:indexer');
 
-// getRuntimeInfo can force a full artifact re-hash on the event loop.
+// getRuntimeInfo can trigger a full re-hash of the contract files, which blocks the event loop.
 const runtimeInfoRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
-// Anonymous and polled by pages: three count queries per call.
+// Open to anonymous callers and polled by web pages. Each call runs three count queries.
 const boardStatusRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 60 });
 
 export default class NightgateIndexerService extends cds.ApplicationService {
@@ -47,7 +48,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         transactionsRolledBack: number;
         effectiveStartHeight: number;
     }> {
-        // Commits before the caller restarts the crawler, so it never reads pre-rollback state.
+        // Commits before the caller restarts the crawler, so the crawler never sees the old rows.
         const result: RollbackResult = await this.db.tx(async (tx) =>
             rollbackIndexedDataFromHeight(tx, fromHeight, {
                 syncStatus: 'stopped',
@@ -92,8 +93,8 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('getHealth', async () => buildHealth(this.db));
 
-        this.on('getReorgHistory', async (req: NightgateRequest) => {
-            const { limit } = req.data as { limit?: number };
+        this.on(getReorgHistory, async (req) => {
+            const { limit } = req.data;
             const effectiveLimit = Math.min(Math.max(limit || 10, 1), 100);
             return this.db.run(
                 SELECT.from(ReorgLog)
@@ -104,7 +105,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('getLiveness', async () => buildLiveness());
 
-        this.on('getRuntimeInfo', async (req: NightgateRequest) => {
+        this.on(getRuntimeInfo, async (req) => {
             const clientKey = principalRateKey(req, 'runtime-info');
             const rate = runtimeInfoRateLimiter.check(clientKey);
             if (!rate.allowed) {
@@ -112,10 +113,10 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             }
             return buildRuntimeInfo();
         });
-        this.on('getWorkerStatus', async (req: NightgateRequest) =>
+        this.on('getWorkerStatus', async (req: Request) =>
             buildWorkerStatus(Boolean(req.user?.is?.('admin'))));
 
-        this.on('getBoardStatus', async (req: NightgateRequest) => {
+        this.on(getBoardStatus, async (req) => {
             const rate = boardStatusRateLimiter.check(principalRateKey(req, 'board-status'));
             if (!rate.allowed) {
                 return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
@@ -123,11 +124,10 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             return buildBoardStatus(this.db);
         });
 
-        this.on('getReadiness', async (req: NightgateRequest) => {
+        this.on(getReadiness, async (req) => {
             const readiness = await buildReadiness(this.db);
-            // The probe's answer is the status code: a payload saying `ready: false`
-            // under 200 reads as healthy to every orchestrator and to the container
-            // healthcheck. `req.http` is absent on an internal call.
+            // Health checks only look at the status code, so "not ready" must be a 503.
+            // `req.http` is missing on an internal call.
             if (readiness.ready !== true) req?.http?.res?.status(503);
             return readiness;
         });
@@ -157,7 +157,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             };
         });
 
-        this.on('resumeCrawler', async (req: NightgateRequest) => {
+        this.on(resumeCrawler, async (req) => {
             if (isCrawlerRunning()) {
                 return {
                     status: 'ok',
@@ -179,8 +179,8 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             }
         });
 
-        this.on('reindexFromHeight', async (req: NightgateRequest) => {
-            const { height } = req.data as { height?: number };
+        this.on(reindexFromHeight, async (req) => {
+            const { height } = req.data;
             const requestedHeight = Number(height);
 
             if (!Number.isInteger(requestedHeight) || requestedHeight < 0) {

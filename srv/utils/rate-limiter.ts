@@ -4,10 +4,10 @@ interface RateLimiterOptions {
     windowMs: number;
     maxRequests: number;
     maxKeys?: number;           // Max tracked keys (default: 10000)
-    sweepIntervalMs?: number;   // Stale key sweep interval (default: 60000)
+    sweepIntervalMs?: number;   // How often unused keys are removed (default: 60000)
     /**
-     * Max keys per group (key up to its first ':', the principal; default 64), so one
-     * caller's made-up scopes cannot evict every other caller's window.
+     * Max keys per caller (default 64). The caller is the part of the key before the first ':'.
+     * This stops one caller from pushing every other caller out of the table.
      */
     maxKeysPerGroup?: number;
 }
@@ -25,14 +25,15 @@ function groupOf(key: string): string {
 import { MARKER_PRINCIPALS } from './agent-token-transport';
 
 /**
- * `principal:scope`, principal = agent grant, else a non-marker user, else the
- * client address (unreliable behind proxies and in batch parts). No ':' in the principal.
+ * Rate-limit key in the form `caller:scope`.
+ * The caller is the agent grant, else the real user, else the client IP address.
+ * The IP address is unreliable behind proxies. The caller part never contains ':'.
  */
 export function principalRateKey(req: any, scope: string): string {
     const grant = req?.agentGrant?.ID;
     const rawUser = req?.user?.id;
     const user = typeof rawUser === 'string' && !MARKER_PRINCIPALS.has(rawUser) ? rawUser : undefined;
-    const ip = req?._?.req?.ip ?? req?.http?.req?.ip ?? req?.ip;
+    const ip = req?.http?.req?.ip ?? req?.ip;
     const principal = grant ? `grant=${String(grant)}`
         : user ? `user=${String(user)}`
         : ip ? `ip=${String(ip).replace(/:/g, '.')}`
@@ -66,7 +67,7 @@ export class RateLimiter {
         return this.checkMany(key, 1);
     }
 
-    /** Would ONE more hit fit? Records nothing. */
+    /** Would one more request fit? Records nothing. */
     peek(key: string): RateCheckResult {
         const now = Date.now();
         const inWindow = (this.hits.get(key) ?? []).filter(t => t > now - this.windowMs);
@@ -75,13 +76,12 @@ export class RateLimiter {
         return { allowed: false, retryAfterMs: Math.max(oldest + this.windowMs - now, 0) };
     }
 
-    /** Forget every key (tests). */
     reset(): void {
         this.hits.clear();
         this.groupCounts.clear();
     }
 
-    /** Consumes `count` slots atomically: all fit and are recorded, or none are. */
+    /** Records `count` requests at once. Either all fit and are recorded, or none are. */
     checkMany(key: string, count: number): RateCheckResult {
         if (count <= 0) return { allowed: true, retryAfterMs: 0 };
         const now = Date.now();
@@ -93,8 +93,8 @@ export class RateLimiter {
             if ((this.groupCounts.get(group) ?? 0) >= this.maxKeysPerGroup) {
                 return { allowed: false, retryAfterMs: this.windowMs };
             }
-            // At capacity evict the LRU key (insertion order, re-set on every hit):
-            // refusing new keys would let one caller lock everyone else out.
+            // When full, drop the least recently used key.
+            // Refusing new keys instead would let one caller lock everyone else out.
             if (this.hits.size >= this.maxKeys) {
                 const oldest = this.hits.keys().next().value;
                 if (oldest !== undefined) this.dropKey(oldest);
@@ -104,12 +104,12 @@ export class RateLimiter {
 
         let timestamps = this.hits.get(key) || [];
         timestamps = timestamps.filter(t => t > windowStart);
-        this.hits.delete(key); // re-insert below = most recently used
+        this.hits.delete(key); // re-inserted below, which marks it as most recently used
 
         if (timestamps.length + count > this.maxRequests) {
             timestamps.sort((a, b) => a - b);
             const oldestInWindow = timestamps[0];
-            // A count above the whole budget never fits: report a full window, not 0.
+            // A count larger than the whole limit never fits, so report a full window instead of 0.
             const retryAfterMs = oldestInWindow === undefined
                 ? this.windowMs
                 : oldestInWindow + this.windowMs - now;

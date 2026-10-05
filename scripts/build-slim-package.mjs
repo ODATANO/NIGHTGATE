@@ -67,6 +67,9 @@ const FILES = [
     // offer files (bech32m); @scure/base only
     { path: 'srv/utils/offer-file.js', buildOutput: true },
     { path: 'srv/utils/offer-file.d.ts', buildOutput: true },
+    // errorMessage(), imported by offer-file and batch-segment-order; no imports of its own
+    { path: 'srv/utils/errors.js', buildOutput: true },
+    { path: 'srv/utils/errors.d.ts', buildOutput: true },
     { path: 'srv/midnight/runtime-config.js', buildOutput: true },
     { path: 'srv/midnight/runtime-config.d.ts', buildOutput: true },
     { path: 'srv/midnight/wasm-proof-provider.js', buildOutput: true },

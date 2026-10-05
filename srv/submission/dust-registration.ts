@@ -1,6 +1,6 @@
 /**
- * DUST (de)registration of NIGHT UTXOs, one worker RPC each. The caller must
- * have built the worker facade for `cacheKey` first.
+ * Register NIGHT UTXOs for dust generation, or deregister them.
+ * The caller must have loaded the wallet for `cacheKey` in the worker first.
  */
 
 import { walletRegisterDustGeneration, walletDeregisterDustGeneration, type RegisterDustGenerationOutcome, type SubmitIntentHook } from '../midnight/wallet-worker-client';
@@ -10,11 +10,10 @@ export interface RegisterDustGenerationArgs {
     cacheKey: string;
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex'>;
     seedHex: string;
-    /** Bech32m DUST address to accrue to; defaults to the wallet's own. */
+    /** Dust address that receives the generated dust. Defaults to the wallet's own. */
     dustReceiverAddress?: string;
-    /** Max wait for wallet sync; undefined waits indefinitely. */
     syncTimeoutMs?: number;
-    /** Pre-broadcast handshake: persist the announced identifier, then the worker sends. */
+    /** Called before the broadcast. It saves the transaction id, and only then the worker sends. */
     onSubmitIntent?: SubmitIntentHook;
 }
 
@@ -34,11 +33,11 @@ export async function registerNightUtxosForDust(
 
 export interface DeregisterDustGenerationArgs {
     cacheKey: string;
-    /** Max wait for sync; undefined waits indefinitely, so production callers pass a bound. */
+    /** Undefined waits for the wallet sync without limit, so production callers should set it. */
     syncTimeoutMs?: number;
-    /** Sponsor facade key that pays the fee: for a wallet whose generation is delegated away (own dust 0). */
+    /** Wallet that pays the fee. Needed when this wallet sends its dust elsewhere and has none itself. */
     sponsorCacheKey?: string;
-    /** Pre-broadcast handshake: persist the announced identifier, then the worker sends. */
+    /** Called before the broadcast. It saves the transaction id, and only then the worker sends. */
     onSubmitIntent?: SubmitIntentHook;
 }
 
@@ -46,7 +45,7 @@ export interface DeregisterDustGenerationResult {
     /** Null if nothing to deregister. */
     txId: string | null;
     deregisteredCount: number;
-    /** Registered + unregistered. */
+    /** Registered plus unregistered. */
     totalNightUtxos: number;
 }
 

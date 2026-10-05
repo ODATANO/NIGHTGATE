@@ -1,8 +1,6 @@
 /**
- * The bindings every persisted ring envelope is written under (crypto.ts v3):
- * one purpose per column, the row's identity as subject. A value copied into
- * another row or another column does not decrypt. The rewrap tool derives the
- * same binding from the row it reads (encryption-rewrap.ts).
+ * The context each encrypted database value is bound to: a purpose per column and the row id.
+ * An encrypted value copied into another row or column will not decrypt.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -28,11 +26,12 @@ export function accountDekBinding(accountId: string): EnvelopeBinding {
     return { purpose: 'account-key/ring-seal', subject: String(accountId) };
 }
 
-/** `AccountKeys.wrappedDekByViewingKey` outer envelope, subject = the account id. */
+/** Content of a disclosure to token holders, subject = the grant id. */
 export function holderDisclosureContentBinding(grantId: string): EnvelopeBinding {
     return { purpose: 'holder-disclosure/content', subject: grantId };
 }
 
+/** `AccountKeys.wrappedDekByViewingKey` outer envelope, subject = the account id. */
 export function accountDekViewingKeySealBinding(accountId: string): EnvelopeBinding {
     return { purpose: 'account-key/viewing-key-seal', subject: String(accountId) };
 }

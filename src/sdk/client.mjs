@@ -1,25 +1,19 @@
-// HTTP client for a hosted NIGHTGATE: every capability of the online endpoint
-// as a callable function. This is the same surface the MCP server exposes to
-// agents, for code instead of tools: crawler-free verification, document
-// ingestion, the ZK attestation actions, disclosure grants, custom tokens and
-// cross-server fee sponsoring, plus job polling.
+// HTTP client for a hosted NIGHTGATE server. Each server action is a function here.
 //
 //   import { connect } from '@odatano/nightgate/client';
 //
 //   const ng = connect({ baseUrl: 'https://nightgate.example' });
 //   const state = await ng.verifyAttestation({ contractAddress, attesterId, payloadHash });
 //
-// Auth: pass `agentToken` (an `ngat_...` agent-grant token, travels in
-// x-agent-token), or `token` (Bearer), or `username`/`password` (Basic). An
-// agent token may be combined with Basic transport credentials.
+// To log in, pass `agentToken`, `token` for Bearer, or `username` and `password` for Basic.
+// An agent token can be sent together with Basic credentials.
 //
-// Write actions are async on the server: they return `{ jobId, status }`.
-// `waitForJob` polls `getJobStatus` until the job settles and returns the
-// parsed result, so the common path is one call + one wait.
+// Actions that write run as background jobs and return `{ jobId, status }`.
+// `waitForJob` polls until the job ends and returns its parsed result.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-/** Error carrying the OData error body of a failed NIGHTGATE call. */
+/** Error of a failed server call, with the server's status and error code. */
 export class NightgateApiError extends Error {
     constructor(status, code, message) {
         super(message);
@@ -29,7 +23,7 @@ export class NightgateApiError extends Error {
     }
 }
 
-/** Server error codes a client may retry unchanged (the server registry marks them retryable). */
+/** Server error codes a client may retry unchanged. */
 export const RETRYABLE_ERROR_CODES = new Set([
     'RATE_LIMITED', 'BAD_GATEWAY', 'UNAVAILABLE', 'ACCOUNT_KEY_UNAVAILABLE', 'JOB_ADMISSION_BUSY',
     'PROVER_KEYS_UNAVAILABLE', 'RUNTIME_UNAVAILABLE', 'SPONSOR_POLICY_UNAVAILABLE', 'SUBMIT_INTENT_TIMEOUT',
@@ -37,8 +31,8 @@ export const RETRYABLE_ERROR_CODES = new Set([
 ]);
 
 /**
- * Whether a failed call may be retried unchanged: by the server's code when it sent
- * one, by the status when a proxy or CAP answered with a number, else network errors.
+ * Whether a failed call may be retried unchanged.
+ * Uses the server's error code if there is one, else the HTTP status. Network errors are retryable.
  */
 export function isRetryable(err) {
     if (err instanceof NightgateApiError) {
@@ -59,8 +53,8 @@ export class NightgateJobError extends Error {
 }
 
 /**
- * Marker for an OData Int64 URL literal: rendered unquoted so precision is
- * preserved beyond Number.MAX_SAFE_INTEGER. Use for scaled circuit integers.
+ * Marks a value as a 64-bit integer for a function URL.
+ * It is written without quotes and keeps full precision above Number.MAX_SAFE_INTEGER.
  */
 export function int64(value) {
     const digits = String(value);
@@ -92,7 +86,7 @@ function isSafeToRepeat(method, body) {
     return typeof key === 'string' && key.length > 0;
 }
 
-/** undici surfaces a keep-alive socket the peer closed as `fetch failed` with an ECONNRESET / EPIPE / UND_ERR_SOCKET cause. */
+/** Detects a reused connection that the server had already closed. */
 function isStaleSocketError(err) {
     const cause = err?.cause ?? err;
     const code = String(cause?.code ?? '');
@@ -103,15 +97,15 @@ function isStaleSocketError(err) {
  * Connect to a hosted NIGHTGATE.
  *
  * @param {object} opts
- * @param {string} opts.baseUrl            e.g. https://nightgate.example (no trailing slash needed)
- * @param {string} [opts.servicePath]      default '/api/v1/nightgate'
- * @param {string} [opts.agentToken]       agent-grant token (ngat_...), sent as x-agent-token
+ * @param {string} opts.baseUrl            For example https://nightgate.example
+ * @param {string} [opts.servicePath]      Defaults to '/api/v1/nightgate'.
+ * @param {string} [opts.agentToken]       Agent token (ngat_...). Sent in the x-agent-token header.
  * @param {string} [opts.token]            Bearer token
- * @param {string} [opts.username]         Basic auth user (also alongside agentToken)
+ * @param {string} [opts.username]         Basic auth user. Can be combined with agentToken.
  * @param {string} [opts.password]
- * @param {number} [opts.timeoutMs]        per-request timeout, default 120000
- * @param {number} [opts.pollMs]           waitForJob poll interval, default 2000
- * @param {Function} [opts.fetchFn]        override fetch (tests)
+ * @param {number} [opts.timeoutMs]        Timeout per request in ms. Defaults to 120000.
+ * @param {number} [opts.pollMs]           How often waitForJob polls, in ms. Defaults to 2000.
+ * @param {Function} [opts.fetchFn]        Replaces fetch, for tests.
  */
 export function connect(opts) {
     const {
@@ -144,12 +138,9 @@ export function connect(opts) {
         try {
             response = await doFetch(url, init());
         } catch (err) {
-            // A closed keep-alive socket (idle longer than the server's timeout,
-            // e.g. while the caller proved locally) fails with this error both
-            // when nothing reached the server and when the response was lost
-            // after the server accepted the request. Only requests that are safe
-            // to repeat are retried: GETs, and POSTs carrying an `idempotencyKey`
-            // the server dedupes on. A write without a key surfaces the error.
+            // A connection that sat idle too long may have been closed by the server.
+            // We cannot tell whether the server got the request, so only safe requests are resent.
+            // Safe means a GET, or a POST with an `idempotencyKey` the server uses to drop duplicates.
             if (!isStaleSocketError(err) || !isSafeToRepeat(method, body)) throw err;
             response = await doFetch(url, init());
         }
@@ -184,19 +175,17 @@ export function connect(opts) {
     }
 
     /**
-     * A poll that failed for a reason that says nothing about the JOB: a proxy
-     * or server hiccup (502/503/504/429), a network error, a timeout. The job
-     * keeps running server-side, so the poll is retried (bounded) instead of
-     * losing the job handle.
+     * A poll that failed for a temporary reason, not because the job failed.
+     * The job keeps running on the server, so the poll is retried.
      */
     function isTransientPollError(err) {
         return isRetryable(err);
     }
 
     /**
-     * Poll getJobStatus until the job settles; returns the PARSED result.
-     * Transient poll failures are retried for up to `pollGraceMs` (default 5
-     * minutes) of consecutive failures; a job failure is thrown immediately.
+     * Polls getJobStatus until the job ends and returns the parsed result.
+     * Temporary poll errors in a row are retried for up to `pollGraceMs`, default 5 minutes.
+     * A failed job throws at once.
      */
     async function waitForJob({ jobId, sessionId, pollMs: overridePollMs, timeoutMs: waitTimeoutMs = 60 * 60 * 1000, pollGraceMs = 5 * 60 * 1000 }) {
         if (!jobId) throw new Error('waitForJob: jobId is required');
@@ -211,8 +200,7 @@ export function connect(opts) {
             } catch (err) {
                 if (!isTransientPollError(err)) throw err;
                 firstPollFailure ??= Date.now();
-                // Both bounds apply: the grace for consecutive poll failures AND
-                // the job's overall deadline.
+                // Give up when poll errors last too long or the overall deadline has passed.
                 if (Date.now() - firstPollFailure > pollGraceMs || Date.now() > deadline) throw err;
                 await new Promise(r => setTimeout(r, interval));
                 continue;
@@ -230,23 +218,22 @@ export function connect(opts) {
         }
     }
 
-    /** callAction + waitForJob in one step, for the submit-and-wait pattern. */
+    /** Starts a job and waits for its result. */
     async function act(name, params, sessionKey = 'sessionId') {
         const started = await callAction(name, params);
         if (!started?.jobId) return started;
-        // Prefer the session the SERVER says the job is keyed by: under an
-        // agent grant the sponsor session is injected server-side and the
-        // caller may not have passed one at all.
+        // Use the session id the server returns. With an agent token the server picks
+        // the session, so the caller may not know it.
         return waitForJob({ jobId: started.jobId, sessionId: started.sessionId ?? params[sessionKey] });
     }
 
     return {
-        // escape hatches: anything not wrapped below
+        // generic calls, for anything without its own function below
         callFunction,
         callAction,
         waitForJob,
 
-        // ---- crawler-free verification (GET, no wallet, no auth needed) ----
+        // ---- checks that read the chain directly. No wallet, no login. ----
         verifyAttestation: (p) => callFunction('verifyAttestationState', p),
         verifyPredicate: (p) => callFunction('verifyPredicateState', p),
         verifyPredicateAttestation: (p) => callFunction('verifyPredicateAttestation', p),
@@ -254,7 +241,7 @@ export function connect(opts) {
         deriveTokenType: (p) => callFunction('deriveTokenType', p),
         getHealth: () => request('GET', `${String(baseUrl).replace(/\/$/, '')}/api/v1/indexer/getHealth()`),
 
-        // ---- compute-only preparation (POST, no wallet) ----
+        // ---- input preparation. No wallet, no transaction. ----
         prepareDocumentProof: (p) => callAction('prepareDocumentProof', p),
         prepareMembershipSet: (p) => callAction('prepareMembershipSet', p),
 
@@ -266,7 +253,7 @@ export function connect(opts) {
         getWalletBalance: (p) => callFunction('getWalletBalance', p),
         getWalletSyncProgress: (p) => callFunction('getWalletSyncProgress', p),
 
-        // ---- anchoring + ZK attestations (async job -> waits for the result) ----
+        // ---- documents and zero-knowledge proofs. These wait for the job result. ----
         anchorDocument: (p) => act('anchorDocument', p),
         attestAgentOutput: (p) => act('attestAgentOutput', p),
         proveFieldPredicate: (p) => act('issueFieldPredicateAttestation', p),
@@ -291,16 +278,15 @@ export function connect(opts) {
         mintShieldedTestToken: (p) => act('mintShieldedTestToken', p),
         sendNight: (p) => act('sendNight', p),
 
-        // ---- cross-server fee sponsoring ----
+        // ---- the server pays the fee for a transaction built elsewhere ----
         /**
-         * Hand a locally built, fee-unpaid transaction (txbuilder's
-         * finalizedTxB64) to the sponsor, wait for the submit, return the
-         * txHash. The job is keyed by the SPONSOR session.
+         * Sends a transaction you built without a fee (txbuilder's finalizedTxB64).
+         * The server adds the fee, submits it and returns the txHash.
          */
         sponsorFinalized: (p) => act('sponsorFinalizedTransaction', p, 'sponsorSessionId'),
-        /** Parallel channel: submit an UNBOUND tx (buildSponsorable bind:false). */
+        /** Like sponsorFinalized, for a transaction built with `bind: false`. The server can pay for several of these at once. */
         sponsorUnbound: (p) => act('sponsorUnboundTransaction', p, 'sponsorSessionId'),
-        /** A shielded swap as its two halves (offer file text or base64 each); the sponsor merges, pays and submits. */
+        /** Takes both halves of a private token swap. The server joins them, pays the fee and submits. */
         sponsorSwap: (p) => act('sponsorSwap', p, 'sponsorSessionId'),
         buildSponsorable: (p) => act('buildSponsorable', p)
     };

@@ -1,6 +1,6 @@
 /**
- * The one rollback for reorg recovery and manual reindex. `NightBalances` is
- * delta-maintained, so affected addresses are recomputed from the remaining rows.
+ * Removes indexed blocks from a given height upwards, after a reorg or for a manual reindex.
+ * `NightBalances` is updated step by step during indexing, so affected addresses are recomputed from the remaining rows.
  */
 
 import cds from '@sap/cds';
@@ -10,10 +10,9 @@ import { bumpReorgGeneration } from '../submission/reorg-generation';
 import { NIGHT_RAW_TOKEN_TYPE } from './block-events';
 import type { DbRunner } from '../utils/db-types';
 
-// PostgreSQL caps one statement at 65535 bind parameters.
+// PostgreSQL allows at most 65535 parameters per statement, so long ID lists are split.
 const IN_CHUNK = 5000;
 
-/** Runs `query` once per chunk of `ids` and concatenates the rows. */
 async function chunked(ids: unknown[], query: (chunk: unknown[]) => Promise<any>): Promise<any[]> {
     const rows: any[] = [];
     for (let i = 0; i < ids.length; i += IN_CHUNK) {
@@ -27,7 +26,7 @@ export interface RollbackResult {
     reorgGeneration: number;
     blocksRolledBack: number;
     transactionsRolledBack: number;
-    /** Highest surviving block below `fromHeight`, if any. */
+    /** Highest remaining block below `fromHeight`, if any. */
     forkBlock: { ID: string; height: number; hash: string } | null;
     affectedAddresses: string[];
     submissionsReverted: number;
@@ -35,18 +34,17 @@ export interface RollbackResult {
 }
 
 export interface RollbackOptions {
-    /** Written to SyncState when blocks were rolled back. */
     syncStatus: 'syncing' | 'stopped';
     extraSyncState?: Record<string, unknown>;
 }
 
-/** Delete all indexed data at/above `fromHeight` and repair derived projections. */
+/** Deletes all indexed data from `fromHeight` upwards and repairs the tables derived from it. */
 export async function rollbackIndexedDataFromHeight(
     tx: DbRunner,
     fromHeight: number,
     opts: RollbackOptions
 ): Promise<RollbackResult> {
-    // Must stay the first write (see bumpReorgGeneration).
+    // Must stay the first write in this transaction. bumpReorgGeneration explains why.
     const reorgGeneration = await bumpReorgGeneration(tx);
     const blocksToRollback: Block[] = await tx.run(
         SELECT.from(Blocks).columns('ID', 'height')
@@ -55,7 +53,7 @@ export async function rollbackIndexedDataFromHeight(
     const blockIds = blocksToRollback.map((b: { ID?: string }) => b.ID).filter(Boolean);
 
     if (blockIds.length === 0) {
-        // Indexer evidence at/above the height is void even without local blocks.
+        // Inclusion data recorded on jobs from this height upwards is invalid, even if no local blocks exist.
         const evidence = await revertSubmissionEvidence(tx, fromHeight);
         return {
             blocksRolledBack: 0,
@@ -73,7 +71,7 @@ export async function rollbackIndexedDataFromHeight(
     ));
     const txIds = txsToDelete.map((t: { ID?: string }) => t.ID).filter(Boolean);
 
-    // Collect affected addresses BEFORE deleting anything.
+    // Collect the affected addresses before anything is deleted.
     const affected = new Set<string>();
     for (const t of txsToDelete) {
         if (t.senderAddress) affected.add(t.senderAddress);
@@ -108,7 +106,7 @@ export async function rollbackIndexedDataFromHeight(
             await tx.run(DELETE.from(TransactionFees).where({ transaction_ID: { in: ids } }));
             await tx.run(DELETE.from(TransactionResults).where({ transaction_ID: { in: ids } }));
         });
-        // After every chunk's deletes: a spend in one chunk may point at a UTXO created in another.
+        // Runs after all deletes, because a spend in one chunk may point at a UTXO created in another.
         await chunked(txIds, ids => tx.run(
             UPDATE.entity(UnshieldedUtxos).set({ spentAtTransaction_ID: null }).where({ spentAtTransaction_ID: { in: ids } })
         ));
@@ -118,9 +116,9 @@ export async function rollbackIndexedDataFromHeight(
         await tx.run(DELETE.from(Transactions).where({ block_ID: { in: ids } }));
         await tx.run(DELETE.from(Blocks).where({ ID: { in: ids } }));
     });
-    // A current state from a rolled-back block is void; the older one is not
-    // stored, so the contract has none until the supplement re-applies the
-    // chain or its next action lands (stateAt reads the indexer meanwhile).
+    // A current contract state from a removed block is invalid. The older state is not stored,
+    // so the contract has no stored state until the indexer pass or a new action fills it again.
+    // Until then, state reads go to the indexer.
     await tx.run(DELETE.from(ContractStates).where({ height: { '>=': fromHeight } }));
 
     for (const address of affected) {
@@ -131,8 +129,8 @@ export async function rollbackIndexedDataFromHeight(
 
     const forkBlock = await selectForkBlock(tx, fromHeight);
     const forkHeight = forkBlock?.height ?? 0;
-    // The trailing passes must not stay above the surviving tip: their work on
-    // rolled-back blocks is gone with the rows.
+    // The decode and indexer passes must not stay above the new tip.
+    // Their results for the removed blocks were deleted with the rows.
     const current: any = await tx.run(
         SELECT.one.from(SyncState).columns('lastDecodedHeight', 'lastSupplementedHeight').where({ ID: 'SINGLETON' })
     );
@@ -163,9 +161,10 @@ export async function rollbackIndexedDataFromHeight(
 }
 
 /**
- * Revert confirmer evidence at/above `fromHeight`, correlated by block height
- * (no hash matches across the pipelines). Jobs failed on that outcome return to
- * reconciliation: the re-landed tx may apply differently. Anchoring hashes stay.
+ * Clears the inclusion data that submissions and jobs recorded from `fromHeight` upwards.
+ * They are matched by block height, because the crawler and the submission side share no common hash.
+ * Jobs that failed on-chain are checked again, because the transaction may apply differently when it lands again.
+ * Anchor hashes recorded on documents are not cleared.
  */
 async function revertSubmissionEvidence(
     tx: DbRunner,
@@ -217,7 +216,6 @@ async function selectForkBlock(
     return forkBlock || null;
 }
 
-/** One address's NightBalances figures as the indexed rows imply them. */
 export interface NightBalanceFigures {
     balance: bigint;
     utxoCount: number;
@@ -230,13 +228,11 @@ export interface NightBalanceFigures {
 }
 
 /**
- * The figures of one address from what is indexed; null without any NIGHT activity. Must
- * mirror the ingest rule in BlockProcessor (`applyBalanceDelta`), which folds the same
- * figures in block by block.
+ * Computes the balance values of one address from the indexed rows. Null if the address has no NIGHT activity.
+ * Must give the same result as `applyBalanceDelta` in BlockProcessor, which updates them block by block.
  */
 export async function computeNightBalance(tx: DbRunner, address: string): Promise<NightBalanceFigures | null> {
-    // NightBalances is a NIGHT balance; an address can hold other tokens in
-    // the same UTXO set, and they do not belong in these figures.
+    // Only NIGHT counts. Other tokens of the same address are ignored.
     const utxos: any[] = await tx.run(
         SELECT.from(UnshieldedUtxos)
             .columns('value', 'spentAtTransaction_ID', 'createdAtTransaction_ID')
@@ -254,8 +250,7 @@ export async function computeNightBalance(tx: DbRunner, address: string): Promis
 
     if (utxos.length === 0 && sentTxs.length === 0) return null;
 
-    // Spending is activity too, so the spending transactions count towards the
-    // height range alongside the creating and the sending ones.
+    // Spending also counts as activity, so spending transactions are included in the height range.
     const activityTxIds = [...new Set([
         ...utxos.map(u => u.createdAtTransaction_ID),
         ...utxos.map(u => u.spentAtTransaction_ID)
@@ -270,7 +265,7 @@ export async function computeNightBalance(tx: DbRunner, address: string): Promis
         SELECT.from(Blocks).columns('ID', 'height').where({ ID: { in: ids } })
     ));
     const heights = blocks.map(b => Number(b.height)).filter(Number.isFinite);
-    // reduce, not Math.min(...): a spread of this size can overflow the call stack.
+    // Uses reduce, because Math.min(...) with a very large array can overflow the call stack.
     const firstSeenHeight = heights.length ? heights.reduce((a, b) => Math.min(a, b)) : null;
     const lastActivityHeight = heights.length ? heights.reduce((a, b) => Math.max(a, b)) : null;
 
@@ -294,7 +289,6 @@ export async function computeNightBalance(tx: DbRunner, address: string): Promis
     };
 }
 
-/** Rebuild one address's NightBalances row from what remains. */
 export async function recomputeNightBalance(tx: DbRunner, address: string): Promise<void> {
     const figures = await computeNightBalance(tx, address);
     if (!figures) {
@@ -307,12 +301,12 @@ export async function recomputeNightBalance(tx: DbRunner, address: string): Prom
         if (existing.dustAddress || existing.isDustRegistered) {
             await tx.run(
                 UPDATE.entity(NightBalances).set({
-                    balance: '0' as any,
+                    balance: '0',
                     utxoCount: 0,
                     txSentCount: 0,
                     txReceivedCount: 0,
-                    totalSent: '0' as any,
-                    totalReceived: '0' as any,
+                    totalSent: '0',
+                    totalReceived: '0',
                     firstSeenHeight: null,
                     lastActivityHeight: null,
                     lastUpdatedAt: new Date().toISOString()
@@ -326,12 +320,12 @@ export async function recomputeNightBalance(tx: DbRunner, address: string): Prom
 
     const nowIso = new Date().toISOString();
     const computed = {
-        balance: figures.balance.toString() as any,
+        balance: figures.balance.toString(),
         utxoCount: figures.utxoCount,
         txSentCount: figures.txSentCount,
         txReceivedCount: figures.txReceivedCount,
-        totalSent: figures.totalSent.toString() as any,
-        totalReceived: figures.totalReceived.toString() as any,
+        totalSent: figures.totalSent.toString(),
+        totalReceived: figures.totalReceived.toString(),
         firstSeenHeight: figures.firstSeenHeight,
         lastActivityHeight: figures.lastActivityHeight,
         lastActivityAt: nowIso,

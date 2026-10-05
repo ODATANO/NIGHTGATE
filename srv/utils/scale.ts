@@ -13,7 +13,7 @@ interface ParsedExtrinsicCore {
     senderAddress?: string;
 }
 
-/** SCALE compact unsigned integer as [value, bytesConsumed], or null if the buffer is too short. */
+/** Decodes a SCALE compact integer. Returns [value, bytesRead], or null if the buffer is too short. */
 export function decodeCompactBigInt(buf: Buffer, offset: number): [bigint, number] | null {
     if (offset >= buf.length) return null;
 
@@ -32,7 +32,7 @@ export function decodeCompactBigInt(buf: Buffer, offset: number): [bigint, numbe
             return [BigInt(buf.readUInt32LE(offset) >>> 2), 4];
 
         case 0b11: {
-            // Big-integer mode: (first_byte >> 2) + 4 bytes, little-endian
+            // Big-integer mode: the next (first_byte >> 2) + 4 bytes, little-endian.
             const byteLength = (buf[offset] >> 2) + 4;
             if (offset + 1 + byteLength > buf.length) return null;
 
@@ -46,7 +46,7 @@ export function decodeCompactBigInt(buf: Buffer, offset: number): [bigint, numbe
     }
 }
 
-/** `decodeCompactBigInt` as a number; values above MAX_SAFE_INTEGER become 0 (bytesConsumed kept). */
+/** Like `decodeCompactBigInt`, but as a number. Values too large for a number become 0. */
 export function decodeCompact(buf: Buffer, offset: number): [number, number] | null {
     const decoded = decodeCompactBigInt(buf, offset);
     if (!decoded) return null;
@@ -65,7 +65,7 @@ function parseAddress(buf: Buffer, offset: number): ParsedAddress | null {
     const type = buf[offset];
     let cursor = offset + 1;
 
-    // MultiAddress::Id and runtime-specific 0xff 32-byte address variant
+    // 32-byte address variants: MultiAddress::Id, Address32 and a runtime-specific 0xff variant.
     if (type === 0x00 || type === 0xff || type === 0x03) {
         if (cursor + 32 > buf.length) return null;
         const bytes = buf.slice(cursor, cursor + 32);
@@ -188,7 +188,7 @@ function parseExtrinsicCore(hex: string): ParsedExtrinsicCore | null {
     };
 }
 
-/** Pallet/call index plus where the call arguments start (for decoding an inherent's payload). */
+/** Pallet and call index of an extrinsic, plus the offset where its call arguments start. */
 export function parseExtrinsicCall(hex: string): { buf: Buffer; palletIndex: number; callIndex: number; argsOffset: number } | null {
     const core = parseExtrinsicCore(hex);
     if (!core) return null;

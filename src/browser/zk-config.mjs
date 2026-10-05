@@ -1,13 +1,9 @@
-// Browser ZK-config provider that fetches prover/verifier keys + zkir over HTTP
-// from NIGHTGATE's `/zk-config/<contract>` route. Mirrors the layout
-// the server-side NodeZkConfigProvider reads:
+// Loads the proving files of a contract over HTTP from the server's `/zk-config/<contract>` route.
+// The file layout is the same as on the server:
 //   keys/<circuitId>.prover, keys/<circuitId>.verifier, zkir/<circuitId>.bzkir
 //
-// Extends the SDK's abstract ZKConfigProvider, so it inherits get() /
-// getVerifierKeys() / asKeyMaterialProvider() for free. The last is exactly the
-// `KeyMaterialProvider` the DApp-Connector's getProvingProvider() expects, so a
-// single instance feeds BOTH proving modalities (self-prove via proofProvider,
-// or wallet-delegated proving).
+// One instance serves both proving modes: proving in the page and proving in the wallet.
+// The wallet uses the asKeyMaterialProvider() view inherited from the SDK base class.
 
 import {
     ZKConfigProvider,
@@ -18,9 +14,9 @@ import {
 
 export class FetchZkConfigProvider extends ZKConfigProvider {
     /**
-     * @param {string} baseUrl  e.g. `https://host/zk-config/attestation-vault`
-     *                          (the per-contract `zkConfigBaseUrl` from /contract-manifest)
-     * @param {typeof fetch} [fetchFn]  injectable for tests; defaults to global fetch
+     * @param {string} baseUrl  The contract's `zkConfigBaseUrl` from /contract-manifest,
+     *                          for example `https://host/zk-config/attestation-vault`.
+     * @param {typeof fetch} [fetchFn]  Defaults to the global fetch.
      */
     constructor(baseUrl, fetchFn) {
         super();

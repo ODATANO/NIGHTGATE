@@ -6,7 +6,8 @@
 //   - CREATE TABLE only when the table is ABSENT (existing data untouched)
 //   - ALTER TABLE ADD COLUMN for columns missing from an EXISTING table
 //     (additive fields like PredicateAttestations.fieldKey; data untouched)
-//   - rebuilds a table whose NOT NULL was relaxed or whose unique keys changed
+//   - rebuilds a table whose NOT NULL was relaxed or tightened (NULL rows take
+//     the column DEFAULT first) or whose unique keys changed
 //     (SQLite cannot alter a constraint; rows are copied)
 //   - DROP + CREATE every VIEW (views are stateless; refreshes projections so
 //     new service entities like DisclosureGrants/GranteeIdentities are queryable)
@@ -157,6 +158,25 @@ function relaxedColumns(name, createStmt) {
     return relaxed;
 }
 
+/**
+ * Columns the target makes NOT NULL with a DEFAULT; their NULL rows take the
+ * default before the rebuild. A tightened column without a DEFAULT stays nullable.
+ */
+function tightenedColumns(name, createStmt) {
+    const info = new Map(
+        db.prepare(`PRAGMA table_info("${name}")`).all().map(r => [r.name, r])
+    );
+    const tightened = [];
+    for (const col of parseColumns(createStmt)) {
+        const cur = info.get(col.name);
+        const fallback = col.def.match(/\bDEFAULT\s+('(?:[^']|'')*'|[^\s,]+)/i)?.[1];
+        if (cur && cur.notnull === 0 && cur.pk === 0 && fallback && /\bNOT\s+NULL\b/i.test(col.def)) {
+            tightened.push({ name: col.name, fallback });
+        }
+    }
+    return tightened;
+}
+
 function rebuildTable(name, createStmt) {
     const have = new Set(db.prepare(`PRAGMA table_info("${name}")`).all().map(r => r.name));
     const shared = parseColumns(createStmt).map(c => c.name).filter(n => have.has(n));
@@ -212,10 +232,19 @@ const migrate = () => {
                 // A relaxed NOT NULL or changed unique keys need a rebuild; the
                 // rebuild also carries any new columns.
                 const relaxed = relaxedColumns(name, stmt);
+                const tightened = tightenedColumns(name, stmt);
                 const uniqueChanged = uniqueKeysChanged(name, stmt);
-                if (relaxed.length > 0 || uniqueChanged) {
+                if (relaxed.length > 0 || tightened.length > 0 || uniqueChanged) {
+                    for (const col of tightened) {
+                        const filled = db.prepare(`UPDATE "${name}" SET "${col.name}" = ${col.fallback} WHERE "${col.name}" IS NULL`).run()?.changes ?? 0;
+                        if (filled) console.log(`[delta] = ${name}.${col.name}: ${filled} NULL row(s) set to ${col.fallback}`);
+                    }
                     rebuildTable(name, stmt);
-                    const why = [relaxed.length > 0 ? `relaxed NOT NULL: ${relaxed.join(', ')}` : '', uniqueChanged ? 'unique keys changed' : ''].filter(Boolean).join('; ');
+                    const why = [
+                        relaxed.length > 0 ? `relaxed NOT NULL: ${relaxed.join(', ')}` : '',
+                        tightened.length > 0 ? `NOT NULL: ${tightened.map(c => c.name).join(', ')}` : '',
+                        uniqueChanged ? 'unique keys changed' : ''
+                    ].filter(Boolean).join('; ');
                     console.log(`[delta] ~ rebuilt ${name} (${why})`);
                     rebuiltTables++;
                     skipped++;
