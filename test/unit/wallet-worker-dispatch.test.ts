@@ -2133,6 +2133,53 @@ describe('dust snapshot collapse on save', () => {
         expect(dust.serializeState).not.toHaveBeenCalled();
     });
 
+    it('save ticks of several wallets run one at a time, and a tick whose predecessor still runs is skipped', async () => {
+        process.env.NIGHTGATE_DUST_SNAPSHOT_COLLAPSE = 'true';
+        vi.useFakeTimers();
+        const A = 'session-lane-a-aaaaaaaaaaaaaa';
+        const B = 'session-lane-b-bbbbbbbbbbbbbb';
+        const resolvers: Array<(v: { ok: true }) => void> = [];
+        verifyCollapsedDustInHelper.mockImplementation(() => new Promise(resolve => { resolvers.push(resolve); }));
+        try {
+            const facadeA = await initSession(A);
+            const facadeB = await initSession(B);
+            facadeA.dust.state = emitting(walletStateWith('100'));
+            facadeB.dust.state = emitting(walletStateWith('200'));
+            fakeParentPort.postMessage.mockClear();
+
+            // Both timers fire together: only the first wallet's check reaches the helper.
+            await vi.advanceTimersByTimeAsync(30_000);
+            expect(verifyCollapsedDustInHelper).toHaveBeenCalledTimes(1);
+            expect(stateSaves()).toHaveLength(0);
+
+            // The next timer round finds both ticks still queued or running and skips.
+            await vi.advanceTimersByTimeAsync(30_000);
+            expect(verifyCollapsedDustInHelper).toHaveBeenCalledTimes(1);
+
+            resolvers[0]({ ok: true });
+            await vi.advanceTimersByTimeAsync(0);
+            expect(verifyCollapsedDustInHelper).toHaveBeenCalledTimes(2);
+            expect(stateSaves().map((s: any) => s.sessionId)).toEqual([A]);
+
+            resolvers[1]({ ok: true });
+            await vi.advanceTimersByTimeAsync(0);
+            expect(stateSaves().map((s: any) => s.sessionId)).toEqual([A, B]);
+
+            // Free again: the next round ticks both.
+            await vi.advanceTimersByTimeAsync(30_000);
+            resolvers[2]({ ok: true });
+            await vi.advanceTimersByTimeAsync(0);
+            resolvers[3]({ ok: true });
+            await vi.advanceTimersByTimeAsync(0);
+            expect(verifyCollapsedDustInHelper).toHaveBeenCalledTimes(4);
+        } finally {
+            verifyCollapsedDustInHelper.mockReset().mockResolvedValue({ ok: true });
+            await rpc('evict', { sessionId: A });
+            await rpc('evict', { sessionId: B });
+            vi.useRealTimers();
+        }
+    });
+
     it('the save tick reports the collapse to the main thread and remembers the key on the ack', async () => {
         process.env.NIGHTGATE_DUST_SNAPSHOT_COLLAPSE = 'true';
         vi.useFakeTimers();

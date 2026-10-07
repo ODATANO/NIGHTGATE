@@ -4,10 +4,10 @@
  * This module does not import `@sap/cds`, because the wallet worker uses it too.
  */
 
-import { Worker, MessageChannel } from 'node:worker_threads';
+import { Worker, MessageChannel, type MessagePort } from 'node:worker_threads';
 import { nightgateErrorFromPayload } from '../../utils/errors';
 import { formatErr } from '../../utils/format-error';
-import type { WorkerRpcReply } from './dispatch';
+import type { WorkerRpcReply, WorkerRpcStarted } from './dispatch';
 
 export type WorkerRpcLogLevel = 'info' | 'warn' | 'error' | 'debug';
 
@@ -22,8 +22,14 @@ export interface WorkerRpcClientOptions {
     /** Read per call. */
     timeoutMs: () => number;
     /**
+     * Counts the timeout from the moment the worker begins the call, not from the send.
+     * A call waiting behind others is then not charged for the queue.
+     */
+    budgetFromStart?: boolean;
+    /**
      * Ends the worker when a call runs past its timeout, so a stuck call does not hold the
-     * thread for the calls behind it. Off, a timed-out call keeps running in the worker.
+     * thread for the calls behind it. Calls the worker had not begun are sent again to the
+     * restarted worker once. Off, a timed-out call keeps running in the worker.
      */
     terminateOnTimeout?: boolean;
     /** For a worker that must never keep its owning thread alive. */
@@ -44,11 +50,25 @@ interface ClientState {
     ready: Promise<void>;
 }
 
-interface PendingRpc { reject: (e: Error) => void }
+interface PendingRpc {
+    method: string;
+    args: unknown;
+    /** The worker that holds this call, once sent. */
+    sentTo: Worker | null;
+    /** The worker reported that it began the call. */
+    started: boolean;
+    /** Sent again after a restart. Once, so a call cannot bounce forever. */
+    resent: boolean;
+    port: MessagePort | null;
+    timer: ReturnType<typeof setTimeout> | null;
+    settle: (outcome: () => void) => void;
+}
 
 export class WorkerRpcClient {
     private client: ClientState | null = null;
     private stoppingWorker: Worker | null = null;
+    /** The worker ended for a timed-out call. Its unstarted calls move to the next worker. */
+    private restartingWorker: Worker | null = null;
     private exitCount = 0;
     private lastExitCode: number | null = null;
     private lastExitAt: string | null = null;
@@ -107,15 +127,16 @@ export class WorkerRpcClient {
         worker.on('exit', (code) => {
             if (this.client === state) this.client = null;
             const planned = this.stoppingWorker === worker;
-            if (planned) {
-                this.stoppingWorker = null;
-            } else {
+            const restarting = this.restartingWorker === worker;
+            if (planned) this.stoppingWorker = null;
+            if (restarting) this.restartingWorker = null;
+            if (!planned) {
                 this.exitCount++;
                 this.lastExitCode = code;
                 this.lastExitAt = new Date().toISOString();
                 log('warn', `${name} exited with code ${code}; it restarts on the next call`);
             }
-            this.rejectAllPending(planned ? `${name} stopped` : `${name} exited with code ${code}`);
+            this.settlePendingOf(worker, restarting, planned ? `${name} stopped` : `${name} exited with code ${code}`);
         });
 
         try {
@@ -134,65 +155,109 @@ export class WorkerRpcClient {
         await state.worker.terminate();
     }
 
-    private rejectAllPending(reason: string): void {
+    /** Calls the gone worker held: unstarted ones go to the next worker after a timeout restart, the rest fail. */
+    private settlePendingOf(worker: Worker, requeueUnstarted: boolean, reason: string): void {
         for (const p of [...this.pendingRpcs]) {
-            try { p.reject(new Error(reason)); } catch { /* already settled */ }
+            if (p.sentTo !== worker) continue;
+            if (requeueUnstarted && !p.started && !p.resent) {
+                p.resent = true;
+                this.detach(p);
+                void this.send(p);
+                continue;
+            }
+            p.settle(() => { throw new Error(reason); });
         }
-        this.pendingRpcs.clear();
     }
 
-    async rpc<T>(method: string, args: unknown): Promise<T> {
-        await this.start();
-        const state = this.client!;
-        const timeoutMs = this.options.timeoutMs();
-        const { name, log } = this.options;
+    private detach(p: PendingRpc): void {
+        if (p.timer) clearTimeout(p.timer);
+        p.timer = null;
+        p.port?.close();
+        p.port = null;
+        p.sentTo = null;
+        p.started = false;
+    }
+
+    rpc<T>(method: string, args: unknown): Promise<T> {
         return new Promise<T>((resolve, reject) => {
-            const { port1, port2 } = new MessageChannel();
             let settled = false;
-            const pending: PendingRpc = { reject: (e) => finish(() => reject(e)) };
-            const finish = (outcome: () => void): void => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                this.pendingRpcs.delete(pending);
-                port2.close();
-                outcome();
+            const pending: PendingRpc = {
+                method,
+                args,
+                sentTo: null,
+                started: false,
+                resent: false,
+                port: null,
+                timer: null,
+                settle: (outcome) => {
+                    if (settled) return;
+                    settled = true;
+                    this.detach(pending);
+                    this.pendingRpcs.delete(pending);
+                    try {
+                        resolve(outcome() as T);
+                    } catch (err) {
+                        reject(err);
+                    }
+                }
             };
             this.pendingRpcs.add(pending);
-            const timer = setTimeout(() => {
-                pending.reject(new Error(`${name} rpc '${method}' timed out after ${timeoutMs}ms`));
+            void this.send(pending);
+        });
+    }
+
+    private async send(pending: PendingRpc): Promise<void> {
+        try {
+            await this.start();
+        } catch (err) {
+            pending.settle(() => { throw err; });
+            return;
+        }
+        if (!this.pendingRpcs.has(pending)) return;
+        const state = this.client!;
+        const { name, log } = this.options;
+        const { method } = pending;
+        const timeoutMs = this.options.timeoutMs();
+        const { port1, port2 } = new MessageChannel();
+        pending.port = port2;
+        pending.sentTo = state.worker;
+
+        const armTimer = (): void => {
+            pending.timer = setTimeout(() => {
+                pending.settle(() => { throw new Error(`${name} rpc '${method}' timed out after ${timeoutMs}ms`); });
                 if (this.options.terminateOnTimeout && this.client === state) {
                     log('warn', `${name} rpc '${method}' ran past ${timeoutMs}ms; ending the thread, it restarts on the next call`);
+                    this.restartingWorker = state.worker;
                     void this.stop().catch(() => undefined);
                 }
             }, timeoutMs);
+        };
+        if (!this.options.budgetFromStart) armTimer();
 
-            port2.on('message', (msg: WorkerRpcReply) => finish(() => {
-                if (msg?.ok) {
-                    resolve(msg.result as T);
-                    return;
-                }
-                const payload = msg?.error;
-                if (!payload || typeof payload.message !== 'string') {
-                    reject(new Error(`${name} rpc failed`));
-                    return;
-                }
-                if (payload.nightgate) {
-                    reject(nightgateErrorFromPayload({ ...payload.nightgate, name: payload.name, message: payload.message }));
-                    return;
-                }
+        port2.on('message', (msg: WorkerRpcReply | WorkerRpcStarted) => {
+            if ((msg as WorkerRpcStarted).kind === 'started') {
+                pending.started = true;
+                if (this.options.budgetFromStart && !pending.timer) armTimer();
+                return;
+            }
+            const reply = msg as WorkerRpcReply;
+            pending.settle(() => {
+                if (reply?.ok) return reply.result;
+                const payload = reply?.error;
+                if (!payload || typeof payload.message !== 'string') throw new Error(`${name} rpc failed`);
+                if (payload.nightgate) throw nightgateErrorFromPayload({ ...payload.nightgate, name: payload.name, message: payload.message });
                 const err = new Error(payload.message);
                 if (payload.name) err.name = payload.name;
-                reject(err);
-            }));
-            port2.once('messageerror', (err) => finish(() => reject(err)));
-            try {
-                state.worker.postMessage({ kind: 'rpc', method, args, port: port1 }, [port1]);
-            } catch (err) {
-                // Never sent, so fail now instead of waiting for the timeout.
-                pending.reject(err as Error);
-            }
+                throw err;
+            });
         });
+        port2.once('messageerror', (err) => pending.settle(() => { throw err; }));
+        try {
+            state.worker.postMessage({ kind: 'rpc', method, args: pending.args, port: port1 }, [port1]);
+        } catch (err) {
+            // Never sent, so fail now instead of waiting for the timeout.
+            pending.settle(() => { throw err; });
+        }
     }
 
     async resetForTests(): Promise<void> {

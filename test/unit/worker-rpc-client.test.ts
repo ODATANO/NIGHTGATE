@@ -11,6 +11,8 @@ type Reply = { ok: true; result: unknown } | { ok: false; error: Record<string, 
 
 class FakeWorker extends EventEmitter {
     sent: Array<{ method: string; args: unknown }> = [];
+    /** Ports of the calls this worker received, in order; a test starts and answers them by hand. */
+    ports: Array<{ postMessage: (m: unknown) => void }> = [];
     terminated = false;
     unrefed = false;
     respond: (method: string, args: unknown) => Reply | undefined = () => undefined;
@@ -22,6 +24,7 @@ class FakeWorker extends EventEmitter {
 
     postMessage(msg: { kind: string; method: string; args: unknown; port: { postMessage: (m: unknown) => void } }): void {
         this.sent.push({ method: msg.method, args: msg.args });
+        this.ports.push(msg.port);
         const reply = this.respond(msg.method, msg.args);
         if (reply !== undefined) setImmediate(() => msg.port.postMessage(reply));
     }
@@ -54,6 +57,11 @@ vi.mock('node:worker_threads', async () => {
 import { WorkerRpcClient } from '../../srv/midnight/worker-rpc/client';
 
 beforeEach(() => { workers = []; });
+
+/** Settles either way, so a rejection that lands before the assertion is not an unhandled one. */
+function outcome<T>(p: Promise<T>): Promise<{ value?: T; error?: Error }> {
+    return p.then(value => ({ value }), (error: Error) => ({ error }));
+}
 
 function clientWith(overrides: Partial<ConstructorParameters<typeof WorkerRpcClient>[0]> = {}) {
     const log = vi.fn();
@@ -111,6 +119,59 @@ describe('WorkerRpcClient', () => {
         await expect(client.rpc('verify', {})).rejects.toThrow(/timed out/);
         expect(workers[0].terminated).toBe(false);
         expect(client.status().running).toBe(true);
+    });
+
+    it('with budgetFromStart the timeout runs from the worker\'s start signal, not from the send', async () => {
+        const { client } = clientWith({ budgetFromStart: true, timeoutMs: () => 60 });
+        const first = outcome(client.rpc('verify', { n: 1 }));
+        const second = client.rpc('verify', { n: 2 });
+        await new Promise(r => setImmediate(r));
+        expect(workers[0].sent.map(s => s.args)).toEqual([{ n: 1 }, { n: 2 }]);
+        // Only the first call begins; the second waits in the helper's queue past the timeout unharmed.
+        workers[0].ports[0].postMessage({ kind: 'started' });
+        await new Promise(r => setTimeout(r, 100));
+        expect(await first).toMatchObject({ error: expect.objectContaining({ message: expect.stringMatching(/timed out after 60ms/) }) });
+        workers[0].ports[1].postMessage({ kind: 'started' });
+        workers[0].ports[1].postMessage({ ok: true, result: 'second' });
+        await expect(second).resolves.toBe('second');
+    });
+
+    it('a timeout restart sends the calls the worker had not begun to the new worker, once', async () => {
+        const { client } = clientWith({ budgetFromStart: true, terminateOnTimeout: true, timeoutMs: () => 40 });
+        const first = outcome(client.rpc('verify', { n: 1 }));
+        const second = outcome(client.rpc('verify', { n: 2 }));
+        const third = client.rpc('verify', { n: 3 });
+        await new Promise(r => setImmediate(r));
+        workers[0].ports[0].postMessage({ kind: 'started' });
+        workers[0].ports[1].postMessage({ kind: 'started' });
+        expect((await first).error?.message).toMatch(/timed out after 40ms/);
+        // The second had begun too, so it dies with the thread; the third moves to the new worker.
+        expect((await second).error?.message).toMatch(/stopped/);
+        await new Promise(r => setImmediate(r));
+        expect(workers).toHaveLength(2);
+        expect(workers[1].sent.map(s => s.args)).toEqual([{ n: 3 }]);
+        workers[1].ports[0].postMessage({ kind: 'started' });
+        workers[1].ports[0].postMessage({ ok: true, result: 'third' });
+        await expect(third).resolves.toBe('third');
+        expect(client.status()).toMatchObject({ running: true, exitCount: 0, inFlightRpcs: 0 });
+    });
+
+    it('a call moved once is not moved again', async () => {
+        const { client } = clientWith({ budgetFromStart: true, terminateOnTimeout: true, timeoutMs: () => 40 });
+        const first = outcome(client.rpc('verify', { n: 1 }));
+        const second = outcome(client.rpc('verify', { n: 2 }));
+        await new Promise(r => setImmediate(r));
+        workers[0].ports[0].postMessage({ kind: 'started' });
+        expect((await first).error?.message).toMatch(/timed out/);
+        await new Promise(r => setImmediate(r));
+        expect(workers[1].sent.map(s => s.args)).toEqual([{ n: 2 }]);
+        // Another call times out on the new worker before the moved one begins.
+        const blocker = outcome(client.rpc('verify', { n: 9 }));
+        await new Promise(r => setImmediate(r));
+        workers[1].ports[1].postMessage({ kind: 'started' });
+        expect((await blocker).error?.message).toMatch(/timed out/);
+        expect((await second).error?.message).toMatch(/stopped/);
+        expect(workers).toHaveLength(2);
     });
 
     it('a crash rejects the calls in flight and counts as an exit; a stop does not', async () => {

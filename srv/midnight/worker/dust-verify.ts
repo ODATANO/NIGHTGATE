@@ -1,7 +1,8 @@
 /**
  * Wallet-worker side of the dust verify worker (`../dust-verify-worker.ts`).
- * One helper thread per wallet worker, started on the first collapse. A call past its budget
- * ends the helper, so a slow restore never queues the next wallet's save behind it.
+ * One helper thread per wallet worker, started on the first collapse. The budget counts from
+ * the moment the helper begins a check; a check past it ends the helper, and checks still
+ * waiting move to the restarted one.
  */
 
 import path from 'node:path';
@@ -19,6 +20,7 @@ const client = new WorkerRpcClient({
     entry: path.join(__dirname, '..', 'dust-verify-worker.js'),
     log,
     timeoutMs: dustCollapseBudgetMs,
+    budgetFromStart: true,
     terminateOnTimeout: true,
     unref: true
 });

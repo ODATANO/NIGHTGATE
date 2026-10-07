@@ -8,7 +8,11 @@ import { NightgateError } from '../../srv/utils/errors';
 function call(dispatch: (msg: unknown) => Promise<void>, method: string, args: unknown): Promise<WorkerRpcReply> {
     const { port1, port2 } = new MessageChannel();
     const reply = new Promise<WorkerRpcReply>((resolve) => {
-        port2.once('message', (m: WorkerRpcReply) => { port2.close(); resolve(m); });
+        port2.on('message', (m: WorkerRpcReply | { kind: 'started' }) => {
+            if ('kind' in m) return;
+            port2.close();
+            resolve(m);
+        });
     });
     void dispatch({ kind: 'rpc', method, args, port: port1 });
     return reply;
@@ -46,6 +50,17 @@ describe('createDispatcher', () => {
         const reply = await call(dispatch, 'coded', {});
         expect(reply.ok).toBe(false);
         if (!reply.ok) expect(reply.error.nightgate).toMatchObject({ code: 'NOT_FOUND', message: 'no such contract' });
+    });
+
+    it('announces the start of a call on its port before the reply', async () => {
+        const { port1, port2 } = new MessageChannel();
+        const seen: unknown[] = [];
+        const done = new Promise<void>((resolve) => {
+            port2.on('message', (m) => { seen.push(m); if (seen.length === 2) { port2.close(); resolve(); } });
+        });
+        void dispatch({ kind: 'rpc', method: 'echo', args: 1, port: port1 });
+        await done;
+        expect(seen).toEqual([{ kind: 'started' }, { ok: true, result: { got: 1 } }]);
     });
 
     it('logs and ignores a message that is not a call', async () => {

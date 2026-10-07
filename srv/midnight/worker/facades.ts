@@ -799,54 +799,70 @@ export function saveIntervalMs(): number {
     return configMs('NIGHTGATE_SAVE_INTERVAL_MS');
 }
 
+// Save ticks of all wallets run one after another, so the wallet thread collapses one
+// dust state at a time and the helper thread checks one at a time.
+let saveLane: Promise<void> = Promise.resolve();
+
 export function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
     if (entry.saveTimer) return;
     let tickCount = 0;
     const intervalMs = saveIntervalMs();
     log('info', `periodic-save interval armed for ${sessionId.slice(0, 16)} (every ${Math.round(intervalMs / 1000)}s)`);
-    entry.saveTimer = setInterval(async () => {
+    entry.saveTimer = setInterval(() => {
         tickCount++;
-        const tickStart = Date.now();
-        // Logged before the first await, because serializeState() can hang.
-        log('debug', `save-tick #${tickCount} fired, calling collectSerializedStates...`);
-        try {
-            const collectStart = Date.now();
-            const epochAtCollect = entry.dustEpoch ?? 0;
-            const shieldedEpochAtCollect = entry.shieldedEpoch ?? 0;
-            const { blobs, dustKey, dustCollapse } = await collectSerializedStates(entry.facade, entry);
-            if (dustCollapse) parentPort?.postMessage({ kind: 'save-stats', sessionId, dust: dustCollapse });
-            if ((entry.dustEpoch ?? 0) !== epochAtCollect && blobs.dust) {
-                // The dust wallet was replaced meanwhile, so this blob may be the old one's. The replacement saved its own.
-                delete blobs.dust;
-                log('debug', `save-tick #${tickCount} dropped dust blob (dust sub-wallet swapped during collect)`);
-            }
-            if ((entry.shieldedEpoch ?? 0) !== shieldedEpochAtCollect && blobs.shielded) {
-                delete blobs.shielded;
-                log('debug', `save-tick #${tickCount} dropped shielded blob (shielded sub-wallet swapped during collect)`);
-            }
-            const collectMs = Date.now() - collectStart;
-            const shape = [
-                `sh=${blobs.shielded ? blobs.shielded.length : '-'}`,
-                `un=${blobs.unshielded ? blobs.unshielded.length : '-'}`,
-                `du=${blobs.dust ? blobs.dust.length : '-'}`
-            ].join(' ');
-            log('debug', `save-tick #${tickCount} collect returned in ${collectMs}ms: ${shape}`);
-
-            if (!hasAnyBlob(blobs)) return;
-            await maybeLogSyncState(sessionId, entry);
-            // Send only the parts that differ from the last confirmed save, so a failed save is retried.
-            const changed = diffAgainstConfirmed(entry, blobs);
-            if (!hasAnyBlob(changed)) {
-                log('debug', `save-tick #${tickCount} unchanged, skipping push`);
-                return;
-            }
-            const seq = pushStateSave(sessionId, entry, changed, { dustKey });
-            log('debug', `save-tick #${tickCount} pushed seq=${seq} (total ${Date.now() - tickStart}ms)`);
-        } catch (err: unknown) {
-            log('warn', `periodic save failed: ${formatErr(err)}`);
+        if (entry.saveTickInFlight) {
+            log('debug', `save-tick #${tickCount} skipped, the previous tick of ${sessionId.slice(0, 16)} is still running`);
+            return;
         }
+        entry.saveTickInFlight = true;
+        const tick = tickCount;
+        saveLane = saveLane
+            .then(() => (facades.get(sessionId) === entry ? saveTick(sessionId, entry, tick) : undefined))
+            .finally(() => { entry.saveTickInFlight = false; });
     }, intervalMs);
     entry.saveTimer.unref();
+}
+
+async function saveTick(sessionId: string, entry: FacadeEntry, tickCount: number): Promise<void> {
+    const tickStart = Date.now();
+    // Logged before the first await, because serializeState() can hang.
+    log('debug', `save-tick #${tickCount} fired, calling collectSerializedStates...`);
+    try {
+        const collectStart = Date.now();
+        const epochAtCollect = entry.dustEpoch ?? 0;
+        const shieldedEpochAtCollect = entry.shieldedEpoch ?? 0;
+        const { blobs, dustKey, dustCollapse } = await collectSerializedStates(entry.facade, entry);
+        if (dustCollapse) parentPort?.postMessage({ kind: 'save-stats', sessionId, dust: dustCollapse });
+        if ((entry.dustEpoch ?? 0) !== epochAtCollect && blobs.dust) {
+            // The dust wallet was replaced meanwhile, so this blob may be the old one's. The replacement saved its own.
+            delete blobs.dust;
+            log('debug', `save-tick #${tickCount} dropped dust blob (dust sub-wallet swapped during collect)`);
+        }
+        if ((entry.shieldedEpoch ?? 0) !== shieldedEpochAtCollect && blobs.shielded) {
+            delete blobs.shielded;
+            log('debug', `save-tick #${tickCount} dropped shielded blob (shielded sub-wallet swapped during collect)`);
+        }
+        const collectMs = Date.now() - collectStart;
+        const shape = [
+            `sh=${blobs.shielded ? blobs.shielded.length : '-'}`,
+            `un=${blobs.unshielded ? blobs.unshielded.length : '-'}`,
+            `du=${blobs.dust ? blobs.dust.length : '-'}`
+        ].join(' ');
+        log('debug', `save-tick #${tickCount} collect returned in ${collectMs}ms: ${shape}`);
+
+        if (!hasAnyBlob(blobs)) return;
+        await maybeLogSyncState(sessionId, entry);
+        // Send only the parts that differ from the last confirmed save, so a failed save is retried.
+        const changed = diffAgainstConfirmed(entry, blobs);
+        if (!hasAnyBlob(changed)) {
+            log('debug', `save-tick #${tickCount} unchanged, skipping push`);
+            return;
+        }
+        const seq = pushStateSave(sessionId, entry, changed, { dustKey });
+        log('debug', `save-tick #${tickCount} pushed seq=${seq} (total ${Date.now() - tickStart}ms)`);
+    } catch (err: unknown) {
+        log('warn', `periodic save failed: ${formatErr(err)}`);
+    }
 }
 
 export interface CollectedStates {

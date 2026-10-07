@@ -305,9 +305,11 @@ database pool wait depth) when the p99 exceeds `NIGHTGATE_EVENT_LOOP_LAG_WARN_MS
   and `dust_collapse_runs_total{session,outcome}` with `collapsed`,
   `uncollapsed` (check failed or over `NIGHTGATE_DUST_COLLAPSE_BUDGET_MS`)
   and `skipped` (dust state unchanged since the confirmed save). The restore
-  check runs in a helper thread of the wallet worker; a tick slower than 5 s
-  logs `dust snapshot collapsed ... in <ms>ms` at INFO. A rising `p99` tracks
-  the growth of the dust tree, which never shrinks.
+  check runs in a helper thread of the wallet worker, one wallet at a time:
+  save ticks queue behind each other, and a timer that fires while its wallet's
+  previous tick still runs is skipped. A tick slower than 5 s logs
+  `dust snapshot collapsed ... in <ms>ms` at INFO. A rising `p99` tracks the
+  growth of the dust tree, which never shrinks.
 
 ## Reading the indexer health endpoint
 
@@ -403,7 +405,9 @@ the collapsed dust snapshot grows with it. Read `dust_collapse_p99_ms` in
 `getMetrics()`, or run `node scripts/profile-workers.mjs 15` against the
 process: a wallet worker whose busy share stays high between jobs with
 `deserialize` of the ledger as the hot frame is paying for the check. The check
-runs in a helper thread and is bounded by `NIGHTGATE_DUST_COLLAPSE_BUDGET_MS`;
+runs in a helper thread and is bounded by `NIGHTGATE_DUST_COLLAPSE_BUDGET_MS`
+(120 s, counted from the start of the check; every `uncollapsed` run in
+`dust_collapse_runs_total` means a restore from that snapshot takes minutes);
 a longer `NIGHTGATE_SAVE_INTERVAL_MS` divides the cost by the same factor, at
 the price of a longer replay after a restart.
 

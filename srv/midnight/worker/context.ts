@@ -58,6 +58,8 @@ export interface FacadeEntry {
     dustKey: any;
     unshieldedKeystore: any;
     saveTimer?: NodeJS.Timeout;
+    /** A save tick is queued or running. A timer that fires meanwhile is skipped. */
+    saveTickInFlight?: boolean;
     progressTimer?: NodeJS.Timeout;
     lastSavedBlobs?: SerializedBlobs; // last save the main thread confirmed
     pendingSaves?: Map<number, PendingSave>; // by save number, until confirmed

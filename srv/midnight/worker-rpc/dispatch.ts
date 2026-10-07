@@ -28,6 +28,9 @@ export interface WorkerRpcErrorPayload {
 
 export type WorkerRpcReply = { ok: true; result: unknown } | { ok: false; error: WorkerRpcErrorPayload };
 
+/** Sent on the call's port before the method runs, so the caller can tell queue time from run time. */
+export interface WorkerRpcStarted { kind: 'started' }
+
 export function isWorkerRpcRequest(msg: unknown): msg is WorkerRpcRequest {
     const m = msg as Partial<WorkerRpcRequest> | null;
     return !!m && m.kind === 'rpc' && typeof m.method === 'string' && !!m.port;
@@ -42,6 +45,7 @@ export function createDispatcher(handlers: WorkerRpcHandlers, log: (level: 'warn
         const { method, args, port } = msg;
         let reply: WorkerRpcReply;
         try {
+            port.postMessage({ kind: 'started' } satisfies WorkerRpcStarted);
             const fn = handlers[method];
             if (!fn) throw new Error(`Unknown method: ${method}`);
             reply = { ok: true, result: await fn(args) };

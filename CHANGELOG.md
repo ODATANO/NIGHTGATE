@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.31.2 - 2026-10-07
+
+### Changes
+
+- Dust snapshot check budget (`NIGHTGATE_DUST_COLLAPSE_BUDGET_MS`) counts from
+  the moment the helper thread begins a check and defaults to 120 s. A check
+  past it ends only that one: checks waiting behind it move to the restarted
+  helper instead of failing with it.
+- Save ticks of all wallets run one after another, so the wallet thread
+  collapses one dust state at a time and the helper checks one at a time. A
+  timer that fires while its wallet's previous tick still runs is skipped.
+- Worker thread RPC: the worker announces the start of a call on its port.
+
 ## 0.31.1 - 2026-10-07
 
 ### Changes
