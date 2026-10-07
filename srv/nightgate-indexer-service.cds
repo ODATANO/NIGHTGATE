@@ -55,10 +55,11 @@ service NightgateIndexerService {
         instanceId : String;
     };
 
-    // Public probe. `ready` is true only when every check passes.
+    // Public probe. `ready` is true when every check passes, and while the server is still warming its sponsor wallets.
     @requires: 'any'
     function getReadiness()                       returns {
         ready              : Boolean;
+        phase              : String; // starting | warming | catching-up | ready | degraded | failed
         crawlerEnabled     : Boolean;
         checks             : {
             database       : Boolean;

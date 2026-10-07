@@ -2,6 +2,7 @@
  * Checks proven claims directly in the live contract state, without the crawler.
  * A claim key is the map key under which the contract stores one proven claim.
  * `@odatano/contract-kit` computes the keys. This module picks the right key for each claim type.
+ * Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
  */
 import {
     CLAIM_TAG,
@@ -19,7 +20,8 @@ import {
     type PredicateResultKind,
     type ReadPredicateResultDeps
 } from '@odatano/contract-kit';
-import { importArtifactByPath } from './contract-registry';
+import { importArtifact } from './artifact-import';
+import { buildPublicDataProvider } from '../midnight/public-data-provider';
 
 export {
     CLAIM_TAG,
@@ -35,6 +37,12 @@ export {
     anchoredRootOf
 };
 export type { PredicateLedger, PredicateResultKind, ReadPredicateResultDeps };
+
+/** The compiled contract module, as far as the state readers use it. */
+export interface ContractArtifact<L> {
+    ledger: (state: unknown) => L;
+    pureCircuits: Record<string, (...args: unknown[]) => unknown>;
+}
 
 export interface ReadPredicateStateForContractArgs {
     contractAddress: string;
@@ -59,6 +67,8 @@ export interface ReadPredicateStateForContractArgs {
     /** Number of field slots, default 16. Only the integrity claim key uses it. */
     slotWidth?: number;
     artifactPath: string;
+    /** Build of the artifact to load. Without it the module at `artifactPath` is imported as is. */
+    artifactDigest?: string;
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
     computeFieldClaimKey?: typeof computeFieldPredicateClaimKey;
     nowSeconds?: number;
@@ -71,13 +81,12 @@ export interface ReadPredicateStateForContractArgs {
 export async function readPredicateStateForContract(
     args: ReadPredicateStateForContractArgs
 ): Promise<boolean | null> {
-    const { buildContractProviders } = await import('../midnight/providers.js');
-    const bundle = await buildContractProviders(args.contractProvidersConfig);
-    const artifact: any = await importArtifactByPath(args.artifactPath);
+    const publicData = await buildPublicDataProvider(args.contractProvidersConfig);
+    const artifact = await importArtifact(args.artifactPath, args.artifactDigest) as ContractArtifact<PredicateLedger>;
 
-    const state = await bundle.publicDataProvider.queryContractState(args.contractAddress.toLowerCase());
+    const state = await publicData.queryContractState(args.contractAddress.toLowerCase());
     if (!state) return null;
-    const led = artifact.ledger(state.data ?? state) as PredicateLedger;
+    const led = artifact.ledger(state.data ?? state);
 
     const recordKeyA = await computeRecordKey(args.attesterId, args.payloadHash);
     const anchorA = anchorOf(led, recordKeyA);

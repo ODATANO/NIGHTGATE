@@ -24,6 +24,7 @@ import { closeSessionsFromPreviousProcess } from '../srv/sessions/wallet-session
 import { getConfiguredFeeSponsorSessions, prewarmFeeSponsorPool } from '../srv/submission/fee-sponsor';
 const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
+import { stopDecodeWorker } from '../srv/midnight/decode-worker-client';
 import { wireWorkerStateSaveSink } from '../srv/submission/wallet-facade-builder';
 import { clearAllEncryptionKeys } from '../srv/submission/wallet-sync-state-store';
 import { ensureIndexes } from '../srv/utils/db-indexes';
@@ -46,6 +47,8 @@ import {
     startInstanceLeaseHeartbeat
 } from '../srv/utils/instance-lease';
 import { configMs } from '../srv/utils/config';
+import { startEventLoopWatch, stopEventLoopWatch } from '../srv/monitoring/event-loop';
+import { dbPoolGauges } from '../srv/monitoring/status';
 
 export type { NightgateConfig } from '../srv/types';
 export { DEFAULT_NETWORK, DEFAULT_NODE_URL } from '../srv/utils/nightgate-config';
@@ -425,6 +428,8 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         logStartupState('stopped', 'crawler disabled');
     }
 
+    startEventLoopWatch({ log, poolGauges: () => dbPoolGauges(cds.db) });
+
     initialized = true;
     setLastStatus({
         initialized,
@@ -457,6 +462,7 @@ function onInstanceLeaseLost(holder: string): void {
 
 /** Stops NIGHTGATE. Calling it again does nothing. */
 export async function shutdown(): Promise<void> {
+    stopEventLoopWatch();
     stopBackgroundJobProcessor();
     stopLeaseHeartbeat?.();
     stopLeaseHeartbeat = undefined;
@@ -476,6 +482,11 @@ export async function shutdown(): Promise<void> {
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         log.warn(`Wallet worker stop error: ${message}`);
+    }
+    try {
+        await stopDecodeWorker();
+    } catch (err) {
+        log.warn(`Decode worker stop error: ${err instanceof Error ? err.message : String(err)}`);
     }
     if (leaseHolder) {
         try {

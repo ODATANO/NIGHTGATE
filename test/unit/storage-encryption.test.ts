@@ -10,6 +10,7 @@
 import {
     StorageEncryption,
     decryptWithPassword,
+    decryptWithPasswordAsync,
     extractEncryptedComponents,
     deriveKey,
     deriveKeyAsync,
@@ -96,6 +97,12 @@ describe('StorageEncryption', () => {
         const k2 = deriveKey(PASSWORD, salt);
         expect(k1.equals(k2)).toBe(true);
         expect(k1.length).toBe(32);
+    });
+
+    test('decryptWithPasswordAsync opens the same blobs as decryptWithPassword and rejects a wrong password', async () => {
+        const blob = new StorageEncryption(PASSWORD).encrypt(PLAINTEXT);
+        await expect(decryptWithPasswordAsync(blob, PASSWORD)).resolves.toBe(PLAINTEXT);
+        await expect(decryptWithPasswordAsync(blob, 'wrong-pass-of-sufficient-length')).rejects.toThrow();
     });
 
     test('deriveKeyAsync derives the same key as deriveKey', async () => {

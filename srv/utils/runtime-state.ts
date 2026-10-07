@@ -22,4 +22,25 @@ export function readRuntimeState(): RuntimeState {
 
 export function __resetRuntimeStateForTests(): void {
     current = { initialized: false, mode: 'idle' };
+    prewarm = { running: false, total: 0, warmed: 0, failed: 0, startedAt: null, finishedAt: null };
+}
+
+/** Progress of the sponsor pool prewarm. Readiness reports `warming` while `running` is true. */
+export interface PrewarmState {
+    running: boolean;
+    total: number;
+    warmed: number;
+    failed: number;
+    startedAt: string | null;
+    finishedAt: string | null;
+}
+
+let prewarm: PrewarmState = { running: false, total: 0, warmed: 0, failed: 0, startedAt: null, finishedAt: null };
+
+export function publishPrewarmState(state: PrewarmState): void {
+    prewarm = { ...state };
+}
+
+export function readPrewarmState(): PrewarmState {
+    return prewarm;
 }

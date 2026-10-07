@@ -117,6 +117,26 @@ npm run sync:start
 
 A cold sync from genesis takes hours; the worker heap stays near 4 GB after the shielded scan. State is saved every 60 s (`NIGHTGATE_SAVE_INTERVAL_MS`) to `WalletSyncStates`; reconnecting the same account delta-syncs from it in seconds.
 
+### Pre-synced wallet states
+
+Sponsor wallets can be synced on any machine and imported, so a fresh server
+restores instead of syncing at full CPU:
+
+```bash
+# any machine, against the public indexer; wallets.json carries the seeds, keep it out of git
+node scripts/presync-wallets.mjs wallets.json --out presync
+# the server's machine, server stopped, server env loaded (database, ENCRYPTION_KEY, NIGHTGATE_FEE_SPONSOR_SESSION)
+node scripts/import-wallet-state.mjs --dry-run presync/*.json
+node scripts/import-wallet-state.mjs presync/*.json
+```
+
+`presync-wallets.mjs` syncs the wallets one after another, saves every two
+minutes and resumes from its own files; exit 0 means every wallet reached the
+tip. `import-wallet-state.mjs` matches each file to a platform sponsor session
+by `sessionId` and refuses it when seed fingerprint, account index, network or
+SDK version differ. Stop the server first: a running wallet overwrites the row at
+its next save.
+
 ## Prover keys
 
 Neither the npm tarballs nor git carry a `*.prover` file. Each contract lineage
@@ -247,11 +267,37 @@ curl "http://localhost:4004/api/v1/indexer/getMetrics()"      # Prometheus text 
 The container HEALTHCHECK (`docker/healthcheck.mjs`) probes `getReadiness()`.
 Payloads come from `srv/monitoring/status.ts`.
 
+`getReadiness()` answers in bounded time: its one database read gives up after
+`NIGHTGATE_READINESS_DB_TIMEOUT_MS` (2 s), everything else comes from memory.
+`phase` says where the process is:
+
+| `phase` | meaning | `ready` |
+|---|---|---|
+| `starting` | plugin init has not finished | false |
+| `failed` | init ended offline (schema, lease, submission pipeline) | false |
+| `warming` | sponsor pool prewarm running; sync at full CPU | true when runtime and initialization pass |
+| `catching-up` | crawler behind the tip (`syncStatus: syncing`) | true |
+| `ready` | | true |
+| `degraded` | started fine, a check fails now (database, crawler, node) | false |
+
+While `warming`, the `database`, `crawler` and `node` checks are reported but do
+not decide `ready`: a healthcheck that times out on a saturated start would
+otherwise restart the container into the same warm-up.
+
+The main thread logs its event-loop lag (p50/p99/max over 30 s, plus the
+database pool wait depth) when the p99 exceeds `NIGHTGATE_EVENT_LOOP_LAG_WARN_MS`
+(500 ms); `getMetrics()` carries `event_loop_lag_p99_ms` and
+`event_loop_lag_max_ms` for the last window.
+
 - `getRuntimeInfo()`: per contract the loaded digest and the current file
   digest. `digestStale: true` = artifacts replaced under the running server;
   every write job is refused until restart.
 - `getWorkerStatus()`: climbing `exitCount` = crash loop, ever-growing
   `inFlightRpcs` = stall. Not part of `getReadiness()`. Per-facade list admin only.
+- `getMetrics()` also carries the decode worker (`decode_worker_running`,
+  `decode_worker_inflight_rpcs`, `decode_worker_exits`): it decodes contract
+  state for the verify functions and ledger payloads for the crawler, and
+  restarts on its next call after a crash.
 
 ## Reading the indexer health endpoint
 

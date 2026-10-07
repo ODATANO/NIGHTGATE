@@ -8,7 +8,7 @@ import crypto from 'crypto';
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 import { WalletSyncStates } from '#cds-models/midnight';
-import { StorageEncryption, decryptWithPassword, extractEncryptedComponents } from '../utils/storage-encryption';
+import { StorageEncryption, decryptWithPasswordAsync, extractEncryptedComponents } from '../utils/storage-encryption';
 import { getEncryptionKey, deriveBoundSecret, type KeyRing } from '../utils/crypto';
 import { resolveAccountDek, syncStatePassphraseFromDek, clearAllAccountDeks, DEK_SCHEME } from './account-keys';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
@@ -207,10 +207,11 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
 
     // The whole row is marked `dek1`, so older snapshots kept from the row are re-encrypted.
     // Unreadable ones are dropped and that sub-wallet syncs again.
-    const carry = (blob: string | null | undefined): string | null => {
+    const carry = async (blob: string | null | undefined): Promise<string | null> => {
         if (!blob) return null;
-        const plain = decryptSyncBlob(accountId, blob, passphrase, ring, dekPassphrase);
-        return plain === null ? null : (plain.underDek ? blob : enc.encrypt(plain.text));
+        if (saltOf(blob)?.equals(enc.salt)) return blob;
+        const plain = await decryptSyncBlob(accountId, blob, passphrase, ring, dekPassphrase);
+        return plain === null ? null : enc.encrypt(plain.text);
     };
 
     const persistOnce = async (): Promise<void> => {
@@ -226,9 +227,9 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
             await db.run(
                 UPDATE.entity(WalletSyncStates)
                     .set({
-                        shieldedStateBlob: shieldedCipher ?? carry(existing.shieldedStateBlob),
-                        unshieldedStateBlob: unshieldedCipher ?? carry(existing.unshieldedStateBlob),
-                        dustStateBlob: dustCipher ?? carry(existing.dustStateBlob),
+                        shieldedStateBlob: shieldedCipher ?? await carry(existing.shieldedStateBlob),
+                        unshieldedStateBlob: unshieldedCipher ?? await carry(existing.unshieldedStateBlob),
+                        dustStateBlob: dustCipher ?? await carry(existing.dustStateBlob),
                         keyScheme: DEK_SCHEME,
                         sdkVersion,
                         networkId: networkId ?? existing.networkId,
@@ -330,7 +331,7 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
     ];
     for (const [name, blob] of blobs) {
         if (!blob) continue;
-        const plain = decryptSyncBlob(accountId, blob, passphrase, ring, dekPassphrase);
+        const plain = await decryptSyncBlob(accountId, blob, passphrase, ring, dekPassphrase);
         if (plain === null) return null;
         result[name] = plain.text;
     }
@@ -340,24 +341,32 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
 const legacyBlobNoted = new Set<string>();
 const unreadableBlobNoted = new Set<string>();
 
-/**
- * Decrypts one snapshot. The salt in its header picks the key. Returns null when it cannot be read.
- * `underDek` means the snapshot already uses the current format and can be kept as is.
- */
-function decryptSyncBlob(accountId: string, blob: string, passphrase: string, ring: KeyRing, dekPassphrase?: string): { text: string; underDek: boolean } | null {
-    let salt: Buffer;
+function saltOf(blob: string): Buffer | null {
     try {
-        salt = extractEncryptedComponents(Buffer.from(blob, 'base64')).salt;
+        return extractEncryptedComponents(Buffer.from(blob, 'base64')).salt;
     } catch {
         return null;
     }
+}
+
+/**
+ * Decrypts one snapshot. The salt in its header picks the key. Returns null when it cannot be read.
+ * `underDek` means the snapshot already uses the current format and can be kept as is.
+ * Key derivation never runs on the event loop: snapshots are megabytes and saved every minute.
+ */
+async function decryptSyncBlob(accountId: string, blob: string, passphrase: string, ring: KeyRing, dekPassphrase?: string): Promise<{ text: string; underDek: boolean } | null> {
+    const salt = saltOf(blob);
+    if (!salt) return null;
     if (dekPassphrase && deriveStableSalt(accountId, dekPassphrase, SALT_LABEL_DEK).equals(salt)) {
-        try { return { text: decryptWithPassword(blob, dekPassphrase), underDek: true }; } catch { return null; }
+        try {
+            const enc = await getEncryption(accountId, dekPassphrase);
+            return { text: enc.decrypt(blob), underDek: true };
+        } catch { return null; }
     }
     for (const c of syncStatePassphraseCandidates(ring, passphrase)) {
         if (!deriveStableSalt(accountId, c.passphrase, c.label).equals(salt)) continue;
         try {
-            const plain = decryptWithPassword(blob, c.passphrase);
+            const plain = await decryptWithPasswordAsync(blob, c.passphrase);
             if (!legacyBlobNoted.has(accountId)) {
                 legacyBlobNoted.add(accountId);
                 log.info(`sync state for ${accountId.slice(0, 16)} predates the account key; it is rewritten under it at the next save`);

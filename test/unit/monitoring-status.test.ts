@@ -60,7 +60,8 @@ vi.mock('../../srv/midnight/wallet-worker-client', () => ({
 // Readiness reads the plugin's initialisation state from the flat holder in
 // srv/utils, which src/index publishes into. No cycle, no SDK graph.
 const mockGetStatus = vi.hoisted(() => vi.fn(() => ({ initialized: true, mode: 'active' })));
-vi.mock('../../srv/utils/runtime-state', () => ({ readRuntimeState: mockGetStatus }));
+const mockPrewarm = vi.hoisted(() => vi.fn(() => ({ running: false, total: 0, warmed: 0, failed: 0, startedAt: null, finishedAt: null })));
+vi.mock('../../srv/utils/runtime-state', () => ({ readRuntimeState: mockGetStatus, readPrewarmState: mockPrewarm }));
 
 const mockListFacades = vi.hoisted(() => vi.fn(() => [] as string[]));
 vi.mock('../../srv/submission/wallet-facade-builder', () => ({ listWalletFacades: mockListFacades }));
@@ -115,6 +116,7 @@ beforeEach(() => {
     mockRuntimeConfig.mockReturnValue({ crawlerConfig: { enabled: true } });
     mockListContracts.mockReturnValue([]);
     mockGetStatus.mockReturnValue({ initialized: true, mode: 'active' } as any);
+    mockPrewarm.mockReturnValue({ running: false, total: 0, warmed: 0, failed: 0, startedAt: null, finishedAt: null });
     mockDbRun.mockResolvedValue(null);
 });
 
@@ -252,6 +254,51 @@ describe('buildReadiness', () => {
         expect((readiness.runtimeWarnings as string[]).join(' ')).toContain('submission pipeline');
     });
 
+    it('reports the phase: catching-up while the crawler syncs, ready once it is synced', async () => {
+        mockDbRun.mockResolvedValueOnce({ syncStatus: 'syncing', lastIndexedAt: new Date().toISOString() });
+        expect(await buildReadiness(db)).toMatchObject({ ready: true, phase: 'catching-up' });
+        mockDbRun.mockResolvedValueOnce({ syncStatus: 'synced', lastIndexedAt: new Date().toISOString() });
+        expect(await buildReadiness(db)).toMatchObject({ ready: true, phase: 'ready' });
+        mockGetStatus.mockReturnValue({ initialized: false, mode: 'idle' } as any);
+        expect(await buildReadiness(db)).toMatchObject({ ready: false, phase: 'starting' });
+        mockGetStatus.mockReturnValue({ initialized: true, mode: 'offline', lastError: 'x' } as any);
+        expect(await buildReadiness(db)).toMatchObject({ ready: false, phase: 'failed' });
+    });
+
+    it('never says ready in the phase while a check fails: degraded', async () => {
+        mockDbRun.mockRejectedValueOnce(new Error('ResourceRequest timed out'));
+        expect(await buildReadiness(db)).toMatchObject({ ready: false, phase: 'degraded' });
+        // Synced crawler, but the node went quiet: the node check fails.
+        mockDbRun.mockResolvedValueOnce({ syncStatus: 'synced', lastIndexedAt: new Date(Date.now() - 10 * 60_000).toISOString() });
+        expect(await buildReadiness(db)).toMatchObject({ ready: false, phase: 'degraded' });
+    });
+
+    it('is ready while the sponsor pool warms, even when the database read fails or the crawler is behind', async () => {
+        // A warming start saturates the thread; a probe that fails on a slow read would restart it into the same warm-up.
+        mockPrewarm.mockReturnValue({ running: true, total: 3, warmed: 1, failed: 0, startedAt: null, finishedAt: null });
+        mockDbRun.mockRejectedValueOnce(new Error('ResourceRequest timed out'));
+        const readiness = await buildReadiness(db);
+        expect(readiness).toMatchObject({ ready: true, phase: 'warming' });
+        expect(readiness.checks).toMatchObject({ database: false });
+        // Runtime and initialization still decide.
+        mockGetStatus.mockReturnValue({ initialized: true, mode: 'offline', lastError: 'x' } as any);
+        expect(await buildReadiness(db)).toMatchObject({ ready: false, phase: 'failed' });
+    });
+
+    it('gives up on a hanging database read after NIGHTGATE_READINESS_DB_TIMEOUT_MS and reports database: false', async () => {
+        process.env.NIGHTGATE_READINESS_DB_TIMEOUT_MS = '100';
+        try {
+            mockDbRun.mockReturnValueOnce(new Promise(() => undefined));
+            const started = Date.now();
+            const readiness = await buildReadiness(db);
+            expect(Date.now() - started).toBeLessThan(2000);
+            expect(readiness.ready).toBe(false);
+            expect(readiness.checks).toMatchObject({ database: false });
+        } finally {
+            delete process.env.NIGHTGATE_READINESS_DB_TIMEOUT_MS;
+        }
+    });
+
     it('is ready after a successful crawler-less start, which also reports idle', async () => {
         mockRuntimeConfig.mockReturnValue({ crawlerConfig: { enabled: false } });
         mockGetStatus.mockReturnValue({ initialized: true, mode: 'idle' } as any);
@@ -293,6 +340,12 @@ describe('buildMetricsText', () => {
         expect(text).toContain('odatano_nightgate_wallet_worker_inflight_rpcs 3');
         expect(text).toContain('odatano_nightgate_wallet_worker_exits 2');
         expect(text).toContain('odatano_nightgate_wallet_worker_rotations 0');
+    });
+
+    it('carries the event-loop lag of the last window', async () => {
+        const text = await buildMetricsText(db);
+        expect(text).toMatch(/odatano_nightgate_event_loop_lag_p99_ms \d/);
+        expect(text).toMatch(/odatano_nightgate_event_loop_lag_max_ms \d/);
     });
 
     it('reports the database connection pool, so a pool that runs dry is visible', async () => {

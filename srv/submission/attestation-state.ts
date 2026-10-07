@@ -1,10 +1,12 @@
 /**
  * Reads an attestation directly from the live vault contract, without the crawler.
  * An attestation is found by attester id plus payload hash, or by a document id bound to it.
+ * Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
  */
 import { hexToBytes } from '../utils/hex';
-import { importArtifactByPath } from './contract-registry';
-import { computeRecordKey } from './predicate-state';
+import { importArtifact } from './artifact-import';
+import { buildPublicDataProvider } from '../midnight/public-data-provider';
+import { computeRecordKey, type ContractArtifact } from './predicate-state';
 
 function hex(b: Uint8Array): string {
     return Buffer.from(b).toString('hex');
@@ -119,16 +121,16 @@ export interface ReadAttestationStateForContractArgs {
     contentRoot?: string;
     schemaId?: string;
     artifactPath: string;
+    /** Build of the artifact to load. Without it the module at `artifactPath` is imported as is. */
+    artifactDigest?: string;
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
 }
 
-/** Dynamic imports, because the SDK is ESM-only and this project is CommonJS. */
 export async function readAttestationStateForContract(
     args: ReadAttestationStateForContractArgs
 ): Promise<AttestationStateResult | null> {
-    const { buildContractProviders } = await import('../midnight/providers.js');
-    const bundle = await buildContractProviders(args.contractProvidersConfig);
-    const artifact: any = await importArtifactByPath(args.artifactPath);
+    const publicData = await buildPublicDataProvider(args.contractProvidersConfig);
+    const artifact = await importArtifact(args.artifactPath, args.artifactDigest) as ContractArtifact<AttestationLedger>;
 
     return readAttestationState({
         contractAddress: args.contractAddress,
@@ -138,6 +140,6 @@ export async function readAttestationStateForContract(
         contentRoot: args.contentRoot,
         schemaId: args.schemaId,
         ledger: artifact.ledger,
-        queryContractState: (addr: string) => bundle.publicDataProvider.queryContractState(addr)
+        queryContractState: (addr: string) => publicData.queryContractState(addr)
     });
 }

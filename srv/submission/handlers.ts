@@ -16,6 +16,7 @@ import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { readAttestationStateForContract } from './attestation-state';
 import { registerVerifyStateHandlers } from './verify-state';
 import { readPredicateStateForContract } from './predicate-state';
+import { readAttestationStateInWorker, readPredicateStateInWorker } from '../midnight/decode-worker-client';
 import { loadPureCircuitsFromRegistry } from './document-proof';
 import { tokenFactoryOps, type TokenFactoryOps } from './token-factory';
 import { recordPlatformMint } from './platform-mints';
@@ -61,8 +62,8 @@ export function registerSubmissionHandlers(
     const submitterFactory = options.submitterFactory ?? ((deps: TransactionSubmitterDeps) => new TransactionSubmitter(deps));
     const argTypesLoader = options.circuitArgTypesLoader ?? loadCircuitArgTypes;
     const disclosureReindexer = options.disclosureReindexer ?? reindexDisclosuresForContract;
-    const attestationStateReader = options.attestationStateReader ?? readAttestationStateForContract;
-    const predicateStateReader = options.predicateStateReader ?? readPredicateStateForContract;
+    const attestationStateReader = options.attestationStateReader ?? readAttestationStateInWorker;
+    const predicateStateReader = options.predicateStateReader ?? readPredicateStateInWorker;
     const pureCircuitsLoader = options.pureCircuitsLoader ?? loadPureCircuitsFromRegistry;
     const tokenFactory = options.tokenFactory ?? tokenFactoryOps;
 

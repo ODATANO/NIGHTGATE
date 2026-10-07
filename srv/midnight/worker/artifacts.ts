@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { computeArtifactGenerationDigest, effectiveModuleFormat, runtimeNodeModulesDir, proverKeyManifestProblems } from '../../submission/artifact-digest';
 import { BoundedCache } from './bounded-cache';
+import { importArtifactGeneration } from '../../submission/artifact-import';
 import { log } from './context';
 import { zkProviderBundles } from './contracts';
 import { noteGenerationImported } from './rotation';
@@ -378,15 +379,4 @@ export function assertArtifactGenerationOnDisk(name: string, registration: Contr
     }
 }
 
-/**
- * Imports one exact generation of a module.
- * ESM caches by URL, so `?gen=` gives a fresh copy. CommonJS caches by file name and ignores
- * the query, so its cache entry is removed first.
- */
-export async function importArtifactGeneration(artifactPath: string, generation: string): Promise<any> {
-    if (!path.isAbsolute(artifactPath)) return import(artifactPath);
-    try { delete require.cache[require.resolve(artifactPath)]; } catch { /* ESM-only path */ }
-    const url = pathToFileURL(artifactPath);
-    if (generation) url.searchParams.set('gen', generation.slice(0, 32));
-    return import(url.href);
-}
+export { importArtifactGeneration } from '../../submission/artifact-import';

@@ -8,7 +8,7 @@
 
 import cds from '@sap/cds';
 import { parseExtrinsicCall } from '../utils/scale';
-import { extractLedgerPayload, decodeLedgerPayload, carriesShieldedCoins, carriesProof, callFreeTxType, type LedgerPayloadFacts } from './ledger-payload';
+import { extractLedgerPayload, carriesShieldedCoins, carriesProof, callFreeTxType, type LedgerPayloadFacts } from './ledger-payload';
 import { readCapBinary } from './cap-binary';
 import { lockReorgGeneration } from '../submission/reorg-generation';
 import { Blocks, Transactions, ContractActions, SyncState, type Block, type Transaction, type ContractAction } from '#cds-models/midnight';
@@ -33,6 +33,8 @@ export interface LedgerDecoderConfig {
     intervalMs: number;
     /** Distance to the indexed tip, so a reorg rarely undoes decoded blocks. */
     lagBlocks: number;
+    /** Decodes one ledger transaction. The crawler passes the decode worker's method. */
+    decode: (payload: Uint8Array) => Promise<LedgerPayloadFacts>;
 }
 
 export interface DecodeRunResult {
@@ -143,7 +145,7 @@ export class LedgerPayloadDecoder {
 
         // Decoding is slow and must not keep a database transaction open.
         // So everything is decoded first and written afterwards.
-        const updates: Array<{ id: string; facts: Awaited<ReturnType<typeof decodeLedgerPayload>> | null; state: DecodeState; txType?: string | null; unknownFlags?: boolean }> = [];
+        const updates: Array<{ id: string; facts: LedgerPayloadFacts | null; state: DecodeState; txType?: string | null; unknownFlags?: boolean }> = [];
         const result: DecodeRunResult = { ...EMPTY_RUN, transactions: rows.length };
 
         for (const row of rows) {
@@ -165,7 +167,7 @@ export class LedgerPayloadDecoder {
                 continue;
             }
             try {
-                updates.push({ id: row.ID, facts: await decodeLedgerPayload(payload), state: 'decoded', txType: (row as { txType?: string | null }).txType });
+                updates.push({ id: row.ID, facts: await this.config.decode(payload), state: 'decoded', txType: (row as { txType?: string | null }).txType });
                 result.decoded++;
             } catch (err) {
                 log.warn(`transaction ${row.ID}: ledger payload did not decode: ${(err as Error).message}`);

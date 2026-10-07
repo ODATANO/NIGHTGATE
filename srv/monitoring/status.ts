@@ -19,8 +19,11 @@ import {
     slotWidthOf
 } from '../submission/contract-registry';
 import { getWalletWorkerStatus } from '../midnight/wallet-worker-client';
+import { getDecodeWorkerStatus } from '../midnight/decode-worker-client';
 import { listWalletFacades } from '../submission/wallet-facade-builder';
-import { readRuntimeState } from '../utils/runtime-state';
+import { readRuntimeState, readPrewarmState } from '../utils/runtime-state';
+import { configMs } from '../utils/config';
+import { eventLoopLagGauges } from './event-loop';
 import { absorbedCrawlerFaults } from '../crawler/crawler-fault-guard';
 import type { DbRunner } from '../utils/db-types';
 import type { getReadiness, getRuntimeInfo } from '#cds-models/NightgateIndexerService';
@@ -93,6 +96,13 @@ export async function buildHealth(db: DbRunner): Promise<Record<string, unknown>
     };
 }
 
+export type ReadinessPhase = 'starting' | 'warming' | 'catching-up' | 'ready' | 'degraded' | 'failed';
+
+/**
+ * Readiness answers in bounded time: the database read has its own timeout, everything else is read from memory.
+ * While the sponsor pool warms, the process is `ready` on the memory checks alone. A saturated start must not be
+ * restarted for a slow database read.
+ */
 export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<ReturnType<typeof getReadiness>>>> {
     const pluginConfig = getNightgatePluginConfig();
     const topology = getRuntimeTopology(pluginConfig);
@@ -102,6 +112,7 @@ export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<
     // Both conditions are needed. `initialized` is also set when startup ended offline.
     const runtime = readRuntimeStatus();
     const initialisationOk = runtime?.initialized === true && runtime.mode !== 'offline';
+    const warming = initialisationOk && readPrewarmState().running;
 
     const checks = {
         database: false,
@@ -111,12 +122,17 @@ export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<
         initialization: initialisationOk
     };
 
+    let syncStatus: string | undefined;
     try {
-        const syncState = await db.run(SELECT.one.from(SyncState).where({ ID: 'SINGLETON' }));
+        const syncState = await withTimeout(
+            db.run(SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })),
+            configMs('NIGHTGATE_READINESS_DB_TIMEOUT_MS')
+        );
         checks.database = true;
 
         if (syncState && crawlerEnabled) {
-            checks.crawler = syncState.syncStatus === 'syncing' || syncState.syncStatus === 'synced';
+            syncStatus = syncState.syncStatus ?? undefined;
+            checks.crawler = syncStatus === 'syncing' || syncStatus === 'synced';
 
             if (syncState.lastIndexedAt) {
                 const lastActivity = new Date(syncState.lastIndexedAt).getTime();
@@ -124,11 +140,22 @@ export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<
             }
         }
     } catch {
-        // Database unavailable: checks.database stays false.
+        // Database unavailable or slow: checks.database stays false.
     }
 
+    const ready = checks.runtime && checks.initialization
+        && (warming || (checks.database && checks.crawler && checks.node));
+    // `degraded`: started fine, but a check fails now (database, crawler or node).
+    const phase: ReadinessPhase = !runtime?.initialized ? 'starting'
+        : !initialisationOk ? 'failed'
+        : warming ? 'warming'
+        : !ready ? 'degraded'
+        : crawlerEnabled && syncStatus === 'syncing' ? 'catching-up'
+        : 'ready';
+
     return {
-        ready: checks.database && checks.crawler && checks.node && checks.runtime && checks.initialization,
+        ready,
+        phase,
         crawlerEnabled,
         checks,
         initializationMode: runtime?.mode ?? 'unknown',
@@ -142,6 +169,13 @@ export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<
             ...(initialisationOk ? [] : [summariseInitFailure(runtime)])
         ]
     };
+}
+
+function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms);
+        work.then(v => { clearTimeout(timer); resolve(v); }, e => { clearTimeout(timer); reject(e); });
+    });
 }
 
 /**
@@ -286,6 +320,25 @@ export async function buildMetricsText(db: DbRunner): Promise<string> {
     lines.push(`# HELP ${metricPrefix}_wallet_worker_rotations Controlled wallet worker rotations (artifact generation budget) since process start`);
     lines.push(`# TYPE ${metricPrefix}_wallet_worker_rotations counter`);
     lines.push(`${metricPrefix}_wallet_worker_rotations ${worker.rotationCount ?? 0}`);
+
+    const decode = getDecodeWorkerStatus();
+    lines.push(`# HELP ${metricPrefix}_decode_worker_running Decode worker thread alive (1=running, 0=not running)`);
+    lines.push(`# TYPE ${metricPrefix}_decode_worker_running gauge`);
+    lines.push(`${metricPrefix}_decode_worker_running ${decode.running ? 1 : 0}`);
+    lines.push(`# HELP ${metricPrefix}_decode_worker_inflight_rpcs Decode worker calls awaiting an answer`);
+    lines.push(`# TYPE ${metricPrefix}_decode_worker_inflight_rpcs gauge`);
+    lines.push(`${metricPrefix}_decode_worker_inflight_rpcs ${decode.inFlightRpcs}`);
+    lines.push(`# HELP ${metricPrefix}_decode_worker_exits Decode worker thread exits since process start`);
+    lines.push(`# TYPE ${metricPrefix}_decode_worker_exits counter`);
+    lines.push(`${metricPrefix}_decode_worker_exits ${decode.exitCount}`);
+
+    const loop = eventLoopLagGauges();
+    lines.push(`# HELP ${metricPrefix}_event_loop_lag_p99_ms Main-thread event-loop delay, 99th percentile over the last window`);
+    lines.push(`# TYPE ${metricPrefix}_event_loop_lag_p99_ms gauge`);
+    lines.push(`${metricPrefix}_event_loop_lag_p99_ms ${loop.p99Ms}`);
+    lines.push(`# HELP ${metricPrefix}_event_loop_lag_max_ms Main-thread event-loop delay, maximum over the last window`);
+    lines.push(`# TYPE ${metricPrefix}_event_loop_lag_max_ms gauge`);
+    lines.push(`${metricPrefix}_event_loop_lag_max_ms ${loop.maxMs}`);
 
     const pool = dbPoolGauges(db);
     if (pool) {

@@ -120,3 +120,7 @@ review-*.md
 
 # Incoming feature requests and notes from other ODATANO projects
 local_docs/
+
+# wallet pre-sync: seeds in, sync states out
+*.local.json
+presync/

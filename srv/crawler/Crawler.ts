@@ -10,6 +10,7 @@ import { ensureSyncStateSingleton } from '../utils/sync-state';
 const log = cds.log('nightgate:crawler');
 import { rollbackIndexedDataFromHeight } from './rollback';
 import { LedgerPayloadDecoder } from './LedgerPayloadDecoder';
+import { decodeLedgerPayloadInWorker } from '../midnight/decode-worker-client';
 import { IndexerSupplement } from './IndexerSupplement';
 import { contractStatePolicy } from './contract-state';
 import { SyncState, ReorgLog, Blocks, type Block } from '#cds-models/midnight';
@@ -151,7 +152,7 @@ export class MidnightCrawler {
     /** Neither pass blocks indexing, and a failure in either leaves the indexed blocks untouched. */
     private async startTrailingPasses(): Promise<void> {
         if (this.config.decodePayloads) {
-            this.decoder = new LedgerPayloadDecoder({ batchSize: 25, intervalMs: 1000, lagBlocks: 10 });
+            this.decoder = new LedgerPayloadDecoder({ batchSize: 25, intervalMs: 1000, lagBlocks: 10, decode: decodeLedgerPayloadInWorker });
             await this.decoder.init(this.db);
             this.decoder.start();
             log.info('Ledger payload decoding enabled (trailing pass)');

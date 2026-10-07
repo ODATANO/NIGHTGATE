@@ -14,7 +14,10 @@
 #            so the 90 s grace gains nothing.
 #
 # `starting` and `healthy` reset the counter. A restart is skipped while the
-# host itself is stalled (host-guard.sh, optional: exit 1 = stalled).
+# host itself is stalled (host-guard.sh, optional: exit 1 = stalled), and for
+# NIGHTGATE_WATCHDOG_START_GRACE seconds after the container started: the
+# sponsor wallets warm for minutes at full CPU, and a restart in that window
+# only starts the warm-up again. Every skipped restart is logged.
 #
 #   cp docker/watchdog.sh /root/nightgate-api/watchdog.sh
 #   crontab -l | { cat; echo '* * * * * /root/nightgate-api/watchdog.sh'; } | crontab -
@@ -28,6 +31,7 @@ CYCLED=/run/nightgate-watchdog.cycled          # epoch seconds of the last crawl
 LOG=${NIGHTGATE_WATCHDOG_LOG:-/root/nightgate-api/watchdog.log}
 GUARD=${NIGHTGATE_HOST_GUARD:-/root/host-guard.sh}
 CYCLE_GRACE=${NIGHTGATE_WATCHDOG_CYCLE_GRACE:-900}   # seconds a cycle counts as tried
+START_GRACE=${NIGHTGATE_WATCHDOG_START_GRACE:-900}   # seconds after a start in which no restart happens
 
 now() { date -u +%FT%TZ; }
 
@@ -100,6 +104,14 @@ if [ "$age" -gt "$CYCLE_GRACE" ] && only_crawler_down; then
         exit 0
     fi
     echo "$(now) crawler cycle failed; falling through to the restart" >> "$LOG"
+fi
+
+started_at=$(docker inspect -f '{{.State.StartedAt}}' "$C" 2>/dev/null)
+started_epoch=$(date -u -d "$started_at" +%s 2>/dev/null || echo 0)
+uptime=$(( $(date +%s) - started_epoch ))
+if [ "$started_epoch" -gt 0 ] && [ "$uptime" -lt "$START_GRACE" ]; then
+    echo "$(now) unhealthy for $n checks, restart skipped: container started ${uptime}s ago, start grace is ${START_GRACE}s" >> "$LOG"
+    exit 0
 fi
 
 if [ -x "$GUARD" ] && ! msg=$("$GUARD"); then

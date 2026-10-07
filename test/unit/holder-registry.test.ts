@@ -4,10 +4,9 @@
  * provider holding real ledger state of the contract.
  */
 const providerState = vi.hoisted(() => ({ state: null as any, queried: [] as string[] }));
-vi.mock('../../srv/midnight/providers', async (importOriginal) => ({
-    ...(await importOriginal<Record<string, unknown>>()),
-    buildContractProviders: vi.fn(async () => ({
-        publicDataProvider: { queryContractState: async (addr: string) => { providerState.queried.push(addr); return providerState.state; } }
+vi.mock('../../srv/midnight/public-data-provider', () => ({
+    buildPublicDataProvider: vi.fn(async () => ({
+        queryContractState: async (addr: string) => { providerState.queried.push(addr); return providerState.state; }
     }))
 }));
 

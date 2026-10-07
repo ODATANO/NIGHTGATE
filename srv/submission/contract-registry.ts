@@ -14,6 +14,9 @@ import { computeArtifactGenerationDigest, artifactGenerationMatch } from './arti
 import { resolveContractPackage, contractPackageDigestProblem, type ZkAssetLayout } from '@odatano/contract-kit/node';
 import { ensureProverKeys, missingProverKeys, ZK_ASSET_URL_ENV } from './prover-keys';
 import { configMs } from '../utils/config';
+import { artifactImportSpec, importArtifactGeneration } from './artifact-import';
+
+export { artifactImportSpec, importArtifactGeneration };
 import { NightgateError } from '../utils/errors';
 
 function resolveContractPath(p: string, baseDir: string): string {
@@ -328,14 +331,6 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
     };
 }
 
-/** file:// URL with the digest in the query. Node caches ESM per URL, so each build loads as its own module. */
-export function artifactImportSpec(artifactPath: string, generation: string): string {
-    if (!path.isAbsolute(artifactPath)) return artifactPath;
-    const url = pathToFileURL(artifactPath);
-    url.searchParams.set('gen', generation.slice(0, 32));
-    return url.href;
-}
-
 export async function importRegisteredArtifact(name: string): Promise<any> {
     const reg = registry.get(name);
     if (!reg) throw new ContractNotRegisteredError(name, listRegisteredContracts());
@@ -348,20 +343,6 @@ export async function importArtifactByPath(artifactPath: string): Promise<any> {
         if (path.resolve(reg.artifactPath) === wanted) return importRegisteredArtifact(name);
     }
     return import(path.isAbsolute(artifactPath) ? pathToFileURL(artifactPath).href : artifactPath);
-}
-
-/**
- * Imports the module of one specific build. Node caches CommonJS by file name and
- * ignores the query, so the CommonJS cache entry is removed first.
- */
-export async function importArtifactGeneration(artifactPath: string, generation: string): Promise<any> {
-    if (path.isAbsolute(artifactPath)) {
-        try {
-            const resolved = require.resolve(artifactPath);
-            delete require.cache[resolved];
-        } catch { /* not a CommonJS module, fine for ESM */ }
-    }
-    return import(artifactImportSpec(artifactPath, generation));
 }
 
 export class ContractNotRegisteredError extends NightgateError {

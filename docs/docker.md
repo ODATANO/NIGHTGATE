@@ -96,7 +96,11 @@ and no copy of the password); the sponsor facades in the same process keep
 running. If the container is still unhealthy three checks later, or if any
 other check fails, `docker restart -t 5` (a hung main thread ignores
 SIGTERM). Restart recovery closes the old sessions and fails or replays
-interrupted jobs. `starting` does not count. The container defaults to the
+interrupted jobs. `starting` does not count, and no restart happens within
+`NIGHTGATE_WATCHDOG_START_GRACE` seconds (900) of the container's start: the
+sponsor wallets warm for minutes at full CPU, readiness reports `warming`, and a
+restart in that window only begins the warm-up again. Skipped restarts are
+logged. The container defaults to the
 compose file's `odatano-nightgate`; a container under another name takes
 `NIGHTGATE_CONTAINER=<name>` in the cron line, and a name that `docker
 inspect` cannot find is logged, never watched. Log path
@@ -185,7 +189,8 @@ smoke test succeed.
   For production set `NIGHTGATE_DB_URL`.
 - Mainnet submission is always gated off.
 - The healthcheck (`docker/healthcheck.mjs`) probes the readiness route; the
-  90 s start period covers schema deploy and plugin init.
+  90 s start period covers schema deploy and plugin init. Readiness is 200
+  while the sponsor pool warms (`phase: warming`).
 - Compiled artifacts are in the image: `attestation-vault`,
   `attestation-vault-32`, `counter`, `shielded-token`.
 - Own artifacts: bind-mount a directory as `NIGHTGATE_CONTRACTS_DIR` (e.g.

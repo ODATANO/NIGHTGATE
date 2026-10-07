@@ -9,21 +9,17 @@
  *    upgrades) without a chain.
  *
  *  - readAttestationStateForContract / readPredicateStateForContract, the
- *    production wrappers: provider bundle mocked at the module seam, the
+ *    readers the decode worker hosts: public data provider mocked at the module seam, the
  *    artifact loaded through the real `import(pathToFileURL(...))` path from
  *    test/fixtures/fake-vault-artifact.mjs.
  */
 import path from 'node:path';
 
 const queryContractState = vi.hoisted(() => (vi.fn()));
-const buildContractProviders = vi.hoisted(() => (vi.fn(async () => ({
-    publicDataProvider: { queryContractState },
-    zkConfigProvider: {},
-    proofProvider: {}
-}))));
+const buildPublicDataProvider = vi.hoisted(() => (vi.fn(async () => ({ queryContractState }))));
 
-vi.mock('../../srv/midnight/providers', () => ({
-    buildContractProviders
+vi.mock('../../srv/midnight/public-data-provider', () => ({
+    buildPublicDataProvider
 }));
 
 import {
@@ -72,7 +68,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
     queryContractState.mockReset();
-    buildContractProviders.mockClear();
+    buildPublicDataProvider.mockClear();
 });
 
 describe('claim-key recomputation (real compact-runtime)', () => {
@@ -126,7 +122,7 @@ describe('readAttestationStateForContract (production wrapper)', () => {
             contractAddress: '0xVault', attesterId: ATTESTER, payloadHash: PAYLOAD, artifactPath: ARTIFACT, contractProvidersConfig: CFG
         });
         expect(result).toBeNull();
-        expect(buildContractProviders).toHaveBeenCalledWith(CFG);
+        expect(buildPublicDataProvider).toHaveBeenCalledWith(CFG);
         // Address is normalized to lowercase before the indexer query.
         expect(queryContractState).toHaveBeenCalledWith('0xvault');
     });

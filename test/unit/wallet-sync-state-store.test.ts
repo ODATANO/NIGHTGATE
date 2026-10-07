@@ -472,6 +472,21 @@ describe('account-key binding of the blob passphrase', () => {
         expect(again!.dust).toBe('du-new');
     });
 
+    test('a save that carries blobs already under the account key keeps their bytes and derives no key on the event loop', async () => {
+        await saveSyncState({ accountId: 'acct-carry', passphrase: PASS, sdkVersion: SDK, states: { shielded: 'sh-1', unshielded: 'un-1', dust: 'du-1' } });
+        const before = store.get('acct-carry');
+        const syncDerivations = vi.spyOn(nodeCrypto, 'pbkdf2Sync');
+        await saveSyncState({ accountId: 'acct-carry', passphrase: PASS, sdkVersion: SDK, states: { dust: 'du-2' } });
+        syncDerivations.mockRestore();
+        const after = store.get('acct-carry');
+        expect(syncDerivations).not.toHaveBeenCalled();
+        expect(after.shieldedStateBlob).toBe(before.shieldedStateBlob);
+        expect(after.unshieldedStateBlob).toBe(before.unshieldedStateBlob);
+        expect(after.dustStateBlob).not.toBe(before.dustStateBlob);
+        const again = await loadSyncState({ accountId: 'acct-carry', passphrase: PASS, expectedSdkVersion: SDK });
+        expect(again).toMatchObject({ shielded: 'sh-1', unshielded: 'un-1', dust: 'du-2' });
+    });
+
     test('a blob under a previous ring key (pre-account-key form) loads while that key is in the ring and is a cold start once it leaves', async () => {
         process.env.ENCRYPTION_KEYS = 'k1=' + 'a'.repeat(32) + ',k2=' + 'b'.repeat(32);
         process.env.ENCRYPTION_KEY_ACTIVE = 'k1';

@@ -4,9 +4,12 @@
  * Exercises the decode/enumerate logic and the reindex upsert+sweep against a
  * FAKE `ledger()`-shaped object, crucially one whose outer `disclosures` map
  * is NOT iterable (only member/lookup), mirroring the real compiled artifact.
+ * The reindex gets its grants through `readGrants`, as it does from the decode worker.
  * No SDK, no chain.
  */
 import { enumerateGrants, reindexDisclosures, queryIndexerTipHeight } from '../../srv/submission/disclosure-indexer';
+
+const grantsOf = (led: unknown) => async () => enumerateGrants(led as Parameters<typeof enumerateGrants>[0]);
 
 // ---- fake ledger builder --------------------------------------------------
 
@@ -103,12 +106,10 @@ describe('reindexDisclosures', () => {
 
     test('returns zero and never decodes when contract state is null', async () => {
         const db = seqDb([]);
-        const ledger = vi.fn(() => { throw new Error('should not decode'); });
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger, queryContractState: async () => null
+            db, contractAddress: CONTRACT, readGrants: async () => null
         });
         expect(res).toEqual({ indexed: 0, deactivated: 0, snapshotHeight: null });
-        expect(ledger).not.toHaveBeenCalled();
         expect(db.run).not.toHaveBeenCalled();
     });
 
@@ -116,8 +117,7 @@ describe('reindexDisclosures', () => {
         // order: SELECT.one existing → INSERT → SELECT active rows
         const db = seqDb([undefined, undefined, []]);
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => oneGrant(),
-            queryContractState: async () => ({ data: {} }), atHeight: 500
+            db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant()), atHeight: 500
         });
         expect(res).toEqual({ indexed: 1, deactivated: 0, snapshotHeight: 500 });
 
@@ -135,8 +135,7 @@ describe('reindexDisclosures', () => {
         const existing = { ID: 'row-1', grantedTxHash: '0xabc', active: false };
         const db = seqDb([existing, undefined, []]);
         await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => oneGrant(),
-            queryContractState: async () => ({ data: {} })
+            db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant())
         });
 
         expect(db.calls.some(c => classify(c) === 'INSERT')).toBe(false);
@@ -147,22 +146,22 @@ describe('reindexDisclosures', () => {
     });
 
     test('the snapshot is read at the given height and stamps the rows it changes', async () => {
-        const queryContractState = vi.fn(async () => ({ data: {} }));
+        const readGrants = vi.fn(grantsOf(oneGrant()));
         const existing = { ID: 'row-1', active: false, changedAtHeight: 400 };
         const db = seqDb([existing, undefined, []]);
-        await reindexDisclosures({ db, contractAddress: CONTRACT, ledger: () => oneGrant(), queryContractState, atHeight: 500 });
-        expect(queryContractState).toHaveBeenCalledWith(CONTRACT, 500);
+        await reindexDisclosures({ db, contractAddress: CONTRACT, readGrants, atHeight: 500 });
+        expect(readGrants).toHaveBeenCalledWith(CONTRACT, 500);
         expect(setOf(db.calls.find(c => classify(c) === 'UPDATE'))).toContain('"changedAtHeight":500');
     });
 
     test('falls back to the indexer tip when no height is given', async () => {
-        const queryContractState = vi.fn(async () => ({ data: {} }));
+        const readGrants = vi.fn(grantsOf(oneGrant()));
         const db = seqDb([undefined, undefined, []]);
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => oneGrant(), queryContractState,
+            db, contractAddress: CONTRACT, readGrants,
             queryTipHeight: async () => 777
         });
-        expect(queryContractState).toHaveBeenCalledWith(CONTRACT, 777);
+        expect(readGrants).toHaveBeenCalledWith(CONTRACT, 777);
         expect(res.snapshotHeight).toBe(777);
     });
 
@@ -172,8 +171,7 @@ describe('reindexDisclosures', () => {
         const revoked = { ID: 'row-1', active: false, revokedTxHash: '0xrevoke', changedAtHeight: 600 };
         const db = seqDb([revoked, []]);
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => oneGrant(),
-            queryContractState: async () => ({ data: {} }), atHeight: 590
+            db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant()), atHeight: 590
         });
         expect(res.indexed).toBe(1);
         expect(db.calls.some(c => classify(c) === 'UPDATE')).toBe(false);
@@ -183,8 +181,7 @@ describe('reindexDisclosures', () => {
         const downgraded = { ID: 'row-1', active: true, level: 1, changedAtHeight: 600 };
         const db = seqDb([downgraded, [{ ...downgraded, attesterId: A_HEX, payloadHash: PAYLOAD_AA, grantee: hx(b(0xcc)) }]]);
         await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => makeLedger({ 0x50: { owner: ATTESTER, payload: 0xaa, grants: [[0xcc, 2]] } }),
-            queryContractState: async () => ({ data: {} }), atHeight: 590
+            db, contractAddress: CONTRACT, readGrants: grantsOf(makeLedger({ 0x50: { owner: ATTESTER, payload: 0xaa, grants: [[0xcc, 2]] } })), atHeight: 590
         });
         expect(db.calls.some(c => classify(c) === 'UPDATE')).toBe(false);
     });
@@ -193,8 +190,7 @@ describe('reindexDisclosures', () => {
         const revoked = { ID: 'row-1', active: false, revokedTxHash: '0xrevoke', changedAtHeight: 600 };
         const db = seqDb([revoked, []]);
         await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => oneGrant(),
-            queryContractState: async () => ({ data: {} })
+            db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant())
         });
         expect(db.calls.some(c => classify(c) === 'UPDATE')).toBe(false);
     });
@@ -203,8 +199,7 @@ describe('reindexDisclosures', () => {
         const revoked = { ID: 'row-1', active: false, revokedTxHash: '0xrevoke', changedAtHeight: 600 };
         const db = seqDb([revoked, undefined, []]);
         await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => oneGrant(),
-            queryContractState: async () => ({ data: {} }), atHeight: 600
+            db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant()), atHeight: 600
         });
         const upd = db.calls.find(c => classify(c) === 'UPDATE');
         expect(setOf(upd)).toContain('"active":true');
@@ -215,8 +210,7 @@ describe('reindexDisclosures', () => {
         const existing = { ID: 'row-1', active: true, level: 1, changedAtHeight: 400 };
         const db = seqDb([existing, undefined, []]);
         await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => oneGrant(),
-            queryContractState: async () => ({ data: {} }), atHeight: 500
+            db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant()), atHeight: 500
         });
         const upd = db.calls.find(c => classify(c) === 'UPDATE');
         expect(upd.UPDATE.where).toEqual(expect.arrayContaining([{ ref: ['ID'] }, { val: 'row-1' }, { ref: ['changedAtHeight'] }, { val: 400 }]));
@@ -226,8 +220,7 @@ describe('reindexDisclosures', () => {
         const existing = { ID: 'row-1', active: false };
         const db = seqDb([existing, undefined, []]);
         await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => oneGrant(),
-            queryContractState: async () => ({ data: {} }), atHeight: 500
+            db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant()), atHeight: 500
         });
         const upd = db.calls.find(c => classify(c) === 'UPDATE');
         expect(JSON.stringify(upd.UPDATE.where)).toContain('"changedAtHeight"');
@@ -239,8 +232,7 @@ describe('reindexDisclosures', () => {
         // onChain empty → no per-grant calls. order: SELECT active rows → UPDATE
         const db = seqDb([[stale], undefined]);
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => noGrants(),
-            queryContractState: async () => ({ data: {} })
+            db, contractAddress: CONTRACT, readGrants: grantsOf(noGrants())
         });
         expect(res).toEqual({ indexed: 0, deactivated: 1, snapshotHeight: null });
         expect(setOf(db.calls.find(c => classify(c) === 'UPDATE'))).toContain('"active":false');
@@ -250,8 +242,7 @@ describe('reindexDisclosures', () => {
         const present = { ID: 'live', attesterId: A_HEX, payloadHash: PAYLOAD_AA, grantee: hx(b(0xcc)) };
         const db = seqDb([undefined, undefined, [present]]);
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => oneGrant(),
-            queryContractState: async () => ({ data: {} })
+            db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant())
         });
         expect(res.deactivated).toBe(0);
         expect(db.calls.filter(c => classify(c) === 'UPDATE')).toHaveLength(0);
@@ -264,8 +255,7 @@ describe('reindexDisclosures', () => {
         const mine = { ID: 'mine', attesterId: A_HEX, payloadHash: PAYLOAD_AA, grantee: hx(b(0xcc)), modifiedAt: '2020-01-01T00:00:00.000Z' };
         const db = seqDb([undefined, undefined, [mine], undefined]);
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => led,
-            queryContractState: async () => ({ data: {} })
+            db, contractAddress: CONTRACT, readGrants: grantsOf(led)
         });
         expect(res).toMatchObject({ indexed: 1, deactivated: 1 });
     });
@@ -273,8 +263,7 @@ describe('reindexDisclosures', () => {
     test('scopes the active-rows sweep query to the contract', async () => {
         const db = seqDb([[], undefined]);
         await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => noGrants(),
-            queryContractState: async () => ({ data: {} })
+            db, contractAddress: CONTRACT, readGrants: grantsOf(noGrants())
         });
         const activeSelect = db.calls.find(c => classify(c) === 'SELECT');
         expect(JSON.stringify(activeSelect.SELECT.where)).toContain(CONTRACT);
@@ -283,8 +272,7 @@ describe('reindexDisclosures', () => {
     test('normalizes contractAddress to lowercase in queries and inserts', async () => {
         const db = seqDb([undefined, undefined, []]);
         await reindexDisclosures({
-            db, contractAddress: '0xVaUlT', ledger: () => oneGrant(),
-            queryContractState: async () => ({ data: {} })
+            db, contractAddress: '0xVaUlT', readGrants: grantsOf(oneGrant())
         });
         const insert = db.calls.find(c => classify(c) === 'INSERT');
         expect(insert.INSERT.entries[0].contractAddress).toBe('0xvault');
@@ -300,8 +288,7 @@ describe('reindexDisclosures', () => {
         };
         const db = seqDb([[fresh]]);
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => noGrants(),
-            queryContractState: async () => ({ data: {} })
+            db, contractAddress: CONTRACT, readGrants: grantsOf(noGrants())
         });
         expect(res.deactivated).toBe(0);
         expect(db.calls.some(c => classify(c) === 'UPDATE')).toBe(false);
@@ -314,8 +301,7 @@ describe('reindexDisclosures', () => {
         };
         const db = seqDb([[old], undefined]);
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => noGrants(),
-            queryContractState: async () => ({ data: {} })
+            db, contractAddress: CONTRACT, readGrants: grantsOf(noGrants())
         });
         expect(res.deactivated).toBe(1);
     });
@@ -331,8 +317,7 @@ describe('reindexDisclosures', () => {
         };
         const db = seqDb([[landedBefore, landedAfter], undefined]);
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => noGrants(),
-            queryContractState: async () => ({ data: {} }), atHeight: 600
+            db, contractAddress: CONTRACT, readGrants: grantsOf(noGrants()), atHeight: 600
         });
         // 'before' landed under the snapshot and is absent from it: revoked.
         // 'after' landed past the snapshot: the snapshot cannot know it.
@@ -348,8 +333,7 @@ describe('reindexDisclosures', () => {
         };
         const db = seqDb([[fresh], undefined]);
         const res = await reindexDisclosures({
-            db, contractAddress: CONTRACT, ledger: () => noGrants(),
-            queryContractState: async () => ({ data: {} }),
+            db, contractAddress: CONTRACT, readGrants: grantsOf(noGrants()),
             sweepGraceMs: 0
         });
         expect(res.deactivated).toBe(1);
@@ -358,16 +342,16 @@ describe('reindexDisclosures', () => {
     test('two reindexes of one contract run one after the other', async () => {
         const order: string[] = [];
         let releaseFirst!: () => void;
-        const firstState = new Promise<any>(resolve => { releaseFirst = () => resolve({ data: {} }); });
+        const firstState = new Promise<void>(resolve => { releaseFirst = resolve; });
         const db1 = seqDb([undefined, undefined, []]);
         const db2 = seqDb([undefined, undefined, []]);
         const first = reindexDisclosures({
-            db: db1, contractAddress: CONTRACT, ledger: () => oneGrant(),
-            queryContractState: async () => { order.push('first-read'); const s = await firstState; order.push('first-done'); return s; }
+            db: db1, contractAddress: CONTRACT,
+            readGrants: async () => { order.push('first-read'); await firstState; order.push('first-done'); return enumerateGrants(oneGrant()); }
         });
         const second = reindexDisclosures({
-            db: db2, contractAddress: CONTRACT, ledger: () => oneGrant(),
-            queryContractState: async () => { order.push('second-read'); return { data: {} }; }
+            db: db2, contractAddress: CONTRACT,
+            readGrants: async () => { order.push('second-read'); return enumerateGrants(oneGrant()); }
         });
         await new Promise(r => setTimeout(r, 10));
         expect(order).toEqual(['first-read']);

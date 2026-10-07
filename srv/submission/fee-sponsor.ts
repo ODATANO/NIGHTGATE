@@ -14,6 +14,7 @@ import { deriveAccountId, deriveStoragePassword } from './wallet-material-factor
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
 import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
 import { NightgateError } from '../utils/errors';
+import { publishPrewarmState } from '../utils/runtime-state';
 
 /**
  * How long startup waits for each sponsor wallet to sync to the chain tip. 0 means build only.
@@ -143,6 +144,12 @@ export async function prewarmFeeSponsorPool(opts: {
     const pool = getConfiguredFeeSponsorSessions(opts.config);
     const warmed: string[] = [];
     const failed: string[] = [];
+    const startedAt = new Date().toISOString();
+    const publish = (running: boolean) => publishPrewarmState({
+        running, total: pool.length, warmed: warmed.length, failed: failed.length,
+        startedAt, finishedAt: running ? null : new Date().toISOString()
+    });
+    publish(pool.length > 0);
     for (const sponsorSessionId of pool) {
         const started = Date.now();
         try {
@@ -163,6 +170,8 @@ export async function prewarmFeeSponsorPool(opts: {
             failed.push(sponsorSessionId);
             opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} failed (${err instanceof Error ? err.message : String(err)}); the pool fails over at use time`);
         }
+        publish(true);
     }
+    publish(false);
     return { warmed, failed };
 }

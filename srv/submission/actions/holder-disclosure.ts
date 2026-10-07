@@ -11,7 +11,8 @@ import { HolderDisclosureGrants, type HolderDisclosureGrant } from '#cds-models/
 import { NightgateError } from '../../utils/errors';
 import { encrypt, decrypt, getEncryptionKey } from '../../utils/crypto';
 import { blake2b256Hex } from '../hashing';
-import { HOLDER_REGISTRY_REF, holderClaimKey, readHolderRegistration } from '../holder-registry';
+import { HOLDER_REGISTRY_REF, holderClaimKey } from '../holder-registry';
+import { readHolderRegistrationInWorker } from '../../midnight/decode-worker-client';
 import { liveProviderConfigured, contractProvidersConfigFromEnv } from '../verify-state';
 import { disclosureRateLimiter, holderClaimRateLimiter, checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
@@ -132,9 +133,10 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
             const resolved = await contractResolver(HOLDER_REGISTRY_REF);
             const registries = [...new Set(live.map(g => String(g.registryAddress)))];
             for (const registryAddress of registries) {
-                const reading = await readHolderRegistration({
+                const reading = await readHolderRegistrationInWorker({
                     contractAddress: registryAddress, tokenType, claimKey,
-                    artifactPath: resolved.artifactPath, contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
+                    artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest,
+                    contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
                 });
                 if (!reading?.registered) continue;
                 const grant = preferredGrant(live.filter(g => String(g.registryAddress) === registryAddress));

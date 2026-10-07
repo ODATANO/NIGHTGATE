@@ -10,11 +10,8 @@
 import cds from '@sap/cds';
 import { createHash } from 'node:crypto';
 
+// The decode worker's method in production; here the facts are scripted per test.
 const decodeLedgerPayload = vi.fn();
-vi.mock('../../srv/crawler/ledger-payload', async (importOriginal) => ({
-    ...(await importOriginal<typeof import('../../srv/crawler/ledger-payload')>()),
-    decodeLedgerPayload: (bytes: Uint8Array) => decodeLedgerPayload(bytes)
-}));
 
 import { LedgerPayloadDecoder } from '../../srv/crawler/LedgerPayloadDecoder';
 import { IndexerSupplement, RATE_LIMIT_BACKOFF_MS } from '../../srv/crawler/IndexerSupplement';
@@ -125,7 +122,7 @@ beforeEach(async () => {
 
 describe('LedgerPayloadDecoder', () => {
     async function runDecoder(): Promise<any> {
-        const decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2 });
+        const decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2, decode: (bytes: Uint8Array) => decodeLedgerPayload(bytes) });
         await decoder.init(db);
         return decoder.runOnce();
     }
@@ -633,7 +630,7 @@ describe('cursor against a reorg', () => {
         await setSync({ lastIndexedHeight: 30, lastDecodedHeight: null });
         decodeLedgerPayload.mockResolvedValue(facts());
 
-        const decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2 });
+        const decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2, decode: (bytes: Uint8Array) => decodeLedgerPayload(bytes) });
         await decoder.init(db);
         // A reorg lands while the pass is between reading the cursor and writing it.
         decodeLedgerPayload.mockImplementation(async () => {
@@ -806,7 +803,7 @@ describe('a rollback that leaves the cursor where it was', () => {
         await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });
         await setSync({ lastIndexedHeight: 30, lastDecodedHeight: 5, reorgGeneration: 1 });
 
-        const decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2 });
+        const decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2, decode: (bytes: Uint8Array) => decodeLedgerPayload(bytes) });
         await decoder.init(db);
         decodeLedgerPayload.mockImplementation(async () => {
             // The rollback lands mid-pass and forks exactly at the cursor.
@@ -931,7 +928,7 @@ describe('a rollback between reading the cursor and the generation', () => {
         for (const h of [5, 6, 20]) await seedBlock(h, `0xw${h}`);
         await setSync({ lastIndexedHeight: 30, lastDecodedHeight: 5, reorgGeneration: 1 });
 
-        const decoder = new LedgerPayloadDecoder({ batchSize: 25, intervalMs: 1, lagBlocks: 10 });
+        const decoder = new LedgerPayloadDecoder({ batchSize: 25, intervalMs: 1, lagBlocks: 10, decode: (bytes: Uint8Array) => decodeLedgerPayload(bytes) });
         await decoder.init(db);
         decodeLedgerPayload.mockResolvedValue(facts());
 
@@ -1203,7 +1200,7 @@ describe('LedgerPayloadDecoder and system transactions', () => {
         const txId = await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20), transactionType: 'SYSTEM' });
         await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
 
-        const decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2 });
+        const decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2, decode: (bytes: Uint8Array) => decodeLedgerPayload(bytes) });
         await decoder.init(db);
         const result = await decoder.runOnce();
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.31.0 - 2026-10-07
+
+### Changes
+
+- `getReadiness()` reports a `phase` (`starting`, `warming`, `catching-up`, `ready`,
+  `degraded`, `failed`) and stays `ready` while the sponsor pool warms; the database read
+  gives up after `NIGHTGATE_READINESS_DB_TIMEOUT_MS` (2 s) instead of queueing
+  behind a saturated pool.
+- Contract state for `verifyAttestationState`, `verifyPredicateState`,
+  `verifyDocument`, `verifyPredicateAttestation`, `claimDisclosure` and the
+  disclosure reindex, and the crawler's ledger payload decoding, run in a second
+  worker thread (`NIGHTGATE_DECODE_WORKER_RPC_TIMEOUT_MS`). The main thread no
+  longer runs wasm.
+- Snapshot decryption derives keys off the event loop; a carried snapshot already
+  under the account key is kept as is (was re-derived and decrypted on every save).
+- Event-loop lag is logged above `NIGHTGATE_EVENT_LOOP_LAG_WARN_MS` (500 ms) with
+  the pool wait depth; `getMetrics()` gains `event_loop_lag_p99_ms`,
+  `event_loop_lag_max_ms` and the `decode_worker_*` gauges.
+- `docker/watchdog.sh` skips restarts for `NIGHTGATE_WATCHDOG_START_GRACE` (900 s)
+  after a container start and logs each skip.
+- `scripts/presync-wallets.mjs` syncs sponsor wallets on any machine;
+  `scripts/import-wallet-state.mjs` loads the states into a stopped server.
+
 ## 0.30.4 - 2026-10-05
 
 ### Changes

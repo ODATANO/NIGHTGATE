@@ -21,6 +21,7 @@ const cap = cds.test(__dirname + '/../..');
 // The booted service runs the compiled modules: spy on what Node loaded.
 /* eslint-disable @typescript-eslint/no-require-imports */
 const registryModule = require('../../srv/submission/holder-registry');
+const decodeWorker = require('../../srv/midnight/decode-worker-client');
 const verifyState = require('../../srv/submission/verify-state');
 const contractRegistry = require('../../srv/submission/contract-registry');
 const { getNightgatePluginConfig } = require('../../srv/utils/nightgate-config');
@@ -38,7 +39,8 @@ const asLab = { authorization: 'Basic ' + Buffer.from('issuer-lab:lab-secret').t
 const asX = { authorization: 'Basic ' + Buffer.from('reader-x:x-secret').toString('base64') };
 const asToken = { 'x-agent-token': TOKEN };
 
-const readSpy = vi.spyOn(registryModule, 'readHolderRegistration');
+// The registry is read in the decode worker; the handler reaches it through this client function.
+const readSpy = vi.spyOn(decodeWorker, 'readHolderRegistrationInWorker');
 const liveSpy = vi.spyOn(verifyState, 'liveProviderConfigured');
 
 async function post(action: string, body: Record<string, unknown>, headers: Record<string, string>) {

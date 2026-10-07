@@ -8,8 +8,9 @@ import cds, { type ActionRequest } from '@sap/cds';
 import { verifyAttestationState, verifyPredicateState } from '#cds-models/NightgateService';
 import { resolveContract, ContractNotRegisteredError, getContractRegistration, slotWidthOf } from './contract-registry';
 import { CoercionError } from './arg-coercion';
-import { readAttestationStateForContract } from './attestation-state';
-import { readPredicateStateForContract } from './predicate-state';
+import type { readAttestationStateForContract } from './attestation-state';
+import type { readPredicateStateForContract } from './predicate-state';
+import { readAttestationStateInWorker, readPredicateStateInWorker } from '../midnight/decode-worker-client';
 import type { ContractProvidersConfig } from '../midnight/providers';
 import {
     resolveNightgateRuntimeConfig,
@@ -132,8 +133,8 @@ async function runVerify<T>(req: ActionRequest<unknown, unknown>, op: () => Prom
 /** Register both state-verification functions on `srv`. */
 export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: VerifyStateDeps = {}): void {
     const contractResolver = deps.contractResolver ?? resolveContract;
-    const attestationStateReader = deps.attestationStateReader ?? readAttestationStateForContract;
-    const predicateStateReader = deps.predicateStateReader ?? readPredicateStateForContract;
+    const attestationStateReader = deps.attestationStateReader ?? readAttestationStateInWorker;
+    const predicateStateReader = deps.predicateStateReader ?? readPredicateStateInWorker;
     const gate = deps.gate;
 
     srv.on(verifyAttestationState, async (req) => {
@@ -166,6 +167,7 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
                 contentRoot: data.contentRoot ?? undefined,
                 schemaId: data.schemaId ?? undefined,
                 artifactPath: resolved.artifactPath,
+                artifactDigest: resolved.artifactDigest,
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
             });
 
@@ -277,6 +279,7 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
                 k,
                 slotWidth: vaultDims(compiledRef).width,
                 artifactPath: resolved.artifactPath,
+                artifactDigest: resolved.artifactDigest,
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
             });
 

@@ -974,9 +974,11 @@ Process identity plus two digests per registered contract: `artifactDigest` (the
 Process-level worker health (per facade: `getWalletSyncProgress`). A climbing `exitCount` means crash-looping; an ever-growing `inFlightRpcs` a stall. Not part of `getReadiness` (a busy worker must not leave rotation). `facades[]` is admin-only (its ids identify wallets across tenants); `facadeCount` is always set. `@requires: 'authenticated-user'`.
 
 ### `getLiveness() → { status, timestamp, uptime }`
-### `getReadiness() → { ready, crawlerEnabled, checks: { database, crawler, node, runtime, initialization }, initializationMode }`
+### `getReadiness() → { ready, phase, crawlerEnabled, checks: { database, crawler, node, runtime, initialization }, initializationMode }`
 
 Kubernetes-style probes. `ready: true` when every applicable check passes; a disabled crawler (the Docker default) passes `crawler`/`node` as not applicable (`crawlerEnabled: false`).
+
+`phase` is `starting`, `failed`, `warming`, `catching-up`, `ready` or `degraded` (started fine, a check fails now). While `warming` (the sponsor pool prewarm runs) the process is `ready` on `runtime` and `initialization` alone; the database read is bounded by `NIGHTGATE_READINESS_DB_TIMEOUT_MS`.
 
 `initialization` is true only after `initialize()` completed and did not end offline. It fails for:
 

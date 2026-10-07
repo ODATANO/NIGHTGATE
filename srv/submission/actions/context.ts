@@ -68,6 +68,7 @@ export function createStateVerifiers(deps: Pick<SubmissionDeps, 'contractResolve
                 attesterId,
                 payloadHash,
                 artifactPath: resolved.artifactPath,
+                artifactDigest: resolved.artifactDigest,
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, networkOverride)
             });
             return Boolean(state?.attested);
@@ -107,6 +108,7 @@ export function createStateVerifiers(deps: Pick<SubmissionDeps, 'contractResolve
                 k: row.predicate === 'documentDiff' ? Number(row.threshold) : undefined,
                 slotWidth: vaultDims(rowRef).width,
                 artifactPath: resolved.artifactPath,
+                artifactDigest: resolved.artifactDigest,
                 contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, recordedNetwork)
             });
             return proven === true;
@@ -162,6 +164,7 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
             db,
             contractAddress,
             artifactPath: resolved.artifactPath,
+            artifactDigest: resolved.artifactDigest,
             contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath),
             atHeight
         });

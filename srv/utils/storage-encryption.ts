@@ -111,16 +111,28 @@ export function extractEncryptedComponents(data: Buffer): EncryptedComponents {
     };
 }
 
-/** Decrypts data in the SDK format, using the salt stored inside it. */
+/** Decrypts data in the SDK format, using the salt stored inside it. Derives the key on the calling thread. */
 export function decryptWithPassword(encryptedData: string, password: string): string {
-    const data = Buffer.from(encryptedData, 'base64');
-    const { version, salt, iv, authTag, encrypted } = extractEncryptedComponents(data);
-    if (version !== CURRENT_ENCRYPTION_VERSION) {
-        throw new Error(`Unsupported encryption version: ${version}`);
+    const parts = checkedComponents(encryptedData);
+    return decryptComponents(parts, deriveKey(password, parts.salt));
+}
+
+/** Same as `decryptWithPassword`, but derives the key without blocking the event loop. */
+export async function decryptWithPasswordAsync(encryptedData: string, password: string): Promise<string> {
+    const parts = checkedComponents(encryptedData);
+    return decryptComponents(parts, await deriveKeyAsync(password, parts.salt));
+}
+
+function checkedComponents(encryptedData: string): EncryptedComponents {
+    const parts = extractEncryptedComponents(Buffer.from(encryptedData, 'base64'));
+    if (parts.version !== CURRENT_ENCRYPTION_VERSION) {
+        throw new Error(`Unsupported encryption version: ${parts.version}`);
     }
-    const key      = deriveKey(password, salt);
+    return parts;
+}
+
+function decryptComponents({ iv, authTag, encrypted }: EncryptedComponents, key: Buffer): string {
     const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH });
     decipher.setAuthTag(authTag);
-    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-    return decrypted.toString('utf-8');
+    return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf-8');
 }

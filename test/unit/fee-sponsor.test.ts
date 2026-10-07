@@ -30,6 +30,7 @@ import {
     prewarmSyncBudgetMs,
     FeeSponsorError
 } from '../../srv/submission/fee-sponsor';
+import { readPrewarmState } from '../../srv/utils/runtime-state';
 import { deriveAccountId, deriveStoragePassword } from '../../srv/submission/wallet-material-factory';
 import { encrypt } from '../../srv/utils/crypto';
 import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
@@ -265,6 +266,19 @@ describe('prewarmFeeSponsorPool (boot)', () => {
         walletWaitForSyncedStateMock.mockClear();
         await prewarmFeeSponsorPool({ db, encryptionKey: TEST_KEY, syncBudgetMs: 0, facadeConfig: cfg });
         expect(walletWaitForSyncedStateMock).not.toHaveBeenCalled();
+    });
+
+    it('publishes its progress for readiness: running while sponsors warm, finished with the counts afterwards', async () => {
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-session-1';
+        const db = { run: vi.fn(async () => sponsorRow({ sessionId: 'sponsor-session-1' })) };
+        const seen: boolean[] = [];
+        getOrBuildWalletFacadeMock.mockImplementation(async () => { seen.push(readPrewarmState().running); return {}; });
+        walletWaitForSyncedStateMock.mockImplementation(async () => ({ synced: true }));
+        const cfg = { networkId: 'preprod', indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i', proofServerUrl: 'http://p', relayUrl: 'ws://n' } as any;
+        await prewarmFeeSponsorPool({ db, encryptionKey: TEST_KEY, facadeConfig: cfg });
+        expect(seen).toEqual([true]);
+        expect(readPrewarmState()).toMatchObject({ running: false, total: 1, warmed: 1, failed: 0 });
+        expect(readPrewarmState().finishedAt).toBeTruthy();
     });
 
     it('prewarmSyncBudgetMs: default 30 min, env override, invalid values fall back', () => {

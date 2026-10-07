@@ -5,53 +5,20 @@
  */
 import cds from '@sap/cds';
 import { DisclosureGrants, type DisclosureGrant } from '#cds-models/midnight';
-import { importArtifactByPath } from './contract-registry';
+import { readDisclosureGrantsInWorker } from '../midnight/decode-worker-client';
+import { enumerateGrants, type DisclosureLedger, type DisclosureGrantRecord } from './disclosure-grants';
 import type { DbRunner } from '../utils/db-types';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
-function hex(b: Uint8Array): string {
-    return Buffer.from(b).toString('hex');
-}
-
-/** The part of the contract's decoded state that this module reads. */
-export interface DisclosureLedger {
-    attestations: Iterable<[Uint8Array, { payload_hash: Uint8Array; owner: Uint8Array }]>;
-    disclosures: {
-        member(key: Uint8Array): boolean;
-        lookup(key: Uint8Array): Iterable<[Uint8Array, bigint]>;
-    };
-}
-
-export interface DisclosureGrantRecord {
-    attesterId: string;
-    payloadHash: string;
-    grantee: string;
-    level: number;
-}
-
-/** All active grants. The `disclosures` map cannot be iterated, so its keys come from `attestations`. */
-export function enumerateGrants(led: DisclosureLedger): DisclosureGrantRecord[] {
-    const rows: DisclosureGrantRecord[] = [];
-    for (const [recordKey, record] of led.attestations) {
-        if (!led.disclosures.member(recordKey)) continue;
-        for (const [granteeBytes, levelBig] of led.disclosures.lookup(recordKey)) {
-            rows.push({
-                attesterId: hex(record.owner),
-                payloadHash: hex(record.payload_hash),
-                grantee: hex(granteeBytes),
-                level: Number(levelBig)
-            });
-        }
-    }
-    return rows;
-}
+export { enumerateGrants };
+export type { DisclosureLedger, DisclosureGrantRecord };
 
 export interface ReindexDeps {
     db: DbRunner;
     contractAddress: string;
-    ledger: (state: any) => DisclosureLedger;
-    queryContractState: (contractAddress: string, atHeight?: number) => Promise<any | null>;
+    /** The grants on chain at a block height, or null when the contract has no state. */
+    readGrants: (contractAddress: string, atHeight?: number) => Promise<DisclosureGrantRecord[] | null>;
     /** Block height where the triggering change landed. The state is read at this height. */
     atHeight?: number | null;
     /** Latest indexed block height. Used when `atHeight` is not given. */
@@ -96,7 +63,7 @@ export function reindexDisclosures(deps: ReindexDeps): Promise<ReindexResult> {
 }
 
 async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
-    const { db, ledger, queryContractState } = deps;
+    const { db, readGrants } = deps;
     const contractAddress = deps.contractAddress.toLowerCase();
     const sweepGraceMs = deps.sweepGraceMs ?? DEFAULT_SWEEP_GRACE_MS;
 
@@ -104,12 +71,8 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
     if (height === null && deps.queryTipHeight) {
         try { height = await deps.queryTipHeight(); } catch { height = null; }
     }
-    const state = await queryContractState(contractAddress, height ?? undefined);
-    if (!state) return { indexed: 0, deactivated: 0, snapshotHeight: height };
-
-    // The state may come wrapped with the ledger in `.data`, or bare.
-    const led = ledger(state.data ?? state);
-    const onChain = enumerateGrants(led);
+    const onChain = await readGrants(contractAddress, height ?? undefined);
+    if (!onChain) return { indexed: 0, deactivated: 0, snapshotHeight: height };
 
     const now = new Date().toISOString();
     const seen = new Set<string>();
@@ -196,30 +159,32 @@ export interface ReindexForContractArgs {
     db: DbRunner;
     contractAddress: string;
     artifactPath: string;
+    /** Build of the artifact to load. Without it the module at `artifactPath` is imported as is. */
+    artifactDigest?: string;
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
     atHeight?: number | null;
 }
 
 /**
- * Reindexes one contract using the real providers.
+ * Reindexes one contract from the live chain state, decoded in the decode worker.
  * Callers treat a failure as non-fatal, it must not fail the grant or revoke.
  */
 export async function reindexDisclosuresForContract(
     args: ReindexForContractArgs
 ): Promise<ReindexResult> {
-    const { db, contractAddress, artifactPath, contractProvidersConfig } = args;
-
-    const { buildContractProviders } = await import('../midnight/providers.js');
-    const bundle = await buildContractProviders(contractProvidersConfig);
-    const artifact: any = await importArtifactByPath(artifactPath);
-
+    const { db, contractAddress, artifactPath, artifactDigest, contractProvidersConfig } = args;
     return reindexDisclosures({
         db,
         contractAddress,
-        ledger: artifact.ledger,
         atHeight: args.atHeight ?? null,
         queryTipHeight: () => queryIndexerTipHeight(contractProvidersConfig.indexerHttpUrl),
-        queryContractState: (addr: string, atHeight?: number) => bundle.publicDataProvider.queryContractState(
-            addr, atHeight === undefined ? undefined : { type: 'blockHeight', blockHeight: atHeight })
+        readGrants: (addr, atHeight) => readDisclosureGrantsInWorker({
+            contractAddress: addr,
+            atHeight,
+            artifactPath,
+            artifactDigest,
+            indexerHttpUrl: contractProvidersConfig.indexerHttpUrl,
+            indexerWsUrl: contractProvidersConfig.indexerWsUrl
+        })
     });
 }
