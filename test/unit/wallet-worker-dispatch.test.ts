@@ -71,6 +71,14 @@ vi.mock('../../srv/utils/wallet-hd', () => ({
     }))
 }));
 
+const verifyCollapsedDustInHelper = vi.hoisted(() => vi.fn(async (): Promise<{ ok: true } | { ok: false; reason: string }> => ({ ok: true })));
+vi.mock('../../srv/midnight/worker/dust-verify', () => ({
+    verifyCollapsedDustInHelper,
+    dustCollapseBudgetMs: () => 30_000,
+    getDustVerifyWorkerStatus: () => ({ running: false, inFlightRpcs: 0, exitCount: 0, lastExitCode: null, lastExitAt: null }),
+    stopDustVerifyWorker: async () => undefined
+}));
+
 vi.mock('../../srv/submission/contract-witnesses', () => ({
     deriveAttestationSecret: vi.fn(() => new Uint8Array(32).fill(9)),
     deriveTokenFactoryIssuerSecret: vi.fn(() => new Uint8Array(32).fill(8)),
@@ -1842,13 +1850,12 @@ describe('snapshot replay', () => {
 
     it('applySaveAck drops a shielded blob acked under a stale epoch', () => {
         const entry: any = {
-            pendingSaves: new Map([[9, { shielded: 'OLD-SH', unshielded: 'UN-9' }]]),
-            shieldedSaveEpochs: new Map([[9, 0]]),
+            pendingSaves: new Map([[9, { blobs: { shielded: 'OLD-SH', unshielded: 'UN-9' }, shieldedEpoch: 0, dustEpoch: 0 }]]),
             shieldedEpoch: 1
         };
         workerExports.applySaveAck(entry, 9);
         expect(entry.lastSavedBlobs).toEqual({ unshielded: 'UN-9' });
-        expect(entry.shieldedSaveEpochs.size).toBe(0);
+        expect(entry.pendingSaves.size).toBe(0);
     });
 });
 
@@ -2026,10 +2033,34 @@ describe('dust snapshot collapse on save', () => {
 
     afterEach(() => { delete process.env.NIGHTGATE_DUST_SNAPSHOT_COLLAPSE; });
 
+    const NIGHT = 'a8ccef598a65df79c2546a61c85a52c1ec0684a0195858e9149dec6446ece151';
+    const ledgerState = (opts: { collapsed?: Array<[bigint, bigint]> } = {}): any => ({
+        utxos: [{ backingNight: NIGHT }],
+        syncTime: new Date('2026-10-07T10:00:00Z'),
+        toString: () => `DustLocalState { generating_tree_first_free: 4, night_indices: {InitialNonce(${NIGHT}): 1}, dust_utxos: {} }`,
+        collapseGenerationTree: (lo: bigint, hi: bigint) => ledgerState({ collapsed: [...(opts.collapsed ?? []), [lo, hi]] }),
+        serialize: () => new Uint8Array([(opts.collapsed ?? []).length]),
+        generatingTreeRoot: () => 7n,
+        commitmentTreeRoot: () => 9n,
+        walletBalance: () => 5n
+    });
+    const fullBlob = JSON.stringify({ publicKey: 'pk', state: 'aabbccdd', offset: '1' });
+    const walletStateWith = (appliedIndex: string) => ({
+        serialize: () => fullBlob,
+        progress: { appliedIndex },
+        totalCoins: [{}],
+        pendingCoins: [],
+        state: { state: ledgerState() }
+    });
+    const warnCount = () => fakeParentPort.postMessage.mock.calls.filter(c => c[0]?.kind === 'log' && /uncollapsed/.test(c[0].message)).length;
+
+    beforeEach(() => { verifyCollapsedDustInHelper.mockReset().mockResolvedValue({ ok: true }); });
+
     it('uses serializeState while the flag is off', async () => {
         const dust = { serializeState: vi.fn(async () => 'BLOB-DU'), state: emitting({}) };
         const out = await workerExports.collectSerializedStates({ dust });
-        expect(out.dust).toBe('BLOB-DU');
+        expect(out.blobs.dust).toBe('BLOB-DU');
+        expect(out.dustCollapse).toBeUndefined();
         expect(dust.serializeState).toHaveBeenCalledTimes(1);
     });
 
@@ -2037,37 +2068,138 @@ describe('dust snapshot collapse on save', () => {
         process.env.NIGHTGATE_DUST_SNAPSHOT_COLLAPSE = 'true';
         const walletState = { serialize: () => '{"state":"aa"}', state: { state: { toString: () => 'no fields', utxos: [] } } };
         const dust = { serializeState: vi.fn(async () => 'BLOB-DU'), state: emitting(walletState) };
-        const warnsBefore = fakeParentPort.postMessage.mock.calls.filter(c => c[0]?.kind === 'log' && /uncollapsed/.test(c[0].message)).length;
-        expect((await workerExports.collectSerializedStates({ dust })).dust).toBe('BLOB-DU');
-        expect((await workerExports.collectSerializedStates({ dust })).dust).toBe('BLOB-DU');
-        const warns = fakeParentPort.postMessage.mock.calls.filter(c => c[0]?.kind === 'log' && /uncollapsed/.test(c[0].message)).length;
-        expect(warns - warnsBefore).toBeLessThanOrEqual(1);
+        const warnsBefore = warnCount();
+        const first = await workerExports.collectSerializedStates({ dust });
+        expect(first.blobs.dust).toBe('BLOB-DU');
+        expect(first.dustCollapse).toMatchObject({ outcome: 'uncollapsed', verifyMs: null });
+        expect((await workerExports.collectSerializedStates({ dust })).blobs.dust).toBe('BLOB-DU');
+        expect(warnCount() - warnsBefore).toBeLessThanOrEqual(1);
         expect(dust.serializeState).toHaveBeenCalledTimes(2);
+        expect(verifyCollapsedDustInHelper).not.toHaveBeenCalled();
+    });
+
+    it('collapses on the wallet thread, verifies in the helper and returns the collapsed blob with its key', async () => {
+        process.env.NIGHTGATE_DUST_SNAPSHOT_COLLAPSE = 'true';
+        const dust = { serializeState: vi.fn(async () => 'BLOB-DU'), state: emitting(walletStateWith('100')) };
+        const out = await workerExports.collectSerializedStates({ dust });
+        expect(verifyCollapsedDustInHelper).toHaveBeenCalledTimes(1);
+        const [bytes, expectation] = verifyCollapsedDustInHelper.mock.calls[0] as any;
+        expect([...bytes]).toEqual([2]);
+        expect(expectation).toEqual({ generatingTreeRoot: '7', commitmentTreeRoot: '9', balance: '5', utxoCount: 1, syncTimeMs: Date.parse('2026-10-07T10:00:00Z') });
+        expect(JSON.parse(out.blobs.dust)).toEqual({ publicKey: 'pk', state: '02', offset: '1' });
+        expect(out.dustKey).toBe('100:1:0');
+        expect(out.dustCollapse).toMatchObject({ outcome: 'collapsed', fullBytes: 4, bytes: 1 });
+        expect(out.dustCollapse.verifyMs).toBeGreaterThanOrEqual(0);
+        expect(dust.serializeState).not.toHaveBeenCalled();
+    });
+
+    it('skips the dust part entirely while the key equals the confirmed save of the same wallet epoch', async () => {
+        process.env.NIGHTGATE_DUST_SNAPSHOT_COLLAPSE = 'true';
+        const walletState = walletStateWith('100');
+        const serialize = vi.spyOn(walletState, 'serialize');
+        const dust = { serializeState: vi.fn(async () => 'BLOB-DU'), state: emitting(walletState) };
+        const skip = { dustEpoch: 1, lastSavedDustKey: { epoch: 1, key: '100:1:0' } };
+        const out = await workerExports.collectSerializedStates({ dust }, skip);
+        expect(out.blobs.dust).toBeUndefined();
+        expect(out.dustKey).toBeUndefined();
+        expect(out.dustCollapse).toMatchObject({ outcome: 'skipped' });
+        expect(serialize).not.toHaveBeenCalled();
+        expect(verifyCollapsedDustInHelper).not.toHaveBeenCalled();
+
+        // Another epoch (the dust wallet was replaced) or another key collapses again.
+        expect((await workerExports.collectSerializedStates({ dust }, { dustEpoch: 2, lastSavedDustKey: { epoch: 1, key: '100:1:0' } })).blobs.dust).toBeDefined();
+        expect((await workerExports.collectSerializedStates({ dust }, { dustEpoch: 1, lastSavedDustKey: { epoch: 1, key: '101:1:0' } })).blobs.dust).toBeDefined();
+    });
+
+    it('saves the full snapshot when the helper refuses or runs past its budget, warning once per reason', async () => {
+        process.env.NIGHTGATE_DUST_SNAPSHOT_COLLAPSE = 'true';
+        const dust = { serializeState: vi.fn(async () => 'BLOB-DU'), state: emitting(walletStateWith('100')) };
+        const warnsBefore = warnCount();
+
+        verifyCollapsedDustInHelper.mockResolvedValue({ ok: false, reason: 'collapsed state does not restore to the same roots, balance and UTXOs' });
+        const refused = await workerExports.collectSerializedStates({ dust });
+        expect(refused.blobs.dust).toBe(fullBlob);
+        expect(refused.dustKey).toBe('100:1:0');
+        expect(refused.dustCollapse).toMatchObject({ outcome: 'uncollapsed', fullBytes: 4, bytes: 4 });
+
+        verifyCollapsedDustInHelper.mockRejectedValue(new Error("dust-verify-worker rpc 'verifyCollapsedDust' timed out after 30000ms"));
+        const late = await workerExports.collectSerializedStates({ dust });
+        expect(late.blobs.dust).toBe(fullBlob);
+        expect(late.dustCollapse).toMatchObject({ outcome: 'uncollapsed' });
+        await workerExports.collectSerializedStates({ dust });
+
+        // One warning per distinct reason: the refusal and the timeout.
+        expect(warnCount() - warnsBefore).toBe(2);
+        expect(dust.serializeState).not.toHaveBeenCalled();
+    });
+
+    it('the save tick reports the collapse to the main thread and remembers the key on the ack', async () => {
+        process.env.NIGHTGATE_DUST_SNAPSHOT_COLLAPSE = 'true';
+        vi.useFakeTimers();
+        const SESSION = 'session-collapse-tick-kkkkkk';
+        try {
+            const facade = await initSession(SESSION);
+            facade.dust.state = emitting(walletStateWith('100'));
+            fakeParentPort.postMessage.mockClear();
+
+            await vi.advanceTimersByTimeAsync(30_000);
+            const stats = fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'save-stats' && m.sessionId === SESSION);
+            expect(stats).toHaveLength(1);
+            expect(stats[0].dust).toMatchObject({ outcome: 'collapsed' });
+            const save = stateSaves().at(-1);
+            expect(JSON.parse(save.blobs.dust).state).toBe('02');
+
+            fakeParentPort.emit('message', { kind: 'state-save-ack', sessionId: SESSION, seq: save.seq });
+            expect(workerExports.facades.get(SESSION).lastSavedDustKey).toEqual({ epoch: 0, key: '100:1:0' });
+
+            // Unchanged: the next tick skips the collapse and pushes nothing.
+            fakeParentPort.postMessage.mockClear();
+            await vi.advanceTimersByTimeAsync(30_000);
+            expect(stateSaves()).toHaveLength(0);
+            const skipped = fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'save-stats' && m.sessionId === SESSION);
+            expect(skipped.at(-1).dust).toMatchObject({ outcome: 'skipped' });
+            expect(verifyCollapsedDustInHelper).toHaveBeenCalledTimes(1);
+        } finally {
+            await rpc('evict', { sessionId: SESSION });
+            vi.useRealTimers();
+        }
     });
 });
 
 describe('dust save epoch guard', () => {
     it('applySaveAck drops a dust blob acked under a stale epoch but merges the rest', () => {
         const entry: any = {
-            pendingSaves: new Map([[7, { shielded: 'SH-7', dust: 'POISON' }]]),
-            dustSaveEpochs: new Map([[7, 0]]),
+            pendingSaves: new Map([[7, { blobs: { shielded: 'SH-7', dust: 'POISON' }, dustEpoch: 0, shieldedEpoch: 0, dustKey: '1:1:0' }]]),
             dustEpoch: 1,
-            lastSavedBlobs: { unshielded: 'UN-0' }
+            lastSavedBlobs: { unshielded: 'UN-0' },
+            lastSavedDustKey: { epoch: 1, key: '9:9:9' }
         };
         workerExports.applySaveAck(entry, 7);
         expect(entry.lastSavedBlobs).toEqual({ unshielded: 'UN-0', shielded: 'SH-7' });
         expect(entry.pendingSaves.size).toBe(0);
-        expect(entry.dustSaveEpochs.size).toBe(0);
+        // The stale dust save does not touch the key of the current wallet either.
+        expect(entry.lastSavedDustKey).toEqual({ epoch: 1, key: '9:9:9' });
     });
 
-    it('applySaveAck merges a dust blob acked under the current epoch', () => {
+    it('applySaveAck merges a dust blob acked under the current epoch and remembers its key', () => {
         const entry: any = {
-            pendingSaves: new Map([[8, { dust: 'CLEAN' }]]),
-            dustSaveEpochs: new Map([[8, 1]]),
+            pendingSaves: new Map([[8, { blobs: { dust: 'CLEAN' }, dustEpoch: 1, shieldedEpoch: 0, dustKey: '100:2:0' }]]),
             dustEpoch: 1
         };
         workerExports.applySaveAck(entry, 8);
         expect(entry.lastSavedBlobs).toEqual({ dust: 'CLEAN' });
+        expect(entry.lastSavedDustKey).toEqual({ epoch: 1, key: '100:2:0' });
+    });
+
+    it('applySaveAck forgets the key when a dust save without one lands (a restore re-save)', () => {
+        const entry: any = {
+            pendingSaves: new Map([[9, { blobs: { dust: 'RESTORED' }, dustEpoch: 2, shieldedEpoch: 0 }]]),
+            dustEpoch: 2,
+            lastSavedDustKey: { epoch: 1, key: '100:2:0' }
+        };
+        workerExports.applySaveAck(entry, 9);
+        expect(entry.lastSavedBlobs).toEqual({ dust: 'RESTORED' });
+        expect(entry.lastSavedDustKey).toBeUndefined();
     });
 
     it('tick collects poisoned -> restore pushes clean -> the late tick push carries no dust', async () => {

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.31.1 - 2026-10-07
+
+### Changes
+
+- Dust snapshot collapse: the restore check of the collapsed state runs in a
+  helper thread of the wallet worker; the wallet thread only collapses and
+  serializes. A check past `NIGHTGATE_DUST_COLLAPSE_BUDGET_MS` (30 s) saves the
+  full snapshot once and restarts the helper.
+- A save tick skips the dust part while the dust state is unchanged since the
+  last confirmed save (applied ledger event, coin and pending coin counts).
+- `getMetrics()` gains `dust_collapse_ms`, `dust_collapse_p99_ms` and
+  `dust_collapse_runs_total{outcome}` per wallet; a collapse over 5 s is logged
+  at INFO.
+- `scripts/profile-workers.mjs`: CPU profile of the main thread and every
+  worker thread through the inspector.
+- One worker-thread RPC module (`srv/midnight/worker-rpc/`) serves the decode
+  worker and the new helper.
+
 ## 0.31.0 - 2026-10-07
 
 ### Changes

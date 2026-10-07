@@ -15,8 +15,10 @@ import { getSharedKeyMaterialProvider } from '../wasm-proof-provider';
 import { deriveAttestationSecret, deriveTokenFactoryIssuerSecret } from '../../submission/contract-witnesses';
 import { deriveRoleSeeds } from '../../utils/wallet-hd';
 import { parentPort } from 'node:worker_threads';
-import { FacadeEntry, InitArgs, ensureNetworkId, facades, getSdkVersion, loadProvingSdk, loadSdk, log, resolveProvingMode } from './context';
-import { collapsedDustSnapshot } from './dust-collapse';
+import { FacadeEntry, InitArgs, PendingSave, SerializedBlobs, ensureNetworkId, facades, getSdkVersion, loadProvingSdk, loadSdk, log, resolveProvingMode } from './context';
+import { collapseDustState, collapsedDustBlob, dustSaveKey } from './dust-collapse';
+import { verifyCollapsedDustInHelper } from './dust-verify';
+import type { DustCollapseSample } from '../dust-collapse-stats';
 import {
     ReplayKind, appliedIndexOf, describeSyncState, formatSyncState, lastReplayRejection,
     observeReplayTrack, shouldResetRestoredSubWallet
@@ -552,29 +554,26 @@ export function resolveSaveAckWaiter(seq: number): void {
     saveAckWaiters.get(seq)?.();
 }
 
-/**
- * `lastSavedBlobs` changes only on confirmation, so a lost save is sent again on the next tick.
- * `beforePost` runs before sending, so a waiter is registered before any confirmation can arrive.
- */
-export function pushStateSave(sessionId: string, entry: FacadeEntry, blobs: { shielded?: string; unshielded?: string; dust?: string }, beforePost?: (seq: number) => void): number {
+export interface PushStateSaveOptions {
+    /** Runs before sending, so a waiter is registered before any confirmation can arrive. */
+    beforePost?: (seq: number) => void;
+    /** `dustSaveKey` of the dust blob, remembered on confirmation so an unchanged state skips the next collapse. */
+    dustKey?: string;
+}
+
+/** `lastSavedBlobs` changes only on confirmation, so a lost save is sent again on the next tick. */
+export function pushStateSave(sessionId: string, entry: FacadeEntry, blobs: SerializedBlobs, options: PushStateSaveOptions = {}): number {
     const seq = ++saveSeqCounter;
     entry.pendingSaves ??= new Map();
-    entry.pendingSaves.set(seq, blobs);
-    // Remember the epoch, so applySaveAck can ignore saves of a wallet that was replaced since.
-    if (blobs.dust !== undefined) {
-        (entry.dustSaveEpochs ??= new Map()).set(seq, entry.dustEpoch ?? 0);
-    }
-    if (blobs.shielded !== undefined) {
-        (entry.shieldedSaveEpochs ??= new Map()).set(seq, entry.shieldedEpoch ?? 0);
-    }
+    // The epochs let applySaveAck ignore saves of a wallet that was replaced since.
+    const pending: PendingSave = { blobs, dustEpoch: entry.dustEpoch ?? 0, shieldedEpoch: entry.shieldedEpoch ?? 0 };
+    if (blobs.dust !== undefined && options.dustKey !== undefined) pending.dustKey = options.dustKey;
+    entry.pendingSaves.set(seq, pending);
     // Keep the map small when the main thread never confirms.
     if (entry.pendingSaves.size > 4) {
-        const oldest = Math.min(...entry.pendingSaves.keys());
-        entry.pendingSaves.delete(oldest);
-        entry.dustSaveEpochs?.delete(oldest);
-        entry.shieldedSaveEpochs?.delete(oldest);
+        entry.pendingSaves.delete(Math.min(...entry.pendingSaves.keys()));
     }
-    beforePost?.(seq);
+    options.beforePost?.(seq);
     parentPort?.postMessage({
         kind: 'state-save',
         sessionId,
@@ -590,9 +589,9 @@ export function restoreSaveAckTimeoutMs(): number {
 }
 
 /** Resolves when the main thread confirms the save. Rejects after `timeoutMs`, because a failed save is never confirmed. */
-export function pushStateSaveAcked(sessionId: string, entry: FacadeEntry, blobs: { shielded?: string; unshielded?: string; dust?: string }, timeoutMs: number): Promise<void> {
+export function pushStateSaveAcked(sessionId: string, entry: FacadeEntry, blobs: SerializedBlobs, timeoutMs: number, dustKey?: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-        pushStateSave(sessionId, entry, blobs, (seq) => {
+        const beforePost = (seq: number): void => {
             const timer = setTimeout(() => {
                 saveAckWaiters.delete(seq);
                 reject(new Error(`state-save seq=${seq} not acked within ${timeoutMs}ms`));
@@ -603,7 +602,8 @@ export function pushStateSaveAcked(sessionId: string, entry: FacadeEntry, blobs:
                 saveAckWaiters.delete(seq);
                 resolve();
             });
-        });
+        };
+        pushStateSave(sessionId, entry, blobs, { beforePost, dustKey });
     });
 }
 
@@ -612,21 +612,23 @@ export function pushStateSaveAcked(sessionId: string, entry: FacadeEntry, blobs:
  * A part saved before its wallet was replaced is ignored.
  */
 export function applySaveAck(entry: FacadeEntry, seq: number): void {
-    const blobs = entry.pendingSaves?.get(seq);
-    if (!blobs) return;
-    let effective = blobs;
-    if (blobs.dust !== undefined && (entry.dustSaveEpochs?.get(seq) ?? 0) !== (entry.dustEpoch ?? 0)) {
+    const pending = entry.pendingSaves?.get(seq);
+    if (!pending) return;
+    let effective = pending.blobs;
+    if (effective.dust !== undefined && pending.dustEpoch !== (entry.dustEpoch ?? 0)) {
         const { dust: _stale, ...rest } = effective;
         effective = rest;
     }
-    if (blobs.shielded !== undefined && (entry.shieldedSaveEpochs?.get(seq) ?? 0) !== (entry.shieldedEpoch ?? 0)) {
+    if (effective.shielded !== undefined && pending.shieldedEpoch !== (entry.shieldedEpoch ?? 0)) {
         const { shielded: _stale, ...rest } = effective;
         effective = rest;
     }
+    if (effective.dust !== undefined) {
+        // A dust save without a key (a restore's re-save) must not let an old key skip the next tick.
+        entry.lastSavedDustKey = pending.dustKey === undefined ? undefined : { epoch: pending.dustEpoch, key: pending.dustKey };
+    }
     entry.lastSavedBlobs = { ...entry.lastSavedBlobs, ...effective };
     entry.pendingSaves!.delete(seq);
-    entry.dustSaveEpochs?.delete(seq);
-    entry.shieldedSaveEpochs?.delete(seq);
 }
 
 /** Reports sync progress while no job waits, because `waitForGenuineSync` reports only during a wait. */
@@ -811,7 +813,8 @@ export function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
             const collectStart = Date.now();
             const epochAtCollect = entry.dustEpoch ?? 0;
             const shieldedEpochAtCollect = entry.shieldedEpoch ?? 0;
-            const blobs = await collectSerializedStates(entry.facade);
+            const { blobs, dustKey, dustCollapse } = await collectSerializedStates(entry.facade, entry);
+            if (dustCollapse) parentPort?.postMessage({ kind: 'save-stats', sessionId, dust: dustCollapse });
             if ((entry.dustEpoch ?? 0) !== epochAtCollect && blobs.dust) {
                 // The dust wallet was replaced meanwhile, so this blob may be the old one's. The replacement saved its own.
                 delete blobs.dust;
@@ -837,7 +840,7 @@ export function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
                 log('debug', `save-tick #${tickCount} unchanged, skipping push`);
                 return;
             }
-            const seq = pushStateSave(sessionId, entry, changed);
+            const seq = pushStateSave(sessionId, entry, changed, { dustKey });
             log('debug', `save-tick #${tickCount} pushed seq=${seq} (total ${Date.now() - tickStart}ms)`);
         } catch (err: unknown) {
             log('warn', `periodic save failed: ${formatErr(err)}`);
@@ -846,22 +849,40 @@ export function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
     entry.saveTimer.unref();
 }
 
-export async function collectSerializedStates(facade: any): Promise<{ shielded?: string; unshielded?: string; dust?: string }> {
-    const out: any = {};
+export interface CollectedStates {
+    blobs: SerializedBlobs;
+    /** `dustSaveKey` of `blobs.dust`, when the state exposed one. */
+    dustKey?: string;
+    /** Set when the collapse flag is on and the dust part was handled. */
+    dustCollapse?: DustCollapseSample;
+}
+
+/** The last confirmed dust save, so an unchanged dust state is not serialized again. */
+export type SaveSkipContext = Pick<FacadeEntry, 'dustEpoch' | 'lastSavedDustKey'>;
+
+export async function collectSerializedStates(facade: any, skip?: SaveSkipContext): Promise<CollectedStates> {
+    const blobs: SerializedBlobs = {};
+    const out: CollectedStates = { blobs };
     const tryOne = async (key: 'shielded' | 'unshielded' | 'dust') => {
         try {
             const sub = facade?.[key];
             if (key === 'dust' && sub?.state && configFlag('NIGHTGATE_DUST_SNAPSHOT_COLLAPSE')) {
+                const started = Date.now();
                 try {
-                    out.dust = await collapsedDustBlob(sub);
+                    const collapsed = await collapsedDustSave(sub, skip);
+                    out.dustCollapse = collapsed.sample;
+                    if (collapsed.skipped) return;
+                    blobs.dust = collapsed.blob;
+                    if (collapsed.dustKey !== null) out.dustKey = collapsed.dustKey;
                     return;
                 } catch (err) {
                     noteDustCollapseFallback(formatErr(err));
+                    out.dustCollapse = { outcome: 'uncollapsed', ms: Date.now() - started, verifyMs: null, fullBytes: null, bytes: null, at: new Date().toISOString() };
                 }
             }
             if (sub && typeof sub.serializeState === 'function') {
                 const blob = await sub.serializeState();
-                if (typeof blob === 'string') out[key] = blob;
+                if (typeof blob === 'string') blobs[key] = blob;
             }
         } catch {
             // One missing part must not block the others.
@@ -885,17 +906,44 @@ function firstEmission(observable: any, timeoutMs: number): Promise<any> {
     });
 }
 
-/** Like `serializeState()`, but with the dust tree shrunk (see dust-collapse.ts). */
-async function collapsedDustBlob(dust: any): Promise<string> {
-    const [walletState, sdk] = await Promise.all([firstEmission(dust.state, 30_000), loadSdk()]);
-    const t0 = Date.now();
-    const r = collapsedDustSnapshot(walletState, sdk.ledger.DustLocalState);
-    if (r.collapsed) {
-        log('debug', `dust snapshot collapsed ${r.fullBytes} -> ${r.bytes} bytes in ${Date.now() - t0}ms`);
-    } else if (r.reason) {
-        noteDustCollapseFallback(r.reason);
+// A collapse slower than this is logged at INFO, so the operator sees the cost grow.
+export const DUST_COLLAPSE_SLOW_MS = 5000;
+
+type CollapsedDustSave =
+    | { skipped: true; sample: DustCollapseSample }
+    | { skipped: false; blob: string; dustKey: string | null; sample: DustCollapseSample };
+
+/**
+ * Like `serializeState()`, but with the dust tree shrunk (see dust-collapse.ts).
+ * Skips everything while the state's key equals the last confirmed save's.
+ * The restore check runs in the helper thread; past its budget or failed, the full blob is saved.
+ */
+async function collapsedDustSave(dust: any, skip?: SaveSkipContext): Promise<CollapsedDustSave> {
+    const started = Date.now();
+    const walletState = await firstEmission(dust.state, 30_000);
+    const dustKey = dustSaveKey(walletState);
+    const last = skip?.lastSavedDustKey;
+    if (dustKey !== null && last && last.key === dustKey && last.epoch === (skip?.dustEpoch ?? 0)) {
+        log('debug', `dust snapshot unchanged (key ${dustKey}), collapse skipped`);
+        return { skipped: true, sample: { outcome: 'skipped', ms: Date.now() - started, verifyMs: null, fullBytes: null, bytes: null, at: new Date().toISOString() } };
     }
-    return r.blob;
+    const collapsed = collapseDustState(walletState);
+    const verifyStarted = Date.now();
+    let verdict: { ok: true } | { ok: false; reason: string };
+    try {
+        verdict = await verifyCollapsedDustInHelper(collapsed.bytes, collapsed.expect);
+    } catch (err) {
+        verdict = { ok: false, reason: formatErr(err) };
+    }
+    const verifyMs = Date.now() - verifyStarted;
+    const ms = Date.now() - started;
+    if (!verdict.ok) {
+        noteDustCollapseFallback(verdict.reason);
+        return { skipped: false, blob: collapsed.fullBlob, dustKey, sample: { outcome: 'uncollapsed', ms, verifyMs, fullBytes: collapsed.fullBytes, bytes: collapsed.fullBytes, at: new Date().toISOString() } };
+    }
+    const bytes = collapsed.bytes.length;
+    log(ms > DUST_COLLAPSE_SLOW_MS ? 'info' : 'debug', `dust snapshot collapsed ${collapsed.fullBytes} -> ${bytes} bytes in ${ms}ms (verify ${verifyMs}ms, ${collapsed.ranges} ranges, ${collapsed.ownLeaves} own leaves)`);
+    return { skipped: false, blob: collapsedDustBlob(collapsed.fullBlob, collapsed.bytes), dustKey, sample: { outcome: 'collapsed', ms, verifyMs, fullBytes: collapsed.fullBytes, bytes, at: new Date().toISOString() } };
 }
 
 function noteDustCollapseFallback(reason: string): void {
@@ -904,16 +952,13 @@ function noteDustCollapseFallback(reason: string): void {
     log('warn', `dust snapshot saved uncollapsed: ${reason}`);
 }
 
-export function hasAnyBlob(b: { shielded?: string; unshielded?: string; dust?: string }): boolean {
+export function hasAnyBlob(b: SerializedBlobs): boolean {
     return !!(b.shielded || b.unshielded || b.dust);
 }
 
-export function diffAgainstConfirmed(
-    entry: FacadeEntry,
-    blobs: { shielded?: string; unshielded?: string; dust?: string }
-): { shielded?: string; unshielded?: string; dust?: string } {
+export function diffAgainstConfirmed(entry: FacadeEntry, blobs: SerializedBlobs): SerializedBlobs {
     const saved = entry.lastSavedBlobs ?? {};
-    const changed: { shielded?: string; unshielded?: string; dust?: string } = {};
+    const changed: SerializedBlobs = {};
     if (blobs.shielded && blobs.shielded !== saved.shielded) changed.shielded = blobs.shielded;
     if (blobs.unshielded && blobs.unshielded !== saved.unshielded) changed.unshielded = blobs.unshielded;
     if (blobs.dust && blobs.dust !== saved.dust) changed.dust = blobs.dust;
@@ -1033,11 +1078,11 @@ export async function evict({ sessionId, awaitSaveAck }: { sessionId: string; aw
         // Wait for the confirmation before replying, because after the reply the main thread
         // no longer stores saves for this session. On timeout the unload continues.
         try {
-            const blobs = await collectSerializedStates(entry.facade);
+            const { blobs, dustKey } = await collectSerializedStates(entry.facade, entry);
             const changed = diffAgainstConfirmed(entry, blobs);
             if (hasAnyBlob(changed)) {
-                if (awaitSaveAck) await pushStateSaveAcked(sessionId, entry, changed, restoreSaveAckTimeoutMs());
-                else pushStateSave(sessionId, entry, changed);
+                if (awaitSaveAck) await pushStateSaveAcked(sessionId, entry, changed, restoreSaveAckTimeoutMs(), dustKey);
+                else pushStateSave(sessionId, entry, changed, { dustKey });
             }
         } catch (err) {
             saved = false;

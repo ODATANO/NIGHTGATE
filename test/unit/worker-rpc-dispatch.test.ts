@@ -1,14 +1,14 @@
-/** srv/midnight/decode-worker/dispatch.ts: one reply per call on the call's port, errors carried with their causes. */
+/** srv/midnight/worker-rpc/dispatch.ts: one reply per call on the call's port, errors carried with their causes. */
 
 import { describe, it, expect, vi } from 'vitest';
 import { MessageChannel } from 'node:worker_threads';
-import { createDispatcher, type DecodeRpcReply } from '../../srv/midnight/decode-worker/dispatch';
+import { createDispatcher, type WorkerRpcReply } from '../../srv/midnight/worker-rpc/dispatch';
 import { NightgateError } from '../../srv/utils/errors';
 
-function call(dispatch: (msg: unknown) => Promise<void>, method: string, args: unknown): Promise<DecodeRpcReply> {
+function call(dispatch: (msg: unknown) => Promise<void>, method: string, args: unknown): Promise<WorkerRpcReply> {
     const { port1, port2 } = new MessageChannel();
-    const reply = new Promise<DecodeRpcReply>((resolve) => {
-        port2.once('message', (m: DecodeRpcReply) => { port2.close(); resolve(m); });
+    const reply = new Promise<WorkerRpcReply>((resolve) => {
+        port2.once('message', (m: WorkerRpcReply) => { port2.close(); resolve(m); });
     });
     void dispatch({ kind: 'rpc', method, args, port: port1 });
     return reply;

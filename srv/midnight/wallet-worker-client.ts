@@ -12,6 +12,7 @@ import { nightgateErrorFromPayload, errorMessage } from '../utils/errors';
 import { isSubmittingMethod, WORKER_ROTATING, WORKER_ROTATED, WorkerSubmitError, isSubmitFailureCode } from './wallet-worker-protocol';
 import { getEncryptionKey } from '../utils/crypto';
 import { configMs, configNumberFrom, resolvedConfigSnapshot } from '../utils/config';
+import { recordDustCollapseSample, forgetDustCollapseStats, type DustCollapseSample } from './dust-collapse-stats';
 import type { profileWorker } from '#cds-models/NightgateAdminService';
 
 const log = cds.log('nightgate:worker-client');
@@ -215,6 +216,8 @@ export async function startWalletWorker(): Promise<void> {
                 if (!snapshot.dust && previousDust) snapshot.dust = previousDust;
                 syncProgressCache.set(msg.sessionId, snapshot);
             }
+        } else if (msg?.kind === 'save-stats') {
+            if (msg.sessionId && msg.dust) recordDustCollapseSample(msg.sessionId, msg.dust as DustCollapseSample);
         } else if (msg?.kind === 'private-state-rpc') {
             dispatchPrivateStateRpc(msg);
         } else if (msg?.kind === 'rotating') {
@@ -608,6 +611,7 @@ export async function walletEvict(sessionId: string): Promise<{ evicted: boolean
         return await rpc('evict', { sessionId, awaitSaveAck: true });
     } finally {
         syncProgressCache.delete(sessionId);
+        forgetDustCollapseStats(sessionId);
     }
 }
 

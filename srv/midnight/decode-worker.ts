@@ -6,7 +6,7 @@
 
 import { parentPort } from 'node:worker_threads';
 import { setConfigWarnSink } from '../utils/config';
-import { createDispatcher, type DecodeHandlers } from './decode-worker/dispatch';
+import { createDispatcher, type WorkerRpcHandlers } from './worker-rpc/dispatch';
 import { readPredicateStateForContract, type ReadPredicateStateForContractArgs } from '../submission/predicate-state';
 import { readAttestationStateForContract, type ReadAttestationStateForContractArgs } from '../submission/attestation-state';
 import { readDisclosureGrants, type ReadDisclosureGrantsArgs } from '../submission/disclosure-grants';
@@ -18,7 +18,7 @@ export function log(level: 'info' | 'warn' | 'debug' | 'error', message: string)
 }
 
 /** The callable methods. The client in `decode-worker-client.ts` has one typed wrapper per entry. */
-export const handlers: DecodeHandlers = {
+export const handlers: WorkerRpcHandlers = {
     readPredicateState: (args) => readPredicateStateForContract(args as ReadPredicateStateForContractArgs),
     readAttestationState: (args) => readAttestationStateForContract(args as ReadAttestationStateForContractArgs),
     readDisclosureGrants: (args) => readDisclosureGrants(args as ReadDisclosureGrantsArgs),

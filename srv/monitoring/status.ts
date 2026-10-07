@@ -20,6 +20,7 @@ import {
 } from '../submission/contract-registry';
 import { getWalletWorkerStatus } from '../midnight/wallet-worker-client';
 import { getDecodeWorkerStatus } from '../midnight/decode-worker-client';
+import { dustCollapseStats } from '../midnight/dust-collapse-stats';
 import { listWalletFacades } from '../submission/wallet-facade-builder';
 import { readRuntimeState, readPrewarmState } from '../utils/runtime-state';
 import { configMs } from '../utils/config';
@@ -331,6 +332,23 @@ export async function buildMetricsText(db: DbRunner): Promise<string> {
     lines.push(`# HELP ${metricPrefix}_decode_worker_exits Decode worker thread exits since process start`);
     lines.push(`# TYPE ${metricPrefix}_decode_worker_exits counter`);
     lines.push(`${metricPrefix}_decode_worker_exits ${decode.exitCount}`);
+
+    const collapses = dustCollapseStats();
+    if (collapses.size > 0) {
+        lines.push(`# HELP ${metricPrefix}_dust_collapse_ms Last dust snapshot collapse of the wallet, restore check included`);
+        lines.push(`# TYPE ${metricPrefix}_dust_collapse_ms gauge`);
+        for (const [sessionId, s] of collapses) lines.push(`${metricPrefix}_dust_collapse_ms{session="${sessionId.slice(0, 16)}"} ${s.last.ms}`);
+        lines.push(`# HELP ${metricPrefix}_dust_collapse_p99_ms Dust snapshot collapse, 99th percentile of the last 100 runs`);
+        lines.push(`# TYPE ${metricPrefix}_dust_collapse_p99_ms gauge`);
+        for (const [sessionId, s] of collapses) lines.push(`${metricPrefix}_dust_collapse_p99_ms{session="${sessionId.slice(0, 16)}"} ${s.p99Ms}`);
+        lines.push(`# HELP ${metricPrefix}_dust_collapse_runs_total Save ticks per outcome: collapsed, uncollapsed (check failed or over budget), skipped (state unchanged)`);
+        lines.push(`# TYPE ${metricPrefix}_dust_collapse_runs_total counter`);
+        for (const [sessionId, s] of collapses) {
+            for (const outcome of ['collapsed', 'uncollapsed', 'skipped'] as const) {
+                lines.push(`${metricPrefix}_dust_collapse_runs_total{session="${sessionId.slice(0, 16)}",outcome="${outcome}"} ${s.runs[outcome]}`);
+            }
+        }
+    }
 
     const loop = eventLoopLagGauges();
     lines.push(`# HELP ${metricPrefix}_event_loop_lag_p99_ms Main-thread event-loop delay, 99th percentile over the last window`);

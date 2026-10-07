@@ -35,6 +35,20 @@ export interface InitArgs {
     restoreBlobs?: { shielded?: string; unshielded?: string; dust?: string };
 }
 
+export interface SerializedBlobs {
+    shielded?: string;
+    unshielded?: string;
+    dust?: string;
+}
+
+/** A save the main thread has not confirmed yet. The epochs tell a save of a replaced wallet from a current one. */
+export interface PendingSave {
+    blobs: SerializedBlobs;
+    dustEpoch: number;
+    shieldedEpoch: number;
+    dustKey?: string;
+}
+
 export interface FacadeEntry {
     /** The key of this entry in `facades`. */
     sessionId: string;
@@ -45,8 +59,10 @@ export interface FacadeEntry {
     unshieldedKeystore: any;
     saveTimer?: NodeJS.Timeout;
     progressTimer?: NodeJS.Timeout;
-    lastSavedBlobs?: { shielded?: string; unshielded?: string; dust?: string }; // last save the main thread confirmed
-    pendingSaves?: Map<number, { shielded?: string; unshielded?: string; dust?: string }>; // by save number, until confirmed
+    lastSavedBlobs?: SerializedBlobs; // last save the main thread confirmed
+    pendingSaves?: Map<number, PendingSave>; // by save number, until confirmed
+    /** Key of the confirmed dust save (`dustSaveKey`) and the epoch of the wallet that produced it. */
+    lastSavedDustKey?: { epoch: number; key: string };
     networkId: string;
     /** Used to read the indexer's latest block, which is the real sync target. */
     indexerHttpUrl: string;
@@ -59,11 +75,8 @@ export interface FacadeEntry {
     preSubmitDustSnapshot?: string;
     /** Raised whenever the dust wallet is replaced. Saves of the old wallet are then ignored. */
     dustEpoch?: number;
-    /** `dustEpoch` of each unconfirmed save. A confirmed save of an old wallet must not count as the latest. */
-    dustSaveEpochs?: Map<number, number>;
     /** The same as `dustEpoch`, for the shielded wallet. */
     shieldedEpoch?: number;
-    shieldedSaveEpochs?: Map<number, number>;
     /** Wallet parts restored from a save that have not yet moved past the saved position. */
     restoredSubWallets?: { dust?: boolean; shielded?: boolean };
     replayTracks?: Partial<Record<ReplayKind, ReplayTrack>>;

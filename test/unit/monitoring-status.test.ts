@@ -76,6 +76,7 @@ vi.mock('../../srv/utils/nightgate-config', () => ({
 }));
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { recordDustCollapseSample, __resetDustCollapseStatsForTests } from '../../srv/midnight/dust-collapse-stats';
 import {
     buildHealth,
     buildLiveness,
@@ -346,6 +347,22 @@ describe('buildMetricsText', () => {
         const text = await buildMetricsText(db);
         expect(text).toMatch(/odatano_nightgate_event_loop_lag_p99_ms \d/);
         expect(text).toMatch(/odatano_nightgate_event_loop_lag_max_ms \d/);
+    });
+
+    it('carries the dust snapshot collapse per wallet once the worker reported one', async () => {
+        __resetDustCollapseStatsForTests();
+        expect(await buildMetricsText(db)).not.toContain('dust_collapse');
+        const at = new Date().toISOString();
+        recordDustCollapseSample('sess-aaaaaaaaaaaa-rest', { outcome: 'collapsed', ms: 1200, verifyMs: 1100, fullBytes: 20_000_000, bytes: 2_000_000, at });
+        recordDustCollapseSample('sess-aaaaaaaaaaaa-rest', { outcome: 'skipped', ms: 3, verifyMs: null, fullBytes: null, bytes: null, at });
+        recordDustCollapseSample('sess-aaaaaaaaaaaa-rest', { outcome: 'uncollapsed', ms: 30_000, verifyMs: 30_000, fullBytes: 20_000_000, bytes: 20_000_000, at });
+        const text = await buildMetricsText(db);
+        expect(text).toContain('odatano_nightgate_dust_collapse_ms{session="sess-aaaaaaaaaaa"} 30000');
+        expect(text).toContain('odatano_nightgate_dust_collapse_p99_ms{session="sess-aaaaaaaaaaa"} 30000');
+        expect(text).toContain('odatano_nightgate_dust_collapse_runs_total{session="sess-aaaaaaaaaaa",outcome="collapsed"} 1');
+        expect(text).toContain('odatano_nightgate_dust_collapse_runs_total{session="sess-aaaaaaaaaaa",outcome="uncollapsed"} 1');
+        expect(text).toContain('odatano_nightgate_dust_collapse_runs_total{session="sess-aaaaaaaaaaa",outcome="skipped"} 1');
+        __resetDustCollapseStatsForTests();
     });
 
     it('reports the database connection pool, so a pool that runs dry is visible', async () => {

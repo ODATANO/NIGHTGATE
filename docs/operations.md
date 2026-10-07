@@ -18,6 +18,7 @@ Running NIGHTGATE: scripts, configuration, wallet sync, upgrades, monitoring, tr
 | `npm run wasm-zswap:e2e` | zswap circuits in-process | Deploys `shielded-token`, mints, shielded self-transfer via `sendNight` `tokenTypeHex` |
 | `npm run width32:e2e` | 32-slot vault | Deploys `attestation-vault-32`, 24-field document, attest+anchor batch, k-of-32 diff, crawler-free verify |
 | `npm run check:server` | Check a running server | Health/readiness; sponsor dust/balance/sync with `NIGHTGATE_SPONSOR_SESSION_ID`; optional URL argument |
+| `node scripts/profile-workers.mjs [s]` | A thread is busy and the log does not say why | CPU profile of the main thread and every worker thread through the inspector (`kill -USR1 <pid>` first); self time per function, callers of the hot wasm frames |
 | `npm run build` | Before publish, after schema changes | `@cds-models/` types + in-place TS compile |
 | `npm run typecheck` | Pre-commit | `tsc --noEmit` |
 | `npm test` | Pre-commit | Vitest suite with coverage |
@@ -298,6 +299,15 @@ database pool wait depth) when the p99 exceeds `NIGHTGATE_EVENT_LOOP_LAG_WARN_MS
   `decode_worker_inflight_rpcs`, `decode_worker_exits`): it decodes contract
   state for the verify functions and ledger payloads for the crawler, and
   restarts on its next call after a crash.
+- With `NIGHTGATE_DUST_SNAPSHOT_COLLAPSE=true`, `getMetrics()` reports the
+  cost of the dust snapshot collapse per wallet: `dust_collapse_ms{session}`
+  (last save tick, restore check included), `dust_collapse_p99_ms{session}`
+  and `dust_collapse_runs_total{session,outcome}` with `collapsed`,
+  `uncollapsed` (check failed or over `NIGHTGATE_DUST_COLLAPSE_BUDGET_MS`)
+  and `skipped` (dust state unchanged since the confirmed save). The restore
+  check runs in a helper thread of the wallet worker; a tick slower than 5 s
+  logs `dust snapshot collapsed ... in <ms>ms` at INFO. A rising `p99` tracks
+  the growth of the dust tree, which never shrinks.
 
 ## Reading the indexer health endpoint
 
@@ -385,6 +395,17 @@ The worker has no facade for the session:
 2. the server restarted since.
 
 Startup closes the previous process's sessions (except `NIGHTGATE_FEE_SPONSOR_SESSION` ids) and fails their queued jobs with `PROCESS_RESTART_SESSION_CLOSED`. Reconnect with `connectWallet` + `connectWalletForSigning` (the facade rebuilds from the saved state) and re-submit. Opt out: `NIGHTGATE_CLOSE_SESSIONS_ON_RESTART=false`.
+
+### Sponsor jobs get slower over days, the wallet worker is busy with no job running
+
+The dust tree grows with every NIGHT UTXO of the chain, so the restore check of
+the collapsed dust snapshot grows with it. Read `dust_collapse_p99_ms` in
+`getMetrics()`, or run `node scripts/profile-workers.mjs 15` against the
+process: a wallet worker whose busy share stays high between jobs with
+`deserialize` of the ledger as the hot frame is paying for the check. The check
+runs in a helper thread and is bounded by `NIGHTGATE_DUST_COLLAPSE_BUDGET_MS`;
+a longer `NIGHTGATE_SAVE_INTERVAL_MS` divides the cost by the same factor, at
+the price of a longer replay after a restart.
 
 ### A wallet takes forever to reach `CAUGHT UP`
 

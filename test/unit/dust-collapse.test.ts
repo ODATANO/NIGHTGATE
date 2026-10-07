@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseOwnGeneration, foreignRanges, collapseForeignGeneration, collapsedDustSnapshot } from '../../srv/midnight/worker/dust-collapse';
+import { parseOwnGeneration, foreignRanges, collapseForeignGeneration, collapseDustState, verifyCollapsedDust, collapsedDustBlob, dustSaveKey } from '../../srv/midnight/worker/dust-collapse';
 
 const A = 'a8ccef598a65df79c2546a61c85a52c1ec0684a0195858e9149dec6446ece151';
 const B = '22ad1012c2dae2d5ce3f901b53bc292aaf85c5856fcf8a0ca515e9d474b55ce3';
@@ -87,30 +87,67 @@ describe('collapseForeignGeneration', () => {
     });
 });
 
-describe('collapsedDustSnapshot', () => {
+describe('collapseDustState + verifyCollapsedDust + collapsedDustBlob', () => {
     const sdkBlob = JSON.stringify({ publicKey: { publicKey: '1' }, state: 'aabbcc', protocolVersion: '1', networkId: 'preprod', offset: '1530131' });
 
-    it('replaces only the state of the SDK snapshot', () => {
+    it('collapses the live state and records what a restore must reproduce', () => {
         const walletState = { serialize: () => sdkBlob, state: { state: fakeState({ firstFree: 10, indices: [[A, 2]], utxoNights: [A, A] }) } };
-        const r = collapsedDustSnapshot(walletState, FakeDustLocalState);
-        expect(r.collapsed).toBe(true);
-        const out = JSON.parse(r.blob);
+        const r = collapseDustState(walletState);
+        expect(r.fullBlob).toBe(sdkBlob);
+        expect(r.fullBytes).toBe(3);
+        expect([...r.bytes]).toEqual([2, 0]);
+        expect(r).toMatchObject({ ranges: 2, ownLeaves: 1 });
+        expect(r.expect).toEqual({
+            generatingTreeRoot: '7', commitmentTreeRoot: '9', balance: '5', utxoCount: 2,
+            syncTimeMs: Date.parse('2026-09-17T07:23:48Z')
+        });
+    });
+
+    it('throws when the collapse refuses, so the caller saves the full snapshot', () => {
+        const walletState = { serialize: () => sdkBlob, state: { state: fakeState({ firstFree: 10, indices: [], utxoNights: [A] }) } };
+        expect(() => collapseDustState(walletState)).toThrow(/missing from night_indices/);
+    });
+
+    it('verifies collapsed bytes that restore to the same roots, balance and UTXOs', () => {
+        const r = collapseDustState({ serialize: () => sdkBlob, state: { state: fakeState({ firstFree: 10, indices: [[A, 2]], utxoNights: [A, A] }) } });
+        expect(verifyCollapsedDust(r.bytes, r.expect, FakeDustLocalState)).toEqual({ ok: true });
+    });
+
+    it('refuses collapsed bytes that restore to another root', () => {
+        const r = collapseDustState({ serialize: () => sdkBlob, state: { state: fakeState({ firstFree: 10, indices: [[A, 2]], utxoNights: [A, A], breakRoot: true }) } });
+        const verdict = verifyCollapsedDust(r.bytes, r.expect, FakeDustLocalState);
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) expect(verdict.reason).toMatch(/same roots/);
+    });
+
+    it('turns a deserialize failure into a reason instead of throwing', () => {
+        const Broken = { deserialize: () => { throw new Error('wasm panic'); } };
+        const r = collapseDustState({ serialize: () => sdkBlob, state: { state: fakeState({ firstFree: 10, indices: [[A, 2]], utxoNights: [A, A] }) } });
+        expect(verifyCollapsedDust(r.bytes, r.expect, Broken)).toEqual({ ok: false, reason: expect.stringContaining('wasm panic') });
+    });
+
+    it('replaces only the state of the SDK snapshot', () => {
+        const out = JSON.parse(collapsedDustBlob(sdkBlob, new Uint8Array([2, 0])));
         expect(out).toMatchObject({ publicKey: { publicKey: '1' }, protocolVersion: '1', networkId: 'preprod', offset: '1530131' });
         expect(out.state).toBe('0200');
         expect(Object.keys(out)).toEqual(Object.keys(JSON.parse(sdkBlob)));
     });
+});
 
-    it('keeps the SDK snapshot when the collapsed state restores to another root', () => {
-        const walletState = { serialize: () => sdkBlob, state: { state: fakeState({ firstFree: 10, indices: [[A, 2]], utxoNights: [A, A], breakRoot: true }) } };
-        const r = collapsedDustSnapshot(walletState, FakeDustLocalState);
-        expect(r).toMatchObject({ collapsed: false, blob: sdkBlob });
-        expect(r.reason).toMatch(/same roots/);
+describe('dustSaveKey', () => {
+    it('changes with the applied index, the coins and the pending coins', () => {
+        const base = { progress: { appliedIndex: '100' }, totalCoins: [{}, {}], pendingCoins: [] };
+        expect(dustSaveKey(base)).toBe('100:2:0');
+        expect(dustSaveKey({ ...base, progress: { appliedIndex: '101' } })).toBe('101:2:0');
+        expect(dustSaveKey({ ...base, pendingCoins: [{}] })).toBe('100:2:1');
     });
 
-    it('keeps the SDK snapshot when the collapse refuses', () => {
-        const walletState = { serialize: () => sdkBlob, state: { state: fakeState({ firstFree: 10, indices: [], utxoNights: [A] }) } };
-        const r = collapsedDustSnapshot(walletState, FakeDustLocalState);
-        expect(r).toMatchObject({ collapsed: false, blob: sdkBlob });
-        expect(r.reason).toMatch(/missing from night_indices/);
+    it('reads a progress nested under state and marks missing coin lists', () => {
+        expect(dustSaveKey({ state: { progress: { appliedIndex: 5 } } })).toBe('5:-:-');
+    });
+
+    it('is null without an applied index, so the caller never skips', () => {
+        expect(dustSaveKey({ totalCoins: [] })).toBeNull();
+        expect(dustSaveKey(undefined)).toBeNull();
     });
 });
