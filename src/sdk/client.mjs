@@ -219,12 +219,12 @@ export function connect(opts) {
     }
 
     /** Starts a job and waits for its result. */
-    async function act(name, params, sessionKey = 'sessionId') {
+    async function act(name, params) {
         const started = await callAction(name, params);
         if (!started?.jobId) return started;
-        // Use the session id the server returns. With an agent token the server picks
-        // the session, so the caller may not know it.
-        return waitForJob({ jobId: started.jobId, sessionId: started.sessionId ?? params[sessionKey] });
+        // Use the session id the server returns. Sponsored jobs run under a session the
+        // server picks, so the caller cannot know it.
+        return waitForJob({ jobId: started.jobId, sessionId: started.sessionId ?? params.sessionId });
     }
 
     return {
@@ -283,11 +283,11 @@ export function connect(opts) {
          * Sends a transaction you built without a fee (txbuilder's finalizedTxB64).
          * The server adds the fee, submits it and returns the txHash.
          */
-        sponsorFinalized: (p) => act('sponsorFinalizedTransaction', p, 'sponsorSessionId'),
+        sponsorFinalized: (p) => act('sponsorFinalizedTransaction', p),
         /** Like sponsorFinalized, for a transaction built with `bind: false`. The server can pay for several of these at once. */
-        sponsorUnbound: (p) => act('sponsorUnboundTransaction', p, 'sponsorSessionId'),
+        sponsorUnbound: (p) => act('sponsorUnboundTransaction', p),
         /** Takes both halves of a private token swap. The server joins them, pays the fee and submits. */
-        sponsorSwap: (p) => act('sponsorSwap', p, 'sponsorSessionId'),
+        sponsorSwap: (p) => act('sponsorSwap', p),
         buildSponsorable: (p) => act('buildSponsorable', p)
     };
 }

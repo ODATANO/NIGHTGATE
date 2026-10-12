@@ -572,7 +572,6 @@ service NightgateService {
      * The sponsor only pays for contracts and circuits its policy allows.
      */
     action   sponsorFinalizedTransaction(finalizedTxB64: LargeString,
-                                         sponsorSessionId: UUID,
                                          idempotencyKey: String)              returns { // optional
         jobId     : UUID;
         status    : String;
@@ -584,7 +583,6 @@ service NightgateService {
      * Such a transaction comes from the transaction builder with `bind: false`. One sponsor can pay several at once.
      */
     action   sponsorUnboundTransaction(unboundTxB64: LargeString,
-                                       sponsorSessionId: UUID,
                                        idempotencyKey: String)                returns { // optional
         jobId     : UUID;
         status    : String;
@@ -598,7 +596,6 @@ service NightgateService {
      */
     action   sponsorSwap(makerHalfB64: LargeString, // required unless offerId is given
                          takerHalfB64: LargeString,
-                         sponsorSessionId: UUID,
                          idempotencyKey: String, // optional
                          offerId: UUID)                                       returns { // optional; a posted offer to use as the maker half
         jobId     : UUID;

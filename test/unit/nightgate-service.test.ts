@@ -817,24 +817,29 @@ describe('getJobStatus', () => {
 // explicit cds.User contexts via cds.tx.
 // ----------------------------------------------------------------------------
 describe('sponsorFinalizedTransaction over REAL OData: the pool sentinel', () => {
-    // The pool sentinel travels through fields DECLARED Edm.Guid
-    // (sponsorSessionId, the returned sessionId, getJobStatus.sessionId).
-    // A non-UUID string sentinel would be rejected by OData deserialization
-    // before any handler ran; this pins that the reserved UUID passes.
+    // The pool sentinel travels through fields DECLARED Edm.Guid (the returned
+    // sessionId, getJobStatus.sessionId). A non-UUID string sentinel would be
+    // rejected by OData deserialization; this pins that the reserved UUID passes.
     const SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
 
-    it('the sentinel passes Edm.Guid validation end to end', async () => {
+    it('the sentinel passes Edm.Guid validation on getJobStatus', async () => {
+        const res: any = await cap.POST(`${API}/getJobStatus`, {
+            jobId: '00000000-0000-4000-8000-000000000009',
+            sessionId: SENTINEL
+        }).catch((e: any) => e.response ?? e);
+        expect(res.status).toBe(404);
+        expect(JSON.stringify(res?.data ?? '')).not.toMatch(/Deserialization|Invalid value.*Guid|not a valid UUID/i);
+    });
+
+    it('the request names no payer', async () => {
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'a4f1c8ee-0000-4000-8000-000000000001';
         try {
-            // Reaches the HANDLER (mainnet gate / submission path), i.e. no
-            // OData 400 about a malformed Guid. The handler itself then fails
-            // on the unusable pool member, which proves admission accepted it.
-            const res = await cap.POST(`${API}/sponsorFinalizedTransaction`, {
+            const res: any = await cap.POST(`${API}/sponsorFinalizedTransaction`, {
                 finalizedTxB64: Buffer.from('probe').toString('base64'),
                 sponsorSessionId: SENTINEL
             }).catch((e: any) => e.response ?? e);
-            const body = JSON.stringify(res?.data ?? res?.message ?? '');
-            expect(body).not.toMatch(/Deserialization|Invalid value.*Guid|not a valid UUID/i);
+            expect(res.status).toBe(400);
+            expect(JSON.stringify(res?.data ?? '')).toMatch(/sponsorSessionId/);
         } finally {
             delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
         }
@@ -849,8 +854,7 @@ describe('sponsorFinalizedTransaction over REAL OData: the pool sentinel', () =>
         process.env.NODE_ENV = 'production';
         try {
             const res: any = await cap.POST(`${API}/sponsorFinalizedTransaction`, {
-                finalizedTxB64: Buffer.from('probe').toString('base64'),
-                sponsorSessionId: SENTINEL
+                finalizedTxB64: Buffer.from('probe').toString('base64')
             }).catch((e: any) => e.response ?? e);
             expect(spy).toHaveBeenCalled();
             expect(res.status).toBe(503);
@@ -864,16 +868,14 @@ describe('sponsorFinalizedTransaction over REAL OData: the pool sentinel', () =>
         }
     });
 
-    it('a NON-UUID sentinel string never starts a job (what a string sentinel would hit)', async () => {
-        let jobId: string | undefined;
-        try {
-            const res: any = await cap.POST(`${API}/sponsorFinalizedTransaction`, {
-                finalizedTxB64: Buffer.from('probe').toString('base64'),
-                sponsorSessionId: 'platform-pool'
-            });
-            jobId = res?.data?.jobId;
-        } catch { /* rejected, which is the point */ }
-        expect(jobId).toBeUndefined();
+    it('without a configured pool nothing can pay: 503, no job', async () => {
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        const res: any = await cap.POST(`${API}/sponsorFinalizedTransaction`, {
+            finalizedTxB64: Buffer.from('probe').toString('base64')
+        }).catch((e: any) => e.response ?? e);
+        expect(res.status).toBe(503);
+        expect(res.data?.jobId).toBeUndefined();
+        expect(JSON.stringify(res?.data ?? '')).toMatch(/no fee sponsor is configured/);
     });
 });
 

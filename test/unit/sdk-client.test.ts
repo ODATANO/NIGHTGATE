@@ -108,15 +108,16 @@ describe('connect: jobs', () => {
         expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j1', sessionId: 's1' });
     });
 
-    test('sponsorFinalized polls under the SPONSOR session', async () => {
+    test('sponsorFinalized polls under the SPONSOR session the server returns', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([
-            { body: { jobId: 'j2', status: 'pending' } },
+            { body: { jobId: 'j2', status: 'pending', sessionId: 'sponsor-1' } },
             { body: { status: 'succeeded', result: JSON.stringify({ txHash: '00cd' }) } }
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
-        const out = await ng.sponsorFinalized({ finalizedTxB64: 'AAAA', sponsorSessionId: 'sponsor-1' });
+        const out = await ng.sponsorFinalized({ finalizedTxB64: 'AAAA' });
         expect(out.txHash).toBe('00cd');
+        expect(JSON.parse(calls[0].init.body)).toEqual({ finalizedTxB64: 'AAAA' });
         expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 'sponsor-1' });
     });
 
@@ -127,9 +128,9 @@ describe('connect: jobs', () => {
             { body: { status: 'succeeded', result: JSON.stringify({ txHash: '00aa', swap: { gives: { tokenType: 'a', amount: '10' }, wants: { tokenType: 'b', amount: '3' } } }) } }
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
-        const out = await ng.sponsorSwap({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC', sponsorSessionId: 'sponsor-1' });
+        const out = await ng.sponsorSwap({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC' });
         expect(calls[0].url).toBe('https://ng.example/api/v1/nightgate/sponsorSwap');
-        expect(JSON.parse(calls[0].init.body)).toEqual({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC', sponsorSessionId: 'sponsor-1' });
+        expect(JSON.parse(calls[0].init.body)).toEqual({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC' });
         expect(JSON.parse(calls[1].init.body)).toMatchObject({ jobId: 'job-9', sessionId: 'sponsor-1' });
         expect(out).toMatchObject({ txHash: '00aa', swap: { gives: { amount: '10' } } });
     });
@@ -158,9 +159,8 @@ describe('connect: jobs', () => {
         expect(calls[1].url).toContain('/getJobStatus');
     });
 
-    test('act polls under the session the SERVER returns (agent-grant sponsor injection)', async () => {
-        // Under an agent grant the caller may omit sponsorSessionId entirely;
-        // the server injects the pinned sponsor and RETURNS the job session.
+    test('act polls under the session the SERVER returns', async () => {
+        // The server picks the paying session and RETURNS the job session.
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([
             { body: { jobId: 'j6', status: 'pending', sessionId: 'server-side-sponsor' } },

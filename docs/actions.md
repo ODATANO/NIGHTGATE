@@ -351,11 +351,11 @@ a vault call); no dust spent. The txbuilder SDK does the same locally.
 Session-scoped rate limits are keyed by principal and session
 (`<agent grant or user>:<sessionId>`).
 
-### `sponsorFinalizedTransaction(finalizedTxB64, sponsorSessionId, idempotencyKey?) → { jobId, status, sessionId }`
+### `sponsorFinalizedTransaction(finalizedTxB64, idempotencyKey?) → { jobId, status, sessionId }`
 
-Phase 2: check the sponsor policy, balance dust with `sponsorSessionId`,
-submit. Poll `getJobStatus` with the returned `sessionId` (the sponsor
-session; a grant may inject it server-side). Job result
+Phase 2: check the sponsor policy, balance dust, submit. The request names no
+payer: the platform pool pays, or the wallet session the caller's grant is
+pinned to. Poll `getJobStatus` with the returned `sessionId`. Job result
 `{ txHash, circuits, contractAddress }`. **Rate limit:** 120/hour per
 principal, shared with `sponsorUnboundTransaction`.
 
@@ -392,9 +392,10 @@ reach this endpoint can make you pay fees.
 
 **Policy layers (changeable while the server runs):**
 
-- **Sponsor binding.** A grant without `sponsorSessionId` cannot name a
-  sponsor (403). A token never inherits the operator's other sponsors or the
-  pool; bind the grant to one sponsor session or the pool sentinel.
+- **Sponsor binding.** The sponsor actions pay from the pool, or from the
+  wallet session the grant is pinned to (`sponsorSessionId` at creation). On
+  every other action a grant without that pin cannot name a sponsor (403); a
+  token never inherits the operator's other sponsors.
 - **Always allowed under any token** (no list entry, no budget): entity reads
   (chain projections; `WalletSessions`, `PendingSubmissions`, `Documents`
   narrowed to the grant's session, `AgentGrants` to the grant;
@@ -478,18 +479,20 @@ reach this endpoint can make you pay fees.
 pool: one in-flight dust spend per wallet, callers wait up to
 `NIGHTGATE_SPONSOR_LEASE_WAIT_MS` (default 120 s), caught-up members first,
 a retryably failing sponsor benched for `NIGHTGATE_SPONSOR_COOLDOWN_MS` while
-the job tries the next. Omit `sponsorSessionId` or pass the sentinel
-`00000000-0000-0000-0000-706f6f6c0000` to use the pool; an explicit session
-stays exact. Members warm one after another at boot. A grant pinned to the
-sentinel may grant only `sponsorFinalizedTransaction` /
-`sponsorUnboundTransaction`; `getJobStatus` polls under the sentinel.
-Idempotency keys are per caller. Throughput scales with the number of pool
-wallets.
+the job tries the next. The three sponsor actions take no sponsor parameter:
+the pool pays, and a grant pinned to a wallet session (`createAgentGrant`
+`sponsorSessionId`) pays from that session instead. Without a pool and
+without a pinned grant the actions answer 503. Pool jobs run under the
+reserved session id `00000000-0000-0000-0000-706f6f6c0000`, which the actions
+return and `getJobStatus` takes. Members warm one after another at boot. A
+grant pinned to that id may grant only the sponsor actions and the offer
+board. Idempotency keys are per caller. Throughput scales with the number of
+pool wallets.
 
 The caller's TTL applies (`buildSponsorable` / SDK `ttlMinutes`, default 30); a
 late transaction is rejected by the node.
 
-### `sponsorUnboundTransaction(unboundTxB64, sponsorSessionId, idempotencyKey?) → { jobId, status, sessionId }`
+### `sponsorUnboundTransaction(unboundTxB64, idempotencyKey?) → { jobId, status, sessionId }`
 
 Phase 2, parallel channel. Takes the unbound (pre-binding) proven and signed
 tx from txbuilder `buildSponsorable({ bind: false })`, applies the same shape
@@ -540,7 +543,7 @@ anchors) rebuild (`NIGHTGATE_STALE_TRANSCRIPT_RETRIES`, default 2, after
 `NIGHTGATE_STALE_TRANSCRIPT_BACKOFF_MS`); a sponsored job cannot rebuild the
 caller's bytes and fails with `1010/104`.
 
-### `sponsorSwap(makerHalfB64 | offerId, takerHalfB64, sponsorSessionId, idempotencyKey?) → { jobId, status, sessionId }`
+### `sponsorSwap(makerHalfB64 | offerId, takerHalfB64, idempotencyKey?) → { jobId, status, sessionId }`
 
 Sponsor a shielded swap that settles without a contract: the maker spends the
 coin it gives and creates the coin it wants, the taker builds the mirror half,

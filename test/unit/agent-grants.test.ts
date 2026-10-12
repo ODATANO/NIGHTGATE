@@ -1045,7 +1045,7 @@ describe('agent grants', () => {
             expect(req.reject).not.toHaveBeenCalled();
             expect(req.user.id).toBe(TEST_USER_ID);
             expect(req.data.sessionId).toBe('sess-1');
-            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], mintedTokenTypes: [], allowDeploy: false, allowSwaps: false });
+            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, sponsorSessionId: null, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], mintedTokenTypes: [], allowDeploy: false, allowSwaps: false });
         });
 
         it('rejects 403 on a sessionId that does not match the grant', async () => {
@@ -1190,9 +1190,10 @@ describe('agent grants', () => {
             const req = tokenReq('sponsorFinalizedTransaction', { finalizedTxB64: 'AAAA' });
             await enforceAgentGrant(req, db);
             expect(req.reject).not.toHaveBeenCalled();
-            // sponsor injected from the grant, so the agent can only spend
-            // THIS sponsor's dust
-            expect(req.data.sponsorSessionId).toBe('sponsor-1');
+            // the sponsor actions take no sponsor parameter; the handler reads the
+            // grant's pin, so the agent can only spend THIS sponsor's dust
+            expect(req.data.sponsorSessionId).toBeUndefined();
+            expect(req.agentGrant.sponsorSessionId).toBe('sponsor-1');
 
             for (const event of ['deriveTokenType', 'prepareMembershipSet']) {
                 mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify([]) }));
@@ -1223,11 +1224,37 @@ describe('agent grants', () => {
             await enforceAgentGrant(write, db);
             expect(write.reject).toHaveBeenCalledWith(403, expect.stringContaining('sessionId'));
 
-            // without a pinned sponsor there is no sponsor-poll exception
+            // without a pinned sponsor there is no sponsor-poll exception for a wallet session
             mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: null }));
             const nopin = tokenReq('getJobStatus', { jobId: 'j1', sessionId: 'sponsor-1' });
             await enforceAgentGrant(nopin, db);
             expect(nopin.reject).toHaveBeenCalledWith(403, expect.stringContaining('sessionId'));
+
+            // but the pool pays for every grant, so every grant polls pool jobs
+            mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: null }));
+            const poolPoll = tokenReq('getJobStatus', { jobId: 'j1', sessionId: '00000000-0000-0000-0000-706f6f6c0000' });
+            await enforceAgentGrant(poolPoll, db);
+            expect(poolPoll.reject).not.toHaveBeenCalled();
+            expect(poolPoll.data.sessionId).toBe('00000000-0000-0000-0000-706f6f6c0000');
+
+            // a pool wallet that is ALSO the grant's pin or own session keeps its id:
+            // those jobs are stored under the wallet, not under the pool id
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-1,sess-1';
+            try {
+                mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: 'sponsor-1' }));
+                const pinnedMember = tokenReq('getJobStatus', { jobId: 'j1', sessionId: 'sponsor-1' });
+                await enforceAgentGrant(pinnedMember, db);
+                expect(pinnedMember.reject).not.toHaveBeenCalled();
+                expect(pinnedMember.data.sessionId).toBe('sponsor-1');
+
+                mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: null }));
+                const ownMember = tokenReq('getJobStatus', { jobId: 'j1', sessionId: 'sess-1' });
+                await enforceAgentGrant(ownMember, db);
+                expect(ownMember.reject).not.toHaveBeenCalled();
+                expect(ownMember.data.sessionId).toBe('sess-1');
+            } finally {
+                delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            }
         });
 
         it('pins the sponsor: mismatch rejects 403, absence injects it', async () => {

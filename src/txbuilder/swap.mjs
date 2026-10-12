@@ -11,7 +11,7 @@
 //
 //   const taker = await createSwapWallet({ seedHex: other, indexerHttpUrl, indexerWsUrl });
 //   const halves = await taker.takeOffer({ offer, expect: { gives: { tokenType: A, amount: 1000n }, wants: { tokenType: B, amount: 300n } } });
-//   await ng.sponsorSwap({ makerHalfB64: halves.makerHalfB64, takerHalfB64: halves.takerHalfB64, sponsorSessionId });
+//   await ng.sponsorSwap({ makerHalfB64: halves.makerHalfB64, takerHalfB64: halves.takerHalfB64 });
 //
 // SPDX-License-Identifier: Apache-2.0
 

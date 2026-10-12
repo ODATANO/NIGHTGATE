@@ -30,13 +30,10 @@ entity Blocks : cuid, managed {
     hash             : HexEncoded not null;
     height           : Integer64 not null;
     protocolVersion  : Integer not null;
-    timestamp        : Integer not null; // UNIX seconds
+    timestamp        : Integer not null;
     author           : HexEncoded;
     stateRoot        : HexEncoded;
-    // The ledger parameters that set fee prices. They come from the Midnight
-    // indexer and are stored only on blocks where they change.
-    ledgerParameters : LargeBinary; // null = same as the last lower block that has them
-
+    ledgerParameters : LargeBinary;
     parent           : Association to Blocks;
     transactions     : Composition of many Transactions
                            on transactions.block = $self;
@@ -50,38 +47,30 @@ entity Blocks : cuid, managed {
 entity Transactions : cuid, managed {
     transactionId            : Integer not null;
     hash                     : HexEncoded not null;
-    // The hash explorers and the Midnight indexer use for this transaction.
     ledgerTxHash             : HexEncoded;
     protocolVersion          : Integer not null;
     raw                      : LargeBinary;
     transactionType          : TransactionType not null;
-
-    // Set for regular transactions only.
     merkleTreeRoot           : HexEncoded;
     startIndex               : Integer64;
     endIndex                 : Integer64;
-    identifiers              : LargeString; // JSON array of strings
-
+    identifiers              : LargeString;
     txType                   : TxType;
-    isShielded               : Boolean; // null = not decoded yet
+    isShielded               : Boolean;
     senderAddress            : String(256);
     receiverAddress          : String(256);
     nightAmount              : BigInt;
     dustConsumed             : BigInt;
-    // The proof that pays the DUST fee does not count here.
-    hasProof                 : Boolean; // null = not decoded yet
+    hasProof                 : Boolean;
     contractAddress          : HexEncoded;
     circuitName              : String(100);
     size                     : Integer;
-
-    // Filled when the transaction bytes are decoded.
     payloadDecode            : PayloadDecodeState;
     zswapInputCount          : Integer;
     zswapOutputCount         : Integer;
     zswapTransientCount      : Integer;
     dustSpendCount           : Integer;
     dustRegistrationCount    : Integer;
-
     block                    : Association to Blocks not null;
     transactionResult        : Composition of one TransactionResults
                                    on transactionResult.transaction = $self;
@@ -101,7 +90,7 @@ entity Transactions : cuid, managed {
 
 entity TransactionResults : cuid {
     status        : TransactionResultStatus not null;
-    outcomeSource : String(40); // 'substrate-system-events'; null = not verified
+    outcomeSource : String(40); // 'substrate-system-events'
     transaction   : Association to Transactions;
     segments      : Composition of many TransactionSegments
                         on segments.transactionResult = $self;
@@ -115,18 +104,14 @@ entity TransactionSegments : cuid {
 }
 
 entity TransactionFees : cuid {
-    paidFees      : BigInt not null; // DUST
-    estimatedFees : BigInt not null; // DUST
+    paidFees      : BigInt not null;
+    estimatedFees : BigInt not null;
     transaction   : Association to Transactions;
 }
 
 entity ContractActions : cuid, managed {
-    // Order of the actions within the transaction. It tells apart two calls on the same contract.
-    actionIndex        : Integer;
+    actionIndex        : Integer; // order of action in tx
     address            : HexEncoded;
-    // Contract state after the action, filled from the Midnight indexer.
-    // Full states are kept only when `crawler.contractStateHistory` asks for them.
-    // Hash and size are always kept.
     state              : LargeBinary;
     zswapState         : LargeBinary;
     stateHash          : HexEncoded;
@@ -135,9 +120,8 @@ entity ContractActions : cuid, managed {
     zswapStateSize     : Integer;
     actionType         : ContractActionType not null;
     entryPoint         : String(256);
-
     transaction        : Association to Transactions not null;
-    deploy             : Association to ContractActions; // null = not a CALL; the action that deployed the contract
+    deploy             : Association to ContractActions; // null = not a CALL;
     unshieldedBalances : Composition of many ContractBalances
                              on unshieldedBalances.contractAction = $self;
 }
@@ -203,8 +187,8 @@ entity WalletSessions : cuid, managed {
     label               : String(100);
     viewingKeyHash      : String(64);
     encryptedViewingKey : LargeString;
-    encryptedSeedKey    : LargeString; // null = viewing only, cannot sign
-    accountIndex        : Integer; // null = 0
+    encryptedSeedKey    : LargeString; // null = viewing only
+    accountIndex        : Integer;
     sessionId           : UUID not null;
     connectedAt         : Timestamp not null;
     disconnectedAt      : Timestamp;
@@ -284,8 +268,7 @@ entity HolderDisclosureGrants : cuid, managed {
 }
 
 /**
- * Shielded token types minted by sponsored calls on this server.
- * When the platform setting `shareMintedTokenTypes` is on, every grant may use them.
+ * Known Shielded token types
  */
 entity LearnedTokenTypes : managed {
     key tokenType        : HexEncoded;
@@ -310,31 +293,24 @@ entity ContractRegistrations : managed {
 
 /** Progress of the block indexer. Exactly one row. */
 entity SyncState {
-    key ID                  : String(10) default 'SINGLETON';
-        networkId           : String(30);
-
-        lastIndexedHeight   : Integer64 default 0;
-        lastIndexedHash     : HexEncoded;
-        lastIndexedAt       : Timestamp;
-
-        // Two later passes add data to indexed blocks. Each keeps its own position.
-        lastDecodedHeight   : Integer64; // null = never run
-        lastSupplementedHeight : Integer64; // null = never run
-
-        lastFinalizedHeight : Integer64 default 0;
-        lastFinalizedHash   : HexEncoded;
-
-        nodeUrl             : String(200);
-        chainHeight         : Integer64 default 0;
-
-        syncStatus          : SyncStatus default 'stopped';
-        reorgGeneration     : Integer64 default 0;
-        syncProgress        : Decimal(5, 2) default 0; // percent; lastIndexedHeight of chainHeight
-        blocksPerSecond     : Decimal(10, 2) default 0;
-
-        lastError           : String(500);
-        lastErrorAt         : Timestamp;
-        consecutiveErrors   : Integer default 0;
+    key ID                     : String(10) default 'SINGLETON';
+        networkId              : String(30);
+        lastIndexedHeight      : Integer64 default 0;
+        lastIndexedHash        : HexEncoded;
+        lastIndexedAt          : Timestamp;
+        lastDecodedHeight      : Integer64;
+        lastSupplementedHeight : Integer64;
+        lastFinalizedHeight    : Integer64 default 0;
+        lastFinalizedHash      : HexEncoded;
+        nodeUrl                : String(200);
+        chainHeight            : Integer64 default 0;
+        syncStatus             : SyncStatus default 'stopped';
+        reorgGeneration        : Integer64 default 0;
+        syncProgress           : Decimal(5, 2) default 0; // percent; lastIndexedHeight of chainHeight
+        blocksPerSecond        : Decimal(10, 2) default 0;
+        lastError              : String(500);
+        lastErrorAt            : Timestamp;
+        consecutiveErrors      : Integer default 0;
 }
 
 entity ReorgLog : cuid, managed {
@@ -362,7 +338,7 @@ entity PendingSubmissions : cuid, managed {
     finalizedTxData  : LargeString; // JSON
     chainBlockHeight : Integer;
     chainBlockHash   : HexEncoded;
-    indexerTxHash    : HexEncoded; // the Midnight indexer's hash, differs from txHash
+    indexerTxHash    : HexEncoded; // the Midnight indexer's hash
     submitIntentData : LargeString;
     errorCode        : String(50);
     errorMessage     : String(500);
@@ -406,7 +382,6 @@ entity BackgroundJobs : cuid, managed {
     txHash              : HexEncoded;
     chainStatus         : BackgroundJobChainStatus; // null = nothing submitted
     chainFinalizedAt    : Timestamp;
-    // Where the transaction landed. A reorg rolls the job back by this height.
     chainBlockHeight    : Integer;
     chainBlockHash      : HexEncoded;
     indexerTxHash       : HexEncoded; // the Midnight indexer's hash, differs from txHash
@@ -451,7 +426,7 @@ entity WalletSyncStates {
         shieldedStateBlob   : LargeString;
         unshieldedStateBlob : LargeString;
         dustStateBlob       : LargeString;
-        keyScheme           : String(16); // 'dek1'; null = key derived from the viewing key
+        keyScheme           : String(16); // 'dek1'
         sdkVersion          : String(64) not null;
         networkId           : String(32);
         seedFingerprint     : String(64);
@@ -480,7 +455,6 @@ entity Documents : cuid, managed {
     storageRef          : String(500); // file://, s3:// or ipfs:// URL
     anchoredTxHash      : HexEncoded;
     anchoredAt          : Timestamp;
-    // Where the hash was written. verifyDocument checks against these values.
     userId              : String(200);
     contractAddress     : HexEncoded;
     network             : String(30);
@@ -490,7 +464,7 @@ entity Documents : cuid, managed {
     attesterId          : HexEncoded;
 }
 
-/** Zero-knowledge proofs about a document's fields, recorded on chain. */
+/** Zero-knowledge proofs about a document's fields */
 entity PredicateAttestations : cuid, managed {
     payloadHash         : HexEncoded not null;
     attesterId          : HexEncoded;
@@ -502,14 +476,13 @@ entity PredicateAttestations : cuid, managed {
     fieldKey            : HexEncoded; // null = proof not tied to one field
     expectedDigest      : HexEncoded;
     setRoot             : HexEncoded;
-    // Proofs that compare two documents: payloadHash is document A, these name document B.
     payloadHashB        : HexEncoded;
     attesterIdB         : HexEncoded;
     allowedMask         : Integer64; // documentIntegrity only; bit i set = field i may differ
     provenTxHash        : HexEncoded;
     provenAt            : Timestamp;
     network             : String(30);
-    compiledArtifactRef : String(200); // contract name; may later point to a newer build
+    compiledArtifactRef : String(200); // contract name
     artifactDigest      : HexEncoded;
 }
 
@@ -537,13 +510,13 @@ entity DisclosureGrants : cuid, managed {
     payloadHash     : HexEncoded not null;
     attesterId      : HexEncoded;
     grantee         : HexEncoded not null;
-    level           : Integer not null; // 0 public, 1 legitimate interest, 2 authority; confirmed on chain
-    pendingLevel    : Integer; // requested level not yet on chain; never grants access
+    level           : Integer not null; // 0 public, 1 legitimate interest, 2 authority;
+    pendingLevel    : Integer;
     contractAddress : HexEncoded not null;
     grantedTxHash   : HexEncoded;
     revokedTxHash   : HexEncoded;
     active          : Boolean default false; // granted on chain and not revoked
-    changedAtHeight : Integer64; // block of the last applied change; older states never overwrite it
+    changedAtHeight : Integer64; // block of the last applied change
 }
 
 /**
@@ -562,20 +535,16 @@ entity NightBalances {
     key address            : String(256);
         balance            : Decimal(20, 0) default 0;
         utxoCount          : Integer default 0;
-
         firstSeenHeight    : Integer64;
         firstSeenAt        : Timestamp;
         lastActivityHeight : Integer64;
         lastActivityAt     : Timestamp;
-
         txSentCount        : Integer default 0;
         txReceivedCount    : Integer default 0;
         totalSent          : Decimal(20, 0) default 0;
         totalReceived      : Decimal(20, 0) default 0;
-
         dustAddress        : DustAddr;
         isDustRegistered   : Boolean default false;
-
         lastUpdatedHeight  : Integer64;
         lastUpdatedAt      : Timestamp;
 }

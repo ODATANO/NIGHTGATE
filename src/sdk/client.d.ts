@@ -109,7 +109,7 @@ export interface NightgateClient {
     sponsorFinalized(p: ActionParams): Promise<JobResult>;
     sponsorUnbound(p: ActionParams): Promise<JobResult>;
     /**
-     * Takes `makerHalfB64`, `takerHalfB64`, and optionally `sponsorSessionId` and `idempotencyKey`.
+     * Takes `makerHalfB64`, `takerHalfB64` and optionally `idempotencyKey`.
      * Each half is either offer file text (`swapoffer1...`) or base64.
      */
     sponsorSwap(p: ActionParams): Promise<JobResult>;

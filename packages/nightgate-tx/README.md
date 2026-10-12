@@ -74,7 +74,7 @@ const call = prepareAttest({ payloadHash, metadataHash, attestationSecret: build
 const { finalizedTxB64 } = await builder.buildSponsorable({ contractAddress: VAULT, call });
 
 const ng = connect({ baseUrl: 'https://nightgate.example' });
-const { txHash } = await ng.sponsorFinalized({ finalizedTxB64, sponsorSessionId });
+const { txHash } = await ng.sponsorFinalized({ finalizedTxB64 });
 ```
 
 The on-chain attestation carries **your** attester id; the sponsor pays the
@@ -101,7 +101,7 @@ Details: `docs/txbuilder.md` in the main repo.
 ## Parallel sponsoring
 
 `buildSponsorable({ ..., bind: false })` returns `unboundTxB64` for
-`ng.sponsorUnbound({ unboundTxB64, sponsorSessionId })`: one sponsor wallet
+`ng.sponsorUnbound({ unboundTxB64 })`: one sponsor wallet
 pays for many callers at once (one per registered dust backing). Same proof,
 identity and TTL.
 
@@ -112,7 +112,7 @@ fee. `createSwapWallet({ seedHex, indexerHttpUrl, indexerWsUrl })` syncs the
 shielded coins only. `buildHalf({ give, want })` returns one half of a swap and
 its offer file (`swapoffer1...`); `takeOffer({ offer, expect })` reads the
 offer's terms from the transaction, builds the mirror half and returns both for
-`ng.sponsorSwap({ makerHalfB64, takerHalfB64, sponsorSessionId })`.
+`ng.sponsorSwap({ makerHalfB64, takerHalfB64 })`.
 `serializeState()` / `walletState` resume a wallet without a sync from genesis.
 Details: `docs/txbuilder.md` in the main repo.
 

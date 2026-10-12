@@ -110,6 +110,12 @@ function makeFakeService() {
 function makeReq(data: Record<string, unknown>) {
     return { data, user: { id: 'test-user' }, reject: vi.fn((status: number, message: string) => { const e: any = new Error(message); e.status = status; return e; }) };
 }
+/** A request under an agent grant pinned to one sponsor wallet session. */
+function grantReq(data: Record<string, unknown>, sponsorSessionId = 'sponsor-1') {
+    const req: any = makeReq(data);
+    req.agentGrant = { ID: 'g1', sessionId: 's', userId: 'test-user', sponsorSessionId, allowedContracts: [], allowedCircuits: [] };
+    return req;
+}
 // db.run captures PendingSubmissions writes (one row per broadcast attempt).
 const dbWrites: any[] = [];
 const fakeDbRows = { next: null as any };
@@ -146,15 +152,25 @@ describe('sponsorFinalizedTransaction', () => {
         workerImpl.fn = async () => ({ txHash: '00aa', circuits: ['attest'], contractAddress: 'c' });
     });
 
-    test('rejects without finalizedTxB64 or sponsorSessionId', async () => {
+    test('rejects without finalizedTxB64', async () => {
         const srv = setup();
-        const r1 = makeReq({ sponsorSessionId: 's' });
+        const r1 = makeReq({});
         await srv.handlers['sponsorFinalizedTransaction'](r1);
         expect(r1.reject).toHaveBeenCalledWith(400, expect.stringMatching(/finalizedTxB64/));
+    });
 
-        const r2 = makeReq({ finalizedTxB64: TX_A });
-        await srv.handlers['sponsorFinalizedTransaction'](r2);
-        expect(r2.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sponsorSessionId/));
+    test('the request names no payer: the pool pays, a grant pinned to a wallet session pays from it', async () => {
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        const srv = setup();
+        const pool: any = await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A }));
+        expect(pool.sessionId).toBe(PLATFORM_POOL_SENTINEL);
+
+        const pinned: any = await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A }, 'sponsor-1'));
+        expect(pinned.sessionId).toBe('sponsor-1');
+        expect(startJobCalls[1].command).toMatchObject({ sponsorSessionId: 'sponsor-1' });
+
+        const pinnedToPool: any = await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A }, PLATFORM_POOL_SENTINEL));
+        expect(pinnedToPool.sessionId).toBe(PLATFORM_POOL_SENTINEL);
     });
 
     test('fingerprints the transaction CONTENT, so equal-length bodies do not dedupe', async () => {
@@ -165,8 +181,8 @@ describe('sponsorFinalizedTransaction', () => {
         expect(TX_A).not.toBe(TX_B);
 
         const srv = setup();
-        await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1', idempotencyKey: 'same-key' }));
-        await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_B, sponsorSessionId: 'sponsor-1', idempotencyKey: 'same-key' }));
+        await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A, idempotencyKey: 'same-key' }));
+        await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_B, idempotencyKey: 'same-key' }));
 
         expect(startJobCalls).toHaveLength(2);
         expect(startJobCalls[0].request).not.toEqual(startJobCalls[1].request);
@@ -176,15 +192,14 @@ describe('sponsorFinalizedTransaction', () => {
 
     test('the same transaction under the same key keeps one fingerprint', async () => {
         const srv = setup();
-        await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1', idempotencyKey: 'same-key' }));
-        await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1', idempotencyKey: 'same-key' }));
+        await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A, idempotencyKey: 'same-key' }));
+        await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A, idempotencyKey: 'same-key' }));
         expect(startJobCalls[0].request).toEqual(startJobCalls[1].request);
     });
 
-    test('returns the SPONSOR session the job is keyed by (agent grants inject it server-side)', async () => {
+    test('returns the SPONSOR session the job is keyed by', async () => {
         const srv = setup();
-        const out: any = await srv.handlers['sponsorFinalizedTransaction'](
-            makeReq({ finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1' }));
+        const out: any = await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A }));
         expect(out).toMatchObject({ jobId: 'job-1', status: 'pending', sessionId: 'sponsor-1' });
     });
 
@@ -215,11 +230,12 @@ describe('sponsorFinalizedTransaction', () => {
         expect((resolveFeeSponsor as any).mock.calls.length).toBe(callsBefore);
     });
 
-    test('omitted sponsor WITHOUT a pool still rejects 400', async () => {
+    test('without a pool and without a pinned grant nothing can pay: 503', async () => {
         const srv = setup();
         const req = makeReq({ finalizedTxB64: TX_A });
         await srv.handlers['sponsorFinalizedTransaction'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sponsorSessionId is required/));
+        expect(req.reject).toHaveBeenCalledWith(503, expect.stringMatching(/no fee sponsor is configured/));
+        expect(startJobCalls).toHaveLength(0);
     });
 
     test('a fully busy pool QUEUES until a lease frees up instead of failing instantly', async () => {
@@ -318,7 +334,7 @@ describe('sponsorFinalizedTransaction', () => {
         process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS = 'attest';
         try {
             const srv = setup();
-            await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1' }));
+            await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A }));
             expect(startJobCalls[0].command).toMatchObject({
                 op: 'sponsorFinalized',
                 allowedContracts: ['0xVAULT', '0xOTHER'],
@@ -344,16 +360,16 @@ describe('per-grant sponsor policy', () => {
         process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS = '0xVAULT,0xOTHER';
         process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS = 'attest,anchorContentRoot';
         const srv = setup();
-        const req: any = makeReq({ finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1' });
-        req.agentGrant = { ID: 'g1', sessionId: 's', userId: 'test-user', allowedContracts: ['0xOTHER'], allowedCircuits: ['attest'] };
+        const req: any = grantReq({ finalizedTxB64: TX_A });
+        req.agentGrant = { ...req.agentGrant, allowedContracts: ['0xOTHER'], allowedCircuits: ['attest'] };
         await srv.handlers['sponsorFinalizedTransaction'](req);
         expect(startJobCalls[0].command).toMatchObject({ allowedContracts: ['0xOTHER'], allowedCircuits: ['attest'] });
     });
 
     test('an unrestricted floor makes the grant the whole policy (onboarding = issuing the grant)', async () => {
         const srv = setup();
-        const req: any = makeReq({ unboundTxB64: TX_B, sponsorSessionId: 'sponsor-1' });
-        req.agentGrant = { ID: 'g1', sessionId: 's', userId: 'test-user', allowedContracts: ['0xCUSTOMER'], allowedCircuits: [] };
+        const req: any = grantReq({ unboundTxB64: TX_B });
+        req.agentGrant = { ...req.agentGrant, allowedContracts: ['0xCUSTOMER'], allowedCircuits: [] };
         await srv.handlers['sponsorUnboundTransaction'](req);
         expect(startJobCalls[0].command).toMatchObject({ op: 'sponsorUnbound', allowedContracts: ['0xCUSTOMER'], allowedCircuits: [] });
     });
@@ -361,8 +377,8 @@ describe('per-grant sponsor policy', () => {
     test('grant ∩ floor empty: 403 SPONSOR_POLICY_EMPTY at admission, no job started', async () => {
         process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS = '0xVAULT';
         const srv = setup();
-        const req: any = makeReq({ finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1' });
-        req.agentGrant = { ID: 'g1', sessionId: 's', userId: 'test-user', allowedContracts: ['0xELSEWHERE'], allowedCircuits: [] };
+        const req: any = grantReq({ finalizedTxB64: TX_A });
+        req.agentGrant = { ...req.agentGrant, allowedContracts: ['0xELSEWHERE'], allowedCircuits: [] };
         await srv.handlers['sponsorFinalizedTransaction'](req);
         expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 403, code: 'SPONSOR_POLICY_EMPTY' }));
         expect(startJobCalls).toHaveLength(0);
@@ -382,7 +398,7 @@ describe('sponsorUnboundTransaction (parallel channel)', () => {
         // passes, and a mismatch fails every job with "no command processor
         // registered".
         const srv = setup();
-        const req = makeReq({ unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1' });
+        const req = grantReq({ unboundTxB64: TX_A });
         await srv.handlers['sponsorUnboundTransaction'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(startJobCalls).toHaveLength(1);
@@ -394,10 +410,10 @@ describe('sponsorUnboundTransaction (parallel channel)', () => {
     test('every replayable job any handler starts has a processor under that exact version', async () => {
         const srv = setup();
         for (const [action, data] of [
-            ['sponsorFinalizedTransaction', { finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1' }],
-            ['sponsorUnboundTransaction', { unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1' }]
+            ['sponsorFinalizedTransaction', { finalizedTxB64: TX_A }],
+            ['sponsorUnboundTransaction', { unboundTxB64: TX_A }]
         ] as const) {
-            await srv.handlers[action](makeReq(data));
+            await srv.handlers[action](grantReq(data));
         }
         expect(startJobCalls.length).toBeGreaterThanOrEqual(2);
         for (const call of startJobCalls) {
@@ -889,7 +905,7 @@ describe('sponsorSwap', () => {
     const T1 = 'ab'.repeat(32);
     const T2 = 'cd'.repeat(32);
     const closed = { allowedContracts: [], allowedCircuits: [], allowedTokenTypes: [], allowDeploy: true };
-    const HALVES = { makerHalfB64: TX_A, takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1' };
+    const HALVES = { makerHalfB64: TX_A, takerHalfB64: TX_B };
     const swapTerms = { gives: { tokenType: T1, amount: '10' }, wants: { tokenType: T2, amount: '3' } };
 
     beforeEach(() => {
@@ -897,7 +913,7 @@ describe('sponsorSwap', () => {
         unboundWorkerCalls.length = 0;
         grantBudget.minted.mockClear();
         __resetSponsorPoolForTests();
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
         // The action reads the floor from the environment, the executor through the policy module.
         process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS = 'true';
         process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = `${T1},${T2}`;
@@ -906,6 +922,7 @@ describe('sponsorSwap', () => {
     });
     afterEach(() => {
         platform.policy = closed;
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
         delete process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS;
         delete process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES;
     });
@@ -927,8 +944,8 @@ describe('sponsorSwap', () => {
         await srv.handlers['sponsorSwap'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(startJobCalls).toHaveLength(1);
-        expect(startJobCalls[0]).toMatchObject({ kind: 'sponsorSwap', sessionId: 'sponsor-1', commandVersion: 1, encryptCommand: true });
-        expect(startJobCalls[0].command).toEqual({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B }, sponsorSessionId: 'sponsor-1', grantId: undefined });
+        expect(startJobCalls[0]).toMatchObject({ kind: 'sponsorSwap', sessionId: PLATFORM_POOL_SENTINEL, commandVersion: 1, encryptCommand: true });
+        expect(startJobCalls[0].command).toEqual({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B }, sponsorSessionId: PLATFORM_POOL_SENTINEL, grantId: undefined });
         expect(processorVersions.get('sponsorSwap')).toBe(1);
         // keyed on both halves: the same maker half with another taker half is another job
         const other = makeReq({ ...HALVES, takerHalfB64: TX_A });
@@ -977,23 +994,23 @@ describe('sponsorSwap', () => {
     test('names the maker half by offerId: the board\'s half fills, a closed or unknown offer is refused first', async () => {
         const srv = setup();
         board.row = { ID: 'offer-1', offer: TX_A, status: 'open', expiresAt: null };
-        const req = makeReq({ takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1', offerId: 'offer-1' });
+        const req = makeReq({ takerHalfB64: TX_B, offerId: 'offer-1' });
         await srv.handlers['sponsorSwap'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(startJobCalls[0].command.swap).toEqual({ makerHalfB64: TX_A, takerHalfB64: TX_B, offerId: 'offer-1' });
 
-        const both = makeReq({ makerHalfB64: TX_A, takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1', offerId: 'offer-1' });
+        const both = makeReq({ makerHalfB64: TX_A, takerHalfB64: TX_B, offerId: 'offer-1' });
         await srv.handlers['sponsorSwap'](both);
         expect(both.reject).toHaveBeenCalledWith(400, 'makerHalfB64 and offerId: one or the other');
-        const unknown = makeReq({ takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1', offerId: 'offer-9' });
+        const unknown = makeReq({ takerHalfB64: TX_B, offerId: 'offer-9' });
         await srv.handlers['sponsorSwap'](unknown);
         expect(unknown.reject).toHaveBeenCalledWith(404, 'swap offer not found');
         board.row = { ID: 'offer-1', offer: TX_A, status: 'filled', expiresAt: null };
-        const filled = makeReq({ takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1', offerId: 'offer-1' });
+        const filled = makeReq({ takerHalfB64: TX_B, offerId: 'offer-1' });
         await srv.handlers['sponsorSwap'](filled);
         expect(filled.reject).toHaveBeenCalledWith(409, 'swap offer is filled');
         board.row = { ID: 'offer-1', offer: TX_A, status: 'open', expiresAt: '2001-01-01T00:00:00.000Z' };
-        const expired = makeReq({ takerHalfB64: TX_B, sponsorSessionId: 'sponsor-1', offerId: 'offer-1' });
+        const expired = makeReq({ takerHalfB64: TX_B, offerId: 'offer-1' });
         await srv.handlers['sponsorSwap'](expired);
         expect(expired.reject).toHaveBeenCalledWith(409, 'swap offer is expired');
         expect(startJobCalls).toHaveLength(1);

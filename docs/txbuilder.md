@@ -79,7 +79,7 @@ const { finalizedTxB64, serializedBytes } = await builder.buildSponsorable({
 await fetch('https://sponsor.example/api/v1/nightgate/sponsorFinalizedTransaction', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ finalizedTxB64, sponsorSessionId })
+    body: JSON.stringify({ finalizedTxB64 })
 });
 
 await builder.close();
@@ -256,7 +256,7 @@ const halves = await taker.takeOffer({
 });
 const ng = connect({ baseUrl, agentToken });
 const { txHash, swap } = await ng.sponsorSwap({
-    makerHalfB64: halves.makerHalfB64, takerHalfB64: halves.takerHalfB64, sponsorSessionId
+    makerHalfB64: halves.makerHalfB64, takerHalfB64: halves.takerHalfB64
 });
 ```
 
@@ -374,8 +374,9 @@ const { unboundTxB64 } = await b.buildSponsorable({
 ## Running the sponsor half
 
 A NIGHTGATE server with a funded, dust-registered wallet session:
-- `sponsorFinalizedTransaction(finalizedTxB64, sponsorSessionId, idempotencyKey)`
-  enforces the contract and circuit allow-list, balances dust and submits.
+- `sponsorFinalizedTransaction(finalizedTxB64, idempotencyKey)` enforces the
+  contract and circuit allow-list, balances dust from the server's sponsor
+  pool and submits.
 - `sponsorUnboundTransaction(unboundTxB64, ...)` pays from a locked dust
   backing; parallelism = distinct NIGHT UTxOs registered for dust generation.
 

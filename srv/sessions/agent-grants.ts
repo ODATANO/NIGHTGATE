@@ -1023,29 +1023,33 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
     const data = req.data;
     if (data && typeof data === 'object' && event !== 'READ') {
         // Sponsoring jobs belong to the sponsor session. Only getJobStatus may name it,
-        // because a write with it would act as the sponsor.
-        const sponsorPoll = event === 'getJobStatus'
-            && !!grant.sponsorSessionId
-            && (data.sessionId === grant.sponsorSessionId
-                || (grant.sponsorSessionId === PLATFORM_POOL_SENTINEL
-                    && getConfiguredFeeSponsorSessions(getNightgatePluginConfig()).includes(String(data.sessionId ?? ''))));
+        // because a write with it would act as the sponsor. The pool pays unless the
+        // grant pins a wallet session, so every grant may poll pool jobs.
+        const polling = event === 'getJobStatus' && data.sessionId !== grant.sessionId;
+        const pinnedPoll = polling && !!grant.sponsorSessionId
+            && grant.sponsorSessionId !== PLATFORM_POOL_SENTINEL && data.sessionId === grant.sponsorSessionId;
+        const poolPoll = polling && !pinnedPoll
+            && (data.sessionId === PLATFORM_POOL_SENTINEL
+                || getConfiguredFeeSponsorSessions(getNightgatePluginConfig()).includes(String(data.sessionId ?? '')));
+        const sponsorPoll = pinnedPoll || poolPoll;
         // Pool jobs are stored under the pool placeholder id, not under one pool wallet.
-        if (sponsorPoll && grant.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
-            data.sessionId = PLATFORM_POOL_SENTINEL;
-        }
+        if (poolPoll) data.sessionId = PLATFORM_POOL_SENTINEL;
         if (data.sessionId !== undefined && data.sessionId !== null
             && data.sessionId !== grant.sessionId && !sponsorPoll) {
             return req.reject(403, 'sessionId does not match this agent grant');
         }
         if (!sponsorPoll) data.sessionId = grant.sessionId;
-        if (allowlisted && grant.sponsorSessionId) {
-            if (data.sponsorSessionId !== undefined && data.sponsorSessionId !== null
-                && data.sponsorSessionId !== grant.sponsorSessionId) {
-                return req.reject(403, 'sponsorSessionId does not match this agent grant');
+        // The sponsor actions take no sponsor parameter; their handlers read the grant's pin.
+        if (allowlisted && !SPONSOR_PHASE2_ACTIONS.has(event)) {
+            if (grant.sponsorSessionId) {
+                if (data.sponsorSessionId !== undefined && data.sponsorSessionId !== null
+                    && data.sponsorSessionId !== grant.sponsorSessionId) {
+                    return req.reject(403, 'sponsorSessionId does not match this agent grant');
+                }
+                data.sponsorSessionId = grant.sponsorSessionId;
+            } else if (data.sponsorSessionId !== undefined && data.sponsorSessionId !== null && data.sponsorSessionId !== '') {
+                return req.reject(403, 'this agent grant has no sponsor binding; issue the grant with sponsorSessionId to sponsor its jobs');
             }
-            data.sponsorSessionId = grant.sponsorSessionId;
-        } else if (allowlisted && data.sponsorSessionId !== undefined && data.sponsorSessionId !== null && data.sponsorSessionId !== '') {
-            return req.reject(403, 'this agent grant has no sponsor binding; issue the grant with sponsorSessionId to sponsor its jobs');
         }
     }
 
@@ -1069,6 +1073,7 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
     (req as any).user = UserCtor ? new UserCtor({ id: grant.userId }) : { id: grant.userId };
     req.agentGrant = {
         ID: grant.ID, sessionId: grant.sessionId, userId: grant.userId,
+        sponsorSessionId: grant.sponsorSessionId ?? null,
         allowedContracts: parseGrantList(grant.allowedContracts),
         allowedCircuits: parseGrantList(grant.allowedCircuits),
         deployedContracts: parseGrantList(grant.deployedContracts),

@@ -94,7 +94,7 @@ const built = await builder.buildDeploySponsorable({ initialPrivateState: {}, bi
 console.log(`OK   deploy built in ${((Date.now() - t1) / 1000).toFixed(1)}s: ${built.serializedBytes} bytes, contractAddress ${built.contractAddress}`);
 if (!built.contractAddress) fail('buildDeploySponsorable returned no contractAddress');
 
-const job = await agent.sponsorUnbound({ unboundTxB64: built.unboundTxB64, sponsorSessionId: sponsor });
+const job = await agent.sponsorUnbound({ unboundTxB64: built.unboundTxB64 });
 console.log(`     sponsor job ${job.jobId}`);
 const out = await agent.waitForJob({ jobId: job.jobId, sessionId: job.sessionId ?? sponsor });
 console.log(`OK   deploy LANDED tx ${String(out.txHash).slice(0, 16)} circuits=${JSON.stringify(out.circuits)} deployed=${JSON.stringify(out.deployed)}`);
@@ -105,7 +105,7 @@ const call = { circuitId: 'increment', args: [] };
 const t2 = Date.now();
 const callTx = await builder.buildSponsorable({ contractAddress: built.contractAddress, call, witnesses: {}, bind: false });
 console.log(`     increment built in ${((Date.now() - t2) / 1000).toFixed(1)}s: ${callTx.serializedBytes} bytes`);
-const job2 = await agent.sponsorUnbound({ unboundTxB64: callTx.unboundTxB64, sponsorSessionId: sponsor });
+const job2 = await agent.sponsorUnbound({ unboundTxB64: callTx.unboundTxB64 });
 const out2 = await agent.waitForJob({ jobId: job2.jobId, sessionId: job2.sessionId ?? sponsor });
 console.log(`OK   increment LANDED tx ${String(out2.txHash).slice(0, 16)} on ${String(out2.contractAddress).slice(0, 16)}`);
 if (out2.contractAddress !== built.contractAddress) fail('follow-up call landed on a different address');
@@ -114,7 +114,7 @@ step('5. Deploy budget exhausted: a SECOND deploy under the grant is refused bef
 const second = await builder.buildDeploySponsorable({ initialPrivateState: {}, bind: false });
 let refused = null;
 try {
-    const j3 = await agent.sponsorUnbound({ unboundTxB64: second.unboundTxB64, sponsorSessionId: sponsor });
+    const j3 = await agent.sponsorUnbound({ unboundTxB64: second.unboundTxB64 });
     const o3 = await agent.waitForJob({ jobId: j3.jobId, sessionId: j3.sessionId ?? sponsor });
     fail(`second deploy was sponsored (${JSON.stringify(o3).slice(0, 200)}); the budget did not hold`);
 } catch (e) {

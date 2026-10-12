@@ -1,25 +1,11 @@
 services:
-  # NIGHTGATE itself, standalone: pull (or build) the image, set two secrets,
-  # and the full attestation server (four OData services, submission pipeline,
-  # in-process wasm proving) runs on :4004. No other service below is
-  # required: proving defaults to in-process wasm and the public preprod
-  # endpoints serve node/indexer. Bring up proof-server and point
-  # NIGHTGATE_PROOF_SERVER_URL at it to offload proving.
-  #
-  # Quickstart (from the repo root):
-  #   ENCRYPTION_KEY=$(openssl rand -hex 32) \
-  #   NIGHTGATE_HTTP_PASSWORD=change-me \
-  #   docker compose -f docker/docker-compose.yml up -d nightgate
+  # NIGHTGATE as standalone service
   # See docs/docker.md for schema-upgrade and proving-mode notes.
   nightgate:
     build:
       context: ..
       dockerfile: Dockerfile
-    # Published by .github/workflows/release.yml on every v* tag; compose
-    # pulls this and only builds locally when the image is unavailable.
-    # NIGHTGATE_IMAGE_TAG overrides; keep the default in lockstep with
-    # package.json on every release.
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.31.2}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.32.0}
     container_name: odatano-nightgate
     # Loopback only by default: basic auth is plain text without TLS, so put a
     # TLS reverse proxy in front. NIGHTGATE_BIND_ADDRESS=0.0.0.0 publishes it.
@@ -30,7 +16,7 @@ services:
       # Not a compose `:?` variable: compose would demand it even for
       # `up proof-server`; the entrypoint refuses to start without it instead.
       ENCRYPTION_KEY: "${ENCRYPTION_KEY:-}"
-      # Optional (0.21.1): PostgreSQL instead of the SQLite file under /data.
+      # Optional: PostgreSQL instead of the SQLite file under /data.
       # With `--profile postgres` the bundled service below matches this URL.
       NIGHTGATE_DB_URL: "${NIGHTGATE_DB_URL:-}"
       # Basic-auth credentials for the OData services (NIGHTGATE_AUTH=dummy
@@ -88,7 +74,7 @@ services:
     image: midnightntwrk/midnight-node:0.20.0
     container_name: odatano-night-node
     ports:
-      - "9944:9944" # Substrate RPC (used by ODATANO-NIGHT crawler)
+      - "9944:9944" # Substrate RPC
       - "30333:30333" # P2P
     environment:
       # Local standalone preset; keep this for undeployed/local testing.
@@ -228,31 +214,19 @@ services:
       resources:
         limits:
           cpus: "4.0"
-          # 4G got the container OOM-killed (exit 137) under the vault's
-          # larger circuits and 6G held for ~10 MB provers; the 0.16.0
-          # cross-root circuit's prover is 38.5 MB, so give the server
-          # headroom for its constraint system.
+          # Proving holds the constraint system in memory; the 38.5 MB comparison prover needs this.
           memory: 12G
         reservations:
           cpus: "0.5"
           memory: 1G
 
-  # PostgreSQL for NIGHTGATE (0.21.1). Start with `--profile postgres` and set
+  # PostgreSQL for NIGHTGATE: Start with `--profile postgres` and set
   # NIGHTGATE_DB_URL=postgres://nightgate:${NIGHTGATE_PG_PASSWORD}@nightgate-postgres:5432/nightgate
-  # on the nightgate service. Migrate an existing SQLite volume with the image's
-  # `migrate` mode (docs/docker.md, "PostgreSQL").
-  # NIGHTGATE_PG_PASSWORD is not a `:?` required variable: compose interpolates
-  # those before profile selection, which would break the SQLite quickstart.
-  # An empty password fails inside the container instead (the postgres image
-  # refuses to initialise without POSTGRES_PASSWORD).
+  # on the nightgate service.
   nightgate-postgres:
     image: postgres:16-alpine
     container_name: nightgate-postgres
     profiles: ["postgres"]
-    # The wallet snapshot table is write-heavy (tens of MB per save): with the
-    # image defaults (128 MB shared_buffers, 5 min checkpoints) a checkpoint
-    # wrote for minutes and stalled the app's connections. Sized for a host
-    # with a few GB to spare; scale shared_buffers with the box.
     command: ["postgres", "-c", "shared_buffers=1GB", "-c", "max_wal_size=4GB", "-c", "checkpoint_timeout=15min", "-c", "wal_buffers=64MB"]
     environment:
       POSTGRES_USER: nightgate

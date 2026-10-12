@@ -8,8 +8,8 @@
 //      cached on disk (second run is offline).
 //   3. `attest` is built, PROVEN IN-PROCESS (wasm), signed and finalized
 //      locally. Nothing is submitted; nothing secret leaves this process.
-//   4. Only the base64 transaction is POSTed to the sponsor, which pays the
-//      dust and submits.
+//   4. Only the base64 transaction is POSTed to the sponsor, whose pool
+//      (NIGHTGATE_FEE_SPONSOR_SESSION) pays the dust and submits.
 //   5. The attestation is verified on chain to carry OUR attester id.
 //
 // This is what an autonomous agent does: it proves under its own identity and
@@ -18,8 +18,7 @@
 // Server (separate terminal): npm run dev
 // Then:  NIGHTGATE_VAULT=<vault> node --env-file=.env scripts/run-txbuilder-e2e.mjs
 //
-// Needs LACE_VIEWING_KEY / LACE_MNEMONIC only for the SPONSOR side (our funded
-// wallet). The caller side needs no funds at all.
+// The server needs a sponsor pool; the caller side needs no funds at all.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -27,7 +26,6 @@ import { randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';
 import { createTxBuilder } from '../src/txbuilder/index.mjs';
 import { prepareAttest } from '../src/browser/index.mjs';
@@ -39,15 +37,12 @@ setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeou
 const URL_BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
 const ENDPOINT = `${URL_BASE}/api/v1/nightgate`;
 const VAULT = process.env.NIGHTGATE_VAULT;
-const VK = process.env.LACE_VIEWING_KEY;
-const MNEMONIC = (process.env.LACE_MNEMONIC || '').trim();
 const INDEXER_HTTP = process.env.NIGHTGATE_INDEXER_HTTP_URL;
 const NODE_URL = process.env.NIGHTGATE_NODE_URL;
 
 function fail(m) { console.error(`\nFAIL ${m}`); process.exit(1); }
 function step(n) { console.log(`\n--- ${n} ---`); }
 if (!VAULT) fail('NIGHTGATE_VAULT (the shared vault address) is required');
-if (!VK || !MNEMONIC || !bip39.validateMnemonic(MNEMONIC)) fail('LACE_VIEWING_KEY + LACE_MNEMONIC are required (the SPONSOR wallet)');
 if (!INDEXER_HTTP) fail('NIGHTGATE_INDEXER_HTTP_URL is required');
 if (!NODE_URL) fail('NIGHTGATE_NODE_URL is required');
 // Use the plugin's own derivation: the indexer path is versioned (/api/v4/…),
@@ -80,13 +75,6 @@ function fnCall(name, params) {
 }
 
 (async () => {
-    step('0. Sponsor session (our funded wallet; the ONLY thing the server holds)');
-    let r = await post('/connectWallet', { viewingKey: VK });
-    const sponsorSession = r.body?.sessionId; if (!sponsorSession) fail(`connectWallet: ${JSON.stringify(r.body)}`);
-    r = await post('/connectWalletForSigning', { sessionId: sponsorSession, mnemonic: MNEMONIC });
-    if (r.body?.prewarmJobId) { console.log('     syncing sponsor...'); await poll(sponsorSession, r.body.prewarmJobId, 'sponsor prewarm'); }
-    console.log(`OK   sponsor ready (${sponsorSession})`);
-
     step('1. LOCAL builder: fresh identity, prover keys fetched + cached');
     const seedHex = randomBytes(64).toString('hex');       // never sent anywhere
     const cacheDir = join(tmpdir(), 'nightgate-txbuilder-e2e');
@@ -119,9 +107,9 @@ function fnCall(name, params) {
     console.log(`OK   built + proven locally in ${((Date.now() - t1) / 1000).toFixed(1)}s: ${serializedBytes} bytes`);
 
     step('3. Ship ONLY the bytes to the sponsor; it pays the dust and submits');
-    const sponsored = await post('/sponsorFinalizedTransaction', { finalizedTxB64, sponsorSessionId: sponsorSession });
+    const sponsored = await post('/sponsorFinalizedTransaction', { finalizedTxB64 });
     if (sponsored.status !== 200 && sponsored.status !== 201) fail(`sponsorFinalizedTransaction -> HTTP ${sponsored.status}: ${JSON.stringify(sponsored.body)}`);
-    const out = await poll(sponsorSession, sponsored.body.jobId, 'sponsor');
+    const out = await poll(sponsored.body.sessionId, sponsored.body.jobId, 'sponsor');
     console.log(`OK   sponsor submitted: ${out.txHash}`);
 
     step('4. Verify on chain that the attestation is OURS');

@@ -26,7 +26,6 @@ import { Contract } from '@odatano/nightgate-tx/attestation-vault';
 const SPONSOR = process.env.NIGHTGATE_URL || 'http://localhost:4004';
 const VAULT = process.env.VAULT;
 const SEED_HEX = process.env.SEED_HEX;
-const SPONSOR_SESSION = process.env.SPONSOR_SESSION_ID;
 const NETWORK = process.env.NETWORK || 'preprod';
 const INDEXER_HTTP = process.env.INDEXER_HTTP_URL || `https://indexer.${NETWORK}.midnight.network/api/v4/graphql`;
 const INDEXER_WS = process.env.INDEXER_WS_URL || INDEXER_HTTP.replace(/^http/, 'ws') + '/ws';
@@ -70,7 +69,7 @@ console.log(`built locally: ${serializedBytes} bytes (nothing submitted yet)`);
 
 // 4 + 5: hand over the bytes. This is the only thing that leaves the machine;
 // sponsorFinalized submits the job AND waits for the on-chain result.
-const result = await ng.sponsorFinalized({ finalizedTxB64, sponsorSessionId: SPONSOR_SESSION });
+const result = await ng.sponsorFinalized({ finalizedTxB64 });
 console.log(`anchored: ${result.txHash}`);
 
 await builder.close();

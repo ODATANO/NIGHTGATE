@@ -6,6 +6,7 @@ export interface RequestAgentGrant {
     ID: string;
     sessionId: string;
     userId: string;
+    sponsorSessionId: string | null; // null = the platform pool; the wallet session that pays sponsored jobs
     allowedContracts: string[];
     allowedCircuits: string[];
     deployedContracts: string[];

@@ -1,29 +1,15 @@
 #!/usr/bin/env bash
-# NIGHTGATE container entrypoint: validate secrets, wire db + auth via
-# CDS_CONFIG (docker/cds-config.mjs), deploy the schema, then serve.
-#
-# Database (0.21.1):
-#   NIGHTGATE_DB_URL=postgres://user:pw@host:5432/db  -> PostgreSQL. The schema
-#       is deployed with `cds deploy` on EVERY boot (CAP's evolution is
-#       additive; an image upgrade brings its own columns and views with it).
-#       NIGHTGATE_DB_DEPLOY=never skips that, e.g. when a migration job owns it.
-#   otherwise                                          -> SQLite file at
-#       NIGHTGATE_DB_PATH (default /data/nightgate.db), deployed on first boot
-#       only; upgrades run `nightgate-schema-delta` (see docs/docker.md).
+# Container entrypoint: check secrets, build CDS_CONFIG (docker/cds-config.mjs),
+# deploy the schema, serve. Details in docs/docker.md.
 set -euo pipefail
 
 DB_URL="${NIGHTGATE_DB_URL:-}"
 DB_PATH="${NIGHTGATE_DB_PATH:-/data/nightgate.db}"
 MODE="${1:-serve}"
 
-# `migrate` mode (0.21.1): deploy the schema into the PostgreSQL database and
-# copy a SQLite file into it, then exit. It serves nothing, so it needs
-# neither ENCRYPTION_KEY nor HTTP credentials, only the database URL. Run it
-# as a one-off container BEFORE the first PostgreSQL start of the service,
-# with every writer stopped:
-#   NIGHTGATE_DB_URL=postgres://... docker compose run --rm --no-deps nightgate \
-#     migrate --from /data/nightgate.db
-# (same volume, network and env as the service; see docs/docker.md)
+
+# `migrate`: deploy the schema into PostgreSQL, copy a SQLite file into it, exit.
+# Needs only the database URL (docs/docker.md).
 if [ "$MODE" = "migrate" ]; then
     shift
     if [ -z "$DB_URL" ]; then
@@ -32,11 +18,7 @@ if [ "$MODE" = "migrate" ]; then
     fi
     CDS_CONFIG="$(node /app/docker/cds-config.mjs --db-only)" || exit 1
     export CDS_CONFIG
-    # A freshly created PostgreSQL may still be initialising: wait for the
-    # listener (up to NIGHTGATE_DB_WAIT_SECONDS, default 60, a finite positive
-    # number; anything else is refused) before deploying. Every connect attempt
-    # is capped at the time left in the window, so a dropped (not refused)
-    # SYN cannot outlive it.
+    # Wait for the PostgreSQL listener (NIGHTGATE_DB_WAIT_SECONDS, default 60).
     node -e '
         const { host, port } = JSON.parse(process.env.CDS_CONFIG).requires.db.credentials;
         const raw = process.env.NIGHTGATE_DB_WAIT_SECONDS ?? "60";
@@ -70,11 +52,7 @@ AUTH_KIND="${NIGHTGATE_AUTH:-basic}"
 if [ "$AUTH_KIND" = "dummy" ]; then
     echo "WARN: NIGHTGATE_AUTH=dummy serves UNAUTHENTICATED. Refused unless NIGHTGATE_ALLOW_UNAUTHENTICATED=true; local testing only." >&2
 fi
-# Custom transport auth (0.17.1): basic as before, PLUS requests carrying
-# x-agent-token pass for /api/v1/nightgate only, where the agent-grant hook
-# does the real authentication. The single configured user IS the operator of
-# this deployment; it holds the roles in NIGHTGATE_HTTP_ROLES (none by default).
-# cds-config.mjs refuses a missing password / unknown auth kind / non-postgres URL.
+# cds-config.mjs refuses a missing password, an unknown auth kind and a non-postgres URL.
 CDS_CONFIG="$(node /app/docker/cds-config.mjs)" || exit 1
 export CDS_CONFIG
 
@@ -86,15 +64,10 @@ if [ -n "$DB_URL" ]; then
     fi
 else
     DB_LABEL="sqlite ($DB_PATH)"
-    # The core's runtime-topology guard rejects SQLite under NODE_ENV=production
-    # unless explicitly overridden: the container IS the supported case (exactly
-    # one instance, volume-persisted), so the override is set here, visibly.
-    # For production-grade deployments set NIGHTGATE_DB_URL instead.
+    # SQLite under NODE_ENV=production is refused unless allowed; one container is the supported case.
     export NIGHTGATE_ALLOW_PRODUCTION_SQLITE="${NIGHTGATE_ALLOW_PRODUCTION_SQLITE:-true}"
     echo "NOTE: SQLite under the production profile (NIGHTGATE_ALLOW_PRODUCTION_SQLITE=$NIGHTGATE_ALLOW_PRODUCTION_SQLITE). Single instance only; set NIGHTGATE_DB_URL for PostgreSQL."
-    # Schema deploy on FIRST boot only: `cds deploy` recreates tables and would
-    # wipe data on an existing file. Upgrades run the additive delta:
-    #   docker exec <container> node scripts/apply-schema-delta.mjs
+    # First boot only: `cds deploy` recreates tables. Upgrades run scripts/apply-schema-delta.mjs.
     if [ ! -f "$DB_PATH" ]; then
         echo "First boot: deploying schema to $DB_PATH"
         npx cds deploy --to "sqlite:$DB_PATH"
@@ -102,20 +75,9 @@ else
 fi
 
 echo "Starting NIGHTGATE (network=${NIGHTGATE_NETWORK:-preprod}, auth=$AUTH_KIND, db=$DB_LABEL)"
-# node itself becomes PID 1 (0.21.7). `exec npx cds-serve` put npm -> sh ->
-# node in between, `sh -c` does not forward SIGTERM, so `docker stop` never
-# reached the server: every stop ended in SIGKILL after the grace period
-# (wallet state unsaved, sessions left open, one recreate raced and stayed
-# down). With node in front, cds runs its shutdown hooks on SIGTERM.
-#
-# V8 flags for the server process (0.23.3). Default: no concurrent
-# recompilation. A live server deadlocked inside V8: the main thread held
-# the transition-array lock, allocated, and waited at a GC safepoint for a
-# background TurboFan compile that was blocked on the same lock. Without
-# the background compile threads that deadlock cannot form; optimizing
-# compiles then run on the calling thread, a few ms each. V8 flags are not
-# accepted in NODE_OPTIONS, so they go on the command line here. Set
-# NIGHTGATE_NODE_FLAGS to override (an empty value passes no flag).
+# node is PID 1 so SIGTERM reaches cds (an `sh -c` in between would not forward it).
+# No concurrent recompilation: a background compile can deadlock with the main
+# thread at a GC safepoint. V8 flags do not fit NODE_OPTIONS, so they go here.
 NODE_FLAGS="${NIGHTGATE_NODE_FLAGS---no-concurrent-recompilation}"
 # shellcheck disable=SC2086  # word splitting is the point: several flags
 exec node $NODE_FLAGS /app/node_modules/@sap/cds/bin/serve.js

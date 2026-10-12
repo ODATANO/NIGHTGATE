@@ -1,9 +1,11 @@
 // Live lane for parallel sponsoring: prebuild N UNBOUND attest txs (each
 // caller proves its OWN circuit locally via the txbuilder SDK), then BURST them
-// concurrently at ONE sponsor wallet and report which backings paid and in which
-// blocks the txs landed. Decouples caller build time from sponsor throughput.
+// concurrently at the server's sponsor pool and report which backings paid and
+// in which blocks the txs landed. Decouples caller build time from sponsor
+// throughput.
 //
-// Server: `npm run serve` (NOT cds watch) with the vaults allow-listed:
+// Server: `npm run serve` (NOT cds watch) with a sponsor pool and the vaults allow-listed:
+//   NIGHTGATE_FEE_SPONSOR_SESSION=<sponsor session>
 //   NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS=<vault1>,<vault2>
 //   NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS=attest
 //   NIGHTGATE_SPONSORED_CALLER_SYNC=skip
@@ -12,11 +14,7 @@
 // same dust note and watch the dust-race rebuild-retry heal the loser.
 //
 // Then: NIGHTGATE_VAULT=<v1> NIGHTGATE_VAULT2=<v2> npm run burst-sponsor:e2e
-// Env: LACE_* (the sponsor wallet; connected + prewarmed by this script) OR
-//      NIGHTGATE_SPONSOR_SESSION_ID (an existing sponsor session or the platform
-//      pool sentinel 00000000-0000-0000-0000-706f6f6c0000; no wallet connect, this
-//      is the shape an external caller uses against a hosted server),
-//      NIGHTGATE_INDEXER_HTTP_URL, NIGHTGATE_NODE_URL, NIGHTGATE_BURST_N (default 4),
+// Env: NIGHTGATE_INDEXER_HTTP_URL, NIGHTGATE_NODE_URL, NIGHTGATE_BURST_N (default 4),
 //      REUSE=1 (reuse prebuilt txs from scratch/unbound, only within their 30 min
 //      TTL), NIGHTGATE_URL (default http://localhost:4004), NIGHTGATE_HTTP_USER /
 //      NIGHTGATE_HTTP_PASSWORD (basic auth of a hosted server), NIGHTGATE_AGENT_TOKEN
@@ -26,7 +24,6 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
-import bip39 from 'bip39';
 import { createTxBuilder } from '../src/txbuilder/index.mjs';
 import { prepareAttest } from '../src/browser/index.mjs';
 import { Contract } from '@odatano/contract-attestation-vault';
@@ -34,18 +31,14 @@ import { connect } from '../src/sdk/client.mjs';
 
 const BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
 const V = [process.env.NIGHTGATE_VAULT, process.env.NIGHTGATE_VAULT2].filter(Boolean);
-const VK = process.env.LACE_VIEWING_KEY, MN = (process.env.LACE_MNEMONIC || '').trim();
-const SPONSOR = process.env.NIGHTGATE_SPONSOR_SESSION_ID || '';
 const IHTTP = process.env.NIGHTGATE_INDEXER_HTTP_URL, NODE = process.env.NIGHTGATE_NODE_URL;
 const N = Number(process.env.NIGHTGATE_BURST_N || '4');
-const haveWallet = !!VK && !!MN && bip39.validateMnemonic(MN);
-if (!V.length || (!SPONSOR && !haveWallet) || !IHTTP || !NODE) { console.error('need NIGHTGATE_VAULT + (LACE_* or NIGHTGATE_SPONSOR_SESSION_ID) + indexer/node'); process.exit(1); }
+if (!V.length || !IHTTP || !NODE) { console.error('need NIGHTGATE_VAULT + indexer/node'); process.exit(1); }
 const { deriveIndexerWsUrl } = await import('../srv/utils/nightgate-config.js');
 const IWS = process.env.NIGHTGATE_INDEXER_WS_URL || deriveIndexerWsUrl(IHTTP);
 const DIR = join(process.cwd(), 'scratch', 'unbound');
 mkdirSync(DIR, { recursive: true });
-// NIGHTGATE_AGENT_TOKEN: run under an agent grant; the sponsor policy is
-// floor ∩ grant and NIGHTGATE_SPONSOR_SESSION_ID names the grant's sponsor.
+// NIGHTGATE_AGENT_TOKEN: run under an agent grant; the sponsor policy is floor ∩ grant.
 const ng = connect({
   baseUrl: BASE, timeoutMs: 60 * 60 * 1000,
   agentToken: process.env.NIGHTGATE_AGENT_TOKEN || undefined,
@@ -81,18 +74,10 @@ if (process.env.REUSE === '1' && have.length >= N) {
   for (let i = 0; i < N; i++) built.push(await build(i)); // sequential = represents N distributed callers
 }
 
-let sessionId = SPONSOR;
-if (!sessionId) {
-  ({ sessionId } = await ng.connectWallet({ viewingKey: VK }));
-  const conn = await ng.connectWalletForSigning({ sessionId, mnemonic: MN });
-  if (conn.prewarmJobId) { console.log('syncing sponsor...'); await ng.waitForJob({ jobId: conn.prewarmJobId, sessionId }); }
-}
-console.log('sponsor:', sessionId);
-
 console.log(`\nPhase B: firing ${built.length} sponsorUnbound jobs CONCURRENTLY (concurrency 4, 2 backings)...`);
 const t0 = Date.now();
 const settled = await Promise.allSettled(built.map(r =>
-  ng.sponsorUnbound({ unboundTxB64: r.unboundTxB64, sponsorSessionId: sessionId }).then(x => ({ ...r, ...x }))));
+  ng.sponsorUnbound({ unboundTxB64: r.unboundTxB64 }).then(x => ({ ...r, ...x }))));
 const dt = ((Date.now() - t0) / 1000).toFixed(1);
 console.log(`\nburst settled in ${dt}s`);
 

@@ -47,7 +47,7 @@ function makeTierGate(tier: AttestationTier, db: cds.DatabaseService) {
 
 /**
  * A proof result in a portable format. The field names are public and must not change.
- * `proofValue` is the hash of the transaction that carried the proof. Midnight proofs can only be checked on chain.
+ * `proofValue` is the hash of the transaction that carried the proof.
  */
 export interface PredicateAttestationEnvelope {
     digestMultibase: string | null;

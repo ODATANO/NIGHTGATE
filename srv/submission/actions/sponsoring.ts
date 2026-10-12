@@ -16,31 +16,39 @@ import { NightgateError } from '../../utils/errors';
 import { transactionBytesOf } from '../../utils/offer-file';
 import { expireSwapOffers, isSwapOfferOpen, loadSwapOffer } from '../swap-offers';
 import type { SubmissionContext } from './context';
+import type { Request } from '@sap/cds';
 import { sponsorFinalizedTransaction, sponsorSwap, sponsorUnboundTransaction } from '#cds-models/NightgateService';
+
+/**
+ * The platform pool pays. A grant pinned to one wallet session pays from that session.
+ * Returns undefined when nothing can pay, after rejecting the request.
+ */
+function sponsorSessionFor(req: Request): string | undefined {
+    const pinned = req.agentGrant?.sponsorSessionId;
+    if (pinned && pinned !== PLATFORM_POOL_SENTINEL) return String(pinned);
+    if (getConfiguredFeeSponsorSessions(getNightgatePluginConfig()).length === 0) {
+        req.reject(503, 'no fee sponsor is configured on this server (NIGHTGATE_FEE_SPONSOR_SESSION)');
+        return undefined;
+    }
+    return PLATFORM_POOL_SENTINEL;
+}
 
 export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | 'db'>): void {
     const { srv, db } = ctx;
 
     srv.on(sponsorFinalizedTransaction, async (req) => {
-        const { finalizedTxB64, sponsorSessionId, idempotencyKey } = req.data;
+        const { finalizedTxB64, idempotencyKey } = req.data;
         if (!finalizedTxB64) return req.reject(400, 'finalizedTxB64 is required');
-        // With the pool placeholder, the job picks a sponsor wallet when it runs.
-        // If one wallet fails, another can take over.
-        const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
-        let effectiveSponsor = sponsorSessionId;
-        if (!effectiveSponsor || effectiveSponsor === PLATFORM_POOL_SENTINEL) {
-            if (pool.length === 0) {
-                return req.reject(400, 'sponsorSessionId is required (the wallet that pays dust); no platform pool is configured');
-            }
-            effectiveSponsor = PLATFORM_POOL_SENTINEL;
-        }
+        // A pool job picks its wallet when it runs, so another wallet can take over if one fails.
+        const effectiveSponsor = sponsorSessionFor(req);
+        if (!effectiveSponsor) return;
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(sponsorRateLimiter, 'sponsor', req)) return;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
-            // A named sponsor is checked here only against its database row.
+            // A pinned sponsor is checked here only against its database row.
             // Loading its wallet is slow and happens when the job runs.
             // Pool jobs skip this check, so one broken pool wallet cannot block new requests.
             if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
@@ -75,14 +83,10 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
     });
 
     srv.on(sponsorUnboundTransaction, async (req) => {
-        const { unboundTxB64, sponsorSessionId, idempotencyKey } = req.data;
+        const { unboundTxB64, idempotencyKey } = req.data;
         if (!unboundTxB64) return req.reject(400, 'unboundTxB64 is required');
-        const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
-        let effectiveSponsor = sponsorSessionId;
-        if (!effectiveSponsor || effectiveSponsor === PLATFORM_POOL_SENTINEL) {
-            if (pool.length === 0) return req.reject(400, 'sponsorSessionId is required; no platform pool is configured');
-            effectiveSponsor = PLATFORM_POOL_SENTINEL;
-        }
+        const effectiveSponsor = sponsorSessionFor(req);
+        if (!effectiveSponsor) return;
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(sponsorRateLimiter, 'sponsor', req)) return;
 
@@ -114,7 +118,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
     });
 
     srv.on(sponsorSwap, async (req) => {
-        const { takerHalfB64, sponsorSessionId, idempotencyKey, offerId } = req.data;
+        const { takerHalfB64, idempotencyKey, offerId } = req.data;
         let makerHalfB64 = req.data.makerHalfB64 as string | undefined;
         if (offerId && makerHalfB64) return req.reject(400, 'makerHalfB64 and offerId: one or the other');
         if (offerId) {
@@ -132,12 +136,8 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
             try { halves[name] = Buffer.from(await transactionBytesOf(value)).toString('base64'); }
             catch (e) { return req.reject(400, `${name}: ${(e as Error).message}`); }
         }
-        const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
-        let effectiveSponsor = sponsorSessionId;
-        if (!effectiveSponsor || effectiveSponsor === PLATFORM_POOL_SENTINEL) {
-            if (pool.length === 0) return req.reject(400, 'sponsorSessionId is required; no platform pool is configured');
-            effectiveSponsor = PLATFORM_POOL_SENTINEL;
-        }
+        const effectiveSponsor = sponsorSessionFor(req);
+        if (!effectiveSponsor) return;
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate(sponsorRateLimiter, 'sponsor', req)) return;
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.32.0 - 2026-10-12
+
+### Breaking
+
+- `sponsorFinalizedTransaction`, `sponsorUnboundTransaction` and `sponsorSwap`
+  take no `sponsorSessionId`. The platform pool (`NIGHTGATE_FEE_SPONSOR_SESSION`)
+  pays; a grant pinned to a wallet session (`createAgentGrant` `sponsorSessionId`)
+  pays from that session. A request that still carries the parameter is a 400.
+- Without a pool and without a pinned grant the three actions answer 503.
+
+### Changes
+
+- `getJobStatus` under any agent grant may poll pool jobs, under the reserved
+  pool session id the sponsor actions return.
+- `@odatano/nightgate-tx` 0.11.0: `sponsorFinalized`, `sponsorUnbound` and
+  `sponsorSwap` send no sponsor session; the poll uses the session the server
+  returns.
+
 ## 0.31.2 - 2026-10-07
 
 ### Changes

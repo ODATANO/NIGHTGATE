@@ -4,7 +4,8 @@
 //
 // Walks:
 //   1. server width check: /zk-config/attestation-vault-32 serves the 32er
-//   2. connectWallet + connectWalletForSigning (LACE session = fee sponsor)
+//   2. connectWallet + connectWalletForSigning (LACE session = the deploying wallet;
+//      the server's sponsor pool pays the txbuilder calls)
 //   3. deployContract('attestation-vault-32') via the SERVER (the registrar
 //      constructor arg derives from the vault-family name prefix)
 //   4. prepareDocumentProof via the SERVER action (24 real fields -> 32
@@ -86,7 +87,7 @@ step('1. Server width check (attestation-vault-32 registered)');
     console.log(`OK   /zk-config/attestation-vault-32 serves the width-32 artifact (${served} B)`);
 }
 
-step('2. connectWallet + connectWalletForSigning (sponsor = LACE session)');
+step('2. connectWallet + connectWalletForSigning (LACE session)');
 const { sessionId } = await ng.connectWallet({ viewingKey: VK });
 const signing = await ng.connectWalletForSigning({ sessionId, mnemonic: MNEMONIC });
 if (signing.prewarmJobId) {
@@ -172,7 +173,7 @@ async function sponsorWithRetry(label, build) {
     let built = await build();
     for (let attempt = 1, jobRetries = 0; ; attempt++) {
         try {
-            const res = await ng.sponsorFinalized({ finalizedTxB64: built.finalizedTxB64, sponsorSessionId: sessionId, idempotencyKey: `${stamp}-${label}-${jobRetries}` });
+            const res = await ng.sponsorFinalized({ finalizedTxB64: built.finalizedTxB64, idempotencyKey: `${stamp}-${label}-${jobRetries}` });
             console.log(`     [${label}] sponsored, tx ${String(res.txHash ?? '').slice(0, 16)}...`);
             return res;
         } catch (e) {
