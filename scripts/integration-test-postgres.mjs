@@ -153,6 +153,30 @@ try {
     const actions = await db.run(cds.ql.SELECT.from('midnight.ContractActions').columns('ID', 'state'));
     ok('postgres: ContractActions.state stays null', actions.length === 1 && actions[0].state === null);
 
+    // ---- 2b. LargeBinary written by UPDATE (contract states, ledger parameters) ----
+    const { upsertCurrentState } = require('./srv/crawler/contract-state.js');
+    const { readCapBinary, capBinaryInput } = require('./srv/crawler/cap-binary.js');
+    const stateA = Buffer.from('midnight:contract-state[v6]:A');
+    const stateB = Buffer.from('midnight:contract-state[v6]:B-longer');
+    const stateRow = (bytes, height) => ({
+        address: 'ab'.repeat(32), height, state: bytes.toString('base64'), zswapState: bytes.toString('base64'),
+        stateHash: 'h'.repeat(64), zswapStateHash: 'z'.repeat(64), contractActionId: actions[0].ID
+    });
+    await upsertCurrentState(db, stateRow(stateA, 9));
+    await upsertCurrentState(db, stateRow(stateB, 10));
+    const csRow = await db.run(cds.ql.SELECT.one.from('midnight.ContractStates').columns('state', 'zswapState').where({ address: 'ab'.repeat(32) }));
+    const csBytes = await readCapBinary(csRow?.state);
+    ok('postgres: ContractStates.state written by UPDATE reads back as the bytes', csBytes?.equals(stateB) === true, csBytes ? csBytes.subarray(0, 32).toString() : 'null');
+    const csLen = await db.run("SELECT octet_length(state) AS n FROM midnight_contractstates");
+    ok('postgres: BYTEA holds the state bytes, not base64 text', Number(csLen[0]?.n) === stateB.length, `octet_length=${csLen[0]?.n}, bytes=${stateB.length}`);
+    await db.run(cds.ql.UPDATE.entity('midnight.ContractActions').set({ state: capBinaryInput(stateA.toString('base64')) }).where({ ID: actions[0].ID }));
+    const caRow = await db.run(cds.ql.SELECT.one.from('midnight.ContractActions').columns('state').where({ ID: actions[0].ID }));
+    ok('postgres: ContractActions.state written by UPDATE reads back as the bytes', (await readCapBinary(caRow?.state))?.equals(stateA) === true);
+    const blockRow = await db.run(cds.ql.SELECT.one.from('midnight.Blocks').columns('ID'));
+    await db.run(cds.ql.UPDATE.entity('midnight.Blocks').set({ ledgerParameters: capBinaryInput(stateA.toString('base64')) }).where({ ID: blockRow.ID }));
+    const lpLen = await db.run("SELECT octet_length(ledgerparameters) AS n FROM midnight_blocks WHERE ledgerparameters IS NOT NULL");
+    ok('postgres: Blocks.ledgerParameters written by UPDATE holds the bytes', Number(lpLen[0]?.n) === stateA.length, `octet_length=${lpLen[0]?.n}`);
+
     // ---- 3. Secondary indexes ---------------------------------------------
     const { ensureIndexes, NIGHTGATE_INDEXES } = require('./srv/utils/db-indexes.js');
     const warnings = [];

@@ -302,8 +302,8 @@ export class IndexerSupplement {
                 const keep = keepsStateHistory(this.config.contractState ?? DEFAULT_CONTRACT_STATE_POLICY, action.address);
                 await dbTx.run(UPDATE.entity(ContractActions)
                     .set({
-                        state: (keep ? match.state : null) as any,
-                        zswapState: (keep ? match.zswapState : null) as any,
+                        state: keep && match.state != null ? capBinaryInput(match.state) : null,
+                        zswapState: keep && match.zswapState != null ? capBinaryInput(match.zswapState) : null,
                         stateHash: state.hash,
                         stateSize: state.size,
                         zswapStateHash: zswapState.hash,

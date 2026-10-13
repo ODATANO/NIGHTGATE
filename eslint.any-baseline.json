@@ -11,7 +11,7 @@
     "srv/crawler/crawler-fault-guard.ts": 14,
     "srv/crawler/Crawler.ts": 7,
     "srv/crawler/indexer-supplement.ts": 9,
-    "srv/crawler/IndexerSupplement.ts": 11,
+    "srv/crawler/IndexerSupplement.ts": 9,
     "srv/crawler/ledger-payload.ts": 7,
     "srv/crawler/LedgerPayloadDecoder.ts": 4,
     "srv/crawler/redecode.ts": 2,

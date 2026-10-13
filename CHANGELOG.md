@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.33.2 - 2026-10-13
+
+### Fixes
+
+- Binary columns updated on PostgreSQL (`ContractStates`, `ContractActions`
+  state and zswap state, `Blocks.ledgerParameters`) were stored as base64 text
+  and read back encoded twice; `stateAt` served them that way and a builder on
+  the API failed with `expected header tag 'midnight:contract-state[v6]:'`.
+  Writes hand the driver bytes now. Rows written before: one SQL run, see
+  `docs/operations.md`.
+
 ## 0.33.1 - 2026-10-13
 
 ### Changes

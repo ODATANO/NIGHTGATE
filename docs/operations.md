@@ -235,6 +235,31 @@ ALTER TABLE midnight_Transactions DROP COLUMN proofHash;
 SQLite: `nightgate-schema-delta` sets NULL rows of a `NOT NULL` column to its
 default and leaves a removed column in place.
 
+### PostgreSQL: binary columns written before 0.33.2
+
+Up to 0.33.1 the server handed PostgreSQL a base64 string for a binary column
+it updated, and the database stored the text. `ContractStates.state` /
+`zswapState`, `ContractActions.state` / `zswapState` and
+`Blocks.ledgerParameters` read back base64-encoded twice, which a builder
+on `stateAt` reports as `expected header tag 'midnight:contract-state[v6]:'`.
+Once, after the first boot of 0.33.2 (every ledger serialization starts with
+`midnight:`, base64 `bWlkbmlnaHQ6`; the guard leaves repaired rows alone):
+
+```sql
+UPDATE midnight_contractstates SET state = decode(convert_from(state, 'UTF8'), 'base64')
+  WHERE convert_from(substring(state from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';
+UPDATE midnight_contractstates SET zswapstate = decode(convert_from(zswapstate, 'UTF8'), 'base64')
+  WHERE convert_from(substring(zswapstate from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';
+UPDATE midnight_contractactions SET state = decode(convert_from(state, 'UTF8'), 'base64')
+  WHERE convert_from(substring(state from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';
+UPDATE midnight_contractactions SET zswapstate = decode(convert_from(zswapstate, 'UTF8'), 'base64')
+  WHERE convert_from(substring(zswapstate from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';
+UPDATE midnight_blocks SET ledgerparameters = decode(convert_from(ledgerparameters, 'UTF8'), 'base64')
+  WHERE convert_from(substring(ledgerparameters from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';
+```
+
+SQLite stores a base64 string and a Buffer the same way; nothing to do.
+
 ### Contract state from before the hash layout
 
 Earlier releases stored the full contract state on every `ContractActions`
