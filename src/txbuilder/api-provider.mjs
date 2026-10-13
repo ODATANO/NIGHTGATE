@@ -35,7 +35,8 @@ const notInBuildOnly = (method) => () => {
 
 // `ledger` deserializes the states. `watchTimeoutMs` bounds the waits the SDK would run forever.
 // `maxLagBlocks`: a state from a database further behind the chain is refused, because a build on it can fail on chain.
-export function apiPublicDataProvider({ client, ledger, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 10 }) {
+// A server's contract states trail the chain by its indexer pass, some ten blocks in normal operation.
+export function apiPublicDataProvider({ client, ledger, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 60 }) {
     if (!client) throw new Error('apiPublicDataProvider: client is required');
     if (!ledger?.ContractState?.deserialize) throw new Error('apiPublicDataProvider: ledger module is required');
     if (!(Number.isInteger(maxLagBlocks) && maxLagBlocks >= 0)) throw new Error('apiPublicDataProvider: maxLagBlocks must be a non-negative integer');

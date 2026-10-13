@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.33.1 - 2026-10-13
+
+### Changes
+
+- `@odatano/nightgate-tx` 0.12.1: `maxLagBlocks` defaults to 60. A server's
+  contract states trail the chain by its indexer pass, some ten blocks in
+  normal operation, which the old default of 10 refused.
+
 ## 0.33.0 - 2026-10-12
 
 ### Changes

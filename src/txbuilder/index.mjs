@@ -472,7 +472,7 @@ export async function deriveIdentity(opts) {
  *                                        ({ baseUrl, agentToken, ... }) or a connected client. Replaces the indexer and
  *                                        the node; needs `walletSync: false` unless the indexer URLs are given as well.
  * @param {number} [opts.maxLagBlocks]    With `api`: refuse a contract state from a server whose database is further
- *                                        behind the chain, default 10 blocks. A build on a stale state can fail on chain.
+ *                                        behind the chain, default 60 blocks. A build on a stale state can fail on chain.
  * @param {string} [opts.indexerHttpUrl]  Required without `api`.
  * @param {string} [opts.indexerWsUrl]    Required without `api`.
  * @param {string} [opts.nodeUrl]         Node RPC URL, for example wss://rpc.preprod.midnight.network/. Required without `api`.

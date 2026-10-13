@@ -139,6 +139,13 @@ describe('apiPublicDataProvider: a stale database is refused', () => {
         await expect(within.queryContractState(ADDRESS)).resolves.toEqual({ kind: 'contract', text: 's' });
     });
 
+    it('allows 60 blocks by default, the normal trailing distance with a margin', async () => {
+        const { apiPublicDataProvider } = await importProvider();
+        const at = (chainHeight: number) => fakeClient({ contractStateAt: vi.fn(async () => ({ height: 12, state: b64('s'), zswapState: b64('z'), ledgerParameters: b64('p'), coveredHeight: 100, chainHeight })) });
+        await expect((apiPublicDataProvider({ client: at(160), ledger }) as any).queryContractState(ADDRESS)).resolves.toEqual({ kind: 'contract', text: 's' });
+        await expect((apiPublicDataProvider({ client: at(161), ledger }) as any).queryContractState(ADDRESS)).rejects.toThrow(/61 blocks behind, allowed 60/);
+    });
+
     it('a snapshot without coverage figures is served as it is', async () => {
         const { apiPublicDataProvider } = await importProvider();
         const provider: any = apiPublicDataProvider({ client: fakeClient(), ledger, maxLagBlocks: 0 });

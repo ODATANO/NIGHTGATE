@@ -57,7 +57,7 @@ export interface CreateTxBuilderInput {
     api?: ConnectOptions | NightgateClient;
     /**
      * With `api`: a contract state from a server whose database is more blocks behind the chain is refused,
-     * because a build on a stale state can fail on chain. Default 10.
+     * because a build on a stale state can fail on chain. Default 60.
      */
     maxLagBlocks?: number;
     /** Required without `api`. */
