@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.33.3 - 2026-10-13
+
+### Fixes
+
+- `@odatano/nightgate-tx` 0.12.2: a builder on `api` deserialized the contract
+  state with the ledger class; circuits run on compact-runtime's class of the
+  same name and refused it ('contractState' parameter has unexpected type).
+  `apiPublicDataProvider` takes `runtime` (compact-runtime) for the contract
+  state and `ledger` for the zswap state and the ledger parameters.
+
 ## 0.33.2 - 2026-10-13
 
 ### Fixes

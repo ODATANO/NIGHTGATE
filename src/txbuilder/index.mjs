@@ -634,7 +634,7 @@ export async function createTxBuilder(opts) {
     // One indexer provider per builder. One per transaction would leak a socket each time.
     const sockets = apiClient ? null : trackingWebSocket(require('ws'));
     const publicDataProvider = apiClient
-        ? apiPublicDataProvider({ client: apiClient, ledger, ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
+        ? apiPublicDataProvider({ client: apiClient, ledger, runtime: require('@midnight-ntwrk/compact-runtime'), ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
         : indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, sockets.WebSocket);
 
     return {

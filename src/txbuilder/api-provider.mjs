@@ -33,12 +33,13 @@ const notInBuildOnly = (method) => () => {
     throw new Error(`${method} is not available: this builder reads the chain through the NIGHTGATE API and never submits itself`);
 };
 
-// `ledger` deserializes the states. `watchTimeoutMs` bounds the waits the SDK would run forever.
-// `maxLagBlocks`: a state from a database further behind the chain is refused, because a build on it can fail on chain.
-// A server's contract states trail the chain by its indexer pass, some ten blocks in normal operation.
-export function apiPublicDataProvider({ client, ledger, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 60 }) {
+// `runtime` (compact-runtime) deserializes the contract state: circuits run on its ContractState class, and ledger-v8's
+// class of the same name is refused. `ledger` deserializes the zswap state and the ledger parameters.
+// `maxLagBlocks`: a state further behind the chain is refused; a server's states trail it by some ten blocks normally.
+export function apiPublicDataProvider({ client, ledger, runtime, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 60 }) {
     if (!client) throw new Error('apiPublicDataProvider: client is required');
-    if (!ledger?.ContractState?.deserialize) throw new Error('apiPublicDataProvider: ledger module is required');
+    if (!ledger?.ZswapChainState?.deserialize || !ledger?.LedgerParameters?.deserialize) throw new Error('apiPublicDataProvider: ledger module is required');
+    if (!runtime?.ContractState?.deserialize) throw new Error('apiPublicDataProvider: runtime module (compact-runtime) is required');
     if (!(Number.isInteger(maxLagBlocks) && maxLagBlocks >= 0)) throw new Error('apiPublicDataProvider: maxLagBlocks must be a non-negative integer');
 
     async function snapshotAt(address, height) {
@@ -71,7 +72,7 @@ export function apiPublicDataProvider({ client, ledger, pollMs = 2_000, watchTim
 
     const contractState = async (address, config) => {
         const snapshot = await snapshotAt(address, heightOf(config));
-        return snapshot?.state ? ledger.ContractState.deserialize(toBytes(snapshot.state)) : null;
+        return snapshot?.state ? runtime.ContractState.deserialize(toBytes(snapshot.state)) : null;
     };
 
     return {
@@ -82,7 +83,7 @@ export function apiPublicDataProvider({ client, ledger, pollMs = 2_000, watchTim
             if (!snapshot?.state) return null;
             return [
                 ledger.ZswapChainState.deserialize(toBytes(need(snapshot, 'zswapState', address))),
-                ledger.ContractState.deserialize(toBytes(snapshot.state)),
+                runtime.ContractState.deserialize(toBytes(snapshot.state)),
                 ledger.LedgerParameters.deserialize(toBytes(need(snapshot, 'ledgerParameters', address)))
             ];
         },
