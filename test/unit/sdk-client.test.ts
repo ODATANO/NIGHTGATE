@@ -319,3 +319,59 @@ describe('isRetryable', () => {
         expect(isRetryable(new TypeError('fetch failed'))).toBe(true);
     });
 });
+
+describe('connect: the chain reads a transaction builder needs', () => {
+    test('contractStateAt asks stateAt with a null height, lowercases the address and drops a 0x prefix', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([{ body: { address: 'ab', height: 7, state: 'c3Q=', ledgerParameters: null } }]);
+        const ng = connect({ baseUrl: 'https://ng.example', agentToken: 'ngat_x', fetchFn: fn as any });
+        const snap = await ng.contractStateAt({ address: '0xAB' });
+        expect(calls[0].url).toBe("https://ng.example/api/v1/nightgate/ContractStates/stateAt(address='ab',height=null)");
+        expect(snap).toEqual(expect.objectContaining({ height: 7, state: 'c3Q=' }));
+        await ng.contractStateAt({ address: 'ab', height: 12 });
+        expect(calls[1].url).toMatch(/height=12\)$/);
+    });
+
+    test('transactionByIdentifier is null on 404 and the inclusion otherwise', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([{ status: 404, body: { error: { message: 'no indexed transaction carries identifier ffff' } } }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        expect(await ng.transactionByIdentifier('0xFFFF')).toBeNull();
+        expect(calls[0].url).toBe("https://ng.example/api/v1/nightgate/Transactions/byIdentifier(identifier='ffff')");
+
+        const found = fakeFetch([{ body: { identifier: 'ffff', hash: '0xtx', blockHeight: 5, status: 'SUCCESS', failedSegments: [] } }]);
+        const ng2 = connect({ baseUrl: 'https://ng.example', fetchFn: found.fn as any });
+        expect(await ng2.transactionByIdentifier('ffff')).toEqual(expect.objectContaining({ hash: '0xtx', blockHeight: 5, status: 'SUCCESS' }));
+    });
+
+    test('contractDeploy filters the deploy action with its transaction, block and result, and names the deploy identifier', async () => {
+        const { connect } = await importClient();
+        const page = {
+            value: [{
+                actionIndex: 1,
+                transaction: {
+                    hash: '0xdeploy', ledgerTxHash: '0xledger', identifiers: JSON.stringify(['id0', 'id1']),
+                    block: { height: 7, hash: '0xb7' },
+                    transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ segmentId: 0, success: true }, { segmentId: 1, success: false }] }
+                }
+            }]
+        };
+        const { fn, calls } = fakeFetch([{ body: page }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        const deploy = await ng.contractDeploy('0x' + 'AB'.repeat(32));
+        const url = decodeURIComponent(calls[0].url);
+        expect(url).toContain(`/ContractActions?$filter=address eq '${'ab'.repeat(32)}' and actionType eq 'DEPLOY'`);
+        expect(url).toContain('$expand=transaction($expand=block,transactionResult($expand=segments))');
+        expect(deploy).toEqual({
+            txHash: '0xdeploy', ledgerTxHash: '0xledger', blockHeight: 7, blockHash: '0xb7', status: 'PARTIAL_SUCCESS',
+            failedSegments: [1], identifiers: ['id0', 'id1'], txId: 'id1'
+        });
+    });
+
+    test('contractDeploy is null while the server has no deploy action', async () => {
+        const { connect } = await importClient();
+        const { fn } = fakeFetch([{ body: { value: [] } }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        expect(await ng.contractDeploy('ab'.repeat(32))).toBeNull();
+    });
+});

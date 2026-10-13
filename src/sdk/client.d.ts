@@ -48,6 +48,52 @@ export type ActionParams = Record<string, unknown>;
 /** The parsed job result, plus the job id and the transaction hash. */
 export type JobResult = Record<string, unknown> & { jobId: string; txHash?: string };
 
+/** A contract's state as the server serves it. Binary fields are base64. */
+export interface ContractStateSnapshot {
+    address: string;
+    /** Block of the state. Null when the server knows the state only from its indexer. */
+    height: number | null;
+    state: string | null;
+    zswapState: string | null;
+    stateHash: string | null;
+    zswapStateHash: string | null;
+    source: 'history' | 'current' | 'indexer';
+    verified: boolean | null;
+    blockHash: string | null;
+    /** The parameters in effect at that block. Null when neither the server nor its indexer knows them. */
+    ledgerParameters: string | null;
+    /** The server's database holds every contract state up to this block. Null for an indexer answer, or while the supplement never ran. */
+    coveredHeight: number | null;
+    /** The chain tip the server last saw. */
+    chainHeight: number | null;
+}
+
+/** Where a transaction landed. */
+export interface TransactionInclusion {
+    identifier: string;
+    hash: string;
+    ledgerTxHash: string | null;
+    blockHeight: number;
+    blockHash: string;
+    /** SUCCESS, PARTIAL_SUCCESS or FAILURE. Null until the server has the result. */
+    status: string | null;
+    failedSegments: number[];
+}
+
+/** The transaction that deployed a contract. */
+export interface ContractDeployInfo {
+    txHash: string;
+    ledgerTxHash: string | null;
+    blockHeight: number;
+    blockHash: string;
+    status: string | null;
+    failedSegments: number[];
+    /** The transaction's ledger identifiers, in order. */
+    identifiers: string[];
+    /** The identifier of the deploy action, when the server has the list. */
+    txId?: string;
+}
+
 export interface NightgateClient {
     /** GET <service>/<name>(p1=...,p2=...) */
     callFunction(name: string, params?: Params): Promise<any>;
@@ -55,6 +101,14 @@ export interface NightgateClient {
     callAction(name: string, params?: ActionParams): Promise<any>;
     /** Polls getJobStatus until the job ends. Temporary poll errors are retried until they last longer than pollGraceMs, default 5 minutes. */
     waitForJob(input: { jobId: string; sessionId?: string; pollMs?: number; timeoutMs?: number; pollGraceMs?: number }): Promise<JobResult>;
+
+    // chain reads a transaction builder needs
+    /** The contract's state at `height`, or its newest one. Null when the server knows no state. */
+    contractStateAt(input: { address: string; height?: number | null }): Promise<ContractStateSnapshot | null>;
+    /** Null while the server has not indexed the transaction. */
+    transactionByIdentifier(identifier: string): Promise<TransactionInclusion | null>;
+    /** Null while the server has not indexed the deploy. */
+    contractDeploy(address: string): Promise<ContractDeployInfo | null>;
 
     // checks that read the chain directly
     verifyAttestation(p: Params): Promise<any>;

@@ -350,6 +350,8 @@ ok('delta: the unique height index replaced the plain one', !ngIdx.includes('ng_
 
 const regs = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_ContractRegistrations'").get();
 ok('delta 0.21: the ContractRegistrations table exists', regs?.type === 'table');
+ok('delta 0.33: the TransactionIdentifiers table exists',
+    after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_TransactionIdentifiers'").get()?.type === 'table');
 
 // Account keys + the key-scheme marker on the three stores.
 const accountKeys = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_AccountKeys'").get();
@@ -401,6 +403,7 @@ ok('delta 0.23: the legacy submission row survived with null coordinates',
     const syncCols = new Set(after.prepare('PRAGMA table_info("midnight_SyncState")').all().map(r => r.name));
     ok('delta 0.25: the two trailing-pass cursors were added to SyncState',
         syncCols.has('lastDecodedHeight') && syncCols.has('lastSupplementedHeight'), [...syncCols].join(','));
+    ok('delta 0.33: the identifier backfill marker was added to SyncState', syncCols.has('identifiersBackfilledAt'), [...syncCols].join(','));
 }
 
 {

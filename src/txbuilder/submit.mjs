@@ -221,9 +221,10 @@ export async function submitFinalized(tx, { nodeUrl, nodeHttpUrl, timeoutMs = 30
  * `applied: false` means the transaction is in a block but its call failed. The fee was still spent.
  * Always check by identifier. Watching the contract address could pick up someone else's call.
  */
-export async function probeLanded(identifier, { indexerHttpUrl, fetchFn, timeoutMs = 15_000 } = {}) {
+export async function probeLanded(identifier, { indexerHttpUrl, api, fetchFn, timeoutMs = 15_000 } = {}) {
     if (!identifier) throw new Error('probeLanded: identifier is required (txIdentifiers(tx).at(-1))');
-    if (!indexerHttpUrl) throw new Error('probeLanded: indexerHttpUrl is required');
+    if (api) return probeLandedOnApi(identifier, api);
+    if (!indexerHttpUrl) throw new Error('probeLanded: indexerHttpUrl or api is required');
     const doFetch = fetchFn || fetch;
     try {
         const r = await doFetch(indexerHttpUrl, {
@@ -249,14 +250,34 @@ export async function probeLanded(identifier, { indexerHttpUrl, fetchFn, timeout
     }
 }
 
+// A refused request (400, 401, 403) stays refused however often it is asked, so it is not "unknown".
+const REFUSED_STATUSES = new Set([400, 401, 403]);
+
+/** The same question to a NIGHTGATE server. An outage or a busy server reads as unknown, a refusal is thrown. */
+async function probeLandedOnApi(identifier, api) {
+    const { apiClientFor } = await import('./api-provider.mjs');
+    const client = apiClientFor(api);
+    let found;
+    try {
+        found = await client.transactionByIdentifier(identifier);
+    } catch (err) {
+        if (REFUSED_STATUSES.has(Number(err?.status))) throw err;
+        return null;
+    }
+    // The server knows the transaction before its result; without the result nothing is settled.
+    if (!found || found.status == null || found.blockHeight == null) return null;
+    const failedSegments = Array.isArray(found.failedSegments) ? found.failedSegments.map(Number) : [];
+    return { height: String(found.blockHeight), status: String(found.status), failedSegments, applied: found.status === 'SUCCESS', txHash: found.hash };
+}
+
 /**
  * Calls `probeLanded` until the transaction is found or `timeoutMs` has passed. It asks at least once.
  * Use it when a resend is rejected. The first send may already be on chain while the indexer lags behind.
  */
-export async function waitLanded(identifier, { indexerHttpUrl, timeoutMs = 30_000, pollMs = 5_000, fetchFn } = {}) {
+export async function waitLanded(identifier, { indexerHttpUrl, api, timeoutMs = 30_000, pollMs = 5_000, fetchFn } = {}) {
     const deadline = Date.now() + timeoutMs;
     for (; ;) {
-        const found = await probeLanded(identifier, { indexerHttpUrl, fetchFn });
+        const found = await probeLanded(identifier, { indexerHttpUrl, api, fetchFn });
         if (found) return found;
         const left = deadline - Date.now();
         if (left <= 0) return null;

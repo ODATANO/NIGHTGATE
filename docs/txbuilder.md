@@ -56,9 +56,8 @@ import { Contract } from '@odatano/nightgate/browser/attestation-vault';
 const builder = await createTxBuilder({
     seedHex,                       // 128 hex chars, YOUR 64-byte BIP39 seed; never sent anywhere
     networkId: 'preprod',
-    indexerHttpUrl: 'https://indexer.preprod.midnight.network/api/v4/graphql',
-    indexerWsUrl:   'wss://indexer.preprod.midnight.network/api/v4/graphql/ws',
-    nodeUrl:        'wss://rpc.preprod.midnight.network/',
+    api: { baseUrl: 'https://sponsor.example', agentToken },   // the server reads the chain for you
+    walletSync: false,             // vault calls move no value, so no wallet sync
     zkConfigBaseUrl: 'https://sponsor.example/zk-config/attestation-vault',
     contractClass: Contract
 });
@@ -97,8 +96,10 @@ and friends) run offline and feed into them.
 | option | required | meaning |
 | --- | --- | --- |
 | `seedHex` | yes | 128 hex chars (64-byte BIP39 seed); HD derivation matches Lace |
-| `indexerHttpUrl`, `indexerWsUrl` | yes | public Midnight indexer; WS = HTTP URL + `/ws`, copy the versioned path |
-| `nodeUrl` | yes | Substrate RPC (the wallet SDK's `relayURL`) |
+| `api` | yes, unless the indexer URLs and `nodeUrl` | a NIGHTGATE server to read the chain through: the options for `connect()` (`{ baseUrl, agentToken, ... }`) or a connected client. Contract state, the deploy and `probeLanded` then come from `ContractStates/stateAt`, `ContractActions` and `Transactions/byIdentifier`. Needs `walletSync: false` unless the indexer URLs are given as well |
+| `maxLagBlocks` | no | with `api`: a contract state from a server whose database is more blocks behind the chain is refused, default 10. A build on a stale state can fail on chain and the fee is spent |
+| `indexerHttpUrl`, `indexerWsUrl` | yes, unless `api` | a Midnight indexer you can reach (the public preprod indexer was switched off in October 2026); WS = HTTP URL + `/ws`, copy the versioned path. With `api` they are only needed for a wallet sync |
+| `nodeUrl` | yes, unless `api` | Substrate RPC (the wallet SDK's `relayURL`). With `api` the builder dials no node |
 | `package` | no | an installed lineage package (`@odatano/contract-<name>`): supplies `contractClass`, `contractName`, `privateStateId` and, without `zkConfigBaseUrl` or `zkConfigDir`, the keys directory inside the package (missing prover keys are fetched from its release assets into it, verified against `keys/manifest.json`). An explicit option still wins: with `zkConfigBaseUrl` the keys come from that server into `cacheDir` |
 | `from` | no | directory `package` resolves from, default `process.cwd()` |
 | `zkConfigBaseUrl` | yes, unless `zkConfigDir` or `package` | public `/zk-config/<contract>` |
@@ -499,6 +500,7 @@ const landed = await withDustGuard(facade, { configuration, dustKey }, async () 
     }
 
     // Confirm by identifier (blocks ~6 s apart, the indexer lags).
+    // The same question to a NIGHTGATE server: waitLanded(identifier, { api: { baseUrl, agentToken }, ... }).
     const found = await waitLanded(identifier, { indexerHttpUrl, timeoutMs: 240_000, pollMs: 6_000 });
     if (found) return found;
     throw new Error('not visible on the indexer yet; it may still land');

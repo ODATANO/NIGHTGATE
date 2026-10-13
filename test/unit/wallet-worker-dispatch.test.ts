@@ -3803,3 +3803,17 @@ describe('worker rotation drains: admission closes, in-flight completes, exit at
         }
     });
 });
+
+describe('deserializeFinalizedTx: the refusal a caller can act on', () => {
+    it('names the base64 characters received, the bytes decoded and the full reason of each attempt', async () => {
+        const { deserializeFinalizedTx } = await import('../../srv/midnight/worker/sponsor');
+        const b64 = Buffer.alloc(30, 7).toString('base64');
+        const headerReason = "Unable to deserialize Transaction. Error: expected header tag 'midnight:transaction[v9](signature[v1],proof,pedersen-schnorr[v1]):', got 'midnight:transaction[v9](signature[v1],proof,embedded-fr[v1]):'";
+        ledgerTx.deserialize
+            .mockImplementationOnce(() => { throw new Error(headerReason); })
+            .mockImplementationOnce(() => { throw new Error('Unable to deserialize Transaction. Error: out of range for u32'); });
+        await expect(deserializeFinalizedTx(b64)).rejects.toThrow(
+            `could not deserialize the caller transaction (40 base64 characters, 30 bytes decoded); tried (signature,proof,binding): ${headerReason} | (signature,proof,pre-binding): Unable to deserialize Transaction. Error: out of range for u32`
+        );
+    });
+});

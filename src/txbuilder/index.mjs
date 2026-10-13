@@ -8,7 +8,8 @@
 //
 //   const b = await createTxBuilder({
 //       seedHex, networkId: 'preprod',
-//       indexerHttpUrl, indexerWsUrl,
+//       api: { baseUrl: 'https://sponsor.example', agentToken },   // or indexerHttpUrl, indexerWsUrl, nodeUrl
+//       walletSync: false,
 //       zkConfigBaseUrl: 'https://sponsor.example/zk-config/attestation-vault',
 //       contractClass: Contract
 //   });
@@ -48,6 +49,14 @@ export {
 } from './swap.mjs';
 
 export { holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from './holder.mjs';
+
+// Reading the chain through the NIGHTGATE API instead of an indexer.
+export { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService } from './api-provider.mjs';
+import { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService } from './api-provider.mjs';
+
+// With `api` and no wallet sync the facade dials neither a node nor an indexer, so these are never used.
+const UNUSED_INDEXER = { indexerHttpUrl: 'http://unused.invalid/', indexerWsUrl: 'ws://unused.invalid/' };
+const UNUSED_NODE_URL = 'ws://unused.invalid/';
 
 export { tokenFactoryIssuerSecret, deriveTokenFactoryIssuerSecret, tokenName, nameOf, issuerKeyOf, domainOf, tokenTypeOf, prepareMint, prepareBurn, tokenFactoryWitnesses, TOKEN_FACTORY_CIRCUITS } from './factory.mjs';
 
@@ -458,9 +467,15 @@ export async function deriveIdentity(opts) {
  * @param {string} opts.seedHex           128 hex chars (64-byte BIP39 seed). Never leaves this process.
  * @param {string} [opts.networkId]       Defaults to 'preprod'.
  * @param {number} [opts.accountIndex]    BIP32 account index. Defaults to 0.
- * @param {string} opts.indexerHttpUrl
- * @param {string} opts.indexerWsUrl
- * @param {string} opts.nodeUrl          Node RPC URL, for example wss://rpc.preprod.midnight.network/
+ * @param {object|import('../sdk/client.mjs').NightgateClient} [opts.api]
+ *                                        A NIGHTGATE server to read the chain through: the options for `connect()`
+ *                                        ({ baseUrl, agentToken, ... }) or a connected client. Replaces the indexer and
+ *                                        the node; needs `walletSync: false` unless the indexer URLs are given as well.
+ * @param {number} [opts.maxLagBlocks]    With `api`: refuse a contract state from a server whose database is further
+ *                                        behind the chain, default 10 blocks. A build on a stale state can fail on chain.
+ * @param {string} [opts.indexerHttpUrl]  Required without `api`.
+ * @param {string} [opts.indexerWsUrl]    Required without `api`.
+ * @param {string} [opts.nodeUrl]         Node RPC URL, for example wss://rpc.preprod.midnight.network/. Required without `api`.
  * @param {string} [opts.proofServerUrl] Only used with provingMode 'server'.
  * @param {number} [opts.proofTimeoutMs]  Server proving only. Timeout of one proof request in ms, default 300000.
  *                                        The SDK retries a timed-out proof, so set it above your slowest circuit.
@@ -489,8 +504,12 @@ export async function createTxBuilder(opts) {
     if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) {
         throw new Error('createTxBuilder: seedHex must be 128 hex chars (64-byte BIP39 seed)');
     }
-    if (!indexerHttpUrl || !indexerWsUrl) throw new Error('createTxBuilder: indexerHttpUrl and indexerWsUrl are required');
-    if (!nodeUrl) throw new Error('createTxBuilder: nodeUrl is required (the Substrate RPC the wallet SDK talks to)');
+    const apiClient = opts.api ? apiClientFor(opts.api) : null;
+    const hasIndexer = Boolean(indexerHttpUrl && indexerWsUrl);
+    if (!apiClient) {
+        if (!hasIndexer) throw new Error('createTxBuilder: indexerHttpUrl and indexerWsUrl are required, or api');
+        if (!nodeUrl) throw new Error('createTxBuilder: nodeUrl is required (the Substrate RPC the wallet SDK talks to), or api');
+    }
     // Explicit options win over the package's values.
     const fromPackage = opts.package ? await resolveBuilderPackage({ package: opts.package, from: opts.from }) : null;
     const contractClass = opts.contractClass ?? fromPackage?.contractClass;
@@ -511,6 +530,9 @@ export async function createTxBuilder(opts) {
         throw new Error(`createTxBuilder: proofTimeoutMs must be a positive integer (ms), got ${String(opts.proofTimeoutMs)}`);
     }
     const syncMode = walletSyncMode(opts.walletSync);
+    if (apiClient && syncMode !== 'none' && !hasIndexer) {
+        throw new Error('createTxBuilder: with api the wallet is not synced; pass walletSync: false, or indexerHttpUrl and indexerWsUrl for the sync');
+    }
     const saved = opts.walletState;
     if (saved !== undefined && (saved === null || typeof saved !== 'object' || ['shielded', 'unshielded', 'dust'].some(k => saved[k] !== undefined && typeof saved[k] !== 'string'))) {
         throw new Error('createTxBuilder: walletState must be the object serializeWalletState() returned');
@@ -567,14 +589,16 @@ export async function createTxBuilder(opts) {
     const configuration = {
         networkId,
         // The SDK requires provingServerUrl even though the wallet proves in this process.
-        relayURL: new URL(nodeUrl),
+        relayURL: new URL(nodeUrl ?? UNUSED_NODE_URL),
         provingServerUrl: new URL(opts.proofServerUrl ?? 'http://127.0.0.1:6300'),
-        indexerClientConnection: { indexerHttpUrl, indexerWsUrl },
+        indexerClientConnection: hasIndexer ? { indexerHttpUrl, indexerWsUrl } : UNUSED_INDEXER,
         txHistoryStorage: new abstractions.InMemoryTransactionHistoryStorage(facadeSdk.WalletEntrySchema, facadeSdk.mergeWalletEntries),
         costParameters: { additionalFeeOverhead: 1n, feeBlocksMargin: 5 }
     };
     const facade = await facadeSdk.WalletFacade.init({
         configuration,
+        // Without a node the SDK's default service would dial the relay at init.
+        ...(nodeUrl ? {} : { submissionService: buildOnlySubmissionService() }),
         provingService: () => proving.makeWasmProvingService({}),
         shielded: () => (saved?.shielded
             ? shielded.ShieldedWallet(configuration).restore(saved.shielded)
@@ -608,8 +632,10 @@ export async function createTxBuilder(opts) {
     }
     const { InMemoryPrivateStateProvider } = await import('../browser/private-state.mjs');
     // One indexer provider per builder. One per transaction would leak a socket each time.
-    const sockets = trackingWebSocket(require('ws'));
-    const publicDataProvider = indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, sockets.WebSocket);
+    const sockets = apiClient ? null : trackingWebSocket(require('ws'));
+    const publicDataProvider = apiClient
+        ? apiPublicDataProvider({ client: apiClient, ledger, ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
+        : indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, sockets.WebSocket);
 
     return {
         provingMode,
@@ -823,7 +849,7 @@ export async function createTxBuilder(opts) {
         /** Stops the wallet sync and closes the indexer connections. */
         async close() {
             try { await facade.stop(); } catch { /* best effort */ }
-            sockets.closeAll();
+            sockets?.closeAll();
         }
     };
 }

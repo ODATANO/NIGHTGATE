@@ -27,6 +27,8 @@ const BLOCK_QUERY = `query($height: Int!) {
   }
 }`;
 
+import type { FetchedContractState } from './contract-state';
+
 export interface SupplementSegment {
     segmentId: number;
     success: boolean;
@@ -228,11 +230,15 @@ export function createIndexerClient(url: string, timeoutMs = 20000): IndexerClie
 }
 
 const CONTRACT_STATE_QUERY = `query($address: HexEncoded!, $offset: ContractActionOffset) {
-  contractAction(address: $address, offset: $offset) { state zswapState }
+  contractAction(address: $address, offset: $offset) {
+    state zswapState
+    transaction { block { hash ledgerParameters } }
+  }
 }`;
 
 /**
- * A contract's state at `height`, or its latest state when no height is given. Values are base64.
+ * A contract's state at `height`, or its latest state when no height is given, with the hash and
+ * ledger parameters of the action's block. Binary values are base64.
  * Returns null when the indexer has no action of the contract up to that height.
  */
 export async function fetchContractState(
@@ -240,10 +246,16 @@ export async function fetchContractState(
     address: string,
     height: number | null,
     timeoutMs = 20000
-): Promise<{ state: string | null; zswapState: string | null } | null> {
+): Promise<FetchedContractState | null> {
     const offset = height == null ? null : { blockOffset: { height } };
     const data = await postQuery(url, CONTRACT_STATE_QUERY, { address, offset }, timeoutMs, 'contract state');
     const action = data?.contractAction;
     if (!action) return null;
-    return { state: toBinary(action.state), zswapState: toBinary(action.zswapState) };
+    const blockHash = hex(action.transaction?.block?.hash);
+    return {
+        state: toBinary(action.state),
+        zswapState: toBinary(action.zswapState),
+        blockHash: blockHash ? `0x${blockHash}` : null,
+        ledgerParameters: toBinary(action.transaction?.block?.ledgerParameters)
+    };
 }

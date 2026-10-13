@@ -36,6 +36,9 @@ const BLOCKS = 'midnight.Blocks';
 const TRANSACTIONS = 'midnight.Transactions';
 const CONTRACT_ACTIONS = 'midnight.ContractActions';
 const CONTRACT_STATES = 'midnight.ContractStates';
+const TX_IDENTIFIERS = 'midnight.TransactionIdentifiers';
+const TX_RESULTS = 'midnight.TransactionResults';
+const TX_SEGMENTS = 'midnight.TransactionSegments';
 const UNSHIELDED_UTXOS = 'midnight.UnshieldedUtxos';
 const NIGHT_BALANCES = 'midnight.NightBalances';
 const BACKGROUND_JOBS = 'midnight.BackgroundJobs';
@@ -60,6 +63,9 @@ beforeEach(async () => {
 
     await db.run(cds.ql.DELETE.from(UNSHIELDED_UTXOS));
     await db.run(cds.ql.DELETE.from(CONTRACT_ACTIONS));
+    await db.run(cds.ql.DELETE.from(TX_IDENTIFIERS));
+    await db.run(cds.ql.DELETE.from(TX_SEGMENTS));
+    await db.run(cds.ql.DELETE.from(TX_RESULTS));
     await db.run(cds.ql.DELETE.from(TRANSACTIONS));
     await db.run(cds.ql.DELETE.from(BLOCKS));
     await db.run(cds.ql.DELETE.from(NIGHT_BALANCES));
@@ -348,6 +354,40 @@ describe('Transactions', () => {
         expect(new Set(res.map((tx: any) => tx.block_ID))).toEqual(new Set([firstBlock, secondBlock]));
     });
 
+    it('byIdentifier() tells where the transaction landed and which segments failed', async () => {
+        const blockId = await seedBlock(5);
+        const txId = await seedTransaction(blockId, { hash: '0xtx5', ledgerTxHash: '0xledger5' });
+        await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries({ identifier: 'cafe01', transaction_ID: txId }));
+        const resultId = cds.utils.uuid();
+        await db.run(cds.ql.INSERT.into(TX_RESULTS).entries({ ID: resultId, status: 'PARTIAL_SUCCESS', outcomeSource: 'substrate-system-events', transaction_ID: txId }));
+        await db.run(cds.ql.INSERT.into(TX_SEGMENTS).entries([
+            { ID: cds.utils.uuid(), segmentId: 0, success: true, transactionResult_ID: resultId },
+            { ID: cds.utils.uuid(), segmentId: 1, success: false, transactionResult_ID: resultId }
+        ]));
+
+        const res = await cap.GET(`${API}/Transactions/byIdentifier(identifier='0xCAFE01')`);
+        expect(res.data).toEqual(expect.objectContaining({
+            identifier: 'cafe01', hash: '0xtx5', ledgerTxHash: '0xledger5', blockHeight: 5, blockHash: '0xblock5',
+            status: 'PARTIAL_SUCCESS', failedSegments: [1]
+        }));
+    });
+
+    it('byIdentifier() reports a null status while the result is not indexed', async () => {
+        const txId = await seedTransaction(await seedBlock(6), { hash: '0xtx6' });
+        await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries({ identifier: 'beef', transaction_ID: txId }));
+        const res = await srv.send({ event: 'byIdentifier', entity: 'Transactions', data: { identifier: 'beef' } });
+        expect(res).toEqual(expect.objectContaining({ hash: '0xtx6', blockHeight: 6, status: null, failedSegments: [] }));
+    });
+
+    it('byIdentifier() answers 404 for an identifier the index has not seen and 400 for a bad one', async () => {
+        await expect(srv.send({ event: 'byIdentifier', entity: 'Transactions', data: { identifier: 'ffff' } }))
+            .rejects.toMatchObject({ status: 404 });
+        await expect(srv.send({ event: 'byIdentifier', entity: 'Transactions', data: {} }))
+            .rejects.toMatchObject({ status: 400 });
+        await expect(srv.send({ event: 'byIdentifier', entity: 'Transactions', data: { identifier: 'not-hex' } }))
+            .rejects.toMatchObject({ status: 400 });
+    });
+
     it('byHash() rejects when hash is missing', async () => {
         await expect(
             srv.send({ event: 'byHash', entity: 'Transactions', data: {} })
@@ -455,7 +495,8 @@ describe('ContractStates', () => {
     });
 
     it('READ and stateAt() serve the stored current state over OData', async () => {
-        const blockId = await seedBlock(7);
+        await db.run(cds.ql.UPDATE.entity('midnight.SyncState').set({ lastSupplementedHeight: 9, chainHeight: 12 }).where({ ID: 'SINGLETON' }));
+        const blockId = await seedBlock(7, { ledgerParameters: Buffer.from('lp7').toString('base64') });
         const txId = await seedTransaction(blockId);
         const actionId = await seedContractAction(txId, { address: ADDRESS, stateHash: 'h1' });
         await db.run(cds.ql.INSERT.into(CONTRACT_STATES).entries({
@@ -466,8 +507,9 @@ describe('ContractStates', () => {
         expect(list.data.value.map((r: any) => r.address)).toEqual([ADDRESS]);
 
         const res = await cap.GET(`${API}/ContractStates/stateAt(address='0x${ADDRESS}',height=null)`);
-        expect(res.data).toEqual(expect.objectContaining({ address: ADDRESS, height: 7, source: 'current', stateHash: 'h1' }));
+        expect(res.data).toEqual(expect.objectContaining({ address: ADDRESS, height: 7, source: 'current', stateHash: 'h1', blockHash: '0xblock7', coveredHeight: 9, chainHeight: 12 }));
         expect(Buffer.from(res.data.state, 'base64').toString()).toBe('st');
+        expect(Buffer.from(res.data.ledgerParameters, 'base64').toString()).toBe('lp7');
     });
 
     it('stateAt() rejects an address that is not hex', async () => {

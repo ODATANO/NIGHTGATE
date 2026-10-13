@@ -40,6 +40,7 @@ const EXPECTED = {
         'classifyNodeReject', 'isPreMempoolReject', 'isTransportFailure', 'isAlreadyImported',
         'rebuildOnStaleTranscript',
         'probeLanded', 'waitLanded', 'withDustGuard', 'nodeHttpUrlFor',
+        'apiPublicDataProvider', 'apiClientFor', 'buildOnlySubmissionService',
         'createSwapWallet', 'readSwapTerms', 'sameSwapTerms', 'encodeOffer', 'decodeOffer', 'SWAP_OFFER_PREFIX',
         'SWAP_MAX_INPUTS', 'chooseSwapCoin', 'spendableWithin',
         'deriveRoleSeeds', 'recipientKeyMap'],

@@ -3,7 +3,7 @@
 // is a consumer concern (own wallet, own node); everything here is pure or
 // runs against injected seams.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
 const importSubmit = () => import('../../src/txbuilder/submit.mjs' as string);
@@ -434,5 +434,55 @@ describe('txbuilder submit: withDustGuard', () => {
         }).catch((e: Error & { dustRestored?: boolean; transport?: boolean; code?: number }) => e);
         expect(err.message).toContain('170');
         expect(facade.dust).toBe(originalDust);
+    });
+});
+
+describe('txbuilder submit: probeLanded over the NIGHTGATE API', () => {
+    const client = (answer: unknown) => ({
+        contractStateAt: async () => null,
+        contractDeploy: async () => null,
+        transactionByIdentifier: vi.fn(async () => answer)
+    });
+
+    it('null while the server has not indexed the identifier, or has no result for it yet', async () => {
+        const { probeLanded } = await importSubmit();
+        await expect(probeLanded('id1', { api: client(null) })).resolves.toBeNull();
+        await expect(probeLanded('id1', { api: client({ hash: '0xtx', blockHeight: 3, status: null, failedSegments: [] }) })).resolves.toBeNull();
+    });
+
+    it('maps the inclusion to the probe result', async () => {
+        const { probeLanded } = await importSubmit();
+        const api = client({ hash: '0xtx', blockHeight: 42, status: 'FAILURE', failedSegments: [1] });
+        await expect(probeLanded('id1', { api })).resolves.toEqual({ height: '42', status: 'FAILURE', failedSegments: [1], applied: false, txHash: '0xtx' });
+        expect(api.transactionByIdentifier).toHaveBeenCalledWith('id1');
+    });
+
+    it('a server error reads as unknown, never as landed', async () => {
+        const { probeLanded } = await importSubmit();
+        const api = { ...client(null), transactionByIdentifier: vi.fn(async () => { throw new Error('503'); }) };
+        await expect(probeLanded('id1', { api })).resolves.toBeNull();
+    });
+
+    it('waitLanded polls the server until the transaction shows', async () => {
+        const { waitLanded } = await importSubmit();
+        const api = { ...client(null), transactionByIdentifier: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ hash: '0xtx', blockHeight: 1, status: 'SUCCESS', failedSegments: [] }) };
+        await expect(waitLanded('id1', { api, timeoutMs: 1_000, pollMs: 1 })).resolves.toEqual(expect.objectContaining({ applied: true }));
+    });
+
+    it('without an indexer URL or api the probe refuses', async () => {
+        const { probeLanded } = await importSubmit();
+        await expect(probeLanded('id1', {})).rejects.toThrow(/indexerHttpUrl or api is required/);
+    });
+});
+
+describe('txbuilder submit: a refused API request is not "unknown"', () => {
+    it('400, 401 and 403 are thrown, a busy or broken server reads as unknown', async () => {
+        const { probeLanded } = await importSubmit();
+        const refusing = (status: number) => ({
+            contractStateAt: async () => null, contractDeploy: async () => null,
+            transactionByIdentifier: vi.fn(async () => { throw Object.assign(new Error(`HTTP ${status}`), { status }); })
+        });
+        for (const status of [400, 401, 403]) await expect(probeLanded('id1', { api: refusing(status) })).rejects.toThrow(`HTTP ${status}`);
+        for (const status of [429, 500, 503]) await expect(probeLanded('id1', { api: refusing(status) })).resolves.toBeNull();
     });
 });

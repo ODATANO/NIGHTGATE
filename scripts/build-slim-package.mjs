@@ -38,6 +38,7 @@ const FILES = [
     { path: 'src/txbuilder/index.mjs' },
     { path: 'src/txbuilder/index.d.ts' },
     { path: 'src/txbuilder/submit.mjs' },
+    { path: 'src/txbuilder/api-provider.mjs' },
     { path: 'src/txbuilder/swap.mjs' },
     { path: 'src/txbuilder/holder.mjs' },
     { path: 'src/txbuilder/holder.d.mts' },

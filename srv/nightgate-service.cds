@@ -47,7 +47,22 @@ service NightgateService {
             // txType: a TxType value
             @cds.odata.bindingparameter.collection
             function byType(txType: String, limit: Integer) returns array of Transactions;
+
+            // identifier: a ledger identifier of the transaction, hex. 404 while the indexer has not seen it.
+            @cds.odata.bindingparameter.collection
+            function byIdentifier(identifier: String)       returns TransactionInclusion;
         };
+
+    /** Where a transaction landed. `status` is null until the indexer supplement has the result. */
+    type TransactionInclusion {
+        identifier     : String;
+        hash           : String;
+        ledgerTxHash   : String;
+        blockHeight    : Integer64;
+        blockHash      : String;
+        status         : String; // SUCCESS | PARTIAL_SUCCESS | FAILURE
+        failedSegments : array of Integer;
+    }
 
     @readonly
     entity TransactionResults    as projection on midnight.TransactionResults;
@@ -78,14 +93,18 @@ service NightgateService {
 
     /** The state of a contract at a block. `state` and `zswapState` are base64. */
     type ContractStateSnapshot {
-        address        : String;
-        height         : Integer64; // null if not known locally
-        state          : LargeString;
-        zswapState     : LargeString;
-        stateHash      : String;
-        zswapStateHash : String;
-        source         : String(10); // history | current | indexer
-        verified       : Boolean; // only for source indexer: the state matches the hash stored on chain
+        address          : String;
+        height           : Integer64; // null if not known locally
+        state            : LargeString;
+        zswapState       : LargeString;
+        stateHash        : String;
+        zswapStateHash   : String;
+        source           : String(10); // history | current | indexer
+        verified         : Boolean; // only for source indexer: the state matches the hash stored on chain
+        blockHash        : String; // the block the state comes from
+        ledgerParameters : LargeString; // base64; in effect at that block; null = not known to this server
+        coveredHeight    : Integer64; // the database holds every contract state up to this block; null = supplement never ran, or source indexer
+        chainHeight      : Integer64; // the chain tip the crawler last saw
     }
 
     /** The newest state of each contract. */

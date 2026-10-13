@@ -10,6 +10,7 @@ import cds from '@sap/cds';
 import { parseExtrinsicCall } from '../utils/scale';
 import { extractLedgerPayload, carriesShieldedCoins, carriesProof, callFreeTxType, type LedgerPayloadFacts } from './ledger-payload';
 import { readCapBinary } from './cap-binary';
+import { replaceTransactionIdentifiers } from './transaction-identifiers';
 import { lockReorgGeneration } from '../submission/reorg-generation';
 import { Blocks, Transactions, ContractActions, SyncState, type Block, type Transaction, type ContractAction } from '#cds-models/midnight';
 import type { DbRunner, Row } from '../utils/db-types';
@@ -210,6 +211,7 @@ export class LedgerPayloadDecoder {
             dustRegistrationCount: facts.dustRegistrationCount,
             dustConsumed: facts.dustSpendValue.toString()
         }).where({ ID: transactionId }));
+        await replaceTransactionIdentifiers(tx, transactionId, facts.identifiers);
 
         // The events name the contract but not the circuit, so circuit names come from the payload.
         // Names are assigned in order, and only if the call counts per contract match.

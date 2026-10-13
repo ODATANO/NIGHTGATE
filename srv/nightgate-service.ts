@@ -7,16 +7,22 @@ import { attachRuntimeGate } from './utils/runtime-gate';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { registerDocumentProofHandlers } from './submission/document-proof';
 import { getJobById } from './submission/background-jobs';
-import { contractStateAt, type ContractStateFetcher } from './crawler/contract-state';
+import { contractStateAt, IndexerBudgetExhausted, type ContractStateFetcher } from './crawler/contract-state';
 import { fetchContractState } from './crawler/indexer-supplement';
+import { normalizeIdentifier } from './crawler/transaction-identifiers';
 import { getNightgatePluginConfig, resolveNightgateRuntimeConfig } from './utils/nightgate-config';
 import { RateLimiter } from './utils/rate-limiter';
 
 // One limit for all callers: the public indexer blocks the host's IP when it gets too many requests.
 const stateAtIndexerLimiter = new RateLimiter({ windowMs: 1000, maxRequests: 2 });
 
-class IndexerBudgetExhausted extends Error {
-    constructor(readonly retryAfterMs: number) { super('indexer request budget exhausted'); }
+/** What byIdentifier reads across the identifier row, its transaction and that transaction's block. */
+interface TransactionLocation {
+    ID: string;
+    hash: string;
+    ledgerTxHash?: string | null;
+    blockHeight: number | string;
+    blockHash: string;
 }
 
 function fetchContractStateFromIndexers(): ContractStateFetcher {
@@ -37,7 +43,7 @@ function fetchContractStateFromIndexers(): ContractStateFetcher {
     };
 }
 
-import { Blocks, Transactions, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions, type WalletSession } from '#cds-models/midnight';
+import { Blocks, Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions, type WalletSession, type TransactionResult, type TransactionSegment } from '#cds-models/midnight';
 import { normalizeHttpError } from './utils/http-errors';
 import { getJobStatus } from '#cds-models/NightgateService';
 import { Block, ContractAction, ContractState, NightBalance, Transaction, UnshieldedUtxo } from '#cds-models/NightgateService';
@@ -108,6 +114,35 @@ export default class NightgateService extends cds.ApplicationService {
             const { hash } = req.data;
             if (!hash) return req.reject(400, 'hash is required');
             return this.db.run(cds.ql.SELECT.from(Transactions).where({ hash }));
+        });
+
+        this.on(Transaction.actions.byIdentifier, 'Transactions', async (req) => {
+            const identifier = normalizeIdentifier(String(req.data.identifier ?? ''));
+            if (!identifier) return req.reject(400, 'identifier is required');
+            if (!/^[0-9a-f]+$/.test(identifier)) return req.reject(400, 'identifier must be hex');
+            const found: TransactionLocation | undefined = await this.db.run(
+                cds.ql.SELECT.one.from(TransactionIdentifiers)
+                    .columns('transaction.ID as ID', 'transaction.hash as hash', 'transaction.ledgerTxHash as ledgerTxHash',
+                        'transaction.block.height as blockHeight', 'transaction.block.hash as blockHash')
+                    .where({ identifier })
+                    .orderBy('transaction.block.height desc')
+            );
+            if (!found) return req.reject(404, `no indexed transaction carries identifier ${identifier}`);
+            const result: Pick<TransactionResult, 'ID' | 'status'> | undefined = await this.db.run(
+                cds.ql.SELECT.one.from(TransactionResults).columns('ID', 'status').where({ transaction_ID: found.ID })
+            );
+            const failed: Pick<TransactionSegment, 'segmentId'>[] = result ? await this.db.run(
+                cds.ql.SELECT.from(TransactionSegments).columns('segmentId').where({ transactionResult_ID: result.ID, success: false })
+            ) : [];
+            return {
+                identifier,
+                hash: found.hash,
+                ledgerTxHash: found.ledgerTxHash ?? null,
+                blockHeight: Number(found.blockHeight),
+                blockHash: found.blockHash,
+                status: result?.status ?? null,
+                failedSegments: failed.map(s => Number(s.segmentId))
+            };
         });
 
         this.on(Transaction.actions.byType, 'Transactions', async (req) => {

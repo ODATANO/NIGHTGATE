@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.33.0 - 2026-10-12
+
+### Changes
+
+- `ContractStates/stateAt` returns `blockHash`, the `ledgerParameters` (base64)
+  in effect at the state's block, `coveredHeight` (the database holds every
+  contract state up to this block) and `chainHeight`. The parameters come from
+  `Blocks` when the indexer supplement stored them, else from the indexer once;
+  a used-up indexer budget is a 429, `null` when the indexer cannot answer.
+- `Transactions/byIdentifier(identifier)`: the transaction a ledger identifier
+  belongs to, as `hash`, `ledgerTxHash`, `blockHeight`, `blockHash`, `status`
+  and `failedSegments`. 404 while the indexer has not seen it. Allowed under
+  every agent token.
+- Schema: table `TransactionIdentifiers` (one row per identifier and
+  transaction), written by the decode pass, removed by a reorg rollback, filled
+  for existing rows in the background at the first start
+  (`SyncState.identifiersBackfilledAt` marks the finished run).
+- `@odatano/nightgate-tx` 0.12.0: `createTxBuilder({ api })` reads contract
+  state and the deploy through a NIGHTGATE server instead of an indexer and a
+  node (`walletSync: false`; with `api` the builder dials no node);
+  `probeLanded` and `waitLanded` take `{ api }` (a refused request is thrown,
+  only an outage reads as unknown); `maxLagBlocks` (default 10) refuses a state
+  from a server further behind the chain; `connect()` gains `contractStateAt`,
+  `transactionByIdentifier` and `contractDeploy`.
+- A sponsor action that cannot read the handed-over transaction names the
+  base64 characters received, the bytes decoded and the full reason of each
+  attempt.
+
 ## 0.32.0 - 2026-10-12
 
 ### Breaking

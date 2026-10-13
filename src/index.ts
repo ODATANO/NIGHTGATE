@@ -33,6 +33,8 @@ import { assertStoredKeyIdsKnown } from '../srv/utils/encryption-rewrap';
 import { recoverInterruptedJobs, dropPendingJobsForClosedSessions, startBackgroundJobProcessor, stopBackgroundJobProcessor, registerChainOutcomeConfirmer } from '../srv/submission/background-jobs';
 import { createHttpTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
 import { TransactionResults } from '#cds-models/midnight';
+import { backfillTransactionIdentifiers } from '../srv/crawler/transaction-identifiers';
+import { errorMessage } from '../srv/utils/errors';
 import {
     assertSupportedRuntimeTopology,
     UnsupportedRuntimeTopologyError
@@ -166,6 +168,9 @@ async function ensureSchemaDeployed(): Promise<void> {
     );
     const removedCount = typeof removed === 'number' ? removed : Number((removed as any)?.changes ?? 0);
     if (removedCount > 0) log.warn(`Removed ${removedCount} legacy unverified TransactionResults row(s); re-crawl historical blocks to backfill canonical outcomes`);
+
+    // Rows decoded before the lookup table existed. Runs in the background, the start does not wait for it.
+    void backfillTransactionIdentifiers(db).catch(err => log.warn(`transaction identifier backfill failed: ${errorMessage(err)}`));
 }
 
 /**

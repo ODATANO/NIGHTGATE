@@ -374,6 +374,15 @@ describe('txbuilder: createTxBuilder input validation', () => {
         await expect(createTxBuilder({ ...base, contractClass: undefined })).rejects.toThrow(/contractClass is required/);
     });
 
+    it('api replaces the indexer and the node, but not a wallet sync', async () => {
+        const { createTxBuilder } = await importTxBuilder();
+        const api = { baseUrl: 'https://ng.example', agentToken: 'ngat_x' };
+        // The URLs may be absent with api; the next check in line is the one for the proving files.
+        await expect(createTxBuilder({ ...base, api, indexerHttpUrl: '', indexerWsUrl: '', nodeUrl: '', zkConfigBaseUrl: '', walletSync: false })).rejects.toThrow(/zkConfigBaseUrl is required/);
+        await expect(createTxBuilder({ ...base, api, indexerHttpUrl: '', indexerWsUrl: '', nodeUrl: '' })).rejects.toThrow(/walletSync: false/);
+        await expect(createTxBuilder({ ...base, api: { token: 'no-base-url' } as any })).rejects.toThrow(/options for connect/);
+    });
+
     it("server proving is an EXPLICIT opt-in: a bare proofServerUrl does not select it, and 'server' without a URL rejects", async () => {
         const { createTxBuilder } = await importTxBuilder();
         await expect(createTxBuilder({ ...base, provingMode: 'tpu' })).rejects.toThrow(/provingMode must be 'wasm' or 'server'/);

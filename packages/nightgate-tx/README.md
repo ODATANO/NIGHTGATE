@@ -63,9 +63,8 @@ import { Contract } from '@odatano/nightgate-tx/attestation-vault';
 const builder = await createTxBuilder({
     seedHex,                                   // yours; never sent anywhere
     networkId: 'preprod',
-    indexerHttpUrl: 'https://indexer.preprod.midnight.network/api/v4/graphql',
-    indexerWsUrl:   'wss://indexer.preprod.midnight.network/api/v4/graphql/ws',
-    nodeUrl:        'wss://rpc.preprod.midnight.network/',
+    api: { baseUrl: 'https://nightgate.example', agentToken },   // or indexerHttpUrl, indexerWsUrl, nodeUrl
+    walletSync: false,
     zkConfigBaseUrl: 'https://nightgate.example/zk-config/attestation-vault',
     contractClass: Contract
 });
@@ -160,8 +159,9 @@ const landed = await waitLanded(identifier, { indexerHttpUrl, timeoutMs: 240_000
 - `submitFinalized` / `submitExtrinsic`: submit over a one-shot WebSocket (the
   node's HTTP gateway rejects bodies over ~14 KB); needs the optional peer
   `@polkadot/api`.
-- `probeLanded` / `waitLanded`: confirm by transaction identifier;
-  `applied: false` = in a block, call failed, fee spent.
+- `probeLanded` / `waitLanded`: confirm by transaction identifier, against an
+  indexer (`indexerHttpUrl`) or a NIGHTGATE server (`api`); `applied: false` =
+  in a block, call failed, fee spent.
 - `classifyNodeReject`: 170/171/196 stale dust proof (re-sync, rebuild; NOT out
   of dust), 138/173 funds, 219-224 sequencing (split the batch), 117 malformed,
   104 stale transcript (rebuild, `rebuildOnStaleTranscript`).

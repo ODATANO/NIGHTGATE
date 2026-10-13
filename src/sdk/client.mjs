@@ -69,6 +69,23 @@ function odataLiteral(value) {
     return `'${String(value).replace(/'/g, "''")}'`;
 }
 
+/** Lowercase hex without `0x`, the form the server stores addresses and identifiers in. */
+function hexOf(value) {
+    return String(value).trim().toLowerCase().replace(/^0x/, '');
+}
+
+/** A JSON list of strings as the server stores it, or an array already. Anything else is empty. */
+function parseStringList(raw) {
+    if (Array.isArray(raw)) return raw.map(String);
+    if (typeof raw !== 'string' || !raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+        return [];
+    }
+}
+
 function stripODataNoise(payload) {
     if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return payload;
     const out = {};
@@ -227,11 +244,55 @@ export function connect(opts) {
         return waitForJob({ jobId: started.jobId, sessionId: started.sessionId ?? params.sessionId });
     }
 
+    /** Null for a 404, so a caller can wait for something the index has not seen yet. */
+    const orNull = (promise) => promise.catch((err) => { if (err instanceof NightgateApiError && err.status === 404) return null; throw err; });
+
+    /** The contract's state at `height`, or its newest one. `state`, `zswapState` and `ledgerParameters` are base64. */
+    function contractStateAt({ address, height } = {}) {
+        if (!address) throw new Error('contractStateAt: address is required');
+        const at = height == null ? 'null' : odataLiteral(height);
+        return orNull(request('GET', `${service}/ContractStates/stateAt(address=${odataLiteral(hexOf(address))},height=${at})`));
+    }
+
+    /** Where a transaction landed, by one of its ledger identifiers. Null while the server has not indexed it. */
+    function transactionByIdentifier(identifier) {
+        if (!identifier) throw new Error('transactionByIdentifier: identifier is required');
+        return orNull(callFunction('Transactions/byIdentifier', { identifier: hexOf(identifier) }));
+    }
+
+    /** The transaction that deployed the contract, or null while the server has not indexed it. */
+    async function contractDeploy(address) {
+        if (!address) throw new Error('contractDeploy: address is required');
+        const filter = `address eq ${odataLiteral(hexOf(address))} and actionType eq 'DEPLOY'`;
+        const expand = '$expand=transaction($expand=block,transactionResult($expand=segments))';
+        const page = await request('GET', `${service}/ContractActions?$filter=${encodeURIComponent(filter)}&${expand}&$top=1`);
+        const action = Array.isArray(page?.value) ? page.value[0] : undefined;
+        const tx = action?.transaction;
+        if (!tx?.block) return null;
+        const identifiers = parseStringList(tx.identifiers);
+        const segments = tx.transactionResult?.segments ?? [];
+        return {
+            txHash: tx.hash,
+            ledgerTxHash: tx.ledgerTxHash ?? null,
+            blockHeight: Number(tx.block.height),
+            blockHash: tx.block.hash,
+            status: tx.transactionResult?.status ?? null,
+            failedSegments: segments.filter(s => s?.success === false).map(s => Number(s.segmentId)),
+            identifiers,
+            txId: action.actionIndex != null ? identifiers[Number(action.actionIndex)] : undefined
+        };
+    }
+
     return {
         // generic calls, for anything without its own function below
         callFunction,
         callAction,
         waitForJob,
+
+        // ---- chain reads a transaction builder needs. No wallet, no login beyond the token. ----
+        contractStateAt,
+        transactionByIdentifier,
+        contractDeploy,
 
         // ---- checks that read the chain directly. No wallet, no login. ----
         verifyAttestation: (p) => callFunction('verifyAttestationState', p),

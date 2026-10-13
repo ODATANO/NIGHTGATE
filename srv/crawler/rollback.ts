@@ -5,7 +5,7 @@
 
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
-import { Blocks, Transactions, ContractActions, ContractBalances, ContractStates, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults, TransactionSegments, NightBalances, SyncState, PendingSubmissions, BackgroundJobs, type Block, type Transaction } from '#cds-models/midnight';
+import { Blocks, Transactions, ContractActions, ContractBalances, ContractStates, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults, TransactionSegments, TransactionIdentifiers, NightBalances, SyncState, PendingSubmissions, BackgroundJobs, type Block, type Transaction } from '#cds-models/midnight';
 import { bumpReorgGeneration } from '../submission/reorg-generation';
 import { NIGHT_RAW_TOKEN_TYPE } from './block-events';
 import type { DbRunner } from '../utils/db-types';
@@ -105,6 +105,7 @@ export async function rollbackIndexedDataFromHeight(
             await tx.run(DELETE.from(DustLedgerEvents).where({ transaction_ID: { in: ids } }));
             await tx.run(DELETE.from(TransactionFees).where({ transaction_ID: { in: ids } }));
             await tx.run(DELETE.from(TransactionResults).where({ transaction_ID: { in: ids } }));
+            await tx.run(DELETE.from(TransactionIdentifiers).where({ transaction_ID: { in: ids } }));
         });
         // Runs after all deletes, because a spend in one chunk may point at a UTXO created in another.
         await chunked(txIds, ids => tx.run(

@@ -19,8 +19,9 @@ import { IndexerHttpError, createIndexerClient, isIndexerRateLimit } from '../..
 import { rollbackIndexedDataFromHeight } from '../../srv/crawler/rollback';
 import { redecodeFromHeight } from '../../srv/crawler/redecode';
 import { readCapBinary } from '../../srv/crawler/cap-binary';
+import { backfillTransactionIdentifiers } from '../../srv/crawler/transaction-identifiers';
 import {
-    compactStoredContractState, contractStateAt, contractStatePolicy, type ContractStatePolicy
+    compactStoredContractState, contractStateAt, contractStatePolicy, IndexerBudgetExhausted, type ContractStatePolicy
 } from '../../srv/crawler/contract-state';
 
 cds.test(__dirname + '/../..');
@@ -36,6 +37,7 @@ const ZSWAP_EVENTS = 'midnight.ZswapLedgerEvents';
 const DUST_EVENTS = 'midnight.DustLedgerEvents';
 const SYNC_STATE = 'midnight.SyncState';
 const CONTRACT_STATES = 'midnight.ContractStates';
+const TX_IDENTIFIERS = 'midnight.TransactionIdentifiers';
 
 const sha256 = (text: string): string => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
 
@@ -93,6 +95,11 @@ async function readSync(): Promise<any> {
     return db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }));
 }
 
+async function identifierRowsOf(txId: string): Promise<string[]> {
+    const rows = await db.run(cds.ql.SELECT.from(TX_IDENTIFIERS).columns('identifier').where({ transaction_ID: txId }).orderBy('identifier'));
+    return rows.map((r: any) => r.identifier);
+}
+
 const facts = (over: Record<string, any> = {}) => ({
     identifiers: ['aa', 'bb'],
     contractActions: [],
@@ -113,7 +120,7 @@ beforeEach(async () => {
     vi.clearAllMocks();
     decodeLedgerPayload.mockReset();
     for (const entity of [
-        CONTRACT_STATES, CONTRACT_BALANCES, CONTRACT_ACTIONS, TX_SEGMENTS, TX_RESULTS, 'midnight.TransactionFees',
+        CONTRACT_STATES, CONTRACT_BALANCES, CONTRACT_ACTIONS, TX_SEGMENTS, TX_RESULTS, 'midnight.TransactionFees', TX_IDENTIFIERS,
         ZSWAP_EVENTS, DUST_EVENTS, UNSHIELDED_UTXOS, TRANSACTIONS, BLOCKS
     ]) {
         await db.run(cds.ql.DELETE.from(entity));
@@ -159,6 +166,19 @@ describe('LedgerPayloadDecoder', () => {
         const action = await db.run(cds.ql.SELECT.one.from(CONTRACT_ACTIONS).where({ transaction_ID: txId }));
         expect(action.entryPoint).toBe('increment');
         expect(Number((await readSync()).lastDecodedHeight)).toBe(10);
+        expect(await identifierRowsOf(txId)).toEqual(['aa', 'bb']);
+    });
+
+    it('a replay rewrites the identifier rows instead of doubling them', async () => {
+        const blockId = await seedBlock(10, '0xd1r');
+        const txId = await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });
+        await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
+        decodeLedgerPayload.mockResolvedValue(facts());
+        await runDecoder();
+        decodeLedgerPayload.mockResolvedValue(facts({ identifiers: ['bb', 'cc'] }));
+        await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
+        await runDecoder();
+        expect(await identifierRowsOf(txId)).toEqual(['bb', 'cc']);
     });
 
     it('sets isShielded and hasProof from the decoded payload', async () => {
@@ -1001,6 +1021,55 @@ describe('rollback', () => {
         expect(sync.lastDecodedHeight).toBeNull();
         expect(sync.lastSupplementedHeight).toBeNull();
     });
+
+    it('removes the identifier rows of the rolled-back transactions and keeps the rest', async () => {
+        const kept = await seedTransaction(await seedBlock(10, '0xr5'), { identifiers: JSON.stringify(['a1']) });
+        const gone = await seedTransaction(await seedBlock(11, '0xr6'), { identifiers: JSON.stringify(['b1', 'b2']) });
+        await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries([
+            { identifier: 'a1', transaction_ID: kept }, { identifier: 'b1', transaction_ID: gone }, { identifier: 'b2', transaction_ID: gone }
+        ]));
+        await setSync({ lastIndexedHeight: 11 });
+
+        await db.tx(async (tx: any) => {
+            await rollbackIndexedDataFromHeight(tx, 11, { syncStatus: 'syncing' });
+        });
+
+        expect(await identifierRowsOf(kept)).toEqual(['a1']);
+        expect(await identifierRowsOf(gone)).toEqual([]);
+    });
+});
+
+describe('backfillTransactionIdentifiers', () => {
+    it('fills the rows for decoded transactions that have none and skips the ones that have', async () => {
+        await setSync({ lastIndexedHeight: 10 });
+        const blockId = await seedBlock(10, '0xbf1');
+        const fresh = await seedTransaction(blockId, { transactionId: 0, identifiers: JSON.stringify(['f1', 'f2']) });
+        const done = await seedTransaction(blockId, { transactionId: 1, identifiers: JSON.stringify(['d1', 'stale']) });
+        await seedTransaction(blockId, { transactionId: 2, identifiers: null });
+        await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries({ identifier: 'd1', transaction_ID: done }));
+
+        const report = await backfillTransactionIdentifiers(db, 1);
+        expect(report).toEqual({ transactions: 1, identifiers: 2 });
+        expect(await identifierRowsOf(fresh)).toEqual(['f1', 'f2']);
+        // Rows that exist are not rewritten.
+        expect(await identifierRowsOf(done)).toEqual(['d1']);
+
+        // The finished run is marked, so the next start does not scan again.
+        expect((await readSync()).identifiersBackfilledAt).toBeTruthy();
+        const later = await seedTransaction(blockId, { transactionId: 3, identifiers: JSON.stringify(['l1']) });
+        expect(await backfillTransactionIdentifiers(db)).toEqual({ transactions: 0, identifiers: 0 });
+        expect(await identifierRowsOf(later)).toEqual([]);
+    });
+
+    it('an interrupted run resumes: without the marker the rows that exist are kept and the rest filled', async () => {
+        await setSync({ lastIndexedHeight: 10, identifiersBackfilledAt: null });
+        const blockId = await seedBlock(10, '0xbf2');
+        const done = await seedTransaction(blockId, { transactionId: 0, identifiers: JSON.stringify(['d1']) });
+        const rest = await seedTransaction(blockId, { transactionId: 1, identifiers: JSON.stringify(['r1']) });
+        await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries({ identifier: 'd1', transaction_ID: done }));
+        expect(await backfillTransactionIdentifiers(db)).toEqual({ transactions: 1, identifiers: 1 });
+        expect(await identifierRowsOf(rest)).toEqual(['r1']);
+    });
 });
 
 describe('contract state storage', () => {
@@ -1101,9 +1170,18 @@ describe('contract state storage', () => {
     describe('contractStateAt', () => {
         const twoStates = { 10: [{ address: CONTRACT, state: 's10' }], 12: [{ address: CONTRACT, state: 's12' }] };
         const text = (value: string | null): string | null => value == null ? null : Buffer.from(value, 'base64').toString('utf8');
+        const fetched = (state: string | null) => ({ state, zswapState: null, blockHash: null, ledgerParameters: null });
+
+        /** The supplement stored the blocks' ledger parameters, so a snapshot needs nothing from the indexer. */
+        async function storeParams(...heights: number[]): Promise<void> {
+            for (const height of heights) {
+                await db.run(cds.ql.UPDATE.entity(BLOCKS).set({ ledgerParameters: b64(`params${height}`) }).where({ height }));
+            }
+        }
 
         it('serves the current state without asking the indexer', async () => {
             await supplyBlocks(twoStates);
+            await storeParams(10, 12);
             const fetchState = vi.fn();
             const snap = await contractStateAt(db, `0x${CONTRACT}`, null, fetchState);
             expect(snap).toEqual(expect.objectContaining({ source: 'current', height: 12, stateHash: sha256('s12') }));
@@ -1115,17 +1193,18 @@ describe('contract state storage', () => {
 
         it('fetches an older state from the indexer and checks it against the stored hash', async () => {
             await supplyBlocks(twoStates);
-            const fetchState = vi.fn(async () => ({ state: b64('s10'), zswapState: null }));
+            const fetchState = vi.fn(async () => fetched(b64('s10')));
             const snap = await contractStateAt(db, CONTRACT, 11, fetchState);
             expect(fetchState).toHaveBeenCalledWith(CONTRACT, 11);
             expect(snap).toEqual(expect.objectContaining({ source: 'indexer', height: 10, verified: true }));
 
-            fetchState.mockResolvedValueOnce({ state: b64('tampered'), zswapState: null });
+            fetchState.mockResolvedValueOnce(fetched(b64('tampered')));
             expect((await contractStateAt(db, CONTRACT, 11, fetchState))?.verified).toBe(false);
         });
 
         it('serves a kept per-action state from the database', async () => {
             await supplyBlocks(twoStates, contractStatePolicy('all'));
+            await storeParams(10, 12);
             const fetchState = vi.fn();
             const snap = await contractStateAt(db, CONTRACT, 11, fetchState);
             expect(snap).toEqual(expect.objectContaining({ source: 'history', height: 10 }));
@@ -1136,7 +1215,7 @@ describe('contract state storage', () => {
         it('does not compare against an older hash while a newer action is not supplemented', async () => {
             await supplyBlocks({ 10: [{ address: CONTRACT, state: 's10' }] });
             await seedCalls(12, [CONTRACT]);
-            const fetchState = vi.fn(async () => ({ state: b64('s12'), zswapState: null }));
+            const fetchState = vi.fn(async () => fetched(b64('s12')));
             const snap = await contractStateAt(db, CONTRACT, 13, fetchState);
             expect(snap).toEqual(expect.objectContaining({ source: 'indexer', height: 12, verified: null }));
         });
@@ -1144,13 +1223,75 @@ describe('contract state storage', () => {
         it('asks the indexer above the indexed tip and leaves it unverified', async () => {
             await supplyBlocks(twoStates);
             await setSync({ lastIndexedHeight: 12 });
-            const fetchState = vi.fn(async () => ({ state: b64('s12'), zswapState: null }));
+            const fetchState = vi.fn(async () => fetched(b64('s12')));
             const snap = await contractStateAt(db, CONTRACT, 15, fetchState);
             expect(snap).toEqual(expect.objectContaining({ source: 'indexer', height: null, verified: null }));
         });
 
         it('answers null when neither side knows the contract', async () => {
             expect(await contractStateAt(db, OTHER, null, async () => null)).toBeNull();
+        });
+
+        it('carries the hash and the ledger parameters of the state\'s block from the database', async () => {
+            await supplyBlocks(twoStates);
+            await db.run(cds.ql.UPDATE.entity(BLOCKS).set({ ledgerParameters: b64('params12') }).where({ height: 12 }));
+            const fetchState = vi.fn();
+            const snap = await contractStateAt(db, CONTRACT, null, fetchState);
+            expect(snap).toEqual(expect.objectContaining({ source: 'current', blockHash: '0xcs12' }));
+            expect(text(snap!.ledgerParameters)).toBe('params12');
+            expect(fetchState).not.toHaveBeenCalled();
+        });
+
+        it('asks the indexer for the parameters of a block the supplement did not store, and takes only those', async () => {
+            await supplyBlocks(twoStates);
+            const fetchState = vi.fn(async () => ({ state: b64('other'), zswapState: null, blockHash: '0xfromindexer', ledgerParameters: b64('p12') }));
+            const snap = await contractStateAt(db, CONTRACT, null, fetchState);
+            expect(fetchState).toHaveBeenCalledWith(CONTRACT, 12);
+            expect(snap).toEqual(expect.objectContaining({ source: 'current', blockHash: '0xcs12' }));
+            expect(text(snap!.state)).toBe('s12');
+            expect(text(snap!.ledgerParameters)).toBe('p12');
+        });
+
+        it('serves the state with null parameters when that ask fails', async () => {
+            await supplyBlocks(twoStates);
+            const fetchState = vi.fn(async () => { throw new Error('indexer down'); });
+            const snap = await contractStateAt(db, CONTRACT, null, fetchState);
+            expect(snap).toEqual(expect.objectContaining({ source: 'current', ledgerParameters: null }));
+            expect(text(snap!.state)).toBe('s12');
+        });
+
+        it('reads the parameters in effect: the newest stored at or below the state\'s block', async () => {
+            await supplyBlocks(twoStates);
+            await storeParams(10);
+            const fetchState = vi.fn();
+            const snap = await contractStateAt(db, CONTRACT, null, fetchState);
+            expect(snap).toEqual(expect.objectContaining({ height: 12, blockHash: '0xcs12' }));
+            expect(text(snap!.ledgerParameters)).toBe('params10');
+            expect(fetchState).not.toHaveBeenCalled();
+        });
+
+        it('reports a used-up indexer budget instead of a silent null', async () => {
+            await supplyBlocks(twoStates);
+            const fetchState = vi.fn(async () => { throw new IndexerBudgetExhausted(500); });
+            await expect(contractStateAt(db, CONTRACT, null, fetchState)).rejects.toBeInstanceOf(IndexerBudgetExhausted);
+        });
+
+        it('tells how far the database is: the supplement cursor and the chain tip', async () => {
+            await supplyBlocks(twoStates);
+            await storeParams(10);
+            await setSync({ lastIndexedHeight: 20, lastSupplementedHeight: 18, chainHeight: 25 });
+            const snap = await contractStateAt(db, CONTRACT, null, vi.fn());
+            expect(snap).toEqual(expect.objectContaining({ coveredHeight: 18, chainHeight: 25 }));
+            const fromIndexer = await contractStateAt(db, CONTRACT, 11, vi.fn(async () => fetched(b64('s10'))));
+            expect(fromIndexer).toEqual(expect.objectContaining({ source: 'indexer', coveredHeight: null, chainHeight: 25 }));
+        });
+
+        it('returns the block hash and parameters the indexer answered with', async () => {
+            await supplyBlocks(twoStates);
+            const fetchState = vi.fn(async () => ({ state: b64('s10'), zswapState: null, blockHash: '0xb10', ledgerParameters: b64('p10') }));
+            const snap = await contractStateAt(db, CONTRACT, 11, fetchState);
+            expect(snap).toEqual(expect.objectContaining({ source: 'indexer', blockHash: '0xb10' }));
+            expect(text(snap!.ledgerParameters)).toBe('p10');
         });
     });
 

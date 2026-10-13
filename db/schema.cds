@@ -88,6 +88,12 @@ entity Transactions : cuid, managed {
                                    on dustLedgerEvents.transaction = $self;
 }
 
+/** One row per ledger identifier of a transaction, so a transaction can be found by one of them. */
+entity TransactionIdentifiers {
+    key identifier  : HexEncoded;
+    key transaction : Association to Transactions;
+}
+
 entity TransactionResults : cuid {
     status        : TransactionResultStatus not null;
     outcomeSource : String(40); // 'substrate-system-events'
@@ -293,24 +299,25 @@ entity ContractRegistrations : managed {
 
 /** Progress of the block indexer. Exactly one row. */
 entity SyncState {
-    key ID                     : String(10) default 'SINGLETON';
-        networkId              : String(30);
-        lastIndexedHeight      : Integer64 default 0;
-        lastIndexedHash        : HexEncoded;
-        lastIndexedAt          : Timestamp;
-        lastDecodedHeight      : Integer64;
-        lastSupplementedHeight : Integer64;
-        lastFinalizedHeight    : Integer64 default 0;
-        lastFinalizedHash      : HexEncoded;
-        nodeUrl                : String(200);
-        chainHeight            : Integer64 default 0;
-        syncStatus             : SyncStatus default 'stopped';
-        reorgGeneration        : Integer64 default 0;
-        syncProgress           : Decimal(5, 2) default 0; // percent; lastIndexedHeight of chainHeight
-        blocksPerSecond        : Decimal(10, 2) default 0;
-        lastError              : String(500);
-        lastErrorAt            : Timestamp;
-        consecutiveErrors      : Integer default 0;
+    key ID                      : String(10) default 'SINGLETON';
+        networkId               : String(30);
+        lastIndexedHeight       : Integer64 default 0;
+        lastIndexedHash         : HexEncoded;
+        lastIndexedAt           : Timestamp;
+        lastDecodedHeight       : Integer64;
+        lastSupplementedHeight  : Integer64;
+        lastFinalizedHeight     : Integer64 default 0;
+        lastFinalizedHash       : HexEncoded;
+        nodeUrl                 : String(200);
+        chainHeight             : Integer64 default 0;
+        syncStatus              : SyncStatus default 'stopped';
+        reorgGeneration         : Integer64 default 0;
+        syncProgress            : Decimal(5, 2) default 0; // percent; lastIndexedHeight of chainHeight
+        blocksPerSecond         : Decimal(10, 2) default 0;
+        lastError               : String(500);
+        lastErrorAt             : Timestamp;
+        consecutiveErrors       : Integer default 0;
+        identifiersBackfilledAt : Timestamp; // null = rows decoded before TransactionIdentifiers existed are not filled in yet
 }
 
 entity ReorgLog : cuid, managed {

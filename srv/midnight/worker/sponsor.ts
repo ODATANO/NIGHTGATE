@@ -33,9 +33,10 @@ export async function deserializeFinalizedTx(b64: string): Promise<{ tx: any; by
     const errs: string[] = [];
     for (const [s, p, b] of attempts) {
         try { const tx = ledger.Transaction.deserialize(s, p, b, bytes); if (tx) return { tx, bytes }; }
-        catch (e) { errs.push(`(${s},${p},${b}): ${formatErr(e).slice(0, 60)}`); }
+        catch (e) { errs.push(`(${s},${p},${b}): ${formatErr(e).slice(0, 300)}`); }
     }
-    throw new Error(`could not deserialize finalized tx (${bytes.length}B); tried ${errs.join(' | ')}`);
+    // The counts let a caller compare with what it sent: base64 characters lost in transit show up here.
+    throw new Error(`could not deserialize the caller transaction (${b64.length} base64 characters, ${bytes.length} bytes decoded); tried ${errs.join(' | ')}`);
 }
 
 export function inspectTxCalls(tx: any): Array<{ address: string; entryPoint: string }> {

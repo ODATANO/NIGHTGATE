@@ -1,5 +1,6 @@
 // Types for `@odatano/nightgate/txbuilder`. It builds a transaction on your machine,
 // with your own key, for a NIGHTGATE server to pay the fee and submit.
+import type { ConnectOptions, NightgateClient } from '../sdk/client';
 
 /** A call prepared by one of the `prepare*` helpers. */
 export interface PreparedCall {
@@ -49,10 +50,22 @@ export interface CreateTxBuilderInput {
     seedHex: string;
     networkId?: string;
     accountIndex?: number;
-    indexerHttpUrl: string;
-    indexerWsUrl: string;
-    /** Node RPC URL. */
-    nodeUrl: string;
+    /**
+     * A NIGHTGATE server to read the chain through: the options for `connect()` or a connected client.
+     * Replaces the indexer and the node. Needs `walletSync: false` unless the indexer URLs are given as well.
+     */
+    api?: ConnectOptions | NightgateClient;
+    /**
+     * With `api`: a contract state from a server whose database is more blocks behind the chain is refused,
+     * because a build on a stale state can fail on chain. Default 10.
+     */
+    maxLagBlocks?: number;
+    /** Required without `api`. */
+    indexerHttpUrl?: string;
+    /** Required without `api`. */
+    indexerWsUrl?: string;
+    /** Node RPC URL. Required without `api`. */
+    nodeUrl?: string;
     /** Only used with `provingMode: 'server'`. */
     proofServerUrl?: string;
     /**
@@ -323,12 +336,28 @@ export interface LandedProbeResult {
     failedSegments: number[];
     /** false means the transaction is in a block but its call failed. The fee was still spent. */
     applied: boolean;
+    /** The transaction hash, when the answer came from a NIGHTGATE server. */
+    txHash?: string;
 }
 
-/** Asks the indexer whether a transaction landed. Returns null while this is not known yet. */
-export declare function probeLanded(identifier: string, opts: { indexerHttpUrl: string, fetchFn?: typeof fetch, timeoutMs?: number }): Promise<LandedProbeResult | null>;
+/** Where to ask whether a transaction landed: an indexer, or a NIGHTGATE server (`connect()` options or client). */
+export interface LandedProbeSource {
+    indexerHttpUrl?: string;
+    api?: ConnectOptions | NightgateClient;
+    fetchFn?: typeof fetch;
+}
+
+/** Asks the indexer or the NIGHTGATE server whether a transaction landed. Returns null while this is not known yet. */
+export declare function probeLanded(identifier: string, opts: LandedProbeSource & { timeoutMs?: number }): Promise<LandedProbeResult | null>;
 /** Calls `probeLanded` until the transaction is found or `timeoutMs` has passed. Use it when a resend is rejected. */
-export declare function waitLanded(identifier: string, opts: { indexerHttpUrl: string, timeoutMs?: number, pollMs?: number, fetchFn?: typeof fetch }): Promise<LandedProbeResult | null>;
+export declare function waitLanded(identifier: string, opts: LandedProbeSource & { timeoutMs?: number, pollMs?: number }): Promise<LandedProbeResult | null>;
+
+/** A midnight-js `PublicDataProvider` that reads contract state and deploys through the NIGHTGATE API. */
+export declare function apiPublicDataProvider(input: { client: NightgateClient; ledger: object; pollMs?: number; watchTimeoutMs?: number }): object;
+/** The client behind an `api` option: a connected client, or `connect()` on the options. */
+export declare function apiClientFor(api: ConnectOptions | NightgateClient): NightgateClient;
+/** A wallet facade submission service that never dials a node. The builder hands its transaction to a sponsor instead. */
+export declare function buildOnlySubmissionService(): (configuration: object) => { submitTransaction(): Promise<never>; close(): Promise<void> };
 
 export interface DustGuardOptions {
     /** The configuration the facade was created with. */
