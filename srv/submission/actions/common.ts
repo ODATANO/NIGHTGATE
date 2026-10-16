@@ -4,7 +4,7 @@
  */
 import { getArtifactGenerationDigest } from '../contract-registry';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../../utils/nightgate-config';
-import { RateLimiter, principalRateKey } from '../../utils/rate-limiter';
+import { checkRateClass, type RateClass } from '../../utils/rate-classes';
 import { WorkflowReconciliationRequiredError } from '../background-jobs';
 import { UINT64_MAX } from '../verify-state';
 import { effectiveSponsorPolicy, getGlobalSponsorPolicy, type SponsorPolicy } from '../sponsor-policy';
@@ -43,20 +43,6 @@ export async function liveSponsorPolicyForJob(db: DbRunner, command: { grantId?:
     return effectiveSponsorPolicy(getGlobalSponsorPolicy(), grant);
 }
 
-// Each limit counts per caller and per scope. The scope is a session, or a contract for reindex.
-export const deployRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 5 });
-export const callRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
-export const anchorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
-export const predicateRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 10 });
-export const disclosureRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
-export const registrarRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
-export const reindexRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
-// Counted per caller only, because the shared sponsor pool pays the dust for every job.
-export const sponsorRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 120 });
-export const swapOfferRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
-export const swapListRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 600 });
-export const holderClaimRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 60 });
-export const buildRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 30 });
 
 /** The vault contract only accepts a `valid_until` after the block time and at most 5 years ahead. */
 export const CLAIM_MAX_LIFETIME_S = 5 * 365 * 24 * 60 * 60;
@@ -298,22 +284,9 @@ export function rejectIfMainnetBlocked(req: ActionRequest<unknown, unknown>): bo
     return false;
 }
 
-/**
- * The key starts with the caller's identity. The scope comes from the request and is not yet
- * checked for ownership, so a scope-only key would let one user use up another user's budget.
- */
-export function rateKey(req: ActionRequest<unknown, unknown>, scope: string): string {
-    return principalRateKey(req, scope);
-}
-
-export function checkRate(limiter: RateLimiter, scope: string, req: ActionRequest<unknown, unknown>, count = 1): boolean {
-    // checkMany counts all or nothing. A rejected batch uses up no budget.
-    const r = limiter.checkMany(rateKey(req, scope), count);
-    if (!r.allowed) {
-        req.reject?.(429, `Rate limited. Retry after ${Math.ceil(r.retryAfterMs / 1000)}s`);
-        return false;
-    }
-    return true;
+/** Counts the call against the class for the caller and the scope; rejects with 429 and returns false when over. */
+export function checkRate(cls: RateClass, scope: string, req: ActionRequest<unknown, unknown>, count = 1): boolean {
+    return checkRateClass(cls, scope, req, count);
 }
 
 /**

@@ -1,6 +1,8 @@
 export declare class NightgateApiError extends Error {
     status: number;
     code: string | undefined;
+    /** Seconds the server asked to wait, from `Retry-After`; set on 429 and on retryable 503s. */
+    retryAfterSeconds: number | undefined;
 }
 
 /** Server error codes a client may retry unchanged. */

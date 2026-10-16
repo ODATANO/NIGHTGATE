@@ -12,7 +12,7 @@ import { decrypt, getEncryptionKey } from '../utils/crypto';
 import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../utils/envelope-bindings';
 import { deriveAccountId, deriveStoragePassword } from './wallet-material-factory';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
-import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
+import { assignDedicatedWorker, walletWaitForSyncedState, walletWorkerPoolConfig } from '../midnight/wallet-worker-client';
 import { NightgateError } from '../utils/errors';
 import { publishPrewarmState } from '../utils/runtime-state';
 
@@ -118,6 +118,7 @@ export async function ensureFeeSponsorFacade(
     sponsor: ResolvedFeeSponsor,
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex' | 'syncStatePassphrase'>
 ): Promise<void> {
+    assignDedicatedWorker(sponsor.accountId);
     // Set accountIndex after the spread. facadeConfig may hold the caller's account,
     // but the sponsor wallet must use the sponsor's own.
     await getOrBuildWalletFacade(sponsor.accountId, {
@@ -129,7 +130,8 @@ export async function ensureFeeSponsorFacade(
 }
 
 /**
- * Starts the platform sponsor wallets after boot, one at a time.
+ * Starts the platform sponsor wallets after boot: one at a time in a shared worker (they would
+ * starve each other), side by side when every sponsor has a worker of its own.
  * A failing sponsor is logged and skipped. The pool then uses the other sponsors.
  */
 export async function prewarmFeeSponsorPool(opts: {
@@ -150,7 +152,7 @@ export async function prewarmFeeSponsorPool(opts: {
         startedAt, finishedAt: running ? null : new Date().toISOString()
     });
     publish(pool.length > 0);
-    for (const sponsorSessionId of pool) {
+    const warmOne = async (sponsorSessionId: string): Promise<void> => {
         const started = Date.now();
         try {
             const sponsor = await resolveFeeSponsor({ db: opts.db, sponsorSessionId, config: opts.config, encryptionKey: opts.encryptionKey });
@@ -171,6 +173,11 @@ export async function prewarmFeeSponsorPool(opts: {
             opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} failed (${err instanceof Error ? err.message : String(err)}); the pool fails over at use time`);
         }
         publish(true);
+    };
+    if (walletWorkerPoolConfig().sponsorWorkers === 'dedicated') {
+        await Promise.all(pool.map(warmOne));
+    } else {
+        for (const sponsorSessionId of pool) await warmOne(sponsorSessionId);
     }
     publish(false);
     return { warmed, failed };

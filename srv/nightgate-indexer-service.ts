@@ -16,19 +16,13 @@ import {
     buildWorkerStatus
 } from './monitoring/status';
 
-import { RateLimiter } from './utils/rate-limiter';
-import { principalRateKey } from './utils/rate-limiter';
+import { checkRateClass } from './utils/rate-classes';
 import { normalizeHttpError } from './utils/http-errors';
 import { buildBoardStatus } from './submission/board-status';
 import { getBoardStatus, getReadiness, getReorgHistory, getRuntimeInfo, reindexFromHeight, resumeCrawler } from '#cds-models/NightgateIndexerService';
 import type { Request } from '@sap/cds';
 
 const log = cds.log('nightgate:indexer');
-
-// getRuntimeInfo can trigger a full re-hash of the contract files, which blocks the event loop.
-const runtimeInfoRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 30 });
-// Open to anonymous callers and polled by web pages. Each call runs three count queries.
-const boardStatusRateLimiter = new RateLimiter({ windowMs: 60 * 1000, maxRequests: 60 });
 
 export default class NightgateIndexerService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
@@ -106,21 +100,14 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         this.on('getLiveness', async () => buildLiveness());
 
         this.on(getRuntimeInfo, async (req) => {
-            const clientKey = principalRateKey(req, 'runtime-info');
-            const rate = runtimeInfoRateLimiter.check(clientKey);
-            if (!rate.allowed) {
-                return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-            }
+            if (!checkRateClass('read', 'read', req)) return;
             return buildRuntimeInfo();
         });
         this.on('getWorkerStatus', async (req: Request) =>
             buildWorkerStatus(Boolean(req.user?.is?.('admin'))));
 
         this.on(getBoardStatus, async (req) => {
-            const rate = boardStatusRateLimiter.check(principalRateKey(req, 'board-status'));
-            if (!rate.allowed) {
-                return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-            }
+            if (!checkRateClass('read', 'read', req)) return;
             return buildBoardStatus(this.db);
         });
 

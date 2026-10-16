@@ -19,12 +19,15 @@ const mockEvictEncryptionKey = vi.hoisted(() => (vi.fn(async () => undefined)));
 
 // Capture the worker-gone listener the module registers at load, so a test
 // can fire it the way a crash or a stop would.
-const workerGoneListeners = vi.hoisted(() => [] as Array<(r: "exit" | "stop") => void | Promise<void>>);
+type GoneInfo = { workerId: string; facades: string[] };
+const workerGoneListeners = vi.hoisted(() => [] as Array<(r: "exit" | "stop", info: GoneInfo) => void | Promise<void>>);
+// the one worker of a plain setup; no wallet reported progress, so the listener drops everything
+const GONE: GoneInfo = { workerId: 'user-0', facades: [] };
 vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletInit: mockWalletInit,
     walletEvict: mockWalletEvict,
     setStateSaveSink: mockSetStateSaveSink,
-    onWorkerGone: (fn: (r: "exit" | "stop") => void | Promise<void>) => { workerGoneListeners.push(fn); return () => { }; }
+    onWorkerGone: (fn: (r: "exit" | "stop", info: GoneInfo) => void | Promise<void>) => { workerGoneListeners.push(fn); return () => { }; }
 }));
 
 vi.mock('../../srv/submission/wallet-sync-state-store', () => ({
@@ -82,7 +85,7 @@ describe('wallet-facade-builder', () => {
 
                 expect(workerGoneListeners.length).toBeGreaterThan(0);
                 expect(getFacadeOrigin('cache-key-gone-1111')).not.toBeNull();
-                for (const fire of workerGoneListeners) await fire("exit");
+                for (const fire of workerGoneListeners) await fire("exit", GONE);
 
                 expect(__getCacheSizeForTests()).toBe(0);
                 expect(hasWalletFacade('cache-key-gone-1111')).toBe(false);
@@ -109,7 +112,7 @@ describe('wallet-facade-builder', () => {
                 wireWorkerStateSaveSink();
                 const sink = mockSetStateSaveSink.mock.calls.at(-1)![0] as (e: any) => Promise<void>;
 
-                for (const fire of workerGoneListeners) await fire("exit");
+                for (const fire of workerGoneListeners) await fire("exit", GONE);
                 expect(hasWalletFacade('cache-key-inflight')).toBe(false);   // no longer warm
                 expect(__getPersistenceSizeForTests()).toBe(1);              // still persistable
 
@@ -139,7 +142,7 @@ describe('wallet-facade-builder', () => {
                 mockSaveSyncState.mockImplementationOnce(() => new Promise<void>(res => { finishSave = res; }));
                 const pending = sink({ sessionId: 'cache-key-stop', blobs: { dust: 'blob' }, seq: 1 });
 
-                const stopped = Promise.all(workerGoneListeners.map(fire => fire('stop')));
+                const stopped = Promise.all(workerGoneListeners.map(fire => fire('stop', GONE)));
                 await Promise.resolve();
                 // Still held: the queued save has not been written yet.
                 expect(__getPersistenceSizeForTests()).toBe(1);

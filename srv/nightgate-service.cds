@@ -64,6 +64,21 @@ service NightgateService {
         failedSegments : array of Integer;
     }
 
+    /** One counted budget of a grant. `max` null = no limit. */
+    type Budget {
+        max      : Integer;
+        used     : Integer;
+        resetsAt : Timestamp; // when `used` returns to 0
+    }
+
+    /** A server rate class as it stands for the caller. */
+    type RateClassState {
+        name          : String; // prove | deploy | sponsor | compute | read
+        windowSeconds : Integer;
+        max           : Integer;
+        remaining     : Integer;
+    }
+
     @readonly
     entity TransactionResults    as projection on midnight.TransactionResults;
 
@@ -1042,7 +1057,8 @@ service NightgateService {
      */
     action   createAgentGrant(sessionId: UUID,
                               allowedActions: array of String,
-                              maxJobsPerDay: Integer, // optional, default unlimited
+                              maxJobsPerDay: Integer, // optional; default NIGHTGATE_GRANT_DEFAULT_JOBS_PER_DAY, else unlimited
+                              maxJobsPerHour: Integer, // optional; default NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR, else unlimited
                               sponsorSessionId: UUID, // optional
                               validUntil: Timestamp, // optional, default no expiry
                               agentLabel: String, // optional
@@ -1071,7 +1087,8 @@ service NightgateService {
                                sessionId: UUID,
                                allowedActions: array of String,
                                labels: array of String, // optional; exactly count entries
-                               maxJobsPerDay: Integer, // optional, default unlimited
+                               maxJobsPerDay: Integer, // optional; default NIGHTGATE_GRANT_DEFAULT_JOBS_PER_DAY, else unlimited
+                               maxJobsPerHour: Integer, // optional; default NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR, else unlimited
                                sponsorSessionId: UUID, // optional
                                validUntil: Timestamp, // optional, default no expiry
                                agentLabel: String, // optional
@@ -1105,6 +1122,7 @@ service NightgateService {
                               agentLabel: String,
                               allowedActions: array of String,
                               maxJobsPerDay: Integer,
+                              maxJobsPerHour: Integer,
                               allowedContracts: array of String,
                               allowedCircuits: array of String,
                               allowedTokenTypes: array of String,
@@ -1121,7 +1139,7 @@ service NightgateService {
         token   : String; // shown only once
     };
 
-    /** What a grant did between `since` and `until`, by default the last 30 days, at most 366 days. */
+    /** What a grant did between `since` and `until` (default last 30 days, max 366) and its limits. A token may leave `grantId` empty. */
     function getGrantUsage(grantId: UUID, since: Timestamp, until: Timestamp) returns {
         grantId       : UUID;
         since         : Timestamp;
@@ -1138,6 +1156,11 @@ service NightgateService {
         jobsUsedToday : Integer;
         maxJobsPerDay : Integer;
         dustPaid      : String;
+        limits        : {
+            jobsPerHour : Budget;
+            jobsPerDay  : Budget;
+            classes     : array of RateClassState;
+        };
     };
 
     /**

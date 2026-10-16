@@ -21,7 +21,7 @@ export const ERROR_CODES = {
     GONE: { status: 410, doc: 'The addressed record expired or was closed.' },
     PRECONDITION_FAILED: { status: 412, doc: 'A required earlier step is missing (e.g. no signing key on the session).' },
     PAYLOAD_TOO_LARGE: { status: 413, doc: 'The request body exceeds a limit.' },
-    RATE_LIMITED: { status: 429, retryable: true, doc: 'A rate limit or daily budget is exhausted; see `Retry-After` where set.' },
+    RATE_LIMITED: { status: 429, retryable: true, doc: 'A rate class or a grant budget is used up; the message names it, `Retry-After` says when to retry.' },
     INTERNAL: { status: 500, doc: 'Unexpected server failure; the message is withheld in production.' },
     NOT_IMPLEMENTED: { status: 501, doc: 'The operation is not available in this configuration.' },
     BAD_GATEWAY: { status: 502, retryable: true, doc: 'An upstream (node, indexer, proof server) answered wrongly.' },

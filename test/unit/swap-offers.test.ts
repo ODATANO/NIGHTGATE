@@ -125,7 +125,9 @@ describe('offer board over HTTP', () => {
         // operator-b owns the token's grant but did not post under its own name: not the poster
         expect((await post('retireSwapOffer', { offerId: byToken.data.offerId }, asB)).status).toBe(403);
         expect((await post('retireSwapOffer', { offerId: byA.data.offerId }, asToken)).status).toBe(403);
-        expect((await post('retireSwapOffer', { offerId: byToken.data.offerId }, asToken)).status).toBe(200);
+        const retired = await post('retireSwapOffer', { offerId: byToken.data.offerId }, asToken);
+        expect(retired.status).toBe(200);
+        expect(String(retired.headers['ratelimit-policy'])).toContain('"compute"');
         expect((await post('retireSwapOffer', { offerId: byA.data.offerId }, asA)).data).toMatchObject({ status: 'retired' });
         // retired twice: not open any more
         expect((await post('retireSwapOffer', { offerId: byA.data.offerId }, asA)).status).toBe(409);

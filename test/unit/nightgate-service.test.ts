@@ -891,6 +891,9 @@ describe('sponsorFinalizedTransaction over REAL OData: the pool sentinel', () =>
     it('a busy admission keeps code + message on the wire in production, with Retry-After', async () => {
         const bg = require('../../srv/submission/background-jobs');
         const spy = vi.spyOn(bg, 'startJob').mockRejectedValueOnce(new bg.JobAdmissionBusyError('sponsorFinalizedTransaction'));
+        // the request-path byte check runs in the wallet worker, which this test does not start
+        const workerClient = require('../../srv/midnight/wallet-worker-client');
+        const described = vi.spyOn(workerClient, 'walletDescribeTransaction').mockResolvedValueOnce({ bytes: 5, bound: true });
         const prevNodeEnv = process.env.NODE_ENV;
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'a4f1c8ee-0000-4000-8000-000000000001';
         process.env.NODE_ENV = 'production';
@@ -898,6 +901,7 @@ describe('sponsorFinalizedTransaction over REAL OData: the pool sentinel', () =>
             const res: any = await cap.POST(`${API}/sponsorFinalizedTransaction`, {
                 finalizedTxB64: Buffer.from('probe').toString('base64')
             }).catch((e: any) => e.response ?? e);
+            expect(described).toHaveBeenCalled();
             expect(spy).toHaveBeenCalled();
             expect(res.status).toBe(503);
             expect(res.headers?.['retry-after']).toBe('2');

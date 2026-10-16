@@ -89,6 +89,10 @@ Every `prepare*` helper of the browser export works the same way
 `prepareGrantDisclosure`, ...). The document helpers (`prepareDocumentProof`
 and friends) run offline and feed into them.
 
+A refused server call throws `NightgateApiError` with the server's `status`
+and `code`; a 429 and a retryable 503 also carry `retryAfterSeconds` from
+`Retry-After`. `isRetryable(err)` says whether the same call may be repeated.
+
 ## API
 
 ### `createTxBuilder(opts) -> TxBuilder`

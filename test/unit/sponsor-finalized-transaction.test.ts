@@ -31,9 +31,16 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
 const unboundWorkerCalls = vi.hoisted(() => [] as any[]);
 const unboundWorkerImpl = vi.hoisted(() => ({ fn: async (_args: any): Promise<any> => ({ txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' }) }));
 const unboundIntentHooks = vi.hoisted(() => [] as any[]);
+// The request-path byte check: ok by default, a test makes it refuse or fail.
+const describeImpl = vi.hoisted(() => ({
+    tx: async (_args: any): Promise<any> => ({ bytes: 600, bound: true }),
+    half: async (_args: any): Promise<any> => ({ gives: { tokenType: 'a', amount: '1' }, wants: { tokenType: 'b', amount: '1' }, bound: false, inputs: 1, nullifiers: [] })
+}));
 const boundIntentHooks = vi.hoisted(() => [] as any[]);
 vi.mock('../../srv/midnight/wallet-worker-client', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
+    walletDescribeTransaction: vi.fn(async (args: any) => describeImpl.tx(args)),
+    walletDescribeSwapHalf: vi.fn(async (args: any) => describeImpl.half(args)),
     walletSponsorFinalizedTx: vi.fn(async (args: any, onSubmitIntent?: any) => { workerCalls.push(args); boundIntentHooks.push(onSubmitIntent); return workerImpl.fn(args); }),
     walletSponsorUnboundTx: vi.fn(async (args: any, onSubmitIntent?: any) => { unboundWorkerCalls.push(args); unboundIntentHooks.push(onSubmitIntent); return unboundWorkerImpl.fn(args); })
 }));
@@ -150,6 +157,7 @@ describe('sponsorFinalizedTransaction', () => {
         __resetSponsorPoolForTests();
         delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
         workerImpl.fn = async () => ({ txHash: '00aa', circuits: ['attest'], contractAddress: 'c' });
+        describeImpl.tx = async () => ({ bytes: 600, bound: true });
     });
 
     test('rejects without finalizedTxB64', async () => {
@@ -157,6 +165,26 @@ describe('sponsorFinalizedTransaction', () => {
         const r1 = makeReq({});
         await srv.handlers['sponsorFinalizedTransaction'](r1);
         expect(r1.reject).toHaveBeenCalledWith(400, expect.stringMatching(/finalizedTxB64/));
+    });
+
+    test('bytes that are not a proven transaction answer 400 before a job exists, a worker outage 503', async () => {
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        const srv = setup();
+        const junk = makeReq({ finalizedTxB64: 'AAAA' });
+        describeImpl.tx = async () => { throw new Error('refusing to sponsor: not a proven transaction (expected header)'); };
+        await srv.handlers['sponsorFinalizedTransaction'](junk);
+        expect(junk.reject).toHaveBeenCalledWith(400, expect.stringMatching(/not a proven transaction/));
+        expect(startJobCalls).toHaveLength(0);
+
+        const down = makeReq({ finalizedTxB64: TX_A });
+        describeImpl.tx = async () => { throw new Error('wallet worker is not running'); };
+        await srv.handlers['sponsorFinalizedTransaction'](down);
+        expect(down.reject).toHaveBeenCalledWith(503, expect.stringMatching(/could not check the transaction/));
+        expect(startJobCalls).toHaveLength(0);
+
+        describeImpl.tx = async () => ({ bytes: 600, bound: true });
+        await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A }));
+        expect(startJobCalls).toHaveLength(1);
     });
 
     test('the request names no payer: the pool pays, a grant pinned to a wallet session pays from it', async () => {
@@ -919,12 +947,34 @@ describe('sponsorSwap', () => {
         process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = `${T1},${T2}`;
         platform.policy = { ...closed, allowedTokenTypes: [T1, T2], allowSwaps: true };
         unboundWorkerImpl.fn = async () => ({ txHash: '00cc', circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms });
+        describeImpl.half = async () => ({ gives: { tokenType: T1, amount: '10' }, wants: { tokenType: T2, amount: '3' }, bound: false, inputs: 1, nullifiers: [] });
     });
     afterEach(() => {
         platform.policy = closed;
         delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
         delete process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS;
         delete process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES;
+    });
+
+    test('the halves are checked before a job exists: the taker half always, the maker half unless it is from the board', async () => {
+        const srv = setup();
+        const checked: string[] = [];
+        describeImpl.half = async (args: any) => { checked.push(args.halfB64); if (args.halfB64 === TX_B) throw new Error('refusing to sponsor: the half is not a proven transaction (3B)'); return { gives: { tokenType: T1, amount: '10' }, wants: { tokenType: T2, amount: '3' }, bound: false, inputs: 1, nullifiers: [] }; };
+        const direct = makeReq({ ...HALVES });
+        await srv.handlers['sponsorSwap'](direct);
+        expect(direct.reject).toHaveBeenCalledWith(400, expect.stringMatching(/not a proven transaction/));
+        expect(checked).toEqual([TX_A, TX_B]);
+        expect(startJobCalls).toHaveLength(0);
+
+        checked.length = 0;
+        describeImpl.half = async (args: any) => { checked.push(args.halfB64); return { gives: { tokenType: T1, amount: '10' }, wants: { tokenType: T2, amount: '3' }, bound: true, inputs: 1, nullifiers: [] }; };
+        board.row = { ID: 'offer-1', offer: TX_A, status: 'open', expiresAt: null };
+        const viaBoard = makeReq({ offerId: 'offer-1', takerHalfB64: TX_B });
+        await srv.handlers['sponsorSwap'](viaBoard);
+        expect(viaBoard.reject).not.toHaveBeenCalled();
+        expect(checked).toEqual([TX_B]);
+        expect(startJobCalls).toHaveLength(1);
+        board.row = null;
     });
 
     test('both halves are required', async () => {

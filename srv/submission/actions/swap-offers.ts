@@ -10,7 +10,7 @@ import { transactionBytesOf } from '../../utils/offer-file';
 import { walletDescribeSwapHalf } from '../../midnight/wallet-worker-client';
 import { isSwapOfferOpen, loadSwapOffer, closeSwapOffer, effectiveSwapOfferStatus, type SwapOfferStatus } from '../swap-offers';
 import { parseJsonStringList } from '../../utils/json-list';
-import { swapOfferRateLimiter, swapListRateLimiter, checkRate, runSubmission } from './common';
+import { checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_RE } from '../../utils/hex';
 import { getSwapOffer, listSwapOffers, postSwapOffer, retireSwapOffer } from '#cds-models/NightgateService';
@@ -89,7 +89,7 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         }
         const parsedTags = parseTags(tags);
         if (typeof parsedTags === 'string') return req.reject(400, parsedTags);
-        if (!checkRate(swapOfferRateLimiter, 'swap-offer', req)) return;
+        if (!checkRate('compute', 'compute', req)) return;
 
         return runSubmission(req, async () => {
             let half: Awaited<ReturnType<typeof walletDescribeSwapHalf>>;
@@ -118,7 +118,7 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
     });
 
     srv.on(listSwapOffers, async (req) => {
-        if (!checkRate(swapListRateLimiter, 'swap-list', req)) return;
+        if (!checkRate('read', 'read', req)) return;
         const { givesType, wantsType, tag, limit, status, since, mine } = req.data;
         const where: Record<string, unknown> = {};
         for (const [name, value] of [['givesType', givesType], ['wantsType', wantsType]] as const) {
@@ -179,7 +179,7 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
     srv.on(getSwapOffer, async (req) => {
         const { offerId } = req.data;
         if (!offerId) return req.reject(400, 'offerId is required');
-        if (!checkRate(swapListRateLimiter, 'swap-list', req)) return;
+        if (!checkRate('read', 'read', req)) return;
         const row = await loadSwapOffer(db, String(offerId));
         if (!row) return req.reject(404, 'swap offer not found');
         return publicView(row, new Date());
@@ -188,6 +188,7 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
     srv.on(retireSwapOffer, async (req) => {
         const { offerId } = req.data;
         if (!offerId) return req.reject(400, 'offerId is required');
+        if (!checkRate('compute', 'compute', req)) return;
         return runSubmission(req, async () => {
             const row = await loadSwapOffer(db, String(offerId));
             if (!row) throw new NightgateError('NOT_FOUND', 'swap offer not found');

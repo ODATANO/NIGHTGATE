@@ -3,7 +3,6 @@ import { WalletSessions, type WalletSession } from '#cds-models/midnight';
 import { getEncryptionKey, encrypt, decrypt, hashViewingKey } from '../utils/crypto';
 import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../utils/envelope-bindings';
 import { validateViewingKey } from '../utils/validation';
-import { RateLimiter } from '../utils/rate-limiter';
 import { deriveAccountId, deriveStoragePassword } from '../submission/wallet-material-factory';
 import { resolveAccountDek } from '../submission/account-keys';
 import { getWalletBalance, estimateSendNightFee } from '../submission/token-ops';
@@ -16,7 +15,7 @@ import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 import { deriveWalletInfo, resolveBip39SeedHex, deriveViewingKeyForAccount } from '../utils/wallet-info';
 import { resolveFeeSponsor, FeeSponsorError, getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import { isSessionExpired } from '../utils/session-expiry';
-import { principalRateKey } from '../utils/rate-limiter';
+import { checkRateClass } from '../utils/rate-classes';
 import { configMs, configNumber } from '../utils/config';
 import { syncGateReading } from '../submission/sponsor-sync-gate';
 import { formatErr } from '../utils/format-error';
@@ -66,36 +65,6 @@ function rejectWorkerReadError(req: Request, action: string, err: unknown) {
         } as any);
     }
     return req.reject(500, `${action} failed: ${msg}`);
-}
-
-const walletRateLimiter = new RateLimiter({
-    windowMs: 60 * 1000,
-    maxRequests: 10
-});
-
-const signingKeyRateLimiter = new RateLimiter({
-    // Also used by deriveWalletInfo. The limit is low because a signing key is added once per session.
-    windowMs: 60 * 60 * 1000,
-    maxRequests: configNumber('NIGHTGATE_SIGNING_KEY_RATE_LIMIT')
-});
-
-const dustRegRateLimiter = new RateLimiter({
-    windowMs: 60 * 60 * 1000,
-    maxRequests: 10
-});
-
-const sendRateLimiter = new RateLimiter({
-    windowMs: 60 * 1000,
-    maxRequests: 10
-});
-
-const diagnosticsRateLimiter = new RateLimiter({
-    windowMs: 60 * 1000,
-    maxRequests: 60
-});
-
-export function __resetWalletRateLimitersForTests(): void {
-    for (const l of [walletRateLimiter, signingKeyRateLimiter, dustRegRateLimiter, sendRateLimiter, diagnosticsRateLimiter]) l.reset();
 }
 
 const MAX_NIGHT_AMOUNT_ATOMS = 10n ** 18n;
@@ -150,11 +119,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         registerBackgroundJobProcessor(kind, 1, declaredJobKindTraits(kind), (command, row) => executeWalletCommand(command, row, db));
     }
     srv.on(connectWallet, async (req) => {
-        const clientKey = principalRateKey(req, 'wallet');
-        const rateResult = walletRateLimiter.check(clientKey);
-        if (!rateResult.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rateResult.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('wallet', 'wallet', req)) return;
 
         const userId = requireUserId(req);
         if (!userId) return;
@@ -211,11 +176,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
     });
 
     srv.on(deriveWalletInfoAction, async (req) => {
-        const clientKey = principalRateKey(req, 'wallet');
-        const rateResult = signingKeyRateLimiter.check(clientKey);
-        if (!rateResult.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rateResult.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('signing', 'signing', req)) return;
 
         const userId = requireUserId(req);
         if (!userId) return;
@@ -245,11 +206,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
     });
 
     srv.on(connectWalletForSigning, async (req) => {
-        const clientKey = principalRateKey(req, 'wallet');
-        const rateResult = signingKeyRateLimiter.check(clientKey);
-        if (!rateResult.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rateResult.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('signing', 'signing', req)) return;
 
         const userId = requireUserId(req);
         if (!userId) return;
@@ -407,11 +364,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         if (rejectIfMainnetBlocked(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = principalRateKey(req, 'wallet');
-        const rate = dustRegRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('wallet', 'wallet', req)) return;
 
         const { sessionId, dustReceiverAddress, idempotencyKey } = req.data;
         if (!sessionId) return req.reject(400, 'sessionId is required');
@@ -442,11 +395,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         if (rejectIfMainnetBlocked(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = principalRateKey(req, 'wallet');
-        const rate = dustRegRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('wallet', 'wallet', req)) return;
 
         const { sessionId, idempotencyKey, sponsorSessionId } = req.data;
         if (!sessionId) return req.reject(400, 'sessionId is required');
@@ -492,11 +441,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         if (rejectIfMainnetBlocked(req)) return;
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = principalRateKey(req, 'wallet');
-        const rate = sendRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('wallet', 'wallet', req)) return;
 
         const { sessionId, receiverAddress, amount, ttlIso, idempotencyKey, tokenTypeHex } = req.data;
 
@@ -546,11 +491,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
     srv.on(getWalletBalanceAction, async (req) => {
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = principalRateKey(req, 'wallet');
-        const rate = diagnosticsRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('read', 'read', req)) return;
 
         const { sessionId } = req.data;
         if (!sessionId) return req.reject(400, 'sessionId is required');
@@ -568,11 +509,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
     srv.on(getSponsorPoolStatus, async (req) => {
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = principalRateKey(req, 'wallet');
-        const rate = diagnosticsRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('read', 'read', req)) return;
 
         const sponsorIds = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
         if (sponsorIds.length === 0) return [];
@@ -745,11 +682,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
     srv.on(getWalletSyncProgress, async (req) => {
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = principalRateKey(req, 'wallet');
-        const rate = diagnosticsRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('read', 'read', req)) return;
 
         const { sessionId } = req.data;
         if (!sessionId) return req.reject(400, 'sessionId is required');
@@ -809,11 +742,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
     srv.on(estimateSendNightFeeAction, async (req) => {
         const userId = requireUserId(req);
         if (!userId) return;
-        const clientKey = principalRateKey(req, 'wallet');
-        const rate = diagnosticsRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('read', 'read', req)) return;
 
         const { sessionId, receiverAddress, amount, ttlIso } = req.data;
 

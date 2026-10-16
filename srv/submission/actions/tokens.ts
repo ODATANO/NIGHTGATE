@@ -7,7 +7,7 @@ import { deriveRawTokenType, TokenTypeError, SHIELDED_TEST_TOKEN_REF, SHIELDED_T
 import { TOKEN_FACTORY_REF, TOKEN_FACTORY_MINT_CIRCUIT, parseFactoryTokenName, parseFactoryMintAmount } from '../token-factory';
 import { startJob } from '../background-jobs';
 import { HEX64_RE } from '../../utils/hex';
-import { callRateLimiter, facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
 import { deriveTokenType, mintFactoryToken, mintShieldedTestToken } from '#cds-models/NightgateService';
 
@@ -29,7 +29,7 @@ export function registerTokenActions(ctx: Pick<SubmissionContext, 'srv' | 'db' |
         if (!HEX64_RE.test(recipient)) return req.reject(400, 'recipientCoinPublicKey must be 64 hex characters (a Zswap coin public key)');
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(callRateLimiter, sessionId, req)) return;
+        if (!checkRate('prove', sessionId, req)) return;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -69,7 +69,7 @@ export function registerTokenActions(ctx: Pick<SubmissionContext, 'srv' | 'db' |
         if (!contractAddress) return req.reject(400, 'contractAddress is required (deploy shielded-token first)');
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(callRateLimiter, sessionId, req)) return;
+        if (!checkRate('prove', sessionId, req)) return;
 
         // The result assumes the test token's separator and amount.
         // Another contract would get a wrong tokenTypeHex.

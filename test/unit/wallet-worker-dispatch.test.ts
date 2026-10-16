@@ -1386,6 +1386,59 @@ describe('buildWorkerWalletProvider', () => {
         }
     });
 
+    it('a resend after the closing socket that the node refuses is looked up on the indexer and lands, no dust race', async () => {
+        withIndexer(true);
+        const restore = withFastResend();
+        const restoreSubmit = sendFailingWith(new Error(TRANSPORT_ERR), new Error('1010: Invalid Transaction: Custom error: 196'));
+        try {
+            const { entry, facade, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const submitsBefore = submitCount();
+            await expect(provider.submitTx(finalized)).resolves.toBe('0xtxid');
+            expect(submitCount() - submitsBefore).toBe(2);
+            expect(logsMatching(/is in block 7 .*although the resend was refused/).length).toBe(1);
+            expect(logsMatching(/died on the client's own closing socket/)[0]).toMatch(/0xtxid/);
+            expect(facade.revert).not.toHaveBeenCalled();
+        } finally {
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('a refused resend after the closing socket with the identifier unknown to the indexer is an unknown outcome, never a dust race', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        const restoreSubmit = sendFailingWith(new Error(TRANSPORT_ERR), new Error('1010: Invalid Transaction: Custom error: 196'));
+        try {
+            const { entry, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            await expect(provider.submitTx(finalized)).rejects.toMatchObject({ name: 'SubmitOutcomeUnknownError', identifier: '0xtxid' });
+        } finally {
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
+    it('with resends disabled a send that died on the closing socket is an unknown outcome', async () => {
+        withIndexer(false);
+        const restore = withFastResend();
+        process.env.NIGHTGATE_SUBMIT_TRANSPORT_RETRIES = '0';
+        const restoreSubmit = sendFailingWith(new Error(TRANSPORT_ERR));
+        try {
+            const { entry, finalized } = makeEntry(DUST_OK);
+            (finalized as any).identifiers = () => ['0xtxid'];
+            const provider = workerExports.buildWorkerWalletProvider(entry);
+            await provider.balanceTx({});
+            const submitsBefore = submitCount();
+            await expect(provider.submitTx(finalized)).rejects.toMatchObject({ name: 'SubmitOutcomeUnknownError' });
+            expect(submitCount() - submitsBefore).toBe(1);
+        } finally {
+            restoreSubmit(); restore(); vi.unstubAllGlobals();
+        }
+    });
+
     it('a connect-phase failure (nothing sent) is resent up to NIGHTGATE_SUBMIT_TRANSPORT_RETRIES times', async () => {
         withIndexer(false);
         const restore = withFastResend();
@@ -3317,6 +3370,93 @@ describe('dedicated submit clients: settle window + closing-socket retry', () =>
     });
 });
 
+describe('dust backing stays reserved until the wallet lists the spend', () => {
+    const until = async (cond: () => boolean, ms: number): Promise<boolean> => {
+        const t0 = Date.now();
+        while (!cond() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 50));
+        return cond();
+    };
+    const callerTx = () => ({
+        intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+        feesWithMargin: () => 1_000n
+    });
+    const sponsorArgs = (sessionId: string) => ({
+        sponsorSessionId: sessionId, unboundTxB64: Buffer.from('caller-tx').toString('base64'), networkId: 'preprod',
+        allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest']
+    });
+
+    it('the backing of a landed sponsored spend is released once its spent note is gone', async () => {
+        const SESSION = 'session-sponsor-unbound-hold01';
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        const { held } = workerExports.__noteLeaseForTests;
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            let notes = [{ token: { backingNight: 'backing-H', nonce: 'note-1' }, generatedNow: 10n ** 9n }];
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => notes } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(callerTx);
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-hold'] }) }) })
+            }));
+            const reply = await rpc('sponsorUnboundTx', sponsorArgs(SESSION));
+            expect(reply.ok).toBe(true);
+            // Landed, but the wallet still lists the spent note: the backing stays reserved.
+            await new Promise((r) => setTimeout(r, 200));
+            expect(held(`${SESSION}|backing-H`)).toBeDefined();
+            // The sync applied the spend: a new note replaces the spent one and the backing is free again.
+            notes = [{ token: { backingNight: 'backing-H', nonce: 'note-2' }, generatedNow: 10n ** 9n }];
+            expect(await until(() => held(`${SESSION}|backing-H`) === undefined, 3_000)).toBe(true);
+        } finally {
+            vi.unstubAllGlobals();
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            await rpc('evict', { sessionId: SESSION });
+        }
+    }, 15_000);
+
+    it('a pre-mempool reject frees the backing at once', async () => {
+        const SESSION = 'session-sponsor-unbound-hold02';
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        const { held } = workerExports.__noteLeaseForTests;
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-R', nonce: 'note-1' }, generatedNow: 10n ** 9n }] } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            ledgerTx.deserialize.mockImplementation(callerTx);
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-reject'] }) }) })
+            }));
+            const restoreSubmit = withSubmit(async () => { throw new Error('1010: Invalid Transaction: Custom error: 196'); });
+            try {
+                const reply = await rpc('sponsorUnboundTx', sponsorArgs(SESSION));
+                expect(reply.ok).toBe(false);
+                expect(held(`${SESSION}|backing-R`)).toBeUndefined();
+            } finally {
+                restoreSubmit();
+            }
+        } finally {
+            vi.unstubAllGlobals();
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            await rpc('evict', { sessionId: SESSION });
+        }
+    });
+});
+
 // ---- lease ownership + client-pool cap --------------------------------------
 
 describe('dust backing lease ownership', () => {
@@ -3325,19 +3465,24 @@ describe('dust backing lease ownership', () => {
 
     it('a lease that outlived its TTL can be taken over; the late finisher does not release the new holder', async () => {
         const { tryLockBacking, releaseNote, held } = workerExports.__noteLeaseForTests;
-        const a = tryLockBacking('sess', notes, 1n, 10); // job A, 10 ms TTL (slow prove/submit)
-        expect(a).toBeTruthy();
-        expect(tryLockBacking('sess', notes, 1n, 60_000)).toBeNull(); // still held
-        await new Promise((r) => setTimeout(r, 25));
-        const b = tryLockBacking('sess', notes, 1n, 60_000); // job B takes the expired lease over
-        expect(b).toBeTruthy();
-        expect(b.token).not.toBe(a.token);
-        releaseNote(a.key, a.token); // job A finishes late: must NOT free B's lock
-        expect(held(a.key)?.token).toBe(b.token);
-        expect(tryLockBacking('sess', notes, 1n, 60_000)).toBeNull(); // a third job still waits
-        releaseNote(b.key, b.token); // the real holder frees it
-        expect(held(b.key)).toBeUndefined();
-        expect(tryLockBacking('sess', notes, 1n, 60_000)).toBeTruthy();
+        vi.useFakeTimers();
+        try {
+            const a = tryLockBacking('sess', notes, 1n, 10); // job A, 10 ms TTL (slow prove/submit)
+            expect(a).toBeTruthy();
+            expect(tryLockBacking('sess', notes, 1n, 60_000)).toBeNull(); // still held
+            vi.advanceTimersByTime(25);
+            const b = tryLockBacking('sess', notes, 1n, 60_000); // job B takes the expired lease over
+            expect(b).toBeTruthy();
+            expect(b.token).not.toBe(a.token);
+            releaseNote(a.key, a.token); // job A finishes late: must NOT free B's lock
+            expect(held(a.key)?.token).toBe(b.token);
+            expect(tryLockBacking('sess', notes, 1n, 60_000)).toBeNull(); // a third job still waits
+            releaseNote(b.key, b.token); // the real holder frees it
+            expect(held(b.key)).toBeUndefined();
+            expect(tryLockBacking('sess', notes, 1n, 60_000)).toBeTruthy();
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it('a plain release by the holder frees the backing', () => {

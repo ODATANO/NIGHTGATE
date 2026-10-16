@@ -14,7 +14,7 @@ import { blake2b256Hex } from '../hashing';
 import { HOLDER_REGISTRY_REF, holderClaimKey } from '../holder-registry';
 import { readHolderRegistrationInWorker } from '../../midnight/decode-worker-client';
 import { liveProviderConfigured, contractProvidersConfigFromEnv } from '../verify-state';
-import { disclosureRateLimiter, holderClaimRateLimiter, checkRate, runSubmission } from './common';
+import { checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
 import { claimDisclosure, grantDisclosureToHolders, revokeHolderDisclosure } from '#cds-models/NightgateService';
@@ -75,7 +75,7 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
             if (ms - Date.now() > MAX_EXPIRY_MS) return req.reject(400, 'expiresAt: at most one year ahead');
             expiry = new Date(ms).toISOString();
         }
-        if (!checkRate(disclosureRateLimiter, 'disclosure', req)) return;
+        if (!checkRate('prove', req.agentGrant?.sessionId ?? 'prove', req)) return;
 
         return runSubmission(req, async () => {
             const grantorUserId = String(req.user?.id ?? 'anonymous');
@@ -120,7 +120,7 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
         const claimSecret = hex64(data.claimSecret);
         if (!claimSecret) return req.reject(400, 'claimSecret is required');
         if (!liveProviderConfigured()) return req.reject(503, 'no live indexer configured to read the holder registry');
-        if (!checkRate(holderClaimRateLimiter, 'holder-claim', req)) return;
+        if (!checkRate('compute', 'compute', req)) return;
 
         return runSubmission(req, async () => {
             const grants: HolderDisclosureGrant[] = await db.run(SELECT.from(HolderDisclosureGrants).where({ payloadHash, tokenType, active: true })) ?? [];

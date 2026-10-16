@@ -25,6 +25,7 @@ import { listWalletFacades } from '../submission/wallet-facade-builder';
 import { readRuntimeState, readPrewarmState } from '../utils/runtime-state';
 import { configMs } from '../utils/config';
 import { eventLoopLagGauges } from './event-loop';
+import { rateLimitedTotals } from '../utils/rate-classes';
 import { absorbedCrawlerFaults } from '../crawler/crawler-fault-guard';
 import type { DbRunner } from '../utils/db-types';
 import type { getReadiness, getRuntimeInfo } from '#cds-models/NightgateIndexerService';
@@ -322,6 +323,10 @@ export async function buildMetricsText(db: DbRunner): Promise<string> {
     lines.push(`# TYPE ${metricPrefix}_wallet_worker_rotations counter`);
     lines.push(`${metricPrefix}_wallet_worker_rotations ${worker.rotationCount ?? 0}`);
 
+    lines.push(`# HELP ${metricPrefix}_rate_limited_total Requests answered 429 since process start, by limit`);
+    lines.push(`# TYPE ${metricPrefix}_rate_limited_total counter`);
+    for (const [name, count] of rateLimitedTotals()) lines.push(`${metricPrefix}_rate_limited_total{limit="${name}"} ${count}`);
+
     const decode = getDecodeWorkerStatus();
     lines.push(`# HELP ${metricPrefix}_decode_worker_running Decode worker thread alive (1=running, 0=not running)`);
     lines.push(`# TYPE ${metricPrefix}_decode_worker_running gauge`);
@@ -451,6 +456,9 @@ export function buildWorkerStatus(isAdmin = false): Record<string, unknown> {
         lastExitCode: worker.lastExitCode,
         lastExitAt: worker.lastExitAt,
         rpcTimeoutMs: worker.rpcTimeoutMs,
+        pool: worker.pool ?? null,
+        // Wallet keys stay admin only, like the facade list below.
+        workers: (worker.workers ?? []).map(w => ({ id: w.id, running: w.running, inFlightRpcs: w.inFlightRpcs, facadeCount: w.facades.length, ...(isAdmin ? { facades: w.facades } : {}) })),
         facadeCount: facades.length,
         // Admin only. The sessionId here is derived from the wallet and stays the same across sessions,
         // so the list would reveal which wallets this server holds.

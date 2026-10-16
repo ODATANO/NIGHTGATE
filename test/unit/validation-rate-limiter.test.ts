@@ -26,7 +26,7 @@ describe('RateLimiter', () => {
         const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 1 });
 
         nowSpy.mockReturnValue(1000);
-        expect(limiter.check('client-1')).toEqual({ allowed: true, retryAfterMs: 0 });
+        expect(limiter.check('client-1')).toMatchObject({ allowed: true, retryAfterMs: 0 });
         expect((limiter as any).hits.get('client-1')).toEqual([1000]);
     });
 
@@ -35,7 +35,7 @@ describe('RateLimiter', () => {
 
         (limiter as any).hits.set('client-1', [1000]);
         nowSpy.mockReturnValue(1500);
-        expect(limiter.check('client-1')).toEqual({ allowed: false, retryAfterMs: 500 });
+        expect(limiter.check('client-1')).toMatchObject({ allowed: false, retryAfterMs: 500 });
     });
 
     it('sorts multiple in-window timestamps before calculating retryAfter', () => {
@@ -43,7 +43,7 @@ describe('RateLimiter', () => {
 
         (limiter as any).hits.set('client-1', [1500, 1000]);
         nowSpy.mockReturnValue(1600);
-        expect(limiter.check('client-1')).toEqual({ allowed: false, retryAfterMs: 400 });
+        expect(limiter.check('client-1')).toMatchObject({ allowed: false, retryAfterMs: 400 });
         expect((limiter as any).hits.get('client-1')).toEqual([1000, 1500]);
     });
 
@@ -52,7 +52,7 @@ describe('RateLimiter', () => {
 
         (limiter as any).hits.set('client-3', [1000, 1500]);
         nowSpy.mockReturnValue(1700);
-        expect(limiter.check('client-3')).toEqual({ allowed: true, retryAfterMs: 0 });
+        expect(limiter.check('client-3')).toMatchObject({ allowed: true, retryAfterMs: 0 });
         expect((limiter as any).hits.get('client-3')).toEqual([1000, 1500, 1700]);
     });
 
@@ -60,10 +60,10 @@ describe('RateLimiter', () => {
         const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 1 });
 
         nowSpy.mockReturnValue(1000);
-        expect(limiter.check('client-2')).toEqual({ allowed: true, retryAfterMs: 0 });
+        expect(limiter.check('client-2')).toMatchObject({ allowed: true, retryAfterMs: 0 });
 
         nowSpy.mockReturnValue(2200);
-        expect(limiter.check('client-2')).toEqual({ allowed: true, retryAfterMs: 0 });
+        expect(limiter.check('client-2')).toMatchObject({ allowed: true, retryAfterMs: 0 });
     });
 });
 
@@ -81,7 +81,7 @@ describe('RateLimiter.checkMany (all-or-nothing batch consume)', () => {
     it('consumes N slots atomically when they fit', () => {
         const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 10 });
         nowSpy.mockReturnValue(1000);
-        expect(limiter.checkMany('k', 8)).toEqual({ allowed: true, retryAfterMs: 0 });
+        expect(limiter.checkMany('k', 8)).toMatchObject({ allowed: true, retryAfterMs: 0 });
         expect((limiter as any).hits.get('k')).toHaveLength(8);
     });
 
@@ -111,16 +111,16 @@ describe('RateLimiter.checkMany (all-or-nothing batch consume)', () => {
 
     it('count <= 0 is a no-op success', () => {
         const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 1 });
-        expect(limiter.checkMany('k', 0)).toEqual({ allowed: true, retryAfterMs: 0 });
+        expect(limiter.checkMany('k', 0)).toMatchObject({ allowed: true, retryAfterMs: 0 });
         expect((limiter as any).hits.get('k')).toBeUndefined();
     });
 
     it('check() delegates to checkMany(key, 1) with identical single-slot semantics', () => {
         const limiter = new RateLimiter({ windowMs: 1000, maxRequests: 1 });
         nowSpy.mockReturnValue(1000);
-        expect(limiter.check('k')).toEqual({ allowed: true, retryAfterMs: 0 });
+        expect(limiter.check('k')).toMatchObject({ allowed: true, retryAfterMs: 0 });
         nowSpy.mockReturnValue(1500);
-        expect(limiter.check('k')).toEqual({ allowed: false, retryAfterMs: 500 });
+        expect(limiter.check('k')).toMatchObject({ allowed: false, retryAfterMs: 500 });
     });
 });
 

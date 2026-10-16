@@ -19,11 +19,11 @@ import { artifactAssetPath } from './artifacts';
 import { buildWorkerContractProviders, getOrCompileContract, withFindContractQueryCache } from './contracts';
 import { createPrivateStateProxy } from './private-state';
 import { BALANCE_SYNC_TIMEOUT_MS, getIndexerTip, waitForGenuineSync, withSessionLocks } from './facades';
-import { announceSubmitIntent, buildBuildOnlyWalletProvider, captureDustSnapshot, revertRecipeBestEffort, submitOnDedicatedClient, submitWithDustGuard } from './submit';
+import { announceSubmitIntent, buildBuildOnlyWalletProvider, captureDustSnapshot, isNothingSent, isPreMempoolReject, revertRecipeBestEffort, submitOnDedicatedClient, submitWithDustGuard } from './submit';
 import { HEX64_RE } from '../../utils/hex-patterns';
 
 /** Reads a caller tx from base64, bound or not yet bound. */
-export async function deserializeFinalizedTx(b64: string): Promise<{ tx: any; bytes: Uint8Array }> {
+export async function deserializeFinalizedTx(b64: string): Promise<{ tx: any; bytes: Uint8Array; bound: boolean }> {
     const bytes = new Uint8Array(Buffer.from(b64, 'base64'));
     const ledger: any = await loadLedger();
     const attempts: Array<[string, string, string]> = [
@@ -32,11 +32,23 @@ export async function deserializeFinalizedTx(b64: string): Promise<{ tx: any; by
     ];
     const errs: string[] = [];
     for (const [s, p, b] of attempts) {
-        try { const tx = ledger.Transaction.deserialize(s, p, b, bytes); if (tx) return { tx, bytes }; }
+        try { const tx = ledger.Transaction.deserialize(s, p, b, bytes); if (tx) return { tx, bytes, bound: b === 'binding' }; }
         catch (e) { errs.push(`(${s},${p},${b}): ${formatErr(e).slice(0, 300)}`); }
     }
     // The counts let a caller compare with what it sent: base64 characters lost in transit show up here.
     throw new Error(`could not deserialize the caller transaction (${b64.length} base64 characters, ${bytes.length} bytes decoded); tried ${errs.join(' | ')}`);
+}
+
+/** The request-path check of caller bytes: refuses what the executor could not deserialize, before a job exists. */
+export async function describeTransaction(args: { txB64: string }): Promise<{ bytes: number; bound: boolean }> {
+    const b64 = String(args.txB64 ?? '');
+    if (Buffer.from(b64, 'base64').length === 0) throw new SponsorRefusalError('refusing to sponsor: the transaction is empty');
+    try {
+        const { bytes, bound } = await deserializeFinalizedTx(b64);
+        return { bytes: bytes.length, bound };
+    } catch (e) {
+        throw new SponsorRefusalError(`refusing to sponsor: not a proven transaction (${formatErr(e).slice(0, 200)})`);
+    }
 }
 
 export function inspectTxCalls(tx: any): Array<{ address: string; entryPoint: string }> {
@@ -514,7 +526,30 @@ export function keepLeaseAlive(key: string, token: number, ttlMs: number): () =>
 export function noteLeaseTtlMs(): number {
     return configMs('NIGHTGATE_NOTE_LEASE_MS');
 }
-export const __noteLeaseForTests = { tryLockBacking, sufficientNoteOnBacking, releaseNote, keepLeaseAlive, noteLeaseTtlMs, held: (key: string) => noteLocks.get(key), reset: () => noteLocks.clear() };
+/**
+ * Keeps a backing reserved after the send until the dust wallet drops the spent note, else the next spend on it would reuse that note (1010/196).
+ */
+export async function releaseBackingWhenSpent(sponsor: FacadeEntry, leased: any, spentNonce: string | undefined, stopRenewal: () => void): Promise<void> {
+    const waitMs = configMs('NIGHTGATE_NOTE_SPENT_WAIT_MS');
+    const t0 = Date.now();
+    try {
+        let listed = spentNonce !== undefined && waitMs > 0;
+        while (listed && Date.now() - t0 < waitMs && facades.get(sponsor.sessionId) === sponsor) {
+            const dws: any = await firstDustState(sponsor.facade.dust);
+            const coins: any[] = Array.from(dws.capabilities.coinsAndBalances.getAvailableCoins(dws.state, new Date()));
+            listed = coins.some((n) => String(n?.token?.nonce) === spentNonce);
+            if (listed) await new Promise((r) => setTimeout(r, 1000).unref?.());
+        }
+        if (listed) log('warn', `backing ${leased.backing} released after ${Date.now() - t0}ms although the dust wallet still lists the spent note`);
+        else if (spentNonce !== undefined) log('debug', `backing ${leased.backing} released: spent note gone after ${Date.now() - t0}ms`);
+    } catch (e) {
+        log('warn', `backing ${leased.backing} released without the spent-note check: ${formatErr(e)}`);
+    } finally {
+        stopRenewal();
+        releaseNote(leased.key, leased.token);
+    }
+}
+export const __noteLeaseForTests = { tryLockBacking, sufficientNoteOnBacking, releaseNote, keepLeaseAlive, noteLeaseTtlMs, releaseBackingWhenSpent, held: (key: string) => noteLocks.get(key), reset: () => noteLocks.clear() };
 
 /** The sponsor adds the dust fee to a tx the caller finalized and sends it. */
 export async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated: any, site: string, replyPort?: MessagePort, calls?: Array<{ address: string; entryPoint: string }>, minted: string[] = []): Promise<string> {
@@ -654,7 +689,7 @@ export function freeSegmentId(tx: any): number {
 /** Builds the dust spend on the reserved backing. Runs under the wallet's session lock. */
 async function buildDustSpend(
     sponsor: FacadeEntry, networkId: string, sdk: any, leased: any, needSpecks: bigint, ctime: Date, ttl: Date, segment: number
-): Promise<{ dustUnproven: any }> {
+): Promise<{ dustUnproven: any; spentNonce: string | undefined }> {
     const CoreWalletApi = await loadDustCoreWallet();
     return withSessionLocks([sponsor.sessionId], async () => {
         if (facades.get(sponsor.sessionId) !== sponsor) {
@@ -673,7 +708,8 @@ async function buildDustSpend(
         const intent = sdk.ledger.Intent.new(ttl);
         intent.dustActions = new sdk.ledger.DustActions('signature', 'pre-proof', ctime, [spends[0]]);
         const dustUnproven = sdk.ledger.Transaction.fromParts(networkId).addIntent({ tag: 'specific', value: segment }, intent);
-        return { dustUnproven };
+        const nonce = note?.token?.nonce;
+        return { dustUnproven, spentNonce: nonce === undefined || nonce === null ? undefined : String(nonce) };
     });
 }
 
@@ -755,7 +791,7 @@ export async function sponsorUnboundTx(args: {
     };
     const shortBackings = new Set<string>();
     let leased: any;
-    let built: { dustUnproven: any } | undefined;
+    let built: { dustUnproven: any; spentNonce: string | undefined } | undefined;
     let stopRenewal: () => void = () => undefined;
     for (let attempt = 0; ; attempt++) {
         leased = await acquireBacking(sponsor.sessionId, () => snapshotNotes(ctime), needSpecks, leaseTtlMs, backingWaitMs, shortBackings);
@@ -774,6 +810,9 @@ export async function sponsorUnboundTx(args: {
         }
     }
 
+    // Once the tx went out, the backing stays reserved until the wallet lists the spend.
+    // Only a tx the node surely never took frees it at once.
+    let sent = false;
     try {
         const tProve = Date.now();
         let provingService: any = sponsor.facade?.provingService;
@@ -794,6 +833,7 @@ export async function sponsorUnboundTx(args: {
             ...(minted.length ? { minted } : {}),
             ...(nullifiers.length ? { nullifiers } : {})
         });
+        sent = true;
         const txId = await submitOnDedicatedClient(sponsor, bound, 'sponsor-unbound-submit');
         log('info', `sponsorUnboundTx: LANDED txHash=${String(txId).slice(0, 16)} on backing ${leased.backing}`);
         return {
@@ -803,10 +843,13 @@ export async function sponsorUnboundTx(args: {
             ...(swap ? { swap } : {}),
             ...(nullifiers.length ? { nullifiers } : {})
         };
+    } catch (e) {
+        if (isPreMempoolReject(e) || isNothingSent(e)) sent = false;
+        throw e;
     } finally {
-        stopRenewal();
-        releaseNote(leased.key, leased.token);
+        if (sent) void releaseBackingWhenSpent(sponsor, leased, built!.spentNonce, stopRenewal);
+        else { stopRenewal(); releaseNote(leased.key, leased.token); }
     }
 }
 
-export const sponsorHandlers = { buildSponsorableTx, sponsorFinalizedTx, sponsorUnboundTx, describeSwapHalf };
+export const sponsorHandlers = { buildSponsorableTx, sponsorFinalizedTx, sponsorUnboundTx, describeSwapHalf, describeTransaction };

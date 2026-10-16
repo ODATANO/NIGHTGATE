@@ -84,13 +84,16 @@ export function getFacadeOrigin(cacheKey: string): FacadeOrigin | null {
 /** Saves in progress. A planned worker stop waits for them. */
 const savesInFlight = new Set<Promise<void>>();
 
-onWorkerGone(async (reason) => {
-    if (residentAccounts.size > 0) {
-        log.info(`worker ${reason}: dropping ${residentAccounts.size} facade residency claim(s)`);
-        residentAccounts.clear();
+onWorkerGone(async (reason, info) => {
+    // Wallets that never reported progress are unknown to the pool: then everything is dropped.
+    const known = info.facades.length > 0;
+    const dropped = known ? info.facades.filter(k => residentAccounts.has(k)) : [...residentAccounts];
+    if (dropped.length > 0) {
+        log.info(`worker ${info.workerId} ${reason}: dropping ${dropped.length} facade residency claim(s)`);
+        for (const k of dropped) residentAccounts.delete(k);
     }
     // Clear old entries, otherwise the next build would not record its own.
-    facadeOrigins.clear();
+    if (known) for (const k of info.facades) facadeOrigins.delete(k); else facadeOrigins.clear();
     if (reason === 'exit') {
         // Crash: keep the passphrases, since queued saves still need them and the worker cannot resend.
         return;

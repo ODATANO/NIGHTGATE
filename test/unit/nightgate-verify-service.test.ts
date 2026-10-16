@@ -22,7 +22,8 @@ vi.mock('../../srv/utils/nightgate-config', async () => {
     };
 });
 
-import { publicVerifyGate, __resetPublicVerifyLimiterForTests } from '../../srv/nightgate-verify-service';
+import { publicVerifyGate } from '../../srv/nightgate-verify-service';
+import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
 import { registerVerifyStateHandlers } from '../../srv/submission/verify-state';
 import { principalRateKey } from '../../srv/utils/rate-limiter';
 import { __resetConfigForTests } from '../../srv/utils/config';
@@ -48,7 +49,7 @@ beforeEach(() => {
     delete process.env.NIGHTGATE_PUBLIC_VERIFY;
     delete process.env.NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT;
     __resetConfigForTests();
-    __resetPublicVerifyLimiterForTests();
+    __resetRateLimitersForTests();
 });
 afterEach(() => {
     delete process.env.NIGHTGATE_PUBLIC_VERIFY;

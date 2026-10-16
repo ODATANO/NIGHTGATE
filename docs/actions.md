@@ -32,6 +32,47 @@ Every submit path broadcasts only after the transaction identifier is persisted 
 
 `chainStatus` (`null | pending | success | failure | dropped`) is the on-chain outcome, independent of `status`: `succeeded` with `failure` means the tx finalized but the call reverted; `dropped` means never included (rule above). The response also carries `submissionId`, `txHash`, `chainFinalizedAt` and lease/attempt/timestamp fields.
 
+## Rate limits
+
+Every limited call belongs to one rate class, named for the resource it
+protects. A class has a fixed window and one count. The count is
+`NIGHTGATE_<CLASS>_RATE_LIMIT`, or `rateLimits.<class>` in
+`NIGHTGATE_SPONSOR_POLICY_FILE`, which applies without a restart. The caller
+is the agent grant, else the user, else the client address.
+
+| Class | Window | Default | Counted per | Calls |
+|---|---|---|---|---|
+| `prove` | hour | 60 | caller and session | `submitContractCall`, `submitContractCallBatch`, `mintShieldedTestToken`, the `issue*` attestations (a batch counts its claims), `anchorDocument`, `registerPassport`, `retractAttestation`, `purgeExpired`, `grantDisclosure`, `revokeDisclosure`, `grantDisclosureToHolders`, `revokeHolderDisclosure`, `buildSponsorable` |
+| `deploy` | hour | 5 | caller and session | `deployContract` |
+| `sponsor` | hour | 120 | caller | `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorSwap`, `mintFactoryToken` |
+| `compute` | hour | 120 | caller | `prepareDocumentProof`, `prepareMembershipSet`, `claimDisclosure`, `postSwapOffer`, `retireSwapOffer`, `reindexDisclosures` (per contract) |
+| `read` | minute | 60 | caller | `listSwapOffers`, `getSwapOffer`, `getBoardStatus`, `getRuntimeInfo`, `getWalletBalance`, `getWalletSyncProgress`, `getSponsorPoolStatus`, `estimateSendNightFee` |
+| `wallet` | minute | 10 | caller | `connectWallet`, `sendNight`, `registerForDustGeneration`, `deregisterFromDustGeneration` |
+| `signing` | hour | 10 | caller | `connectWalletForSigning`, `deriveWalletInfo` (`NIGHTGATE_SIGNING_KEY_RATE_LIMIT`) |
+| `admin` | hour | 10 | caller | `createAgentGrant`, `createAgentGrants`, `updateAgentGrant`, `rotateAgentGrantToken`, `revokeAgentGrant` |
+| `public-verify` | minute | 60 | client address | the verify functions under `/api/v1/verify` |
+
+An agent grant adds its own budgets on top of the classes: `maxJobsPerHour`
+and `maxJobsPerDay` count the grant's allowlisted calls per UTC hour and UTC
+day, survive a restart, and give a unit back when the request fails with a
+4xx status (a rate class that refuses after the take included). `NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR` and
+`_PER_DAY` fill a budget the creation does not name.
+
+The three sponsor actions deserialize the caller's bytes before a job exists:
+input that is not a proven transaction answers 400 at once and takes no
+proving slot and no budget unit.
+
+Every answer under a limit carries `RateLimit-Policy` with the limits the
+request passed (`"prove";q=60;w=3600, "grant-hour";q=20;w=3600`) and
+`RateLimit` with the tightest one (`"grant-hour";r=3;t=1740`). A refusal is
+`429 RATE_LIMITED` with `Retry-After` and the limit in the message:
+`Rate limited (prove: 60 per hour). Retry after 58s`. Not on `$batch` parts.
+`getGrantUsage(...).limits` shows a grant's budgets and classes with what is
+left; `getMetrics()` counts refusals as `rate_limited_total{limit}`.
+
+Not a class: `ContractStates/stateAt` asks the indexer under one budget of 2
+per second for all callers (`indexer-budget`).
+
 ## Session lifecycle
 
 ### `connectWallet(viewingKey) → { sessionId, ID, connectedAt, expiresAt, isActive }`
@@ -43,7 +84,7 @@ Open a **read-only** session; the viewing key is stored AES-256-GCM encrypted.
 | `viewingKey` | String | 64 hex chars (the encryption public key of the wallet) |
 | `label` | String (optional) | Operator-facing name, at most 100 chars |
 
-**Rate limit:** 10/min per client IP.
+**Rate class:** `wallet`.
 
 ```bash
 curl -X POST http://localhost:4004/api/v1/nightgate/connectWallet \
@@ -66,7 +107,7 @@ Add **signing** to a read-only session: the BIP39 seed is stored encrypted, keys
 
 **Fail-closed:** 400 unless the seed at `accountIndex` derives the session's viewing key, so signer, session and on-chain attester id (`caller_id()`) are one account.
 
-**Rate limit:** 10/hour per client IP (default; override via `NIGHTGATE_SIGNING_KEY_RATE_LIMIT`). Shared with `deriveWalletInfo`.
+**Rate class:** `signing`.
 
 **Errors:** 400 (invalid mnemonic/seed/accountIndex, or seed does not derive the session's viewing key), 404 (no session), 410 (expired), 412 (already signing), 429 (rate-limited).
 
@@ -76,7 +117,7 @@ Close a session: nulls the encrypted keys, evicts the worker's wallet facade, pe
 
 ### `deriveWalletInfo(mnemonic | seedHex, accountIndex?) → { viewingKey, shieldedAddress, nightAddress, dustAddress, attesterId, accountIndex, network }`
 
-Derive `viewingKey` (input to `connectWallet`), addresses and `attesterId` from a mnemonic or seed without creating a session; nothing is stored or logged. Same derivation as `connectWalletForSigning` for the same `accountIndex` (default 0). `dustAddress` is a `dustReceiverAddress` for `registerForDustGeneration`. **Rate limit:** 10/hour per client IP (shared with `connectWalletForSigning`).
+Derive `viewingKey` (input to `connectWallet`), addresses and `attesterId` from a mnemonic or seed without creating a session; nothing is stored or logged. Same derivation as `connectWalletForSigning` for the same `accountIndex` (default 0). `dustAddress` is a `dustReceiverAddress` for `registerForDustGeneration`. **Rate class:** `signing`.
 
 `attesterId` is the vault's `caller_id()` for this wallet, network-independent. Pass it as `registerPassport`'s `ownerId` to register a document id for a wallet before its first transaction.
 
@@ -95,7 +136,7 @@ Send NIGHT (or `tokenTypeHex`) to a Midnight address. The Bech32m prefix picks t
 | `tokenTypeHex` | String (optional) | Raw token type (64 hex) instead of NIGHT; the receiver prefix picks shielded or unshielded holdings |
 | `idempotencyKey` | String (optional) | Dedupes retries against the original job |
 
-**Rate limit:** 10/min per client IP.
+**Rate class:** `wallet`.
 
 **Errors:**
 - 400 - invalid address prefix, malformed amount, TTL in past
@@ -148,7 +189,7 @@ Deploy a contract registered via `cds.requires.nightgate.contracts.<ref>` or `re
 | `idempotencyKey` | String (optional) | Dedupes retries; a reused key returns the existing `jobId` |
 | `recoveryId` | String (optional) | Vault family only: 64-hex attester id that may re-point the registrar (`registerPassport` modes 3 and 4). The registrar is the deploy session's attester id. Absent = no recovery; a lost registrar key then locks the id registry for good. |
 
-**Rate limit:** 5/hour per session.
+**Rate class:** `deploy`.
 
 **Errors:**
 - 400 - `Wallet.InsufficientFunds` (insufficient dust), `OnChainStatus:FailEntirely`, `MalformedResult`
@@ -170,7 +211,7 @@ Invoke a circuit on a deployed contract. Job result: `{ submissionId, txHash, co
 | `initialPrivateState` | LargeString (optional) | JSON; seeded only on this wallet's first contact with the contract, never overwrites |
 | `sponsorSessionId` | UUID (optional) | Second session that pays the dust fee. See **Per-tx fee sponsoring** below |
 
-**Rate limit:** 30/min per session.
+**Rate class:** `prove`.
 
 ### `submitContractCallBatch(contractAddress, calls, compiledArtifactRef, sessionId, idempotencyKey?, initialPrivateState?, sponsorSessionId?, independentCalls?) → { jobId, status }`
 
@@ -231,7 +272,7 @@ Job result: `{ submissionId, txHash, contractAddress, circuits, status }`, one
 | `sponsorSessionId` | UUID (optional) | Second session pays the dust fee once for the whole batch. See **Per-tx fee sponsoring** |
 | `independentCalls` | Boolean (optional) | Calls share no state: order by execution stage instead of call order |
 
-**Rate limit:** 30/min per session (shared with `submitContractCall`).
+**Rate class:** `prove`.
 
 #### Per-tx fee sponsoring (`sponsorSessionId`)
 
@@ -346,18 +387,14 @@ side: [txbuilder.md](txbuilder.md).
 Phase 1 on the server: build, prove, sign and finalize ONE call without
 submitting. Job result `{ finalizedTxB64, serializedBytes }` (~5 KB base64 for
 a vault call); no dust spent. The txbuilder SDK does the same locally.
-**Rate limit:** 30/hour per session.
-
-Session-scoped rate limits are keyed by principal and session
-(`<agent grant or user>:<sessionId>`).
+**Rate class:** `prove`.
 
 ### `sponsorFinalizedTransaction(finalizedTxB64, idempotencyKey?) → { jobId, status, sessionId }`
 
 Phase 2: check the sponsor policy, balance dust, submit. The request names no
 payer: the platform pool pays, or the wallet session the caller's grant is
 pinned to. Poll `getJobStatus` with the returned `sessionId`. Job result
-`{ txHash, circuits, contractAddress }`. **Rate limit:** 120/hour per
-principal, shared with `sponsorUnboundTransaction`.
+`{ txHash, circuits, contractAddress }`. **Rate class:** `sponsor`.
 
 The policy is a fail-closed shape check: allow-listed contract calls and
 nothing else. A deploy, an unshielded transfer, a zswap offer, caller-side dust
@@ -458,22 +495,24 @@ reach this endpoint can make you pay fees.
   on one session and returns every token once (`grants[{ grantId, token,
   agentLabel }]`); `labels` names them (exactly `count`), else
   `<agentLabel | 'agent'>-1..n`. Same checks, policy and rate limit as
-  `createAgentGrant`; `maxJobsPerDay` and `maxDeploys` apply per grant.
+  `createAgentGrant`; `maxJobsPerHour`, `maxJobsPerDay` and `maxDeploys` apply
+  per grant.
 - **Grant administration.** `updateAgentGrant(grantId, ...)` changes only the
-  given parameters; `null` clears `maxJobsPerDay`, `validUntil`, `agentLabel`
-  and the allow-lists; `sessionId`, `sponsorSessionId` and the token are
-  immutable; `maxDeploys` >= deploys used; a new `maxJobsPerDay` applies to
-  the current UTC day. `rotateAgentGrantToken(grantId)` returns a new token
+  given parameters; `null` clears `maxJobsPerHour`, `maxJobsPerDay`,
+  `validUntil`, `agentLabel` and the allow-lists; `sessionId`,
+  `sponsorSessionId` and the token are immutable; `maxDeploys` >= deploys
+  used; a new budget applies to the current window. `rotateAgentGrantToken(grantId)` returns a new token
   once; the old one is 401 from the next request; budgets and
   `deployedContracts` stay. Both owner-scoped (foreign 404; revoked: update
-  `409 GRANT_REVOKED`, rotate 404), never grantable, rate limit shared with
-  create/revoke (`NIGHTGATE_GRANT_ADMIN_RATE_LIMIT`, default 10/hour per
-  principal).
+  `409 GRANT_REVOKED`, rotate 404), never grantable, rate class `admin`.
 - **Usage per grant.** Jobs under a token carry `BackgroundJobs.grantId`
-  (inherited by child jobs). `getGrantUsage(grantId, since?, until?)` returns
-  jobs by kind and status, `landed`, `failed`, deploy and daily budgets, and
-  `dustPaid` (indexed DUST fees; null without the crawler). Default window 30
-  days up to now, max 366. Owner-scoped; a token reads only its own grant.
+  (inherited by child jobs). `getGrantUsage(grantId?, since?, until?)` returns
+  jobs by kind and status, `landed`, `failed`, deploy and daily budgets,
+  `dustPaid` (indexed DUST fees; null without the crawler) and `limits`: the
+  hour and day budgets as `{ max, used, resetsAt }` and the rate classes the
+  grant can reach as `{ name, windowSeconds, max, remaining }`. Default window
+  30 days up to now, max 366. Owner-scoped; a token reads only its own grant
+  and may leave `grantId` empty.
 
 **Pool + failover.** `NIGHTGATE_FEE_SPONSOR_SESSION` sessions form a lease
 pool: one in-flight dust spend per wallet, callers wait up to
@@ -499,12 +538,13 @@ tx from txbuilder `buildSponsorable({ bind: false })`, applies the same shape
 check, allow-list, pool, grant and idempotency rules, locks one free dust
 backing of the sponsor, proves a dust-only spend, merges, binds and submits.
 Job result `{ txHash, circuits, contractAddress, note }` (`note` = backing
-used). **Rate limit:** 120/hour per principal, shared with
-`sponsorFinalizedTransaction`.
+used). **Rate class:** `sponsor`.
 
 Parallelism: only the dust build is serialized per wallet; one wallet sponsors
 as many transactions at once as it has distinct registered dust backings.
 Same-backing requests wait up to `NIGHTGATE_BACKING_WAIT_MS` (default 5 min).
+A backing stays reserved after its spend went out until the sponsor wallet no
+longer lists the spent note (`NIGHTGATE_NOTE_SPENT_WAIT_MS`, default 30 s).
 A lost dust race (`1010/170`, `1010/171`, `1010/196`) is rebuilt on the same sponsor
 (`NIGHTGATE_SPONSOR_DUST_RETRIES`, default 4; `NIGHTGATE_SPONSOR_DUST_BACKOFF_MS`,
 default 5000). Job concurrency: `cds.requires.nightgate.jobs.concurrency.heavy`
@@ -514,7 +554,9 @@ for finality).
 Submit timeouts per phase, for every submit (bound and unbound; each goes
 out on its own node client, never on the wallet's shared socket): connect
 (`NIGHTGATE_SUBMIT_CONNECT_TIMEOUT_MS`, 20 s; nothing sent, resent on a fresh
-client up to `NIGHTGATE_SUBMIT_TRANSPORT_RETRIES` times), request
+client up to `NIGHTGATE_SUBMIT_TRANSPORT_RETRIES` times; a send that died on
+the client's closing socket is resent the same way, and a resend the node
+refuses is looked up on the indexer, never rebuilt), request
 (`NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS`, 30 s; ambiguous, `no-reply`), watch
 until InBlock (`NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS`, 75 s; ambiguous). Logged as
 `submit-phases <site> <identifier> ...`; a timed-out attempt keeps listening
@@ -562,7 +604,7 @@ both halves, merges them, adds the dust spend and submits on the unbound
 channel. Job result
 `{ txHash, circuits: ["<swap>"], note, swap: { gives: { tokenType, amount },
 wants: { tokenType, amount } } }`, from the maker's side, amounts in atoms.
-**Rate limit:** 120/hour per principal, shared with the other sponsor actions.
+**Rate class:** `sponsor`.
 
 Off by default: `NIGHTGATE_SPONSOR_ALLOW_SWAPS` (policy file `allowSwaps`)
 opens it, and a token caller needs `sponsorSwap` in its grant's
@@ -582,7 +624,7 @@ What the check cannot see: the token types of the coins themselves (only a
 half's net change shows a type) and who owns them. A swap against an amount of
 1 is a transfer in effect and one party can build both halves, so an open swap
 right makes the sponsor a fee-free relay for the listed types, bounded by the
-rate limit and the grant's `maxJobsPerDay`. The sponsor pays dust only; it
+rate class and the grant's budgets. The sponsor pays dust only; it
 never adds or removes value.
 
 An offer fills once: the first transaction that lands spends the maker's coin,
@@ -625,7 +667,7 @@ SWAP_OFFER_INVALID`). `expiresAt` at most 90 days ahead; `tags` a JSON array of
 up to 8 strings of up to 40 characters. The offer closes when one of its input
 nullifiers lands in a sponsored swap (`filled`), when `expiresAt` passes
 (`expired`), or when the poster retires it. Grantable (`postSwapOffer`), also
-for a platform-pool grant. **Rate limit:** 60/hour per principal.
+for a platform-pool grant. **Rate class:** `compute`.
 
 ### `listSwapOffers(givesType?, wantsType?, tag?, limit?, status?, since?, mine?) → [{ offerId, offer, bound, givesType, givesAmount, wantsType, wantsAmount, tags, expiresAt, postedAt, status, filledTxHash, closedAt, changedAt }]` (function)
 
@@ -637,14 +679,14 @@ Open offers, newest first; filters are exact (64-hex types), `limit` 1 to 200
 (an offer the clock ran out changed at `expiresAt`, stamped or not): polled
 with `status: 'all'` it is the board's change feed. `mine: true` narrows
 to the caller's own posts (a token: its grant's). Never the poster's identity
-or the half's nullifiers. `tags` is an array of strings. Every token may read the board; rate limit 600/hour
-per caller. Call it with all seven parameters, `null` for the unused ones:
+or the half's nullifiers. `tags` is an array of strings. Every token may read the board (rate class `read`).
+Call it with all seven parameters, `null` for the unused ones:
 `listSwapOffers(givesType=null,wantsType='…',tag=null,limit=20,status=null,since=null,mine=null)`.
 
 ### `getSwapOffer(offerId) → { offerId, offer, …, status, filledTxHash, closedAt, changedAt }` (function)
 
 One offer by id in the board's shape, open or closed; unknown id 404. Every
-token may read it; same rate limit as the list.
+token may read it (rate class `read`).
 
 ### `retireSwapOffer(offerId) → { offerId, status }`
 
@@ -657,7 +699,7 @@ Anchor a document hash in the vault with ONE `attest` transaction. Only the hash
 
 The record key `recordKey(attesterId, sha256)` is derived from the caller in-circuit: no other identity can pre-empt or take over the record, and another session's attest of the same hash is a separate record. Verifiers name it by both values or a bound document id. Job result `{ documentId, attestationId, attesterId, txHash, anchoredAt }`.
 
-**Rate limit:** 10/hour per session.
+**Rate class:** `prove`.
 
 ### `verifyDocument(documentId, providedSha256) → { verified, included, stateChecked, anchoredTxHash, anchoredAt, originalSha256 }` (function)
 
@@ -679,11 +721,11 @@ Canonical JSON (RFC 8785 order: keys sorted by UTF-16 code units, so `"10"` prec
 - `opening` (`{ saltSeed, slots[width] }`): store it with the document; losing the seed makes the root unprovable, leaking it makes leaf hashes dictionary-testable.
 - **Roots are bound to the artifact generation.** `contentRoot`, `schemaId`, membership set roots and every claim key derived from them use the circuit's `transientHash`, which is not guaranteed stable across compiler generations; `payloadHash` (blake2b outside the circuit) is. A vault compiled with a new compiler generation is a redeploy with an empty ledger: holders re-anchor from the stored `opening` and re-prove, older claims are not carried over. Verification of what is anchored today needs today's artifact, which ships with each release.
 
-**Rate limit:** 120/hour per client.
+**Rate class:** `compute`.
 
 ### `prepareMembershipSet(allowedValuesJson, value?, valueDigest?, compiledArtifactRef?) → { setRoot, memberCount, setSiblingsJson?, setDirsJson? }`
 
-Canonical depth-6 set root for `issueFieldMembershipAttestation` and `verifyPredicateState`: blake2b-256 each exact string, dedupe, sort ascending, pad to 64 by repeating the last member digest, leaf-wrap with the `setLeafHash` pure circuit. Padding repeats a real member so the padding value is never provable. More than 64 distinct values: 400. Without `value`/`valueDigest`: `{ setRoot, memberCount }`. With one: plus the inclusion path (`setSiblingsJson`/`setDirsJson`, witness); 400 if not a member. **Rate limit:** 120/hour per client (shared with `prepareDocumentProof`).
+Canonical depth-6 set root for `issueFieldMembershipAttestation` and `verifyPredicateState`: blake2b-256 each exact string, dedupe, sort ascending, pad to 64 by repeating the last member digest, leaf-wrap with the `setLeafHash` pure circuit. Padding repeats a real member so the padding value is never provable. More than 64 distinct values: 400. Without `value`/`valueDigest`: `{ setRoot, memberCount }`. With one: plus the inclusion path (`setSiblingsJson`/`setDirsJson`, witness); 400 if not a member. **Rate class:** `compute`.
 
 Outside a server: `import { buildMembershipSet, membershipPathFor, canonicalSetDigests, SET_DEPTH, MAX_SET_VALUES } from '@odatano/nightgate/set-root'` (no CAP, no Node builtins; takes the artifact's `setLeafHash`/`nodeHash` pure circuits; byte-identical roots).
 
@@ -709,7 +751,7 @@ The generation digest pins the manifest, not the key bytes: a fetch changes no r
 
 ### `issueFieldPredicateAttestation(payloadHash, attesterId?, fieldKey, value, fieldSalt, predicate, threshold, sessionId, contractAddress, contentRoot?, schemaId?, siblingsJson?, dirsJson?, unit?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-Prove the scaled integer `value` at `fieldKey` against `threshold` (`proveFieldPredicate`, Merkle inclusion in the anchored content root). A given `contentRoot` is anchored first (`anchorContentRoot`, requires `schemaId`). `value` stays witness, never persisted; `value` must fit Uint<64>, `threshold` is recorded and stays at most 9223372036854775807 (2^63 - 1). `siblingsJson`/`dirsJson`: inclusion path of depth log2(width) (4 × 64-hex siblings and 4 booleans at width 16, 5 at 32). Job result `{ predicateAttestationId, payloadHash, claim, proof }`. **Rate limit:** 10/hour per session.
+Prove the scaled integer `value` at `fieldKey` against `threshold` (`proveFieldPredicate`, Merkle inclusion in the anchored content root). A given `contentRoot` is anchored first (`anchorContentRoot`, requires `schemaId`). `value` stays witness, never persisted; `value` must fit Uint<64>, `threshold` is recorded and stays at most 9223372036854775807 (2^63 - 1). `siblingsJson`/`dirsJson`: inclusion path of depth log2(width) (4 × 64-hex siblings and 4 booleans at width 16, 5 at 32). Job result `{ predicateAttestationId, payloadHash, claim, proof }`. **Rate class:** `prove`.
 
 ### `issueFieldPredicateAttestationBatch(payloadHash, attesterId?, claimsJson, sessionId, contractAddress, contentRoot?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, claims, droppedDuplicates }`
 
@@ -721,23 +763,23 @@ Prove up to 8 claims on ONE payload in ONE transaction (one balancing, submit, c
 - integrity: `{ predicate: 'documentIntegrity', payloadHashB, attesterIdB?, allowedMask, schema, openingA, openingB }`
 - diff: `{ predicate: 'documentDiff', payloadHashB, attesterIdB?, k, schema, openingA, openingB }`
 
-Cross-root: document A is the batch `payloadHash`; an in-batch `contentRoot` is A's root, B's must already be anchored. A given `contentRoot` (with `schemaId`) is anchored as the first call and takes one of the 8 slots. Exact duplicate claims are dropped (`droppedDuplicates`). One `PredicateAttestations` row per claim, one shared `provenTxHash`; `claims` is a JSON array of `{ predicateAttestationId, fieldKey, predicate, ... }`. Proofs run sequentially, one per claim. A false claim fails at local proving (nothing submitted); after submission `PARTIAL_SUCCESS` fails the job with `OnChainStatus:...`, so verify per claim with `verifyPredicateAttestation`. **Rate limit:** N claims against the shared 10/hour predicate budget.
+Cross-root: document A is the batch `payloadHash`; an in-batch `contentRoot` is A's root, B's must already be anchored. A given `contentRoot` (with `schemaId`) is anchored as the first call and takes one of the 8 slots. Exact duplicate claims are dropped (`droppedDuplicates`). One `PredicateAttestations` row per claim, one shared `provenTxHash`; `claims` is a JSON array of `{ predicateAttestationId, fieldKey, predicate, ... }`. Proofs run sequentially, one per claim. A false claim fails at local proving (nothing submitted); after submission `PARTIAL_SUCCESS` fails the job with `OnChainStatus:...`, so verify per claim with `verifyPredicateAttestation`. **Rate class:** `prove`, one count per claim.
 
 ### `issueFieldEqualityAttestation(payloadHash, attesterId?, fieldKey, expectedValue|expectedDigest, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblingsJson?, dirsJson?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-Prove the bytes field at `fieldKey` holds the value whose blake2b-256 digest is `expectedDigest` (`proveFieldEquality`). Pass one of `expectedValue` (exact string, no trimming) or `expectedDigest` (64 hex). The digest is public: authenticity, not confidentiality (a low-entropy value is guessable). The field must be `kind: 'bytes'` in `prepareDocumentProof`; path as on the numeric action; a given `contentRoot` is anchored first (requires `schemaId`). **Rate limit:** 10/hour per session (shared predicate budget).
+Prove the bytes field at `fieldKey` holds the value whose blake2b-256 digest is `expectedDigest` (`proveFieldEquality`). Pass one of `expectedValue` (exact string, no trimming) or `expectedDigest` (64 hex). The digest is public: authenticity, not confidentiality (a low-entropy value is guessable). The field must be `kind: 'bytes'` in `prepareDocumentProof`; path as on the numeric action; a given `contentRoot` is anchored first (requires `schemaId`). **Rate class:** `prove`.
 
 ### `issueFieldMembershipAttestation(payloadHash, attesterId?, fieldKey, value|valueDigest, allowedValuesJson | setRoot+setSiblingsJson+setDirsJson, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblingsJson?, dirsJson?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-Prove the hidden bytes value at `fieldKey` is one of a public allow-list of up to 64 values, without revealing which (`proveFieldMembership`; set rule: `prepareMembershipSet`). Pass one of `value` or `valueDigest` (64 hex; witness, never persisted), and either `allowedValuesJson` (400 before proving if the value is absent) or `setRoot` + `setSiblingsJson`/`setDirsJson` (6 × 64-hex siblings, 6 booleans). **Rate limit:** 10/hour per session (shared predicate budget).
+Prove the hidden bytes value at `fieldKey` is one of a public allow-list of up to 64 values, without revealing which (`proveFieldMembership`; set rule: `prepareMembershipSet`). Pass one of `value` or `valueDigest` (64 hex; witness, never persisted), and either `allowedValuesJson` (400 before proving if the value is absent) or `setRoot` + `setSiblingsJson`/`setDirsJson` (6 × 64-hex siblings, 6 booleans). **Rate class:** `prove`.
 
 ### `issueDocumentIntegrityAttestation(payloadHashA, payloadHashB, attesterIdA?, attesterIdB?, allowedMask, schemaJson, openingAJson, openingBJson, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-Prove document B differs from A only in slots set in `allowedMask` (`proveDocumentComparison` mode 0; width bits, bit i = slot i may differ, 0 = identical; a mask constraining no real slot is rejected), values hidden. `schemaJson` is the shared descriptor list, `openingAJson`/`openingBJson` the openings (`schema`/`opening` from `prepareDocumentProof`); the circuit recomputes the schema root and both content roots, so a forged schema id fails the proof. Both documents must be anchored under the same `schemaId`. A change outside the mask fails at local proving. `payloadHashA != payloadHashB` (asserted in-circuit); (A, B) order is part of the claim key. `contentRootA`/`contentRootB` anchor first, one transaction each (the batch `documentIntegrity` kind does it in one). **Rate limit:** 10/hour per session (shared predicate budget).
+Prove document B differs from A only in slots set in `allowedMask` (`proveDocumentComparison` mode 0; width bits, bit i = slot i may differ, 0 = identical; a mask constraining no real slot is rejected), values hidden. `schemaJson` is the shared descriptor list, `openingAJson`/`openingBJson` the openings (`schema`/`opening` from `prepareDocumentProof`); the circuit recomputes the schema root and both content roots, so a forged schema id fails the proof. Both documents must be anchored under the same `schemaId`. A change outside the mask fails at local proving. `payloadHashA != payloadHashB` (asserted in-circuit); (A, B) order is part of the claim key. `contentRootA`/`contentRootB` anchor first, one transaction each (the batch `documentIntegrity` kind does it in one). **Rate class:** `prove`.
 
 ### `issueDocumentDiffAttestation(payloadHashA, payloadHashB, attesterIdA?, attesterIdB?, k, schemaJson, openingAJson, openingBJson, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-Prove at least `k` (1..width) aligned slots differ between two anchored documents, hiding which (`proveDocumentComparison` mode 1; k=1: provably not the same document). Witnesses as in the integrity mode, never persisted. A value or presence change counts; both-empty and padding slots do not. One descriptor list must fold to both anchored schema ids. Fewer than k differences fail at local proving. **Rate limit:** 10/hour per session (shared predicate budget).
+Prove at least `k` (1..width) aligned slots differ between two anchored documents, hiding which (`proveDocumentComparison` mode 1; k=1: provably not the same document). Witnesses as in the integrity mode, never persisted. A value or presence change counts; both-empty and padding slots do not. One descriptor list must fold to both anchored schema ids. Fewer than k differences fail at local proving. **Rate class:** `prove`.
 
 ### `verifyPredicateAttestation(predicateAttestationId) → { verified, included, stateChecked, predicate, threshold, unit, expectedDigest, setRoot, payloadHashB, allowedMask, provenTxHash, provenAt }` (function)
 
@@ -747,7 +789,7 @@ Prove at least `k` (1..width) aligned slots differ between two anchored document
 
 Read live contract state (`queryContractState`): no crawler, txHash or server row needed, e.g. for wallet-submitted transactions. Absent state or no live provider: `verified: false`, not a 5xx. `network` (e.g. `preview` | `preprod`) reads another network's public indexer (unknown: 400; endpoints via `cds.requires.nightgate.networks.<network>.*`).
 
-**Public lane.** `NIGHTGATE_PUBLIC_VERIFY=true` serves both functions without credentials at `/api/v1/verify` (`NightgateVerifyService`, same signatures and results): the image admits the path unauthenticated with CORS `*`; a CAP host serves it under `@requires: 'any'`. Off (default): `404 PUBLIC_VERIFY_DISABLED`. Rate limit `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` (default 60/min per client address). Nothing enumerable: every call needs contract, payload and claim coordinates. `verifyDocument` and `verifyPredicateAttestation` stay private (owner-scoped rows).
+**Public lane.** `NIGHTGATE_PUBLIC_VERIFY=true` serves both functions without credentials at `/api/v1/verify` (`NightgateVerifyService`, same signatures and results): the image admits the path unauthenticated with CORS `*`; a CAP host serves it under `@requires: 'any'`. Off (default): `404 PUBLIC_VERIFY_DISABLED`. Rate class `public-verify` (`NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT`, per client address). Nothing enumerable: every call needs contract, payload and claim coordinates. `verifyDocument` and `verifyPredicateAttestation` stay private (owner-scoped rows).
 
 **Independent verification:** everything these functions check is recomputable from public data: read the vault state from the public indexer, recompute the claim key (`persistentHash` over the tagged claim struct, e.g. bytes equality `{ tag 17, recordKey, contentRoot, schemaId, fieldKey, expectedDigest }` with `recordKey = persistentHash({ tag 21, attesterId, payloadHash })` and root and schema id from `content_anchors`), and look it up in `claims` (value: `valid_until` block time). The Compact source ships in `@odatano/contract-attestation-vault` under `src/`.
 
@@ -773,27 +815,27 @@ The vault's on-chain disclosure ACL (which grantee holds which tier of a record)
 
 ### `grantDisclosure(payloadHash, grantee, level, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, disclosureGrantId }`
 
-Grant `grantee` (64-hex `Bytes<32>`) a tier on the session's own record of the payload (`grantDisclosure` circuit); the caller must have attested it. The `DisclosureGrants` row is inserted at once (`active=false`) and set active once the chain reindex confirms the grant. Job result `{ disclosureGrantId, payloadHash, grantee, level, txHash }`. `compiledArtifactRef` defaults to `attestation-vault`. **Rate limit:** 30/hour per session.
+Grant `grantee` (64-hex `Bytes<32>`) a tier on the session's own record of the payload (`grantDisclosure` circuit); the caller must have attested it. The `DisclosureGrants` row is inserted at once (`active=false`) and set active once the chain reindex confirms the grant. Job result `{ disclosureGrantId, payloadHash, grantee, level, txHash }`. `compiledArtifactRef` defaults to `attestation-vault`. **Rate class:** `prove`.
 
 ### `revokeDisclosure(payloadHash, grantee, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
 
-Remove a grantee's entry on chain (`revokeDisclosure` circuit); attester-only. The `DisclosureGrants` row turns inactive. Job result `{ payloadHash, grantee, txHash }`. **Rate limit:** 30/hour per session.
+Remove a grantee's entry on chain (`revokeDisclosure` circuit); attester-only. The `DisclosureGrants` row turns inactive. Job result `{ payloadHash, grantee, txHash }`. **Rate class:** `prove`.
 
 ### `reindexDisclosures(contractAddress, compiledArtifactRef?) → { contractAddress, active, deactivated, reconciledAt }`
 
-Reconcile `DisclosureGrants` with the vault `disclosures` map in live state, e.g. after a wallet-submitted grant or revoke. Idempotent, crawler-independent. `active` = grants on chain afterwards; zero (not a 5xx) without a live provider. **Rate limit:** 60/hour per contract.
+Reconcile `DisclosureGrants` with the vault `disclosures` map in live state, e.g. after a wallet-submitted grant or revoke. Idempotent, crawler-independent. `active` = grants on chain afterwards; zero (not a 5xx) without a live provider. **Rate class:** `compute`, per contract.
 
 ### `registerPassport(documentId, ownerId, mode?, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
 
-Document id registry (`registerDocument` circuit; `passportId` is an alias of `documentId`). Modes 0 to 2 are registrar-only, in-circuit: the registrar is a constructor argument (NIGHTGATE deploys use the deploy session's attester id; an external deployer may nominate another). `mode` 0 (default) assigns `documentId` (64 hex) to `ownerId`, the only attester who may bind it via `bindDocument`; re-registering transfers ownership and releases a binding held by another attester (the id resolves to nothing until the new owner binds). Unregistered ids stay first-come-first-served. `mode` 1 unregisters (`ownerId` ignored); `mode` 2 hands the registrar role to `ownerId` (`documentId` ignored). Modes 3 and 4 belong to the recovery identity named at deploy (`deployContract` `recoveryId`; `documentId` ignored): 3 re-points the registrar to `ownerId`, 4 hands the recovery role to `ownerId`. Job result `{ documentId, ownerId, mode, contractAddress, txHash }`. **Rate limit:** 30/hour per session.
+Document id registry (`registerDocument` circuit; `passportId` is an alias of `documentId`). Modes 0 to 2 are registrar-only, in-circuit: the registrar is a constructor argument (NIGHTGATE deploys use the deploy session's attester id; an external deployer may nominate another). `mode` 0 (default) assigns `documentId` (64 hex) to `ownerId`, the only attester who may bind it via `bindDocument`; re-registering transfers ownership and releases a binding held by another attester (the id resolves to nothing until the new owner binds). Unregistered ids stay first-come-first-served. `mode` 1 unregisters (`ownerId` ignored); `mode` 2 hands the registrar role to `ownerId` (`documentId` ignored). Modes 3 and 4 belong to the recovery identity named at deploy (`deployContract` `recoveryId`; `documentId` ignored): 3 re-points the registrar to `ownerId`, 4 hands the recovery role to `ownerId`. Job result `{ documentId, ownerId, mode, contractAddress, txHash }`. **Rate class:** `prove`.
 
 ### `retractAttestation(payloadHash, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
 
-Remove the caller's record of a payload (`retract` circuit, mode 0): attestation, content anchor, disclosure grants and document binding leave the chain; `DisclosureGrants` rows turn inactive. Claims on its root stop verifying (they stay in `claims` until purged). The payload may be attested again. Job result `{ mode, key, contractAddress, txHash }`. **Rate limit:** 30/hour per session.
+Remove the caller's record of a payload (`retract` circuit, mode 0): attestation, content anchor, disclosure grants and document binding leave the chain; `DisclosureGrants` rows turn inactive. Claims on its root stop verifying (they stay in `claims` until purged). The payload may be attested again. Job result `{ mode, key, contractAddress, txHash }`. **Rate class:** `prove`.
 
 ### `purgeExpired(kind, key, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
 
-Removes an expired ledger entry via the `retract` circuit; any wallet session may call it. `kind` `claim` removes an expired claim (`key` = claim key, mode 1). The vault refuses an entry that has not expired. **Rate limit:** 30/hour per session.
+Removes an expired ledger entry via the `retract` circuit; any wallet session may call it. `kind` `claim` removes an expired claim (`key` = claim key, mode 1). The vault refuses an entry that has not expired. **Rate class:** `prove`.
 
 ### `registerGranteeIdentity(bindingInput, scope?) → { ID, granteeId, bindingKind }`
 
@@ -822,7 +864,7 @@ The issuer binds `payloadHash` to `tokenType` on the registry at
 encrypted under the server key; without it the grant is an entitlement the
 issuer serves elsewhere. `expiresAt` at most a year ahead. The same grantor,
 payload, type and registry again updates the grant (`status: "updated"`).
-Grantable. **Rate limit:** 30/hour per principal, shared with the disclosure actions.
+Grantable. **Rate class:** `prove`.
 
 ### `revokeHolderDisclosure(holderGrantId) → { holderGrantId, status }`
 
@@ -834,7 +876,7 @@ Proves the holding and reads what the issuer disclosed: computes the claim key
 from `claimSecret`, reads the registry live from the indexer (503 without a
 live indexer) and answers `entitled: true` with the stored text, or
 `entitled: false` with a `reason` (no grant, expired, not registered). Every
-token may call it; the secret is the credential. **Rate limit:** 60/hour per principal.
+token may call it; the secret is the credential. **Rate class:** `compute`.
 
 ## Diagnostics
 
@@ -842,7 +884,7 @@ token may call it; the secret is the credential. **Rate limit:** 60/hour per pri
 
 Read-only; amounts are decimal atom strings. `shieldedTokens`: other shielded token types with a non-zero balance (`tokenType` as returned by `deriveTokenType`, `amount`), spendable via `sendNight(tokenTypeHex)`. Dust fields: `dustUtxoCount` tracked notes, `dustPendingCount`/`dustPendingValue` in-flight spends, `dustRestoreCount` wedge-protection restores confirmed persisted (process lifetime). `registeredNightUtxoCount > 0` with `dustUtxoCount == 0` and `dustPendingCount == 0` while fees keep failing means a dust wedge, not an empty wallet (see the operations guide).
 
-**Rate limit:** 60/min per client IP.
+**Rate class:** `read`.
 
 ```bash
 curl "http://localhost:4004/api/v1/nightgate/getWalletBalance(sessionId='c07b1f0a-...')"
@@ -879,7 +921,7 @@ Health of every session in `NIGHTGATE_FEE_SPONSOR_SESSION` / `cds.requires.night
 - `stale: true`: the worker did not answer within the cap (e.g. while it restores another wallet's snapshot); the dust figures are the last ones the worker pushed, read at `asOf`, `usable` is false, `unshieldedNight` null and `lastError` says why. `stale: false`: read now, `asOf` is the read time.
 - Not available to agent tokens (403).
 
-**Rate limit:** 60/min per client IP.
+**Rate class:** `read`.
 
 Response:
 ```json
@@ -912,7 +954,7 @@ Wallet catch-up progress, from a snapshot the worker pushes about every 15 s (ch
 - `staleSeconds`: snapshot age; `stale` past `NIGHTGATE_SYNC_PROGRESS_STALE_S` (default 60 s) means nobody is syncing. `jobId`/`jobStatus`: latest prewarm job. `lastProgressAt`: last advance of `appliedIndex`. The prewarm fails after `NIGHTGATE_PREWARM_STALL_MS` (default 10 min) without progress, or at `NIGHTGATE_PREWARM_SYNC_TIMEOUT_MS` (default 12 h).
 - Sync state is persisted per account (`WalletSyncStates`); a reconnect applies only the delta, a wallet without snapshot syncs from zero. `restoredFromSnapshot` (false = cold start), `snapshotSavedAt`, `facadeBuildStartedAt`, `facadeBuiltAt` (null while deserializing, which takes minutes for a large dust state); all null while nothing is built. Logged under `nightgate:facade` (`sync state RESTORED from snapshot ...`, `COLD START`, `built in Ns`).
 
-**Rate limit:** 60/min per client IP.
+**Rate class:** `read`.
 
 ```bash
 curl "http://localhost:4004/api/v1/nightgate/getWalletSyncProgress(sessionId='c07b1f0a-...')"

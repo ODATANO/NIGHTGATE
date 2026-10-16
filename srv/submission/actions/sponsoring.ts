@@ -11,18 +11,35 @@ import { startJob } from '../background-jobs';
 import { PLATFORM_POOL_SENTINEL } from '../sponsor-pool';
 import { resolveSponsorPolicyForRequest } from '../sponsor-policy';
 import { getConfiguredFeeSponsorSessions } from '../fee-sponsor';
-import { sponsorRateLimiter, facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
-import { NightgateError } from '../../utils/errors';
+import { facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { NightgateError, isNightgateError } from '../../utils/errors';
+import { walletDescribeSwapHalf, walletDescribeTransaction } from '../../midnight/wallet-worker-client';
 import { transactionBytesOf } from '../../utils/offer-file';
 import { expireSwapOffers, isSwapOfferOpen, loadSwapOffer } from '../swap-offers';
 import type { SubmissionContext } from './context';
 import type { Request } from '@sap/cds';
 import { sponsorFinalizedTransaction, sponsorSwap, sponsorUnboundTransaction } from '#cds-models/NightgateService';
 
+/** True when the worker refused the bytes themselves, not the call. */
+function isRefusal(e: unknown): boolean {
+    return (isNightgateError(e) && e.code === 'SPONSOR_REFUSED')
+        || /not a proven transaction|not a swap half|is empty/.test((e as Error)?.message ?? String(e));
+}
+
 /**
- * The platform pool pays. A grant pinned to one wallet session pays from that session.
- * Returns undefined when nothing can pay, after rejecting the request.
+ * Deserializes the caller's bytes before a job exists: junk answers 400 here and never
+ * takes a heavy slot or a budget unit. Returns false after rejecting.
  */
+async function rejectUnlessProven(req: Request, describe: () => Promise<unknown>): Promise<boolean> {
+    try { await describe(); return true; }
+    catch (e) {
+        if (isRefusal(e)) { req.reject(400, (e as Error).message); return false; }
+        req.reject(503, `could not check the transaction (${(e as Error)?.message ?? String(e)})`);
+        return false;
+    }
+}
+
+/** The platform pool pays, or the wallet session a grant is pinned to. Returns undefined when nothing can pay, after rejecting the request. */
 function sponsorSessionFor(req: Request): string | undefined {
     const pinned = req.agentGrant?.sponsorSessionId;
     if (pinned && pinned !== PLATFORM_POOL_SENTINEL) return String(pinned);
@@ -43,7 +60,8 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         const effectiveSponsor = sponsorSessionFor(req);
         if (!effectiveSponsor) return;
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(sponsorRateLimiter, 'sponsor', req)) return;
+        if (!checkRate('sponsor', 'sponsor', req)) return;
+        if (!await rejectUnlessProven(req, () => walletDescribeTransaction({ txB64: finalizedTxB64 }))) return;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -88,7 +106,8 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         const effectiveSponsor = sponsorSessionFor(req);
         if (!effectiveSponsor) return;
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(sponsorRateLimiter, 'sponsor', req)) return;
+        if (!checkRate('sponsor', 'sponsor', req)) return;
+        if (!await rejectUnlessProven(req, () => walletDescribeTransaction({ txB64: unboundTxB64 }))) return;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -139,7 +158,10 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         const effectiveSponsor = sponsorSessionFor(req);
         if (!effectiveSponsor) return;
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(sponsorRateLimiter, 'sponsor', req)) return;
+        if (!checkRate('sponsor', 'sponsor', req)) return;
+        for (const name of offerId ? ['takerHalfB64' as const] : ['makerHalfB64' as const, 'takerHalfB64' as const]) {
+            if (!await rejectUnlessProven(req, () => walletDescribeSwapHalf({ halfB64: halves[name] }))) return;
+        }
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();

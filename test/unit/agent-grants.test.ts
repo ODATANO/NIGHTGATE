@@ -70,7 +70,8 @@ vi.mock('../../srv/utils/nightgate-config', () => ({
 
 import { FeeSponsorError } from '../../srv/submission/fee-sponsor';
 
-import { __resetGrantRateLimiterForTests, currentGrantPolicy,
+import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
+import { currentGrantPolicy,
     registerAgentGrantHandlers,
     enforceAgentGrant,
     grantScopeViolation,
@@ -136,6 +137,7 @@ function grantRow(overrides: Record<string, any> = {}) {
 }
 
 const TODAY = new Date().toISOString().slice(0, 10);
+const THIS_HOUR = new Date().toISOString().slice(0, 13);
 
 describe('agent grants', () => {
     const handlers: Record<string, Function> = {};
@@ -145,7 +147,7 @@ describe('agent grants', () => {
     const db = { run: mockDbRun };
 
     beforeEach(() => {
-        __resetGrantRateLimiterForTests();
+        __resetRateLimitersForTests();
         for (const k of SPONSOR_POLICY_ENV) delete process.env[k];
         __resetSponsorPolicyForTests();
         vi.clearAllMocks();
@@ -929,7 +931,7 @@ describe('agent grants', () => {
             expect(req.user).toEqual({ id: TEST_USER_ID });
         });
 
-        it('refunds the daily budget unit when the handler refuses the request as invalid (4xx below 429), keeps it otherwise', async () => {
+        it('refunds the daily budget unit when the handler refuses the request with a 4xx (a rate class included), keeps it on 5xx', async () => {
             const today = new Date().toISOString().slice(0, 10);
             const handlers: Record<string, (err: unknown) => void> = {};
             const run = async (status: number) => {
@@ -953,7 +955,7 @@ describe('agent grants', () => {
                 expect(await run(400)).toBe(1);   // refund UPDATE issued
                 expect(updateSetSpy).toHaveBeenCalledWith({ jobsUsedToday: { '-=': 1 } });
                 expect(await run(404)).toBe(1);
-                expect(await run(429)).toBe(0);   // exhausted stays exhausted
+                expect(await run(429)).toBe(1);   // a rate class refused after the take: nothing ran
                 expect(await run(503)).toBe(0);   // a server-side failure after admission keeps the unit
             } finally {
                 // unconsumed mockResolvedValueOnce values must not leak into the next test
@@ -1298,7 +1300,41 @@ describe('agent grants', () => {
             mockDbRun.mockResolvedValueOnce(0); // bounded increment finds no headroom
             const req = tokenReq('anchorDocument', {});
             await enforceAgentGrant(req, db);
-            expect(req.reject).toHaveBeenCalledWith(429, expect.stringContaining('budget'));
+            expect(req.reject).toHaveBeenCalledWith(429, expect.stringContaining('grant-day: 2 per day'));
+        });
+
+        it('rejects 429 when the hour budget is exhausted', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ maxJobsPerHour: 2, jobsUsedThisHour: 2, hourWindow: THIS_HOUR }));
+            mockDbRun.mockResolvedValueOnce(0); // bounded increment finds no headroom
+            const req = tokenReq('anchorDocument', {});
+            await enforceAgentGrant(req, db);
+            expect(req.reject).toHaveBeenCalledWith(429, expect.stringMatching(/^Rate limited \(grant-hour: 2 per hour\)\. Retry after \d+s$/));
+            expect(updateWhereSpy).toHaveBeenLastCalledWith(
+                expect.objectContaining({ ID: 'grant-1', hourWindow: THIS_HOUR, jobsUsedThisHour: { '<': 2 } })
+            );
+        });
+
+        it('takes the hour unit first and gives it back when the day budget refuses', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({
+                maxJobsPerHour: 5, jobsUsedThisHour: 1, hourWindow: THIS_HOUR,
+                maxJobsPerDay: 10, jobsUsedToday: 10, budgetWindow: TODAY
+            }));
+            mockDbRun.mockResolvedValueOnce(1); // hour increment
+            mockDbRun.mockResolvedValueOnce(0); // day increment finds no headroom
+            mockDbRun.mockResolvedValueOnce(1); // hour refund
+            const req = tokenReq('anchorDocument', {});
+            await enforceAgentGrant(req, db);
+            expect(req.reject).toHaveBeenCalledWith(429, expect.stringContaining('grant-day: 10 per day'));
+            expect(updateSetSpy).toHaveBeenCalledWith({ jobsUsedThisHour: { '-=': 1 } });
+            expect(mockDbRun).toHaveBeenCalledTimes(4);
+        });
+
+        it('a token without grantId on getGrantUsage gets its own grant', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify([]) }));
+            const req = tokenReq('getGrantUsage', {});
+            await enforceAgentGrant(req, db);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(req.data.grantId).toBe('grant-1');
         });
     });
 });

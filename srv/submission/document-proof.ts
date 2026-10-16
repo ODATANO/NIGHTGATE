@@ -4,7 +4,7 @@
  */
 import cds from '@sap/cds';
 import { randomBytes } from 'node:crypto';
-import { RateLimiter } from '../utils/rate-limiter';
+import { checkRateClass } from '../utils/rate-classes';
 import { getContractRegistration, slotWidthOf, importRegisteredArtifact } from './contract-registry';
 import {
     blake2b256Hex,
@@ -60,9 +60,6 @@ const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
 export function slotWidthForRef(compiledRef: string): number {
     return slotWidthOf(getContractRegistration(compiledRef));
 }
-
-// These actions send nothing, but each call loads the contract and hashes a full tree.
-const prepareRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: 120 });
 
 // ---- Pure-circuit loading -------------------------------------------------
 
@@ -120,11 +117,7 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
     const findProducedAt = deps.findProducedAt ?? recordedProducedAt;
 
     srv.on(prepareDocumentProof, async (req) => {
-        const clientKey = req.http?.req?.ip || 'global';
-        const rate = prepareRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('compute', 'compute', req)) return;
 
         const data = req.data;
         if (!data.documentJson) return req.reject(400, 'documentJson is required');
@@ -210,11 +203,7 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
     });
 
     srv.on(prepareMembershipSet, async (req) => {
-        const clientKey = req.http?.req?.ip || 'global';
-        const rate = prepareRateLimiter.check(clientKey);
-        if (!rate.allowed) {
-            return req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-        }
+        if (!checkRateClass('compute', 'compute', req)) return;
 
         const data = req.data;
         if (!data.allowedValuesJson) return req.reject(400, 'allowedValuesJson is required');

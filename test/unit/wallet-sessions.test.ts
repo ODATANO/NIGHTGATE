@@ -145,7 +145,8 @@ import cds from '@sap/cds';
 import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
 import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 import { RateLimiter } from '../../srv/utils/rate-limiter';
-import { __resetWalletRateLimitersForTests, registerWalletSessionHandlers, startSessionCleanup, closeSessionsFromPreviousProcess } from '../../srv/sessions/wallet-sessions';
+import { registerWalletSessionHandlers, startSessionCleanup, closeSessionsFromPreviousProcess } from '../../srv/sessions/wallet-sessions';
+import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
 
 async function runPersistedCommand(args: any): Promise<unknown> {
     const processor = registeredProcessors.get(args.kind);
@@ -242,7 +243,7 @@ describe('wallet session handlers', () => {
     });
 
     beforeEach(() => {
-        __resetWalletRateLimitersForTests();
+        __resetRateLimitersForTests();
         vi.clearAllMocks();
         for (const key of NIGHTGATE_ENV_KEYS) delete process.env[key];
         mockDbRun.mockReset();
@@ -277,10 +278,7 @@ describe('wallet session handlers', () => {
     }
 
     it('connectWallet rejects rate-limited clients before validating or inserting a session', async () => {
-        const checkSpy = vi.spyOn(RateLimiter.prototype, 'check').mockReturnValue({
-            allowed: false,
-            retryAfterMs: 1500
-        });
+        const checkSpy = vi.spyOn(RateLimiter.prototype, 'checkMany').mockReturnValue({ allowed: false, retryAfterMs: 1500, limit: 10, remaining: 0, resetMs: 1500 });
 
         try {
             const handler = registeredHandlers['connectWallet'];
@@ -288,8 +286,8 @@ describe('wallet session handlers', () => {
 
             await handler(req);
 
-            expect(checkSpy).toHaveBeenCalledWith(expect.stringMatching(/^user=.*:wallet$/));
-            expect(req.reject).toHaveBeenCalledWith(429, 'Rate limited. Retry after 2s');
+            expect(checkSpy).toHaveBeenCalledWith(expect.stringMatching(/^user=.*:wallet$/), 1);
+            expect(req.reject).toHaveBeenCalledWith(429, 'Rate limited (wallet: 10 per minute). Retry after 2s');
             expect(insertEntriesSpy).not.toHaveBeenCalled();
         } finally {
             checkSpy.mockRestore();
@@ -317,7 +315,7 @@ describe('wallet session handlers', () => {
     });
 
     it('connectWallet keys the rate limit by principal and uses the default TTL when no config is present', async () => {
-        const checkSpy = vi.spyOn(RateLimiter.prototype, 'check');
+        const checkSpy = vi.spyOn(RateLimiter.prototype, 'checkMany');
         const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
         (cds.env as any).requires = {};
         mockDbRun.mockResolvedValueOnce(1);
@@ -327,7 +325,7 @@ describe('wallet session handlers', () => {
             const req = createMockRequest({ viewingKey: 'a'.repeat(64) }, null);
             const result = await handler(req);
 
-            expect(checkSpy).toHaveBeenCalledWith(expect.stringMatching(/^user=.*:wallet$/));
+            expect(checkSpy).toHaveBeenCalledWith(expect.stringMatching(/^user=.*:wallet$/), 1);
             expect(result.expiresAt).toBe(new Date(1_700_086_400_000).toISOString());
             expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({
                 expiresAt: new Date(1_700_086_400_000).toISOString()
@@ -695,7 +693,7 @@ describe('wallet session handlers', () => {
         });
 
         it('rejects rate-limited clients', async () => {
-            const checkSpy = vi.spyOn(RateLimiter.prototype, 'check').mockReturnValue({ allowed: false, retryAfterMs: 1000 });
+            const checkSpy = vi.spyOn(RateLimiter.prototype, 'checkMany').mockReturnValue({ allowed: false, retryAfterMs: 1000, limit: 10, remaining: 0, resetMs: 1000 });
             try {
                 const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
                 await registeredHandlers['connectWalletForSigning'](req);
@@ -896,7 +894,7 @@ describe('wallet session handlers', () => {
         });
 
         it('rejects 429 when rate-limited', async () => {
-            const checkSpy = vi.spyOn(RateLimiter.prototype, 'check').mockReturnValue({ allowed: false, retryAfterMs: 1000 });
+            const checkSpy = vi.spyOn(RateLimiter.prototype, 'checkMany').mockReturnValue({ allowed: false, retryAfterMs: 1000, limit: 10, remaining: 0, resetMs: 1000 });
             try {
                 const req = createMockRequest({ sessionId: 's1' });
                 await registeredHandlers['registerForDustGeneration'](req);

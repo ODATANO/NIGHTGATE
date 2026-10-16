@@ -8,7 +8,6 @@ import { parseJsonStringList } from '../utils/json-list';
 import cds from '@sap/cds';
 import crypto from 'crypto';
 import { AgentGrants, WalletSessions, BackgroundJobs, Transactions, TransactionFees, type WalletSession, type AgentGrant } from '#cds-models/midnight';
-import { RateLimiter } from '../utils/rate-limiter';
 import { PLATFORM_POOL_SENTINEL } from '../submission/sponsor-pool';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import {
@@ -19,10 +18,10 @@ import { withKeyedLock } from '../utils/keyed-lock';
 import { runWithoutAmbientTx } from '../submission/background-jobs';
 import { resolveFeeSponsor, FeeSponsorError } from '../submission/fee-sponsor';
 import { getNightgatePluginConfig, resolveNightgateRuntimeConfig } from '../utils/nightgate-config';
-import { configNumber } from '../utils/config';
+import { configInt } from '../utils/config';
+import { checkRateClass, peekRateClassForGrant, rejectRateLimited, noteRateLimitHeaders, RATE_CLASSES, RATE_CLASS_NAMES, type RateLimitState } from '../utils/rate-classes';
 import { isSessionExpired } from '../utils/session-expiry';
 import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER, PUBLIC_VERIFY_TRANSPORT_USER } from '../utils/agent-token-transport';
-import { principalRateKey } from '../utils/rate-limiter';
 import type { DbRunner } from '../utils/db-types';
 import { errorMessage } from '../utils/errors';
 import { HEX64_RE } from '../utils/hex-patterns';
@@ -116,11 +115,6 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     // all sponsor sessions of that user.
 ]);
 
-const grantAdminRateLimiter = new RateLimiter({ windowMs: 60 * 60 * 1000, maxRequests: configNumber('NIGHTGATE_GRANT_ADMIN_RATE_LIMIT') });
-
-export function __resetGrantRateLimiterForTests(): void {
-    grantAdminRateLimiter.reset();
-}
 
 
 /**
@@ -373,9 +367,56 @@ function utcDay(now: Date = new Date()): string {
     return now.toISOString().slice(0, 10);
 }
 
+function utcHour(now: Date = new Date()): string {
+    return now.toISOString().slice(0, 13);
+}
+
+/** One counted budget of a grant: its columns, its window and the name it is reported under. */
+interface GrantBudget {
+    limitName: 'grant-hour' | 'grant-day';
+    maxField: 'maxJobsPerHour' | 'maxJobsPerDay';
+    usedField: 'jobsUsedThisHour' | 'jobsUsedToday';
+    windowField: 'hourWindow' | 'budgetWindow';
+    windowMs: number;
+    current(now?: Date): string;
+    resetsAt(now?: Date): Date;
+}
+
+const HOUR_BUDGET: GrantBudget = {
+    limitName: 'grant-hour', maxField: 'maxJobsPerHour', usedField: 'jobsUsedThisHour', windowField: 'hourWindow',
+    windowMs: 60 * 60 * 1000, current: utcHour,
+    resetsAt: (now = new Date()) => new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours() + 1))
+};
+const DAY_BUDGET: GrantBudget = {
+    limitName: 'grant-day', maxField: 'maxJobsPerDay', usedField: 'jobsUsedToday', windowField: 'budgetWindow',
+    windowMs: 24 * 60 * 60 * 1000, current: utcDay,
+    resetsAt: (now = new Date()) => new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1))
+};
+/** The hour is checked first: it is the one that usually refuses. */
+const GRANT_BUDGETS: readonly GrantBudget[] = [HOUR_BUDGET, DAY_BUDGET];
+const BUDGET_FIELDS = ['maxJobsPerDay', 'maxJobsPerHour'] as const;
+
+function usedInWindow(grant: AgentGrant, budget: GrantBudget): number {
+    return grant[budget.windowField] === budget.current() ? (grant[budget.usedField] ?? 0) : 0;
+}
+
+function budgetView(grant: AgentGrant, budget: GrantBudget): { max: number | null; used: number; resetsAt: string } {
+    return { max: grant[budget.maxField] ?? null, used: usedInWindow(grant, budget), resetsAt: budget.resetsAt().toISOString() };
+}
+
+/** The budget after this request took one unit, from the row read before the take. */
+function budgetHeaderState(grant: AgentGrant, budget: GrantBudget): RateLimitState {
+    const max = grant[budget.maxField] as number;
+    return {
+        name: budget.limitName, limit: max, remaining: Math.max(max - usedInWindow(grant, budget) - 1, 0),
+        windowSeconds: budget.windowMs / 1000, resetSeconds: Math.ceil((budget.resetsAt().getTime() - Date.now()) / 1000)
+    };
+}
+
 interface GrantShapeInput {
     allowedActions?: string[] | null;
     maxJobsPerDay?: number | null;
+    maxJobsPerHour?: number | null;
     validUntil?: string | null;
     agentLabel?: string | null;
     allowedContracts?: string[] | null;
@@ -389,6 +430,7 @@ interface GrantShapeInput {
 interface GrantShapeValues {
     allowedActions?: string[];
     maxJobsPerDay?: number | null;
+    maxJobsPerHour?: number | null;
     validUntil?: string | null;
     agentLabel?: string | null;
     allowedContracts: string[];
@@ -461,13 +503,13 @@ export function validateGrantShape(
 
     const values: GrantShapeValues = { allowedContracts, allowedCircuits, allowedTokenTypes, allowDeploy, maxDeploys };
     if (actions) values.allowedActions = actions;
-    if (has('maxJobsPerDay') || !existing) {
-        if (input.maxJobsPerDay !== undefined && input.maxJobsPerDay !== null) {
-            if (!Number.isInteger(input.maxJobsPerDay) || input.maxJobsPerDay < 1) {
-                return fail('maxJobsPerDay must be a positive integer');
-            }
+    for (const field of BUDGET_FIELDS) {
+        if (existing && !has(field)) continue;
+        const budget = input[field];
+        if (budget !== undefined && budget !== null && (!Number.isInteger(budget) || budget < 1)) {
+            return fail(`${field} must be a positive integer`);
         }
-        values.maxJobsPerDay = input.maxJobsPerDay ?? null;
+        values[field] = budget ?? null;
     }
     if (has('validUntil') || !existing) {
         if (input.validUntil) {
@@ -597,6 +639,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         sessionId?: string | null;
         allowedActions?: string[] | null;
         maxJobsPerDay?: number | null;
+        maxJobsPerHour?: number | null;
         sponsorSessionId?: string | null;
         validUntil?: string | null;
         agentLabel?: string | null;
@@ -613,6 +656,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
      */
     async function prepareGrantCreation(req: Request, data: GrantCreationInput, userId: string): Promise<{ values: GrantShapeValues; actions: string[]; sessionId: string } | undefined> {
         if (!data.sessionId) { req.reject(400, 'sessionId is required'); return undefined; }
+        applyBudgetDefaults(data);
         const shape = validateGrantShape(data);
         if (!shape.ok) { req.reject(400, shape.message); return undefined; }
         const actions = shape.values.allowedActions as string[];
@@ -660,6 +704,18 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         return { values: shape.values, actions, sessionId: data.sessionId };
     }
 
+    /** A budget the creation leaves out takes the env default. An explicit null stays null. */
+    function applyBudgetDefaults(data: GrantCreationInput): void {
+        if (!Object.prototype.hasOwnProperty.call(data, 'maxJobsPerDay')) {
+            const d = configInt('NIGHTGATE_GRANT_DEFAULT_JOBS_PER_DAY');
+            if (d !== undefined) data.maxJobsPerDay = d;
+        }
+        if (!Object.prototype.hasOwnProperty.call(data, 'maxJobsPerHour')) {
+            const h = configInt('NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR');
+            if (h !== undefined) data.maxJobsPerHour = h;
+        }
+    }
+
     function newGrantRow(userId: string, sessionId: string, data: GrantCreationInput, values: GrantShapeValues, actions: string[], agentLabel: string | null) {
         const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes } = values;
         const token = TOKEN_PREFIX + crypto.randomBytes(TOKEN_BYTES).toString('hex');
@@ -670,9 +726,12 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
             sessionId,
             tokenHash: hashAgentToken(token),
             allowedActions: JSON.stringify(actions),
-            maxJobsPerDay: data.maxJobsPerDay ?? null,
+            maxJobsPerDay: values.maxJobsPerDay ?? null,
             jobsUsedToday: 0,
             budgetWindow: null,
+            maxJobsPerHour: values.maxJobsPerHour ?? null,
+            jobsUsedThisHour: 0,
+            hourWindow: null,
             sponsorSessionId: data.sponsorSessionId ?? null,
             allowedContracts: allowedContracts.length ? JSON.stringify(allowedContracts) : null,
             allowedCircuits: allowedCircuits.length ? JSON.stringify(allowedCircuits) : null,
@@ -687,9 +746,9 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         return { grant, token };
     }
 
-    function describeGrantCreation(values: GrantShapeValues, actions: string[], maxJobsPerDay: number | null | undefined): string {
-        const { allowedContracts, allowedCircuits, allowedTokenTypes } = values;
-        return `actions: ${actions.join(', ')}${maxJobsPerDay ? `, budget ${maxJobsPerDay}/day` : ''}`
+    function describeGrantCreation(values: GrantShapeValues, actions: string[]): string {
+        const { allowedContracts, allowedCircuits, allowedTokenTypes, maxJobsPerDay, maxJobsPerHour } = values;
+        return `actions: ${actions.join(', ')}${maxJobsPerDay ? `, budget ${maxJobsPerDay}/day` : ''}${maxJobsPerHour ? `, budget ${maxJobsPerHour}/hour` : ''}`
             + `${allowedContracts.length ? `, contracts ${allowedContracts.map(c => c.slice(0, 12)).join('|')}` : ''}`
             + `${allowedCircuits.length ? `, circuits ${allowedCircuits.join('|')}` : ''}`
             + `${allowedTokenTypes.length ? `, token types ${allowedTokenTypes.map(t => t.slice(0, 12)).join('|')}` : ''}`;
@@ -711,7 +770,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
 
         const { grant, token } = newGrantRow(userId, sessionId, data, values, actions, data.agentLabel ?? null);
         await db.run(INSERT.into(AgentGrants).entries(grant));
-        log.info(`agent grant ${grant.ID} created for session ${String(data.sessionId).slice(0, 8)}… (${describeGrantCreation(values, actions, grant.maxJobsPerDay)})`);
+        log.info(`agent grant ${grant.ID} created for session ${String(data.sessionId).slice(0, 8)}… (${describeGrantCreation(values, actions)})`);
 
         return { grantId: grant.ID, token, ...grantShapeView(values, actions, grant.validUntil) };
     });
@@ -742,7 +801,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
 
         const rows = labels.map(label => newGrantRow(userId, sessionId, data, values, actions, label));
         await db.run(INSERT.into(AgentGrants).entries(rows.map(r => r.grant)));
-        log.info(`${rows.length} agent grants created for session ${String(data.sessionId).slice(0, 8)}… (${describeGrantCreation(values, actions, data.maxJobsPerDay)})`);
+        log.info(`${rows.length} agent grants created for session ${String(data.sessionId).slice(0, 8)}… (${describeGrantCreation(values, actions)})`);
 
         return {
             grants: rows.map(({ grant, token }) => ({ grantId: grant.ID, token, agentLabel: grant.agentLabel })),
@@ -796,6 +855,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         };
         if (v.allowedActions) patch.allowedActions = JSON.stringify(v.allowedActions);
         if ('maxJobsPerDay' in v) patch.maxJobsPerDay = v.maxJobsPerDay;
+        if ('maxJobsPerHour' in v) patch.maxJobsPerHour = v.maxJobsPerHour;
         if ('validUntil' in v) patch.validUntil = v.validUntil;
         if ('agentLabel' in v) patch.agentLabel = v.agentLabel;
         const updated = Object.keys(data).filter(k => k !== 'grantId');
@@ -888,18 +948,24 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
             failed,
             deploysUsed: grant.deploysUsed ?? 0,
             maxDeploys: grant.maxDeploys ?? null,
-            jobsUsedToday: grant.budgetWindow === utcDay() ? (grant.jobsUsedToday ?? 0) : 0,
+            jobsUsedToday: usedInWindow(grant, DAY_BUDGET),
             maxJobsPerDay: grant.maxJobsPerDay ?? null,
-            dustPaid
+            dustPaid,
+            limits: {
+                jobsPerHour: budgetView(grant, HOUR_BUDGET),
+                jobsPerDay: budgetView(grant, DAY_BUDGET),
+                classes: RATE_CLASS_NAMES.filter(c => RATE_CLASSES[c].grantVisible).map(c => {
+                    const scope = c === 'prove' || c === 'deploy' ? grant.sessionId : c;
+                    const state = peekRateClassForGrant(c, grant.ID, scope);
+                    return { name: c, windowSeconds: state.windowSeconds, max: state.limit, remaining: state.remaining };
+                })
+            }
         };
     });
 }
 
 function checkGrantAdminRate(req: Request): boolean {
-    const rate = grantAdminRateLimiter.check(principalRateKey(req, 'grant-admin'));
-    if (rate.allowed) return true;
-    req.reject(429, `Rate limited. Retry after ${Math.ceil(rate.retryAfterMs / 1000)}s`);
-    return false;
+    return checkRateClass('admin', 'admin', req);
 }
 
 async function loadOwnGrant(db: DbRunner, grantId: string, userId: string): Promise<AgentGrant | null> {
@@ -984,9 +1050,10 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
 
     const event = String(req.event ?? '');
     const alwaysAllowed = AGENT_ALWAYS_ALLOWED_EVENTS.has(event);
-    // The handler only checks the owner, which would allow every grant of that user.
-    if (event === 'getGrantUsage' && String(req.data?.grantId ?? '') !== grant.ID) {
-        return req.reject(404, 'Grant not found');
+    // A token sees its own grant only: no grantId means its own, another one is not found.
+    if (event === 'getGrantUsage') {
+        if (!req.data?.grantId) req.data.grantId = grant.ID;
+        else if (String(req.data.grantId) !== grant.ID) return req.reject(404, 'Grant not found');
     }
     let allowlisted = false;
     if (!alwaysAllowed) {
@@ -1055,18 +1122,29 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
 
     // Runs outside the request transaction, so the count stays even if the request fails later.
     // Counting a failure is better than missing abuse.
-    if (allowlisted && grant.maxJobsPerDay !== undefined && grant.maxJobsPerDay !== null) {
-        const consumed = await consumeDailyBudget(db, grant);
-        if (!consumed) {
-            return req.reject(429, `agent grant daily job budget exhausted (${grant.maxJobsPerDay}/day)`);
+    if (allowlisted) {
+        const taken: GrantBudget[] = [];
+        for (const budget of GRANT_BUDGETS) {
+            const max = grant[budget.maxField];
+            if (max === undefined || max === null) continue;
+            if (await consumeBudget(db, grant, budget)) { taken.push(budget); continue; }
+            for (const t of taken) await refundBudget(db, grant, t);
+            return rejectRateLimited(req, {
+                name: budget.limitName, limit: max, windowSeconds: budget.windowMs / 1000,
+                retryAfterMs: budget.resetsAt().getTime() - Date.now()
+            });
         }
-        // A 400 to 428 error started no job, so give the unit back. 429 and 5xx keep it.
-        (req as any).on?.('failed', (err: any) => {
-            const status = Number(err?.status ?? err?.statusCode ?? err?.code);
-            if (Number.isInteger(status) && status >= 400 && status < 429) {
-                void refundDailyBudget(db, grant).catch((e: unknown) => log.warn(`daily budget refund for grant ${grant.ID} failed: ${errorMessage(e)}`));
-            }
-        });
+        for (const budget of taken) noteRateLimitHeaders(req, budgetHeaderState(grant, budget));
+        if (taken.length) {
+            // A 4xx started no job (429 = a rate class refused after the take), so give the units back. 5xx keep them.
+            (req as any).on?.('failed', (err: any) => {
+                const status = Number(err?.status ?? err?.statusCode ?? err?.code);
+                if (!Number.isInteger(status) || status < 400 || status >= 500) return;
+                for (const budget of taken) {
+                    void refundBudget(db, grant, budget).catch((e: unknown) => log.warn(`${budget.limitName} refund for grant ${grant.ID} failed: ${errorMessage(e)}`));
+                }
+            });
+        }
     }
 
     const UserCtor = (cds as any).User;
@@ -1086,34 +1164,34 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
     };
 }
 
-async function refundDailyBudget(db: DbRunner, grant: AgentGrant): Promise<void> {
+async function refundBudget(db: DbRunner, grant: AgentGrant, budget: GrantBudget): Promise<void> {
     await runWithoutAmbientTx(() => db.run(
         UPDATE.entity(AgentGrants)
-            .set({ jobsUsedToday: { '-=': 1 } })
-            .where({ ID: grant.ID, budgetWindow: utcDay(), jobsUsedToday: { '>': 0 } })
+            .set({ [budget.usedField]: { '-=': 1 } })
+            .where({ ID: grant.ID, [budget.windowField]: budget.current(), [budget.usedField]: { '>': 0 } })
     ));
 }
 
 /**
- * Uses one unit of the daily budget. Safe under parallel requests.
- * A new day resets the counter only if no other request reset it first.
+ * Uses one unit of the budget. Safe under parallel requests.
+ * A new window resets the counter only if no other request reset it first.
  */
-async function consumeDailyBudget(db: DbRunner, grant: AgentGrant): Promise<boolean> {
-    const today = utcDay();
-    const max = grant.maxJobsPerDay as number;
+async function consumeBudget(db: DbRunner, grant: AgentGrant, budget: GrantBudget): Promise<boolean> {
+    const window = budget.current();
+    const max = grant[budget.maxField] as number;
 
-    if (grant.budgetWindow !== today) {
+    if (grant[budget.windowField] !== window) {
         const reset = await runWithoutAmbientTx(() => db.run(
             UPDATE.entity(AgentGrants)
-                .set({ budgetWindow: today, jobsUsedToday: 1 })
-                .where({ ID: grant.ID, budgetWindow: grant.budgetWindow ?? null })
+                .set({ [budget.windowField]: window, [budget.usedField]: 1 })
+                .where({ ID: grant.ID, [budget.windowField]: grant[budget.windowField] ?? null })
         ));
         if (Number(reset)) return true;
     }
     const incremented = await runWithoutAmbientTx(() => db.run(
         UPDATE.entity(AgentGrants)
-            .set({ jobsUsedToday: { '+=': 1 } })
-            .where({ ID: grant.ID, budgetWindow: today, jobsUsedToday: { '<': max } })
+            .set({ [budget.usedField]: { '+=': 1 } })
+            .where({ ID: grant.ID, [budget.windowField]: window, [budget.usedField]: { '<': max } })
     ));
     return Number(incremented) > 0;
 }

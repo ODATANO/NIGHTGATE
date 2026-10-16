@@ -69,8 +69,8 @@ probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`,
 | `NODE_OPTIONS` | `--max-old-space-size=8192` | Heap; container memory limit must be higher |
 | `NIGHTGATE_NODE_FLAGS` | `--no-concurrent-recompilation` | V8 flags on the node command line (not allowed in `NODE_OPTIONS`). The default avoids a compile-thread/GC-safepoint deadlock; empty = no flag |
 | `NIGHTGATE_PUBLIC_VERIFY` | `false` | `verifyAttestationState` / `verifyPredicateState` without credentials under `/api/v1/verify` (CORS preflight `*`) |
-| `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` | `60` | Public verify calls per minute per client address |
-| `NIGHTGATE_GRANT_ADMIN_RATE_LIMIT` | `10` | Grant administration calls per hour per principal (create, update, rotate, revoke) |
+| `NIGHTGATE_<CLASS>_RATE_LIMIT` | per class | Count of a rate class (`PROVE` 60/h, `DEPLOY` 5/h, `SPONSOR` 120/h, `COMPUTE` 120/h, `READ` 60/min, `WALLET` 10/min, `SIGNING_KEY` 10/h, `ADMIN` 10/h, `PUBLIC_VERIFY` 60/min); `rateLimits` in the policy file replaces a key without a restart |
+| `NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR` / `_PER_DAY` |  | Budgets of a grant whose creation names none |
 
 Default proving is in-process wasm: no extra container, but proofs take
 minutes and block the thread. For throughput start the compose `proof-server`

@@ -9,6 +9,8 @@ import { configList, configFlag, configString, configIsSet } from '../utils/conf
 import { NightgateError, errorMessage } from '../utils/errors';
 import { HEX64_RE } from '../utils/hex';
 import { sharedLearnedTokenTypes } from './learned-token-types';
+import { isRateClass, RATE_CLASS_NAMES, type RateClass } from '../utils/rate-class-table';
+import { setRateLimitOverrideSource } from '../utils/rate-classes';
 
 const log = cds.log('nightgate:sponsor-policy');
 
@@ -34,6 +36,8 @@ export interface SponsorPolicy {
     ownTokenTypes?: string[];
     /** Token types minted anywhere on the platform that are part of `allowedTokenTypes`. */
     sharedTokenTypes?: string[];
+    /** Counts per rate class that replace the config keys while the file is set. */
+    rateLimits?: Partial<Record<RateClass, number>>;
 }
 
 export interface GrantPolicyInput {
@@ -143,6 +147,7 @@ function readPolicyFile(filePath: string): SponsorPolicy {
     for (const flag of ['allowDeploy', 'allowContractMints', 'allowSwaps', 'shareMintedTokenTypes']) {
         if (parsed[flag] !== undefined && typeof parsed[flag] !== 'boolean') throw new Error(`${flag} must be a boolean`);
     }
+    const rateLimits = readRateLimits(parsed.rateLimits);
     return {
         allowedContracts: validatePolicyList('allowedContracts', parsed.allowedContracts),
         allowedCircuits: validatePolicyList('allowedCircuits', parsed.allowedCircuits),
@@ -150,11 +155,24 @@ function readPolicyFile(filePath: string): SponsorPolicy {
         allowedTokenTypes: validateTokenTypeList('allowedTokenTypes', parsed.allowedTokenTypes),
         allowContractMints: parsed.allowContractMints === true,
         allowSwaps: parsed.allowSwaps === true,
-        shareMintedTokenTypes: parsed.shareMintedTokenTypes === true
+        shareMintedTokenTypes: parsed.shareMintedTokenTypes === true,
+        ...(rateLimits ? { rateLimits } : {})
     };
 }
 
-const POLICY_FILE_KEYS = ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'allowedTokenTypes', 'allowContractMints', 'allowSwaps', 'shareMintedTokenTypes'];
+function readRateLimits(raw: unknown): Partial<Record<RateClass, number>> | undefined {
+    if (raw === undefined) return undefined;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('rateLimits must be an object of class name to count');
+    const out: Partial<Record<RateClass, number>> = {};
+    for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+        if (!isRateClass(name)) throw new Error(`rateLimits names unknown class '${name}'; known: ${RATE_CLASS_NAMES.join(', ')}`);
+        if (!Number.isInteger(value) || (value as number) < 1) throw new Error(`rateLimits.${name} must be an integer of at least 1`);
+        out[name] = value as number;
+    }
+    return out;
+}
+
+const POLICY_FILE_KEYS = ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'allowedTokenTypes', 'allowContractMints', 'allowSwaps', 'shareMintedTokenTypes', 'rateLimits'];
 
 /** Env settings the policy file replaces while it is set. */
 const SHADOWED_ENV_KEYS = [
@@ -214,7 +232,8 @@ export function getGlobalSponsorPolicy(): SponsorPolicy {
             `, ${policy.allowedTokenTypes?.length ?? 0} token type(s)` +
             (policy.allowContractMints ? ', contract mints sponsored' : '') +
             (policy.allowSwaps ? ', swaps sponsored' : '') +
-            (policy.shareMintedTokenTypes ? ', minted types shared' : ''));
+            (policy.shareMintedTokenTypes ? ', minted types shared' : '') +
+            (policy.rateLimits ? `, rate limits ${Object.entries(policy.rateLimits).map(([k, v]) => `${k}=${v}`).join(' ')}` : ''));
         return policy;
     } catch (e) {
         log.error(`sponsor policy file ${filePath} is invalid (${errorMessage(e)}); ` +
@@ -224,6 +243,19 @@ export function getGlobalSponsorPolicy(): SponsorPolicy {
         throw new SponsorPolicyUnavailableError(`sponsor policy file ${filePath} is invalid and no policy was loaded before; refusing to sponsor`);
     }
 }
+
+/** The rate counts the policy file sets; empty without a file or while it is unusable. */
+export function policyFileRateLimits(): Partial<Record<RateClass, number>> {
+    if (!configString('NIGHTGATE_SPONSOR_POLICY_FILE')) return {};
+    try {
+        return getGlobalSponsorPolicy().rateLimits ?? {};
+    } catch (e) {
+        if (e instanceof SponsorPolicyUnavailableError) return {};
+        throw e;
+    }
+}
+
+setRateLimitOverrideSource(policyFileRateLimits);
 
 // ---- Effective policy ------------------------------------------------------
 

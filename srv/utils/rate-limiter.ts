@@ -2,7 +2,8 @@
 
 interface RateLimiterOptions {
     windowMs: number;
-    maxRequests: number;
+    /** A function is read on every check, so a changed setting applies without a restart. */
+    maxRequests: number | (() => number);
     maxKeys?: number;           // Max tracked keys (default: 10000)
     sweepIntervalMs?: number;   // How often unused keys are removed (default: 60000)
     /**
@@ -12,9 +13,15 @@ interface RateLimiterOptions {
     maxKeysPerGroup?: number;
 }
 
-interface RateCheckResult {
+export interface RateCheckResult {
     allowed: boolean;
     retryAfterMs: number;
+    /** The limit in force for this check. */
+    limit: number;
+    /** Requests still allowed in the current window after this check. */
+    remaining: number;
+    /** Until the oldest counted request leaves the window; 0 when nothing is counted. */
+    resetMs: number;
 }
 
 function groupOf(key: string): string {
@@ -41,9 +48,14 @@ export function principalRateKey(req: any, scope: string): string {
     return `${principal}:${scope}`;
 }
 
+/** The key `principalRateKey` builds for a request under the grant. */
+export function grantRateKey(grantId: string, scope: string): string {
+    return `grant=${grantId}:${scope}`;
+}
+
 export class RateLimiter {
-    private windowMs: number;
-    private maxRequests: number;
+    readonly windowMs: number;
+    private readonly maxRequestsOption: number | (() => number);
     private maxKeys: number;
     private maxKeysPerGroup: number;
     private groupCounts: Map<string, number> = new Map();
@@ -52,7 +64,7 @@ export class RateLimiter {
 
     constructor(opts: RateLimiterOptions) {
         this.windowMs = opts.windowMs;
-        this.maxRequests = opts.maxRequests;
+        this.maxRequestsOption = opts.maxRequests;
         this.maxKeys = opts.maxKeys || 10000;
         this.maxKeysPerGroup = opts.maxKeysPerGroup || 64;
 
@@ -63,6 +75,11 @@ export class RateLimiter {
         }
     }
 
+    get maxRequests(): number {
+        const v = this.maxRequestsOption;
+        return typeof v === 'function' ? v() : v;
+    }
+
     check(key: string): RateCheckResult {
         return this.checkMany(key, 1);
     }
@@ -70,10 +87,12 @@ export class RateLimiter {
     /** Would one more request fit? Records nothing. */
     peek(key: string): RateCheckResult {
         const now = Date.now();
+        const limit = this.maxRequests;
         const inWindow = (this.hits.get(key) ?? []).filter(t => t > now - this.windowMs);
-        if (inWindow.length < this.maxRequests) return { allowed: true, retryAfterMs: 0 };
-        const oldest = Math.min(...inWindow);
-        return { allowed: false, retryAfterMs: Math.max(oldest + this.windowMs - now, 0) };
+        const oldest = inWindow.length ? Math.min(...inWindow) : undefined;
+        const resetMs = oldest === undefined ? 0 : Math.max(oldest + this.windowMs - now, 0);
+        if (inWindow.length < limit) return { allowed: true, retryAfterMs: 0, limit, remaining: limit - inWindow.length, resetMs };
+        return { allowed: false, retryAfterMs: resetMs, limit, remaining: 0, resetMs };
     }
 
     reset(): void {
@@ -83,7 +102,8 @@ export class RateLimiter {
 
     /** Records `count` requests at once. Either all fit and are recorded, or none are. */
     checkMany(key: string, count: number): RateCheckResult {
-        if (count <= 0) return { allowed: true, retryAfterMs: 0 };
+        const limit = this.maxRequests;
+        if (count <= 0) return { allowed: true, retryAfterMs: 0, limit, remaining: limit, resetMs: 0 };
         const now = Date.now();
         const windowStart = now - this.windowMs;
 
@@ -91,7 +111,7 @@ export class RateLimiter {
         if (isNew) {
             const group = groupOf(key);
             if ((this.groupCounts.get(group) ?? 0) >= this.maxKeysPerGroup) {
-                return { allowed: false, retryAfterMs: this.windowMs };
+                return { allowed: false, retryAfterMs: this.windowMs, limit, remaining: 0, resetMs: this.windowMs };
             }
             // When full, drop the least recently used key.
             // Refusing new keys instead would let one caller lock everyone else out.
@@ -106,20 +126,21 @@ export class RateLimiter {
         timestamps = timestamps.filter(t => t > windowStart);
         this.hits.delete(key); // re-inserted below, which marks it as most recently used
 
-        if (timestamps.length + count > this.maxRequests) {
+        if (timestamps.length + count > limit) {
             timestamps.sort((a, b) => a - b);
             const oldestInWindow = timestamps[0];
             // A count larger than the whole limit never fits, so report a full window instead of 0.
             const retryAfterMs = oldestInWindow === undefined
                 ? this.windowMs
-                : oldestInWindow + this.windowMs - now;
+                : Math.max(oldestInWindow + this.windowMs - now, 0);
             this.hits.set(key, timestamps);
-            return { allowed: false, retryAfterMs: Math.max(retryAfterMs, 0) };
+            return { allowed: false, retryAfterMs, limit, remaining: Math.max(limit - timestamps.length, 0), resetMs: retryAfterMs };
         }
 
+        const oldest = timestamps.length ? Math.min(...timestamps) : now;
         for (let i = 0; i < count; i++) timestamps.push(now);
         this.hits.set(key, timestamps);
-        return { allowed: true, retryAfterMs: 0 };
+        return { allowed: true, retryAfterMs: 0, limit, remaining: limit - timestamps.length, resetMs: Math.max(oldest + this.windowMs - now, 0) };
     }
 
     private dropKey(key: string): void {

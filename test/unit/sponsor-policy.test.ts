@@ -30,10 +30,12 @@ import {
     grantPolicyConflict,
     describeGlobalSponsorPolicy,
     shadowedSponsorEnvKeys,
+    policyFileRateLimits,
     __resetSponsorPolicyForTests
 } from '../../srv/submission/sponsor-policy';
+import { rateClassLimit } from '../../srv/utils/rate-classes';
 
-const ENV_KEYS = ['NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_POLICY_FILE', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES',
+const ENV_KEYS = ['NIGHTGATE_PROVE_RATE_LIMIT', 'NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_POLICY_FILE', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES',
     'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_SPONSOR_ALLOW_SWAPS', 'NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES'];
 let tmpDir: string;
 
@@ -93,6 +95,26 @@ describe('allowedTokenTypes: raw types, floor opens, grant narrows', () => {
         fs.writeFileSync(file, JSON.stringify({ allowedTokenTypes: ['nope'] }));
         __resetSponsorPolicyForTests();
         expect(() => getGlobalSponsorPolicy()).toThrow(SponsorPolicyUnavailableError);
+    });
+
+    it('policy file: rateLimits names rate classes and replaces their env counts; an unknown class fails closed', () => {
+        const file = path.join(tmpDir, 'policy.json');
+        fs.writeFileSync(file, JSON.stringify({ allowedContracts: [], rateLimits: { prove: 7 } }));
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        process.env.NIGHTGATE_PROVE_RATE_LIMIT = '99';
+        expect(getGlobalSponsorPolicy().rateLimits).toEqual({ prove: 7 });
+        expect(policyFileRateLimits()).toEqual({ prove: 7 });
+        expect(rateClassLimit('prove')).toBe(7);
+        expect(rateClassLimit('read')).toBe(60);
+        fs.writeFileSync(file, JSON.stringify({ rateLimits: { nope: 1 } }));
+        __resetSponsorPolicyForTests();
+        expect(() => getGlobalSponsorPolicy()).toThrow(SponsorPolicyUnavailableError);
+        expect(policyFileRateLimits()).toEqual({});
+        expect(rateClassLimit('prove')).toBe(99);
+        fs.writeFileSync(file, JSON.stringify({ rateLimits: { prove: 0 } }));
+        __resetSponsorPolicyForTests();
+        expect(() => getGlobalSponsorPolicy()).toThrow(SponsorPolicyUnavailableError);
+        expect(rateClassLimit('prove')).toBe(99);
     });
 
     it('effective: a closed floor stays closed whatever the grant says; a grant narrows an open floor', () => {

@@ -11,7 +11,7 @@ import { deriveGranteeId } from '../grantee-identity';
 import { getConfiguredGranteeBinding, isSelfServiceGranteeRegistrationAllowed } from '../../utils/nightgate-config';
 import { DisclosureGrants, GranteeIdentities, type DisclosureGrant } from '#cds-models/midnight';
 import { grantDisclosure, revokeDisclosure, reindexDisclosures, registerGranteeIdentity } from '#cds-models/NightgateService';
-import { disclosureRateLimiter, reindexRateLimiter, facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
 
 const { INSERT, UPDATE, SELECT, DELETE } = cds.ql;
@@ -39,7 +39,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
             : DEFAULT_ATTESTATION_VAULT_REF;
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(disclosureRateLimiter, data.sessionId, req)) return;
+        if (!checkRate('prove', data.sessionId, req)) return;
 
         const payloadHashLc = data.payloadHash.toLowerCase();
         const granteeLc = data.grantee.toLowerCase();
@@ -150,7 +150,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
             : DEFAULT_ATTESTATION_VAULT_REF;
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(disclosureRateLimiter, data.sessionId, req)) return;
+        if (!checkRate('prove', data.sessionId, req)) return;
 
         const payloadHashLc = data.payloadHash.toLowerCase();
         const granteeLc = data.grantee.toLowerCase();
@@ -200,7 +200,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
             : DEFAULT_ATTESTATION_VAULT_REF;
         const contractAddressLc = data.contractAddress.toLowerCase();
 
-        if (!checkRate(reindexRateLimiter, contractAddressLc, req)) return;
+        if (!checkRate('compute', contractAddressLc, req)) return;
 
         // Without a live provider, answer with zero counts instead of a server error.
         if (!liveProviderConfigured()) {

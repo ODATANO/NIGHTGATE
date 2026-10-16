@@ -218,6 +218,9 @@ entity AgentGrants : cuid, managed {
     maxJobsPerDay     : Integer; // null = no limit; per UTC day
     jobsUsedToday     : Integer default 0;
     budgetWindow      : String(10); // YYYY-MM-DD; the UTC day jobsUsedToday counts for
+    maxJobsPerHour    : Integer; // null = no limit; per UTC hour
+    jobsUsedThisHour  : Integer default 0;
+    hourWindow        : String(13); // YYYY-MM-DDTHH; the UTC hour jobsUsedThisHour counts for
     sponsorSessionId  : UUID;
     allowedContracts  : LargeString; // JSON array of strings; null = platform list
     allowedCircuits   : LargeString; // JSON array of strings; null = platform list

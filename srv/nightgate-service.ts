@@ -12,6 +12,7 @@ import { fetchContractState } from './crawler/indexer-supplement';
 import { normalizeIdentifier } from './crawler/transaction-identifiers';
 import { getNightgatePluginConfig, resolveNightgateRuntimeConfig } from './utils/nightgate-config';
 import { RateLimiter } from './utils/rate-limiter';
+import { rejectRateLimited } from './utils/rate-classes';
 
 // One limit for all callers: the public indexer blocks the host's IP when it gets too many requests.
 const stateAtIndexerLimiter = new RateLimiter({ windowMs: 1000, maxRequests: 2 });
@@ -199,9 +200,10 @@ export default class NightgateService extends cds.ApplicationService {
                 return snapshot;
             } catch (err) {
                 if (err instanceof IndexerBudgetExhausted) {
-                    const seconds = Math.max(1, Math.ceil(err.retryAfterMs / 1000));
-                    try { req.http?.res?.set?.('Retry-After', String(seconds)); } catch { /* header is a courtesy */ }
-                    return req.reject(429, `Rate limited. Retry after ${seconds}s`);
+                    return rejectRateLimited(req, {
+                        name: 'indexer-budget', limit: stateAtIndexerLimiter.maxRequests,
+                        windowSeconds: stateAtIndexerLimiter.windowMs / 1000, retryAfterMs: err.retryAfterMs
+                    });
                 }
                 return req.reject(502, `indexer could not serve the contract state: ${(err as Error).message}`);
             }

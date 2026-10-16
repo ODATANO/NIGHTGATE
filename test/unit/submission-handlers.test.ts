@@ -89,6 +89,7 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
 }));
 
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';
+import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
 import { computeRecordKey } from '../../srv/submission/predicate-state';
 import { JobAdmissionBusyError } from '../../srv/submission/background-jobs';
 import {
@@ -842,6 +843,9 @@ describe('error translation to OData status codes', () => {
 
 // ---- Rate limiting --------------------------------------------------------
 
+// One prove limiter for every prove action: the sessions of earlier tests must not fill a principal's key table.
+beforeEach(() => __resetRateLimitersForTests());
+
 describe('rate limiting', () => {
     test('deployContract: 5 deploys/hour/session, 6th gets 429', async () => {
         const srv = makeFakeService();
@@ -863,7 +867,7 @@ describe('rate limiting', () => {
         expect(sixth.reject).toHaveBeenCalledWith(429, expect.stringMatching(/Rate limited/));
     });
 
-    test('submitContractCall: 30 calls/min/session, 31st gets 429', async () => {
+    test('submitContractCall: 60 prove calls/hour/session, 61st gets 429', async () => {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, {} as any, {
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
@@ -873,7 +877,7 @@ describe('rate limiting', () => {
         });
 
         const sessionId = `rate-test-call-${Date.now()}`;
-        for (let i = 0; i < 30; i++) {
+        for (let i = 0; i < 60; i++) {
             const req = makeReq({ ...VALID_CALL_ARGS, sessionId });
             await srv.handlers['submitContractCall'](req);
             expect(req.reject).not.toHaveBeenCalled();
@@ -1050,10 +1054,10 @@ describe('anchorDocument', () => {
         expect(result).toMatchObject({ jobId: expect.any(String), status: 'pending' });
     });
 
-    test('rate-limited at 10 anchors/hour/session', async () => {
+    test('rate-limited at 60 prove calls/hour/session', async () => {
         const { srv } = setupHandlersWithDb();
         const sessionId = `anchor-rate-${Date.now()}`;
-        for (let i = 0; i < 10; i++) {
+        for (let i = 0; i < 60; i++) {
             const req = makeReq({ ...VALID_ANCHOR_ARGS(), sessionId });
             await srv.handlers['anchorDocument'](req);
             expect(req.reject).not.toHaveBeenCalled();
@@ -1609,10 +1613,10 @@ describe('grantDisclosure', () => {
         }));
     });
 
-    test('rate-limited at 30 ops/hour/session', async () => {
+    test('rate-limited at 60 prove calls/hour/session', async () => {
         const { srv } = setupHandlersWithDb();
         const sessionId = `disc-rate-${Date.now()}`;
-        for (let i = 0; i < 30; i++) {
+        for (let i = 0; i < 60; i++) {
             const req = makeReq({ ...VALID_ARGS(), sessionId });
             await srv.handlers['grantDisclosure'](req);
             expect(req.reject).not.toHaveBeenCalled();
@@ -2469,7 +2473,8 @@ describe('issueFieldPredicateAttestationBatch', () => {
         expect(insertedEntries.match(new RegExp(dupe.fieldKey, 'g'))).toHaveLength(1);
     });
 
-    test('counts N claims against the predicate rate limiter, not one action call', async () => {
+    test('counts N claims against the prove class, not one action call; the env count applies at once', async () => {
+        process.env.NIGHTGATE_PROVE_RATE_LIMIT = '10';
         const { srv } = setupHandlersWithDb();
         const sessionId = `fieldpredbatch-rate-${Math.random().toString(36).slice(2)}`;
         const eight = JSON.stringify(Array.from({ length: 8 }, (_, i) => makeClaim(i + 1)));
@@ -2478,7 +2483,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         await srv.handlers['issueFieldPredicateAttestationBatch'](first);
         expect(first.reject).not.toHaveBeenCalled();
 
-        // 8 of the 10/hour budget consumed; a 3-claim follow-up must trip 429.
+        // 8 of the 10 per hour consumed; a 3-claim follow-up must trip 429.
         const second = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: JSON.stringify([makeClaim(11), makeClaim(12), makeClaim(13)]), sessionId }));
         await srv.handlers['issueFieldPredicateAttestationBatch'](second);
         expect(second.reject).toHaveBeenCalledWith(429, expect.stringMatching(/Rate limited/));
@@ -2488,6 +2493,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         const third = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: JSON.stringify([makeClaim(14), makeClaim(15)]), sessionId }));
         await srv.handlers['issueFieldPredicateAttestationBatch'](third);
         expect(third.reject).not.toHaveBeenCalled();
+        delete process.env.NIGHTGATE_PROVE_RATE_LIMIT;
     });
 });
 

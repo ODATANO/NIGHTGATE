@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.34.0 - 2026-10-15
+
+One throughput policy: rate classes, grant budgets per hour, one 429 answer.
+Schema delta: three nullable columns on `AgentGrants`. No circuit change.
+
+### Changes
+
+- Rate classes replace the per-action limiters. Each class has a fixed window
+  and one count, `NIGHTGATE_<CLASS>_RATE_LIMIT` or `rateLimits.<class>` in
+  `NIGHTGATE_SPONSOR_POLICY_FILE`, which applies without a restart: `prove`
+  60/hour per session (contract calls and batches, token operations, the
+  `issue*` attestations counting their claims, anchoring, document registry,
+  disclosure, `buildSponsorable`), `deploy` 5/hour per session, `sponsor`
+  120/hour (the three sponsor actions and `mintFactoryToken`), `compute`
+  120/hour (`prepareDocumentProof`, `prepareMembershipSet`, `claimDisclosure`,
+  `postSwapOffer`, `retireSwapOffer`, `reindexDisclosures` per contract),
+  `read` 60/minute (offer board, `getBoardStatus`, `getRuntimeInfo`, wallet
+  diagnostics), `wallet` 10/minute (`connectWallet`, `sendNight`, dust
+  registration), `signing` 10/hour, `admin` 10/hour, `public-verify`
+  60/minute per client address. `NIGHTGATE_GRANT_ADMIN_RATE_LIMIT` is
+  `NIGHTGATE_ADMIN_RATE_LIMIT`. The old numbers: deploy 5/h, call 30/min,
+  anchor 10/h, predicate 10/h, disclosure 30/h, registrar 30/h, reindex
+  60/h, sponsor 120/h, swap offer 60/h, swap list 600/h, holder claim
+  60/h, build 30/h, prepare 120/h, board status 60/min, runtime info 30/min,
+  connect 10/min, send 10/min, dust registration 10/h, diagnostics 60/min.
+- `AgentGrants.maxJobsPerHour` next to `maxJobsPerDay`: a budget per UTC
+  hour that survives a restart, on `createAgentGrant`, `createAgentGrants`
+  and `updateAgentGrant`; a unit goes back when the request fails with a
+  4xx, a rate class that refuses after the take included.
+  `NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR` and `_PER_DAY` fill a budget the
+  creation leaves out.
+- `sponsorFinalizedTransaction`, `sponsorUnboundTransaction` and `sponsorSwap`
+  deserialize the caller's bytes before a job exists: input that is not a
+  proven transaction answers 400 at once instead of failing in a proving slot.
+- Every 429 names its limit and carries `Retry-After`: `Rate limited
+  (prove: 60 per hour). Retry after 58s`. Answers under a limit carry
+  `RateLimit-Policy` and `RateLimit` (IETF httpapi draft).
+- `getGrantUsage` returns `limits`: the hour and day budgets as
+  `{ max, used, resetsAt }` and the rate classes a grant can reach as
+  `{ name, windowSeconds, max, remaining }`. A token may leave `grantId`
+  empty.
+- `getMetrics()`: `rate_limited_total{limit}`.
+- Wallet worker pool. `NIGHTGATE_WALLET_WORKERS` (default 1) runs user wallets on
+  several threads, a wallet always in the same one; `NIGHTGATE_SPONSOR_WORKERS=dedicated`
+  gives every pool sponsor a thread of its own, warms the sponsors side by side at
+  boot, and lets sponsored jobs of different sponsors run in parallel (one thread
+  carried every sponsor before: ~20 sponsored jobs a minute on the hosted box).
+  Saves are ordered per wallet, a crash or rotation of one worker touches only its
+  wallets. A bound call whose sponsor lives in another worker answers 412; keep
+  `shared` for bound sponsoring on pool wallets. `getMetrics()` and the status
+  report the pool and every worker.
+- `@odatano/nightgate-tx` 0.13.0: `NightgateApiError.retryAfterSeconds`
+  from `Retry-After`.
+
+### Fixes
+
+- `sponsorUnboundTransaction` and `sponsorSwap` keep the dust backing reserved
+  after the spend went out until the sponsor wallet no longer lists the spent
+  note (`NIGHTGATE_NOTE_SPENT_WAIT_MS`, default 30 s). The reservation ended
+  at inclusion before, and the next job on that backing built a second spend
+  of the same note, which the node rejected (`1010/196`) and the job rebuilt.
+- A submit that died on the client's own closing socket counts as a resend:
+  a copy the node refuses is looked up on the indexer and reported as landed,
+  instead of being rebuilt as a dust race. The resend, refusal and dust-race
+  log lines carry the transaction identifier.
+
 ## 0.33.3 - 2026-10-13
 
 ### Fixes

@@ -91,7 +91,8 @@ import cds from '@sap/cds';
 import { encrypt, getEncryptionKey } from '../../srv/utils/crypto';
 import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 import { RateLimiter } from '../../srv/utils/rate-limiter';
-import { registerWalletSessionHandlers, startSessionCleanup, __resetWalletRateLimitersForTests } from '../../srv/sessions/wallet-sessions';
+import { registerWalletSessionHandlers, startSessionCleanup } from '../../srv/sessions/wallet-sessions';
+import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
 
 const TEST_USER_ID = 'guard-user';
 let __ipCounter = 0;
@@ -146,7 +147,7 @@ describe('wallet session guard branches', () => {
     });
 
     beforeEach(() => {
-        __resetWalletRateLimitersForTests();
+        __resetRateLimitersForTests();
         vi.clearAllMocks();
         for (const k of NIGHTGATE_ENV_KEYS) delete process.env[k];
         (cds.env as any).requires = { nightgate: {} };
@@ -169,8 +170,8 @@ describe('wallet session guard branches', () => {
         });
 
         it('rejects rate-limited clients with 429', async () => {
-            const spy = vi.spyOn(RateLimiter.prototype, 'check')
-                .mockReturnValue({ allowed: false, retryAfterMs: 30_000 });
+            const spy = vi.spyOn(RateLimiter.prototype, 'checkMany')
+                .mockReturnValue({ allowed: false, retryAfterMs: 30_000, limit: 10, remaining: 0, resetMs: 30_000 });
             try {
                 const req = makeReq({ mnemonic: MNEMONIC });
                 await handlers['deriveWalletInfo'](req);
@@ -243,8 +244,8 @@ describe('wallet session guard branches', () => {
         });
 
         it('rejects rate-limited clients with 429', async () => {
-            const spy = vi.spyOn(RateLimiter.prototype, 'check')
-                .mockReturnValue({ allowed: false, retryAfterMs: 5000 });
+            const spy = vi.spyOn(RateLimiter.prototype, 'checkMany')
+                .mockReturnValue({ allowed: false, retryAfterMs: 5000, limit: 10, remaining: 0, resetMs: 5000 });
             try {
                 const req = makeReq(base);
                 await handlers[op](req);

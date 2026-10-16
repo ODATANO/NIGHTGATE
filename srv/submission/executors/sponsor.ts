@@ -115,7 +115,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
             if (!currentSubmissionId) return;
             try { await db.run(UPDATE.entity(PendingSubmissions).set({ status: 'included', contractAddress: out.contractAddress ?? null, circuitName: out.circuits?.[0] ?? null }).where({ ID: currentSubmissionId })); } catch { /* best effort */ }
         };
-        return { failPreviousAttempt, onSubmitIntent, markIncluded };
+        return { failPreviousAttempt, onSubmitIntent, markIncluded, lastTxHash: () => currentTxHash };
     };
 
     /** Sponsor wallets to try, in order. A named sponsor is never swapped for another, since grants pin it. */
@@ -290,10 +290,11 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                 } catch (e) {
                     lastErr = e;
                     const verdict = decideSponsorFailure(e);
+                    const attemptHash = (ledger.lastTxHash() ?? '?').slice(0, 16);
                     if (verdict.decision === 'ambiguous') {
                         // The tx may still land, so a rebuild could pay twice.
                         // The chain confirmer settles the job later.
-                        cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)}: ambiguous submit outcome, leaving the job for reconciliation: ${String((e as Error).message).slice(0, 120)}`);
+                        cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)}: ambiguous submit outcome of ${attemptHash}, leaving the job for reconciliation: ${String((e as Error).message).slice(0, 120)}`);
                         throw e;
                     }
                     if (verdict.decision === 'landed-not-applied') {
@@ -307,7 +308,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                         // A generic pool rejection gets one rebuild only, since the caller's tx may be the cause.
                         const budget = verdict.generic ? Math.min(1, dustRetries) : dustRetries;
                         if (attempt < budget) {
-                            cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} hit a dust race (1010/170|171|196 or pool Invalid), rebuild-retry ${attempt + 1}/${budget}: ${String((e as Error).message).slice(-120)}`);
+                            cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} hit a dust race with ${attemptHash} (1010/170|171|196 or pool Invalid), rebuild-retry ${attempt + 1}/${budget}: ${String((e as Error).message).slice(-120)}`);
                             await new Promise(resolve => setTimeout(resolve, dustBackoffMs));
                             continue; // rebuild the dust payment with the same sponsor
                         }

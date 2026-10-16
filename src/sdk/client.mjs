@@ -13,13 +13,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-/** Error of a failed server call, with the server's status and error code. */
+/** Error of a failed server call, with the server's status and error code. `retryAfterSeconds` comes from `Retry-After` when the server sent it. */
 export class NightgateApiError extends Error {
-    constructor(status, code, message) {
+    constructor(status, code, message, retryAfterSeconds) {
         super(message);
         this.name = 'NightgateApiError';
         this.status = status;
         this.code = code;
+        this.retryAfterSeconds = retryAfterSeconds;
     }
 }
 
@@ -166,7 +167,9 @@ export function connect(opts) {
         try { payload = text ? JSON.parse(text) : {}; } catch { payload = { raw: text }; }
         if (!response.ok) {
             const err = payload?.error;
-            throw new NightgateApiError(response.status, err?.code, err?.message ?? `NIGHTGATE request failed with HTTP ${response.status}`);
+            const retryAfter = Number(response.headers?.get?.('retry-after'));
+            throw new NightgateApiError(response.status, err?.code, err?.message ?? `NIGHTGATE request failed with HTTP ${response.status}`,
+                Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined);
         }
         return stripODataNoise(payload);
     }

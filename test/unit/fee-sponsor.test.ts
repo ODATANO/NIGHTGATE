@@ -19,7 +19,9 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
 }));
 const walletWaitForSyncedStateMock = vi.hoisted(() => vi.fn(async (..._args: any[]) => ({ synced: true })));
 vi.mock('../../srv/midnight/wallet-worker-client', () => ({
-    walletWaitForSyncedState: walletWaitForSyncedStateMock
+    walletWaitForSyncedState: walletWaitForSyncedStateMock,
+    assignDedicatedWorker: vi.fn(),
+    walletWorkerPoolConfig: () => ({ walletWorkers: 1, sponsorWorkers: 'shared' })
 }));
 
 import {

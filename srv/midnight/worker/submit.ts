@@ -240,7 +240,8 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
 // The SDK's node client closes its connection after every submit, so parallel submits on one
 // client break each other. Each submit therefore gets a client of its own from a pool.
 // The SDK's disconnect returns before the socket is closed, so a client is reused only after a
-// short wait. A send that fails on such a closing socket was never sent and is retried once.
+// short wait. A send that fails on such a closing socket may have left the socket first, so it is
+// resent once and a refusal of the resend is looked up on the indexer.
 export let SUBMIT_CLIENT_POOL_MAX = 8;
 let submitClientSettleMs = 2500;
 /** Limit for closing a stuck client. The SDK's close waits for the client's start, which may be what hangs. */
@@ -464,7 +465,7 @@ export async function announceSubmitIntent(port: MessagePort | undefined, intent
     });
 }
 
-/** The send failed on a socket the client was still closing, so nothing was sent. */
+/** The send failed on a socket the client was closing. The request may have left before the close. */
 export function isClosingSocketReject(err: unknown): boolean {
     return /disconnected from \S*:\s*1000\s*::\s*Normal Closure/i.test(classificationHaystack(err));
 }
@@ -503,7 +504,7 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
         return true;
     };
     const resend = async (reason: string): Promise<void> => {
-        log('warn', `${site}: ${reason}; resending the SAME transaction (no rebuild, no re-proving)`);
+        log('warn', `${site}: ${identifier.slice(0, 16)}: ${reason}; resending the SAME transaction (no rebuild, no re-proving)`);
         await new Promise((r) => setTimeout(r, submitTransportBackoffMs()));
     };
     if (opts.book) await bookPending(entry, tx, site);
@@ -517,7 +518,12 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
                 const phase = submitPhaseOf(e);
                 const earlierUnresolved = maybeSent;
                 if (attempt === 0 && isClosingSocketReject(e)) {
-                    log('warn', `${site}: submit request died on the client's own closing socket (SDK disconnect lag); retrying once on a settled client`);
+                    // The request may have left before the socket closed. The node refuses a copy it
+                    // already has, and a refused resend is looked up on the indexer below, never rebuilt.
+                    maybeSent = true;
+                    if (resends >= retries) throw unknownOutcome(e);
+                    resends++;
+                    log('warn', `${site}: submit request ${identifier.slice(0, 16)} died on the client's own closing socket (SDK disconnect lag); retrying once on a settled client`);
                     continue;
                 }
                 if (phase === 'connect') {
@@ -547,7 +553,7 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
                 // A resend was refused. The first send may have landed, so check the indexer.
                 if (resends > 0 && await landed(submitLandedProbeMs(), 'although the resend was refused')) return identifier;
                 if (earlierUnresolved) throw unknownOutcome(e);
-                log('info', `${site}: submit failed (${isPreMempoolReject(e) ? 'pre-mempool reject' : 'not pre-mempool'}): ${safeDeepInspect(e, 512).slice(0, 600)}`);
+                log('info', `${site}: submit of ${identifier.slice(0, 16)} failed (${isPreMempoolReject(e) ? 'pre-mempool reject' : 'not pre-mempool'}): ${safeDeepInspect(e, 512).slice(0, 600)}`);
                 throw e;
             }
         }

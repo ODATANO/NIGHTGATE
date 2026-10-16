@@ -44,7 +44,8 @@ vi.mock('../../srv/utils/wallet-info', async () => {
     };
 });
 
-import { registerWalletSessionHandlers, __resetWalletRateLimitersForTests } from '../../srv/sessions/wallet-sessions';
+import { registerWalletSessionHandlers } from '../../srv/sessions/wallet-sessions';
+import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
 import { encrypt, decrypt, getEncryptionKey } from '../../srv/utils/crypto';
 import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 
@@ -148,7 +149,7 @@ function seedSession(db: ReturnType<typeof makeFakeDb>, overrides: any = {}) {
     });
 }
 
-beforeEach(() => { __resetWalletRateLimitersForTests(); });
+beforeEach(() => { __resetRateLimitersForTests(); });
 
 describe('connectWalletForSigning: argument validation', () => {
     function setup() {

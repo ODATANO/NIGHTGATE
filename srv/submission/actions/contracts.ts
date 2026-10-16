@@ -7,7 +7,7 @@ import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
 import { vaultDims } from '../verify-state';
 import { SET_DEPTH } from '../set-root';
-import { deployRateLimiter, callRateLimiter, buildRateLimiter, MerkleProofBundle, validateSchemaSlots, validateOpening, facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { MerkleProofBundle, validateSchemaSlots, validateOpening, facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
 import { buildSponsorable, deployContract, submitContractCall, submitContractCallBatch } from '#cds-models/NightgateService';
@@ -23,7 +23,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(deployRateLimiter, sessionId, req)) return;
+        if (!checkRate('deploy', sessionId, req)) return;
 
         let parsedInitialState: unknown = {};
         if (initialPrivateState) {
@@ -65,7 +65,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(callRateLimiter, sessionId, req)) return;
+        if (!checkRate('prove', sessionId, req)) return;
 
         let parsedArgs: unknown[] = [];
         if (args) {
@@ -124,7 +124,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(buildRateLimiter, sessionId, req)) return;
+        if (!checkRate('prove', sessionId, req)) return;
         let parsedArgs: unknown[] = [];
         if (args) { try { const v = JSON.parse(args); if (!Array.isArray(v)) return req.reject(400, 'args must be a JSON array'); parsedArgs = v; } catch { return req.reject(400, 'args must be valid JSON'); } }
 
@@ -154,7 +154,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (!calls) return req.reject(400, 'calls is required');
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(callRateLimiter, sessionId, req)) return;
+        if (!checkRate('prove', sessionId, req)) return;
 
         // The batch size is limited: each call carries a proof,
         // and one rejected call fails the whole batch.

@@ -10,7 +10,7 @@ import { DEFAULT_ATTESTATION_VAULT_REF, UINT64_MAX, vaultDims, parsePredicate, c
 import { blake2b256Hex, PureCircuitsUnavailableError } from '../document-proof';
 import { membershipPathFor, SET_DEPTH } from '../set-root';
 import { Transactions, TransactionResults, PredicateAttestations, type Transaction } from '#cds-models/midnight';
-import { predicateRateLimiter, parseValidUntil, SchemaSlotWire, OpeningWire, parseInclusionPath, validateSchemaSlots, validateOpening, isVacuousMask, INT64_MAX, parseDocPairInputs, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { parseValidUntil, SchemaSlotWire, OpeningWire, parseInclusionPath, validateSchemaSlots, validateOpening, isVacuousMask, INT64_MAX, parseDocPairInputs, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
 import { issueDocumentDiffAttestation, issueDocumentIntegrityAttestation, issueFieldEqualityAttestation, issueFieldMembershipAttestation, issueFieldPredicateAttestation, issueFieldPredicateAttestationBatch, verifyPredicateAttestation } from '#cds-models/NightgateService';
@@ -79,7 +79,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             : DEFAULT_ATTESTATION_VAULT_REF;
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
+        if (!checkRate('prove', data.sessionId, req)) return;
 
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
         if (!attesterId) return;
@@ -186,7 +186,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             : DEFAULT_ATTESTATION_VAULT_REF;
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
+        if (!checkRate('prove', data.sessionId, req)) return;
 
         // No operator or threshold here. The claim is the expected digest itself.
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
@@ -340,7 +340,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         }
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
+        if (!checkRate('prove', data.sessionId, req)) return;
 
         // Only the set root is public. The value digest and the paths stay private proof inputs.
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
@@ -454,7 +454,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             : DEFAULT_ATTESTATION_VAULT_REF;
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
+        if (!checkRate('prove', data.sessionId, req)) return;
 
         // Document A is stored in the payloadHash column.
         const attesterIdA = await resolveAttester(req, data.sessionId, data.attesterIdA, Boolean(data.contentRootA));
@@ -570,7 +570,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             : DEFAULT_ATTESTATION_VAULT_REF;
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(predicateRateLimiter, data.sessionId, req)) return;
+        if (!checkRate('prove', data.sessionId, req)) return;
 
         // k is stored in the threshold column.
         const attesterIdA = await resolveAttester(req, data.sessionId, data.attesterIdA, Boolean(data.contentRootA));
@@ -875,7 +875,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         if (rejectIfMainnetBlocked(req)) return;
         // Each claim counts against the rate limit, so a batch cannot bypass it.
-        if (!checkRate(predicateRateLimiter, data.sessionId, req, uniqueClaims.length)) return;
+        if (!checkRate('prove', data.sessionId, req, uniqueClaims.length)) return;
 
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
         if (!attesterId) return;

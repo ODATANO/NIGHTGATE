@@ -13,7 +13,7 @@ import { agentOutputProducedAt } from '../document-proof';
 import { Documents, Transactions, TransactionResults, type Document, type Transaction } from '#cds-models/midnight';
 import type { Row } from '../../utils/db-types';
 import type { ActionRequest } from '@sap/cds';
-import { anchorRateLimiter, registrarRateLimiter, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
 import { anchorDocument, purgeExpired, registerPassport, retractAttestation, verifyDocument } from '#cds-models/NightgateService';
 
@@ -36,7 +36,7 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
             : DEFAULT_ATTESTATION_VAULT_REF;
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(anchorRateLimiter, data.sessionId, req)) return;
+        if (!checkRate('prove', data.sessionId, req)) return;
 
         const metadataHashBytes = sha256(new TextEncoder().encode(metadataStr));
         const producedAt = agentOutputProducedAt(data.contentType, metadataStr);
@@ -196,7 +196,7 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
             : DEFAULT_ATTESTATION_VAULT_REF;
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(registrarRateLimiter, data.sessionId, req)) return;
+        if (!checkRate('prove', data.sessionId, req)) return;
 
         const passportIdLc = data.passportId.toLowerCase();
         const ownerIdLc = data.ownerId.toLowerCase();
@@ -244,7 +244,7 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
             ? data.compiledArtifactRef
             : DEFAULT_ATTESTATION_VAULT_REF;
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate(registrarRateLimiter, data.sessionId, req)) return;
+        if (!checkRate('prove', data.sessionId, req)) return;
         const keyLc = key.toLowerCase();
         const contractAddressLc = data.contractAddress.toLowerCase();
         return runSubmission(req, async () => {
