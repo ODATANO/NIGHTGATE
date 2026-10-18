@@ -2,7 +2,7 @@
  * NIGHTGATE's two transport lanes (`srv/utils/transport-lanes.ts`) inside the
  * package's middleware with a stub delegate: the agent-token lane admits a
  * token on the Nightgate service under the marker principal (the grant hook
- * authenticates), the public verify lane admits `/api/v1/verify` when enabled.
+ * authenticates), the public verify lane admits `/odata/v4/midnight-verify` when enabled.
  */
 
 import { describe, test, expect, vi, beforeEach } from 'vitest';
@@ -18,7 +18,7 @@ const basic = (u: string, p: string) => 'Basic ' + Buffer.from(`${u}:${p}`).toSt
 let delegate: ReturnType<typeof vi.fn>;
 let auth: AuthMiddleware;
 
-async function run(headers: Record<string, string>, path = '/api/v1/nightgate/sponsorFinalizedTransaction', method = 'GET') {
+async function run(headers: Record<string, string>, path = '/odata/v4/midnight/sponsorFinalizedTransaction', method = 'GET') {
     const req: any = { headers, baseUrl: path, originalUrl: path, ip: '10.0.0.1', method };
     const res: any = { statusCode: 200, set: vi.fn(), setHeader: vi.fn(), status: vi.fn().mockReturnThis(), json: vi.fn(), send: vi.fn(), end: vi.fn() };
     const next = vi.fn();
@@ -47,7 +47,7 @@ describe('transport lanes', () => {
         expect(ok.req.user.is('admin')).toBe(false);
         expect(delegate).not.toHaveBeenCalled();
         // every other service is the delegate's: no grant hook there
-        for (const path of ['/api/v1/admin/anything', '/api/v1/analytics/x', '/api/v1/indexer/getHealth()']) {
+        for (const path of ['/odata/v4/midnight-admin/anything', '/odata/v4/midnight-analytics/x', '/odata/v4/midnight-indexer/getHealth()']) {
             const other = await run({ 'x-agent-token': 'ngat_abc' }, path);
             expect(other.req.user, path).toBeUndefined();
         }
@@ -55,7 +55,7 @@ describe('transport lanes', () => {
     });
 
     test('$batch and the query form are admitted under the marker; the grant hook authenticates every part', async () => {
-        for (const path of ['/api/v1/nightgate/$batch', '/api/v1/nightgate/$batch?x=1', '/api/v1/nightgate', '/api/v1/nightgate?x=1']) {
+        for (const path of ['/odata/v4/midnight/$batch', '/odata/v4/midnight/$batch?x=1', '/odata/v4/midnight', '/odata/v4/midnight?x=1']) {
             const { req, next } = await run({ 'x-agent-token': 'ngat_abc' }, path);
             expect(next, path).toHaveBeenCalled();
             expect(req.user.id).toBe(AGENT_TOKEN_TRANSPORT_USER);
@@ -64,10 +64,10 @@ describe('transport lanes', () => {
 
     test('an empty token header and lookalike prefixes do not open the lane', async () => {
         for (const [headers, path] of [
-            [{ 'x-agent-token': '' }, '/api/v1/nightgate/x'],
-            [{ 'x-agent-token': 'ngat_abc' }, '/api/v1/nightgate-admin/x'],
-            [{ 'x-agent-token': 'ngat_abc' }, '/api/v1/nightgateevil/sponsorFinalizedTransaction'],
-            [{ 'x-agent-token': 'ngat_abc' }, '/api/v1/admin/../nightgate-lookalike']
+            [{ 'x-agent-token': '' }, '/odata/v4/midnight/x'],
+            [{ 'x-agent-token': 'ngat_abc' }, '/odata/v4/midnight-admin/x'],
+            [{ 'x-agent-token': 'ngat_abc' }, '/odata/v4/midnightevil/sponsorFinalizedTransaction'],
+            [{ 'x-agent-token': 'ngat_abc' }, '/odata/v4/midnight-admin/../nightgate-lookalike']
         ] as const) {
             const { req } = await run(headers as Record<string, string>, path);
             expect(req.user, path).toBeUndefined();
@@ -86,7 +86,7 @@ describe('transport lanes', () => {
     });
 
     test('the public verify lane stays closed while NIGHTGATE_PUBLIC_VERIFY is unset', async () => {
-        const { req, res } = await run({}, "/api/v1/verify/verifyAttestationState(contractAddress='c',payloadHash='p')");
+        const { req, res } = await run({}, "/odata/v4/midnight-verify/verifyAttestationState(contractAddress='c',payloadHash='p')");
         expect(req.user).toBeUndefined();
         expect(delegate).toHaveBeenCalledTimes(1);
         expect(res.set).not.toHaveBeenCalledWith('Access-Control-Allow-Origin', '*');
@@ -95,29 +95,29 @@ describe('transport lanes', () => {
     test('enabled: the verify path passes under the public marker with CORS headers; lookalikes stay closed', async () => {
         process.env.NIGHTGATE_PUBLIC_VERIFY = 'true';
         __resetConfigForTests();
-        for (const path of ['/api/v1/verify', "/api/v1/verify/verifyPredicateState(contractAddress='c',payloadHash='p',predicate='setMembership')", '/api/v1/verify?x=1']) {
+        for (const path of ['/odata/v4/midnight-verify', "/odata/v4/midnight-verify/verifyPredicateState(contractAddress='c',payloadHash='p',predicate='setMembership')", '/odata/v4/midnight-verify?x=1']) {
             const { req, res, next } = await run({}, path);
             expect(next, path).toHaveBeenCalled();
             expect(req.user.id).toBe(PUBLIC_VERIFY_TRANSPORT_USER);
             expect(res.set).toHaveBeenCalledWith('Access-Control-Allow-Origin', '*');
         }
-        for (const path of ['/api/v1/verifyx/a', '/api/v1/verify-admin', '/api/v1/nightgate/verifyAttestationState()', '/api/v1/admin/x']) {
+        for (const path of ['/odata/v4/midnight-verifyx/a', '/odata/v4/midnight-verify-admin', '/odata/v4/midnight/verifyAttestationState()', '/odata/v4/midnight-admin/x']) {
             const { req } = await run({}, path);
             expect(req.user, path).toBeUndefined();
         }
-        const op = await run({ authorization: basic('nightgate', 'op-secret') }, '/api/v1/verify/x');
+        const op = await run({ authorization: basic('nightgate', 'op-secret') }, '/odata/v4/midnight-verify/x');
         expect(op.req.user.id).toBe('nightgate');
     });
 
     test('the lane answers the CORS preflight itself', async () => {
         process.env.NIGHTGATE_PUBLIC_VERIFY = 'true';
         __resetConfigForTests();
-        const { res, next } = await run({ origin: 'https://example.org' }, '/api/v1/verify/verifyAttestationState()', 'OPTIONS');
+        const { res, next } = await run({ origin: 'https://example.org' }, '/odata/v4/midnight-verify/verifyAttestationState()', 'OPTIONS');
         expect(next).not.toHaveBeenCalled();
         expect(res.statusCode).toBe(204);
         expect(res.end).toHaveBeenCalled();
         expect(res.set).toHaveBeenCalledWith('Access-Control-Allow-Methods', 'GET, OPTIONS');
-        const other = await run({}, '/api/v1/nightgate/x', 'OPTIONS');
+        const other = await run({}, '/odata/v4/midnight/x', 'OPTIONS');
         expect(other.req.user).toBeUndefined();
         expect(delegate).toHaveBeenCalledTimes(1);
     });

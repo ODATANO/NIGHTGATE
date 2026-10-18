@@ -56,7 +56,7 @@ fetch("http://127.0.0.1:" + port + path, {
 
 # Readiness says: crawler down, database / runtime / initialization up.
 only_crawler_down() {
-    r=$(api GET "/api/v1/indexer/getReadiness()")
+    r=$(api GET "/odata/v4/midnight-indexer/getReadiness()")
     body=${r#* }
     case "$body" in
         *'"crawler":false'*) ;;
@@ -69,9 +69,9 @@ only_crawler_down() {
 }
 
 cycle_crawler() {
-    p=$(api POST "/api/v1/indexer/pauseCrawler")
+    p=$(api POST "/odata/v4/midnight-indexer/pauseCrawler")
     sleep 3
-    r=$(api POST "/api/v1/indexer/resumeCrawler")
+    r=$(api POST "/odata/v4/midnight-indexer/resumeCrawler")
     echo "$(now) crawler cycle: pause -> $p | resume -> $r" >> "$LOG"
     case "$r" in
         200*) return 0 ;;

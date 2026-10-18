@@ -3,15 +3,17 @@
 All OData V4 actions and functions: signatures, request and response shapes, error codes, examples. Actions are POST (side effects), functions GET (read-only).
 
 Base paths:
-- `http://localhost:4004/api/v1/nightgate/<actionName>` - main service
-- `http://localhost:4004/api/v1/indexer/<functionName>()` - indexer service
-- `http://localhost:4004/api/v1/analytics/<functionName>()` - analytics service
-- `http://localhost:4004/api/v1/admin/<actionName>` - admin service
-- `http://localhost:4004/api/v1/verify/<functionName>(...)` - public verify service (see [Crawler-free state verification](#crawler-free-state-verification))
+- `http://localhost:4004/odata/v4/midnight/<actionName>` - main service
+- `http://localhost:4004/odata/v4/midnight-indexer/<functionName>()` - indexer service
+- `http://localhost:4004/odata/v4/midnight-analytics/<functionName>()` - analytics service
+- `http://localhost:4004/odata/v4/midnight-admin/<actionName>` - admin service
+- `http://localhost:4004/odata/v4/midnight-verify/<functionName>(...)` - public verify service (see [Crawler-free state verification](#crawler-free-state-verification))
 
 ## API versioning while 0.x
 
-Paths stay `/api/v1/...` until 1.0. Under 0.x a minor release may change or
+Paths stay `/odata/v4/midnight...` until 1.0; the `/api/v1/...` paths answer
+until then (`getMetrics()` counts them as `legacy_path_requests_total{path}`).
+Under 0.x a minor release may change or
 remove an action, a patch release never does; a removal is marked
 `@deprecated` (CDS doc and this file) at least one minor release ahead.
 `getRuntimeInfo().apiVersion` reports the running major.minor.
@@ -50,7 +52,7 @@ is the agent grant, else the user, else the client address.
 | `wallet` | minute | 10 | caller | `connectWallet`, `sendNight`, `registerForDustGeneration`, `deregisterFromDustGeneration` |
 | `signing` | hour | 10 | caller | `connectWalletForSigning`, `deriveWalletInfo` (`NIGHTGATE_SIGNING_KEY_RATE_LIMIT`) |
 | `admin` | hour | 10 | caller | `createAgentGrant`, `createAgentGrants`, `updateAgentGrant`, `rotateAgentGrantToken`, `revokeAgentGrant` |
-| `public-verify` | minute | 60 | client address | the verify functions under `/api/v1/verify` |
+| `public-verify` | minute | 60 | client address | the verify functions under `/odata/v4/midnight-verify` |
 
 An agent grant adds its own budgets on top of the classes: `maxJobsPerHour`
 and `maxJobsPerDay` count the grant's allowlisted calls per UTC hour and UTC
@@ -87,7 +89,7 @@ Open a **read-only** session; the viewing key is stored AES-256-GCM encrypted.
 **Rate class:** `wallet`.
 
 ```bash
-curl -X POST http://localhost:4004/api/v1/nightgate/connectWallet \
+curl -X POST http://localhost:4004/odata/v4/midnight/connectWallet \
   -H "Content-Type: application/json" \
   -d '{"viewingKey":"a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403"}'
 ```
@@ -146,7 +148,7 @@ Send NIGHT (or `tokenTypeHex`) to a Midnight address. The Bech32m prefix picks t
 - 500 - `Wallet.InsufficientFunds`, `Wallet.Sync` errors from SDK
 
 ```bash
-curl -X POST http://localhost:4004/api/v1/nightgate/sendNight \
+curl -X POST http://localhost:4004/odata/v4/midnight/sendNight \
   -H "Content-Type: application/json" \
   -d '{
     "sessionId": "c07b1f0a-...",
@@ -789,7 +791,7 @@ Prove at least `k` (1..width) aligned slots differ between two anchored document
 
 Read live contract state (`queryContractState`): no crawler, txHash or server row needed, e.g. for wallet-submitted transactions. Absent state or no live provider: `verified: false`, not a 5xx. `network` (e.g. `preview` | `preprod`) reads another network's public indexer (unknown: 400; endpoints via `cds.requires.nightgate.networks.<network>.*`).
 
-**Public lane.** `NIGHTGATE_PUBLIC_VERIFY=true` serves both functions without credentials at `/api/v1/verify` (`NightgateVerifyService`, same signatures and results): the image admits the path unauthenticated with CORS `*`; a CAP host serves it under `@requires: 'any'`. Off (default): `404 PUBLIC_VERIFY_DISABLED`. Rate class `public-verify` (`NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT`, per client address). Nothing enumerable: every call needs contract, payload and claim coordinates. `verifyDocument` and `verifyPredicateAttestation` stay private (owner-scoped rows).
+**Public lane.** `NIGHTGATE_PUBLIC_VERIFY=true` serves both functions without credentials at `/odata/v4/midnight-verify` (`NightgateVerifyService`, same signatures and results): the image admits the path unauthenticated with CORS `*`; a CAP host serves it under `@requires: 'any'`. Off (default): `404 PUBLIC_VERIFY_DISABLED`. Rate class `public-verify` (`NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT`, per client address). Nothing enumerable: every call needs contract, payload and claim coordinates. `verifyDocument` and `verifyPredicateAttestation` stay private (owner-scoped rows).
 
 **Independent verification:** everything these functions check is recomputable from public data: read the vault state from the public indexer, recompute the claim key (`persistentHash` over the tagged claim struct, e.g. bytes equality `{ tag 17, recordKey, contentRoot, schemaId, fieldKey, expectedDigest }` with `recordKey = persistentHash({ tag 21, attesterId, payloadHash })` and root and schema id from `content_anchors`), and look it up in `claims` (value: `valid_until` block time). The Compact source ships in `@odatano/contract-attestation-vault` under `src/`.
 
@@ -887,7 +889,7 @@ Read-only; amounts are decimal atom strings. `shieldedTokens`: other shielded to
 **Rate class:** `read`.
 
 ```bash
-curl "http://localhost:4004/api/v1/nightgate/getWalletBalance(sessionId='c07b1f0a-...')"
+curl "http://localhost:4004/odata/v4/midnight/getWalletBalance(sessionId='c07b1f0a-...')"
 ```
 
 Response:
@@ -957,7 +959,7 @@ Wallet catch-up progress, from a snapshot the worker pushes about every 15 s (ch
 **Rate class:** `read`.
 
 ```bash
-curl "http://localhost:4004/api/v1/nightgate/getWalletSyncProgress(sessionId='c07b1f0a-...')"
+curl "http://localhost:4004/odata/v4/midnight/getWalletSyncProgress(sessionId='c07b1f0a-...')"
 ```
 
 Response:
@@ -1090,16 +1092,16 @@ Every `@readonly` entity supports the full OData V4 query surface. Examples:
 
 ```bash
 # Latest 10 blocks
-curl "http://localhost:4004/api/v1/nightgate/Blocks?\$top=10&\$orderby=height desc"
+curl "http://localhost:4004/odata/v4/midnight/Blocks?\$top=10&\$orderby=height desc"
 
 # Transactions in a given block
-curl "http://localhost:4004/api/v1/nightgate/Transactions?\$filter=block_ID eq <uuid>"
+curl "http://localhost:4004/odata/v4/midnight/Transactions?\$filter=block_ID eq <uuid>"
 
 # Pending submissions for a specific session
-curl "http://localhost:4004/api/v1/nightgate/PendingSubmissions?\$filter=sessionId eq 'c07b1f0a-...'"
+curl "http://localhost:4004/odata/v4/midnight/PendingSubmissions?\$filter=sessionId eq 'c07b1f0a-...'"
 
 # Top 5 NIGHT holders
-curl "http://localhost:4004/api/v1/nightgate/NightBalances/NightgateService.getTopHolders(limit=5)"
+curl "http://localhost:4004/odata/v4/midnight/NightBalances/NightgateService.getTopHolders(limit=5)"
 ```
 
 ## Error model

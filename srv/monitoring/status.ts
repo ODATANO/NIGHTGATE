@@ -26,6 +26,7 @@ import { readRuntimeState, readPrewarmState } from '../utils/runtime-state';
 import { configMs } from '../utils/config';
 import { eventLoopLagGauges } from './event-loop';
 import { rateLimitedTotals } from '../utils/rate-classes';
+import { legacyPathRequestTotals } from '../utils/legacy-service-paths';
 import { absorbedCrawlerFaults } from '../crawler/crawler-fault-guard';
 import type { DbRunner } from '../utils/db-types';
 import type { getReadiness, getRuntimeInfo } from '#cds-models/NightgateIndexerService';
@@ -326,6 +327,10 @@ export async function buildMetricsText(db: DbRunner): Promise<string> {
     lines.push(`# HELP ${metricPrefix}_rate_limited_total Requests answered 429 since process start, by limit`);
     lines.push(`# TYPE ${metricPrefix}_rate_limited_total counter`);
     for (const [name, count] of rateLimitedTotals()) lines.push(`${metricPrefix}_rate_limited_total{limit="${name}"} ${count}`);
+
+    lines.push(`# HELP ${metricPrefix}_legacy_path_requests_total Requests on a deprecated /api/v1 service path since process start`);
+    lines.push(`# TYPE ${metricPrefix}_legacy_path_requests_total counter`);
+    for (const [path, count] of legacyPathRequestTotals()) lines.push(`${metricPrefix}_legacy_path_requests_total{path="${path}"} ${count}`);
 
     const decode = getDecodeWorkerStatus();
     lines.push(`# HELP ${metricPrefix}_decode_worker_running Decode worker thread alive (1=running, 0=not running)`);

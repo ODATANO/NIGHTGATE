@@ -20,7 +20,7 @@ import { Agent, setGlobalDispatcher } from 'undici';
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
 const URL_BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
-const ENDPOINT = `${URL_BASE}/api/v1/nightgate`;
+const ENDPOINT = `${URL_BASE}/odata/v4/midnight`;
 const VK = process.env.LACE_VIEWING_KEY;
 const MNEMONIC = (process.env.LACE_MNEMONIC || '').trim();
 const PREWARM_TIMEOUT_MS = parseInt(process.env.E2E_PREWARM_TIMEOUT_MIN || '600', 10) * 60_000;

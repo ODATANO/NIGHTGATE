@@ -21,9 +21,9 @@ npm run dev
 
 `npm run dev` runs `cds watch` with a 12 GB heap against the public Preprod RPC; no `.env` needed. The crawler catches up from genesis on the first run and resumes afterwards. Wait for `[Crawler] Live subscription active`, then:
 ```bash
-curl "http://localhost:4004/api/v1/indexer/getHealth()"
-curl "http://localhost:4004/api/v1/indexer/getSyncStatus()"
-curl "http://localhost:4004/api/v1/nightgate/Blocks?\$top=5&\$orderby=height desc"
+curl "http://localhost:4004/odata/v4/midnight-indexer/getHealth()"
+curl "http://localhost:4004/odata/v4/midnight-indexer/getSyncStatus()"
+curl "http://localhost:4004/odata/v4/midnight/Blocks?\$top=5&\$orderby=height desc"
 ```
 
 Expect a non-zero `chainHeight` and five blocks.
@@ -111,7 +111,7 @@ A cold sync from a fresh seed takes hours and several GB of worker heap; later r
 After the sync reaches the tip (`caughtUp: true`):
 
 ```bash
-curl "http://localhost:4004/api/v1/nightgate/getWalletBalance(sessionId='c07b1f0a-...')"
+curl "http://localhost:4004/odata/v4/midnight/getWalletBalance(sessionId='c07b1f0a-...')"
 ```
 
 Response:
@@ -132,7 +132,7 @@ Requires a synced wallet with DUST.
 ### Estimate the fee
 
 ```bash
-curl "http://localhost:4004/api/v1/nightgate/estimateSendNightFee(sessionId='...',receiverAddress='mn_addr_preprod1...',amount='1000000')"
+curl "http://localhost:4004/odata/v4/midnight/estimateSendNightFee(sessionId='...',receiverAddress='mn_addr_preprod1...',amount='1000000')"
 ```
 
 Response: `{"fee":"123456","toLedger":"unshielded"}`; compare with `dustBalance`.
@@ -140,7 +140,7 @@ Response: `{"fee":"123456","toLedger":"unshielded"}`; compare with `dustBalance`
 ### Send NIGHT
 
 ```bash
-curl -X POST http://localhost:4004/api/v1/nightgate/sendNight \
+curl -X POST http://localhost:4004/odata/v4/midnight/sendNight \
   -H "Content-Type: application/json" \
   -d '{
     "sessionId": "c07b1f0a-...",
@@ -156,7 +156,7 @@ Response: `{"jobId":"...","status":"pending"}`. Poll `getJobStatus(jobId, sessio
 The contract lineages are npm dependencies (`@odatano/contract-counter`, `-attestation-vault`, `-attestation-vault-32`, `-shielded-token`, `-token-factory`, `-holder-registry`) and registered in `package.json` (`cds.requires.nightgate.contracts`, one `{ "package": "..." }` entry each). `attestation-vault` carries 16 fields per document, `attestation-vault-32` 32; cross-document proofs need the same width. Sources, compiled artifacts and release assets: [NIGHTGATE-CONTRACTS](https://github.com/ODATANO/NIGHTGATE-CONTRACTS).
 
 ```bash
-curl -X POST http://localhost:4004/api/v1/nightgate/deployContract \
+curl -X POST http://localhost:4004/odata/v4/midnight/deployContract \
   -H "Content-Type: application/json" \
   -d '{
     "compiledArtifactRef": "counter",
@@ -197,7 +197,7 @@ The package ships contract modules, verifier keys and zkir, but no prover keys. 
 
 Then `cds watch`. `network` is required (without it the plugin stays idle); everything else defaults to public endpoints. Configuration: [reference.md#configuration](reference.md#configuration). A `"kind": "nightgate"` entry is ignored.
 
-The services register under `/api/v1/{nightgate,indexer,analytics,admin,verify}`.
+The services register under `/odata/v4/midnight`, `/odata/v4/midnight-indexer`, `/odata/v4/midnight-analytics`, `/odata/v4/midnight-admin` and `/odata/v4/midnight-verify`.
 
 ## Next
 

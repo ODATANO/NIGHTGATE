@@ -35,7 +35,7 @@ const require = createRequire(import.meta.url);
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
 const URL_BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
-const ENDPOINT = `${URL_BASE}/api/v1/nightgate`;
+const ENDPOINT = `${URL_BASE}/odata/v4/midnight`;
 const VAULT = process.env.NIGHTGATE_VAULT;
 const INDEXER_HTTP = process.env.NIGHTGATE_INDEXER_HTTP_URL;
 const NODE_URL = process.env.NIGHTGATE_NODE_URL;

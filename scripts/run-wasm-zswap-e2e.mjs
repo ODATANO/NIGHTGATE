@@ -41,7 +41,7 @@ setGlobalDispatcher(new Agent({
 }));
 
 const URL_BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
-const ENDPOINT = `${URL_BASE}/api/v1/nightgate`;
+const ENDPOINT = `${URL_BASE}/odata/v4/midnight`;
 const VK = process.env.LACE_VIEWING_KEY;
 const MNEMONIC = (process.env.LACE_MNEMONIC || '').trim();
 const DOMAIN_SEP_STR = 'nightgate:zswap-e2e'; // must match shielded-token.compact pad(32, ...)
@@ -109,7 +109,7 @@ function domainSepBytes() {
         const deadline = Date.now() + 30_000;
         let up = false;
         while (Date.now() < deadline && !up) {
-            try { up = (await fetch(`${URL_BASE}/api/v1/indexer/getHealth()`)).ok; } catch { /* retry */ }
+            try { up = (await fetch(`${URL_BASE}/odata/v4/midnight-indexer/getHealth()`)).ok; } catch { /* retry */ }
             if (!up) await new Promise(r => setTimeout(r, 1000));
         }
         if (!up) fail(`Server at ${URL_BASE} did not respond within 30s`);

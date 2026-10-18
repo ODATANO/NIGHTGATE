@@ -16,7 +16,7 @@ import { isRuntimeWriteEvent, runtimeUnavailableReason, RUNTIME_FREE_ACTIONS } f
     users: { operator: { password: 'op-secret', roles: [] } }
 };
 const cap = cds.test(__dirname + '/../..');
-const API = '/api/v1/nightgate';
+const API = '/odata/v4/midnight';
 const AUTH = { auth: { username: 'operator', password: 'op-secret' }, validateStatus: () => true };
 
 // The booted server runs the compiled twin of runtime-state.js; the state is
@@ -102,7 +102,7 @@ describe('offline runtime on the served API', () => {
         expect(compute.status).not.toBe(503);
         // The probe answers for itself: 503 carrying the readiness payload,
         // not the runtime gate's generic refusal.
-        const readiness = await cap.axios.get('/api/v1/indexer/getReadiness()', AUTH);
+        const readiness = await cap.axios.get('/odata/v4/midnight-indexer/getReadiness()', AUTH);
         expect(readiness.status).toBe(503);
         expect(readiness.data.ready).toBe(false);
         expect(readiness.data.checks.initialization).toBe(false);

@@ -89,7 +89,7 @@ describe('crawler fault guard on a booted server', () => {
 
     it('serves requests throughout, which is the point of absorbing at all', async () => {
         const { GET } = cap as any;
-        const before = await GET('/api/v1/indexer/getLiveness()');
+        const before = await GET('/odata/v4/midnight-indexer/getLiveness()');
         expect(before.status).toBe(200);
 
         const fault = new Error('Not connected to Midnight Node');
@@ -97,7 +97,7 @@ describe('crawler fault guard on a booted server', () => {
             + '    at rpc (/app/srv/providers/MidnightNodeProvider.js:223:19)';
         process.emit('unhandledRejection', fault, Promise.resolve() as any);
 
-        const after = await GET('/api/v1/indexer/getLiveness()');
+        const after = await GET('/odata/v4/midnight-indexer/getLiveness()');
         expect(after.status).toBe(200);
     });
 });

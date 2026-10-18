@@ -30,12 +30,12 @@ describe('BlockStatistics', () => {
     });
 
     it('counts the transactions of each block, zero included', async () => {
-        const { data } = await cap.GET('/api/v1/analytics/BlockStatistics?$filter=height le 3&$orderby=height asc');
+        const { data } = await cap.GET('/odata/v4/midnight-analytics/BlockStatistics?$filter=height le 3&$orderby=height asc');
         expect(data.value.map((r: any) => [Number(r.height), r.transactionCount])).toEqual([[1, 0], [2, 2], [3, 1]]);
     });
 
     it('answers one page by default and links the next', async () => {
-        const { data } = await cap.GET('/api/v1/analytics/BlockStatistics?$orderby=height desc');
+        const { data } = await cap.GET('/odata/v4/midnight-analytics/BlockStatistics?$orderby=height desc');
         expect(data.value).toHaveLength(100);
         expect(Number(data.value[0].height)).toBe(105);
         expect(data['@odata.nextLink']).toBeTruthy();

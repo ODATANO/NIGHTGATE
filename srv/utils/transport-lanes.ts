@@ -10,7 +10,7 @@ import { registerTransportLane, inLaneOf, markerUser, requestPath, setHeader, ty
 import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER, PUBLIC_VERIFY_TRANSPORT_USER, PUBLIC_VERIFY_LANE_PREFIX } from './agent-token-transport';
 import { configFlag } from './config';
 
-export const AGENT_LANE_PREFIX = '/api/v1/nightgate';
+export const AGENT_LANE_PREFIX = '/odata/v4/midnight';
 
 export const agentTokenLane: TransportLane = {
     name: 'agent-token',

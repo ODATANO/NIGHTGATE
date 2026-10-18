@@ -7,6 +7,7 @@ import { initialize, shutdown, SchemaNotDeployedError } from './index';
 import { mountZkConfigRoute, mountContractManifestRoute } from './connector-routes';
 import { applyPoolDefault } from './cap-pool-default';
 import { registerNightgateTransportLanes } from '../srv/utils/transport-lanes';
+import { legacyServicePathMiddleware } from '../srv/utils/legacy-service-paths';
 
 const log = cds.log('nightgate');
 
@@ -37,6 +38,7 @@ function registerModels(): void {
 function registerConnectorRoutes(): void {
     cds.on('bootstrap', (app: any) => {
         // Only these routes are added. HTTP policy and global middleware are left to the host app.
+        app.use(legacyServicePathMiddleware);
         mountZkConfigRoute(app);
         mountContractManifestRoute(app);
     });

@@ -26,7 +26,7 @@ setGlobalDispatcher(new Agent({
 }));
 
 const URL_BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
-const ENDPOINT = `${URL_BASE}/api/v1/nightgate`;
+const ENDPOINT = `${URL_BASE}/odata/v4/midnight`;
 const VK = process.env.LACE_VIEWING_KEY;
 const MNEMONIC = (process.env.LACE_MNEMONIC || '').trim();
 const ARTIFACT = process.env.WASM_E2E_ARTIFACT || 'counter';
@@ -87,7 +87,7 @@ async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS
         let up = false;
         while (Date.now() < deadline && !up) {
             try {
-                const r = await fetch(`${URL_BASE}/api/v1/indexer/getHealth()`);
+                const r = await fetch(`${URL_BASE}/odata/v4/midnight-indexer/getHealth()`);
                 up = r.ok;
             } catch { /* retry */ }
             if (!up) await new Promise(r => setTimeout(r, 1000));

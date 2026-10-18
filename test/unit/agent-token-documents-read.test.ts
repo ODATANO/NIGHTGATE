@@ -18,7 +18,7 @@ import crypto from 'node:crypto';
 
 const cap = cds.test(__dirname + '/../..');
 
-const API = '/api/v1/nightgate';
+const API = '/odata/v4/midnight';
 const TOKEN = 'ngat_' + 'c'.repeat(64);
 const OPERATOR = 'operator-docs';
 const SESSION = 'a1a1a1a1-0000-4000-8000-000000000001';

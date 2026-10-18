@@ -52,7 +52,7 @@ console.log(`OK   sponsor ready (${sponsor})`);
 
 step('1. Grant with the DEPLOY right (maxDeploys 1) for the sponsor session');
 async function post(path, body) {
-    const r = await fetch(`${BASE}/api/v1/nightgate${path}`, {
+    const r = await fetch(`${BASE}/odata/v4/midnight${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Basic ' + Buffer.from(`${auth.username}:${auth.password ?? ''}`).toString('base64') },
         body: JSON.stringify(body), signal: AbortSignal.timeout(10 * 60 * 1000)

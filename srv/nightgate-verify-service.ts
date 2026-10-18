@@ -1,5 +1,5 @@
 /**
- * Public verification endpoint at `/api/v1/verify`.
+ * Public verification endpoint at `/odata/v4/midnight-verify`.
  * It serves the same verify handlers as the main service, behind a feature flag and a rate limit.
  */
 

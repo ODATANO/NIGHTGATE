@@ -1,6 +1,6 @@
 using { midnight } from '../db/schema';
 
-@path: '/api/v1/admin'
+@path: '/odata/v4/midnight-admin'
 @requires: 'admin'
 service NightgateAdminService {
 

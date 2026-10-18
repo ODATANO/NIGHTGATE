@@ -7,7 +7,7 @@ using { Hex64 } from '../db/types';
  * A retry with the same `idempotencyKey` returns the first job. `sponsorSessionId` is a second session that pays the fee.
  * Amounts are decimal strings in the smallest unit.
  */
-@path    : '/api/v1/nightgate'
+@path    : '/odata/v4/midnight'
 @requires: 'authenticated-user'
 service NightgateService {
 

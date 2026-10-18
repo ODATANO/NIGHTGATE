@@ -343,6 +343,13 @@ describe('buildMetricsText', () => {
         expect(text).toContain('odatano_nightgate_wallet_worker_rotations 0');
     });
 
+    it('counts requests on the deprecated service paths per path', async () => {
+        const text = await buildMetricsText(db);
+        expect(text).toContain('# TYPE odatano_nightgate_legacy_path_requests_total counter');
+        expect(text).toContain('odatano_nightgate_legacy_path_requests_total{path="/api/v1/nightgate"} 0');
+        expect(text).toContain('odatano_nightgate_legacy_path_requests_total{path="/api/v1/indexer"} 0');
+    });
+
     it('carries the event-loop lag of the last window', async () => {
         const text = await buildMetricsText(db);
         expect(text).toMatch(/odatano_nightgate_event_loop_lag_p99_ms \d/);

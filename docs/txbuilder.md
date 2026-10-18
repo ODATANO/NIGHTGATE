@@ -75,7 +75,7 @@ const { finalizedTxB64, serializedBytes } = await builder.buildSponsorable({
     call
 });
 
-await fetch('https://sponsor.example/api/v1/nightgate/sponsorFinalizedTransaction', {
+await fetch('https://sponsor.example/odata/v4/midnight/sponsorFinalizedTransaction', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ finalizedTxB64 })

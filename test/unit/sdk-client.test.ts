@@ -36,7 +36,7 @@ describe('connect: encoding', () => {
             k: 3, network: undefined, fieldKey: ''
         });
         expect(calls[0].url).toBe(
-            "https://ng.example/api/v1/nightgate/verifyPredicateState(contractAddress='o''hara',payloadHash='ab',threshold=9007199254740993,k=3)"
+            "https://ng.example/odata/v4/midnight/verifyPredicateState(contractAddress='o''hara',payloadHash='ab',threshold=9007199254740993,k=3)"
         );
         expect(calls[0].init.method).toBe('GET');
     });
@@ -46,7 +46,7 @@ describe('connect: encoding', () => {
         const { fn, calls } = fakeFetch([{ body: { jobId: null } }]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
         await ng.callAction('sendNight', { amount: 5n, receiverAddress: 'addr', ttlIso: undefined });
-        expect(calls[0].url).toBe('https://ng.example/api/v1/nightgate/sendNight');
+        expect(calls[0].url).toBe('https://ng.example/odata/v4/midnight/sendNight');
         expect(JSON.parse(calls[0].init.body)).toEqual({ amount: '5', receiverAddress: 'addr' });
     });
 
@@ -63,6 +63,28 @@ describe('connect: encoding', () => {
         await expect(ng2.verifyAttestation({ contractAddress: 'c', payloadHash: 'p' }))
             .rejects.toMatchObject({ name: 'NightgateApiError', status: 400, code: 'BadThing', message: 'nope' });
         expect(new NightgateApiError(1, 'x', 'y')).toBeInstanceOf(Error);
+    });
+});
+
+describe('connect: service paths', () => {
+    test('defaults to the midnight paths; servicePath and indexerServicePath override them', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([{ body: {} }]);
+        const ng = connect({ baseUrl: 'https://ng.example/', fetchFn: fn as any });
+        await ng.getHealth();
+        await ng.verifyAttestation({ contractAddress: 'c', payloadHash: 'p' });
+        expect(calls[0].url).toBe('https://ng.example/odata/v4/midnight-indexer/getHealth()');
+        expect(calls[1].url.startsWith('https://ng.example/odata/v4/midnight/verifyAttestationState(')).toBe(true);
+
+        const old = fakeFetch([{ body: {} }]);
+        const ngOld = connect({
+            baseUrl: 'https://ng.example', fetchFn: old.fn as any,
+            servicePath: '/api/v1/nightgate', indexerServicePath: '/api/v1/indexer'
+        });
+        await ngOld.getHealth();
+        await ngOld.verifyAttestation({ contractAddress: 'c', payloadHash: 'p' });
+        expect(old.calls[0].url).toBe('https://ng.example/api/v1/indexer/getHealth()');
+        expect(old.calls[1].url.startsWith('https://ng.example/api/v1/nightgate/verifyAttestationState(')).toBe(true);
     });
 });
 
@@ -129,7 +151,7 @@ describe('connect: jobs', () => {
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
         const out = await ng.sponsorSwap({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC' });
-        expect(calls[0].url).toBe('https://ng.example/api/v1/nightgate/sponsorSwap');
+        expect(calls[0].url).toBe('https://ng.example/odata/v4/midnight/sponsorSwap');
         expect(JSON.parse(calls[0].init.body)).toEqual({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC' });
         expect(JSON.parse(calls[1].init.body)).toMatchObject({ jobId: 'job-9', sessionId: 'sponsor-1' });
         expect(out).toMatchObject({ txHash: '00aa', swap: { gives: { amount: '10' } } });
@@ -326,7 +348,7 @@ describe('connect: the chain reads a transaction builder needs', () => {
         const { fn, calls } = fakeFetch([{ body: { address: 'ab', height: 7, state: 'c3Q=', ledgerParameters: null } }]);
         const ng = connect({ baseUrl: 'https://ng.example', agentToken: 'ngat_x', fetchFn: fn as any });
         const snap = await ng.contractStateAt({ address: '0xAB' });
-        expect(calls[0].url).toBe("https://ng.example/api/v1/nightgate/ContractStates/stateAt(address='ab',height=null)");
+        expect(calls[0].url).toBe("https://ng.example/odata/v4/midnight/ContractStates/stateAt(address='ab',height=null)");
         expect(snap).toEqual(expect.objectContaining({ height: 7, state: 'c3Q=' }));
         await ng.contractStateAt({ address: 'ab', height: 12 });
         expect(calls[1].url).toMatch(/height=12\)$/);
@@ -337,7 +359,7 @@ describe('connect: the chain reads a transaction builder needs', () => {
         const { fn, calls } = fakeFetch([{ status: 404, body: { error: { message: 'no indexed transaction carries identifier ffff' } } }]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
         expect(await ng.transactionByIdentifier('0xFFFF')).toBeNull();
-        expect(calls[0].url).toBe("https://ng.example/api/v1/nightgate/Transactions/byIdentifier(identifier='ffff')");
+        expect(calls[0].url).toBe("https://ng.example/odata/v4/midnight/Transactions/byIdentifier(identifier='ffff')");
 
         const found = fakeFetch([{ body: { identifier: 'ffff', hash: '0xtx', blockHeight: 5, status: 'SUCCESS', failedSegments: [] } }]);
         const ng2 = connect({ baseUrl: 'https://ng.example', fetchFn: found.fn as any });

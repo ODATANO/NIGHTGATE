@@ -53,7 +53,7 @@ describe('agent token never reaches the JSON request log', () => {
         ctx.http = { req: { headers: { 'x-agent-token': 'ngat_' + 'a'.repeat(64), 'x-forwarded-for': '10.0.0.9', authorization: 'Basic abc' } } };
         try {
             // The formatter returns the console arguments: one JSON string.
-            const out = (cds as any)._with(ctx, () => format.call({}, 'odata', 3, 'GET /api/v1/nightgate/getJobStatus'));
+            const out = (cds as any)._with(ctx, () => format.call({}, 'odata', 3, 'GET /odata/v4/midnight/getJobStatus'));
             const line = JSON.parse(String(Array.isArray(out) ? out[0] : out));
             expect(line.x_agent_token).toBe('***');
             expect(line.authorization).toBe('***');

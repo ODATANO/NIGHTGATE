@@ -43,7 +43,7 @@ const UNSHIELDED_UTXOS = 'midnight.UnshieldedUtxos';
 const NIGHT_BALANCES = 'midnight.NightBalances';
 const BACKGROUND_JOBS = 'midnight.BackgroundJobs';
 
-const API = '/api/v1/nightgate';
+const API = '/odata/v4/midnight';
 
 let db: any;
 let srv: any;

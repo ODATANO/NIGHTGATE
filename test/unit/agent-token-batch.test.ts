@@ -21,7 +21,7 @@ cds.User.default = (cds.User as unknown as { Anonymous: typeof cds.User.default 
 
 const cap = cds.test(__dirname + '/../..');
 
-const API = '/api/v1/nightgate';
+const API = '/odata/v4/midnight';
 const TOKEN = 'ngat_' + 'b'.repeat(64);
 const OPERATOR = 'operator-batch';
 const SESSION = 'sess-batch-1';

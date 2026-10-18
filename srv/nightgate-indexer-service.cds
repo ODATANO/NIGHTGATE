@@ -8,7 +8,7 @@ using {midnight} from '../db/schema';
  * The probes getLiveness, getReadiness, getMetrics, getSyncStatus, getHealth and getBoardStatus are public.
  * Everything else needs a signed-in user or an admin.
  */
-@path    : '/api/v1/indexer'
+@path    : '/odata/v4/midnight-indexer'
 @requires: 'any'
 service NightgateIndexerService {
 

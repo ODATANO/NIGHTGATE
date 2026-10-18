@@ -14,7 +14,7 @@ export const AGENT_TOKEN_TRANSPORT_USER = 'agent-token-transport';
 /** Placeholder user for an anonymous request to the public verify service. It owns nothing and is refused elsewhere. */
 export const PUBLIC_VERIFY_TRANSPORT_USER = 'public-verify-transport';
 
-export const PUBLIC_VERIFY_LANE_PREFIX = '/api/v1/verify';
+export const PUBLIC_VERIFY_LANE_PREFIX = '/odata/v4/midnight-verify';
 
 /** User ids that identify no real user. Rate limits count these by client address instead. */
 export const MARKER_PRINCIPALS: ReadonlySet<string> = new Set([

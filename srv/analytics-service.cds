@@ -1,6 +1,6 @@
 using { midnight } from '../db/schema';
 
-@path: '/api/v1/analytics'
+@path: '/odata/v4/midnight-analytics'
 @requires: 'authenticated-user'
 service NightgateAnalyticsService {
 

@@ -41,7 +41,7 @@
 │  └─────────┬────────────┘                 │ - private-state-rpc      │    │
 │            │ OData V4                     └──────────┬───────────────┘    │
 │            ▼                                         │                    │
-│  5 services on /api/v1/{nightgate, indexer, analytics, admin, verify}     │
+│  5 services on /odata/v4/midnight{,-indexer,-analytics,-admin,-verify}    │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -84,11 +84,11 @@ First sync walkthrough: [docs/quickstart.md](docs/quickstart.md).
 
 | Service | Path | Content |
 |---|---|---|
-| `NightgateService` | `/api/v1/nightgate` | chain data, wallet sessions, token / contract / attestation actions |
-| `NightgateIndexerService` | `/api/v1/indexer` | sync state, health, metrics, crawler control |
-| `NightgateAnalyticsService` | `/api/v1/analytics` | aggregate counts |
-| `NightgateAdminService` | `/api/v1/admin` | sessions, contract registration, diagnostics |
-| `NightgateVerifyService` | `/api/v1/verify` | unauthenticated state verification (`NIGHTGATE_PUBLIC_VERIFY=true`) |
+| `NightgateService` | `/odata/v4/midnight` | chain data, wallet sessions, token / contract / attestation actions |
+| `NightgateIndexerService` | `/odata/v4/midnight-indexer` | sync state, health, metrics, crawler control |
+| `NightgateAnalyticsService` | `/odata/v4/midnight-analytics` | aggregate counts |
+| `NightgateAdminService` | `/odata/v4/midnight-admin` | sessions, contract registration, diagnostics |
+| `NightgateVerifyService` | `/odata/v4/midnight-verify` | unauthenticated state verification (`NIGHTGATE_PUBLIC_VERIFY=true`) |
 
 Submit actions are async: they return `{ jobId, status }`; poll `getJobStatus(jobId, sessionId)`. Signatures, error codes and examples: [docs/actions.md](docs/actions.md).
 

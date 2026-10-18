@@ -116,7 +116,8 @@ function isStaleSocketError(err) {
  *
  * @param {object} opts
  * @param {string} opts.baseUrl            For example https://nightgate.example
- * @param {string} [opts.servicePath]      Defaults to '/api/v1/nightgate'.
+ * @param {string} [opts.servicePath]      Defaults to '/odata/v4/midnight'.
+ * @param {string} [opts.indexerServicePath] Defaults to '/odata/v4/midnight-indexer'; getHealth() reads it.
  * @param {string} [opts.agentToken]       Agent token (ngat_...). Sent in the x-agent-token header.
  * @param {string} [opts.token]            Bearer token
  * @param {string} [opts.username]         Basic auth user. Can be combined with agentToken.
@@ -127,13 +128,14 @@ function isStaleSocketError(err) {
  */
 export function connect(opts) {
     const {
-        baseUrl, servicePath = '/api/v1/nightgate',
+        baseUrl, servicePath = '/odata/v4/midnight', indexerServicePath = '/odata/v4/midnight-indexer',
         agentToken, token, username, password,
         timeoutMs = 120_000, pollMs = 2_000, fetchFn
     } = opts ?? {};
     if (!baseUrl) throw new Error('connect: baseUrl is required');
     const doFetch = fetchFn || fetch;
     const service = String(baseUrl).replace(/\/$/, '') + servicePath;
+    const indexerService = String(baseUrl).replace(/\/$/, '') + indexerServicePath;
 
     async function request(method, url, body) {
         const headers = { Accept: 'application/json' };
@@ -303,7 +305,7 @@ export function connect(opts) {
         verifyPredicateAttestation: (p) => callFunction('verifyPredicateAttestation', p),
         verifyDocument: (p) => callFunction('verifyDocument', p),
         deriveTokenType: (p) => callFunction('deriveTokenType', p),
-        getHealth: () => request('GET', `${String(baseUrl).replace(/\/$/, '')}/api/v1/indexer/getHealth()`),
+        getHealth: () => request('GET', `${indexerService}/getHealth()`),
 
         // ---- input preparation. No wallet, no transaction. ----
         prepareDocumentProof: (p) => callAction('prepareDocumentProof', p),

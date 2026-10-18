@@ -37,7 +37,7 @@ setGlobalDispatcher(new Agent({
 }));
 
 const URL_BASE = process.env.NIGHTGATE_URL || 'http://localhost:4004';
-const ENDPOINT = `${URL_BASE}/api/v1/nightgate`;
+const ENDPOINT = `${URL_BASE}/odata/v4/midnight`;
 const VK = process.env.LACE_VIEWING_KEY;
 const MNEMONIC = process.env.LACE_MNEMONIC;
 const DUST_WAIT_S = parseInt(process.env.DEPLOY_E2E_DUST_WAIT_SECONDS || '90', 10);
@@ -118,7 +118,7 @@ async function waitForServer() {
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
         try {
-            const r = await fetch(`${URL_BASE}/api/v1/indexer/getHealth()`);
+            const r = await fetch(`${URL_BASE}/odata/v4/midnight-indexer/getHealth()`);
             if (r.ok) {
                 const body = await r.json();
                 console.log(`OK   server up (mode=${body?.mode || 'unknown'})`);

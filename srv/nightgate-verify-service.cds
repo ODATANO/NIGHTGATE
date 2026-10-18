@@ -5,7 +5,7 @@ using { Hex64 } from '../db/types';
  * Off by default. Set `NIGHTGATE_PUBLIC_VERIFY=true` to enable it.
  * Requests per client address are limited by `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` per minute.
  */
-@path    : '/api/v1/verify'
+@path    : '/odata/v4/midnight-verify'
 @requires: 'any'
 service NightgateVerifyService {
 

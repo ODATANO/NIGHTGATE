@@ -199,7 +199,7 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_ADMIN_RATE_LIMIT` | int (min 1) | `10` | Rate class `admin`, grant administration calls (`createAgentGrant`, `createAgentGrants`, `updateAgentGrant`, `rotateAgentGrantToken`, `revokeAgentGrant`) per hour per principal; default `10`. |
 | `NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR` | int (min 1) |  | `maxJobsPerHour` of a grant whose creation does not name it. Unset = no hourly budget. |
 | `NIGHTGATE_GRANT_DEFAULT_JOBS_PER_DAY` | int (min 1) |  | `maxJobsPerDay` of a grant whose creation does not name it. Unset = no daily budget. |
-| `NIGHTGATE_PUBLIC_VERIFY` | bool | `false` | Serve `verifyAttestationState` and `verifyPredicateState` without credentials under `/api/v1/verify` (the image admits the path unauthenticated and answers CORS preflight with `*`); default off, the functions answer `404 PUBLIC_VERIFY_DISABLED`. |
+| `NIGHTGATE_PUBLIC_VERIFY` | bool | `false` | Serve `verifyAttestationState` and `verifyPredicateState` without credentials under `/odata/v4/midnight-verify` (the image admits the path unauthenticated and answers CORS preflight with `*`); default off, the functions answer `404 PUBLIC_VERIFY_DISABLED`. |
 | `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` | int (min 1) | `60` | Rate class `public-verify`, public verify calls per minute per client address; default `60`. |
 | `NIGHTGATE_CLAIM_LIFETIME_S` | int (min 60) | `31536000` | Default claim lifetime in seconds for the issue* actions when the caller passes no `validUntil`; default one year, the vault caps a claim at five years ahead. |
 | `NIGHTGATE_FEE_SPONSOR_SESSION` | list |  | Comma list of platform fee-sponsor session ids (the pool); overrides `feeSponsorSessions`. |
@@ -551,10 +551,10 @@ crash recovery only.
 NIGHTGATE installs no global HTTP middleware; CORS, CSP, HSTS and preflight are
 host policy. Hosts serving `/zk-config/...` or `/contract-manifest`
 cross-origin add them to their CORS allow-list. The plugin registers two
-transport lanes with `@odatano/cap-auth` (agent token on `/api/v1/nightgate`,
+transport lanes with `@odatano/cap-auth` (agent token on `/odata/v4/midnight`,
 public verify under `NIGHTGATE_PUBLIC_VERIFY`); they act only in a host that
 runs that package as its `cds.requires.auth.impl`, as the standalone image
-does. There, with `NIGHTGATE_PUBLIC_VERIFY=true`, `/api/v1/verify` is admitted
+does. There, with `NIGHTGATE_PUBLIC_VERIFY=true`, `/odata/v4/midnight-verify` is admitted
 without credentials and its preflight answered with `*`.
 
 ## Programmatic API
@@ -586,11 +586,11 @@ import {
 
 | Service | Path | Surface |
 |---|---|---|
-| `NightgateService` | `/api/v1/nightgate` | Blockchain entities + wallet sessions + token ops + contract ops |
-| `NightgateIndexerService` | `/api/v1/indexer` | Sync state, health, reorgs, Prometheus metrics, crawler control |
-| `NightgateAnalyticsService` | `/api/v1/analytics` | Aggregate counts |
-| `NightgateAdminService` | `/api/v1/admin` | Session admin |
-| `NightgateVerifyService` | `/api/v1/verify` | `verifyAttestationState` + `verifyPredicateState` without credentials (`NIGHTGATE_PUBLIC_VERIFY=true`; off: `404 PUBLIC_VERIFY_DISABLED`), per-address rate limit |
+| `NightgateService` | `/odata/v4/midnight` | Blockchain entities + wallet sessions + token ops + contract ops |
+| `NightgateIndexerService` | `/odata/v4/midnight-indexer` | Sync state, health, reorgs, Prometheus metrics, crawler control |
+| `NightgateAnalyticsService` | `/odata/v4/midnight-analytics` | Aggregate counts |
+| `NightgateAdminService` | `/odata/v4/midnight-admin` | Session admin |
+| `NightgateVerifyService` | `/odata/v4/midnight-verify` | `verifyAttestationState` + `verifyPredicateState` without credentials (`NIGHTGATE_PUBLIC_VERIFY=true`; off: `404 PUBLIC_VERIFY_DISABLED`), per-address rate limit |
 
 For per-action signatures and curl examples, see [actions.md](actions.md).
 

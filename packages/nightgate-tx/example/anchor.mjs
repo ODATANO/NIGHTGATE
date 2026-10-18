@@ -75,4 +75,4 @@ console.log(`anchored: ${result.txHash}`);
 await builder.close();
 
 // Anyone can verify this without a wallet and without this package:
-console.log(`\nverify:\n  curl "${SPONSOR}/api/v1/nightgate/verifyAttestationState(contractAddress='${VAULT}',payloadHash='${payloadHash}')"`);
+console.log(`\nverify:\n  curl "${SPONSOR}/odata/v4/midnight/verifyAttestationState(contractAddress='${VAULT}',payloadHash='${payloadHash}')"`);

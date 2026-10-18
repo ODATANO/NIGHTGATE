@@ -22,8 +22,10 @@ export declare function int64(value: string | number | bigint): Int64Literal;
 export interface ConnectOptions {
     /** For example https://nightgate.example */
     baseUrl: string;
-    /** Defaults to '/api/v1/nightgate'. */
+    /** Defaults to '/odata/v4/midnight'. */
     servicePath?: string;
+    /** Defaults to '/odata/v4/midnight-indexer'. getHealth() reads it. */
+    indexerServicePath?: string;
     /** Agent token (ngat_...). Sent in the x-agent-token header. */
     agentToken?: string;
     /** Bearer token */

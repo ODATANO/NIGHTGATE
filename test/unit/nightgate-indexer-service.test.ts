@@ -731,7 +731,7 @@ describe('authorization', () => {
     );
 
     it('answers getReadiness() with 503 while a check fails and 200 once they pass', async () => {
-        const probe = () => cap.axios.get('/api/v1/indexer/getReadiness()', { validateStatus: () => true });
+        const probe = () => cap.axios.get('/odata/v4/midnight-indexer/getReadiness()', { validateStatus: () => true });
 
         const checks = { database: true, crawler: true, node: true, runtime: true, initialization: true };
         const spy = vi.spyOn(statusNative, 'buildReadiness');

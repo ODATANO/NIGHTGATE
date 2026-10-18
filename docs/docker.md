@@ -38,8 +38,8 @@ The JSON request log masks `authorization`, `cookie` and `x-agent-token`
 Runs as user `node` (uid 1000); a bind-mounted `/data` must be writable by
 uid 1000 (`chown 1000:1000 <dir>`).
 
-Listens on `http://localhost:4004`: `/api/v1/nightgate`, `/api/v1/indexer`,
-`/api/v1/analytics`, `/api/v1/admin`. HTTP basic auth (`nightgate` / your
+Listens on `http://localhost:4004`: `/odata/v4/midnight`, `/odata/v4/midnight-indexer`,
+`/odata/v4/midnight-analytics`, `/odata/v4/midnight-admin`. HTTP basic auth (`nightgate` / your
 password) via `@odatano/cap-auth` (`kind: basic`, realm `nightgate`; 20
 failed attempts per 15 min per client address and user, then 429 with
 `Retry-After`); agent requests use `x-agent-token`. A request without
@@ -54,7 +54,7 @@ probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`,
 | `ENCRYPTION_KEY` | required | Encrypts viewing/seed keys, job commands and account data keys; at least 32 characters in production. Alternative: ring `ENCRYPTION_KEYS=id=secret,...` + `ENCRYPTION_KEY_ACTIVE` (rotation: docs/operations.md) |
 | `NIGHTGATE_HTTP_PASSWORD` | required | Basic-auth password |
 | `NIGHTGATE_HTTP_USER` | `nightgate` | Basic-auth user |
-| (agent tokens) | - | `x-agent-token` requests need no basic credentials on `/api/v1/nightgate`; the grant hook authenticates them, incl. every `$batch` part |
+| (agent tokens) | - | `x-agent-token` requests need no basic credentials on `/odata/v4/midnight`; the grant hook authenticates them, incl. every `$batch` part |
 | `NIGHTGATE_HTTP_ROLES` | none | Roles of the basic-auth user, comma separated; `admin` opens the admin service (signing-key export, session invalidation, job queue) |
 | `NIGHTGATE_AUTH` | `basic` | `dummy` = unauthenticated and privileged; refused unless `NIGHTGATE_ALLOW_UNAUTHENTICATED=true`, local testing only |
 | `NIGHTGATE_BIND_ADDRESS` | `127.0.0.1` | Compose only: host address port 4004 is published on. Basic auth is plain text without TLS: put a TLS reverse proxy in front before `0.0.0.0` |
@@ -68,7 +68,7 @@ probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`,
 | `NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS` | `30000` | SQLite lock wait for writers (large wallet-state saves hold the lock for seconds) |
 | `NODE_OPTIONS` | `--max-old-space-size=8192` | Heap; container memory limit must be higher |
 | `NIGHTGATE_NODE_FLAGS` | `--no-concurrent-recompilation` | V8 flags on the node command line (not allowed in `NODE_OPTIONS`). The default avoids a compile-thread/GC-safepoint deadlock; empty = no flag |
-| `NIGHTGATE_PUBLIC_VERIFY` | `false` | `verifyAttestationState` / `verifyPredicateState` without credentials under `/api/v1/verify` (CORS preflight `*`) |
+| `NIGHTGATE_PUBLIC_VERIFY` | `false` | `verifyAttestationState` / `verifyPredicateState` without credentials under `/odata/v4/midnight-verify` (CORS preflight `*`) |
 | `NIGHTGATE_<CLASS>_RATE_LIMIT` | per class | Count of a rate class (`PROVE` 60/h, `DEPLOY` 5/h, `SPONSOR` 120/h, `COMPUTE` 120/h, `READ` 60/min, `WALLET` 10/min, `SIGNING_KEY` 10/h, `ADMIN` 10/h, `PUBLIC_VERIFY` 60/min); `rateLimits` in the policy file replaces a key without a restart |
 | `NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR` / `_PER_DAY` |  | Budgets of a grant whose creation names none |
 

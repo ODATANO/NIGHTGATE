@@ -8,7 +8,7 @@
  * an operation-level `@requires: 'any'` can never open a single operation on
  * such a service — anonymous callers get the 401 challenge first. Seen live on
  * 0.24.1 behind ODATANO ACCESS: the gateway's credential-free probe of
- * `/api/v1/indexer/getLiveness()` answered 401. The layout is therefore:
+ * `/odata/v4/midnight-indexer/getLiveness()` answered 401. The layout is therefore:
  * service `any`, every element restricted on its own, exactly the anonymous
  * operations `any`. The integration suite runs its unauthenticated requests as
  * a privileged user and cannot catch a regression here, so this test pins the

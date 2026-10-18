@@ -32,7 +32,7 @@ async function get(path) {
 console.log(`nightgate check: ${BASE}`);
 
 try {
-  const live = await get('/api/v1/indexer/getLiveness()');
+  const live = await get('/odata/v4/midnight-indexer/getLiveness()');
   ok('liveness', `up ${Math.round(live.uptime / 60)} min, instance ${live.instanceId}`);
 } catch (e) {
   fail('liveness', e.message);
@@ -41,7 +41,7 @@ try {
 }
 
 try {
-  const r = await get('/api/v1/indexer/getReadiness()');
+  const r = await get('/odata/v4/midnight-indexer/getReadiness()');
   const checks = Object.entries(r.checks || {}).map(([k, v]) => `${k}=${v ? 'ok' : 'DOWN'}`).join(' ');
   const line = `${checks}${r.crawlerEnabled === false ? ' (crawler disabled)' : ''}`;
   r.ready ? ok('readiness', line) : fail('readiness', line);
@@ -51,7 +51,7 @@ try {
 }
 
 try {
-  const h = await get('/api/v1/indexer/getHealth()');
+  const h = await get('/odata/v4/midnight-indexer/getHealth()');
   const line = `chain ${h.chainHeight}, indexed ${h.indexedHeight}, lag ${h.lag}, ${h.syncStatus}`;
   Number(h.lag) > 50 ? warn('indexer', line) : ok('indexer', line);
 } catch (e) {
@@ -60,7 +60,7 @@ try {
 
 if (SPONSOR) {
   try {
-    const b = await get(`/api/v1/nightgate/getWalletBalance(sessionId=${SPONSOR})`);
+    const b = await get(`/odata/v4/midnight/getWalletBalance(sessionId=${SPONSOR})`);
     const night = (Number(b.unshieldedNight) / 1e6).toFixed(2);
     const line = `${night} NIGHT, dust ${b.dustBalance}, backings ${b.registeredNightUtxoCount}, ` +
       `dust utxos ${b.dustUtxoCount} (${b.dustPendingCount} pending)`;
@@ -72,7 +72,7 @@ if (SPONSOR) {
   }
 
   try {
-    const s = await get(`/api/v1/nightgate/getWalletSyncProgress(sessionId=${SPONSOR})`);
+    const s = await get(`/odata/v4/midnight/getWalletSyncProgress(sessionId=${SPONSOR})`);
     if (!s.known) warn('sponsor sync', 'no snapshot yet');
     else {
       const line = `caughtUp=${s.caughtUp}, behind ${s.behindEvents} events, connected=${s.isConnected}`;

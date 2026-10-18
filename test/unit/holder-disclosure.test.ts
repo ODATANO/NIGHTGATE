@@ -27,7 +27,7 @@ const contractRegistry = require('../../srv/submission/contract-registry');
 const { getNightgatePluginConfig } = require('../../srv/utils/nightgate-config');
 /* eslint-enable @typescript-eslint/no-require-imports */
 
-const API = '/api/v1/nightgate';
+const API = '/odata/v4/midnight';
 const TOKEN = 'ngat_' + 'e'.repeat(64);
 const SESSION = 'c3c3c3c3-0000-4000-8000-000000000001';
 const T = 'ab'.repeat(32);

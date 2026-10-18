@@ -15,7 +15,7 @@ const PORT = process.env.PORT || '4004';
 // 127.0.0.1, not localhost: where that name resolves to ::1 first and the
 // server listens on IPv4, the probe stalls until its own timeout and reports
 // a healthy container as sick.
-const URL = `http://127.0.0.1:${PORT}/api/v1/indexer/getReadiness()`;
+const URL = `http://127.0.0.1:${PORT}/odata/v4/midnight-indexer/getReadiness()`;
 
 async function main() {
     const res = await fetch(URL, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(8000) });

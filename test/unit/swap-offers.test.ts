@@ -23,7 +23,7 @@ const offersModule = require('../../srv/submission/swap-offers');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const boardStatusModule = require('../../srv/submission/board-status');
 
-const API = '/api/v1/nightgate';
+const API = '/odata/v4/midnight';
 const TOKEN = 'ngat_' + 'd'.repeat(64);
 const SESSION = 'b2b2b2b2-0000-4000-8000-000000000001';
 const T_CERT = 'ab'.repeat(32);
@@ -252,7 +252,7 @@ describe('offer board over HTTP', () => {
     it('getBoardStatus counts open and filled offers for an anonymous reader, nothing else', async () => {
         const type = 'd4'.repeat(32);
         boardStatusModule.__resetBoardStatusForTests();
-        const before = await cap.axios.get('/api/v1/indexer/getBoardStatus()', { validateStatus: () => true });
+        const before = await cap.axios.get('/odata/v4/midnight-indexer/getBoardStatus()', { validateStatus: () => true });
         expect(before.status).toBe(200);
         describeAs({ gives: [type, '1'], wants: [T_CREDIT, '91'], nullifiers: [nullifier(91)] });
         const a = await post('postSwapOffer', { offer: halfText(51) }, asA);
@@ -261,10 +261,10 @@ describe('offer board over HTTP', () => {
         const db = await cds.connect.to('db');
         await offersModule.closeSwapOffersByNullifiers(db, [nullifier(91)], 'ba'.repeat(32));
         // the figures are memoized for a few seconds: a repeat read within them is the same answer
-        const memo = await cap.axios.get('/api/v1/indexer/getBoardStatus()', { validateStatus: () => true });
+        const memo = await cap.axios.get('/odata/v4/midnight-indexer/getBoardStatus()', { validateStatus: () => true });
         expect(memo.data).toEqual(before.data);
         boardStatusModule.__resetBoardStatusForTests();
-        const after = await cap.axios.get('/api/v1/indexer/getBoardStatus()', { validateStatus: () => true });
+        const after = await cap.axios.get('/odata/v4/midnight-indexer/getBoardStatus()', { validateStatus: () => true });
         expect(after.status).toBe(200);
         expect(after.data.openOffers - before.data.openOffers).toBe(1);
         expect(after.data.offersFilledToday - before.data.offersFilledToday).toBe(1);

@@ -25,17 +25,17 @@ const cap = cds.test(__dirname + '/../..') as unknown as { url: string };
 runTransportAuthContract({
     url: () => cap.url,
     kind: 'basic',
-    anonymousPath: '/api/v1/indexer/getLiveness()',
-    authenticatedPath: '/api/v1/indexer/SyncState',
-    operatorPath: '/api/v1/admin/BackgroundJobs',
+    anonymousPath: '/odata/v4/midnight-indexer/getLiveness()',
+    authenticatedPath: '/odata/v4/midnight-indexer/SyncState',
+    operatorPath: '/odata/v4/midnight-admin/BackgroundJobs',
     operator: { user: 'nightgate', password: 'op-secret' },
     realm: 'nightgate',
     maxFailures: 4,
     lane: {
         header: 'x-agent-token',
         value: 'ngat_' + 'a'.repeat(64),
-        insidePath: '/api/v1/nightgate/WalletSessions',
-        outsidePath: '/api/v1/admin/BackgroundJobs',
+        insidePath: '/odata/v4/midnight/WalletSessions',
+        outsidePath: '/odata/v4/midnight-admin/BackgroundJobs',
         insideStatus: 401
     }
 });

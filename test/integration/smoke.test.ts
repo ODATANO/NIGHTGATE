@@ -9,7 +9,7 @@ const test = cds.test(__dirname + '/../..');
 
 describe('cds.test harness boots', () => {
     it('serves NightgateService.Blocks against the in-memory DB (empty)', async () => {
-        const { status, data } = await test.get('/api/v1/nightgate/Blocks');
+        const { status, data } = await test.get('/odata/v4/midnight/Blocks');
         expect(status).toBe(200);
         expect(Array.isArray(data.value)).toBe(true);
         expect(data.value).toHaveLength(0);

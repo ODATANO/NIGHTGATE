@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.35.0 - 2026-10-18
+
+Services under `/odata/v4/midnight…`; the `/api/v1/…` paths keep answering
+until 1.0. No schema change, no circuit change.
+
+### Changes
+
+- Service paths: `NightgateService` `/odata/v4/midnight`, `NightgateIndexerService`
+  `/odata/v4/midnight-indexer`, `NightgateVerifyService` `/odata/v4/midnight-verify`,
+  `NightgateAnalyticsService` `/odata/v4/midnight-analytics`, `NightgateAdminService`
+  `/odata/v4/midnight-admin`. Names, model and handlers unchanged;
+  `/contract-manifest` and `/zk-config/*` stay where they are.
+- The agent-token lane and the public verify lane (CORS `*`) sit on the new paths.
+- Container healthcheck and watchdog read `/odata/v4/midnight-indexer/getReadiness()`.
+- `getMetrics()`: `legacy_path_requests_total{path}`, requests on each old
+  path since process start.
+- `@odatano/nightgate-tx` 0.14.0: `connect()` defaults `servicePath` to
+  `/odata/v4/midnight` and the new `indexerServicePath` (`getHealth()`) to
+  `/odata/v4/midnight-indexer`. Against a server below 0.35.0 pass
+  `servicePath: '/api/v1/nightgate', indexerServicePath: '/api/v1/indexer'`.
+
+### Deprecated
+
+- `/api/v1/nightgate`, `/api/v1/indexer`, `/api/v1/verify`, `/api/v1/analytics`,
+  `/api/v1/admin`: rewritten to the new paths before the services
+  (`srv/utils/legacy-service-paths.ts`), logged once per path, counted in
+  `getMetrics()`. They go with 1.0.
+
 ## 0.34.0 - 2026-10-15
 
 One throughput policy: rate classes, grant budgets per hour, one 429 answer.

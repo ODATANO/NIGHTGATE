@@ -284,10 +284,10 @@ The read-only probes of the indexer service are anonymous at the model
 level, so scrapers and K8s probes need no credentials:
 
 ```bash
-curl "http://localhost:4004/api/v1/indexer/getLiveness()"    # 200 while the process serves
-curl -i "http://localhost:4004/api/v1/indexer/getReadiness()" # 200 when ready, else 503 naming the failing check
-curl "http://localhost:4004/api/v1/indexer/getHealth()"
-curl "http://localhost:4004/api/v1/indexer/getMetrics()"      # Prometheus text inside {"value": "..."}
+curl "http://localhost:4004/odata/v4/midnight-indexer/getLiveness()"    # 200 while the process serves
+curl -i "http://localhost:4004/odata/v4/midnight-indexer/getReadiness()" # 200 when ready, else 503 naming the failing check
+curl "http://localhost:4004/odata/v4/midnight-indexer/getHealth()"
+curl "http://localhost:4004/odata/v4/midnight-indexer/getMetrics()"      # Prometheus text inside {"value": "..."}
 ```
 
 The container HEALTHCHECK (`docker/healthcheck.mjs`) probes `getReadiness()`.
@@ -338,7 +338,7 @@ database pool wait depth) when the p99 exceeds `NIGHTGATE_EVENT_LOOP_LAG_WARN_MS
 
 ## Reading the indexer health endpoint
 
-`GET /api/v1/indexer/getHealth()` reports the **crawler's** view, not the wallet's:
+`GET /odata/v4/midnight-indexer/getHealth()` reports the **crawler's** view, not the wallet's:
 
 ```json
 {
@@ -441,7 +441,7 @@ the price of a longer replay after a restart.
 Slow or stuck?
 
 ```bash
-curl "http://localhost:4004/api/v1/nightgate/getWalletSyncProgress(sessionId='...')"
+curl "http://localhost:4004/odata/v4/midnight/getWalletSyncProgress(sessionId='...')"
 ```
 
 Climbing `appliedIndex` with `eventsPerSecond` > 0: slow, see `etaSeconds` (log: `genuine-sync [prewarm] ... rate=... eta=...`). `appliedIndex` static while `elapsedMs` grows, or `isConnected: false`: stalled, check the indexer (below).
@@ -567,7 +567,7 @@ Envelopes (`v3`) bind key id, purpose and row id in the AAD: a value copied to a
 Each deploy stores a contract signing key in `ContractSigningKeys` (under the deploying account's key). It can replace the contract's verifier keys. Export it once and keep it offline:
 
 ```
-POST /api/v1/admin/exportContractSigningKey
+POST /odata/v4/midnight-admin/exportContractSigningKey
 { "sessionId": "<deploying session>", "contractAddress": "<address>", "password": "<16+ characters>" }
 ```
 

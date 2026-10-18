@@ -27,6 +27,7 @@ actions submit the job AND wait for the result, so one call returns the
 const ng = connect({
     baseUrl: 'https://nightgate.example',
     agentToken: 'ngat_...'            // or token: / username: + password:
+    // servicePath: '/api/v1/nightgate', indexerServicePath: '/api/v1/indexer'  // a server below 0.35.0
 });
 
 const proof = await ng.prepareDocumentProof({
