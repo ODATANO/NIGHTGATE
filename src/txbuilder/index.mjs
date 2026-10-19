@@ -33,6 +33,9 @@ import {
     resolveContractPackage, contractPackageDigestProblem, readProverKeyManifest, verifierCircuits, missingProverKeys,
     keyMatchesManifest, proverKeyUrl
 } from '@odatano/contract-kit/node';
+// Imported, never required: under a CJS-aware loader (tsx) require() of this
+// ESM package yields a second instance whose ContractState class the circuits refuse.
+import * as compactRuntime from '@midnight-ntwrk/compact-runtime';
 
 const require = createRequire(import.meta.url);
 
@@ -408,7 +411,7 @@ async function deriveKeyMaterial({ seedHex, networkId = 'preprod', accountIndex 
         import('@midnightntwrk/wallet-sdk-address-format')
     ]);
     const { deriveRoleSeeds } = require('../../srv/utils/wallet-hd.js');
-    const rt = require('@midnight-ntwrk/compact-runtime');
+    const rt = compactRuntime;
     const roleSeeds = await deriveRoleSeeds(new Uint8Array(Buffer.from(seedHex, 'hex')), accountIndex);
     const keystore = unshielded.createKeystore(roleSeeds.night, networkId);
     const attestationSecret = ownSecret ?? deriveAttestationSecret(roleSeeds.zswap);
@@ -434,7 +437,7 @@ async function deriveKeyMaterial({ seedHex, networkId = 'preprod', accountIndex 
  * Gives the same result as the vault's `recordKey` circuit.
  */
 export function computeRecordKey(attesterId, payloadHash) {
-    const rt = require('@midnight-ntwrk/compact-runtime');
+    const rt = compactRuntime;
     const u8 = new rt.CompactTypeUnsignedInteger(255n, 1);
     const b32 = new rt.CompactTypeBytes(32);
     const hexToBytes = (h, name) => {
@@ -634,7 +637,7 @@ export async function createTxBuilder(opts) {
     // One indexer provider per builder. One per transaction would leak a socket each time.
     const sockets = apiClient ? null : trackingWebSocket(require('ws'));
     const publicDataProvider = apiClient
-        ? apiPublicDataProvider({ client: apiClient, ledger, runtime: require('@midnight-ntwrk/compact-runtime'), ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
+        ? apiPublicDataProvider({ client: apiClient, ledger, runtime: compactRuntime, ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
         : indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, sockets.WebSocket);
 
     return {

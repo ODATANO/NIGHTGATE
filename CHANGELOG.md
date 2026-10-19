@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.35.1 - 2026-10-19
+
+### Fixes
+
+- `@odatano/nightgate-tx` 0.14.1: the transaction builder imports
+  `@midnight-ntwrk/compact-runtime` instead of requiring it. Under a loader
+  that serves `require()` of an ESM package separately (tsx), the `api`
+  builder's contract state came from a second runtime instance and every
+  circuit call failed with `'contractState' parameter ... has unexpected
+  type`. Plain Node was not affected.
+
 ## 0.35.0 - 2026-10-18
 
 Services under `/odata/v4/midnight…`; the `/api/v1/…` paths keep answering
