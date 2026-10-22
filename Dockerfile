@@ -4,7 +4,7 @@
 # working attestation server. Zero-config proving default is in-process wasm;
 # point NIGHTGATE_PROOF_SERVER_URL at a proof-server container to switch.
 
-FROM node:22-slim AS build
+FROM node:22.23.4-slim AS build
 # better-sqlite3 falls back to a source build when no prebuilt binary matches.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
@@ -21,7 +21,7 @@ RUN npm run build
 # build one that would fetch at runtime.
 RUN set -e; for c in counter shielded-token token-factory holder-registry attestation-vault attestation-vault-32; do node scripts/fetch-contract-keys.mjs "$c"; done
 
-FROM node:22-slim
+FROM node:22.23.4-slim
 ARG VERSION=dev
 ARG BUILD_DATE=unknown
 ARG VCS_REF=unknown

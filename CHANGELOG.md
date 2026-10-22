@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.35.2 - 2026-10-22
+
+### Changed
+
+- `Dockerfile` builds both stages from `node:22.23.4-slim` (Node security
+  release of 2026-10-21: Brotli decoder out-of-bounds write, TLS hostname
+  checks, keep-alive response desync, dependency updates). The base image is
+  pinned to the exact Node version instead of the floating `node:22-slim`.
+  No code change.
+
 ## 0.35.1 - 2026-10-19
 
 ### Fixes
