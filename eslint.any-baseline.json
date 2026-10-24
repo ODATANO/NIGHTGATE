@@ -31,7 +31,7 @@
     "srv/submission/actions/contracts.ts": 1,
     "srv/submission/actions/disclosure.ts": 1,
     "srv/submission/actions/documents.ts": 2,
-    "srv/submission/actions/predicates.ts": 11,
+    "srv/submission/actions/predicates.ts": 9,
     "srv/submission/attestation-state.ts": 2,
     "srv/submission/background-jobs.ts": 3,
     "srv/submission/board-status.ts": 1,

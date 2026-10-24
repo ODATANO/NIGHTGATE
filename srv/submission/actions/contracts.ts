@@ -25,11 +25,8 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate('deploy', sessionId, req)) return;
 
-        let parsedInitialState: unknown = {};
-        if (initialPrivateState) {
-            try { parsedInitialState = JSON.parse(initialPrivateState); }
-            catch { return req.reject(400, 'initialPrivateState must be valid JSON'); }
-        }
+        if (Array.isArray(initialPrivateState)) return req.reject(400, 'initialPrivateState must be a JSON object');
+        const parsedInitialState: unknown = initialPrivateState ?? {};
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -79,11 +76,8 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         }
 
         // Used only when the wallet has no private state for this contract yet.
-        let parsedInitialPrivateState: unknown;
-        if (initialPrivateState) {
-            try { parsedInitialPrivateState = JSON.parse(initialPrivateState); }
-            catch { return req.reject(400, 'initialPrivateState must be valid JSON'); }
-        }
+        if (Array.isArray(initialPrivateState)) return req.reject(400, 'initialPrivateState must be a JSON object');
+        const parsedInitialPrivateState: unknown = initialPrivateState ?? undefined;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -253,11 +247,8 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
             return req.reject(400, e instanceof Error && /^calls\[/.test(e.message) ? e.message : 'calls must be valid JSON');
         }
 
-        let parsedInitialPrivateState: unknown;
-        if (initialPrivateState) {
-            try { parsedInitialPrivateState = JSON.parse(initialPrivateState); }
-            catch { return req.reject(400, 'initialPrivateState must be valid JSON'); }
-        }
+        if (Array.isArray(initialPrivateState)) return req.reject(400, 'initialPrivateState must be a JSON object');
+        const parsedInitialPrivateState: unknown = initialPrivateState ?? undefined;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();

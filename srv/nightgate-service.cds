@@ -217,12 +217,110 @@ service NightgateService {
     };
 
     // ---- Zero-knowledge proofs about document fields ----
-    // The inputs come from prepareDocumentProof: payloadHash, contentRoot, schemaId, fieldKey, fieldSalt, siblingsJson, dirsJson.
+    // The inputs come from prepareDocumentProof: payloadHash, contentRoot, schemaId, fieldKey, fieldSalt, siblings, dirs.
     // A contentRoot passed here is recorded on chain first, under the session's own attester only.
 
     /** Proofs created by the issue* actions. `provenTxHash` and `provenAt` are set once the proof is on chain. */
     @readonly
     entity PredicateAttestations as projection on midnight.PredicateAttestations;
+
+    // ---- Proof input types ----
+
+    /** A field of a document to make provable. Its position in the list is its slot. */
+    type ProofField {
+        field : String; // path into the document, dots descend; a top-level key containing dots wins
+        @assert.range
+        kind  : String enum {
+            uint;
+            bytes;
+        }; // default uint
+        @assert.range: [1, 1000000000]
+        scale : Integer; // uint only; default 1000
+    }
+
+    /** One prepared field: the inputs of a single-field proof. `salt` is the proof actions' `fieldSalt`. */
+    type PreparedField {
+        field       : String;
+        fieldKey    : Hex64;
+        kind        : String enum {
+            uint;
+            bytes;
+        };
+        value       : String; // decimal integer, scaled; uint only
+        valueDigest : Hex64; // blake2b-256 of the exact string; bytes only
+        salt        : Hex64;
+        siblings    : array of Hex64;
+        dirs        : array of Boolean;
+    }
+
+    /** One slot of the schema a document was prepared with. The comparison circuit recomputes the schema id from the list. */
+    type SchemaSlot {
+        fieldKey : Hex64;
+        @assert.range: [0, 2]
+        kind     : Integer; // 0 = uint, 1 = bytes, 2 = padding
+        scale    : String; // decimal integer; 0 for bytes and padding
+    }
+
+    /** A document's private value of one slot. */
+    type SlotOpening {
+        present     : Boolean;
+        value       : String; // decimal integer, scaled; uint only
+        valueDigest : Hex64; // blake2b-256 of the exact string; bytes only
+    }
+
+    /** A document's private inputs for the comparison circuits. Store it; without it nothing can be proven about the root. */
+    type DocumentOpening {
+        saltSeed : Hex64;
+        slots    : array of SlotOpening; // one per slot of the width
+    }
+
+    /** One claim of a batch: the inputs of the single action selected by `predicate`. */
+    type BatchClaim {
+        @assert.range
+        predicate      : String enum {
+            lessOrEqual;
+            greaterOrEqual;
+            bytesEquality;
+            setMembership;
+            documentIntegrity;
+            documentDiff;
+        };
+        fieldKey       : Hex64; // all but the document kinds
+        salt           : Hex64; // all but the document kinds
+        siblings       : array of Hex64; // all but the document kinds
+        dirs           : array of Boolean; // all but the document kinds
+        unit           : String; // optional
+        value          : String; // numeric: decimal integer, scaled; setMembership: the exact string
+        threshold      : Integer64; // numeric; scaled like the value
+        expectedValue  : String; // bytesEquality; one of expectedValue, expectedDigest
+        expectedDigest : Hex64; // bytesEquality
+        valueDigest    : Hex64; // setMembership; one of value, valueDigest
+        allowedValues  : array of String; // setMembership; or setRoot with its path
+        setRoot        : Hex64; // setMembership
+        setSiblings    : array of Hex64; // setMembership; 6 entries
+        setDirs        : array of Boolean; // setMembership; 6 entries
+        payloadHashB   : Hex64; // document kinds
+        attesterIdB    : Hex64; // document kinds; optional, default the batch attester
+        allowedMask    : Integer64; // documentIntegrity; bit i set = slot i may differ
+        k              : Integer; // documentDiff; minimum number of differing slots
+        schema         : array of SchemaSlot; // document kinds
+        openingA       : DocumentOpening; // document kinds
+        openingB       : DocumentOpening; // document kinds
+    }
+
+    /** One claim of a batch as recorded, with its `PredicateAttestations` row. */
+    type IssuedClaim {
+        predicateAttestationId : UUID;
+        predicate              : String;
+        fieldKey               : Hex64;
+        threshold              : Integer64;
+        unit                   : String;
+        expectedDigest         : Hex64;
+        setRoot                : Hex64;
+        payloadHashB           : Hex64;
+        allowedMask            : Integer64;
+        k                      : Integer;
+    }
 
     /** Proves that a numeric document field is at most or at least `threshold`, without revealing the value. */
     action   issueFieldPredicateAttestation(payloadHash: Hex64,
@@ -232,9 +330,13 @@ service NightgateService {
                                             fieldSalt: Hex64,
                                             contentRoot: Hex64, // optional
                                             schemaId: Hex64, // required with contentRoot
-                                            siblingsJson: String, // JSON array of 64 hex
-                                            dirsJson: String, // JSON array of booleans
-                                            predicate: String, // 'lessOrEqual' | 'greaterOrEqual'
+                                            siblings: array of Hex64, // inclusion path; one entry per tree level
+                                            dirs: array of Boolean, // inclusion path; one entry per tree level
+                                            @assert.range
+                                            predicate: String enum {
+                                                lessOrEqual;
+                                                greaterOrEqual;
+                                            },
                                             threshold: Integer64, // scaled like the value
                                             unit: String, // optional
                                             sessionId: UUID,
@@ -251,14 +353,14 @@ service NightgateService {
 
     /**
      * Proves up to 8 claims about one document in a single transaction, 7 if `contentRoot` is given.
-     * Each entry in `claimsJson` has the inputs of the matching single action, selected by `predicate`.
+     * Each entry in `claims` has the inputs of the matching single action, selected by `predicate`.
      * If only part of the transaction succeeds on chain, the job fails. Then verify each claim on its own.
      */
     action   issueFieldPredicateAttestationBatch(payloadHash: Hex64,
                                                  attesterId: Hex64, // optional, default the session's attester
                                                  contentRoot: Hex64, // optional
                                                  schemaId: Hex64, // required with contentRoot
-                                                 claimsJson: LargeString, // JSON array
+                                                 claims: array of BatchClaim,
                                                  sessionId: UUID,
                                                  contractAddress: String,
                                                  compiledArtifactRef: String, // optional, default 'attestation-vault'
@@ -268,7 +370,7 @@ service NightgateService {
     )                                                                         returns {
         jobId             : UUID;
         status            : String;
-        claims            : LargeString; // JSON array
+        claims            : array of IssuedClaim;
         droppedDuplicates : Integer;
     };
 
@@ -284,8 +386,8 @@ service NightgateService {
                                            fieldSalt: Hex64,
                                            contentRoot: Hex64, // optional
                                            schemaId: Hex64, // required with contentRoot
-                                           siblingsJson: String, // JSON array of 64 hex
-                                           dirsJson: String, // JSON array of booleans
+                                           siblings: array of Hex64, // inclusion path; one entry per tree level
+                                           dirs: array of Boolean, // inclusion path; one entry per tree level
                                            sessionId: UUID,
                                            contractAddress: String,
                                            compiledArtifactRef: String, // optional, default 'attestation-vault'
@@ -300,22 +402,22 @@ service NightgateService {
 
     /**
      * Proves that a hidden text field is one of up to 64 allowed values.
-     * Pass the allowed values as `allowedValuesJson`, or the set from prepareMembershipSet as `setRoot` with its path.
+     * Pass the allowed values as `allowedValues`, or the set from prepareMembershipSet as `setRoot` with its path.
      */
     action   issueFieldMembershipAttestation(payloadHash: Hex64,
                                              attesterId: Hex64, // optional, default the session's attester
                                              fieldKey: Hex64,
                                              value: String,
                                              valueDigest: Hex64, // optional; blake2b-256 of value
-                                             allowedValuesJson: LargeString, // JSON array of strings
+                                             allowedValues: array of String, // or setRoot with its path
                                              setRoot: Hex64,
-                                             setSiblingsJson: String, // JSON array of 6 x 64 hex
-                                             setDirsJson: String, // JSON array of 6 booleans
+                                             setSiblings: array of Hex64, // 6 entries
+                                             setDirs: array of Boolean, // 6 entries
                                              fieldSalt: Hex64,
                                              contentRoot: Hex64, // optional
                                              schemaId: Hex64, // required with contentRoot
-                                             siblingsJson: String, // JSON array of 64 hex
-                                             dirsJson: String, // JSON array of booleans
+                                             siblings: array of Hex64, // inclusion path; one entry per tree level
+                                             dirs: array of Boolean, // inclusion path; one entry per tree level
                                              sessionId: UUID,
                                              contractAddress: String,
                                              compiledArtifactRef: String, // optional, default 'attestation-vault'
@@ -337,9 +439,9 @@ service NightgateService {
                                                attesterIdA: Hex64, // optional, default the session's attester
                                                attesterIdB: Hex64, // optional, default attesterIdA
                                                allowedMask: Integer64, // bit i set = field i may differ
-                                               schemaJson: LargeString,
-                                               openingAJson: LargeString,
-                                               openingBJson: LargeString,
+                                               schema: array of SchemaSlot, // `schema` from prepareDocumentProof
+                                               openingA: DocumentOpening, // `opening` from prepareDocumentProof
+                                               openingB: DocumentOpening,
                                                contentRootA: Hex64, // optional
                                                contentRootB: Hex64, // optional
                                                schemaId: Hex64, // required with contentRootA or contentRootB
@@ -364,9 +466,9 @@ service NightgateService {
                                           attesterIdA: Hex64, // optional, default the session's attester
                                           attesterIdB: Hex64, // optional, default attesterIdA
                                           k: Integer, // 1 to the number of fields; minimum number of differing fields
-                                          schemaJson: LargeString,
-                                          openingAJson: LargeString,
-                                          openingBJson: LargeString,
+                                          schema: array of SchemaSlot, // `schema` from prepareDocumentProof
+                                          openingA: DocumentOpening, // `opening` from prepareDocumentProof
+                                          openingB: DocumentOpening,
                                           contentRootA: Hex64, // optional
                                           contentRootB: Hex64, // optional
                                           schemaId: Hex64, // required with contentRootA or contentRootB
@@ -432,7 +534,15 @@ service NightgateService {
                                   attesterId: Hex64,
                                   payloadHash: Hex64, // document A when comparing two documents
                                   fieldKey: Hex64, // required for single-field predicates
-                                  predicate: String, // 'lessOrEqual' | 'greaterOrEqual' | 'bytesEquality' | 'setMembership' | 'documentIntegrity' | 'documentDiff'
+                                  @assert.range
+                                  predicate: String enum {
+                                      lessOrEqual;
+                                      greaterOrEqual;
+                                      bytesEquality;
+                                      setMembership;
+                                      documentIntegrity;
+                                      documentDiff;
+                                  },
                                   threshold: Integer64, // required for numeric predicates; the scaled integer used when proving
                                   expectedDigest: Hex64, // required for 'bytesEquality'
                                   setRoot: Hex64, // required for 'setMembership'
@@ -527,7 +637,10 @@ service NightgateService {
     };
 
     /** Removes an expired proof from the contract. Anyone can call it. */
-    action   purgeExpired(kind: String, // 'claim'
+    action   purgeExpired(@assert.range
+                          kind: String enum {
+                              claim;
+                          },
                           key: Hex64,
                           sessionId: UUID,
                           contractAddress: String,
@@ -561,7 +674,7 @@ service NightgateService {
     /** Deploys a contract known to the server. */
     action   deployContract(compiledArtifactRef: String,
                             sessionId: UUID,
-                            initialPrivateState: LargeString, // JSON
+                            initialPrivateState: Map, // optional, default {}
                             idempotencyKey: String, // optional
                             sponsorSessionId: UUID, // optional
                             recoveryId: Hex64 // optional; the attester that may use registerPassport modes 3 and 4
@@ -581,7 +694,7 @@ service NightgateService {
                                 sessionId: UUID,
                                 args: LargeString, // JSON array
                                 idempotencyKey: String, // optional
-                                initialPrivateState: LargeString, // JSON; optional, default {}
+                                initialPrivateState: Map, // optional, default {}
                                 sponsorSessionId: UUID // optional
     )                                                                         returns {
         jobId  : UUID;
@@ -645,7 +758,7 @@ service NightgateService {
      */
     action   postSwapOffer(offer: LargeString, // offer file or base64
                            expiresAt: Timestamp, // optional
-                           tags: LargeString)                                 returns { // JSON array of up to 8 strings; optional
+                           tags: array of String) returns { // up to 8; optional
         offerId     : UUID;
         status      : String;
         bound       : Boolean; // the half is already sealed
@@ -767,7 +880,7 @@ service NightgateService {
                                      compiledArtifactRef: String,
                                      sessionId: UUID,
                                      idempotencyKey: String, // optional
-                                     initialPrivateState: LargeString, // JSON; optional, default {}
+                                     initialPrivateState: Map, // optional, default {}
                                      sponsorSessionId: UUID, // optional
                                      independentCalls: Boolean // optional; true lets the server reorder calls that do not depend on each other
     )                                                                         returns {
@@ -984,38 +1097,38 @@ service NightgateService {
 
     /**
      * Prepares a JSON document for the proof actions. Nothing is stored.
-     * Keep the field order of `proofFieldsJson` the same for every document of a kind. `kind` is 'uint' or 'bytes', `scale` defaults to 1000.
+     * Keep the field order of `proofFields` the same for every document of a kind.
      * Store `opening`. Without it no later proof about this document is possible.
      */
-    action   prepareDocumentProof(documentJson: LargeString, // JSON object
-                                  proofFieldsJson: LargeString, // JSON array of { field, kind, scale }, at most 16 or 32 entries depending on the contract
+    action   prepareDocumentProof(document: Map, // the JSON document
+                                  proofFields: array of ProofField, // at most 16 or 32 entries depending on the contract
                                   saltSeed: Hex64, // optional, default random
                                   compiledArtifactRef: String // optional, default 'attestation-vault'
     )                                                                         returns {
         payloadHash       : Hex64;
         canonicalDocument : LargeString; // the exact text that was hashed
         contentRoot       : Hex64;
-        fields            : LargeString; // JSON array
-        emptyFields       : LargeString; // JSON array
+        fields            : array of PreparedField;
+        emptyFields       : array of String;
         schemaId          : Hex64;
-        schema            : LargeString; // JSON array
-        leaves            : LargeString; // JSON array of 64 hex
-        opening           : LargeString; // JSON
+        schema            : array of SchemaSlot;
+        leaves            : array of Hex64; // salted leaf hashes in slot order
+        opening           : DocumentOpening;
     };
 
     /**
      * Builds the set of allowed values for issueFieldMembershipAttestation.
      * With `value` or `valueDigest` it also returns the path that proves the value is in the set.
      */
-    action   prepareMembershipSet(allowedValuesJson: LargeString, // JSON array of up to 64 strings
+    action   prepareMembershipSet(allowedValues: array of String, // up to 64 distinct values
                                   value: String, // optional
                                   valueDigest: Hex64, // optional; blake2b-256 of value
                                   compiledArtifactRef: String // optional, default 'attestation-vault'
     )                                                                         returns {
         setRoot         : Hex64;
         memberCount     : Integer;
-        setSiblingsJson : String;
-        setDirsJson     : String;
+        setSiblings     : array of Hex64; // empty without value or valueDigest
+        setDirs         : array of Boolean; // empty without value or valueDigest
     };
 
     /**

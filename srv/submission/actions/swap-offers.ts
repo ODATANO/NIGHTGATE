@@ -29,13 +29,9 @@ const MAX_LIST_LIMIT = 200;
 type StatusFilter = SwapOfferStatus | 'all';
 const STATUS_FILTERS: ReadonlySet<string> = new Set(['open', 'filled', 'retired', 'expired', 'all']);
 
-function parseTags(raw: unknown): string[] | string {
-    if (raw === undefined || raw === null || raw === '') return [];
-    let v: unknown = raw;
-    if (typeof raw === 'string') {
-        try { v = JSON.parse(raw); } catch { return 'tags must be a JSON array of strings'; }
-    }
-    if (!Array.isArray(v)) return 'tags must be a JSON array of strings';
+function parseTags(v: readonly unknown[] | null | undefined): string[] | string {
+    if (v === undefined || v === null) return [];
+    if (!Array.isArray(v)) return 'tags must be an array of strings';
     if (v.length > MAX_TAGS) return `tags: at most ${MAX_TAGS}`;
     const tags = [...new Set(v.map(t => String(t ?? '').trim()).filter(t => t.length > 0))];
     if (tags.some(t => t.length > MAX_TAG_CHARS)) return `tags: each at most ${MAX_TAG_CHARS} characters`;

@@ -189,12 +189,12 @@ function expectStatus(r, want, label) {
     };
     const PROOF_FIELDS = [{ field: 'contractValueEur' }, { field: 'expiryDays' }];
     r = await post('/prepareDocumentProof', {
-        documentJson: JSON.stringify(CONTRACT_DOC),
-        proofFieldsJson: JSON.stringify(PROOF_FIELDS)
+        document: CONTRACT_DOC,
+        proofFields: PROOF_FIELDS
     }, agent);
     if (r.status >= 400) fail(`prepareDocumentProof → ${r.status}: ${pretty(r.body)}`);
     const { payloadHash, canonicalDocument, contentRoot, schemaId } = r.body;
-    const fields = JSON.parse(r.body.fields);
+    const fields = r.body.fields;
     if (blake2b256Hex(canonicalDocument) !== payloadHash) fail('payloadHash does not re-hash from canonicalDocument');
     if (fields.length !== 2) fail(`expected 2 prepared fields, got ${fields.length}`);
     console.log(`OK   payloadHash = ${payloadHash.slice(0, 12)}…, contentRoot = ${contentRoot.slice(0, 12)}…, re-hash matches`);
@@ -222,7 +222,7 @@ function expectStatus(r, want, label) {
     ];
     r = await post('/issueFieldPredicateAttestationBatch', {
         payloadHash, contentRoot, schemaId,
-        claimsJson: JSON.stringify(claims),
+        claims: claims,
         contractAddress
         // again no sessionId: injected
     }, agent);

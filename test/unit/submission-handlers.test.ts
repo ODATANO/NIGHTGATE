@@ -161,7 +161,7 @@ function makeReq(data: Record<string, unknown>) {
 const VALID_DEPLOY_ARGS = {
     compiledArtifactRef: 'attestation-vault',
     sessionId: 'session-abc',
-    initialPrivateState: '{"counter":0}'
+    initialPrivateState: { counter: 0 }
 };
 
 const VALID_CALL_ARGS = {
@@ -212,18 +212,18 @@ describe('deployContract: argument validation', () => {
     }
 
     test('rejects missing compiledArtifactRef', async () => {
-        const req = await setupAndCallDeploy({ sessionId: 's', initialPrivateState: '{}' });
+        const req = await setupAndCallDeploy({ sessionId: 's', initialPrivateState: {} });
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/compiledArtifactRef/));
     });
 
     test('rejects missing sessionId', async () => {
-        const req = await setupAndCallDeploy({ compiledArtifactRef: 'a', initialPrivateState: '{}' });
+        const req = await setupAndCallDeploy({ compiledArtifactRef: 'a', initialPrivateState: {} });
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sessionId/));
     });
 
-    test('rejects non-JSON initialPrivateState', async () => {
-        const req = await setupAndCallDeploy({ ...VALID_DEPLOY_ARGS, initialPrivateState: 'not-json' });
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/JSON/));
+    test('rejects an initialPrivateState that is not an object', async () => {
+        const req = await setupAndCallDeploy({ ...VALID_DEPLOY_ARGS, initialPrivateState: [1] });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/JSON object/));
     });
 
 });
@@ -256,9 +256,9 @@ describe('submitContractCall: argument validation', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/JSON/));
     });
 
-    test('rejects non-JSON initialPrivateState (multi-caller seeding)', async () => {
-        const req = await setupAndCallSubmit({ ...VALID_CALL_ARGS, initialPrivateState: '{broken' });
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/initialPrivateState must be valid JSON/));
+    test('rejects an initialPrivateState that is not an object (multi-caller seeding)', async () => {
+        const req = await setupAndCallSubmit({ ...VALID_CALL_ARGS, initialPrivateState: [1] });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/initialPrivateState must be a JSON object/));
     });
 });
 
@@ -313,9 +313,9 @@ describe('submitContractCallBatch: argument validation', () => {
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/calls\[0\]\.args must be an array/));
     });
 
-    test('rejects non-JSON initialPrivateState', async () => {
-        const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, initialPrivateState: '{broken' });
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/initialPrivateState must be valid JSON/));
+    test('rejects an initialPrivateState that is not an object', async () => {
+        const req = await setupAndCallBatch({ ...VALID_BATCH_ARGS, initialPrivateState: [1] });
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/initialPrivateState must be a JSON object/));
     });
 
     const SIBS4 = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
@@ -2155,8 +2155,8 @@ describe('issueFieldPredicateAttestation', () => {
         fieldSalt: 'f5'.repeat(32),
         contentRoot: VALID_ROOT,
         schemaId: 'ab'.repeat(32),
-        siblingsJson: JSON.stringify(SIBLINGS),
-        dirsJson: JSON.stringify([true, false, true, false]),
+        siblings: SIBLINGS,
+        dirs: [true, false, true, false],
         predicate: 'lessOrEqual',
         threshold: 50000,
         unit: 'kgCO2e/kWh',
@@ -2194,12 +2194,10 @@ describe('issueFieldPredicateAttestation', () => {
         [{ threshold: 'abc' }, /threshold must be an integer/],
         [{ threshold: '9223372036854775808' }, /threshold exceeds the recorded range/],
         [{ predicate: 'between' }, /lessOrEqual.*greaterOrEqual/],
-        [{ siblingsJson: 'not-json' }, /siblingsJson must be a JSON array/],
-        [{ dirsJson: 'not-json' }, /dirsJson must be a JSON array/],
-        [{ siblingsJson: JSON.stringify(SIBLINGS.slice(0, 2)) }, /array of 4 hashes/],
-        [{ dirsJson: JSON.stringify([true]) }, /array of 4 booleans/],
-        [{ siblingsJson: JSON.stringify([...SIBLINGS.slice(0, 3), 'short']) }, /each sibling must be 64 hex/],
-        [{ dirsJson: JSON.stringify([true, false, 'false', true]) }, /dirsJson entries must be booleans/],
+        [{ siblings: SIBLINGS.slice(0, 2) }, /array of 4 hashes/],
+        [{ dirs: [true] }, /array of 4 booleans/],
+        [{ siblings: [...SIBLINGS.slice(0, 3), 'short'] }, /each siblings entry must be 64 hex/],
+        [{ dirs: [true, false, 'false', true] }, /dirs entries must be booleans/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/]
     ])('rejects %o', async (patch, msg) => {
@@ -2306,7 +2304,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         payloadHash: VALID_PAYLOAD,
         contentRoot: VALID_ROOT,
         schemaId: 'ab'.repeat(32),
-        claimsJson: JSON.stringify([makeClaim(1), makeClaim(2)]),
+        claims: [makeClaim(1), makeClaim(2)],
         sessionId: `fieldpredbatch-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
         compiledArtifactRef: 'attestation-vault',
@@ -2334,19 +2332,18 @@ describe('issueFieldPredicateAttestationBatch', () => {
         [{ payloadHash: undefined }, /payloadHash is required/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/],
-        [{ claimsJson: undefined }, /claimsJson is required/],
-        [{ claimsJson: 'not-json' }, /claimsJson must be valid JSON/],
-        [{ claimsJson: '[]' }, /non-empty JSON array/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { fieldKey: 'zz' })]) }, /claims\[0\].fieldKey must be 64 hex/],
-        [{ claimsJson: JSON.stringify([makeClaim(1), makeClaim(2, { value: '' })]) }, /claims\[1\].value is required/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { value: '47.3' })]) }, /claims\[0\].value must be an integer/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { value: '-5' })]) }, /claims\[0\].value must be a non-negative integer/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { threshold: 'abc' })]) }, /claims\[0\].threshold must be an integer/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { predicate: 'between' })]) }, /claims\[0\].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { siblings: SIBLINGS.slice(0, 2) })]) }, /claims\[0\].siblings must be a JSON array of 4 hashes/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { siblings: [...SIBLINGS.slice(0, 3), 'short'] })]) }, /claims\[0\].siblings entries must be 64 hex/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { dirs: [true] })]) }, /claims\[0\].dirs must be a JSON array of 4 booleans/],
-        [{ claimsJson: JSON.stringify([makeClaim(1, { dirs: [true, false, 'false', true] })]) }, /claims\[0\].dirs entries must be booleans/]
+        [{ claims: undefined }, /claims is required/],
+        [{ claims: [] }, /claims is required/],
+        [{ claims: [makeClaim(1, { fieldKey: 'zz' })] }, /claims\[0\].fieldKey must be 64 hex/],
+        [{ claims: [makeClaim(1), makeClaim(2, { value: '' })] }, /claims\[1\].value is required/],
+        [{ claims: [makeClaim(1, { value: '47.3' })] }, /claims\[0\].value must be an integer/],
+        [{ claims: [makeClaim(1, { value: '-5' })] }, /claims\[0\].value must be a non-negative integer/],
+        [{ claims: [makeClaim(1, { threshold: 'abc' })] }, /claims\[0\].threshold must be an integer/],
+        [{ claims: [makeClaim(1, { predicate: 'between' })] }, /claims\[0\].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'/],
+        [{ claims: [makeClaim(1, { siblings: SIBLINGS.slice(0, 2) })] }, /claims\[0\].siblings must be an array of 4 hashes/],
+        [{ claims: [makeClaim(1, { siblings: [...SIBLINGS.slice(0, 3), 'short'] })] }, /claims\[0\].siblings entries must be 64 hex/],
+        [{ claims: [makeClaim(1, { dirs: [true] })] }, /claims\[0\].dirs must be an array of 4 booleans/],
+        [{ claims: [makeClaim(1, { dirs: [true, false, 'false', true] })] }, /claims\[0\].dirs entries must be booleans/]
     ])('rejects %o', async (patch, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq(VALID_ARGS(patch));
@@ -2356,14 +2353,14 @@ describe('issueFieldPredicateAttestationBatch', () => {
 
     test('caps at 8 claims without anchor and 7 with an in-batch contentRoot anchor', async () => {
         const { srv } = setupHandlersWithDb();
-        const nine = JSON.stringify(Array.from({ length: 9 }, (_, i) => makeClaim(i + 1)));
-        const eight = JSON.stringify(Array.from({ length: 8 }, (_, i) => makeClaim(i + 1)));
+        const nine = Array.from({ length: 9 }, (_, i) => makeClaim(i + 1));
+        const eight = Array.from({ length: 8 }, (_, i) => makeClaim(i + 1));
 
-        const reqNine = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: nine }));
+        const reqNine = makeReq(VALID_ARGS({ contentRoot: undefined, claims: nine }));
         await srv.handlers['issueFieldPredicateAttestationBatch'](reqNine);
         expect(reqNine.reject).toHaveBeenCalledWith(400, expect.stringMatching(/at most 8 entries/));
 
-        const reqEightWithAnchor = makeReq(VALID_ARGS({ claimsJson: eight }));
+        const reqEightWithAnchor = makeReq(VALID_ARGS({ claims: eight }));
         await srv.handlers['issueFieldPredicateAttestationBatch'](reqEightWithAnchor);
         expect(reqEightWithAnchor.reject).toHaveBeenCalledWith(400, expect.stringMatching(/at most 7 entries.*anchor/));
     });
@@ -2392,10 +2389,10 @@ describe('issueFieldPredicateAttestationBatch', () => {
         expect(result).toEqual({
             jobId: 'job-issueFieldPredicateAttestationBatch-test',
             status: 'pending',
-            claims: expect.any(String),
+            claims: expect.any(Array),
             droppedDuplicates: 0
         });
-        const claims = JSON.parse(result.claims);
+        const claims = result.claims;
         expect(claims).toHaveLength(2);
         for (const c of claims) {
             expect(c).toEqual({
@@ -2460,12 +2457,12 @@ describe('issueFieldPredicateAttestationBatch', () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const dupe = makeClaim(1);
-        const req = makeReq(VALID_ARGS({ claimsJson: JSON.stringify([dupe, makeClaim(2), { ...dupe }]) }));
+        const req = makeReq(VALID_ARGS({ claims: [dupe, makeClaim(2), { ...dupe }] }));
 
         const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.droppedDuplicates).toBe(1);
-        expect(JSON.parse(result.claims)).toHaveLength(2);
+        expect(result.claims).toHaveLength(2);
         const batchArgs = (submitter.callBatch as Mock).mock.calls[0][0];
         // anchor + 2 unique proofs; the duplicate proved nothing extra.
         expect(batchArgs.calls).toHaveLength(3);
@@ -2477,20 +2474,20 @@ describe('issueFieldPredicateAttestationBatch', () => {
         process.env.NIGHTGATE_PROVE_RATE_LIMIT = '10';
         const { srv } = setupHandlersWithDb();
         const sessionId = `fieldpredbatch-rate-${Math.random().toString(36).slice(2)}`;
-        const eight = JSON.stringify(Array.from({ length: 8 }, (_, i) => makeClaim(i + 1)));
+        const eight = Array.from({ length: 8 }, (_, i) => makeClaim(i + 1));
 
-        const first = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: eight, sessionId }));
+        const first = makeReq(VALID_ARGS({ contentRoot: undefined, claims: eight, sessionId }));
         await srv.handlers['issueFieldPredicateAttestationBatch'](first);
         expect(first.reject).not.toHaveBeenCalled();
 
         // 8 of the 10 per hour consumed; a 3-claim follow-up must trip 429.
-        const second = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: JSON.stringify([makeClaim(11), makeClaim(12), makeClaim(13)]), sessionId }));
+        const second = makeReq(VALID_ARGS({ contentRoot: undefined, claims: [makeClaim(11), makeClaim(12), makeClaim(13)], sessionId }));
         await srv.handlers['issueFieldPredicateAttestationBatch'](second);
         expect(second.reject).toHaveBeenCalledWith(429, expect.stringMatching(/Rate limited/));
 
         // All-or-nothing: the rejected batch consumed NOTHING, so the 2
         // remaining slots are still available.
-        const third = makeReq(VALID_ARGS({ contentRoot: undefined, claimsJson: JSON.stringify([makeClaim(14), makeClaim(15)]), sessionId }));
+        const third = makeReq(VALID_ARGS({ contentRoot: undefined, claims: [makeClaim(14), makeClaim(15)], sessionId }));
         await srv.handlers['issueFieldPredicateAttestationBatch'](third);
         expect(third.reject).not.toHaveBeenCalled();
         delete process.env.NIGHTGATE_PROVE_RATE_LIMIT;
@@ -2512,8 +2509,8 @@ describe('issueFieldEqualityAttestation', () => {
         fieldSalt: 'f5'.repeat(32),
         contentRoot: VALID_ROOT,
         schemaId: 'ab'.repeat(32),
-        siblingsJson: JSON.stringify(SIBLINGS),
-        dirsJson: JSON.stringify([true, false, true, false]),
+        siblings: SIBLINGS,
+        dirs: [true, false, true, false],
         sessionId: `fieldeq-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
         compiledArtifactRef: 'attestation-vault'
@@ -2540,8 +2537,8 @@ describe('issueFieldEqualityAttestation', () => {
         [{ payloadHash: undefined }, /payloadHash is required/],
         [{ expectedDigest: undefined }, /exactly one of expectedValue \/ expectedDigest/],
         [{ expectedValue: 'NMC811' }, /exactly one of expectedValue \/ expectedDigest/],
-        [{ siblingsJson: JSON.stringify(SIBLINGS.slice(0, 2)) }, /array of 4 hashes/],
-        [{ dirsJson: JSON.stringify([true, false, 'false', true]) }, /entries must be booleans/],
+        [{ siblings: SIBLINGS.slice(0, 2) }, /array of 4 hashes/],
+        [{ dirs: [true, false, 'false', true] }, /entries must be booleans/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/]
     ])('rejects %o', async (patch, msg) => {
@@ -2623,16 +2620,16 @@ describe('issueFieldMembershipAttestation', () => {
         valueDigest: DIGEST,
         fieldSalt: 'f5'.repeat(32),
         setRoot: SET_ROOT,
-        setSiblingsJson: JSON.stringify(SET_SIBLINGS),
-        setDirsJson: JSON.stringify([true, false, true, false, true, false]),
-        siblingsJson: JSON.stringify(SIBLINGS),
-        dirsJson: JSON.stringify([true, false, true, false]),
+        setSiblings: SET_SIBLINGS,
+        setDirs: [true, false, true, false, true, false],
+        siblings: SIBLINGS,
+        dirs: [true, false, true, false],
         sessionId: `fieldmem-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
         compiledArtifactRef: 'attestation-vault'
     });
 
-    /** Fake pure circuits for the allowedValuesJson lane (set-root builder). */
+    /** Fake pure circuits for the allowedValues lane (set-root builder). */
     const fakeSetPure = {
         leafHash: vi.fn(), nodeHash: (l: Uint8Array, r: Uint8Array) => {
             const out = new Uint8Array(32);
@@ -2669,11 +2666,11 @@ describe('issueFieldMembershipAttestation', () => {
         [{ fieldKey: undefined }, /fieldKey is required/],
         [{ valueDigest: undefined }, /exactly one of value \/ valueDigest/],
         [{ value: 'EEA' }, /exactly one of value \/ valueDigest/],
-        [{ allowedValuesJson: '["EEA"]' }, /not both/],
-        [{ setRoot: undefined, setSiblingsJson: undefined, setDirsJson: undefined }, /allowedValuesJson or setRoot \+ setSiblingsJson \+ setDirsJson is required/],
-        [{ setSiblingsJson: JSON.stringify(SET_SIBLINGS.slice(0, 3)) }, /setSiblingsJson must be a JSON array of 6 hashes/],
-        [{ setDirsJson: JSON.stringify([true, false, 'false', true, false, true]) }, /setDirsJson entries must be booleans/],
-        [{ siblingsJson: JSON.stringify(SIBLINGS.slice(0, 2)) }, /array of 4 hashes/],
+        [{ allowedValues: ['EEA'] }, /not both/],
+        [{ setRoot: undefined, setSiblings: undefined, setDirs: undefined }, /allowedValues or setRoot \+ setSiblings \+ setDirs is required/],
+        [{ setSiblings: SET_SIBLINGS.slice(0, 3) }, /setSiblings must be an array of 6 hashes/],
+        [{ setDirs: [true, false, 'false', true, false, true] }, /setDirs entries must be booleans/],
+        [{ siblings: SIBLINGS.slice(0, 2) }, /array of 4 hashes/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/]
     ])('rejects %o', async (patch, msg) => {
@@ -2719,7 +2716,7 @@ describe('issueFieldMembershipAttestation', () => {
         });
     });
 
-    test('allowedValuesJson lane: builds the canonical set, rejects non-members BEFORE any job', async () => {
+    test('allowedValues lane: builds the canonical set, rejects non-members BEFORE any job', async () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const { blake2b256Hex } = await import('../../srv/submission/document-proof.js');
@@ -2730,8 +2727,8 @@ describe('issueFieldMembershipAttestation', () => {
 
         const ok = makeReq({
             ...VALID_ARGS(), valueDigest: undefined, value: 'CH',
-            setRoot: undefined, setSiblingsJson: undefined, setDirsJson: undefined,
-            allowedValuesJson: JSON.stringify(list)
+            setRoot: undefined, setSiblings: undefined, setDirs: undefined,
+            allowedValues: list
         });
         await srv.handlers['issueFieldMembershipAttestation'](ok);
         expect(ok.reject).not.toHaveBeenCalled();
@@ -2742,8 +2739,8 @@ describe('issueFieldMembershipAttestation', () => {
         (db.run as Mock).mockClear();
         const notInList = makeReq({
             ...VALID_ARGS(), valueDigest: undefined, value: 'DE',
-            setRoot: undefined, setSiblingsJson: undefined, setDirsJson: undefined,
-            allowedValuesJson: JSON.stringify(list)
+            setRoot: undefined, setSiblings: undefined, setDirs: undefined,
+            allowedValues: list
         });
         await srv.handlers['issueFieldMembershipAttestation'](notInList);
         expect(notInList.reject).toHaveBeenCalledWith(400, expect.stringMatching(/not in the allowed list/));
@@ -2781,7 +2778,7 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
         payloadHash: VALID_PAYLOAD,
         contentRoot: VALID_ROOT,
         schemaId: 'ab'.repeat(32),
-        claimsJson: JSON.stringify([numericClaim, equalityClaim, membershipClaim]),
+        claims: [numericClaim, equalityClaim, membershipClaim],
         sessionId: `mixedbatch-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
         compiledArtifactRef: 'attestation-vault',
@@ -2806,12 +2803,12 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
     }
 
     test.each([
-        [{ claimsJson: JSON.stringify([{ ...equalityClaim, expectedDigest: undefined }]) }, /claims\[0\]: pass exactly one of expectedValue \/ expectedDigest/],
-        [{ claimsJson: JSON.stringify([{ ...membershipClaim, valueDigest: undefined }]) }, /claims\[0\]: pass exactly one of value \/ valueDigest/],
-        [{ claimsJson: JSON.stringify([{ ...membershipClaim, setRoot: undefined }]) }, /claims\[0\]: allowedValues or setRoot \+ setSiblings \+ setDirs is required/],
-        [{ claimsJson: JSON.stringify([{ ...membershipClaim, allowedValues: ['x'] }]) }, /claims\[0\]: pass either allowedValues or setRoot/],
-        [{ claimsJson: JSON.stringify([{ ...membershipClaim, setSiblings: SET_SIBLINGS.slice(0, 3) }]) }, /claims\[0\].setSiblings must be a JSON array of 6 hashes/],
-        [{ claimsJson: JSON.stringify([{ ...numericClaim, predicate: 'between' }]) }, /claims\[0\].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'/]
+        [{ claims: [{ ...equalityClaim, expectedDigest: undefined }] }, /claims\[0\]: pass exactly one of expectedValue \/ expectedDigest/],
+        [{ claims: [{ ...membershipClaim, valueDigest: undefined }] }, /claims\[0\]: pass exactly one of value \/ valueDigest/],
+        [{ claims: [{ ...membershipClaim, setRoot: undefined }] }, /claims\[0\]: allowedValues or setRoot \+ setSiblings \+ setDirs is required/],
+        [{ claims: [{ ...membershipClaim, allowedValues: ['x'] }] }, /claims\[0\]: pass either allowedValues or setRoot/],
+        [{ claims: [{ ...membershipClaim, setSiblings: SET_SIBLINGS.slice(0, 3) }] }, /claims\[0\].setSiblings must be an array of 6 hashes/],
+        [{ claims: [{ ...numericClaim, predicate: 'between' }] }, /claims\[0\].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'/]
     ])('rejects %o', async (patch, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq(VALID_ARGS(patch));
@@ -2827,7 +2824,7 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
         const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.droppedDuplicates).toBe(0);
-        const claims = JSON.parse(result.claims);
+        const claims = result.claims;
         expect(claims.map((c: any) => c.predicate)).toEqual(['lessOrEqual', 'bytesEquality', 'setMembership']);
         expect(claims[1].expectedDigest).toBe(EXPECTED);
         expect(claims[2].setRoot).toBe(SET_ROOT);
@@ -2868,10 +2865,10 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS({
-            claimsJson: JSON.stringify([
+            claims: [
                 equalityClaim, { ...equalityClaim }, // exact dupe -> dropped
                 membershipClaim, { ...membershipClaim, valueDigest: 'd'.repeat(64) } // same (fieldKey, setRoot) -> dropped
-            ])
+            ]
         }));
 
         const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
@@ -2919,9 +2916,9 @@ describe('issueDocumentIntegrityAttestation', () => {
         payloadHashA: PAYLOAD_A,
         payloadHashB: PAYLOAD_B,
         allowedMask: 5,
-        schemaJson: JSON.stringify(DOC_SCHEMA),
-        openingAJson: JSON.stringify(DOC_OPENING_A),
-        openingBJson: JSON.stringify(DOC_OPENING_B),
+        schema: DOC_SCHEMA,
+        openingA: DOC_OPENING_A,
+        openingB: DOC_OPENING_B,
         contentRootA: ROOT_A,
         contentRootB: ROOT_B,
         schemaId: SCHEMA_ID,
@@ -2958,11 +2955,10 @@ describe('issueDocumentIntegrityAttestation', () => {
         [{ allowedMask: 0xffff }, /vacuous/],
         // DOC_SCHEMA has exactly 2 real slots (0, 1); mask 3 frees both.
         [{ allowedMask: 3 }, /frees every real \(non-padding\) schema slot/],
-        [{ schemaJson: JSON.stringify(DOC_SCHEMA.slice(0, 15)) }, /exactly 16 slot descriptors/],
-        [{ schemaJson: JSON.stringify([{ ...DOC_SCHEMA[0], kind: 9 }, ...DOC_SCHEMA.slice(1)]) }, /kind must be 0/],
-        [{ openingAJson: JSON.stringify({ ...DOC_OPENING_A, saltSeed: 'zz' }) }, /saltSeed must be 64 hex/],
-        [{ openingBJson: JSON.stringify({ ...DOC_OPENING_B, slots: [{ present: true }, ...DOC_OPENING_B.slots.slice(1)] }) }, /present slot needs value or valueDigest/],
-        [{ schemaJson: 'not json' }, /must be valid JSON/],
+        [{ schema: DOC_SCHEMA.slice(0, 15) }, /exactly 16 slot descriptors/],
+        [{ schema: [{ ...DOC_SCHEMA[0], kind: 9 }, ...DOC_SCHEMA.slice(1)] }, /kind must be 0/],
+        [{ openingA: { ...DOC_OPENING_A, saltSeed: 'zz' } }, /saltSeed must be 64 hex/],
+        [{ openingB: { ...DOC_OPENING_B, slots: [{ present: true }, ...DOC_OPENING_B.slots.slice(1)] } }, /present slot needs value or valueDigest/],
         [{ schemaId: undefined }, /schemaId is required when anchoring/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/]
@@ -3053,9 +3049,9 @@ describe('issueDocumentDiffAttestation', () => {
         payloadHashA: PAYLOAD_A,
         payloadHashB: PAYLOAD_B,
         k: 2,
-        schemaJson: JSON.stringify(DOC_SCHEMA),
-        openingAJson: JSON.stringify(DOC_OPENING_A),
-        openingBJson: JSON.stringify(DOC_OPENING_B),
+        schema: DOC_SCHEMA,
+        openingA: DOC_OPENING_A,
+        openingB: DOC_OPENING_B,
         sessionId: `docdiff-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
         compiledArtifactRef: 'attestation-vault'
@@ -3085,10 +3081,9 @@ describe('issueDocumentDiffAttestation', () => {
         [{ k: 0 }, /1\.\.16/],
         [{ k: 17 }, /1\.\.16/],
         [{ k: 1.5 }, /1\.\.16/],
-        [{ schemaJson: JSON.stringify(DOC_SCHEMA.slice(0, 15)) }, /schemaJson must be a JSON array of exactly 16 slot descriptors/],
-        [{ schemaJson: JSON.stringify([{ fieldKey: 'zz', kind: 0, scale: '1' }, ...DOC_SCHEMA.slice(1)]) }, /fieldKey must be 64 hex/],
-        [{ openingAJson: JSON.stringify({ ...DOC_OPENING_A, slots: DOC_OPENING_A.slots.slice(0, 15) }) }, /openingAJson.slots must be a JSON array of exactly 16/],
-        [{ openingBJson: 'not json' }, /must be valid JSON/],
+        [{ schema: DOC_SCHEMA.slice(0, 15) }, /schema must be an array of exactly 16 slot descriptors/],
+        [{ schema: [{ fieldKey: 'zz', kind: 0, scale: '1' }, ...DOC_SCHEMA.slice(1)] }, /fieldKey must be 64 hex/],
+        [{ openingA: { ...DOC_OPENING_A, slots: DOC_OPENING_A.slots.slice(0, 15) } }, /openingA.slots must be an array of exactly 16/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/]
     ])('rejects %o', async (patch, msg) => {
@@ -3142,7 +3137,7 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
     };
     const VALID_ARGS = (claims: unknown[]) => ({
         payloadHash: PAYLOAD_A,
-        claimsJson: JSON.stringify(claims),
+        claims: claims,
         sessionId: `docbatch-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
         compiledArtifactRef: 'attestation-vault'
@@ -3169,9 +3164,9 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
         [[{ ...integrityClaim, payloadHashB: undefined }], /payloadHashB must be 64 hex/],
         [[{ ...integrityClaim, payloadHashB: PAYLOAD_A }], /must differ from the batch payloadHash/],
         [[{ ...integrityClaim, allowedMask: 65536 }], /allowedMask must be an integer in 0\.\.65535/],
-        [[{ ...integrityClaim, schema: DOC_SCHEMA.slice(0, 15) }], /schema must be a JSON array of exactly 16 slot descriptors/],
+        [[{ ...integrityClaim, schema: DOC_SCHEMA.slice(0, 15) }], /schema must be an array of exactly 16 slot descriptors/],
         [[{ ...diffClaim, k: 0 }], /k must be an integer in 1\.\.16/],
-        [[{ ...diffClaim, openingB: { ...DOC_OPENING_B, slots: DOC_OPENING_B.slots.slice(0, 15) } }], /openingB.slots must be a JSON array of exactly 16/],
+        [[{ ...diffClaim, openingB: { ...DOC_OPENING_B, slots: DOC_OPENING_B.slots.slice(0, 15) } }], /openingB.slots must be an array of exactly 16/],
         [[{ ...diffClaim, openingA: { ...DOC_OPENING_A, saltSeed: 'zz' } }], /saltSeed must be 64 hex/]
     ])('rejects %o', async (claims, msg) => {
         const { srv } = setupHandlersWithDb();
@@ -3188,7 +3183,7 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
         const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.droppedDuplicates).toBe(0);
-        const claims = JSON.parse(result.claims);
+        const claims = result.claims;
         expect(claims).toHaveLength(3);
         expect(claims[1]).toMatchObject({ predicate: 'documentIntegrity', payloadHashB: PAYLOAD_B, allowedMask: 1 });
         expect(claims[2]).toMatchObject({ predicate: 'documentDiff', payloadHashB: PAYLOAD_B, k: 1 });

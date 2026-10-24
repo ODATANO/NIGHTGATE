@@ -160,14 +160,14 @@ async function waitForServer() {
     step('4. prepareDocumentProof (three numeric fields, salted leaves)');
     const document = { carbonFootprint: 47.3, capacityKwh: 120, recycledPct: 0.85, batch: `field-batch-e2e-${Date.now()}` };
     r = await post('/prepareDocumentProof', {
-        documentJson: JSON.stringify(document),
-        proofFieldsJson: JSON.stringify([{ field: 'carbonFootprint' }, { field: 'capacityKwh' }, { field: 'recycledPct' }])
+        document: document,
+        proofFields: [{ field: 'carbonFootprint' }, { field: 'capacityKwh' }, { field: 'recycledPct' }]
     });
     if (r.status >= 400) fail(`prepareDocumentProof → ${r.status}: ${pretty(r.body)}`);
     const payloadHash = r.body.payloadHash;
     const contentRoot = r.body.contentRoot;
     const schemaId = r.body.schemaId;
-    const prepared = JSON.parse(r.body.fields);
+    const prepared = r.body.fields;
     // value = scaled integer (x1000): 47300 / 120000 / 850
     const FIELDS = ['carbonFootprint', 'capacityKwh', 'recycledPct'].map(name =>
         prepared.find(f => f.field === name) || fail(`prepared field '${name}' missing`));
@@ -203,12 +203,12 @@ async function waitForServer() {
     step('6. issueFieldPredicateAttestationBatch - POSITIVE (anchor in-batch + 3 claims + 1 dup)');
     r = await post('/issueFieldPredicateAttestationBatch', {
         payloadHash, contentRoot, schemaId,
-        claimsJson: JSON.stringify(claims),
+        claims: claims,
         sessionId, contractAddress
     });
     if (r.status >= 400) fail(`issueFieldPredicateAttestationBatch(+) → ${r.status}: ${pretty(r.body)}`);
     if (r.body.droppedDuplicates !== 1) fail(`expected droppedDuplicates=1, got ${r.body.droppedDuplicates}`);
-    const respClaims = JSON.parse(r.body.claims);
+    const respClaims = r.body.claims;
     if (respClaims.length !== 3) fail(`expected 3 accepted claims, got ${respClaims.length}`);
     console.log(`OK   accepted 3 claims, dropped 1 duplicate; jobId=${r.body.jobId}`);
 
@@ -234,7 +234,7 @@ async function waitForServer() {
         claimFor(0, 'lessOrEqual', 100)      // FALSE (47300 <= 100)
     ];
     r = await post('/issueFieldPredicateAttestationBatch', {
-        payloadHash, claimsJson: JSON.stringify(negClaims), sessionId, contractAddress
+        payloadHash, claims: negClaims, sessionId, contractAddress
     });
     if (r.status >= 400) fail(`issueFieldPredicateAttestationBatch(-) → ${r.status}: ${pretty(r.body)}`);
     const negRes = await pollJob(sessionId, r.body.jobId, 'batch-', { expect: 'fail' });

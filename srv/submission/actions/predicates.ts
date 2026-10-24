@@ -52,20 +52,9 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         const op = parsedPredicate.opCode!;
 
         const { depth } = vaultDims(data.compiledArtifactRef);
-        let siblings: string[];
-        let dirs: boolean[];
-        try { siblings = JSON.parse(data.siblingsJson ?? '[]'); } catch { return req.reject(400, 'siblingsJson must be a JSON array'); }
-        try { dirs = JSON.parse(data.dirsJson ?? '[]'); } catch { return req.reject(400, 'dirsJson must be a JSON array'); }
-        if (!Array.isArray(siblings) || siblings.length !== depth) return req.reject(400, `siblingsJson must be a JSON array of ${depth} hashes`);
-        if (!Array.isArray(dirs) || dirs.length !== depth) return req.reject(400, `dirsJson must be a JSON array of ${depth} booleans`);
-        for (const s of siblings) {
-            if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) return req.reject(400, 'each sibling must be 64 hex chars (32 bytes)');
-        }
-        for (const d of dirs) {
-            // Only real booleans. Boolean("false") is true and would give a wrong path.
-            if (typeof d !== 'boolean') return req.reject(400, 'dirsJson entries must be booleans');
-        }
-        const dirsBool = dirs as boolean[];
+        const path = parseInclusionPath(req, data.siblings, data.dirs, depth, { siblings: 'siblings', dirs: 'dirs' });
+        if (!path) return;
+        const { siblings, dirs: dirsBool } = path;
 
         if (data.contentRoot && !data.schemaId) {
             return req.reject(400, 'schemaId is required when contentRoot is supplied (anchorContentRoot anchors both)');
@@ -130,7 +119,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress, predicate: data.predicate,
                     threshold: String(data.threshold), value: data.value, fieldSalt: data.fieldSalt,
-                    contentRoot: data.contentRoot, schemaId: data.schemaId, siblingsJson: data.siblingsJson, dirsJson: data.dirsJson,
+                    contentRoot: data.contentRoot, schemaId: data.schemaId, siblings, dirs: dirsBool,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: req.user?.id,
@@ -173,7 +162,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             return req.reject(400, 'fieldSalt is required (v4 salted leaves; prepareDocumentProof returns it per field)');
         }
 
-        const path = parseInclusionPath(req, data.siblingsJson, data.dirsJson, vaultDims(data.compiledArtifactRef).depth, { siblings: 'siblingsJson', dirs: 'dirsJson' });
+        const path = parseInclusionPath(req, data.siblings, data.dirs, vaultDims(data.compiledArtifactRef).depth, { siblings: 'siblings', dirs: 'dirs' });
         if (!path) return;
         if (data.contentRoot && !data.schemaId) {
             return req.reject(400, 'schemaId is required when contentRoot is supplied (anchorContentRoot anchors both)');
@@ -239,7 +228,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     contractAddress: data.contractAddress, predicate: 'bytesEquality',
                     expectedDigest, fieldSalt: data.fieldSalt,
                     contentRoot: data.contentRoot, schemaId: data.schemaId,
-                    siblingsJson: data.siblingsJson, dirsJson: data.dirsJson,
+                    siblings: path.siblings, dirs: path.dirs,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: req.user?.id,
@@ -279,16 +268,16 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             return req.reject(400, 'fieldSalt is required (v4 salted leaves; prepareDocumentProof returns it per field)');
         }
 
-        const hasList = typeof data.allowedValuesJson === 'string' && data.allowedValuesJson.length > 0;
-        const hasSetPath = !!(data.setRoot || data.setSiblingsJson || data.setDirsJson);
+        const hasList = Array.isArray(data.allowedValues) && data.allowedValues.length > 0;
+        const hasSetPath = !!(data.setRoot || data.setSiblings || data.setDirs);
         if (hasList && hasSetPath) {
-            return req.reject(400, 'pass either allowedValuesJson or setRoot + setSiblingsJson + setDirsJson, not both');
+            return req.reject(400, 'pass either allowedValues or setRoot + setSiblings + setDirs, not both');
         }
-        if (!hasList && !(data.setRoot && data.setSiblingsJson && data.setDirsJson)) {
-            return req.reject(400, 'allowedValuesJson or setRoot + setSiblingsJson + setDirsJson is required');
+        if (!hasList && !(data.setRoot && data.setSiblings && data.setDirs)) {
+            return req.reject(400, 'allowedValues or setRoot + setSiblings + setDirs is required');
         }
 
-        const path = parseInclusionPath(req, data.siblingsJson, data.dirsJson, vaultDims(data.compiledArtifactRef).depth, { siblings: 'siblingsJson', dirs: 'dirsJson' });
+        const path = parseInclusionPath(req, data.siblings, data.dirs, vaultDims(data.compiledArtifactRef).depth, { siblings: 'siblings', dirs: 'dirs' });
         if (!path) return;
         if (data.contentRoot && !data.schemaId) {
             return req.reject(400, 'schemaId is required when contentRoot is supplied (anchorContentRoot anchors both)');
@@ -305,14 +294,13 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         let setSiblings: string[];
         let setDirs: boolean[];
         if (hasList) {
-            let allowed: unknown;
-            try { allowed = JSON.parse(data.allowedValuesJson!); } catch { return req.reject(400, 'allowedValuesJson must be valid JSON'); }
-            if (!Array.isArray(allowed) || allowed.length === 0 || allowed.some(v => typeof v !== 'string' || v.length === 0)) {
-                return req.reject(400, 'allowedValuesJson must be a non-empty JSON array of non-empty strings');
+            const allowed = data.allowedValues!;
+            if (allowed.some(v => typeof v !== 'string' || v.length === 0)) {
+                return req.reject(400, 'allowedValues entries must be non-empty strings');
             }
             // Every entry is hashed before duplicates are removed, so limit the raw list size.
             if (allowed.length > 1024) {
-                return req.reject(400, 'allowedValuesJson supports at most 1024 raw entries (64 distinct values)');
+                return req.reject(400, 'allowedValues supports at most 1024 raw entries (64 distinct values)');
             }
             let pure;
             try {
@@ -323,7 +311,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             }
             let member;
             try {
-                member = membershipPathFor(allowed as string[], valueDigest, pure);
+                member = membershipPathFor(allowed, valueDigest, pure);
             } catch (err) {
                 return req.reject(400, (err as Error).message);
             }
@@ -332,7 +320,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             setSiblings = member.setSiblings;
             setDirs = member.setDirs;
         } else {
-            const setPath = parseInclusionPath(req, data.setSiblingsJson, data.setDirsJson, SET_DEPTH, { siblings: 'setSiblingsJson', dirs: 'setDirsJson' });
+            const setPath = parseInclusionPath(req, data.setSiblings, data.setDirs, SET_DEPTH, { siblings: 'setSiblings', dirs: 'setDirs' });
             if (!setPath) return;
             setRoot = data.setRoot!.toLowerCase();
             setSiblings = setPath.siblings;
@@ -393,7 +381,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     contractAddress: data.contractAddress, predicate: 'setMembership',
                     setRoot, valueDigest, fieldSalt: data.fieldSalt,
                     contentRoot: data.contentRoot, schemaId: data.schemaId,
-                    siblingsJson: data.siblingsJson, dirsJson: data.dirsJson,
+                    siblings: path.siblings, dirs: path.dirs,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: req.user?.id,
@@ -438,7 +426,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (allowedMask === maxMask) {
             return req.reject(400, `allowedMask ${maxMask} permits every slot to differ; the claim would be vacuous`);
         }
-        const docPair = parseDocPairInputs(req, data.schemaJson, data.openingAJson, data.openingBJson, intWidth);
+        const docPair = parseDocPairInputs(req, data.schema, data.openingA, data.openingB, intWidth);
         if (!docPair) return;
         if (isVacuousMask(allowedMask, docPair.schema)) {
             return req.reject(400, 'allowedMask frees every real (non-padding) schema slot; the claim would be vacuous');
@@ -557,7 +545,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!Number.isInteger(data.k) || data.k < 1 || data.k > diffWidth) {
             return req.reject(400, `k must be an integer in 1..${diffWidth} (minimum differing slots)`);
         }
-        const docPair = parseDocPairInputs(req, data.schemaJson, data.openingAJson, data.openingBJson, diffWidth);
+        const docPair = parseDocPairInputs(req, data.schema, data.openingA, data.openingB, diffWidth);
         if (!docPair) return;
         if ((data.contentRootA || data.contentRootB) && !data.schemaId) {
             return req.reject(400, 'schemaId is required when anchoring a content root (anchorContentRoot anchors both)');
@@ -670,7 +658,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         const contractAddress = data.contractAddress;
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
-        if (!data.claimsJson) return req.reject(400, 'claimsJson is required');
+        if (!data.claims?.length) return req.reject(400, 'claims is required');
 
         // At most 8 calls per transaction. Storing the contentRoot in the same batch uses one of them.
         const maxClaims = data.contentRoot ? 7 : 8;
@@ -687,33 +675,30 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             payloadHashB?: string; attesterIdB?: string; allowedMask?: number; k?: number;
             schema?: SchemaSlotWire[]; openingA?: OpeningWire; openingB?: OpeningWire;
         }
-        const parsePath = (entry: any, i: number, depth: number, sibName: string, dirName: string): { siblings: string[]; dirs: boolean[] } => {
-            const sibs = entry[sibName];
-            const ds = entry[dirName];
+        const parsePath = (sibs: unknown, ds: unknown, i: number, depth: number, sibName: string, dirName: string): { siblings: string[]; dirs: boolean[] } => {
             if (!Array.isArray(sibs) || sibs.length !== depth) {
-                throw new Error(`claims[${i}].${sibName} must be a JSON array of ${depth} hashes`);
+                throw new Error(`claims[${i}].${sibName} must be an array of ${depth} hashes`);
             }
             for (const s of sibs) {
                 if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) throw new Error(`claims[${i}].${sibName} entries must be 64 hex chars (32 bytes)`);
             }
             if (!Array.isArray(ds) || ds.length !== depth) {
-                throw new Error(`claims[${i}].${dirName} must be a JSON array of ${depth} booleans`);
+                throw new Error(`claims[${i}].${dirName} must be an array of ${depth} booleans`);
             }
             for (const d of ds) {
                 // Only real booleans. Boolean("false") is true and would give a wrong path.
                 if (typeof d !== 'boolean') throw new Error(`claims[${i}].${dirName} entries must be booleans`);
             }
-            return { siblings: sibs.map((s: string) => s.toLowerCase()), dirs: ds as boolean[] };
+            return { siblings: (sibs as string[]).map(s => s.toLowerCase()), dirs: ds as boolean[] };
         };
         const { width: batchWidth, depth: batchDepth, maxMask: batchMaxMask } = vaultDims(data.compiledArtifactRef);
         let claims: BatchClaim[];
         try {
-            const v = JSON.parse(data.claimsJson);
-            if (!Array.isArray(v) || v.length === 0) return req.reject(400, 'claimsJson must be a non-empty JSON array');
+            const v = data.claims;
             if (v.length > maxClaims) {
-                return req.reject(400, `claimsJson supports at most ${maxClaims} entries per batch` + (data.contentRoot ? ' (the contentRoot anchor occupies one of the 8 call slots)' : ''));
+                return req.reject(400, `claims supports at most ${maxClaims} entries per batch` + (data.contentRoot ? ' (the contentRoot anchor occupies one of the 8 call slots)' : ''));
             }
-            claims = v.map((entry: any, i: number): BatchClaim => {
+            claims = v.map((entry, i): BatchClaim => {
                 if (!entry || typeof entry !== 'object') throw new Error(`claims[${i}] must be an object`);
                 const parsed = parsePredicate(entry.predicate);
                 if (!parsed) throw new Error(`claims[${i}].predicate must be 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'`);
@@ -735,25 +720,27 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     const openingA = validateOpening(entry.openingA, `claims[${i}].openingA`, batchWidth);
                     const openingB = validateOpening(entry.openingB, `claims[${i}].openingB`, batchWidth);
                     if (parsed.kind === 'integrity') {
-                        if (!Number.isInteger(entry.allowedMask) || entry.allowedMask < 0 || entry.allowedMask > batchMaxMask) {
+                        const allowedMask = entry.allowedMask === undefined || entry.allowedMask === null ? null : coerceMask(entry.allowedMask);
+                        if (allowedMask === null || allowedMask < 0 || allowedMask > batchMaxMask) {
                             throw new Error(`claims[${i}].allowedMask must be an integer in 0..${batchMaxMask}`);
                         }
-                        if (entry.allowedMask === batchMaxMask) {
+                        if (allowedMask === batchMaxMask) {
                             throw new Error(`claims[${i}].allowedMask ${batchMaxMask} permits every slot to differ; the claim would be vacuous`);
                         }
-                        if (isVacuousMask(entry.allowedMask, schema)) {
+                        if (isVacuousMask(allowedMask, schema)) {
                             throw new Error(`claims[${i}].allowedMask frees every real (non-padding) schema slot; the claim would be vacuous`);
                         }
                         return {
-                            predicate: 'documentIntegrity', payloadHashB, attesterIdB, allowedMask: entry.allowedMask,
+                            predicate: 'documentIntegrity', payloadHashB, attesterIdB, allowedMask,
                             schema, openingA, openingB
                         };
                     }
-                    if (!Number.isInteger(entry.k) || entry.k < 1 || entry.k > batchWidth) {
+                    const k = entry.k;
+                    if (k === null || k === undefined || !Number.isInteger(k) || k < 1 || k > batchWidth) {
                         throw new Error(`claims[${i}].k must be an integer in 1..${batchWidth}`);
                     }
                     return {
-                        predicate: 'documentDiff', payloadHashB, attesterIdB, k: entry.k,
+                        predicate: 'documentDiff', payloadHashB, attesterIdB, k,
                         schema, openingA, openingB
                     };
                 }
@@ -761,7 +748,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 if (typeof entry.fieldKey !== 'string' || !HEX64_ANY_CASE_RE.test(entry.fieldKey)) {
                     throw new Error(`claims[${i}].fieldKey must be 64 hex chars (32 bytes)`);
                 }
-                const contentPath = parsePath(entry, i, batchDepth, 'siblings', 'dirs');
+                const contentPath = parsePath(entry.siblings, entry.dirs, i, batchDepth, 'siblings', 'dirs');
                 if (typeof entry.salt !== 'string' || !HEX64_ANY_CASE_RE.test(entry.salt)) {
                     throw new Error(`claims[${i}].salt must be 64 hex chars (32 bytes; v4 salted leaves)`);
                 }
@@ -775,19 +762,19 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 };
 
                 if (parsed.kind === 'equality') {
-                    const hasVal = typeof entry.expectedValue === 'string' && entry.expectedValue.length > 0;
-                    const hasDig = typeof entry.expectedDigest === 'string' && entry.expectedDigest.length > 0;
-                    if (hasVal === hasDig) throw new Error(`claims[${i}]: pass exactly one of expectedValue / expectedDigest`);
-                    if (hasDig && !HEX64_ANY_CASE_RE.test(entry.expectedDigest)) throw new Error(`claims[${i}].expectedDigest must be 64 hex chars (32 bytes)`);
-                    return { ...base, expectedDigest: hasDig ? entry.expectedDigest.toLowerCase() : blake2b256Hex(entry.expectedValue) };
+                    const expectedValue = typeof entry.expectedValue === 'string' && entry.expectedValue.length > 0 ? entry.expectedValue : null;
+                    const expectedDigest = typeof entry.expectedDigest === 'string' && entry.expectedDigest.length > 0 ? entry.expectedDigest : null;
+                    if ((expectedValue === null) === (expectedDigest === null)) throw new Error(`claims[${i}]: pass exactly one of expectedValue / expectedDigest`);
+                    if (expectedDigest !== null && !HEX64_ANY_CASE_RE.test(expectedDigest)) throw new Error(`claims[${i}].expectedDigest must be 64 hex chars (32 bytes)`);
+                    return { ...base, expectedDigest: expectedDigest !== null ? expectedDigest.toLowerCase() : blake2b256Hex(expectedValue!) };
                 }
 
                 if (parsed.kind === 'membership') {
-                    const hasVal = typeof entry.value === 'string' && entry.value.length > 0;
-                    const hasDig = typeof entry.valueDigest === 'string' && entry.valueDigest.length > 0;
-                    if (hasVal === hasDig) throw new Error(`claims[${i}]: pass exactly one of value / valueDigest`);
-                    if (hasDig && !HEX64_ANY_CASE_RE.test(entry.valueDigest)) throw new Error(`claims[${i}].valueDigest must be 64 hex chars (32 bytes)`);
-                    const valueDigest = hasDig ? entry.valueDigest.toLowerCase() : blake2b256Hex(entry.value);
+                    const value = typeof entry.value === 'string' && entry.value.length > 0 ? entry.value : null;
+                    const digest = typeof entry.valueDigest === 'string' && entry.valueDigest.length > 0 ? entry.valueDigest : null;
+                    if ((value === null) === (digest === null)) throw new Error(`claims[${i}]: pass exactly one of value / valueDigest`);
+                    if (digest !== null && !HEX64_ANY_CASE_RE.test(digest)) throw new Error(`claims[${i}].valueDigest must be 64 hex chars (32 bytes)`);
+                    const valueDigest = digest !== null ? digest.toLowerCase() : blake2b256Hex(value!);
                     const hasAllowed = Array.isArray(entry.allowedValues);
                     const hasSetPath = !!(entry.setRoot || entry.setSiblings || entry.setDirs);
                     if (hasAllowed && hasSetPath) throw new Error(`claims[${i}]: pass either allowedValues or setRoot + setSiblings + setDirs, not both`);
@@ -804,7 +791,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                         throw new Error(`claims[${i}]: allowedValues or setRoot + setSiblings + setDirs is required`);
                     }
                     if (typeof entry.setRoot !== 'string' || !HEX64_ANY_CASE_RE.test(entry.setRoot)) throw new Error(`claims[${i}].setRoot must be 64 hex chars (32 bytes)`);
-                    const setPath = parsePath(entry, i, SET_DEPTH, 'setSiblings', 'setDirs');
+                    const setPath = parsePath(entry.setSiblings, entry.setDirs, i, SET_DEPTH, 'setSiblings', 'setDirs');
                     return { ...base, valueDigest, setRoot: entry.setRoot.toLowerCase(), setSiblings: setPath.siblings, setDirs: setPath.dirs };
                 }
 
@@ -823,7 +810,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 return { ...base, value: valueBig.toString(), threshold: thresholdBig.toString(), opCode: parsed.opCode! };
             });
         } catch (e: unknown) {
-            return req.reject(400, e instanceof Error && /^claims\[/.test(e.message) ? e.message : 'claimsJson must be valid JSON');
+            return req.reject(400, e instanceof Error && /^claims\[/.test(e.message) ? e.message : 'claims entries must match the predicate\'s inputs');
         }
 
         const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
@@ -984,7 +971,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 : publicClaims;
             return {
                 jobId: job.jobId, status: job.status,
-                claims: JSON.stringify(stableClaims),
+                claims: stableClaims,
                 droppedDuplicates
             };
         });

@@ -98,7 +98,7 @@ describe('offline runtime on the served API', () => {
         serverRuntimeState.publishRuntimeState({ initialized: false, mode: 'offline', lastError: 'synthetic topology rejection' });
         // The compute action reaches its handler (whatever it answers about
         // the input); the gate never turns it into a 503.
-        const compute = await cap.axios.post(`${API}/prepareMembershipSet`, { allowedValuesJson: JSON.stringify(['a', 'b']) }, AUTH);
+        const compute = await cap.axios.post(`${API}/prepareMembershipSet`, { allowedValues: ['a', 'b'] }, AUTH);
         expect(compute.status).not.toBe(503);
         // The probe answers for itself: 503 carrying the readiness payload,
         // not the runtime gate's generic refusal.

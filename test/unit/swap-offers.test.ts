@@ -71,7 +71,7 @@ describe('offer board over HTTP', () => {
 
     it('a posted half is recorded with the terms the worker read, never the caller\'s', async () => {
         describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '250'], nullifiers: [nullifier(11)] });
-        const res = await post('postSwapOffer', { offer: halfText(1), tags: JSON.stringify(['cert', 'copper']) }, asA);
+        const res = await post('postSwapOffer', { offer: halfText(1), tags: ['cert', 'copper'] }, asA);
         expect(res.status).toBe(200);
         expect(res.data).toMatchObject({ status: 'open', bound: true, givesType: T_CERT, givesAmount: '1', wantsType: T_CREDIT, wantsAmount: '250', expiresAt: null });
         expect(describeSpy).toHaveBeenCalledWith({ halfB64: halfText(1) });
@@ -101,9 +101,9 @@ describe('offer board over HTTP', () => {
 
     it('lists by gives/wants type and by tag, newest first, within the limit', async () => {
         describeAs({ gives: [T_CREDIT, '250'], wants: [T_CERT, '1'], nullifiers: [nullifier(21)] });
-        const first = await post('postSwapOffer', { offer: halfText(3), tags: '["buyback"]' }, asA);
+        const first = await post('postSwapOffer', { offer: halfText(3), tags: ['buyback'] }, asA);
         describeAs({ gives: [T_CREDIT, '300'], wants: [T_CERT, '1'], nullifiers: [nullifier(22)] });
-        const second = await post('postSwapOffer', { offer: halfText(4), tags: '["buyback"]' }, asA);
+        const second = await post('postSwapOffer', { offer: halfText(4), tags: ['buyback'] }, asA);
         expect(first.status).toBe(200); expect(second.status).toBe(200);
 
         const byGives = await list({ givesType: T_CREDIT, tag: 'buyback' }, asA);
@@ -153,11 +153,11 @@ describe('offer board over HTTP', () => {
     it('newer expired offers never push an open one out of the limit', async () => {
         const type = 'f1'.repeat(32);
         describeAs({ gives: [type, '1'], wants: [T_CREDIT, '21'], nullifiers: [nullifier(61)] });
-        const open = await post('postSwapOffer', { offer: halfText(21), tags: JSON.stringify(['scarce']) }, asA);
+        const open = await post('postSwapOffer', { offer: halfText(21), tags: ['scarce'] }, asA);
         const soon = new Date(Date.now() + 1500).toISOString();
         for (const seed of [62, 63]) {
             describeAs({ gives: [type, '1'], wants: [T_CREDIT, '22'], nullifiers: [nullifier(seed)] });
-            expect((await post('postSwapOffer', { offer: halfText(seed), expiresAt: soon, tags: JSON.stringify(['scarce']) }, asA)).status).toBe(200);
+            expect((await post('postSwapOffer', { offer: halfText(seed), expiresAt: soon, tags: ['scarce'] }, asA)).status).toBe(200);
         }
         await new Promise(r => setTimeout(r, 1600));
         expect((await list({ givesType: type, limit: 1 }, asA)).data.value.map((o: any) => o.offerId)).toEqual([open.data.offerId]);
@@ -186,7 +186,7 @@ describe('offer board over HTTP', () => {
 
     it("getSwapOffer reads one offer by id in the board's shape, open or closed, for every token", async () => {
         describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '70'], nullifiers: [nullifier(71)] });
-        const posted = await post('postSwapOffer', { offer: halfText(31), tags: '["single"]' }, asA);
+        const posted = await post('postSwapOffer', { offer: halfText(31), tags: ['single'] }, asA);
         expect(posted.status).toBe(200);
         const open = await getOffer(posted.data.offerId, asToken);
         expect(open.status).toBe(200);

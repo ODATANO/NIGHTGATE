@@ -187,7 +187,7 @@ Deploy a contract registered via `cds.requires.nightgate.contracts.<ref>` or `re
 |---|---|---|
 | `compiledArtifactRef` | String | Logical name from the registry (e.g. `"counter"`) |
 | `sessionId` | UUID | Must have signing enabled |
-| `initialPrivateState` | LargeString | JSON-encoded initial state (e.g. `"{}"`) |
+| `initialPrivateState` | Map (optional) | Initial private state as a JSON object, default `{}` |
 | `idempotencyKey` | String (optional) | Dedupes retries; a reused key returns the existing `jobId` |
 | `recoveryId` | String (optional) | Vault family only: 64-hex attester id that may re-point the registrar (`registerPassport` modes 3 and 4). The registrar is the deploy session's attester id. Absent = no recovery; a lost registrar key then locks the id registry for good. |
 
@@ -210,7 +210,7 @@ Invoke a circuit on a deployed contract. Job result: `{ submissionId, txHash, co
 | `sessionId` | UUID | Must have signing enabled |
 | `args` | LargeString | JSON-encoded array (use `"[]"` for no args). See **Encoding circuit args** below |
 | `idempotencyKey` | String (optional) | Dedupes retries; a reused key returns the existing `jobId` |
-| `initialPrivateState` | LargeString (optional) | JSON; seeded only on this wallet's first contact with the contract, never overwrites |
+| `initialPrivateState` | Map (optional) | JSON object; seeded only on this wallet's first contact with the contract, never overwrites |
 | `sponsorSessionId` | UUID (optional) | Second session that pays the dust fee. See **Per-tx fee sponsoring** below |
 
 **Rate class:** `prove`.
@@ -270,7 +270,7 @@ Job result: `{ submissionId, txHash, contractAddress, circuits, status }`, one
 | `compiledArtifactRef` | String | Logical name from registry |
 | `sessionId` | UUID | Must have signing enabled |
 | `idempotencyKey` | String (optional) | Dedupes retries |
-| `initialPrivateState` | LargeString (optional) | Seeded on this wallet's first contact with the contract, as in `submitContractCall` |
+| `initialPrivateState` | Map (optional) | Seeded on this wallet's first contact with the contract, as in `submitContractCall` |
 | `sponsorSessionId` | UUID (optional) | Second session pays the dust fee once for the whole batch. See **Per-tx fee sponsoring** |
 | `independentCalls` | Boolean (optional) | Calls share no state: order by execution stage instead of call order |
 
@@ -335,7 +335,7 @@ carries this fixture's separator and amount. Other minting contracts use
 `submitContractCall` plus `deriveTokenType`.
 
 ```bash
-curl -X POST .../deployContract   -d '{"compiledArtifactRef":"shielded-token","sessionId":"<id>","initialPrivateState":"{}"}'
+curl -X POST .../deployContract   -d '{"compiledArtifactRef":"shielded-token","sessionId":"<id>","initialPrivateState":{}}'
 # -> jobId; poll getJobStatus for contractAddress
 
 curl -X POST .../mintShieldedTestToken   -d '{"contractAddress":"<addr>","sessionId":"<id>"}'
@@ -665,7 +665,7 @@ value: a half is filled or retired whole, nothing is held, matched or priced.
 sponsored half except for the token allow-list and reads the terms from it
 (a half that carries an intent, a fallible offer, a transient or contract-owned
 coin, or not exactly one type given and one wanted, is `400
-SWAP_OFFER_INVALID`). `expiresAt` at most 90 days ahead; `tags` a JSON array of
+SWAP_OFFER_INVALID`). `expiresAt` at most 90 days ahead; `tags` an array of
 up to 8 strings of up to 40 characters. The offer closes when one of its input
 nullifiers lands in a sponsored swap (`filled`), when `expiresAt` passes
 (`expired`), or when the poster retires it. Grantable (`postSwapOffer`), also
@@ -711,11 +711,11 @@ The record key `recordKey(attesterId, sha256)` is derived from the caller in-cir
 
 Synchronous helpers that turn structured data into the proof inputs the predicate actions consume. Nothing is persisted, no job is started; responses carry WITNESS material and are never logged.
 
-### `prepareDocumentProof(documentJson, proofFieldsJson, saltSeed?, compiledArtifactRef?) → { payloadHash, canonicalDocument, contentRoot, fields, emptyFields, schemaId, schema, leaves, opening }`
+### `prepareDocumentProof(document, proofFields, saltSeed?, compiledArtifactRef?) → { payloadHash, canonicalDocument, contentRoot, fields, emptyFields, schemaId, schema, leaves, opening }`
 
-Canonical JSON (RFC 8785 order: keys sorted by UTF-16 code units, so `"10"` precedes `"9"`; an external payloadHash must follow the same rule) → blake2b-256 `payloadHash` (what `anchorDocument` anchors), plus a salted Merkle `contentRoot` of depth log2(width) over the ordered `proofFieldsJson` (leaf index = position; keep it stable across anchor and proof) with per-field inclusion paths.
+Canonical JSON (RFC 8785 order: keys sorted by UTF-16 code units, so `"10"` precedes `"9"`; an external payloadHash must follow the same rule) → blake2b-256 `payloadHash` (what `anchorDocument` anchors), plus a salted Merkle `contentRoot` of depth log2(width) over the ordered `proofFields` (leaf index = position; keep it stable across anchor and proof) with per-field inclusion paths.
 
-- `proofFieldsJson`: up to width (16, or 32 with `compiledArtifactRef: 'attestation-vault-32'`) `{ field, kind?, scale? }` entries. `kind: 'uint'` (default; number x `scale`, default 1000) or `'bytes'` (blake2b-256 of the exact string, for the equality/membership actions; no `scale`). `field` is a dot path (numeric segments index arrays; a literal top-level key with dots wins).
+- `proofFields`: up to width (16, or 32 with `compiledArtifactRef: 'attestation-vault-32'`) `{ field, kind?, scale? }` entries. `kind: 'uint'` (default; number x `scale`, default 1000) or `'bytes'` (blake2b-256 of the exact string, for the equality/membership actions; no `scale`). `field` is a dot path (numeric segments index arrays; a literal top-level key with dots wins).
 - Per-slot salts derive from a 32-byte seed (`saltSeed`: random unless given for a deterministic re-prepare). Absent values use the salted absent leaf (key `nightgate/empty-leaf/v2`, ASCII zero-padded) and are listed in `emptyFields`.
 - Hashing uses the artifact's pure circuits, so root and `schemaId` equal the in-circuit recompute.
 - `fields`: `{ field, fieldKey, kind, value?, valueDigest?, salt, siblings, dirs }`; `salt` is the proof actions' `fieldSalt`.
@@ -725,9 +725,9 @@ Canonical JSON (RFC 8785 order: keys sorted by UTF-16 code units, so `"10"` prec
 
 **Rate class:** `compute`.
 
-### `prepareMembershipSet(allowedValuesJson, value?, valueDigest?, compiledArtifactRef?) → { setRoot, memberCount, setSiblingsJson?, setDirsJson? }`
+### `prepareMembershipSet(allowedValues, value?, valueDigest?, compiledArtifactRef?) → { setRoot, memberCount, setSiblings, setDirs }`
 
-Canonical depth-6 set root for `issueFieldMembershipAttestation` and `verifyPredicateState`: blake2b-256 each exact string, dedupe, sort ascending, pad to 64 by repeating the last member digest, leaf-wrap with the `setLeafHash` pure circuit. Padding repeats a real member so the padding value is never provable. More than 64 distinct values: 400. Without `value`/`valueDigest`: `{ setRoot, memberCount }`. With one: plus the inclusion path (`setSiblingsJson`/`setDirsJson`, witness); 400 if not a member. **Rate class:** `compute`.
+Canonical depth-6 set root for `issueFieldMembershipAttestation` and `verifyPredicateState`: blake2b-256 each exact string, dedupe, sort ascending, pad to 64 by repeating the last member digest, leaf-wrap with the `setLeafHash` pure circuit. Padding repeats a real member so the padding value is never provable. More than 64 distinct values: 400. Without `value`/`valueDigest`: `setSiblings` and `setDirs` are empty. With one: the inclusion path (`setSiblings`/`setDirs`, witness); 400 if not a member. **Rate class:** `compute`.
 
 Outside a server: `import { buildMembershipSet, membershipPathFor, canonicalSetDigests, SET_DEPTH, MAX_SET_VALUES } from '@odatano/nightgate/set-root'` (no CAP, no Node builtins; takes the artifact's `setLeafHash`/`nodeHash` pure circuits; byte-identical roots).
 
@@ -751,13 +751,13 @@ npx nightgate-fetch-keys attestation-vault-32 --from https://host/zk-config/atte
 
 The generation digest pins the manifest, not the key bytes: a fetch changes no recorded evidence and needs no restart. Container images already contain the keys.
 
-### `issueFieldPredicateAttestation(payloadHash, attesterId?, fieldKey, value, fieldSalt, predicate, threshold, sessionId, contractAddress, contentRoot?, schemaId?, siblingsJson?, dirsJson?, unit?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueFieldPredicateAttestation(payloadHash, attesterId?, fieldKey, value, fieldSalt, predicate, threshold, sessionId, contractAddress, contentRoot?, schemaId?, siblings?, dirs?, unit?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-Prove the scaled integer `value` at `fieldKey` against `threshold` (`proveFieldPredicate`, Merkle inclusion in the anchored content root). A given `contentRoot` is anchored first (`anchorContentRoot`, requires `schemaId`). `value` stays witness, never persisted; `value` must fit Uint<64>, `threshold` is recorded and stays at most 9223372036854775807 (2^63 - 1). `siblingsJson`/`dirsJson`: inclusion path of depth log2(width) (4 × 64-hex siblings and 4 booleans at width 16, 5 at 32). Job result `{ predicateAttestationId, payloadHash, claim, proof }`. **Rate class:** `prove`.
+Prove the scaled integer `value` at `fieldKey` against `threshold` (`proveFieldPredicate`, Merkle inclusion in the anchored content root). A given `contentRoot` is anchored first (`anchorContentRoot`, requires `schemaId`). `value` stays witness, never persisted; `value` must fit Uint<64>, `threshold` is recorded and stays at most 9223372036854775807 (2^63 - 1). `siblings`/`dirs`: inclusion path of depth log2(width) (4 × 64-hex siblings and 4 booleans at width 16, 5 at 32). Job result `{ predicateAttestationId, payloadHash, claim, proof }`. **Rate class:** `prove`.
 
-### `issueFieldPredicateAttestationBatch(payloadHash, attesterId?, claimsJson, sessionId, contractAddress, contentRoot?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, claims, droppedDuplicates }`
+### `issueFieldPredicateAttestationBatch(payloadHash, attesterId?, claims, sessionId, contractAddress, contentRoot?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, claims, droppedDuplicates }`
 
-Prove up to 8 claims on ONE payload in ONE transaction (one balancing, submit, confirmation and fee; with `sponsorSessionId` one dust spend). `claimsJson` entries mix kinds by `predicate`, each validated like its single action:
+Prove up to 8 claims on ONE payload in ONE transaction (one balancing, submit, confirmation and fee; with `sponsorSessionId` one dust spend). `claims` entries mix kinds by `predicate`, each validated like its single action:
 
 - numeric: `{ fieldKey, value, salt, siblings, dirs, predicate: 'lessOrEqual'|'greaterOrEqual', threshold, unit? }`
 - equality: `{ fieldKey, expectedValue|expectedDigest, salt, siblings, dirs, predicate: 'bytesEquality' }`
@@ -765,21 +765,21 @@ Prove up to 8 claims on ONE payload in ONE transaction (one balancing, submit, c
 - integrity: `{ predicate: 'documentIntegrity', payloadHashB, attesterIdB?, allowedMask, schema, openingA, openingB }`
 - diff: `{ predicate: 'documentDiff', payloadHashB, attesterIdB?, k, schema, openingA, openingB }`
 
-Cross-root: document A is the batch `payloadHash`; an in-batch `contentRoot` is A's root, B's must already be anchored. A given `contentRoot` (with `schemaId`) is anchored as the first call and takes one of the 8 slots. Exact duplicate claims are dropped (`droppedDuplicates`). One `PredicateAttestations` row per claim, one shared `provenTxHash`; `claims` is a JSON array of `{ predicateAttestationId, fieldKey, predicate, ... }`. Proofs run sequentially, one per claim. A false claim fails at local proving (nothing submitted); after submission `PARTIAL_SUCCESS` fails the job with `OnChainStatus:...`, so verify per claim with `verifyPredicateAttestation`. **Rate class:** `prove`, one count per claim.
+Cross-root: document A is the batch `payloadHash`; an in-batch `contentRoot` is A's root, B's must already be anchored. A given `contentRoot` (with `schemaId`) is anchored as the first call and takes one of the 8 slots. Exact duplicate claims are dropped (`droppedDuplicates`). One `PredicateAttestations` row per claim, one shared `provenTxHash`; the response `claims` lists `{ predicateAttestationId, fieldKey, predicate, ... }` per claim. Proofs run sequentially, one per claim. A false claim fails at local proving (nothing submitted); after submission `PARTIAL_SUCCESS` fails the job with `OnChainStatus:...`, so verify per claim with `verifyPredicateAttestation`. **Rate class:** `prove`, one count per claim.
 
-### `issueFieldEqualityAttestation(payloadHash, attesterId?, fieldKey, expectedValue|expectedDigest, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblingsJson?, dirsJson?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueFieldEqualityAttestation(payloadHash, attesterId?, fieldKey, expectedValue|expectedDigest, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblings?, dirs?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
 Prove the bytes field at `fieldKey` holds the value whose blake2b-256 digest is `expectedDigest` (`proveFieldEquality`). Pass one of `expectedValue` (exact string, no trimming) or `expectedDigest` (64 hex). The digest is public: authenticity, not confidentiality (a low-entropy value is guessable). The field must be `kind: 'bytes'` in `prepareDocumentProof`; path as on the numeric action; a given `contentRoot` is anchored first (requires `schemaId`). **Rate class:** `prove`.
 
-### `issueFieldMembershipAttestation(payloadHash, attesterId?, fieldKey, value|valueDigest, allowedValuesJson | setRoot+setSiblingsJson+setDirsJson, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblingsJson?, dirsJson?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueFieldMembershipAttestation(payloadHash, attesterId?, fieldKey, value|valueDigest, allowedValues | setRoot+setSiblings+setDirs, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblings?, dirs?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-Prove the hidden bytes value at `fieldKey` is one of a public allow-list of up to 64 values, without revealing which (`proveFieldMembership`; set rule: `prepareMembershipSet`). Pass one of `value` or `valueDigest` (64 hex; witness, never persisted), and either `allowedValuesJson` (400 before proving if the value is absent) or `setRoot` + `setSiblingsJson`/`setDirsJson` (6 × 64-hex siblings, 6 booleans). **Rate class:** `prove`.
+Prove the hidden bytes value at `fieldKey` is one of a public allow-list of up to 64 values, without revealing which (`proveFieldMembership`; set rule: `prepareMembershipSet`). Pass one of `value` or `valueDigest` (64 hex; witness, never persisted), and either `allowedValues` (400 before proving if the value is absent) or `setRoot` + `setSiblings`/`setDirs` (6 × 64-hex siblings, 6 booleans). **Rate class:** `prove`.
 
-### `issueDocumentIntegrityAttestation(payloadHashA, payloadHashB, attesterIdA?, attesterIdB?, allowedMask, schemaJson, openingAJson, openingBJson, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueDocumentIntegrityAttestation(payloadHashA, payloadHashB, attesterIdA?, attesterIdB?, allowedMask, schema, openingA, openingB, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
-Prove document B differs from A only in slots set in `allowedMask` (`proveDocumentComparison` mode 0; width bits, bit i = slot i may differ, 0 = identical; a mask constraining no real slot is rejected), values hidden. `schemaJson` is the shared descriptor list, `openingAJson`/`openingBJson` the openings (`schema`/`opening` from `prepareDocumentProof`); the circuit recomputes the schema root and both content roots, so a forged schema id fails the proof. Both documents must be anchored under the same `schemaId`. A change outside the mask fails at local proving. `payloadHashA != payloadHashB` (asserted in-circuit); (A, B) order is part of the claim key. `contentRootA`/`contentRootB` anchor first, one transaction each (the batch `documentIntegrity` kind does it in one). **Rate class:** `prove`.
+Prove document B differs from A only in slots set in `allowedMask` (`proveDocumentComparison` mode 0; width bits, bit i = slot i may differ, 0 = identical; a mask constraining no real slot is rejected), values hidden. `schema` is the shared descriptor list, `openingA`/`openingB` the openings (`schema`/`opening` from `prepareDocumentProof`); the circuit recomputes the schema root and both content roots, so a forged schema id fails the proof. Both documents must be anchored under the same `schemaId`. A change outside the mask fails at local proving. `payloadHashA != payloadHashB` (asserted in-circuit); (A, B) order is part of the claim key. `contentRootA`/`contentRootB` anchor first, one transaction each (the batch `documentIntegrity` kind does it in one). **Rate class:** `prove`.
 
-### `issueDocumentDiffAttestation(payloadHashA, payloadHashB, attesterIdA?, attesterIdB?, k, schemaJson, openingAJson, openingBJson, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueDocumentDiffAttestation(payloadHashA, payloadHashB, attesterIdA?, attesterIdB?, k, schema, openingA, openingB, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
 Prove at least `k` (1..width) aligned slots differ between two anchored documents, hiding which (`proveDocumentComparison` mode 1; k=1: provably not the same document). Witnesses as in the integrity mode, never persisted. A value or presence change counts; both-empty and padding slots do not. One descriptor list must fold to both anchored schema ids. Fewer than k differences fail at local proving. **Rate class:** `prove`.
 

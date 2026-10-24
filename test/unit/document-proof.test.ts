@@ -78,22 +78,21 @@ describe('prepareDocumentProof handler', () => {
     });
 
     const VALID = {
-        documentJson: JSON.stringify({ price: 10, days: 30 }),
-        proofFieldsJson: JSON.stringify([{ field: 'price' }, { field: 'days' }])
+        document: { price: 10, days: 30 },
+        proofFields: [{ field: 'price' }, { field: 'days' }]
     };
 
     it('rejects 400 on missing or malformed inputs', async () => {
         for (const [data, msg] of [
-            [{}, 'documentJson'],
-            [{ documentJson: '{]' , proofFieldsJson: '[]' }, 'valid JSON'],
-            [{ documentJson: '[1]', proofFieldsJson: '[{"field":"a"}]' }, 'JSON object'],
-            [{ documentJson: '{}', proofFieldsJson: '[]' }, 'non-empty'],
-            [{ documentJson: '{}', proofFieldsJson: JSON.stringify([{ field: 'a' }, { field: 'a' }]) }, 'duplicate'],
-            [{ documentJson: '{}', proofFieldsJson: JSON.stringify([{ field: 'a', scale: 0 }]) }, 'scale'],
-            [{ documentJson: '{}', proofFieldsJson: JSON.stringify([{ field: 'a', kind: 'hex' }]) }, "kind must be 'uint' or 'bytes'"],
-            [{ documentJson: '{}', proofFieldsJson: JSON.stringify([{ field: 'a', kind: 'bytes', scale: 100 }]) }, "not applicable to kind 'bytes'"],
-            [{ documentJson: '{"a":7}', proofFieldsJson: JSON.stringify([{ field: 'a', kind: 'bytes' }]) }, 'requires a string'],
-            [{ documentJson: '{"a":-1}', proofFieldsJson: JSON.stringify([{ field: 'a' }]) }, 'non-negative']
+            [{}, 'document'],
+            [{ document: [1], proofFields: [{ field: 'a' }] }, 'JSON object'],
+            [{ document: {}, proofFields: [] }, 'proofFields is required'],
+            [{ document: {}, proofFields: [{ field: 'a' }, { field: 'a' }] }, 'duplicate'],
+            [{ document: {}, proofFields: [{ field: 'a', scale: 0 }] }, 'scale'],
+            [{ document: {}, proofFields: [{ field: 'a', kind: 'hex' }] }, "kind must be 'uint' or 'bytes'"],
+            [{ document: {}, proofFields: [{ field: 'a', kind: 'bytes', scale: 100 }] }, "not applicable to kind 'bytes'"],
+            [{ document: { a: 7 }, proofFields: [{ field: 'a', kind: 'bytes' }] }, 'requires a string'],
+            [{ document: { a: -1 }, proofFields: [{ field: 'a' }] }, 'non-negative']
         ] as const) {
             const req = makeReq(data as any);
             await handlers.prepareDocumentProof(req);
@@ -103,7 +102,7 @@ describe('prepareDocumentProof handler', () => {
 
     it('rejects 400 on more than 16 proof fields', async () => {
         const many = Array.from({ length: MAX_PROOF_FIELDS + 1 }, (_, i) => ({ field: `f${i}` }));
-        const req = makeReq({ documentJson: '{}', proofFieldsJson: JSON.stringify(many) });
+        const req = makeReq({ document: {}, proofFields: many });
         await handlers.prepareDocumentProof(req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('16'));
     });
@@ -122,9 +121,9 @@ describe('prepareDocumentProof handler', () => {
         expect(result.canonicalDocument).toBe(canonicalize({ price: 10, days: 30 }));
         expect(result.payloadHash).toBe(blake2b256Hex(result.canonicalDocument));
         expect(result.contentRoot).toMatch(HEX64_RE);
-        const fields = JSON.parse(result.fields);
+        const fields = result.fields;
         expect(fields.map((f: any) => f.field)).toEqual(['price', 'days']);
-        expect(JSON.parse(result.emptyFields)).toEqual([]);
+        expect(result.emptyFields).toEqual([]);
         expect(loadPure).toHaveBeenCalledWith('attestation-vault');
     });
 });
@@ -143,17 +142,16 @@ describe('prepareMembershipSet handler', () => {
         registerDocumentProofHandlers(srv, { loadPure });
     });
 
-    const LIST = JSON.stringify(['EEA', 'CH', 'NO']);
+    const LIST = ['EEA', 'CH', 'NO'];
 
     it('rejects 400 on malformed inputs', async () => {
         for (const [data, msg] of [
-            [{}, 'allowedValuesJson'],
-            [{ allowedValuesJson: '{]' }, 'valid JSON'],
-            [{ allowedValuesJson: '[]' }, 'non-empty'],
-            [{ allowedValuesJson: '[1]' }, 'non-empty strings'],
-            [{ allowedValuesJson: LIST, value: 'EEA', valueDigest: 'a'.repeat(64) }, 'at most one'],
-            [{ allowedValuesJson: LIST, value: 'DE' }, 'not in the allowed list'],
-            [{ allowedValuesJson: JSON.stringify(Array.from({ length: 65 }, (_, i) => `v${i}`)) }, 'at most 64']
+            [{}, 'allowedValues'],
+            [{ allowedValues: [] }, 'allowedValues is required'],
+            [{ allowedValues: [1] }, 'non-empty strings'],
+            [{ allowedValues: LIST, value: 'EEA', valueDigest: 'a'.repeat(64) }, 'at most one'],
+            [{ allowedValues: LIST, value: 'DE' }, 'not in the allowed list'],
+            [{ allowedValues: Array.from({ length: 65 }, (_, i) => `v${i}`) }, 'at most 64']
         ] as const) {
             const req = makeReq(data as any);
             await handlers.prepareMembershipSet(req);
@@ -163,27 +161,27 @@ describe('prepareMembershipSet handler', () => {
     });
 
     it('returns just the canonical root without a member (verifier lane)', async () => {
-        const req = makeReq({ allowedValuesJson: LIST });
+        const req = makeReq({ allowedValues: LIST });
         const result = await handlers.prepareMembershipSet(req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.setRoot).toMatch(HEX64_RE);
         expect(result.memberCount).toBe(3);
-        expect(result.setSiblingsJson).toBeNull();
+        expect(result.setSiblings).toEqual([]);
     });
 
     it('the root is canonical: order and duplicates of the list do not matter', async () => {
-        const a = await handlers.prepareMembershipSet(makeReq({ allowedValuesJson: LIST }));
-        const b = await handlers.prepareMembershipSet(makeReq({ allowedValuesJson: JSON.stringify(['NO', 'EEA', 'CH', 'EEA']) }));
+        const a = await handlers.prepareMembershipSet(makeReq({ allowedValues: LIST }));
+        const b = await handlers.prepareMembershipSet(makeReq({ allowedValues: ['NO', 'EEA', 'CH', 'EEA'] }));
         expect(b.setRoot).toBe(a.setRoot);
         expect(b.memberCount).toBe(3);
     });
 
     it('returns a refoldable inclusion path for a member (by value and by digest)', async () => {
-        const byValue = await handlers.prepareMembershipSet(makeReq({ allowedValuesJson: LIST, value: 'CH' }));
-        const byDigest = await handlers.prepareMembershipSet(makeReq({ allowedValuesJson: LIST, valueDigest: blake2b256Hex('CH') }));
+        const byValue = await handlers.prepareMembershipSet(makeReq({ allowedValues: LIST, value: 'CH' }));
+        const byDigest = await handlers.prepareMembershipSet(makeReq({ allowedValues: LIST, valueDigest: blake2b256Hex('CH') }));
         for (const result of [byValue, byDigest]) {
-            const siblings = JSON.parse(result.setSiblingsJson);
-            const dirs = JSON.parse(result.setDirsJson);
+            const siblings = result.setSiblings;
+            const dirs = result.setDirs;
             expect(siblings).toHaveLength(6);
             expect(dirs).toHaveLength(6);
             const leaf = Buffer.from(fakePure.setLeafHash(Buffer.from(blake2b256Hex('CH'), 'hex'))).toString('hex');
@@ -194,7 +192,7 @@ describe('prepareMembershipSet handler', () => {
 
     it('rejects 404 when the artifact is unavailable', async () => {
         loadPure.mockRejectedValueOnce(new PureCircuitsUnavailableError("contract 'nope' is not registered"));
-        const req = makeReq({ allowedValuesJson: LIST, compiledArtifactRef: 'nope' });
+        const req = makeReq({ allowedValues: LIST, compiledArtifactRef: 'nope' });
         await handlers.prepareMembershipSet(req);
         expect(req.reject).toHaveBeenCalledWith(404, expect.stringContaining('nope'));
     });

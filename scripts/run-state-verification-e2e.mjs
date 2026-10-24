@@ -206,18 +206,18 @@ async function waitForServer() {
     // predicate action). Build a tiny content tree and anchor it in-flow
     // (anchorContentRoot + proveFieldPredicate).
     r = await post('/prepareDocumentProof', {
-        documentJson: JSON.stringify({ demoValue: 5 }),
-        proofFieldsJson: JSON.stringify([{ field: 'demoValue', scale: 1 }])
+        document: { demoValue: 5 },
+        proofFields: [{ field: 'demoValue', scale: 1 }]
     });
     if (r.status >= 400) fail(`prepareDocumentProof → ${r.status}: ${pretty(r.body)}`);
-    const demoField = JSON.parse(r.body.fields).find(f => f.field === 'demoValue');
+    const demoField = r.body.fields.find(f => f.field === 'demoValue');
     const demoRoot = r.body.contentRoot;
     const demoSchemaId = r.body.schemaId;
     r = await post('/issueFieldPredicateAttestation', {
         payloadHash, fieldKey: demoField.fieldKey, value: demoField.value, fieldSalt: demoField.salt,
         predicate: 'lessOrEqual', threshold: 10, unit: 'demo',
         contentRoot: demoRoot, schemaId: demoSchemaId,
-        siblingsJson: JSON.stringify(demoField.siblings), dirsJson: JSON.stringify(demoField.dirs),
+        siblings: demoField.siblings, dirs: demoField.dirs,
         sessionId, contractAddress
     });
     if (r.status >= 400) fail(`issueFieldPredicateAttestation → ${r.status}: ${pretty(r.body)}`);

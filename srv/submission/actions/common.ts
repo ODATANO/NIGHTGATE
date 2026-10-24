@@ -131,39 +131,38 @@ export type ContractCommandV1 =
  */
 export type ContractCommandV1WithProvenance = ContractCommandV1 & { artifactDigest?: string };
 
-/** Parses a JSON Merkle path of fixed depth. On bad input it rejects with 400 and returns null. */
+/** Checks a Merkle path of fixed depth. On bad input it rejects with 400 and returns null. */
+// CAP checks the element types of the arrays, not the hex format of a plain `array of Hex64`.
 export function parseInclusionPath(
     req: ActionRequest<unknown, unknown>,
-    siblingsJson: string | null | undefined,
-    dirsJson: string | null | undefined,
+    siblings: readonly unknown[] | null | undefined,
+    dirs: readonly unknown[] | null | undefined,
     depth: number,
     names: { siblings: string; dirs: string }
 ): { siblings: string[]; dirs: boolean[] } | null {
-    let siblings: unknown;
-    let dirs: unknown;
-    try { siblings = JSON.parse(siblingsJson ?? '[]'); } catch { req.reject(400, `${names.siblings} must be a JSON array`); return null; }
-    try { dirs = JSON.parse(dirsJson ?? '[]'); } catch { req.reject(400, `${names.dirs} must be a JSON array`); return null; }
-    if (!Array.isArray(siblings) || siblings.length !== depth) {
-        req.reject(400, `${names.siblings} must be a JSON array of ${depth} hashes`); return null;
+    const sibs = siblings ?? [];
+    const ds = dirs ?? [];
+    if (!Array.isArray(sibs) || sibs.length !== depth) {
+        req.reject(400, `${names.siblings} must be an array of ${depth} hashes`); return null;
     }
-    if (!Array.isArray(dirs) || dirs.length !== depth) {
-        req.reject(400, `${names.dirs} must be a JSON array of ${depth} booleans`); return null;
+    if (!Array.isArray(ds) || ds.length !== depth) {
+        req.reject(400, `${names.dirs} must be an array of ${depth} booleans`); return null;
     }
-    for (const s of siblings) {
+    for (const s of sibs) {
         if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) {
             req.reject(400, `each ${names.siblings} entry must be 64 hex chars (32 bytes)`); return null;
         }
     }
-    for (const d of dirs) {
+    for (const d of ds) {
         // Strict: Boolean("false") is true and would corrupt the path.
         if (typeof d !== 'boolean') { req.reject(400, `${names.dirs} entries must be booleans`); return null; }
     }
-    return { siblings: (siblings as string[]).map(s => s.toLowerCase()), dirs: dirs as boolean[] };
+    return { siblings: (sibs as string[]).map(s => s.toLowerCase()), dirs: ds as boolean[] };
 }
 
 export function validateSchemaSlots(schema: unknown, name: string, width = 16): SchemaSlotWire[] {
     if (!Array.isArray(schema) || schema.length !== width) {
-        throw new Error(`${name} must be a JSON array of exactly ${width} slot descriptors`);
+        throw new Error(`${name} must be an array of exactly ${width} slot descriptors`);
     }
     return schema.map((d: any, i: number) => {
         if (!d || typeof d !== 'object') throw new Error(`${name}[${i}] must be an object`);
@@ -187,7 +186,7 @@ export function validateOpening(opening: unknown, name: string, width = 16): Ope
         throw new Error(`${name}.saltSeed must be 64 hex chars (32 bytes)`);
     }
     if (!Array.isArray(o.slots) || o.slots.length !== width) {
-        throw new Error(`${name}.slots must be a JSON array of exactly ${width} slot openings`);
+        throw new Error(`${name}.slots must be an array of exactly ${width} slot openings`);
     }
     const slots = o.slots.map((s: any, i: number) => {
         if (!s || typeof s !== 'object') throw new Error(`${name}.slots[${i}] must be an object`);
@@ -224,23 +223,22 @@ export function isVacuousMask(allowedMask: number, schema: SchemaSlotWire[]): bo
 /** `PredicateAttestations.threshold` is an Integer64 column, so a stored threshold must stay below 2^63. */
 export const INT64_MAX = 9223372036854775807n;
 
-/** Parses the schema and both document inputs. On bad input it rejects with 400 and returns null. */
+/** Checks the schema and both document openings. On bad input it rejects with 400 and returns null. */
 export function parseDocPairInputs(
     req: ActionRequest<unknown, unknown>,
-    schemaJson: string | null | undefined,
-    openingAJson: string | null | undefined,
-    openingBJson: string | null | undefined,
+    schema: unknown,
+    openingA: unknown,
+    openingB: unknown,
     width = 16
 ): { schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire } | null {
     try {
-        const schema = validateSchemaSlots(JSON.parse(schemaJson ?? ''), 'schemaJson', width);
-        const openingA = validateOpening(JSON.parse(openingAJson ?? ''), 'openingAJson', width);
-        const openingB = validateOpening(JSON.parse(openingBJson ?? ''), 'openingBJson', width);
-        return { schema, openingA, openingB };
+        return {
+            schema: validateSchemaSlots(schema, 'schema', width),
+            openingA: validateOpening(openingA, 'openingA', width),
+            openingB: validateOpening(openingB, 'openingB', width)
+        };
     } catch (e: unknown) {
-        req.reject(400, e instanceof SyntaxError
-            ? 'schemaJson / openingAJson / openingBJson must be valid JSON'
-            : formatErr(e));
+        req.reject(400, formatErr(e));
         return null;
     }
 }

@@ -166,18 +166,18 @@ async function waitForServer() {
         batch: `membership-e2e-${Date.now()}`
     };
     r = await post('/prepareDocumentProof', {
-        documentJson: JSON.stringify(document),
-        proofFieldsJson: JSON.stringify([
+        document: document,
+        proofFields: [
             { field: 'chemistry', kind: 'bytes' },
             { field: 'origin', kind: 'bytes' },
             { field: 'capacityKwh' }
-        ])
+        ]
     });
     if (r.status >= 400) fail(`prepareDocumentProof → ${r.status}: ${pretty(r.body)}`);
     const payloadHash = r.body.payloadHash;
     const contentRoot = r.body.contentRoot;
     const schemaId = r.body.schemaId;
-    const fields = JSON.parse(r.body.fields);
+    const fields = r.body.fields;
     const pick = (name) => fields.find(f => f.field === name) || fail(`prepared field '${name}' missing`);
     const chem = pick('chemistry');
     const origin = pick('origin');
@@ -204,8 +204,8 @@ async function waitForServer() {
         expectedValue: 'NMC811',
         fieldSalt: chem.salt,
         contentRoot, schemaId,
-        siblingsJson: JSON.stringify(chem.siblings),
-        dirsJson: JSON.stringify(chem.dirs),
+        siblings: chem.siblings,
+        dirs: chem.dirs,
         sessionId, contractAddress
     });
     if (r.status >= 400) fail(`issueFieldEqualityAttestation → ${r.status}: ${pretty(r.body)}`);
@@ -223,11 +223,11 @@ async function waitForServer() {
 
     step('8. prepareMembershipSet (canonical root + path; verifier lane cross-check)');
     const ALLOWED = ['EEA', 'CH', 'NO', 'UK'];
-    r = await post('/prepareMembershipSet', { allowedValuesJson: JSON.stringify(ALLOWED), value: 'EEA' });
+    r = await post('/prepareMembershipSet', { allowedValues: ALLOWED, value: 'EEA' });
     if (r.status >= 400) fail(`prepareMembershipSet → ${r.status}: ${pretty(r.body)}`);
     const setRoot = r.body.setRoot;
     if (r.body.memberCount !== 4) fail(`expected memberCount=4: ${pretty(r.body)}`);
-    const verifierLane = await post('/prepareMembershipSet', { allowedValuesJson: JSON.stringify([...ALLOWED].reverse()) });
+    const verifierLane = await post('/prepareMembershipSet', { allowedValues: [...ALLOWED].reverse() });
     if (verifierLane.body?.setRoot !== setRoot) fail('canonical set root differs between permuted lists');
     console.log(`OK   setRoot = ${setRoot.slice(0, 16)}… (canonical across permutations)`);
 
@@ -256,11 +256,11 @@ async function waitForServer() {
         }
     ];
     r = await post('/issueFieldPredicateAttestationBatch', {
-        payloadHash, claimsJson: JSON.stringify(batchClaims), sessionId, contractAddress
+        payloadHash, claims: batchClaims, sessionId, contractAddress
     });
     if (r.status >= 400) fail(`issueFieldPredicateAttestationBatch → ${r.status}: ${pretty(r.body)}`);
     if (r.body.droppedDuplicates !== 1) fail(`expected droppedDuplicates=1, got ${r.body.droppedDuplicates}`);
-    const accepted = JSON.parse(r.body.claims);
+    const accepted = r.body.claims;
     if (accepted.length !== 3) fail(`expected 3 accepted claims, got ${accepted.length}`);
     const batchRes = await pollJob(sessionId, r.body.jobId, 'batch+');
     const batchTx = batchRes?.proof?.proofValue;
@@ -284,9 +284,9 @@ async function waitForServer() {
     r = await post('/issueFieldMembershipAttestation', {
         payloadHash, fieldKey: origin.fieldKey, value: 'US',
         fieldSalt: origin.salt,
-        allowedValuesJson: JSON.stringify(ALLOWED),
-        siblingsJson: JSON.stringify(origin.siblings),
-        dirsJson: JSON.stringify(origin.dirs),
+        allowedValues: ALLOWED,
+        siblings: origin.siblings,
+        dirs: origin.dirs,
         sessionId, contractAddress
     });
     if (r.status !== 400) fail(`expected 400 for a non-member value, got ${r.status}: ${pretty(r.body)}`);
@@ -294,7 +294,7 @@ async function waitForServer() {
 
     step('12. NEGATIVE b: set path from a DIFFERENT list → local proving abort, atomic');
     const otherList = ['CH', 'NO'];
-    const otherPath = await post('/prepareMembershipSet', { allowedValuesJson: JSON.stringify(otherList), value: 'CH' });
+    const otherPath = await post('/prepareMembershipSet', { allowedValues: otherList, value: 'CH' });
     if (otherPath.status >= 400) fail(`prepareMembershipSet(other) → ${otherPath.status}`);
     const freshNumeric = {
         fieldKey: capacity.fieldKey, value: capacity.value, salt: capacity.salt,
@@ -304,13 +304,13 @@ async function waitForServer() {
     const wrongMembership = {
         fieldKey: origin.fieldKey, valueDigest: origin.valueDigest, salt: origin.salt, // digest('EEA')
         setRoot: otherPath.body.setRoot,                            // root over [CH, NO]
-        setSiblings: JSON.parse(otherPath.body.setSiblingsJson),    // path of 'CH', not 'EEA'
-        setDirs: JSON.parse(otherPath.body.setDirsJson),
+        setSiblings: otherPath.body.setSiblings,    // path of 'CH', not 'EEA'
+        setDirs: otherPath.body.setDirs,
         siblings: origin.siblings, dirs: origin.dirs,
         predicate: 'setMembership'
     };
     r = await post('/issueFieldPredicateAttestationBatch', {
-        payloadHash, claimsJson: JSON.stringify([freshNumeric, wrongMembership]), sessionId, contractAddress
+        payloadHash, claims: [freshNumeric, wrongMembership], sessionId, contractAddress
     });
     if (r.status >= 400) fail(`negative batch submit → ${r.status}: ${pretty(r.body)}`);
     const negRes = await pollJob(sessionId, r.body.jobId, 'batch-', { expect: 'fail' });

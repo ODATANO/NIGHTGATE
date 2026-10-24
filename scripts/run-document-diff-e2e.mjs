@@ -143,18 +143,18 @@ const PROOF_FIELDS = [
 
 async function prepare(document, label) {
     const r = await post('/prepareDocumentProof', {
-        documentJson: JSON.stringify(document),
-        proofFieldsJson: JSON.stringify(PROOF_FIELDS)
+        document: document,
+        proofFields: PROOF_FIELDS
     });
     if (r.status >= 400) fail(`prepareDocumentProof(${label}) → ${r.status}: ${pretty(r.body)}`);
     return {
         payloadHash: r.body.payloadHash,
         contentRoot: r.body.contentRoot,
         schemaId: r.body.schemaId,
-        schema: JSON.parse(r.body.schema),
-        fields: JSON.parse(r.body.fields),
-        leaves: JSON.parse(r.body.leaves),
-        opening: JSON.parse(r.body.opening)
+        schema: r.body.schema,
+        fields: r.body.fields,
+        leaves: r.body.leaves,
+        opening: r.body.opening
     };
 }
 
@@ -218,7 +218,7 @@ async function prepare(document, label) {
     r = await post('/issueDocumentIntegrityAttestation', {
         payloadHashA: v1.payloadHash, payloadHashB: v2.payloadHash,
         allowedMask: ALLOWED_MASK,
-        schemaJson: JSON.stringify(v1.schema), openingAJson: JSON.stringify(v1.opening), openingBJson: JSON.stringify(v2.opening),
+        schema: v1.schema, openingA: v1.opening, openingB: v2.opening,
         contentRootA: v1.contentRoot, contentRootB: v2.contentRoot, schemaId: v1.schemaId,
         sessionId, contractAddress
     });
@@ -239,7 +239,7 @@ async function prepare(document, label) {
     r = await post('/issueDocumentDiffAttestation', {
         payloadHashA: v1.payloadHash, payloadHashB: v2.payloadHash,
         k: DIFF_COUNT,
-        schemaJson: JSON.stringify(v1.schema), openingAJson: JSON.stringify(v1.opening), openingBJson: JSON.stringify(v2.opening),
+        schema: v1.schema, openingA: v1.opening, openingB: v2.opening,
         sessionId, contractAddress
     });
     if (r.status >= 400) fail(`issueDocumentDiffAttestation → ${r.status}: ${pretty(r.body)}`);
@@ -269,7 +269,7 @@ async function prepare(document, label) {
         }
     ];
     r = await post('/issueFieldPredicateAttestationBatch', {
-        payloadHash: v1.payloadHash, claimsJson: JSON.stringify(batchClaims), sessionId, contractAddress
+        payloadHash: v1.payloadHash, claims: batchClaims, sessionId, contractAddress
     });
     if (r.status >= 400) fail(`issueFieldPredicateAttestationBatch → ${r.status}: ${pretty(r.body)}`);
     const batchRes = await pollJob(sessionId, r.body.jobId, 'batch+');
@@ -286,7 +286,7 @@ async function prepare(document, label) {
     r = await post('/issueDocumentIntegrityAttestation', {
         payloadHashA: v1.payloadHash, payloadHashB: v2.payloadHash,
         allowedMask: 4, // covers only the capacity change, NOT the dropped origin
-        schemaJson: JSON.stringify(v1.schema), openingAJson: JSON.stringify(v1.opening), openingBJson: JSON.stringify(v2.opening),
+        schema: v1.schema, openingA: v1.opening, openingB: v2.opening,
         sessionId, contractAddress
     });
     if (r.status >= 400) fail(`negative integrity submit → ${r.status}: ${pretty(r.body)}`);
@@ -307,7 +307,7 @@ async function prepare(document, label) {
     r = await post('/issueDocumentDiffAttestation', {
         payloadHashA: v1.payloadHash, payloadHashB: v2.payloadHash,
         k: DIFF_COUNT + 1,
-        schemaJson: JSON.stringify(v1.schema), openingAJson: JSON.stringify(v1.opening), openingBJson: JSON.stringify(v2.opening),
+        schema: v1.schema, openingA: v1.opening, openingB: v2.opening,
         sessionId, contractAddress
     });
     if (r.status >= 400) fail(`negative diff submit → ${r.status}: ${pretty(r.body)}`);

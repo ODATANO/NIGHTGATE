@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.36.0 - 2026-10-24
+
+Proof inputs as typed OData parameters. BREAKING for callers of the proof
+actions: the `*Json` string parameters are gone, the same values go as arrays
+and objects. No schema change, no circuit change.
+
+### Changes
+
+- `issueFieldPredicateAttestation`, `issueFieldEqualityAttestation`,
+  `issueFieldMembershipAttestation`: `siblings: array of Hex64` and
+  `dirs: array of Boolean` replace `siblingsJson` / `dirsJson`. Membership
+  takes `allowedValues: array of String` or `setRoot` + `setSiblings` +
+  `setDirs`.
+- `issueFieldPredicateAttestationBatch`: `claims: array of BatchClaim`
+  replaces `claimsJson`; the response `claims` is an array of `IssuedClaim`.
+- `issueDocumentIntegrityAttestation`, `issueDocumentDiffAttestation`:
+  `schema: array of SchemaSlot`, `openingA` and `openingB: DocumentOpening`
+  replace the three JSON strings.
+- `prepareDocumentProof(document: Map, proofFields: array of ProofField)`
+  replaces `documentJson` / `proofFieldsJson`; `fields`, `emptyFields`,
+  `schema`, `leaves` and `opening` come back as arrays and an object.
+- `prepareMembershipSet(allowedValues: array of String)` replaces
+  `allowedValuesJson`; the path comes back as `setSiblings` / `setDirs`,
+  empty without `value` / `valueDigest`.
+- Types `ProofField`, `PreparedField`, `SchemaSlot`, `SlotOpening`,
+  `DocumentOpening`, `BatchClaim`, `IssuedClaim` in `$metadata`. CAP answers
+  400 before the handler runs for a non-array, a wrong element type, an enum
+  value outside the list, a number outside its range, a malformed hash inside
+  a structured type, a string where an object is expected and an unknown
+  parameter name.
+- `deployContract`, `submitContractCall`, `submitContractCallBatch`:
+  `initialPrivateState: Map` replaces the JSON string.
+- `postSwapOffer`: `tags: array of String` replaces the JSON string.
+- `predicate` on `issueFieldPredicateAttestation` and `verifyPredicateState`
+  and `kind` on `purgeExpired` are enums in `$metadata`; the values are
+  unchanged.
+- `submitContractCallBatch.calls`, `args`, `anchorDocument.metadata` and
+  `attestAgentOutput.envelopeJson` stay JSON text: circuit arguments are
+  untyped, metadata and envelope are the hashed bytes.
+- `@odatano/nightgate-mcp` 0.16.0 sends the new shapes.
+
+### Migration
+
+| before | after |
+|---|---|
+| `siblingsJson: '["…"]'`, `dirsJson: '[true,…]'` | `siblings: ["…"]`, `dirs: [true, …]` |
+| `setSiblingsJson`, `setDirsJson` | `setSiblings`, `setDirs` |
+| `allowedValuesJson: '["EEA"]'` | `allowedValues: ["EEA"]` |
+| `claimsJson: '[{…}]'` | `claims: [{…}]` |
+| `schemaJson`, `openingAJson`, `openingBJson` | `schema`, `openingA`, `openingB` |
+| `documentJson: '{…}'`, `proofFieldsJson: '[{…}]'` | `document: {…}`, `proofFields: [{…}]` |
+| `initialPrivateState: '{…}'` | `initialPrivateState: {…}` |
+| `tags: '["…"]'` | `tags: ["…"]` |
+| responses `fields`, `emptyFields`, `schema`, `leaves`, `opening`, `claims`, `setSiblingsJson`, `setDirsJson` as JSON text | arrays and objects; `setSiblings`, `setDirs` |
+
 ## 0.35.2 - 2026-10-22
 
 ### Changed

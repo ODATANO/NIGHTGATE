@@ -120,24 +120,18 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
         if (!checkRateClass('compute', 'compute', req)) return;
 
         const data = req.data;
-        if (!data.documentJson) return req.reject(400, 'documentJson is required');
-        if (!data.proofFieldsJson) return req.reject(400, 'proofFieldsJson is required');
-
-        let document: Record<string, unknown>;
-        try {
-            document = JSON.parse(data.documentJson);
-        } catch { return req.reject(400, 'documentJson must be valid JSON'); }
-        if (!document || typeof document !== 'object' || Array.isArray(document)) {
-            return req.reject(400, 'documentJson must be a JSON object');
+        if (!data.document) return req.reject(400, 'document is required');
+        // CAP's Map type accepts any JSON value that is not a scalar, so arrays are refused here.
+        if (typeof data.document !== 'object' || Array.isArray(data.document)) {
+            return req.reject(400, 'document must be a JSON object');
         }
-
-        let specs: ProofFieldSpec[];
-        try {
-            specs = JSON.parse(data.proofFieldsJson);
-        } catch { return req.reject(400, 'proofFieldsJson must be valid JSON'); }
-        if (!Array.isArray(specs) || specs.length === 0) {
-            return req.reject(400, 'proofFieldsJson must be a non-empty JSON array');
-        }
+        const document = data.document as Record<string, unknown>;
+        if (!data.proofFields?.length) return req.reject(400, 'proofFields is required');
+        const specs: ProofFieldSpec[] = data.proofFields.map(f => ({
+            field: f.field ?? '',
+            ...(f.kind != null ? { kind: f.kind } : {}),
+            ...(f.scale != null ? { scale: f.scale } : {})
+        }));
         const widthRef = data.compiledArtifactRef?.length ? data.compiledArtifactRef : DEFAULT_ATTESTATION_VAULT_REF;
         const slotWidth = slotWidthForRef(widthRef);
         if (specs.length > slotWidth) {
@@ -192,13 +186,16 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
             canonicalDocument,
             contentRoot: built.contentRoot,
             schemaId: built.schemaId,
-            schema: JSON.stringify(built.schema),
-            fields: JSON.stringify(built.fields),
-            emptyFields: JSON.stringify(built.emptyFields),
-            leaves: JSON.stringify(built.leaves),
+            schema: built.schema,
+            fields: built.fields.map(f => ({ ...f, value: f.value ?? null, valueDigest: f.valueDigest ?? null })),
+            emptyFields: built.emptyFields,
+            leaves: built.leaves,
             // Holds the salt seed. Without it nothing can be proven about the stored root.
             // If it leaks, field values can be guessed by trying candidates.
-            opening: JSON.stringify(built.opening)
+            opening: {
+                saltSeed: built.opening.saltSeed,
+                slots: built.opening.slots.map(sl => ({ present: sl.present, value: sl.value ?? null, valueDigest: sl.valueDigest ?? null }))
+            }
         };
     });
 
@@ -206,17 +203,14 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
         if (!checkRateClass('compute', 'compute', req)) return;
 
         const data = req.data;
-        if (!data.allowedValuesJson) return req.reject(400, 'allowedValuesJson is required');
-        let allowed: unknown;
-        try {
-            allowed = JSON.parse(data.allowedValuesJson);
-        } catch { return req.reject(400, 'allowedValuesJson must be valid JSON'); }
-        if (!Array.isArray(allowed) || allowed.length === 0 || allowed.some(v => typeof v !== 'string' || v.length === 0)) {
-            return req.reject(400, 'allowedValuesJson must be a non-empty JSON array of non-empty strings');
+        const allowed = data.allowedValues;
+        if (!allowed?.length) return req.reject(400, 'allowedValues is required');
+        if (allowed.some(v => typeof v !== 'string' || v.length === 0)) {
+            return req.reject(400, 'allowedValues entries must be non-empty strings');
         }
         // Every entry is hashed before duplicates are removed, so limit the raw list size.
         if (allowed.length > 1024) {
-            return req.reject(400, 'allowedValuesJson exceeds 1024 raw entries');
+            return req.reject(400, 'allowedValues exceeds 1024 raw entries');
         }
         if (data.value !== undefined && data.valueDigest !== undefined) {
             return req.reject(400, 'pass at most one of value / valueDigest');
@@ -232,10 +226,10 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
         }
 
         try {
-            const values = allowed as string[];
+            const values = allowed;
             if (data.value === undefined && data.valueDigest === undefined) {
                 const { setRoot, digests } = buildMembershipSet(values, pure);
-                return { setRoot, memberCount: digests.length, setSiblingsJson: null, setDirsJson: null };
+                return { setRoot, memberCount: digests.length, setSiblings: [], setDirs: [] };
             }
             const memberDigest = data.valueDigest ?? blake2b256Hex(data.value!);
             const path = membershipPathFor(values, memberDigest, pure);
@@ -244,8 +238,8 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
             return {
                 setRoot: path.setRoot,
                 memberCount: canonicalSetDigests(values).length,
-                setSiblingsJson: JSON.stringify(path.setSiblings),
-                setDirsJson: JSON.stringify(path.setDirs)
+                setSiblings: path.setSiblings,
+                setDirs: path.setDirs
             };
         } catch (err) {
             return req.reject(400, (err as Error).message);

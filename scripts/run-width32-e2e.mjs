@@ -130,13 +130,13 @@ for (let i = 0; i < CHANGED; i++) docB[`marker_${String(i).padStart(2, '0')}`] =
 
 async function prepare(document, label) {
     const r = await ng.prepareDocumentProof({
-        documentJson: JSON.stringify(document),
-        proofFieldsJson: JSON.stringify(PROOF_FIELDS),
+        document: document,
+        proofFields: PROOF_FIELDS,
         compiledArtifactRef: 'attestation-vault-32'
     });
     const out = {
         payloadHash: r.payloadHash, contentRoot: r.contentRoot, schemaId: r.schemaId,
-        schema: JSON.parse(r.schema), fields: JSON.parse(r.fields), opening: JSON.parse(r.opening)
+        schema: r.schema, fields: r.fields, opening: r.opening
     };
     if (out.schema.length !== 32) fail(`prepare(${label}): schema has ${out.schema.length} slots, expected 32`);
     if (out.opening.slots.length !== 32) fail(`prepare(${label}): opening has ${out.opening.slots.length} slots`);
@@ -229,7 +229,7 @@ const marker0 = A.fields.find(f => f.field === 'marker_00') || fail('marker_00 m
 const eq = await ng.proveFieldEquality({
     payloadHash: A.payloadHash, attesterId: b.attesterId, fieldKey: marker0.fieldKey,
     expectedValue: docA.marker_00, fieldSalt: marker0.salt,
-    siblingsJson: JSON.stringify(marker0.siblings), dirsJson: JSON.stringify(marker0.dirs),
+    siblings: marker0.siblings, dirs: marker0.dirs,
     sessionId, contractAddress, compiledArtifactRef: 'attestation-vault-32'
 });
 if (!eq?.proof?.proofValue && !eq?.claim) fail(`equality job returned no proof: ${JSON.stringify(eq)}`);
