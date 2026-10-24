@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.36.1 - 2026-10-24
+
+### Fixes
+
+- `@odatano/nightgate-tx` 0.14.2: the README example of `connect()` passes
+  `document` and `proofFields` as in 0.36.0. The builder code is unchanged;
+  `connect()` forwards action parameters as given.
+
 ## 0.36.0 - 2026-10-24
 
 Proof inputs as typed OData parameters. BREAKING for callers of the proof

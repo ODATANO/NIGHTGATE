@@ -31,8 +31,8 @@ const ng = connect({
 });
 
 const proof = await ng.prepareDocumentProof({
-    documentJson: JSON.stringify(doc),
-    proofFieldsJson: JSON.stringify(['battery.capacity_kwh'])
+    document: doc,
+    proofFields: [{ field: 'battery.capacity_kwh' }]
 });
 await ng.anchorDocument({ sha256, storageRef, sessionId, contractAddress });
 await ng.proveFieldPredicate({
