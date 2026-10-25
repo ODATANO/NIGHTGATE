@@ -531,6 +531,31 @@ describe('ContractStates', () => {
             fetchSpy.mockRestore();
         }
     });
+
+    it('stateAt() asks the indexer again after it answered from behind the newest action', async () => {
+        const address = 'ef'.repeat(32);
+        const old = await seedContractAction(await seedTransaction(await seedBlock(520)), { address });
+        await seedContractAction(await seedTransaction(await seedBlock(522)), { address });
+        await db.run(cds.ql.INSERT.into(CONTRACT_STATES).entries({
+            address, height: 520, state: Buffer.from('st').toString('base64'), contractAction_ID: old
+        }));
+        const answer = (blockHash: string) => new Response(JSON.stringify({ data: { contractAction: {
+            state: '0a0b', zswapState: null, transaction: { block: { hash: blockHash, ledgerParameters: null } }
+        } } }), { status: 200 });
+        // The limiter allows two indexer reads per second; the test before used them up.
+        await new Promise(r => setTimeout(r, 1100));
+        const fetchSpy = vi.spyOn(globalThis, 'fetch')
+            .mockImplementationOnce(async () => answer('0xblock520'))
+            .mockImplementationOnce(async () => answer('0xblock522'));
+        try {
+            const ask = () => srv.send({ event: 'stateAt', entity: 'ContractStates', data: { address } });
+            await expect(ask()).rejects.toMatchObject({ status: 503 });
+            expect(await ask()).toEqual(expect.objectContaining({ source: 'indexer', height: 522, blockHash: '0xblock522' }));
+            expect(fetchSpy).toHaveBeenCalledTimes(2);
+        } finally {
+            fetchSpy.mockRestore();
+        }
+    });
 });
 
 // ----------------------------------------------------------------------------
@@ -826,11 +851,40 @@ describe('getJobStatus', () => {
 
     // Ownership is FAIL-CLOSED for non-admin callers: a missing
     // session row (e.g. closed after a restart) must not open the job up.
-    function sendAs(userId: string): Promise<any> {
+    function sendAs(userId: string, extra: Record<string, unknown> = {}): Promise<any> {
         const user = new (cds as any).User({ id: userId, roles: [] });
         return cds.tx({ user } as any, () =>
-            srv.send('getJobStatus', { jobId: VALID_JOB_ID, sessionId: VALID_SESSION }));
+            srv.send('getJobStatus', { jobId: VALID_JOB_ID, sessionId: VALID_SESSION, ...extra }));
     }
+
+    it('names the identifier and, once indexed, the hash explorers show', async () => {
+        await seedJob({ requestedBy: 'alice', txHash: '0xCAFE77' });
+        expect(await sendAs('alice')).toEqual(expect.objectContaining({ txHash: '0xCAFE77', transactionId: '0xCAFE77', transactionHash: null }));
+        const txId = await seedTransaction(await seedBlock(77), { hash: '0xtx77', ledgerTxHash: 'ab77' });
+        await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries({ identifier: 'cafe77', transaction_ID: txId }));
+        expect((await sendAs('alice')).transactionHash).toBe('ab77');
+    });
+
+    it('takes a job txHash that is the explorer hash itself', async () => {
+        await seedTransaction(await seedBlock(78), { hash: '0xtx78', ledgerTxHash: 'ab78' });
+        await seedJob({ requestedBy: 'alice', txHash: 'ab78' });
+        expect((await sendAs('alice')).transactionHash).toBe('ab78');
+    });
+
+    it('waits with waitMs until the job settles', async () => {
+        await seedJob({ requestedBy: 'alice', status: 'running' });
+        setTimeout(() => { void db.run(cds.ql.UPDATE.entity(BACKGROUND_JOBS).set({ status: 'succeeded' }).where({ ID: VALID_JOB_ID })); }, 300);
+        const t0 = Date.now();
+        const out = await sendAs('alice', { waitMs: 5000 });
+        expect(out.status).toBe('succeeded');
+        expect(Date.now() - t0).toBeLessThan(4000);
+    });
+
+    it('returns the unsettled job when waitMs runs out, and refuses a waitMs out of range', async () => {
+        await seedJob({ requestedBy: 'alice', status: 'running' });
+        expect((await sendAs('alice', { waitMs: 600 })).status).toBe('running');
+        await expect(sendAs('alice', { waitMs: 25_001 })).rejects.toMatchObject({ message: 'waitMs must be an integer from 0 to 25000' });
+    });
 
     it('404s for a non-admin caller when the job has no requestedBy and no session row (fail-closed)', async () => {
         await seedJob();

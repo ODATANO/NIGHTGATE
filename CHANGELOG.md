@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.37.0 - 2026-10-25
+
+### Changes
+
+- `getJobStatus` returns `transactionId`, the ledger identifier (same as
+  `txHash`), and `transactionHash`, the hash explorers show, `null` until the
+  transaction is indexed.
+- `getJobStatus(…, waitMs)`: holds the call up to 25 s until the job reaches
+  `succeeded`, `failed` or `reconciliation_required`. Reads run in short
+  transactions; past 100 waiting calls the server answers at once.
+- `GET /zk-config/<contract>` lists the contract's circuits and the files served
+  below it, instead of 404.
+- `ContractStates/stateAt`: `NIGHTGATE_STATE_AT_INDEXER_RATE` (default 2 per
+  second) sets the indexer budget; equal requests share one indexer read, a
+  state at a fixed height is kept 5 s. A stale stored state is read at the
+  newest action's block, and the answer is 503 while the indexer has not
+  reached that block.
+- `@odatano/nightgate-tx` 0.15.0:
+  - `waitForJob` and the write actions long-poll with `waitMs`
+    (`connect({ longPollMs })`, default 20000, 0 polls); a server without
+    `waitMs` is polled as before. The job result carries `transactionHash`.
+  - The API provider retries a 503 or 429 of `stateAt` up to `stateRetryMs`
+    (default 30000).
+  - Prover keys download to a temporary file per writer, so builders sharing a
+    cache directory no longer overwrite each other's half-written key.
+  - `example/anchor.mjs` reads the chain through the API and verifies on the
+    public route; `example/self-funded.mjs` requires `INDEXER_HTTP_URL`.
+  - README: `oda_` keys as `token`, `attestation-vault-32`, the seed format.
+
 ## 0.36.2 - 2026-10-25
 
 ### Fixes

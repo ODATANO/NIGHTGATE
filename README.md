@@ -116,6 +116,7 @@ Submit actions are async: they return `{ jobId, status }`; poll `getJobStatus(jo
 ## Documentation
 
 - [Quickstart](docs/quickstart.md): first wallet-signed transaction
+- [First anchor on the hosted API](https://api.preprod.odatano.dev/quickstart): key, seed and a shared sandbox vault, no indexer; [AGENT_MS](https://github.com/maxalexweber1/AGENT_MS) is a working agent built that way
 - [Actions](docs/actions.md): every action and function with examples
 - [Architecture](docs/architecture.md): worker thread, submission flow, persistence
 - [Operations](docs/operations.md): scripts, local indexer, troubleshooting

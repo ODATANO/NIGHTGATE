@@ -1,43 +1,43 @@
 // Anchor a document on Midnight under YOUR identity, with a sponsor paying the
-// fee. This is the whole integration: no server of your own, no proof server,
-// no Docker, no database.
+// fee. This is the whole integration: no server of your own, no indexer, no
+// proof server, no Docker, no database.
 //
 //   npm install @odatano/nightgate-tx
-//   NIGHTGATE_URL=https://... VAULT=... SEED_HEX=... node anchor.mjs ./mydoc.json
+//   NIGHTGATE_URL=https://api.preprod.odatano.dev ODATANO_KEY=oda_... VAULT=... SEED_HEX=... node anchor.mjs ./mydoc.json
 //
 // What happens:
 //   1. your seed -> your attester id, locally
 //   2. the document is hashed locally (nothing about it is sent anywhere)
-//   3. the transaction is built, PROVEN and signed locally
-//   4. only ~5 KB of finalized transaction goes to the sponsor
-//   5. the sponsor pays the dust and submits; the anchor is yours
+//   3. the transaction is built, PROVEN and signed locally; the chain is read through the API
+//   4. only ~5 KB of transaction goes to the sponsor, which pays the dust and submits
+//   5. the identifier resolves to the hash explorers show
 //
-// Verification needs nothing at all: verifyAttestationState is a plain GET, so
-// anyone can check the anchor without a wallet, a key, or this package.
+// Verification needs nothing at all: the public verify route takes no key.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { connect, createTxBuilder } from '@odatano/nightgate-tx';
+import { waitLanded } from '@odatano/nightgate-tx/txbuilder';
 import { prepareAttest } from '@odatano/nightgate-tx/calls';
-import { Contract } from '@odatano/nightgate-tx/attestation-vault';
+import { Contract } from '@odatano/nightgate-tx/attestation-vault-32';
 
-const SPONSOR = process.env.NIGHTGATE_URL || 'http://localhost:4004';
+const BASE = (process.env.NIGHTGATE_URL || 'https://api.preprod.odatano.dev').replace(/\/+$/, '');
+const KEY = process.env.ODATANO_KEY;
 const VAULT = process.env.VAULT;
 const SEED_HEX = process.env.SEED_HEX;
 const NETWORK = process.env.NETWORK || 'preprod';
-const INDEXER_HTTP = process.env.INDEXER_HTTP_URL || `https://indexer.${NETWORK}.midnight.network/api/v4/graphql`;
-const INDEXER_WS = process.env.INDEXER_WS_URL || INDEXER_HTTP.replace(/^http/, 'ws') + '/ws';
-const NODE_URL = process.env.NODE_URL || `wss://rpc.${NETWORK}.midnight.network/`;
 const file = process.argv[2];
 
-if (!VAULT || !SEED_HEX || !file) {
-    console.error('usage: VAULT=<addr> SEED_HEX=<128 hex> node anchor.mjs <file.json>');
+if (!KEY || !VAULT || !SEED_HEX || !file) {
+    console.error('usage: ODATANO_KEY=oda_... VAULT=<64 hex> SEED_HEX=<128 hex> node anchor.mjs <file.json>');
     process.exit(2);
 }
 
-const ng = connect({ baseUrl: SPONSOR });
+// An oda_ key goes as Bearer; a bare ngat_ grant against a server without the gateway as agentToken.
+const api = KEY.startsWith('ngat_') ? { baseUrl: BASE, agentToken: KEY } : { baseUrl: BASE, token: KEY };
+const ng = connect(api);
 
 // 1 + 2: identity and document hash, both local.
 const document = await readFile(file);
@@ -47,32 +47,33 @@ const metadataHash = createHash('sha256').update(JSON.stringify({ file, at: new 
 const builder = await createTxBuilder({
     seedHex: SEED_HEX,
     networkId: NETWORK,
-    indexerHttpUrl: INDEXER_HTTP,
-    indexerWsUrl: INDEXER_WS,
-    nodeUrl: NODE_URL,
-    // The sponsor's own zk-config: this is what pins the prover keys to the
-    // generation of the contract actually deployed at VAULT.
-    zkConfigBaseUrl: `${SPONSOR}/zk-config/attestation-vault`,
-    contractClass: Contract,
-    // An attest moves no value: nothing to balance, so the wallet need not sync
-    // (the default sync runs from genesis at a full core until the tip).
+    api,
+    // An attest moves no value, so the wallet need not sync.
     walletSync: false,
+    // The sponsor's own zk-config pins the prover keys to the contract deployed at VAULT.
+    zkConfigBaseUrl: `${BASE}/zk-config/attestation-vault-32`,
+    contractClass: Contract,
+    contractName: 'attestation-vault-32',
     onProgress: e => e.phase === 'zk-assets' && console.log('fetching prover keys (first run only)...')
 });
 console.log(`attester id : ${builder.attesterId}`);
 console.log(`payload hash: ${payloadHash}`);
 
-// 3: build + prove + sign, all in this process.
-const call = prepareAttest({ payloadHash, metadataHash, attestationSecret: builder.attestationSecret });
-const { finalizedTxB64, serializedBytes } = await builder.buildSponsorable({ contractAddress: VAULT, call });
-console.log(`built locally: ${serializedBytes} bytes (nothing submitted yet)`);
+try {
+    // 3: build + prove + sign, all in this process.
+    const call = prepareAttest({ payloadHash, metadataHash, attestationSecret: builder.attestationSecret });
+    const { unboundTxB64, serializedBytes } = await builder.buildSponsorable({ contractAddress: VAULT, call, bind: false });
+    console.log(`built locally: ${serializedBytes} bytes (nothing submitted yet)`);
 
-// 4 + 5: hand over the bytes. This is the only thing that leaves the machine;
-// sponsorFinalized submits the job AND waits for the on-chain result.
-const result = await ng.sponsorFinalized({ finalizedTxB64 });
-console.log(`anchored: ${result.txHash}`);
+    // 4: hand over the bytes; sponsorUnbound submits the job AND waits for the chain.
+    const job = await ng.sponsorUnbound({ unboundTxB64, idempotencyKey: `anchor-${payloadHash}` });
+    console.log(`anchored, identifier ${job.txHash}`);
 
-await builder.close();
+    // 5: the hash explorers show.
+    const landed = await waitLanded(job.txHash, { api, timeoutMs: 120_000 });
+    console.log(`explorer hash: ${landed?.txHash ?? job.transactionHash ?? '(not indexed yet)'}`);
+} finally {
+    await builder.close();
+}
 
-// Anyone can verify this without a wallet and without this package:
-console.log(`\nverify:\n  curl "${SPONSOR}/odata/v4/midnight/verifyAttestationState(contractAddress='${VAULT}',payloadHash='${payloadHash}')"`);
+console.log(`\nverify, no key needed:\n  curl "${BASE}/odata/v4/midnight-verify/verifyAttestationState(contractAddress='${VAULT}',attesterId='${builder.attesterId}',payloadHash='${payloadHash}',compiledArtifactRef='attestation-vault-32')"`);

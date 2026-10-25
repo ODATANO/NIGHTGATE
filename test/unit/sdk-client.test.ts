@@ -127,7 +127,7 @@ describe('connect: jobs', () => {
         const out = await ng.anchorDocument({ sha256: 'x', sessionId: 's1', contractAddress: 'c' });
         expect(out).toMatchObject({ jobId: 'j1', txHash: '00ab', documentId: 'd1' });
         // the polls carry the SESSION the job was started under
-        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j1', sessionId: 's1' });
+        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j1', sessionId: 's1', waitMs: 20_000 });
     });
 
     test('sponsorFinalized polls under the SPONSOR session the server returns', async () => {
@@ -140,7 +140,7 @@ describe('connect: jobs', () => {
         const out = await ng.sponsorFinalized({ finalizedTxB64: 'AAAA' });
         expect(out.txHash).toBe('00cd');
         expect(JSON.parse(calls[0].init.body)).toEqual({ finalizedTxB64: 'AAAA' });
-        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 'sponsor-1' });
+        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 'sponsor-1', waitMs: 20_000 });
     });
 
     test('sponsorSwap posts both halves and polls under the SPONSOR session', async () => {
@@ -191,7 +191,7 @@ describe('connect: jobs', () => {
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
         const out = await ng.sponsorFinalized({ finalizedTxB64: 'AAAA' });
         expect(out.txHash).toBe('0011');
-        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j6', sessionId: 'server-side-sponsor' });
+        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j6', sessionId: 'server-side-sponsor', waitMs: 20_000 });
     });
 
     test('an action without a jobId returns as-is (sync surface)', async () => {
@@ -199,6 +199,48 @@ describe('connect: jobs', () => {
         const { fn } = fakeFetch([{ body: { txId: 'direct', toLedger: 'unshielded' } }]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
         expect(await ng.deployContract({ sessionId: 's' })).toEqual({ txId: 'direct', toLedger: 'unshielded' });
+    });
+
+    test('waitForJob long-polls with waitMs and returns the explorer hash', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([
+            { body: { status: 'running' } },
+            { body: { status: 'succeeded', txHash: '00ab', transactionHash: 'cd01', result: '{}' } }
+        ]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1, longPollMs: 15_000 });
+        const out = await ng.waitForJob({ jobId: 'j1', sessionId: 's', timeoutMs: 60_000 });
+        expect(out).toEqual(expect.objectContaining({ txHash: '00ab', transactionHash: 'cd01' }));
+        expect(JSON.parse(calls[0].init.body)).toEqual({ jobId: 'j1', sessionId: 's', waitMs: 15_000 });
+    });
+
+    test('waitForJob polls without waitMs against a server that does not know it', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([
+            { status: 400, body: { error: { message: "Property 'waitMs' does not exist in NightgateService.getJobStatus" } } },
+            { body: { status: 'succeeded', result: '{"txHash":"00ef"}' } }
+        ]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
+        expect((await ng.waitForJob({ jobId: 'j2', sessionId: 's' })).txHash).toBe('00ef');
+        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 's' });
+    });
+
+    test('waitForJob keeps waitMs inside the server maximum and the request timeout', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([{ body: { status: 'succeeded', result: '{}' } }]);
+        await connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, longPollMs: 30_000.5 }).waitForJob({ jobId: 'a', sessionId: 's' });
+        expect(JSON.parse(calls[0].init.body).waitMs).toBe(25_000);
+        await connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, timeoutMs: 15_000 }).waitForJob({ jobId: 'b', sessionId: 's' });
+        expect(JSON.parse(calls[1].init.body).waitMs).toBe(10_000);
+        await connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, timeoutMs: 4_000 }).waitForJob({ jobId: 'c', sessionId: 's' });
+        expect(JSON.parse(calls[2].init.body)).toEqual({ jobId: 'c', sessionId: 's' });
+    });
+
+    test('waitForJob with longPollMs 0 never sends waitMs', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([{ body: { status: 'succeeded', result: '{}' } }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, longPollMs: 0 });
+        await ng.waitForJob({ jobId: 'j3', sessionId: 's' });
+        expect(JSON.parse(calls[0].init.body)).toEqual({ jobId: 'j3', sessionId: 's' });
     });
 
     test('waitForJob times out rather than spinning forever', async () => {

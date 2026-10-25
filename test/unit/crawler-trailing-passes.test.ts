@@ -21,7 +21,7 @@ import { redecodeFromHeight } from '../../srv/crawler/redecode';
 import { readCapBinary } from '../../srv/crawler/cap-binary';
 import { backfillTransactionIdentifiers } from '../../srv/crawler/transaction-identifiers';
 import {
-    compactStoredContractState, contractStateAt, contractStatePolicy, IndexerBudgetExhausted, type ContractStatePolicy
+    compactStoredContractState, contractStateAt, contractStatePolicy, IndexerBudgetExhausted, IndexerBehind, type ContractStatePolicy
 } from '../../srv/crawler/contract-state';
 
 cds.test(__dirname + '/../..');
@@ -1226,9 +1226,28 @@ describe('contract state storage', () => {
             await seedCalls(12, [CONTRACT]);
             const fetchState = vi.fn(async () => fetched(b64('s12')));
             const snap = await contractStateAt(db, CONTRACT, null, fetchState);
-            expect(fetchState).toHaveBeenCalledWith(CONTRACT, null);
+            expect(fetchState).toHaveBeenCalledWith(CONTRACT, 12);
             expect(snap).toEqual(expect.objectContaining({ source: 'indexer', height: 12, verified: null }));
             expect(text(snap!.state)).toBe('s12');
+        });
+
+        it('refuses the indexer answer when the indexer has not reached the newest action', async () => {
+            await supplyBlocks({ 10: [{ address: CONTRACT, state: 's10' }] });
+            await storeParams(10);
+            await seedCalls(12, [CONTRACT]);
+            const behind = vi.fn(async () => ({ state: b64('s10'), zswapState: null, blockHash: '0xcs10', ledgerParameters: null }));
+            await expect(contractStateAt(db, CONTRACT, null, behind)).rejects.toBeInstanceOf(IndexerBehind);
+            const reached = vi.fn(async () => ({ state: b64('s12'), zswapState: null, blockHash: 'CS12', ledgerParameters: null }));
+            expect((await contractStateAt(db, CONTRACT, null, reached))?.source).toBe('indexer');
+        });
+
+        it('answers IndexerBehind, not null, when the indexer knows no state at the newest action\'s block', async () => {
+            await supplyBlocks({ 10: [{ address: CONTRACT, state: 's10' }] });
+            await storeParams(10);
+            await seedCalls(12, [CONTRACT]);
+            await expect(contractStateAt(db, CONTRACT, null, async () => null)).rejects.toEqual(
+                expect.objectContaining({ address: CONTRACT, height: 12 })
+            );
         });
 
         it('asks the indexer above the indexed tip and leaves it unverified', async () => {

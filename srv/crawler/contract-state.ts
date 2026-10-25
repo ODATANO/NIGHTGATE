@@ -138,6 +138,11 @@ export class IndexerBudgetExhausted extends Error {
     constructor(readonly retryAfterMs: number) { super('indexer request budget exhausted'); }
 }
 
+/** The indexer has not reached the newest action the crawler stored. A build on its answer would fail on chain. */
+export class IndexerBehind extends Error {
+    constructor(readonly address: string, readonly height: number) { super(`the indexer has not reached the contract's action at block ${height} yet; retry in a few seconds`); }
+}
+
 type LocatedSnapshot = Omit<ContractStateSnapshot, 'blockHash' | 'ledgerParameters' | 'coveredHeight' | 'chainHeight'>;
 
 /** How far the database is: the supplement writes the states, the crawler knows the chain tip. */
@@ -209,6 +214,7 @@ export async function contractStateAt(
     }, fetchState);
 
     let newest: any = null;
+    let staleHeight: number | null = null;
     if (height == null && current) {
         // The crawler stores an action before the supplement stores its state. Then the stored state is stale.
         newest = await db.run(
@@ -218,6 +224,7 @@ export async function contractStateAt(
                 .orderBy('transaction.block.height desc', 'transaction.transactionId desc', 'actionIndex desc')
         );
         if (!newest || newest.ID === current.contractAction_ID || Number(newest.height) <= Number(current.height)) return fromCurrent();
+        staleHeight = Number(newest.height);
     }
 
     // The database has every action up to the indexed height.
@@ -253,8 +260,18 @@ export async function contractStateAt(
         }
     }
 
-    const fetched = await fetchState(address, height);
-    if (!fetched) return null;
+    // A stale stored state is fetched at the newest action's block, so equal requests share the answer.
+    const fetched = await fetchState(address, staleHeight ?? height);
+    // The contract exists, so no answer at the newest action's block means the indexer is behind.
+    if (!fetched) {
+        if (staleHeight !== null) throw new IndexerBehind(address, staleHeight);
+        return null;
+    }
+    if (staleHeight !== null && fetched.blockHash) {
+        const block: Pick<Block, 'hash'> | undefined = await db.run(SELECT.one.from(Blocks).columns('hash').where({ height: staleHeight }));
+        const bare = (h: string) => h.replace(/^0x/i, '').toLowerCase();
+        if (block?.hash && bare(block.hash) !== bare(fetched.blockHash)) throw new IndexerBehind(address, staleHeight);
+    }
     const digest = digestOfBase64(fetched.state);
     const zswapDigest = digestOfBase64(fetched.zswapState);
     const expected = newest?.stateHash ?? null;

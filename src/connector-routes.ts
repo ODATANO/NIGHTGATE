@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
+import type { Request, Response } from 'express';
 
 import { getNightgatePluginConfig, getConfiguredNightgateNetwork, DEFAULT_NETWORK } from '../srv/utils/nightgate-config';
 import { getContractRegistration, listRegisteredContracts } from '../srv/submission/contract-registry';
@@ -25,7 +26,26 @@ export function zkFileEtag(absPath: string): string | null {
     return etag;
 }
 
+function listZkFiles(zkConfigPath: string, dir: 'keys' | 'zkir'): string[] {
+    try {
+        return fs.readdirSync(path.join(zkConfigPath, dir)).filter(f => ZK_FILE_RE.test(f)).sort();
+    } catch { return []; }
+}
+
 export function mountZkConfigRoute(app: any): void {
+    // The bare contract path lists what is served below it.
+    app.get(['/zk-config/:contract', '/zk-config/:contract/'], (req: Request, res: Response) => {
+        const contract = String(req.params.contract);
+        const reg = getContractRegistration(contract);
+        if (!reg) { res.status(404).end(); return; }
+        res.setHeader('Cache-Control', 'public, no-cache');
+        res.json({
+            contract,
+            circuits: listContractCircuits(reg.zkConfigPath),
+            files: { keys: listZkFiles(reg.zkConfigPath, 'keys'), zkir: listZkFiles(reg.zkConfigPath, 'zkir') }
+        });
+    });
+
     app.get('/zk-config/:contract/:dir/:file', (req: any, res: any) => {
         const { contract, dir, file } = req.params;
         if ((dir !== 'keys' && dir !== 'zkir') || !ZK_FILE_RE.test(file)) {

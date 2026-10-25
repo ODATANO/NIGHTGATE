@@ -35,15 +35,30 @@ const notInBuildOnly = (method) => () => {
 
 // `runtime` (compact-runtime) deserializes the contract state: circuits run on its ContractState class, and ledger-v8's
 // class of the same name is refused. `ledger` deserializes the zswap state and the ledger parameters.
-// `maxLagBlocks`: a state further behind the chain is refused; a server's states trail it by some ten blocks normally.
-export function apiPublicDataProvider({ client, ledger, runtime, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 60 }) {
+// `maxLagBlocks`: a state further behind the chain is refused. `stateRetryMs`: how long a 503 or 429 of stateAt is retried.
+export function apiPublicDataProvider({ client, ledger, runtime, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 60, stateRetryMs = 30_000 }) {
     if (!client) throw new Error('apiPublicDataProvider: client is required');
     if (!ledger?.ZswapChainState?.deserialize || !ledger?.LedgerParameters?.deserialize) throw new Error('apiPublicDataProvider: ledger module is required');
     if (!runtime?.ContractState?.deserialize) throw new Error('apiPublicDataProvider: runtime module (compact-runtime) is required');
     if (!(Number.isInteger(maxLagBlocks) && maxLagBlocks >= 0)) throw new Error('apiPublicDataProvider: maxLagBlocks must be a non-negative integer');
 
-    async function snapshotAt(address, height) {
-        const snapshot = await client.contractStateAt({ address, height });
+    // 503: the server's indexer has not reached the newest action yet. 429: its indexer budget is used up.
+    async function stateWithRetry(address, height, retryMs = stateRetryMs) {
+        const deadline = Date.now() + retryMs;
+        for (;;) {
+            try {
+                return await client.contractStateAt({ address, height });
+            } catch (err) {
+                const status = Number(err?.status);
+                if ((status !== 503 && status !== 429) || Date.now() >= deadline) throw err;
+                const waitMs = Number(err?.retryAfterSeconds) > 0 ? Number(err.retryAfterSeconds) * 1000 : pollMs;
+                await new Promise(r => setTimeout(r, Math.min(waitMs, Math.max(0, deadline - Date.now()))));
+            }
+        }
+    }
+
+    async function snapshotAt(address, height, retryMs) {
+        const snapshot = await stateWithRetry(address, height, retryMs);
         if (snapshot?.coveredHeight != null && snapshot.chainHeight != null) {
             const lag = Number(snapshot.chainHeight) - Number(snapshot.coveredHeight);
             if (lag > maxLagBlocks) {
@@ -63,15 +78,15 @@ export function apiPublicDataProvider({ client, ledger, runtime, pollMs = 2_000,
     async function waitFor(what, read) {
         const deadline = Date.now() + watchTimeoutMs;
         for (;;) {
-            const found = await read();
+            const found = await read(Math.max(0, deadline - Date.now()));
             if (found) return found;
             if (Date.now() >= deadline) throw new Error(`${what} not indexed by the NIGHTGATE server within ${watchTimeoutMs}ms`);
             await new Promise(r => setTimeout(r, pollMs));
         }
     }
 
-    const contractState = async (address, config) => {
-        const snapshot = await snapshotAt(address, heightOf(config));
+    const contractState = async (address, config, retryMs) => {
+        const snapshot = await snapshotAt(address, heightOf(config), retryMs);
         return snapshot?.state ? runtime.ContractState.deserialize(toBytes(snapshot.state)) : null;
     };
 
@@ -108,7 +123,8 @@ export function apiPublicDataProvider({ client, ledger, runtime, pollMs = 2_000,
             };
         },
 
-        watchForContractState: (address) => waitFor(`the state of contract ${address}`, () => contractState(address)),
+        // A watch retries a 503 or 429 for its whole timeout, not only for stateRetryMs.
+        watchForContractState: (address) => waitFor(`the state of contract ${address}`, (left) => contractState(address, undefined, left)),
 
         watchForTxData: notInBuildOnly('watchForTxData'),
         queryUnshieldedBalances: notInBuildOnly('queryUnshieldedBalances'),

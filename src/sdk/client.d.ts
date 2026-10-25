@@ -36,6 +36,8 @@ export interface ConnectOptions {
     timeoutMs?: number;
     /** How often waitForJob polls, in ms. Defaults to 2000. */
     pollMs?: number;
+    /** How long one getJobStatus call of waitForJob waits on the server, in ms. Defaults to 20000; 0 polls instead. At most 25000 and 5000 below timeoutMs. */
+    longPollMs?: number;
     fetchFn?: typeof fetch;
 }
 
@@ -50,7 +52,8 @@ export interface JobStatus {
 export type Params = Record<string, string | number | bigint | boolean | Int64Literal | undefined>;
 export type ActionParams = Record<string, unknown>;
 /** The parsed job result, plus the job id and the transaction hash. */
-export type JobResult = Record<string, unknown> & { jobId: string; txHash?: string };
+/** `txHash` is the ledger identifier; `transactionHash` the hash explorers show, null until indexed. */
+export type JobResult = Record<string, unknown> & { jobId: string; txHash?: string; transactionHash?: string | null };
 
 /** A contract's state as the server serves it. Binary fields are base64. */
 export interface ContractStateSnapshot {

@@ -25,7 +25,7 @@
 
 import { createRequire } from 'node:module';
 import { mkdir, writeFile, readFile, access, rename, rm } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -38,6 +38,9 @@ import {
 import * as compactRuntime from '@midnight-ntwrk/compact-runtime';
 
 const require = createRequire(import.meta.url);
+
+// Each writer gets its own temporary file, so builders sharing a cache directory never mix their bytes.
+const partFileFor = (dest) => `${dest}.${process.pid}.${randomUUID()}.part`;
 
 // Paying the fee yourself and submitting to the node directly.
 export {
@@ -164,7 +167,7 @@ export async function ensureZkAssets(input) {
             if (expected && sha256Hex(body) !== expected) {
                 throw new Error('ensureZkAssets: ' + rel + ' does not match the sha256 in the served keys/manifest.json');
             }
-            const tmp = dest + '.part';
+            const tmp = partFileFor(dest);
             try {
                 await writeFile(tmp, body);
                 await rename(tmp, dest);
@@ -205,7 +208,7 @@ async function ensurePackageProverKeys({ package: packageName, from, circuits, f
         const body = Buffer.from(await res.arrayBuffer());
         if (!keyMatchesManifest(body, expected)) throw new Error(`ensureZkAssets: ${circuit}.prover from ${url} does not match keys/manifest.json`);
         const dest = join(keysDir, `${circuit}.prover`);
-        const tmp = dest + '.part';
+        const tmp = partFileFor(dest);
         try {
             await writeFile(tmp, body);
             await rename(tmp, dest);

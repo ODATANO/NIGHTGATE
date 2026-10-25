@@ -124,14 +124,21 @@ function isStaleSocketError(err) {
  * @param {string} [opts.password]
  * @param {number} [opts.timeoutMs]        Timeout per request in ms. Defaults to 120000.
  * @param {number} [opts.pollMs]           How often waitForJob polls, in ms. Defaults to 2000.
+ * @param {number} [opts.longPollMs]       How long one getJobStatus call of waitForJob may wait on the server, in ms.
+ *                                         Defaults to 20000; 0 polls instead. At most 25000 and 5000 below timeoutMs.
+ *                                         A server without waitMs is polled.
  * @param {Function} [opts.fetchFn]        Replaces fetch, for tests.
  */
 export function connect(opts) {
     const {
         baseUrl, servicePath = '/odata/v4/midnight', indexerServicePath = '/odata/v4/midnight-indexer',
         agentToken, token, username, password,
-        timeoutMs = 120_000, pollMs = 2_000, fetchFn
+        timeoutMs = 120_000, pollMs = 2_000, longPollMs = 20_000, fetchFn
     } = opts ?? {};
+    // The server waits at most 25 s. Each wait ends 5 s before the request timeout so the answer still arrives.
+    const longPollCapMs = Math.max(0, Math.min(Math.floor(Number(longPollMs) || 0), 25_000, timeoutMs - 5_000));
+    // Turned off for this client when the server does not know getJobStatus' waitMs.
+    let longPoll = longPollCapMs > 0;
     if (!baseUrl) throw new Error('connect: baseUrl is required');
     const doFetch = fetchFn || fetch;
     const service = String(baseUrl).replace(/\/$/, '') + servicePath;
@@ -216,10 +223,16 @@ export function connect(opts) {
         let firstPollFailure = null;
         for (;;) {
             let job;
+            const waitMs = longPoll ? Math.max(0, Math.min(longPollCapMs, deadline - Date.now())) : 0;
+            const asked = Date.now();
             try {
-                job = await callAction('getJobStatus', { jobId, sessionId });
+                job = await callAction('getJobStatus', waitMs > 0 ? { jobId, sessionId, waitMs } : { jobId, sessionId });
                 firstPollFailure = null;
             } catch (err) {
+                if (waitMs > 0 && err instanceof NightgateApiError && err.status === 400 && /waitMs/.test(err.message) && !/waitMs must be/.test(err.message)) {
+                    longPoll = false;
+                    continue;
+                }
                 if (!isTransientPollError(err)) throw err;
                 firstPollFailure ??= Date.now();
                 // Give up when poll errors last too long or the overall deadline has passed.
@@ -230,13 +243,14 @@ export function connect(opts) {
             if (job.status === 'succeeded') {
                 let result = {};
                 try { result = job.result ? JSON.parse(job.result) : {}; } catch { result = { raw: job.result }; }
-                return { ...result, jobId, txHash: result.txHash ?? job.txHash };
+                return { ...result, jobId, txHash: result.txHash ?? job.txHash, transactionHash: job.transactionHash ?? null };
             }
             if (job.status === 'failed' || job.status === 'reconciliation_required') {
                 throw new NightgateJobError({ ...job, jobId });
             }
             if (Date.now() > deadline) throw new Error(`waitForJob: job ${jobId} still ${job.status} after ${waitTimeoutMs}ms`);
-            await new Promise(r => setTimeout(r, interval));
+            // A long poll that ran its time needs no pause; one the server answered at once does.
+            if (waitMs === 0 || Date.now() - asked < Math.min(waitMs, 1000)) await new Promise(r => setTimeout(r, interval));
         }
     }
 

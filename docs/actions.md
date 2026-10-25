@@ -22,9 +22,11 @@ remove an action, a patch release never does; a removal is marked
 
 Every submitting action returns `{ jobId, status: "pending" }`; poll `getJobStatus(jobId, sessionId)` until `succeeded` or `failed`. A reused `idempotencyKey` returns the existing job; the same key with a different payload answers 409 `IDEMPOTENCY_KEY_CONFLICT`, a key over 128 characters 400 `IDEMPOTENCY_KEY_INVALID`. Each write action lists its job-result shape (the parsed `result`); functions return their result directly.
 
-### `getJobStatus(jobId, sessionId) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, chainFinalizedAt, chainBlockHeight, chainBlockHash, chainSegments, … }`
+### `getJobStatus(jobId, sessionId, waitMs?) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, transactionId, transactionHash, chainFinalizedAt, chainBlockHeight, chainBlockHash, chainSegments, … }`
 
-`status`: `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. `result` is the action's result as a JSON string; on failure `errorCode` + `errorMessage` (see [Error model](#error-model)). `chainBlockHeight` / `chainBlockHash` are the confirmed inclusion coordinates; a reorg rollback reverts by them. An on-chain failure without a block height stays briefly in `reconciliation_required` / `CHAIN_EXECUTION_FAILED_UNCONFIRMED` until the confirmer records the coordinates.
+`status`: `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. `waitMs` (at most 25000) holds the call until the job reaches `succeeded`, `failed` or `reconciliation_required` or the time is up, so one call replaces many polls; past 100 waiting calls a server answers at once. `result` is the action's result as a JSON string; on failure `errorCode` + `errorMessage` (see [Error model](#error-model)). `chainBlockHeight` / `chainBlockHash` are the confirmed inclusion coordinates; a reorg rollback reverts by them. An on-chain failure without a block height stays briefly in `reconciliation_required` / `CHAIN_EXECUTION_FAILED_UNCONFIRMED` until the confirmer records the coordinates.
+
+`transactionId` (same as `txHash`) is the ledger identifier: it exists once the transaction is built and stays the same when a sponsor adds its fee, so it tracks the job. `transactionHash` is the hash explorers show, from the indexed transaction; `null` until the server indexed it. `Transactions/byIdentifier(identifier)` returns the same value as `ledgerTxHash`.
 
 `chainSegments` (batches, once the outcome is confirmed; `null` otherwise): JSON `[{ segment, calls, applied }]`, the call names of each segment and whether it applied. A partial success reads `status: failed`, `chainStatus: failure` as before; the segments with `applied: true` are on chain, resend only the others.
 
@@ -72,8 +74,10 @@ request passed (`"prove";q=60;w=3600, "grant-hour";q=20;w=3600`) and
 `getGrantUsage(...).limits` shows a grant's budgets and classes with what is
 left; `getMetrics()` counts refusals as `rate_limited_total{limit}`.
 
-Not a class: `ContractStates/stateAt` asks the indexer under one budget of 2
-per second for all callers (`indexer-budget`).
+Not a class: `ContractStates/stateAt` asks the indexer under one budget for all
+callers (`indexer-budget`, `NIGHTGATE_STATE_AT_INDEXER_RATE`, default 2 per
+second). Equal requests share one read. While the crawler holds a newer action
+of the contract than the indexer, `stateAt` answers 503: retry in a few seconds.
 
 ## Session lifecycle
 

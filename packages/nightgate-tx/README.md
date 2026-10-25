@@ -11,10 +11,9 @@ own key**. Under 1 MB; no server, database, proof server or Docker of your own.
 ```js
 import { connect } from '@odatano/nightgate-tx';
 
-const ng = connect({ baseUrl: 'https://nightgate.example' });
-
-// verification is a plain read: no wallet, no key, no auth
-const state = await ng.verifyAttestation({ contractAddress, attesterId, payloadHash });
+// the public verify route: no wallet, no key, no auth
+const ng = connect({ baseUrl: 'https://api.preprod.odatano.dev', servicePath: '/odata/v4/midnight-verify' });
+const state = await ng.verifyAttestation({ contractAddress, attesterId, payloadHash, compiledArtifactRef: 'attestation-vault-32' });
 ```
 
 ## The two halves
@@ -25,8 +24,8 @@ actions submit the job AND wait for the result, so one call returns the
 
 ```js
 const ng = connect({
-    baseUrl: 'https://nightgate.example',
-    agentToken: 'ngat_...'            // or token: / username: + password:
+    baseUrl: 'https://api.preprod.odatano.dev',
+    token: 'oda_...'                  // or agentToken: 'ngat_...' / username: + password:
     // servicePath: '/api/v1/nightgate', indexerServicePath: '/api/v1/indexer'  // a server below 0.35.0
 });
 
@@ -59,23 +58,31 @@ sponsor:
 ```js
 import { connect, createTxBuilder } from '@odatano/nightgate-tx';
 import { prepareAttest } from '@odatano/nightgate-tx/calls';
-import { Contract } from '@odatano/nightgate-tx/attestation-vault';
+import { Contract } from '@odatano/nightgate-tx/attestation-vault-32';
 
+const api = { baseUrl: 'https://api.preprod.odatano.dev', token: 'oda_...' };
 const builder = await createTxBuilder({
-    seedHex,                                   // yours; never sent anywhere
+    seedHex,                                   // 128 hex chars, a 64-byte seed; yours, never sent anywhere
     networkId: 'preprod',
-    api: { baseUrl: 'https://nightgate.example', agentToken },   // or indexerHttpUrl, indexerWsUrl, nodeUrl
+    api,                                       // reads the chain through the API; or indexerHttpUrl, indexerWsUrl, nodeUrl
     walletSync: false,
-    zkConfigBaseUrl: 'https://nightgate.example/zk-config/attestation-vault',
-    contractClass: Contract
+    zkConfigBaseUrl: 'https://api.preprod.odatano.dev/zk-config/attestation-vault-32',
+    contractClass: Contract,
+    contractName: 'attestation-vault-32'
 });
 
 const call = prepareAttest({ payloadHash, metadataHash, attestationSecret: builder.attestationSecret });
-const { finalizedTxB64 } = await builder.buildSponsorable({ contractAddress: VAULT, call });
+const { unboundTxB64 } = await builder.buildSponsorable({ contractAddress: VAULT, call, bind: false });
 
-const ng = connect({ baseUrl: 'https://nightgate.example' });
-const { txHash } = await ng.sponsorFinalized({ finalizedTxB64 });
+const job = await connect(api).sponsorUnbound({ unboundTxB64, idempotencyKey: `anchor-${payloadHash}` });
+// job.txHash is the ledger identifier, job.transactionHash the hash explorers show (null until indexed)
 ```
+
+A seed is 64 bytes, written as 128 hex characters:
+`node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"`.
+Write actions and `waitForJob` long-poll `getJobStatus` with `waitMs`, so one
+call usually covers the wait; `longPollMs: 0` in `connect()` polls instead.
+A step-by-step guide with a shared sandbox vault: [api.preprod.odatano.dev/quickstart](https://api.preprod.odatano.dev/quickstart).
 
 The on-chain attestation carries **your** attester id; the sponsor pays the
 dust and never sees a key, witness or preimage. Runnable version:

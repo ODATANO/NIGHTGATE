@@ -353,7 +353,7 @@ export declare function probeLanded(identifier: string, opts: LandedProbeSource 
 export declare function waitLanded(identifier: string, opts: LandedProbeSource & { timeoutMs?: number, pollMs?: number }): Promise<LandedProbeResult | null>;
 
 /** A midnight-js `PublicDataProvider` that reads contract state and deploys through the NIGHTGATE API. */
-export declare function apiPublicDataProvider(input: { client: NightgateClient; ledger: object; runtime: object; pollMs?: number; watchTimeoutMs?: number; maxLagBlocks?: number }): object;
+export declare function apiPublicDataProvider(input: { client: NightgateClient; ledger: object; runtime: object; pollMs?: number; watchTimeoutMs?: number; maxLagBlocks?: number; stateRetryMs?: number }): object;
 /** The client behind an `api` option: a connected client, or `connect()` on the options. */
 export declare function apiClientFor(api: ConnectOptions | NightgateClient): NightgateClient;
 /** A wallet facade submission service that never dials a node. The builder hands its transaction to a sponsor instead. */

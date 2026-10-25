@@ -30,6 +30,41 @@ function fakeClient(over: Record<string, any> = {}) {
 }
 
 describe('apiPublicDataProvider: contract state', () => {
+    it('retries a 503 or 429 of stateAt and gives up after stateRetryMs', async () => {
+        const { apiPublicDataProvider } = await importProvider();
+        const behind = Object.assign(new Error('the indexer has not reached the action'), { status: 503 });
+        const budget = Object.assign(new Error('indexer budget'), { status: 429, retryAfterSeconds: 0 });
+        const ok = { address: ADDRESS, height: 12, state: b64('s12'), zswapState: b64('z12'), ledgerParameters: b64('p12'), blockHash: '0xb12' };
+        const contractStateAt = vi.fn().mockRejectedValueOnce(behind).mockRejectedValueOnce(budget).mockResolvedValueOnce(ok);
+        const provider: any = apiPublicDataProvider({ client: fakeClient({ contractStateAt }), ledger, runtime, pollMs: 1 });
+        expect(await provider.queryContractState(ADDRESS)).toEqual({ kind: 'contract', text: 's12' });
+        expect(contractStateAt).toHaveBeenCalledTimes(3);
+
+        const always = vi.fn(async () => { throw behind; });
+        const impatient: any = apiPublicDataProvider({ client: fakeClient({ contractStateAt: always }), ledger, runtime, pollMs: 1, stateRetryMs: 20 });
+        await expect(impatient.queryContractState(ADDRESS)).rejects.toBe(behind);
+        const refused = Object.assign(new Error('forbidden'), { status: 403 });
+        const once = vi.fn(async () => { throw refused; });
+        await expect((apiPublicDataProvider({ client: fakeClient({ contractStateAt: once }), ledger, runtime, pollMs: 1 }) as any).queryContractState(ADDRESS)).rejects.toBe(refused);
+        expect(once).toHaveBeenCalledTimes(1);
+    });
+
+    it('watchForContractState retries a 503 for its whole timeout, past stateRetryMs', async () => {
+        const { apiPublicDataProvider } = await importProvider();
+        const behind = Object.assign(new Error('the indexer has not reached the action'), { status: 503 });
+        const ok = { address: ADDRESS, height: 12, state: b64('s12'), zswapState: b64('z12'), ledgerParameters: b64('p12'), blockHash: '0xb12' };
+        let calls = 0;
+        const started = Date.now();
+        const contractStateAt = vi.fn(async () => {
+            calls++;
+            if (Date.now() - started < 60) throw behind;
+            return ok;
+        });
+        const provider: any = apiPublicDataProvider({ client: fakeClient({ contractStateAt }), ledger, runtime, pollMs: 5, stateRetryMs: 10, watchTimeoutMs: 5_000 });
+        expect(await provider.watchForContractState(ADDRESS)).toEqual({ kind: 'contract', text: 's12' });
+        expect(calls).toBeGreaterThan(1);
+    });
+
     it('queryContractState asks for the newest state, or the state at a block height', async () => {
         const { apiPublicDataProvider } = await importProvider();
         const client = fakeClient();

@@ -192,6 +192,12 @@ Dependent batches leave the flag unset. A remaining violation carries
 `calls: [{ name, segId, stages }]` in apply order (also in the message), so a
 consumer can split deterministically.
 
+**Map size.** Every call of a batch is budgeted against the state at build time.
+A batch that grows a map past 1, 16 or 256 entries needs more gas for its
+later calls than they were given; the node refuses it before the mempool
+(`1010/104`, no fee). Cross those sizes with single calls and batch the rest.
+From about 4096 entries on the ledger's 20 % margin covers one more level.
+
 `bind` picks the handover. `true` (default) returns `finalizedTxB64` for
 `sponsorFinalizedTransaction`. `false` returns `unboundTxB64`, the signed
 pre-binding transaction for `sponsorUnboundTransaction`: the sponsor merges its

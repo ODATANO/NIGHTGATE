@@ -7,15 +7,23 @@ import { attachRuntimeGate } from './utils/runtime-gate';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { registerDocumentProofHandlers } from './submission/document-proof';
 import { getJobById } from './submission/background-jobs';
-import { contractStateAt, IndexerBudgetExhausted, type ContractStateFetcher } from './crawler/contract-state';
+import { contractStateAt, IndexerBudgetExhausted, IndexerBehind, type ContractStateFetcher, type FetchedContractState } from './crawler/contract-state';
 import { fetchContractState } from './crawler/indexer-supplement';
 import { normalizeIdentifier } from './crawler/transaction-identifiers';
 import { getNightgatePluginConfig, resolveNightgateRuntimeConfig } from './utils/nightgate-config';
 import { RateLimiter } from './utils/rate-limiter';
+import { configNumber } from './utils/config';
 import { rejectRateLimited } from './utils/rate-classes';
 
-// One limit for all callers: the public indexer blocks the host's IP when it gets too many requests.
-const stateAtIndexerLimiter = new RateLimiter({ windowMs: 1000, maxRequests: 2 });
+// One limit for all callers of this server: the public indexer blocks the host's IP when it gets too many requests.
+let stateAtLimiter: RateLimiter | null = null;
+const stateAtIndexerLimiter = (): RateLimiter =>
+    (stateAtLimiter ??= new RateLimiter({ windowMs: 1000, maxRequests: configNumber('NIGHTGATE_STATE_AT_INDEXER_RATE') }));
+
+// Equal requests share one indexer read. A state at a fixed height is kept briefly; the newest state never is.
+const STATE_AT_CACHE_MS = 5_000;
+const stateAtInFlight = new Map<string, Promise<FetchedContractState | null>>();
+const stateAtCache = new Map<string, { at: number; value: FetchedContractState }>();
 
 /** What byIdentifier reads across the identifier row, its transaction and that transaction's block. */
 interface TransactionLocation {
@@ -26,12 +34,62 @@ interface TransactionLocation {
     blockHash: string;
 }
 
+const JOB_WAIT_MAX_MS = 25_000;
+const JOB_WAITERS_MAX = 100;
+const JOB_SETTLED = new Set(['succeeded', 'failed', 'reconciliation_required']);
+let jobWaiters = 0;
+
+// Each read runs in its own short transaction, so a waiting call holds no database connection.
+async function readJob(jobId: string): Promise<BackgroundJob | null> {
+    let job: BackgroundJob | null = null;
+    await cds.tx({}, async () => { job = await getJobById(jobId); });
+    return job;
+}
+
+/** Re-reads the job until it settles or `waitMs` is over. Past JOB_WAITERS_MAX waiting calls it answers at once. */
+async function settledJob(job: BackgroundJob, waitMs: number): Promise<BackgroundJob> {
+    if (JOB_SETTLED.has(String(job.status)) || jobWaiters >= JOB_WAITERS_MAX) return job;
+    const deadline = Date.now() + waitMs;
+    let current = job;
+    jobWaiters++;
+    try {
+        while (!JOB_SETTLED.has(String(current.status)) && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, Math.min(500, deadline - Date.now())));
+            current = (await readJob(job.ID!)) ?? current;
+        }
+    } finally {
+        jobWaiters--;
+    }
+    return current;
+}
+
+/** The indexed transaction that carries a ledger identifier, newest block first. */
+async function locateByIdentifier(db: cds.DatabaseService, identifier: string): Promise<TransactionLocation | undefined> {
+    return db.run(
+        cds.ql.SELECT.one.from(TransactionIdentifiers)
+            .columns('transaction.ID as ID', 'transaction.hash as hash', 'transaction.ledgerTxHash as ledgerTxHash',
+                'transaction.block.height as blockHeight', 'transaction.block.hash as blockHash')
+            .where({ identifier })
+            .orderBy('transaction.block.height desc')
+    );
+}
+
+/** The hash explorers show for a job's `txHash`: found by identifier, or the value itself when a row stored that hash. */
+async function explorerHashOf(db: cds.DatabaseService, txHash: string | null | undefined): Promise<string | null> {
+    const value = normalizeIdentifier(String(txHash ?? ''));
+    if (!value || !/^[0-9a-f]+$/.test(value)) return null;
+    const located = await locateByIdentifier(db, value);
+    if (located?.ledgerTxHash) return located.ledgerTxHash;
+    const stored: Pick<IndexedTransaction, 'ledgerTxHash'> | undefined = await db.run(
+        cds.ql.SELECT.one.from(Transactions).columns('ledgerTxHash').where({ ledgerTxHash: value })
+    );
+    return stored?.ledgerTxHash ?? null;
+}
+
 function fetchContractStateFromIndexers(): ContractStateFetcher {
     const { crawlerConfig, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
     const urls = [...new Set([String(crawlerConfig.indexerUrl || ''), submissionEndpoints.indexerHttpUrl].filter(Boolean))];
-    return async (address, height) => {
-        const budget = stateAtIndexerLimiter.check('indexer');
-        if (!budget.allowed) throw new IndexerBudgetExhausted(budget.retryAfterMs);
+    const read = async (address: string, height: number | null): Promise<FetchedContractState | null> => {
         let lastError: unknown;
         for (const url of urls) {
             try {
@@ -42,9 +100,30 @@ function fetchContractStateFromIndexers(): ContractStateFetcher {
         }
         throw lastError ?? new Error('no indexer configured');
     };
+    return async (address, height) => {
+        const key = `${address}:${height ?? 'newest'}`;
+        const hit = height == null ? undefined : stateAtCache.get(key);
+        if (hit && Date.now() - hit.at < STATE_AT_CACHE_MS) return hit.value;
+        const pending = stateAtInFlight.get(key);
+        if (pending) return pending;
+        const budget = stateAtIndexerLimiter().check('indexer');
+        if (!budget.allowed) throw new IndexerBudgetExhausted(budget.retryAfterMs);
+        const started = read(address, height);
+        stateAtInFlight.set(key, started);
+        try {
+            const value = await started;
+            if (value && height != null) {
+                if (stateAtCache.size >= 500) stateAtCache.clear();
+                stateAtCache.set(key, { at: Date.now(), value });
+            }
+            return value;
+        } finally {
+            stateAtInFlight.delete(key);
+        }
+    };
 }
 
-import { Blocks, Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions, type WalletSession, type TransactionResult, type TransactionSegment } from '#cds-models/midnight';
+import { Blocks, Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions, type WalletSession, type TransactionResult, type TransactionSegment, type Transaction as IndexedTransaction, type BackgroundJob } from '#cds-models/midnight';
 import { normalizeHttpError } from './utils/http-errors';
 import { getJobStatus } from '#cds-models/NightgateService';
 import { Block, ContractAction, ContractState, NightBalance, Transaction, UnshieldedUtxo } from '#cds-models/NightgateService';
@@ -121,13 +200,7 @@ export default class NightgateService extends cds.ApplicationService {
             const identifier = normalizeIdentifier(String(req.data.identifier ?? ''));
             if (!identifier) return req.reject(400, 'identifier is required');
             if (!/^[0-9a-f]+$/.test(identifier)) return req.reject(400, 'identifier must be hex');
-            const found: TransactionLocation | undefined = await this.db.run(
-                cds.ql.SELECT.one.from(TransactionIdentifiers)
-                    .columns('transaction.ID as ID', 'transaction.hash as hash', 'transaction.ledgerTxHash as ledgerTxHash',
-                        'transaction.block.height as blockHeight', 'transaction.block.hash as blockHash')
-                    .where({ identifier })
-                    .orderBy('transaction.block.height desc')
-            );
+            const found = await locateByIdentifier(this.db, identifier);
             if (!found) return req.reject(404, `no indexed transaction carries identifier ${identifier}`);
             const result: Pick<TransactionResult, 'ID' | 'status'> | undefined = await this.db.run(
                 cds.ql.SELECT.one.from(TransactionResults).columns('ID', 'status').where({ transaction_ID: found.ID })
@@ -200,10 +273,16 @@ export default class NightgateService extends cds.ApplicationService {
                 return snapshot;
             } catch (err) {
                 if (err instanceof IndexerBudgetExhausted) {
+                    const limiter = stateAtIndexerLimiter();
                     return rejectRateLimited(req, {
-                        name: 'indexer-budget', limit: stateAtIndexerLimiter.maxRequests,
-                        windowSeconds: stateAtIndexerLimiter.windowMs / 1000, retryAfterMs: err.retryAfterMs
+                        name: 'indexer-budget', limit: limiter.maxRequests,
+                        windowSeconds: limiter.windowMs / 1000, retryAfterMs: err.retryAfterMs
                     });
+                }
+                if (err instanceof IndexerBehind) {
+                    // The cached answer predates the newest action. A retry must ask the indexer again.
+                    stateAtCache.delete(`${err.address}:${err.height}`);
+                    return req.reject(503, err.message);
                 }
                 return req.reject(502, `indexer could not serve the contract state: ${(err as Error).message}`);
             }
@@ -295,11 +374,14 @@ export default class NightgateService extends cds.ApplicationService {
         registerDocumentProofHandlers(this);
 
         this.on(getJobStatus, async (req) => {
-            const { jobId, sessionId } = req.data;
+            const { jobId, sessionId, waitMs } = req.data;
             if (!jobId) return req.reject(400, 'jobId is required');
             if (!sessionId) return req.reject(400, 'sessionId is required');
+            if (waitMs != null && !(Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= JOB_WAIT_MAX_MS)) {
+                return req.reject(400, `waitMs must be an integer from 0 to ${JOB_WAIT_MAX_MS}`);
+            }
 
-            const job = await getJobById(jobId);
+            let job = await readJob(jobId);
             if (!job || job.sessionId !== sessionId) {
                 return req.reject(404, 'Job not found');
             }
@@ -313,14 +395,16 @@ export default class NightgateService extends cds.ApplicationService {
                         return req.reject(404, 'Job not found');
                     }
                 } else {
-                    const sess: WalletSession | undefined = await this.db.run(
-                        cds.ql.SELECT.one.from(WalletSessions).columns('userId').where({ sessionId })
+                    const sess: WalletSession | undefined = await cds.tx({}, (tx) =>
+                        tx.run(cds.ql.SELECT.one.from(WalletSessions).columns('userId').where({ sessionId }))
                     );
                     if (!sess?.userId || !requesterId || sess.userId !== requesterId) {
                         return req.reject(404, 'Job not found');
                     }
                 }
             }
+
+            if (waitMs) job = await settledJob(job, waitMs);
 
             return {
                 jobId: job.ID,
@@ -333,6 +417,8 @@ export default class NightgateService extends cds.ApplicationService {
                 maxAttempts: job.maxAttempts,
                 submissionId: job.submissionId,
                 txHash: job.txHash,
+                transactionId: job.txHash ?? null,
+                transactionHash: await explorerHashOf(this.db, job.txHash),
                 chainStatus: job.chainStatus,
                 chainFinalizedAt: job.chainFinalizedAt,
                 chainBlockHeight: job.chainBlockHeight ?? null,

@@ -33,13 +33,14 @@ const VAULT = process.env.VAULT;
 const SEED_HEX = process.env.SEED_HEX;
 const ZK_CONFIG_URL = process.env.ZK_CONFIG_URL;   // a public /zk-config/attestation-vault
 const NETWORK = process.env.NETWORK || 'preprod';
-const INDEXER_HTTP = process.env.INDEXER_HTTP_URL || `https://indexer.${NETWORK}.midnight.network/api/v4/graphql`;
-const INDEXER_WS = process.env.INDEXER_WS_URL || INDEXER_HTTP.replace(/^http/, 'ws') + '/ws';
+// Paying yourself needs a synced wallet, so an indexer you can reach (your own, or a hosted one with a key).
+const INDEXER_HTTP = process.env.INDEXER_HTTP_URL;
+const INDEXER_WS = process.env.INDEXER_WS_URL || (INDEXER_HTTP ? INDEXER_HTTP.replace(/^http/, 'ws') + '/ws' : undefined);
 const NODE_URL = process.env.NODE_URL || `wss://rpc.${NETWORK}.midnight.network/`;
 const file = process.argv[2];
 
-if (!VAULT || !SEED_HEX || !ZK_CONFIG_URL || !file) {
-    console.error('usage: VAULT=<addr> SEED_HEX=<128 hex> ZK_CONFIG_URL=<url> node self-funded.mjs <file.json>');
+if (!VAULT || !SEED_HEX || !ZK_CONFIG_URL || !INDEXER_HTTP || !file) {
+    console.error('usage: VAULT=<addr> SEED_HEX=<128 hex> ZK_CONFIG_URL=<url> INDEXER_HTTP_URL=<url> node self-funded.mjs <file.json>');
     process.exit(2);
 }
 

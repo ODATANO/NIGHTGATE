@@ -1279,10 +1279,13 @@ service NightgateService {
     /**
      * Returns the status of a background job. Poll until `status` is `succeeded` or `failed`.
      * `result` is the action's result as JSON. This is a POST but changes nothing.
+     * With `waitMs` the call holds until the job settles or the time is up, so one call replaces many polls.
      */
 
     action   getJobStatus(jobId: UUID,
-                          sessionId: UUID)                                    returns {
+                          sessionId: UUID,
+                          waitMs: Integer // ms; optional, at most 25000; wait for succeeded, failed or reconciliation_required
+    )                                                                         returns {
         jobId               : UUID;
         kind                : String;
         status              : String; // pending | running | external_execution | submitted | reconciliation_required | succeeded | failed
@@ -1292,7 +1295,9 @@ service NightgateService {
         attempt             : Integer;
         maxAttempts         : Integer;
         submissionId        : UUID;
-        txHash              : String;
+        txHash              : String; // hex; null before the build; the ledger identifier, same as transactionId
+        transactionId       : String; // hex; null before the build; the ledger identifier, stable when the sponsor adds its fee
+        transactionHash     : String; // hex; null until indexed; the transaction hash explorers show
         chainStatus         : String; // null | pending | success | failure | dropped
         chainFinalizedAt    : Timestamp;
         chainBlockHeight    : Integer;
