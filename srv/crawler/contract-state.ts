@@ -208,7 +208,17 @@ export async function contractStateAt(
         verified: null
     }, fetchState);
 
-    if (height == null && current) return fromCurrent();
+    let newest: any = null;
+    if (height == null && current) {
+        // The crawler stores an action before the supplement stores its state. Then the stored state is stale.
+        newest = await db.run(
+            SELECT.one.from(ContractActions)
+                .columns('ID', 'stateHash', 'transaction.block.height as height')
+                .where({ address })
+                .orderBy('transaction.block.height desc', 'transaction.transactionId desc', 'actionIndex desc')
+        );
+        if (!newest || newest.ID === current.contractAction_ID || Number(newest.height) <= Number(current.height)) return fromCurrent();
+    }
 
     // The database has every action up to the indexed height.
     // Above that height a newer action may be missing, so local rows cannot be trusted there.
@@ -217,7 +227,6 @@ export async function contractStateAt(
     );
     const covered = height != null && sync?.lastIndexedHeight != null && height <= Number(sync.lastIndexedHeight);
 
-    let newest: any = null;
     if (covered) {
         newest = await db.run(
             SELECT.one.from(ContractActions)

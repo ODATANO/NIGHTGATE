@@ -450,11 +450,17 @@ describe('txbuilder submit: probeLanded over the NIGHTGATE API', () => {
         await expect(probeLanded('id1', { api: client({ hash: '0xtx', blockHeight: 3, status: null, failedSegments: [] }) })).resolves.toBeNull();
     });
 
-    it('maps the inclusion to the probe result', async () => {
+    it('maps the inclusion to the probe result, txHash = the ledger hash', async () => {
         const { probeLanded } = await importSubmit();
-        const api = client({ hash: '0xtx', blockHeight: 42, status: 'FAILURE', failedSegments: [1] });
-        await expect(probeLanded('id1', { api })).resolves.toEqual({ height: '42', status: 'FAILURE', failedSegments: [1], applied: false, txHash: '0xtx' });
+        const api = client({ hash: '0xextrinsic', ledgerTxHash: 'ab12', blockHeight: 42, status: 'FAILURE', failedSegments: [1] });
+        await expect(probeLanded('id1', { api })).resolves.toEqual({ height: '42', status: 'FAILURE', failedSegments: [1], applied: false, txHash: 'ab12' });
         expect(api.transactionByIdentifier).toHaveBeenCalledWith('id1');
+    });
+
+    it('no txHash while the server has no ledger hash for the transaction', async () => {
+        const { probeLanded } = await importSubmit();
+        const api = client({ hash: '0xextrinsic', ledgerTxHash: null, blockHeight: 42, status: 'SUCCESS', failedSegments: [] });
+        await expect(probeLanded('id1', { api })).resolves.toEqual({ height: '42', status: 'SUCCESS', failedSegments: [], applied: true, txHash: undefined });
     });
 
     it('a server error reads as unknown, never as landed', async () => {

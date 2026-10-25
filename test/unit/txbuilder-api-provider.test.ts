@@ -82,12 +82,19 @@ describe('apiPublicDataProvider: the deploy', () => {
 
     it('watchForDeployTxData maps the server\'s result status to the SDK\'s names and waits for an unindexed deploy', async () => {
         const { apiPublicDataProvider } = await importProvider();
-        const deploy = { txHash: '0xdeploy', blockHeight: 7, blockHash: '0xb7', status: 'PARTIAL_SUCCESS', failedSegments: [1], identifiers: ['id0'], txId: 'id0' };
+        const deploy = { txHash: '0xdeploy', ledgerTxHash: 'de01', blockHeight: 7, blockHash: '0xb7', status: 'PARTIAL_SUCCESS', failedSegments: [1], identifiers: ['id0'], txId: 'id0' };
         const contractDeploy = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(deploy);
         const provider: any = apiPublicDataProvider({ client: fakeClient({ contractDeploy }), ledger, runtime, pollMs: 1 });
         const data = await provider.watchForDeployTxData(ADDRESS);
         expect(contractDeploy).toHaveBeenCalledTimes(2);
-        expect(data).toEqual(expect.objectContaining({ status: 'FailFallible', txId: 'id0', txHash: '0xdeploy', blockHeight: 7, blockHash: '0xb7' }));
+        expect(data).toEqual(expect.objectContaining({ status: 'FailFallible', txId: 'id0', txHash: 'de01', blockHeight: 7, blockHash: '0xb7' }));
+    });
+
+    it('watchForDeployTxData falls back to the stored hash while the ledger hash is unknown', async () => {
+        const { apiPublicDataProvider } = await importProvider();
+        const deploy = { txHash: '0xdeploy', ledgerTxHash: null, blockHeight: 7, blockHash: '0xb7', status: 'SUCCESS', failedSegments: [], identifiers: ['id0'], txId: 'id0' };
+        const provider: any = apiPublicDataProvider({ client: fakeClient({ contractDeploy: vi.fn(async () => deploy) }), ledger, runtime, pollMs: 1 });
+        expect(await provider.watchForDeployTxData(ADDRESS)).toEqual(expect.objectContaining({ txHash: '0xdeploy' }));
     });
 
     it('gives up waiting after watchTimeoutMs', async () => {

@@ -31,7 +31,7 @@ export interface IndexerSupplementConfig {
     url: string;
     batchSize: number;
     intervalMs: number;
-    /** Distance to the indexed tip, because the indexer is behind the node. */
+    /** Distance to the indexed tip. A block the indexer has not reached yet is retried either way. */
     lagBlocks: number;
     requestTimeoutMs: number;
     /** Indexer requests per second, one block per request. 0 or unset means no limit. */

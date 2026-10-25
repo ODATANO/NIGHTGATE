@@ -152,7 +152,8 @@ export class MidnightCrawler {
     /** Neither pass blocks indexing, and a failure in either leaves the indexed blocks untouched. */
     private async startTrailingPasses(): Promise<void> {
         if (this.config.decodePayloads) {
-            this.decoder = new LedgerPayloadDecoder({ batchSize: 25, intervalMs: 1000, lagBlocks: 10, decode: decodeLedgerPayloadInWorker });
+            // The crawler stores only finalized blocks, so the pass can decode up to the indexed tip.
+            this.decoder = new LedgerPayloadDecoder({ batchSize: 25, intervalMs: 1000, lagBlocks: 0, decode: decodeLedgerPayloadInWorker });
             await this.decoder.init(this.db);
             this.decoder.start();
             log.info('Ledger payload decoding enabled (trailing pass)');
@@ -165,7 +166,8 @@ export class MidnightCrawler {
                     url: this.config.indexerUrl,
                     batchSize: 25,
                     intervalMs: 1000,
-                    lagBlocks: 10,
+                    // A block the indexer has not reached yet is retried on the next run, so no fixed distance.
+                    lagBlocks: 0,
                     requestTimeoutMs: this.config.requestTimeout,
                     maxBlocksPerSecond: this.config.supplementBlocksPerSecond,
                     contractState: contractStatePolicy(this.config.contractStateHistory, this.config.contractStateWatch)

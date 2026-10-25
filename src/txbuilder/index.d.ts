@@ -336,7 +336,7 @@ export interface LandedProbeResult {
     failedSegments: number[];
     /** false means the transaction is in a block but its call failed. The fee was still spent. */
     applied: boolean;
-    /** The transaction hash, when the answer came from a NIGHTGATE server. */
+    /** The ledger transaction hash explorers show, when the answer came from a NIGHTGATE server. */
     txHash?: string;
 }
 

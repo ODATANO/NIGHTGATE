@@ -1,5 +1,5 @@
 /**
- * Background pass that decodes the stored ledger transactions, a few blocks behind the indexed tip.
+ * Background pass that decodes the stored ledger transactions, behind the indexed tip.
  *
  * It reads `Transactions.raw`, which the crawler already stored.
  * To decode blocks again, reset the cursor. Nothing has to be fetched from the chain again.
@@ -32,7 +32,7 @@ export interface LedgerDecoderConfig {
     batchSize: number;
     /** Pause between passes, so other work gets the thread. */
     intervalMs: number;
-    /** Distance to the indexed tip, so a reorg rarely undoes decoded blocks. */
+    /** Distance to the indexed tip. */
     lagBlocks: number;
     /** Decodes one ledger transaction. The crawler passes the decode worker's method. */
     decode: (payload: Uint8Array) => Promise<LedgerPayloadFacts>;

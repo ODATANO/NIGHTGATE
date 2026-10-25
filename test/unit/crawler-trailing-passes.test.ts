@@ -1220,6 +1220,17 @@ describe('contract state storage', () => {
             expect(snap).toEqual(expect.objectContaining({ source: 'indexer', height: 12, verified: null }));
         });
 
+        it('asks the indexer for the current state while a newer action is not supplemented', async () => {
+            await supplyBlocks({ 10: [{ address: CONTRACT, state: 's10' }] });
+            await storeParams(10);
+            await seedCalls(12, [CONTRACT]);
+            const fetchState = vi.fn(async () => fetched(b64('s12')));
+            const snap = await contractStateAt(db, CONTRACT, null, fetchState);
+            expect(fetchState).toHaveBeenCalledWith(CONTRACT, null);
+            expect(snap).toEqual(expect.objectContaining({ source: 'indexer', height: 12, verified: null }));
+            expect(text(snap!.state)).toBe('s12');
+        });
+
         it('asks the indexer above the indexed tip and leaves it unverified', async () => {
             await supplyBlocks(twoStates);
             await setSync({ lastIndexedHeight: 12 });

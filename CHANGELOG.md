@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.36.2 - 2026-10-25
+
+### Fixes
+
+- `Transactions/byIdentifier` finds a transaction seconds after its block is
+  finalized. The decode pass no longer trails the indexed tip by ten blocks;
+  the crawler stores only finalized blocks.
+- The indexer supplement no longer trails by ten blocks. A block the indexer
+  has not reached yet is retried on the next run.
+- `ContractStates/stateAt` without a height asks the indexer when the crawler
+  holds a newer action of the contract than the stored state.
+- `@odatano/nightgate-tx` 0.14.3: `probeLanded({ api })` and the API
+  provider's `watchForDeployTxData` return the ledger transaction hash as
+  `txHash`, the hash explorers show.
+
 ## 0.36.1 - 2026-10-24
 
 ### Fixes

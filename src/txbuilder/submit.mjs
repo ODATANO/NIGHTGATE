@@ -267,7 +267,7 @@ async function probeLandedOnApi(identifier, api) {
     // The server knows the transaction before its result; without the result nothing is settled.
     if (!found || found.status == null || found.blockHeight == null) return null;
     const failedSegments = Array.isArray(found.failedSegments) ? found.failedSegments.map(Number) : [];
-    return { height: String(found.blockHeight), status: String(found.status), failedSegments, applied: found.status === 'SUCCESS', txHash: found.hash };
+    return { height: String(found.blockHeight), status: String(found.status), failedSegments, applied: found.status === 'SUCCESS', txHash: found.ledgerTxHash ?? undefined };
 }
 
 /**
