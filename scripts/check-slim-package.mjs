@@ -183,6 +183,18 @@ async function main() {
         const out = execFileSync(process.execPath, [probeMjs], { cwd: probeRoot, encoding: 'utf8' }).trim();
         if (!out.includes('install-probe ok')) bad('real-install probe: unexpected output ' + out);
         else ok('real-install probe: all entry points import from a clean npm install, proof provider loads');
+
+        // Two copies of a Midnight package break instanceof checks between them.
+        const tree = JSON.parse(execFileSync('npm', ['ls', '--all', '--json'], { cwd: probeRoot, encoding: 'utf8', shell: process.platform === 'win32', maxBuffer: 64 * 1024 * 1024 }));
+        const versions = new Map();
+        const walk = (deps = {}) => Object.entries(deps).forEach(([name, d]) => {
+            if (/^@midnight-?ntwrk\//.test(name) && d.version) versions.set(name, (versions.get(name) ?? new Set()).add(d.version));
+            walk(d.dependencies);
+        });
+        walk(tree.dependencies);
+        const dupes = [...versions].filter(([, v]) => v.size > 1).map(([n, v]) => `${n} (${[...v].join(', ')})`);
+        if (dupes.length) bad('real-install probe: Midnight packages installed in more than one version: ' + dupes.join('; '));
+        else ok(`real-install probe: ${versions.size} Midnight packages, one version each`);
     } catch (e) {
         bad('real-install probe failed: ' + String(e.stderr || e.message).split(/\r?\n/).slice(-6).join(' '));
     } finally {

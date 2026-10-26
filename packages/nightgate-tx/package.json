@@ -1,6 +1,6 @@
 {
     "name": "@odatano/nightgate-tx",
-    "version": "0.15.0",
+    "version": "0.15.1",
     "description": "NIGHTGATE client SDK: drive a hosted NIGHTGATE (ZK attestations, verification, disclosure, fee sponsoring) and build transactions locally with your own key.",
     "license": "Apache-2.0",
     "author": "ODATANO",
@@ -88,6 +88,7 @@
         "@midnight-ntwrk/midnight-js-network-id": "4.1.1",
         "@midnight-ntwrk/midnight-js-node-zk-config-provider": "4.1.1",
         "@midnight-ntwrk/midnight-js-types": "4.1.1",
+        "@midnight-ntwrk/onchain-runtime-v3": "3.0.0",
         "@midnight-ntwrk/wallet-sdk-address-format": "npm:@midnightntwrk/wallet-sdk-address-format@^3.1.2",
         "@midnight-ntwrk/zkir-v2": "2.1.0",
         "@midnightntwrk/wallet-sdk-abstractions": "^2.1.0",

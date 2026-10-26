@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.37.1 - 2026-10-26
+
+### Fixes
+
+- `@odatano/nightgate-tx` 0.15.1: pins `@midnight-ntwrk/onchain-runtime-v3`
+  3.0.0. A fresh install no longer gets a second copy of the runtime, which
+  failed every build with `expected instance of StateValue`.
+- `check:slim` fails when the clean install holds a Midnight package in more
+  than one version.
+
 ## 0.37.0 - 2026-10-25
 
 ### Changes
