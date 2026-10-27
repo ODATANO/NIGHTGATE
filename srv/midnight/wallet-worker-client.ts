@@ -9,6 +9,7 @@ import { Worker, MessageChannel } from 'node:worker_threads';
 import path from 'node:path';
 import type { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
 import type { MerkleProofBundle } from '../submission/contract-witnesses';
+import type { ContractCircuitRules } from '../submission/sponsor-policy';
 import { errorName, formatErr } from '../utils/format-error';
 import { nightgateErrorFromPayload, errorMessage, NightgateError } from '../utils/errors';
 import { isSubmittingMethod, WORKER_ROTATING, WORKER_ROTATED, WorkerSubmitError, isSubmitFailureCode } from './wallet-worker-protocol';
@@ -969,6 +970,8 @@ export function walletSponsorFinalizedTx(args: {
     networkId: WalletSubmitContractCallArgs['networkId'];
     allowedContracts?: string[];
     allowedCircuits?: string[];
+    /** Replaces `allowedCircuits` for calls on the listed contracts. */
+    contractCircuits?: ContractCircuitRules;
     /** Both the server rules and the grant allow a contract deploy in this tx. */
     allowDeploy?: boolean;
     /** Contracts deployed under this grant. Calls on them skip `allowedCircuits`. */
@@ -1034,6 +1037,8 @@ export function walletSponsorUnboundTx(args: {
     networkId: WalletSubmitContractCallArgs['networkId'];
     allowedContracts?: string[];
     allowedCircuits?: string[];
+    /** Replaces `allowedCircuits` for calls on the listed contracts. */
+    contractCircuits?: ContractCircuitRules;
     /** Both the server rules and the grant allow a contract deploy in this tx. */
     allowDeploy?: boolean;
     /** Contracts deployed under this grant. Calls on them skip `allowedCircuits`. */

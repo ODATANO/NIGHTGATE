@@ -764,3 +764,28 @@ describe('ownContracts: circuits of a grant-deployed contract are sponsorable un
         expect(() => workerExports.checkSponsorableShape(t, 5000, [], [], { ownContracts: [OWN] })).toThrow(/over the 1000B budget/);
     });
 });
+
+describe('contractCircuits: a circuit rule per contract replaces the global list', () => {
+    const X = 'dd'.repeat(32);
+    const Y = 'aa'.repeat(32);
+    const call = (address: string, circuit: string) => tx([{ actions: [CALL(address, circuit)], guaranteedUnshieldedOffer: null, dustActions: null }]);
+    it('"*" sponsors a circuit off the global list on that contract only', () => {
+        const rules = { [X]: '*' };
+        expect(workerExports.checkSponsorableShape(call(X, 'placeOrder'), 5000, [X, Y], ['attest'], { contractCircuits: rules }))
+            .toEqual([{ address: X, entryPoint: 'placeOrder' }]);
+        expect(() => workerExports.checkSponsorableShape(call(Y, 'placeOrder'), 5000, [X, Y], ['attest'], { contractCircuits: rules }))
+            .toThrow(/circuit 'placeOrder' is not sponsorable on contract aaaaaaaaaaaaaaaa/);
+    });
+    it('a list is exact: a global circuit outside it is refused on that contract, an empty list refuses every call', () => {
+        expect(workerExports.checkSponsorableShape(call(X, 'a'), 5000, [X], ['attest'], { contractCircuits: { [X]: ['a'] } }))
+            .toEqual([{ address: X, entryPoint: 'a' }]);
+        expect(() => workerExports.checkSponsorableShape(call(X, 'attest'), 5000, [X], ['attest'], { contractCircuits: { [X]: ['a'] } }))
+            .toThrow(/not sponsorable/);
+        expect(() => workerExports.checkSponsorableShape(call(X, 'attest'), 5000, [X], [], { contractCircuits: { [X]: [] } }))
+            .toThrow(/not sponsorable/);
+    });
+    it('the rule never widens the contract list', () => {
+        expect(() => workerExports.checkSponsorableShape(call(X, 'a'), 5000, [Y], [], { contractCircuits: { [X]: '*' } }))
+            .toThrow(/not in the allow-list/);
+    });
+});

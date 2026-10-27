@@ -116,6 +116,13 @@ service NightgateAdminService {
         gc            : { count: Integer; totalMs: Integer; byKind: String }; // byKind is JSON: count and ms per GC kind
     };
 
+    /** The circuits sponsored on one contract instead of `allowedCircuits`. */
+    type ContractCircuitRule {
+        contract    : String;
+        allCircuits : Boolean;          // true = every circuit of the contract
+        circuits    : array of String;  // empty when allCircuits
+    };
+
     /**
      * Shows what the fee sponsor may pay for. `floor` holds the platform lists.
      * With `grantId`, `effective` holds what the grant may use. `effectiveError` says why it may use nothing.
@@ -129,6 +136,7 @@ service NightgateAdminService {
         floor          : {
             allowedContracts   : array of String; // empty = any
             allowedCircuits    : array of String; // empty = any
+            contractCircuits   : array of ContractCircuitRule;
             allowedTokenTypes  : array of String; // empty = none
             allowDeploy        : Boolean;
             allowContractMints : Boolean;
@@ -150,6 +158,7 @@ service NightgateAdminService {
         effective      : {
             allowedContracts   : array of String;
             allowedCircuits    : array of String;
+            contractCircuits   : array of ContractCircuitRule;
             allowedTokenTypes  : array of String;
             ownContracts       : array of String;
             ownTokenTypes      : array of String;

@@ -475,14 +475,22 @@ reach this endpoint can make you pay fees.
   SPONSOR_POLICY_UNAVAILABLE` while the policy file is unreadable); a grant
   without lists is always written.
 - **Policy file (platform floor).** `NIGHTGATE_SPONSOR_POLICY_FILE` = JSON
-  `{ "allowedContracts": [...], "allowedCircuits": [...], "allowDeploy": false,
-  "allowedTokenTypes": [...], "allowContractMints": false, "allowSwaps":
-  false, "shareMintedTokenTypes": false }`, re-read per
+  `{ "allowedContracts": [...], "allowedCircuits": [...], "contractCircuits":
+  { "<address>": "*" }, "allowDeploy": false, "allowedTokenTypes": [...],
+  "allowContractMints": false, "allowSwaps": false, "shareMintedTokenTypes":
+  false }`, re-read per
   sponsored call (mtime cache), replaces the env settings (a WARN names the
   ones that are set and ignored). Fail-closed: an invalid file keeps the last
   good policy; with none loaded every sponsored call is
   `503 SPONSOR_POLICY_UNAVAILABLE`. Admin `getSponsorPolicy(grantId?)` shows
   the policy in force.
+- **Circuits per contract.** Policy-file `contractCircuits` maps a contract
+  address (64 hex) to `"*"` (every circuit of it) or a list of circuit names.
+  The entry replaces `allowedCircuits` for calls on that contract and allows
+  the contract without a second entry in `allowedContracts`. A grant's
+  `allowedCircuits` narrows every rule; a grant list that only a rule names is
+  accepted, and the grant then reaches the ruled contracts only. File only,
+  no env setting.
 - **Sponsored deploys.** `createAgentGrant(..., allowDeploy: true,
   maxDeploys?)` lets the sponsor pay a deploy the caller built and signed
   (txbuilder `buildDeploySponsorable`). Requires the floor
@@ -1064,7 +1072,7 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 
 `getJobStats(windowHours?) → { windowHours, since, total, byStatus[], topErrors[], oldestQueuedSeconds }`: counts per status and the ten most frequent error codes over `windowHours` (default 24, max 720).
 
-`getSponsorPolicy(grantId?) → { source, path, loadedAt, ignoredEnv[], floor, floorError, grant, effective, effectiveError }`: the platform sponsor policy (`source` `file` or `env`, `loadedAt` of the policy file, `ignoredEnv` = env settings the file replaces), and with `grantId` the grant's lists, its `deployedContracts` and `mintedTokenTypes`, and what is left of them (`effective`, with `ownContracts` and `ownTokenTypes`), or why nothing is (`effectiveError`). Unknown grant 404.
+`getSponsorPolicy(grantId?) → { source, path, loadedAt, ignoredEnv[], floor, floorError, grant, effective, effectiveError }`: the platform sponsor policy (`source` `file` or `env`, `loadedAt` of the policy file, `ignoredEnv` = env settings the file replaces), and with `grantId` the grant's lists, its `deployedContracts` and `mintedTokenTypes`, and what is left of them (`effective`, with `ownContracts` and `ownTokenTypes`), or why nothing is (`effectiveError`). `floor` and `effective` list the per-contract circuit rules as `contractCircuits[{ contract, allCircuits, circuits }]`. Unknown grant 404.
 
 `redecodeFromHeight(height) → { fromHeight, previousDecodedHeight, blocks, changed }`: moves the ledger payload decode cursor (`SyncState.lastDecodedHeight`) to just below `height`, so the decode pass (`crawler.decodePayloads`) replays every indexed block from there and rewrites what it reads from the payloads: `txType` of call-free transactions, `isShielded`, `hasProof`, the zswap and DUST counts, `identifiers`, circuit names. A regular transaction whose payload does not decode ends with `isShielded` / `hasProof` `null`. The cursor is only lowered: `changed` is `false` when it already stood below `height`; `blocks` counts the indexed blocks from `height` to the tip. Runs under the reorg lock, so a pass in flight drops its own cursor write.
 

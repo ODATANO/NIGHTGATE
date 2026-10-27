@@ -147,6 +147,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     const policyArgs = (policy: SponsorPolicy) => ({
         allowedContracts: policy.allowedContracts,
         allowedCircuits: policy.allowedCircuits,
+        contractCircuits: policy.contractCircuits,
         allowDeploy: policy.allowDeploy === true,
         ownContracts: policy.ownContracts,
         allowedTokenTypes: policy.allowedTokenTypes,

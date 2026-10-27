@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.37.2 - 2026-10-27
+
+### Changes
+
+- Policy file `contractCircuits`: a contract address mapped to `"*"` or a
+  list of circuit names. The entry replaces `allowedCircuits` for calls on
+  that contract and allows the contract without a second entry in
+  `allowedContracts`. A grant's `allowedCircuits` narrows every rule; a grant
+  list that only a rule names is accepted and reaches the ruled contracts only.
+- Admin `getSponsorPolicy`: `floor.contractCircuits` and
+  `effective.contractCircuits` (`contract`, `allCircuits`, `circuits`).
+- The refusal of a circuit outside the rules names the contract.
+
 ## 0.37.1 - 2026-10-26
 
 ### Fixes

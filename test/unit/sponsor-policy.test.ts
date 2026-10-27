@@ -21,6 +21,7 @@ vi.mock('../../srv/submission/learned-token-types', () => ({
 import {
     validatePolicyList,
     validateTokenTypeList,
+    validateContractCircuits,
     effectiveSponsorPolicy,
     getGlobalSponsorPolicy,
     resolveSponsorPolicyForRequest,
@@ -505,5 +506,59 @@ describe('mintedTokenTypes: what a grant minted counts as listed for it', () => 
 
     it('is absent without a grant', () => {
         expect(effectiveSponsorPolicy(floor).ownTokenTypes).toBeUndefined();
+    });
+});
+
+describe('contractCircuits: a circuit rule per contract', () => {
+    const X = 'ab'.repeat(32);
+    const Y = 'cd'.repeat(32);
+    const floor = { allowedContracts: ['A', X], allowedCircuits: ['attest'], contractCircuits: { [X]: ['placeOrder', 'cancelOrder'] } };
+
+    it('policy file: keys lowercased 64 hex, values "*" or a non-empty list; a ruled contract is allowed without a second entry', () => {
+        const file = path.join(tmpDir, 'policy.json');
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        fs.writeFileSync(file, JSON.stringify({ allowedContracts: ['A'], allowedCircuits: ['attest'], contractCircuits: { [X.toUpperCase()]: '*', [Y]: ['placeOrder'] } }));
+        const policy = getGlobalSponsorPolicy();
+        expect(policy.contractCircuits).toEqual({ [X]: '*', [Y]: ['placeOrder'] });
+        expect(policy.allowedContracts).toEqual(['A', X, Y]);
+        for (const bad of [{ [X]: ['*'] }, { [X]: [] }, { short: '*' }, { [X]: 'attest' }, [X]]) {
+            fs.writeFileSync(file, JSON.stringify({ contractCircuits: bad }));
+            __resetSponsorPolicyForTests();
+            expect(() => getGlobalSponsorPolicy()).toThrow(SponsorPolicyUnavailableError);
+        }
+    });
+    it('validateContractCircuits names the fault', () => {
+        expect(validateContractCircuits('contractCircuits', undefined)).toBeUndefined();
+        expect(() => validateContractCircuits('contractCircuits', { [X]: ['*'] })).toThrow(/use "\*" as the value/);
+        expect(() => validateContractCircuits('contractCircuits', { nope: '*' })).toThrow(/not a contract address/);
+        expect(() => validateContractCircuits('contractCircuits', { [X]: [] })).toThrow(/non-empty array/);
+        expect(() => validateContractCircuits('contractCircuits', { [X]: '*', [X.toUpperCase()]: '*' })).toThrow(/twice/);
+    });
+    it('an empty allowedContracts stays "every contract" with rules present', () => {
+        const file = path.join(tmpDir, 'policy.json');
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        fs.writeFileSync(file, JSON.stringify({ contractCircuits: { [X]: '*' } }));
+        expect(getGlobalSponsorPolicy().allowedContracts).toEqual([]);
+    });
+    it('a grant without a circuit list inherits the rules; a grant list narrows "*" to itself and a list to the overlap', () => {
+        expect(effectiveSponsorPolicy(floor).contractCircuits).toEqual(floor.contractCircuits);
+        expect(effectiveSponsorPolicy({ allowedContracts: [], allowedCircuits: [] }).contractCircuits).toBeUndefined();
+        const narrowed = effectiveSponsorPolicy({ ...floor, contractCircuits: { [X]: '*', [Y]: ['a', 'b'] } }, { allowedCircuits: ['attest', 'a'] });
+        expect(narrowed.allowedCircuits).toEqual(['attest']);
+        expect(narrowed.contractCircuits).toEqual({ [X]: ['attest', 'a'], [Y]: ['a'] });
+    });
+    it('a grant list off the global list is valid when a rule names it; only the ruled contracts stay callable', () => {
+        const e = effectiveSponsorPolicy(floor, { allowedCircuits: ['placeOrder'] });
+        expect(e.allowedContracts).toEqual([X]);
+        expect(e.allowedCircuits).toEqual(['placeOrder']);
+        expect(e.contractCircuits).toEqual({ [X]: ['placeOrder'] });
+        expect(grantPolicyConflict(floor, { allowedCircuits: ['placeOrder'] })).toBeNull();
+        expect(effectiveSponsorPolicy({ ...floor, allowedContracts: [] }, { allowedCircuits: ['placeOrder'] }).allowedContracts).toEqual([X]);
+        expect(() => effectiveSponsorPolicy(floor, { allowedCircuits: ['mint'] })).toThrow(SponsorPolicyEmptyError);
+        expect(() => effectiveSponsorPolicy(floor, { allowedContracts: ['A'], allowedCircuits: ['placeOrder'] })).toThrow(SponsorPolicyEmptyError);
+    });
+    it('a grant on a ruled contract alone is accepted; deployed contracts still join', () => {
+        expect(grantPolicyConflict(floor, { allowedContracts: [X] })).toBeNull();
+        expect(effectiveSponsorPolicy(floor, { allowedContracts: [X], deployedContracts: ['NEW'] }).allowedContracts).toEqual([X, 'NEW']);
     });
 });

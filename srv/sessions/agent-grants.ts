@@ -575,6 +575,9 @@ function policyView(p: SponsorPolicy): NonNullable<SponsorPolicyDescription['eff
     return {
         allowedContracts: p.allowedContracts,
         allowedCircuits: p.allowedCircuits,
+        contractCircuits: Object.entries(p.contractCircuits ?? {}).map(([contract, rule]) => ({
+            contract, allCircuits: rule === '*', circuits: rule === '*' ? [] : rule
+        })),
         allowedTokenTypes: p.allowedTokenTypes ?? [],
         ownContracts: p.ownContracts ?? [],
         ownTokenTypes: p.ownTokenTypes ?? [],

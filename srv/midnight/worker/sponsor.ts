@@ -13,6 +13,7 @@ import { SponsorRefusalError } from '../submit-error-classification';
 import { formatErr } from '../../utils/format-error';
 import { getSharedKeyMaterialProvider } from '../wasm-proof-provider';
 import { type MerkleProofBundle } from '../../submission/contract-witnesses';
+import { type ContractCircuitRules } from '../../submission/sponsor-policy';
 import { type MessagePort } from 'node:worker_threads';
 import { FacadeEntry, ensureNetworkId, facades, loadContractsSdk, loadDustCoreWallet, loadProvingSdk, loadSdk, log, resolveProvingMode, loadLedger } from './context';
 import { artifactAssetPath } from './artifacts';
@@ -342,6 +343,8 @@ export function checkSponsorableShape(
     allowedCircuits?: string[],
     options: {
         allowDeploy?: boolean; maxDeploys?: number; ownContracts?: string[]; allowedTokenTypes?: string[]; nightTokenType?: string;
+        /** Replaces `allowedCircuits` for calls on the listed contracts. */
+        contractCircuits?: ContractCircuitRules;
         /** Set both to also pay for tokens the calls mint. */
         allowContractMints?: boolean; deriveTokenType?: (domainSeparatorHex: string, contractAddress: string) => string;
     } = {}
@@ -420,8 +423,12 @@ export function checkSponsorableShape(
                 throw new SponsorRefusalError(`refusing to sponsor: contract ${address.slice(0, 16)} is not in the allow-list`);
             }
             const own = Array.isArray(options.ownContracts) && options.ownContracts.includes(address);
-            if (!own && allowedCircuits?.length && !allowedCircuits.includes(name)) {
-                throw new SponsorRefusalError(`refusing to sponsor: circuit '${name}' is not sponsorable`);
+            const rule = options.contractCircuits?.[address];
+            const circuitSponsorable = rule !== undefined
+                ? rule === '*' || rule.includes(name)
+                : !allowedCircuits?.length || allowedCircuits.includes(name);
+            if (!own && !circuitSponsorable) {
+                throw new SponsorRefusalError(`refusing to sponsor: circuit '${name}' is not sponsorable on contract ${address.slice(0, 16)}`);
             }
             calls.push({ address, entryPoint: name });
         }
@@ -641,7 +648,7 @@ export async function buildSponsorableTx(args: {
 /** Checks a caller's finalized tx against the sponsor rules, pays its fee and sends it. */
 export async function sponsorFinalizedTx(args: {
     sponsorSessionId: string; finalizedTxB64: string; networkId: string;
-    allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean; ownContracts?: string[]; allowedTokenTypes?: string[]; allowContractMints?: boolean;
+    allowedContracts?: string[]; allowedCircuits?: string[]; contractCircuits?: ContractCircuitRules; allowDeploy?: boolean; ownContracts?: string[]; allowedTokenTypes?: string[]; allowContractMints?: boolean;
     /** Set by the dispatcher. Used to announce the tx before sending it. */
     __replyPort?: MessagePort;
 }) {
@@ -651,7 +658,7 @@ export async function sponsorFinalizedTx(args: {
     await ensureNetworkId(args.networkId, sdk);
     const { tx, bytes } = await deserializeFinalizedTx(args.finalizedTxB64);
 
-    const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw, allowContractMints: args.allowContractMints === true, deriveTokenType: tokenTypeDeriver(sdk.ledger) });
+    const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, contractCircuits: args.contractCircuits, allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw, allowContractMints: args.allowContractMints === true, deriveTokenType: tokenTypeDeriver(sdk.ledger) });
     log('info', `sponsorFinalizedTx: paying dust for ${calls.map(c => c.entryPoint).join('+')} (${bytes.length}B)`);
     const minted = mintedTypesOf(tx, args.allowContractMints, sdk.ledger);
     const txId = await sponsorAndSubmitFinalized(sponsor, tx, 'sponsor-endpoint', args.__replyPort, calls, minted);
@@ -722,7 +729,7 @@ export async function sponsorUnboundTx(args: {
     sponsorSessionId: string; unboundTxB64?: string; networkId: string;
     /** The two halves of a shielded swap, used instead of one caller tx. */
     swap?: { makerHalfB64: string; takerHalfB64: string }; allowSwaps?: boolean;
-    allowedContracts?: string[]; allowedCircuits?: string[]; allowDeploy?: boolean; ownContracts?: string[]; allowedTokenTypes?: string[]; allowContractMints?: boolean;
+    allowedContracts?: string[]; allowedCircuits?: string[]; contractCircuits?: ContractCircuitRules; allowDeploy?: boolean; ownContracts?: string[]; allowedTokenTypes?: string[]; allowContractMints?: boolean;
     /** Set by the dispatcher. Used to announce the tx before sending it. */
     __replyPort?: MessagePort;
 }) {
@@ -755,7 +762,7 @@ export async function sponsorUnboundTx(args: {
     } else {
         const deserialized = await deserializeFinalizedTx(String(args.unboundTxB64 ?? ''));
         callerTx = deserialized.tx;
-        calls = checkSponsorableShape(callerTx, deserialized.bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw, allowContractMints: args.allowContractMints === true, deriveTokenType: tokenTypeDeriver(sdk.ledger) });
+        calls = checkSponsorableShape(callerTx, deserialized.bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, contractCircuits: args.contractCircuits, allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw, allowContractMints: args.allowContractMints === true, deriveTokenType: tokenTypeDeriver(sdk.ledger) });
     }
     const minted = swap ? [] : mintedTypesOf(callerTx, args.allowContractMints, sdk.ledger);
     const contractAddress = calls[0]?.address || undefined;
