@@ -274,10 +274,21 @@ export async function createSwapWallet(opts) {
 
         maxInputs,
 
-        /** Balance per token type, in the smallest unit. */
+        /** Balance of the free coins per token type, in the smallest unit. */
         async balances() {
             const state = await latest(wallet.state, 'wallet state');
             return Object.fromEntries(Object.entries(state?.balances ?? {}).map(([t, v]) => [String(t).toLowerCase(), BigInt(v)]));
+        },
+
+        /** Per token type, what the halves built here bring back once their swaps land: change and wanted coins. Listed until the swap lands or `revert()`. */
+        async pendingBalances() {
+            const state = await latest(wallet.state, 'wallet state');
+            const pending = {};
+            for (const { coin } of state?.pendingCoins ?? []) {
+                const type = String(coin.type).toLowerCase();
+                pending[type] = (pending[type] ?? 0n) + BigInt(coin.value);
+            }
+            return pending;
         },
 
         /** The unreserved coins, smallest first. */

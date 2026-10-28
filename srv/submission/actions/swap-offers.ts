@@ -10,6 +10,8 @@ import { transactionBytesOf } from '../../utils/offer-file';
 import { walletDescribeSwapHalf } from '../../midnight/wallet-worker-client';
 import { isSwapOfferOpen, loadSwapOffer, closeSwapOffer, effectiveSwapOfferStatus, type SwapOfferStatus } from '../swap-offers';
 import { parseJsonStringList } from '../../utils/json-list';
+import { LONG_POLL_MAX_MS, holdUntil, waiterPool } from '../../utils/long-poll';
+import { runWithoutAmbientTx } from '../background-jobs';
 import { checkRate, runSubmission } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_RE } from '../../utils/hex';
@@ -25,6 +27,8 @@ const MAX_TAG_CHARS = 40;
 const MAX_EXPIRY_MS = 90 * 24 * 60 * 60 * 1000;
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 200;
+/** The listSwapOffers calls holding for an offer. */
+export const boardWaiters = waiterPool(100);
 
 type StatusFilter = SwapOfferStatus | 'all';
 const STATUS_FILTERS: ReadonlySet<string> = new Set(['open', 'filled', 'retired', 'expired', 'all']);
@@ -115,7 +119,7 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
     srv.on(listSwapOffers, async (req) => {
         if (!checkRate('read', 'read', req)) return;
-        const { givesType, wantsType, tag, limit, status, since, mine } = req.data;
+        const { givesType, wantsType, tag, limit, status, since, mine, waitMs } = req.data;
         const where: Record<string, unknown> = {};
         for (const [name, value] of [['givesType', givesType], ['wantsType', wantsType]] as const) {
             if (value === undefined || value === null || value === '') continue;
@@ -133,13 +137,15 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             if (!Number.isFinite(ms)) return req.reject(400, 'since must be an ISO timestamp');
             sinceIso = new Date(ms).toISOString();
         }
+        if (waitMs != null && !(Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= LONG_POLL_MAX_MS)) {
+            return req.reject(400, `waitMs must be an integer from 0 to ${LONG_POLL_MAX_MS}`);
+        }
         if (mine === true) Object.assign(where, posterOf(req));
         const wantTag = tag ? String(tag).trim() : '';
-        const now = new Date();
-        const nowIso = now.toISOString();
+
         // Expiry is checked in the query. Listing never writes the expired status,
         // so the limit counts only matching offers.
-        const offers = () => {
+        const offers = (nowIso: string) => {
             const q = SELECT.from(SwapOffers).where(where);
             if (statusFilter === 'open') q.where({ status: 'open' }).and('expiresAt is null or expiresAt >', nowIso);
             else if (statusFilter === 'expired') q.where("status = 'expired' or (status = 'open' and expiresAt <=", nowIso, ')');
@@ -148,28 +154,38 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             if (sinceIso) q.where('modifiedAt >', sinceIso, "or (status = 'open' and expiresAt <=", nowIso, 'and expiresAt >', sinceIso, ')');
             return q.orderBy(statusFilter === 'open' ? 'createdAt desc' : 'modifiedAt desc');
         };
-        if (!wantTag) {
-            const rows: SwapOffer[] = await db.run(offers().limit(n)) ?? [];
-            return rows.map(row => publicView(row, now));
-        }
-        // Tags are stored as JSON, so the query cannot filter them.
-        // Page through IDs and tags until enough offers match, then load only those offers.
-        const ids: string[] = [];
-        const page = MAX_LIST_LIMIT * 4;
-        for (let offset = 0; ids.length < n; offset += page) {
-            const heads: Array<Pick<SwapOffer, 'ID' | 'tags'>> = await db.run(
-                offers().columns('ID', 'tags').limit(page, offset)
-            ) ?? [];
-            for (const h of heads) {
-                if (parseJsonStringList(h.tags).includes(wantTag)) ids.push(h.ID);
-                if (ids.length >= n) break;
+        const load = async (now: Date): Promise<SwapOffer[]> => {
+            const nowIso = now.toISOString();
+            if (!wantTag) return (await db.run(offers(nowIso).limit(n)) as SwapOffer[] | undefined) ?? [];
+            // Tags are stored as JSON, so the query cannot filter them.
+            // Page through IDs and tags until enough offers match, then load only those offers.
+            const ids: string[] = [];
+            const page = MAX_LIST_LIMIT * 4;
+            for (let offset = 0; ids.length < n; offset += page) {
+                const heads = (await db.run(offers(nowIso).columns('ID', 'tags').limit(page, offset)) as Array<Pick<SwapOffer, 'ID' | 'tags'>> | undefined) ?? [];
+                for (const h of heads) {
+                    if (parseJsonStringList(h.tags).includes(wantTag)) ids.push(h.ID);
+                    if (ids.length >= n) break;
+                }
+                if (heads.length < page) break;
             }
-            if (heads.length < page) break;
+            if (ids.length === 0) return [];
+            const rows = (await db.run(SELECT.from(SwapOffers).where({ ID: { in: ids } })) as SwapOffer[] | undefined) ?? [];
+            const order = new Map(ids.map((id, i) => [id, i]));
+            return rows.sort((a, b) => (order.get(a.ID) ?? 0) - (order.get(b.ID) ?? 0));
+        };
+
+        if (!waitMs) {
+            const now = new Date();
+            return (await load(now)).map(row => publicView(row, now));
         }
-        if (ids.length === 0) return [];
-        const rows: SwapOffer[] = await db.run(SELECT.from(SwapOffers).where({ ID: { in: ids } })) ?? [];
-        const order = new Map(ids.map((id, i) => [id, i]));
-        return rows.sort((a, b) => (order.get(a.ID) ?? 0) - (order.get(b.ID) ?? 0)).map(row => publicView(row, now));
+        // Each read runs outside the request's transaction, so a waiting call holds no database connection.
+        const readOnce = async () => {
+            const now = new Date();
+            return { rows: await runWithoutAmbientTx(() => load(now)), now };
+        };
+        const result = await holdUntil(req, waitMs, boardWaiters, await readOnce(), readOnce, r => r.rows.length > 0);
+        return result.rows.map(row => publicView(row, result.now));
     });
 
     srv.on(getSwapOffer, async (req) => {

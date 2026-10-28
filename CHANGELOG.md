@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.38.0 - 2026-10-28
+
+### Changes
+
+- `listSwapOffers(…, waitMs)`: holds the call up to 25 s while nothing
+  matches, until an offer matches or the time is up. A poller with
+  `status: 'all'` and `since` makes one call per change instead of one per
+  interval. Reads run in short transactions; past 100 waiting calls the
+  server answers at once. A held call ends as soon as its client disconnects,
+  on `listSwapOffers` and on `getJobStatus`.
+- `@odatano/nightgate-tx` 0.16.0: the swap wallet's `pendingBalances()` sums
+  per token type what the halves built there bring back once their swaps
+  land, the change and the wanted coins. `balances()` stays the free coins.
+
 ## 0.37.2 - 2026-10-27
 
 ### Changes

@@ -109,7 +109,7 @@ describe('createSwapWallet', () => {
     const SEED = 'ab'.repeat(64);
     const URLS = { indexerHttpUrl: 'https://indexer.example/api/v3/graphql', indexerWsUrl: 'wss://indexer.example/api/v3/graphql/ws' };
 
-    function fakeSdk(over: { balances?: Record<string, bigint>; built?: (inputs: any, outputs: any) => any; coins?: Array<{ type: string; value: bigint }>; unprovenInputs?: number } = {}) {
+    function fakeSdk(over: { balances?: Record<string, bigint>; built?: (inputs: any, outputs: any) => any; coins?: Array<{ type: string; value: bigint }>; pendingCoins?: Array<{ type: string; value: bigint }>; unprovenInputs?: number } = {}) {
         const calls: any = { initSwap: [], reverted: [], restored: [], started: 0, stopped: 0, proven: [], picked: [] };
         const coins = over.coins ?? [{ type: A, value: 5000n }, { type: B, value: 5000n }];
         let selection: any;
@@ -126,7 +126,7 @@ describe('createSwapWallet', () => {
             return tx;
         };
         const wallet = {
-            state: { subscribe: (o: any) => { o.next({ balances: over.balances ?? { [A]: 5000n }, availableCoins: coins.map(coin => ({ coin })) }); return { unsubscribe() { /* nothing to release */ } }; } },
+            state: { subscribe: (o: any) => { o.next({ balances: over.balances ?? { [A]: 5000n }, availableCoins: coins.map(coin => ({ coin })), pendingCoins: (over.pendingCoins ?? []).map(coin => ({ coin, ttl: undefined })) }); return { unsubscribe() { /* nothing to release */ } }; } },
             start: vi.fn(async () => { calls.started++; }),
             stop: vi.fn(async () => { calls.stopped++; }),
             getAddress: vi.fn(async () => ownAddress),
@@ -238,6 +238,7 @@ describe('createSwapWallet', () => {
         expect(fresh.calls.started).toBe(1);
         expect(wallet).toMatchObject({ address: 'mn_shield-addr_preprod1own', coinPublicKey: 'c1'.repeat(32), encryptionPublicKey: 'e1'.repeat(32), provingMode: 'wasm' });
         expect(await wallet.balances()).toEqual({ [A]: 5000n });
+        expect(await wallet.pendingBalances()).toEqual({});
         expect(await wallet.serializeState()).toBe('{"saved":true}');
         await wallet.close();
         expect(fresh.calls.stopped).toBe(1);
@@ -246,6 +247,14 @@ describe('createSwapWallet', () => {
         await createSwapWallet({ ...URLS, seedHex: SEED, walletState: '{"saved":true}', sdk: resumed.sdk });
         expect(resumed.calls.restored).toEqual(['{"saved":true}']);
         expect(resumed.factory.startWithSecretKeys).not.toHaveBeenCalled();
+    });
+
+    it('pendingBalances sums the coins the built halves bring back, per token type', async () => {
+        const { createSwapWallet } = await importTxBuilder();
+        const { sdk } = fakeSdk({ coins: [{ type: A, value: 100n }], pendingCoins: [{ type: A.toUpperCase(), value: 1355n }, { type: B, value: 145n }, { type: B, value: 5n }] });
+        const wallet = await createSwapWallet({ ...URLS, seedHex: SEED, sdk });
+        expect(await wallet.balances()).toEqual({ [A]: 5000n });
+        expect(await wallet.pendingBalances()).toEqual({ [A]: 1355n, [B]: 150n });
     });
 
     it('buildHalf: bound with its offer file by default, unbound as base64 only', async () => {

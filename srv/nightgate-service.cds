@@ -772,6 +772,7 @@ service NightgateService {
     /**
      * Lists offers, by default the open ones, newest first.
      * With `status: 'all'` and `since`, polling returns every change since the last call.
+     * With `waitMs` the call holds while nothing matches, until an offer matches or the time is up, so one call replaces many polls.
      */
     function listSwapOffers(givesType: Hex64, // optional
                             wantsType: Hex64, // optional
@@ -779,7 +780,9 @@ service NightgateService {
                             limit: Integer, // optional, default 50, at most 200
                             status: String, // optional, default 'open'; 'filled' | 'retired' | 'expired' | 'all'
                             since: Timestamp, // optional
-                            mine: Boolean)                                    returns array of { // optional; only the caller's own offers
+                            mine: Boolean, // optional; only the caller's own offers
+                            waitMs: Integer // ms; optional, at most 25000; hold the call until there is something to return
+    )                                                                         returns array of {
         offerId      : UUID;
         offer        : LargeString;
         bound        : Boolean; // the half is already sealed
@@ -1284,7 +1287,7 @@ service NightgateService {
 
     action   getJobStatus(jobId: UUID,
                           sessionId: UUID,
-                          waitMs: Integer // ms; optional, at most 25000; wait for succeeded, failed or reconciliation_required
+                          waitMs: Integer // ms; optional, at most 25000; hold the call until there is something to return
     )                                                                         returns {
         jobId               : UUID;
         kind                : String;

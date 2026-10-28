@@ -289,8 +289,15 @@ on one core; a wallet resumed from its saved state (about 5 kB) continues where
 it stopped. The state holds the wallet's coins: store it like a key.
 
 Returns `{ address, coinPublicKey, encryptionPublicKey, provingMode,
-maxInputs, sync, balances, coins, spendable, buildHalf, takeOffer,
-serializeState, close }`.
+maxInputs, sync, balances, pendingBalances, coins, spendable, buildHalf,
+takeOffer, serializeState, close }`.
+
+- `balances()` sums the free coins per token type. `pendingBalances()` sums
+  what the halves built here bring back once their swaps land, the change of
+  the given token and the wanted coins. While a half can still land, the
+  wallet is worth `balances` plus `pendingBalances`; a half can give only from
+  `balances`. A half that will not land keeps its coins reserved and its
+  pending amounts listed until `revert()` returns the inputs to `balances`.
 
 - `buildHalf({ give, want, bind? })` -> `{ offer?, halfB64, bound, terms,
   serializedBytes, revert }`. `bind: true` (default) binds the half and

@@ -494,8 +494,10 @@ export interface SwapWallet {
     /** Resolves once the wallet has caught up with the chain. */
     sync(): Promise<void>;
     maxInputs: number;
-    /** Balance per token type, in the smallest unit. */
+    /** Balance of the free coins per token type, in the smallest unit. */
     balances(): Promise<Record<string, bigint>>;
+    /** Per token type, what the halves built here bring back once their swaps land: change and wanted coins. Listed until the swap lands or `revert()`. */
+    pendingBalances(): Promise<Record<string, bigint>>;
     /** The unreserved coins, smallest first. */
     coins(): Promise<SwapLeg[]>;
     /** The most one half can give of a token type. */

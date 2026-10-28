@@ -6,7 +6,8 @@ import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { attachRuntimeGate } from './utils/runtime-gate';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { registerDocumentProofHandlers } from './submission/document-proof';
-import { getJobById } from './submission/background-jobs';
+import { getJobById, runWithoutAmbientTx } from './submission/background-jobs';
+import { LONG_POLL_MAX_MS, holdUntil, waiterPool } from './utils/long-poll';
 import { contractStateAt, IndexerBudgetExhausted, IndexerBehind, type ContractStateFetcher, type FetchedContractState } from './crawler/contract-state';
 import { fetchContractState } from './crawler/indexer-supplement';
 import { normalizeIdentifier } from './crawler/transaction-identifiers';
@@ -34,34 +35,11 @@ interface TransactionLocation {
     blockHash: string;
 }
 
-const JOB_WAIT_MAX_MS = 25_000;
-const JOB_WAITERS_MAX = 100;
 const JOB_SETTLED = new Set(['succeeded', 'failed', 'reconciliation_required']);
-let jobWaiters = 0;
+const jobWaiters = waiterPool(100);
 
-// Each read runs in its own short transaction, so a waiting call holds no database connection.
-async function readJob(jobId: string): Promise<BackgroundJob | null> {
-    let job: BackgroundJob | null = null;
-    await cds.tx({}, async () => { job = await getJobById(jobId); });
-    return job;
-}
-
-/** Re-reads the job until it settles or `waitMs` is over. Past JOB_WAITERS_MAX waiting calls it answers at once. */
-async function settledJob(job: BackgroundJob, waitMs: number): Promise<BackgroundJob> {
-    if (JOB_SETTLED.has(String(job.status)) || jobWaiters >= JOB_WAITERS_MAX) return job;
-    const deadline = Date.now() + waitMs;
-    let current = job;
-    jobWaiters++;
-    try {
-        while (!JOB_SETTLED.has(String(current.status)) && Date.now() < deadline) {
-            await new Promise(r => setTimeout(r, Math.min(500, deadline - Date.now())));
-            current = (await readJob(job.ID!)) ?? current;
-        }
-    } finally {
-        jobWaiters--;
-    }
-    return current;
-}
+// Each read runs outside the request's transaction, so a waiting call holds no database connection.
+const readJob = (jobId: string): Promise<BackgroundJob | null> => runWithoutAmbientTx(() => getJobById(jobId));
 
 /** The indexed transaction that carries a ledger identifier, newest block first. */
 async function locateByIdentifier(db: cds.DatabaseService, identifier: string): Promise<TransactionLocation | undefined> {
@@ -377,8 +355,8 @@ export default class NightgateService extends cds.ApplicationService {
             const { jobId, sessionId, waitMs } = req.data;
             if (!jobId) return req.reject(400, 'jobId is required');
             if (!sessionId) return req.reject(400, 'sessionId is required');
-            if (waitMs != null && !(Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= JOB_WAIT_MAX_MS)) {
-                return req.reject(400, `waitMs must be an integer from 0 to ${JOB_WAIT_MAX_MS}`);
+            if (waitMs != null && !(Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= LONG_POLL_MAX_MS)) {
+                return req.reject(400, `waitMs must be an integer from 0 to ${LONG_POLL_MAX_MS}`);
             }
 
             let job = await readJob(jobId);
@@ -404,7 +382,10 @@ export default class NightgateService extends cds.ApplicationService {
                 }
             }
 
-            if (waitMs) job = await settledJob(job, waitMs);
+            if (waitMs) {
+                const found = job;
+                job = await holdUntil(req, waitMs, jobWaiters, found, async () => (await readJob(jobId)) ?? found, j => JOB_SETTLED.has(String(j.status)));
+            }
 
             return {
                 jobId: job.ID,

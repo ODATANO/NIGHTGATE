@@ -20,6 +20,7 @@ const cap = cds.test(__dirname + '/../..');
 const workerClient = require('../../srv/midnight/wallet-worker-client');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const offersModule = require('../../srv/submission/swap-offers');
+const boardActions = require('../../srv/submission/actions/swap-offers');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const boardStatusModule = require('../../srv/submission/board-status');
 
@@ -50,7 +51,7 @@ async function post(action: string, body: Record<string, unknown>, headers: Reco
     return cap.axios.post(`${API}/${action}`, body, { headers, validateStatus: () => true });
 }
 async function list(params: Record<string, string | number | boolean | null>, headers: Record<string, string>) {
-    const args = Object.entries({ givesType: null, wantsType: null, tag: null, limit: null, status: null, since: null, mine: null, ...params })
+    const args = Object.entries({ givesType: null, wantsType: null, tag: null, limit: null, status: null, since: null, mine: null, waitMs: null, ...params })
         .map(([k, v]) => `${k}=${v === null ? 'null' : typeof v === 'number' || typeof v === 'boolean' ? v : `'${v}'`}`).join(',');
     return cap.axios.get(`${API}/listSwapOffers(${args})`, { headers, validateStatus: () => true });
 }
@@ -247,6 +248,51 @@ describe('offer board over HTTP', () => {
         expect(ids(await list({ givesType: type, status: 'all', mine: true }, asA)).sort()).toEqual(
             [toFill, stays, expiring].map(r => r.data.offerId).sort());
         expect(ids(await list({ givesType: type, status: 'all', mine: true }, asB))).toEqual([]);
+    });
+
+    it('waitMs holds an empty answer until an offer matches or the time is up; a full one returns at once', async () => {
+        const type = 'e3'.repeat(32);
+        expect((await list({ givesType: type, waitMs: 25001 }, asB)).status).toBe(400);
+        expect((await list({ givesType: type, waitMs: -1 }, asB)).status).toBe(400);
+
+        // nothing matches and nothing arrives: the call returns empty when the time is up
+        let t0 = Date.now();
+        const empty = await list({ givesType: type, status: 'all', since: new Date(Date.now() + 60_000).toISOString(), waitMs: 1200 }, asB);
+        expect(empty.status).toBe(200);
+        expect(empty.data.value).toEqual([]);
+        expect(Date.now() - t0).toBeGreaterThanOrEqual(1100);
+
+        // an offer posted during the wait ends it
+        t0 = Date.now();
+        const waiting = list({ givesType: type, waitMs: 10_000 }, asB);
+        await new Promise(r => setTimeout(r, 700));
+        describeAs({ gives: [type, '1'], wants: [T_CREDIT, '95'], nullifiers: [nullifier(95)] });
+        const posted = await post('postSwapOffer', { offer: halfText(61) }, asA);
+        expect(posted.status).toBe(200);
+        const found = await waiting;
+        expect(found.status).toBe(200);
+        expect(found.data.value.map((o: any) => o.offerId)).toEqual([posted.data.offerId]);
+        expect(Date.now() - t0).toBeLessThan(5000);
+
+        // a non-empty list never waits, with or without waitMs
+        t0 = Date.now();
+        const atOnce = await list({ givesType: type, waitMs: 10_000 }, asB);
+        expect(atOnce.data.value).toHaveLength(1);
+        expect(Date.now() - t0).toBeLessThan(1000);
+        expect((await list({ givesType: type, waitMs: 0 }, asB)).data.value).toHaveLength(1);
+    });
+
+    it('a waiting call whose client disconnects frees its slot at once', async () => {
+        const type = 'e4'.repeat(32);
+        const abort = new AbortController();
+        const gone = cap.axios.get(`${API}/listSwapOffers(givesType='${type}',wantsType=null,tag=null,limit=null,status=null,since=null,mine=null,waitMs=20000)`,
+            { headers: asB, signal: abort.signal, validateStatus: () => true }).then(() => 'answered', () => 'aborted');
+        await new Promise(r => setTimeout(r, 400));
+        expect(boardActions.boardWaiters.count).toBe(1);
+        abort.abort();
+        expect(await gone).toBe('aborted');
+        await new Promise(r => setTimeout(r, 800));
+        expect(boardActions.boardWaiters.count).toBe(0);
     });
 
     it('getBoardStatus counts open and filled offers for an anonymous reader, nothing else', async () => {

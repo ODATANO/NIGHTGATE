@@ -24,7 +24,7 @@ Every submitting action returns `{ jobId, status: "pending" }`; poll `getJobStat
 
 ### `getJobStatus(jobId, sessionId, waitMs?) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, transactionId, transactionHash, chainFinalizedAt, chainBlockHeight, chainBlockHash, chainSegments, … }`
 
-`status`: `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. `waitMs` (at most 25000) holds the call until the job reaches `succeeded`, `failed` or `reconciliation_required` or the time is up, so one call replaces many polls; past 100 waiting calls a server answers at once. `result` is the action's result as a JSON string; on failure `errorCode` + `errorMessage` (see [Error model](#error-model)). `chainBlockHeight` / `chainBlockHash` are the confirmed inclusion coordinates; a reorg rollback reverts by them. An on-chain failure without a block height stays briefly in `reconciliation_required` / `CHAIN_EXECUTION_FAILED_UNCONFIRMED` until the confirmer records the coordinates.
+`status`: `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. `waitMs` (at most 25000) holds the call until the job reaches `succeeded`, `failed` or `reconciliation_required` or the time is up, so one call replaces many polls; past 100 waiting calls a server answers at once, and a call whose client disconnects ends at once. `result` is the action's result as a JSON string; on failure `errorCode` + `errorMessage` (see [Error model](#error-model)). `chainBlockHeight` / `chainBlockHash` are the confirmed inclusion coordinates; a reorg rollback reverts by them. An on-chain failure without a block height stays briefly in `reconciliation_required` / `CHAIN_EXECUTION_FAILED_UNCONFIRMED` until the confirmer records the coordinates.
 
 `transactionId` (same as `txHash`) is the ledger identifier: it exists once the transaction is built and stays the same when a sponsor adds its fee, so it tracks the job. `transactionHash` is the hash explorers show, from the indexed transaction; `null` until the server indexed it. `Transactions/byIdentifier(identifier)` returns the same value as `ledgerTxHash`.
 
@@ -683,7 +683,7 @@ nullifiers lands in a sponsored swap (`filled`), when `expiresAt` passes
 (`expired`), or when the poster retires it. Grantable (`postSwapOffer`), also
 for a platform-pool grant. **Rate class:** `compute`.
 
-### `listSwapOffers(givesType?, wantsType?, tag?, limit?, status?, since?, mine?) → [{ offerId, offer, bound, givesType, givesAmount, wantsType, wantsAmount, tags, expiresAt, postedAt, status, filledTxHash, closedAt, changedAt }]` (function)
+### `listSwapOffers(givesType?, wantsType?, tag?, limit?, status?, since?, mine?, waitMs?) → [{ offerId, offer, bound, givesType, givesAmount, wantsType, wantsAmount, tags, expiresAt, postedAt, status, filledTxHash, closedAt, changedAt }]` (function)
 
 Open offers, newest first; filters are exact (64-hex types), `limit` 1 to 200
 (default 50). `status` reads the closed ones instead: `filled`, `retired`,
@@ -694,8 +694,12 @@ Open offers, newest first; filters are exact (64-hex types), `limit` 1 to 200
 with `status: 'all'` it is the board's change feed. `mine: true` narrows
 to the caller's own posts (a token: its grant's). Never the poster's identity
 or the half's nullifiers. `tags` is an array of strings. Every token may read the board (rate class `read`).
-Call it with all seven parameters, `null` for the unused ones:
-`listSwapOffers(givesType=null,wantsType='…',tag=null,limit=20,status=null,since=null,mine=null)`.
+`waitMs` (0 to 25000) holds the call while nothing matches, until an offer
+matches or the time is up, so a poller with `status: 'all'` and `since` makes
+one call per change instead of one per interval. Reads run in short
+transactions; past 100 waiting calls the server answers at once, and a call
+whose client disconnects ends at once. A parameter left out counts as `null`:
+`listSwapOffers(givesType=null,wantsType='…',tag=null,limit=20,status=null,since=null,mine=null,waitMs=20000)`.
 
 ### `getSwapOffer(offerId) → { offerId, offer, …, status, filledTxHash, closedAt, changedAt }` (function)
 
