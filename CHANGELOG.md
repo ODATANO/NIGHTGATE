@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.39.1 - 2026-10-29
+
+### Fixes
+
+- Shielded addresses decode at their full length. The address format's `parse`
+  leaves the length limit to `@scure/base`, whose 2.4.0 applies the 90-character
+  bech32 default to `decodeToBytes`; a shielded address has 132 characters.
+  `sendNight` to a shielded address, `registerForDustGeneration` with a
+  `dustReceiverAddress` and the builder's `buildTransfer` now decode without a
+  limit (`srv/utils/midnight-address.ts`), in every `@scure/base` 2.x.
+- `@odatano/nightgate-tx` 0.17.1: `buildTransfer({ to })` accepts the address
+  `createSwapWallet().address` and `deriveIdentity` encode.
+
 ## 0.39.0 - 2026-10-28
 
 ### Changes

@@ -66,9 +66,13 @@ const FILES = [
     // two helpers the builder requires by relative path (BUILD OUTPUT)
     { path: 'srv/utils/wallet-hd.js', buildOutput: true },
     { path: 'srv/utils/wallet-hd.d.ts', buildOutput: true },
-    // offer files (bech32m); @scure/base only
+    // offer files and addresses (bech32m); @scure/base only
+    { path: 'srv/utils/bech32m.js', buildOutput: true },
+    { path: 'srv/utils/bech32m.d.ts', buildOutput: true },
     { path: 'srv/utils/offer-file.js', buildOutput: true },
     { path: 'srv/utils/offer-file.d.ts', buildOutput: true },
+    { path: 'srv/utils/midnight-address.js', buildOutput: true },
+    { path: 'srv/utils/midnight-address.d.ts', buildOutput: true },
     // errorMessage(), imported by offer-file and batch-segment-order; no imports of its own
     { path: 'srv/utils/errors.js', buildOutput: true },
     { path: 'srv/utils/errors.d.ts', buildOutput: true },

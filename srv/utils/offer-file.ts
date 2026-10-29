@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import { errorMessage } from './errors';
+import { loadBech32m } from './bech32m';
 
 export const OFFER_FILE_HRP = 'swapoffer';
 
@@ -12,20 +13,6 @@ export class OfferFileError extends Error {
         super(message);
         this.name = 'OfferFileError';
     }
-}
-
-interface Bech32m {
-    encode(prefix: string, words: number[], limit: number | false): string;
-    decode(text: string, limit: number | false): { prefix: string; words: number[] };
-    toWords(bytes: Uint8Array): number[];
-    fromWords(words: number[]): Uint8Array;
-}
-
-// `@scure/base` is ESM-only: loaded once through a dynamic import.
-let cached: Promise<Bech32m> | undefined;
-function loadBech32m(): Promise<Bech32m> {
-    cached ??= import('@scure/base' as string).then((m: { bech32m: Bech32m }) => m.bech32m);
-    return cached;
 }
 
 /**

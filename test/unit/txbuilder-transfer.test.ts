@@ -3,6 +3,7 @@
 // sponsor checks. Against a fake wallet SDK; the live path is covered by the probes.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { bech32m } from '@scure/base';
 
 const A = 'a1'.repeat(32);
 const B = 'b2'.repeat(32);
@@ -45,7 +46,8 @@ describe('readTransferShape', () => {
 describe('createSwapWallet().buildTransfer', () => {
     const SEED = 'ab'.repeat(64);
     const URLS = { indexerHttpUrl: 'https://indexer.example/api/v3/graphql', indexerWsUrl: 'wss://indexer.example/api/v3/graphql/ws' };
-    const TO = 'mn_shield-addr_preprod1recipient';
+    // A real shielded address: 64 bytes, 132 characters, beyond the 90-character default of bech32.
+    const TO = bech32m.encode('mn_shield-addr_preprod', bech32m.toWords(Uint8Array.from({ length: 64 }, (_, i) => i)), false);
 
     function fakeSdk(coins: Array<{ type: string; value: bigint }> = [{ type: A, value: 5000n }, { type: B, value: 5000n }], shape: Record<string, unknown> = {}) {
         const calls: any = { initSwap: [], reverted: [], decoded: [], proven: [] };
@@ -85,11 +87,13 @@ describe('createSwapWallet().buildTransfer', () => {
             abstractions: { InMemoryTransactionHistoryStorage: class { /* stand-in */ } },
             facade: { WalletEntrySchema: {}, mergeWalletEntries: () => ({}) },
             addressFormat: {
-                MidnightBech32m: {
-                    encode: () => ({ toString: () => 'mn_shield-addr_preprod1own' }),
-                    parse: (text: string) => { if (!text.startsWith('mn_shield-addr_')) throw new Error('bad prefix'); return { text }; }
+                mainnet: Symbol('Mainnet'),
+                MidnightBech32m: class {
+                    static prefix = 'mn';
+                    static encode() { return { toString: () => 'mn_shield-addr_preprod1own' }; }
+                    constructor(readonly type: string, readonly network: string | symbol, readonly data: Buffer) { /* records the parts */ }
                 },
-                ShieldedAddress: { codec: { decode: (network: string, repr: { text: string }) => { calls.decoded.push([network, repr.text]); return { decoded: repr.text }; } } }
+                ShieldedAddress: { codec: { decode: (network: string, repr: { type: string; network: string; data: Buffer }) => { calls.decoded.push([network, repr.type, repr.network, repr.data.length]); return { decoded: TO }; } } }
             },
             networkId: { setNetworkId: vi.fn() },
             deriveRoleSeeds: async () => ({ zswap: new Uint8Array(32), dust: new Uint8Array(32), night: new Uint8Array(32) }),
@@ -105,7 +109,7 @@ describe('createSwapWallet().buildTransfer', () => {
         const { sdk, calls } = fakeSdk();
         const wallet = await createSwapWallet({ ...URLS, seedHex: SEED, sdk });
         const built = await wallet.buildTransfer({ tokenType: A, amount: '700', to: TO });
-        expect(calls.decoded).toEqual([['preprod', TO]]);
+        expect(calls.decoded).toEqual([['preprod', 'shield-addr', 'preprod', 64]]);
         expect(calls.initSwap[0]).toEqual({ inputs: { [A]: 700n }, outputs: [{ type: A, receiverAddress: { decoded: TO }, amount: 700n }] });
         expect(built).toMatchObject({ bound: true, serializedBytes: 40, inputs: 1, terms: { tokenType: A, amount: 700n, to: TO } });
         expect(built.txB64).toBe(Buffer.from(Uint8Array.from({ length: 40 }, (_, i) => i)).toString('base64'));

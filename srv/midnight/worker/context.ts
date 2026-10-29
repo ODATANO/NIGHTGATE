@@ -8,6 +8,7 @@
 // and config is read at load time.
 import { configEnum, setConfigWarnSink } from '../../utils/config';
 import { RpcErrorPayload } from '../wallet-worker-protocol';
+import { parseMidnightAddress } from '../../utils/midnight-address';
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 import { parentPort, type MessagePort } from 'node:worker_threads';
 import type { ReplayKind, ReplayTrack } from './sync-replay';
@@ -269,10 +270,10 @@ export type ReceiverParsed =
 export async function parseReceiverAddress(addr: string, networkId: string): Promise<ReceiverParsed> {
     const af = await loadAddressFormat();
     if (addr.startsWith('mn_shield-addr_')) {
-        return { kind: 'shielded', addr: af.MidnightBech32m.parse(addr).decode(af.ShieldedAddress, networkId) };
+        return { kind: 'shielded', addr: (await parseMidnightAddress(af, addr)).decode(af.ShieldedAddress, networkId) };
     }
     if (addr.startsWith('mn_addr_')) {
-        return { kind: 'unshielded', addr: af.MidnightBech32m.parse(addr).decode(af.UnshieldedAddress, networkId) };
+        return { kind: 'unshielded', addr: (await parseMidnightAddress(af, addr)).decode(af.UnshieldedAddress, networkId) };
     }
     throw new Error(
         `Unsupported receiver address prefix in '${addr.slice(0, 16)}...' ` +

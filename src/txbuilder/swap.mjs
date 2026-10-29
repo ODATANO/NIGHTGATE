@@ -23,6 +23,7 @@ const require = createRequire(import.meta.url);
 export const SWAP_OFFER_PREFIX = 'swapoffer';
 
 const offerFile = () => require('../../srv/utils/offer-file.js');
+const midnightAddress = () => require('../../srv/utils/midnight-address.js');
 const loadLedger = () => import('@midnight-ntwrk/ledger-v8');
 
 const RAW_TOKEN_TYPE = /^[0-9a-f]{64}$/;
@@ -253,7 +254,7 @@ export async function createSwapWallet(opts) {
         if (typeof to !== 'string' || to.trim() === '') throw new Error('buildTransfer: to must be a shielded address (mn_shield-addr_...)');
         let receiver;
         try {
-            receiver = sdk.addressFormat.ShieldedAddress.codec.decode(networkId, sdk.addressFormat.MidnightBech32m.parse(to.trim()));
+            receiver = sdk.addressFormat.ShieldedAddress.codec.decode(networkId, await midnightAddress().parseMidnightAddress(sdk.addressFormat, to));
         } catch (e) {
             throw new Error(`buildTransfer: to is not a shielded address of ${networkId}: ${e?.message ?? String(e)}`);
         }

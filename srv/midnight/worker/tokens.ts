@@ -6,6 +6,7 @@ import { formatErr } from '../../utils/format-error';
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 import { type MessagePort } from 'node:worker_threads';
 import { encodeAddressString, ensureNetworkId, facades, loadAddressFormat, loadSdk, log, parseReceiverAddress } from './context';
+import { parseMidnightAddress } from '../../utils/midnight-address';
 import { BALANCE_SYNC_TIMEOUT_MS, SYNC_POLL_MS, countAllNightUtxos, countRegisteredNightUtxos, peekFacadeState, waitForGenuineSync, waitForSyncedStateBounded, wsleep } from './facades';
 import { captureDustSnapshot, feeOfDiscardedRecipe, submitWithDustGuard } from './submit';
 import { resolveSponsorEntry } from './sponsor';
@@ -70,9 +71,7 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
     let receiverParsed: AddressFormat.DustAddress | string = receiverRaw;
     if (typeof receiverRaw === 'string') {
         const af = await loadAddressFormat();
-        receiverParsed = af.MidnightBech32m
-            .parse(receiverRaw)
-            .decode(af.DustAddress, entry.networkId);
+        receiverParsed = (await parseMidnightAddress(af, receiverRaw)).decode(af.DustAddress, entry.networkId);
     }
 
     const verifyingKey = entry.unshieldedKeystore.getPublicKey();

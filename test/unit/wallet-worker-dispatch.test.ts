@@ -107,9 +107,12 @@ vi.mock('@midnight-ntwrk/ledger-v8', () => ({
 // Receiver-address parsing + address encoding go through the real
 // parseReceiverAddress/encodeAddressString; only the SDK codec is stubbed.
 vi.mock('@midnightntwrk/wallet-sdk-address-format', () => ({
-    MidnightBech32m: {
-        parse: vi.fn((s: string) => ({ decode: vi.fn(() => ({ decoded: s })) })),
-        encode: vi.fn((_net: string, addr: any) => ({ toString: () => `enc:${JSON.stringify(addr)}` }))
+    mainnet: Symbol('Mainnet'),
+    MidnightBech32m: class {
+        static prefix = 'mn';
+        static encode = vi.fn((_net: string, addr: any) => ({ toString: () => `enc:${JSON.stringify(addr)}` }));
+        constructor(readonly type: string, readonly network: string | symbol, readonly data: Buffer) { /* records the parts */ }
+        decode() { return { decoded: `${this.type}:${this.data.length}` }; }
     },
     ShieldedAddress: class {},
     UnshieldedAddress: class {},
@@ -252,7 +255,13 @@ vi.mock('ws', () => {
 });
 
 import { MessageChannel } from 'node:worker_threads';
+import { bech32m } from '@scure/base';
 import path from 'node:path';
+
+const addressOf = (prefix: string, bytes: number) => bech32m.encode(prefix, bech32m.toWords(new Uint8Array(bytes).fill(1)), false);
+const UNSHIELDED_RECEIVER = addressOf('mn_addr_preprod', 32);
+const SHIELDED_RECEIVER = addressOf('mn_shield-addr_preprod', 64);
+const DUST_ADDRESS = addressOf('mn_dust_preprod', 32);
 
 function makeFakeFacade() {
     const facade: any = {
@@ -260,7 +269,7 @@ function makeFakeFacade() {
         stop: vi.fn(async () => undefined),
         shielded: { serializeState: vi.fn(async () => 'BLOB-SH') },
         unshielded: { serializeState: vi.fn(async () => 'BLOB-UN') },
-        dust: { serializeState: vi.fn(async () => 'BLOB-DU'), getAddress: vi.fn(async () => 'mn_dust_own_address') },
+        dust: { serializeState: vi.fn(async () => 'BLOB-DU'), getAddress: vi.fn(async () => DUST_ADDRESS) },
         state: () => ({
             subscribe(obs: any) { obs.next(facadeState.current); return { unsubscribe() { /* noop */ } }; }
         }),
@@ -2327,7 +2336,7 @@ describe('dust save epoch guard', () => {
             restoreSubmit = withSubmit(async () => { throw new Error('1014: Priority is too low'); });
             const reply = await rpc('transferNight', {
                 sessionId: SESSION,
-                receiverAddress: 'mn_addr_preprod1' + 'x'.repeat(48),
+                receiverAddress: UNSHIELDED_RECEIVER,
                 amount: '10'
             });
             restoreSubmit();
@@ -2648,7 +2657,7 @@ describe('transferNight', () => {
         const facade = await initSession('session-transfer-night-aaaa');
         const reply = await rpc('transferNight', {
             sessionId: 'session-transfer-night-aaaa',
-            receiverAddress: 'mn_addr_preprod1' + 'x'.repeat(48),
+            receiverAddress: UNSHIELDED_RECEIVER,
             amount: '1234'
         });
         expect(reply.ok).toBe(true);
@@ -2672,7 +2681,7 @@ describe('transferNight', () => {
         const custom = 'ab'.repeat(32);
         const reply = await rpc('transferNight', {
             sessionId: 'session-transfer-token-bbbb',
-            receiverAddress: 'mn_shield-addr_preprod1' + 'x'.repeat(40),
+            receiverAddress: SHIELDED_RECEIVER,
             amount: '5',
             tokenTypeHex: custom
         });
@@ -2766,7 +2775,7 @@ describe('getBalance / estimateTransferFee', () => {
         const facade = await initSession('session-estimate-eeeeeeee');
         const reply = await rpc('estimateTransferFee', {
             sessionId: 'session-estimate-eeeeeeee',
-            receiverAddress: 'mn_addr_preprod1' + 'x'.repeat(48),
+            receiverAddress: UNSHIELDED_RECEIVER,
             amount: '10'
         });
         expect(reply.ok).toBe(true);
