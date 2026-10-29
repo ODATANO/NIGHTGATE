@@ -22,7 +22,7 @@ remove an action, a patch release never does; a removal is marked
 
 Every submitting action returns `{ jobId, status: "pending" }`; poll `getJobStatus(jobId, sessionId)` until `succeeded` or `failed`. A reused `idempotencyKey` returns the existing job; the same key with a different payload answers 409 `IDEMPOTENCY_KEY_CONFLICT`, a key over 128 characters 400 `IDEMPOTENCY_KEY_INVALID`. Each write action lists its job-result shape (the parsed `result`); functions return their result directly.
 
-### `getJobStatus(jobId, sessionId, waitMs?) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, transactionId, transactionHash, chainFinalizedAt, chainBlockHeight, chainBlockHash, chainSegments, … }`
+### `getJobStatus(jobId, sessionId, waitMs?) → { status, chainStatus, result, errorCode, errorMessage, submissionId, txHash, transactionId, transactionHash, chainFinalizedAt, chainBlockHeight, chainBlockHash, chainSegments, receipt, … }`
 
 `status`: `pending | running | external_execution | submitted | reconciliation_required | succeeded | failed`. `waitMs` (at most 25000) holds the call until the job reaches `succeeded`, `failed` or `reconciliation_required` or the time is up, so one call replaces many polls; past 100 waiting calls a server answers at once, and a call whose client disconnects ends at once. `result` is the action's result as a JSON string; on failure `errorCode` + `errorMessage` (see [Error model](#error-model)). `chainBlockHeight` / `chainBlockHash` are the confirmed inclusion coordinates; a reorg rollback reverts by them. An on-chain failure without a block height stays briefly in `reconciliation_required` / `CHAIN_EXECUTION_FAILED_UNCONFIRMED` until the confirmer records the coordinates.
 
@@ -35,6 +35,18 @@ Every submitting action returns `{ jobId, status: "pending" }`; poll `getJobStat
 Every submit path broadcasts only after the transaction identifier is persisted as the job's `txHash`. A `failed` job without `txHash` sent nothing; `reconciliation_required` always carries the one identifier that may be on chain. A pre-mempool reject closes its attempt `REJECTED` on `PendingSubmissions` and clears the hash before anything else is sent.
 
 `chainStatus` (`null | pending | success | failure | dropped`) is the on-chain outcome, independent of `status`: `succeeded` with `failure` means the tx finalized but the call reverted; `dropped` means never included (rule above). The response also carries `submissionId`, `txHash`, `chainFinalizedAt` and lease/attempt/timestamp fields.
+`receipt` (`null` until a `sponsorSwap` or `sponsorTransfer` job succeeded on
+chain): `{ payload, signature, publicKey, algorithm: "ed25519" }`. `payload` is
+canonical JSON (keys sorted) of `{ v: 1, kind: "swap" | "transfer", jobId,
+network, txHash, transactionHash, blockHeight, blockHash, finalizedAt, swap |
+transfer }`; a transfer carries `declared: true`, because its terms are the
+caller's statement. The signature is Ed25519 over the UTF-8 payload under the
+instance's receipt key, which `getReceiptKey()` on the indexer service
+publishes without credentials (`NIGHTGATE_RECEIPT_SIGNING_KEY`, else derived
+from the active encryption key, so a key rotation changes it). A payee hands
+the receipt to a third party, which checks it against that key
+(`verifyReceipt` in `@odatano/nightgate-tx`) without reading the board or this
+server. The same facts always give the same signature.
 
 ## Rate limits
 
@@ -46,9 +58,9 @@ is the agent grant, else the user, else the client address.
 
 | Class | Window | Default | Counted per | Calls |
 |---|---|---|---|---|
-| `prove` | hour | 60 | caller and session | `submitContractCall`, `submitContractCallBatch`, `mintShieldedTestToken`, the `issue*` attestations (a batch counts its claims), `anchorDocument`, `registerPassport`, `retractAttestation`, `purgeExpired`, `grantDisclosure`, `revokeDisclosure`, `grantDisclosureToHolders`, `revokeHolderDisclosure`, `buildSponsorable` |
+| `prove` | hour | 60 | caller and session | `submitContractCall`, `submitContractCallBatch`, `mintShieldedTestToken`, `burnFactoryToken`, the `issue*` attestations (a batch counts its claims), `anchorDocument`, `registerPassport`, `retractAttestation`, `purgeExpired`, `grantDisclosure`, `revokeDisclosure`, `grantDisclosureToHolders`, `revokeHolderDisclosure`, `buildSponsorable` |
 | `deploy` | hour | 5 | caller and session | `deployContract` |
-| `sponsor` | hour | 120 | caller | `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorSwap`, `mintFactoryToken` |
+| `sponsor` | hour | 120 | caller | `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorSwap`, `sponsorTransfer`, `mintFactoryToken` |
 | `compute` | hour | 120 | caller | `prepareDocumentProof`, `prepareMembershipSet`, `claimDisclosure`, `postSwapOffer`, `retireSwapOffer`, `reindexDisclosures` (per contract) |
 | `read` | minute | 60 | caller | `listSwapOffers`, `getSwapOffer`, `getBoardStatus`, `getRuntimeInfo`, `getWalletBalance`, `getWalletSyncProgress`, `getSponsorPoolStatus`, `estimateSendNightFee` |
 | `wallet` | minute | 10 | caller | `connectWallet`, `sendNight`, `registerForDustGeneration`, `deregisterFromDustGeneration` |
@@ -350,7 +362,7 @@ Each call mints 100000000 atoms; repeated calls mint distinct coins. Send them
 with `sendNight(tokenTypeHex)` once the wallet has synced the coin (a few
 blocks).
 
-### `mintFactoryToken(contractAddress, name, amount, recipientCoinPublicKey, sessionId, idempotencyKey?, sponsorSessionId?) → { jobId, status, name, amount, issuerKey, domain, tokenType }`
+### `mintFactoryToken(contractAddress?, name, amount, recipientCoinPublicKey, sessionId?, idempotencyKey?, sponsorSessionId?) → { jobId, status, name, amount, issuerKey, domain, tokenType }`
 
 Mint on the `token-factory` lineage (`@odatano/contract-token-factory`,
 registered as `token-factory`; `contractAddress` is a deployment of it). The
@@ -373,6 +385,23 @@ lineage.
 curl -X POST .../mintFactoryToken -d '{"contractAddress":"<factory>","name":"CREDIT","amount":"1000000","recipientCoinPublicKey":"<64 hex>","sessionId":"<id>"}'
 # -> { jobId, tokenType, domain, issuerKey, ... }; poll getJobStatus
 ```
+
+### `burnFactoryToken(contractAddress?, name, amount, issuerKey?, sessionId, idempotencyKey?, sponsorSessionId?) → { jobId, status, name, amount, issuerKey, domain, tokenType }`
+
+Burn `amount` of a factory token the session holds: the wallet funds a fresh
+coin of the token, the `burn` circuit sends it to the burn address and the
+factory's supply ledger drops. `issuerKey` names the token's issuer (64 hex,
+from `mintFactoryToken`); without it the session's own tokens are meant.
+`contractAddress` defaults to `NIGHTGATE_TOKEN_FACTORY_CONTRACT`. Job result as
+`submitContractCall`. Grantable (`burnFactoryToken`, circuit `burn`); a grant's
+value budget counts the amount. **Rate class:** `prove`.
+
+`mintFactoryToken` without `contractAddress` mints on the same default factory.
+A token caller may leave out `sessionId`: the mint then runs from the session
+that pays its sponsored jobs (the grant's pinned wallet, else the first pool
+wallet), which is the issuer, so a platform-pool grant can mint without a
+wallet session of its own. `getBoardStatus.factoryContract` names the default
+factory.
 
 ### `deriveTokenType(contractAddress, domainSeparator?) → { tokenTypeHex, contractAddress, domainSeparator }` (function)
 
@@ -474,11 +503,27 @@ reach this endpoint can make you pay fees.
   for a token type the platform does not list (`503
   SPONSOR_POLICY_UNAVAILABLE` while the policy file is unreadable); a grant
   without lists is always written.
+- **Rights beyond the action list.** `allowDeploy` (with `maxDeploys`) lets
+  the sponsor pay for deploys the agent built; `allowUnshieldedOffers` (with
+  `allowedUnshieldedTokenTypes`, NIGHT always included) lets a sponsored call
+  move the agent's own unshielded tokens into the contract it calls. Both need
+  a sponsoring action in `allowedActions` and the matching platform switch
+  (`NIGHTGATE_SPONSOR_ALLOW_DEPLOY`, `NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS`);
+  a grant only narrows the platform's unshielded type list. Swaps and
+  transfers are rights of the action list: `sponsorSwap`, `sponsorTransfer`.
+- **Value budgets.** `maxValuePerDay: [{ tokenType, amount }]` caps the atoms
+  a grant moves per UTC day and token type: a sponsored swap counts what the
+  caller gives (the maker's `wants` for a board offer, else the taker half's
+  `gives`), a transfer its declared amount, a mint or burn its amount. Over
+  the limit is 429 (`grant-value`, `Retry-After` until midnight UTC); a 4xx
+  later in the same request gives the amount back. Types without an entry are
+  unlimited. `getGrantUsage.limits.valuePerDay` lists max, used and the reset.
 - **Policy file (platform floor).** `NIGHTGATE_SPONSOR_POLICY_FILE` = JSON
   `{ "allowedContracts": [...], "allowedCircuits": [...], "contractCircuits":
   { "<address>": "*" }, "allowDeploy": false, "allowedTokenTypes": [...],
-  "allowContractMints": false, "allowSwaps": false, "shareMintedTokenTypes":
-  false }`, re-read per
+  "allowContractMints": false, "allowSwaps": false, "allowTransfers": false,
+  "shareMintedTokenTypes": false, "allowUnshieldedOffers": false,
+  "allowedUnshieldedTokenTypes": [...] }`, re-read per
   sponsored call (mtime cache), replaces the env settings (a WARN names the
   ones that are set and ignored). Fail-closed: an invalid file keeps the last
   good policy; with none loaded every sponsored call is
@@ -599,7 +644,25 @@ anchors) rebuild (`NIGHTGATE_STALE_TRANSCRIPT_RETRIES`, default 2, after
 `NIGHTGATE_STALE_TRANSCRIPT_BACKOFF_MS`); a sponsored job cannot rebuild the
 caller's bytes and fails with `1010/104`.
 
-### `sponsorSwap(makerHalfB64 | offerId, takerHalfB64, idempotencyKey?) → { jobId, status, sessionId }`
+Unshielded offers (both channels): a call whose circuit receives the caller's
+own unshielded tokens, for example NIGHT paid into the contract, puts the caller's
+UTXO inputs and the contract-owned output into the intent's unshielded offer.
+Refused by default. With `allowUnshieldedOffers` on the grant and
+`NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS` on the server (policy file
+`allowUnshieldedOffers`) such an intent is accepted when all of this holds:
+the offer sits next to a contract call of the same intent; every input and
+output type is NIGHT or in `allowedUnshieldedTokenTypes` (floor
+`NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES`, a grant only narrows);
+inputs equal outputs per type; every output goes to the contract called, a
+contract on the allow-list, a contract deployed under the grant, or back to
+the address of an input owner (change); no input belongs to the sponsor's own
+wallet. An unshielded offer is public, so every rule is checked on the bytes;
+the sponsor adds dust only, never value. Caller dust actions stay refused. The
+job result carries `unshielded: [{ type, amount, to }]`, one entry per
+contract-owned output. A payout from the contract to the caller is not covered:
+without an input of the caller its address cannot be derived from the offer.
+
+### `sponsorSwap(makerHalfB64 | offerId, takerHalfB64, idempotencyKey?, takerSecret?) → { jobId, status, sessionId }`
 
 Sponsor a shielded swap that settles without a contract: the maker spends the
 coin it gives and creates the coin it wants, the taker builds the mirror half,
@@ -666,12 +729,38 @@ closed offer is 409 before anything is parsed, an unknown one 404. A landed
 swap closes the offer it filled and every open offer whose half spent one of
 the same inputs (the input nullifiers travel with the job).
 
+### `sponsorTransfer(transferTxB64, tokenType, amount, idempotencyKey?) → { jobId, status, sessionId }`
+
+Sponsor a plain shielded transfer: the caller's wallet spends its own coins of
+one type and creates the recipient's coin and its change, with no fee of its
+own (the swap wallet's `buildTransfer`, `docs/txbuilder.md`); the sponsor adds
+the dust and submits. `transferTxB64` is the proven transaction, bound or
+unbound, as base64 or offer-file text. Job result `{ txHash, circuits:
+["<transfer>"], note, transfer: { tokenType, amount } }`. **Rate class:**
+`sponsor`.
+
+Off by default: `NIGHTGATE_SPONSOR_ALLOW_TRANSFERS` (policy file
+`allowTransfers`) opens it, and a token caller needs `sponsorTransfer` in its
+grant's `allowedActions`. `tokenType` must be in the effective
+`allowedTokenTypes`. Refused unless the transaction carries an offer and
+nothing else (no intent, no fallible offer, no transient, no contract-owned
+coin), spends 1 to `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS` coins, creates one or
+two, and nets to zero in every type (the ledger drops zero deltas, so a
+transfer shows none; a net change makes it a swap half).
+
+What the check cannot see: recipient and amount are commitments, and so is the
+type of a transfer that nets to zero. `tokenType` and `amount` are therefore
+the caller's declaration, recorded with the job, counted against the grant's
+value budget and repeated in the receipt as `declared: true`; the sponsor
+verifies the shape, never the value. The sponsor pays dust only. A landed
+transfer closes every open offer whose half spent one of the same coins.
+
 ## Offer board
 
 Open maker halves, posted for takers to find. The board stores intent, never
 value: a half is filled or retired whole, nothing is held, matched or priced.
 
-### `postSwapOffer(offer, expiresAt?, tags?) → { offerId, status, bound, givesType, givesAmount, wantsType, wantsAmount, expiresAt }`
+### `postSwapOffer(offer, expiresAt?, tags?, takerSecretHash?) → { offerId, status, bound, givesType, givesAmount, wantsType, wantsAmount, expiresAt, directed }`
 
 `offer` is a maker half as offer file or base64. The worker checks it like a
 sponsored half except for the token allow-list and reads the terms from it
@@ -683,7 +772,14 @@ nullifiers lands in a sponsored swap (`filled`), when `expiresAt` passes
 (`expired`), or when the poster retires it. Grantable (`postSwapOffer`), also
 for a platform-pool grant. **Rate class:** `compute`.
 
-### `listSwapOffers(givesType?, wantsType?, tag?, limit?, status?, since?, mine?, waitMs?) → [{ offerId, offer, bound, givesType, givesAmount, wantsType, wantsAmount, tags, expiresAt, postedAt, status, filledTxHash, closedAt, changedAt }]` (function)
+`takerSecretHash` (optional, sha256 of a secret as 64 hex) makes the offer
+directed: `sponsorSwap(offerId, …)` then needs `takerSecret`, the text whose
+sha256 matches, or answers 403. The board shows `directed: true` and never the
+hash; the poster hands the secret to its counterparty out of band, so an
+invoice or an agreed deal can be taken by that party only. A directed offer
+still fills once and still closes on expiry or retirement.
+
+### `listSwapOffers(givesType?, wantsType?, tag?, limit?, status?, since?, mine?, waitMs?) → [{ offerId, offer, bound, givesType, givesAmount, wantsType, wantsAmount, tags, expiresAt, postedAt, status, filledTxHash, closedAt, changedAt, directed }]` (function)
 
 Open offers, newest first; filters are exact (64-hex types), `limit` 1 to 200
 (default 50). `status` reads the closed ones instead: `filled`, `retired`,

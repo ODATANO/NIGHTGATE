@@ -6,6 +6,7 @@ import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { attachRuntimeGate } from './utils/runtime-gate';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { registerDocumentProofHandlers } from './submission/document-proof';
+import { receiptForJob } from './submission/receipts';
 import { getJobById, runWithoutAmbientTx } from './submission/background-jobs';
 import { LONG_POLL_MAX_MS, holdUntil, waiterPool } from './utils/long-poll';
 import { contractStateAt, IndexerBudgetExhausted, IndexerBehind, type ContractStateFetcher, type FetchedContractState } from './crawler/contract-state';
@@ -386,6 +387,7 @@ export default class NightgateService extends cds.ApplicationService {
                 const found = job;
                 job = await holdUntil(req, waitMs, jobWaiters, found, async () => (await readJob(jobId)) ?? found, j => JOB_SETTLED.has(String(j.status)));
             }
+            const transactionHash = await explorerHashOf(this.db, job.txHash);
 
             return {
                 jobId: job.ID,
@@ -399,7 +401,7 @@ export default class NightgateService extends cds.ApplicationService {
                 submissionId: job.submissionId,
                 txHash: job.txHash,
                 transactionId: job.txHash ?? null,
-                transactionHash: await explorerHashOf(this.db, job.txHash),
+                transactionHash,
                 chainStatus: job.chainStatus,
                 chainFinalizedAt: job.chainFinalizedAt,
                 chainBlockHeight: job.chainBlockHeight ?? null,
@@ -409,7 +411,8 @@ export default class NightgateService extends cds.ApplicationService {
                 externalExecutionAt: job.externalExecutionAt,
                 submittedAt: job.submittedAt,
                 startedAt: job.startedAt,
-                finishedAt: job.finishedAt
+                finishedAt: job.finishedAt,
+                receipt: receiptForJob(job, transactionHash, String(resolveNightgateRuntimeConfig(getNightgatePluginConfig()).network))
             };
         });
 

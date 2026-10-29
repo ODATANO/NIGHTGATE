@@ -440,6 +440,12 @@ export interface SubmitIntent {
     segments?: Array<{ segment: number; calls: string[] }>;
     /** Raw token types the calls mint. Recorded on the grant once the tx landed. */
     minted?: string[];
+    /** Input nullifiers of a sponsored swap or transfer. A landed tx closes the offers that spent them. */
+    nullifiers?: string[];
+    /** Unshielded tokens the calls move into a contract, read from the offers. */
+    unshielded?: Array<{ type: string; amount: string; to: string }>;
+    /** The declared terms of a sponsored transfer. */
+    transfer?: { tokenType: string; amount: string };
 }
 const INTENT_ACK_WARN_MS = 10_000;
 /** Waits for the main thread to confirm the tx id. Without a confirmation the tx is not sent. Does nothing without a port. */

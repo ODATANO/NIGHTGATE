@@ -320,6 +320,10 @@ export function connect(opts) {
         verifyDocument: (p) => callFunction('verifyDocument', p),
         deriveTokenType: (p) => callFunction('deriveTokenType', p),
         getHealth: () => request('GET', `${indexerService}/getHealth()`),
+        /** Counts of the offer board and the sponsor pool, plus the instance's token factory. No login. */
+        getBoardStatus: () => request('GET', `${indexerService}/getBoardStatus()`),
+        /** The key the instance signs job receipts with. No login. */
+        getReceiptKey: () => request('GET', `${indexerService}/getReceiptKey()`),
 
         // ---- input preparation. No wallet, no transaction. ----
         prepareDocumentProof: (p) => callAction('prepareDocumentProof', p),
@@ -356,6 +360,10 @@ export function connect(opts) {
         submitContractCall: (p) => act('submitContractCall', p),
         submitContractCallBatch: (p) => act('submitContractCallBatch', p),
         mintShieldedTestToken: (p) => act('mintShieldedTestToken', p),
+        /** Mints a named token on a token factory. Takes `name`, `amount`, `recipientCoinPublicKey`, optionally `contractAddress` and `sessionId`. */
+        mintFactoryToken: (p) => act('mintFactoryToken', p),
+        /** Burns `amount` of a factory token the session holds. Takes `name`, `amount`, `sessionId`, optionally `contractAddress` and `issuerKey`. */
+        burnFactoryToken: (p) => act('burnFactoryToken', p),
         sendNight: (p) => act('sendNight', p),
 
         // ---- the server pays the fee for a transaction built elsewhere ----
@@ -368,6 +376,8 @@ export function connect(opts) {
         sponsorUnbound: (p) => act('sponsorUnboundTransaction', p),
         /** Takes both halves of a private token swap. The server joins them, pays the fee and submits. */
         sponsorSwap: (p) => act('sponsorSwap', p),
+        /** Takes a plain transfer (`transferTxB64`, `tokenType`, `amount`) built by the swap wallet. The server pays the fee and submits. */
+        sponsorTransfer: (p) => act('sponsorTransfer', p),
         buildSponsorable: (p) => act('buildSponsorable', p)
     };
 }

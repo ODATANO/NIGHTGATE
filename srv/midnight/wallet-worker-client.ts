@@ -10,6 +10,7 @@ import path from 'node:path';
 import type { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
 import type { MerkleProofBundle } from '../submission/contract-witnesses';
 import type { ContractCircuitRules } from '../submission/sponsor-policy';
+import type { DeclaredTransfer, UnshieldedMove } from '../submission/submit-intent';
 import { errorName, formatErr } from '../utils/format-error';
 import { nightgateErrorFromPayload, errorMessage, NightgateError } from '../utils/errors';
 import { isSubmittingMethod, WORKER_ROTATING, WORKER_ROTATED, WorkerSubmitError, isSubmitFailureCode } from './wallet-worker-protocol';
@@ -980,7 +981,11 @@ export function walletSponsorFinalizedTx(args: {
     allowedTokenTypes?: string[];
     /** Also pay for the offer of a token that a call in this tx mints. */
     allowContractMints?: boolean;
-}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; deployed?: string[]; minted?: string[] }> {
+    /** Both the server rules and the grant let the calls move the caller's own unshielded tokens into the contract. */
+    allowUnshieldedOffers?: boolean;
+    /** Unshielded token types besides NIGHT such an offer may move. */
+    allowedUnshieldedTokenTypes?: string[];
+}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; deployed?: string[]; minted?: string[]; unshielded?: UnshieldedMove[] }> {
     return rpc('sponsorFinalizedTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
@@ -1034,6 +1039,9 @@ export function walletSponsorUnboundTx(args: {
     /** The two halves of a shielded swap, proven but not bound. The worker checks and merges them. */
     swap?: { makerHalfB64: string; takerHalfB64: string };
     allowSwaps?: boolean;
+    /** A plain shielded transfer with the terms the caller declares. The worker checks its shape. */
+    transfer?: { txB64: string; tokenType: string; amount: string };
+    allowTransfers?: boolean;
     networkId: WalletSubmitContractCallArgs['networkId'];
     allowedContracts?: string[];
     allowedCircuits?: string[];
@@ -1047,8 +1055,20 @@ export function walletSponsorUnboundTx(args: {
     allowedTokenTypes?: string[];
     /** Also pay for the offer of a token that a call in this tx mints. */
     allowContractMints?: boolean;
-}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[]; minted?: string[]; swap?: SponsoredSwapTerms; nullifiers?: string[] }> {
+    /** Both the server rules and the grant let the calls move the caller's own unshielded tokens into the contract. */
+    allowUnshieldedOffers?: boolean;
+    /** Unshielded token types besides NIGHT such an offer may move. */
+    allowedUnshieldedTokenTypes?: string[];
+}, onSubmitIntent?: SubmitIntentHook): Promise<{
+    txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[]; minted?: string[];
+    swap?: SponsoredSwapTerms; transfer?: DeclaredTransfer; unshielded?: UnshieldedMove[]; nullifiers?: string[];
+}> {
     return rpc('sponsorUnboundTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
+}
+
+/** Checks that caller bytes are a plain shielded transfer: an offer and nothing else that nets to zero. Throws `SPONSOR_REFUSED` otherwise. */
+export async function walletDescribeTransfer(args: { txB64: string }): Promise<{ bound: boolean; inputs: number; outputs: number; nullifiers: string[] }> {
+    return rpc('describeTransfer', args, RPC_TIMEOUT_MS);
 }
 
 /** Checks that caller bytes are a proven transaction, bound or not. Throws `SPONSOR_REFUSED` for anything else. */

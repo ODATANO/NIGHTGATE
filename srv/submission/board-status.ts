@@ -12,6 +12,7 @@ import { loadSigningSessionAccountId } from '../sessions/wallet-session-lifecycl
 import { walletGetSyncProgress } from '../midnight/wallet-worker-client';
 import { syncGateReading } from './sponsor-sync-gate';
 import { runWithoutAmbientTx } from './background-jobs';
+import { configString } from '../utils/config';
 
 const { SELECT } = cds.ql;
 
@@ -21,6 +22,8 @@ export interface BoardStatus {
     swapsToday: number;
     sponsorsConfigured: number;
     sponsorsReady: number;
+    /** The token factory a mint without `contractAddress` uses; null when the instance sets none. */
+    factoryContract: string | null;
     asOf: string;
 }
 
@@ -73,5 +76,6 @@ async function computeBoardStatus(db: DbRunner, now: Date): Promise<BoardStatus>
     ]);
     const sponsorIds = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
     const sponsorsReady = sponsorIds.length ? await countReadySponsors(db, sponsorIds) : 0;
-    return { openOffers, offersFilledToday, swapsToday, sponsorsConfigured: sponsorIds.length, sponsorsReady, asOf: nowIso };
+    const factoryContract = String(configString('NIGHTGATE_TOKEN_FACTORY_CONTRACT') ?? '').trim().toLowerCase() || null;
+    return { openOffers, offersFilledToday, swapsToday, sponsorsConfigured: sponsorIds.length, sponsorsReady, factoryContract, asOf: nowIso };
 }

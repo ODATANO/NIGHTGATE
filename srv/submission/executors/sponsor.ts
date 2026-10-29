@@ -69,7 +69,11 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         };
         // Called just before the worker broadcasts. It stores what the worker chose,
         // so the result can be reconstructed from the attempt row after a crash.
-        const onSubmitIntent = () => async (txHash: string, intent?: { contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string; segments?: Array<{ segment: number; calls: string[] }>; minted?: string[]; nullifiers?: string[] }) => {
+        const onSubmitIntent = () => async (txHash: string, intent?: {
+            contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string;
+            segments?: Array<{ segment: number; calls: string[] }>; minted?: string[]; nullifiers?: string[];
+            unshielded?: SubmitIntentCoordinates['unshielded']; transfer?: SubmitIntentCoordinates['transfer'];
+        }) => {
             const submissionId = cds.utils.uuid();
             const deployed = (intent?.deployed ?? []).map(String).filter(Boolean);
             const grantId = command?.grantId ? String(command.grantId) : null;
@@ -85,6 +89,8 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                 ...(deployed.length ? { deployed } : {}),
                 ...(intent?.minted?.length ? { minted: intent.minted } : {}),
                 ...(intent?.nullifiers?.length ? { nullifiers: intent.nullifiers } : {}),
+                ...(intent?.unshielded?.length ? { unshielded: intent.unshielded } : {}),
+                ...(intent?.transfer ? { transfer: intent.transfer } : {}),
                 ...(command?.swap?.offerId ? { offerId: String(command.swap.offerId) } : {}),
                 ...(grantId && deployed.length ? { deployReservation: { grantId, count: deployed.length } } : {})
             } satisfies SubmitIntentCoordinates;
@@ -151,13 +157,16 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         allowDeploy: policy.allowDeploy === true,
         ownContracts: policy.ownContracts,
         allowedTokenTypes: policy.allowedTokenTypes,
-        allowContractMints: policy.allowContractMints === true
+        allowContractMints: policy.allowContractMints === true,
+        allowUnshieldedOffers: policy.allowUnshieldedOffers === true,
+        allowedUnshieldedTokenTypes: policy.allowedUnshieldedTokenTypes
     });
 
     /** Records what a landed job produced: minted token types, closed offers and deployed contracts. */
     const recordOnGrant = async (command: any, out: { deployed?: string[]; minted?: string[]; txHash?: string; nullifiers?: string[] }): Promise<void> => {
         if (out.minted?.length) await recordPlatformMint(db, out.minted, { grantId: command.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: out.txHash ?? null });
-        if (command.swap) await closeSwapOffersOf(command, out.nullifiers ?? [], out.txHash ?? null);
+        // A transfer may spend a coin an open offer reserved; that offer is closed like a filled one.
+        if (command.swap || command.transfer) await closeSwapOffersOf(command, out.nullifiers ?? [], out.txHash ?? null);
         if (!command.grantId) return;
         if (out.deployed?.length) await recordDeployedContracts(db, command.grantId, out.deployed);
     };
@@ -263,7 +272,9 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         // failures pause the sponsor and move on.
         const dustRetries = configNumber('NIGHTGATE_SPONSOR_DUST_RETRIES');
         const dustBackoffMs = configMs('NIGHTGATE_SPONSOR_DUST_BACKOFF_MS');
-        const size = command.swap ? (command.swap.makerHalfB64?.length ?? 0) + (command.swap.takerHalfB64?.length ?? 0) : command.unboundTxB64?.length ?? 0;
+        const size = command.swap
+            ? (command.swap.makerHalfB64?.length ?? 0) + (command.swap.takerHalfB64?.length ?? 0)
+            : command.transfer ? (command.transfer.txB64?.length ?? 0) : command.unboundTxB64?.length ?? 0;
         cds.log('nightgate').info(`${job.kind} job: ${size} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
 
         let lastErr: unknown;
@@ -282,7 +293,9 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                             sponsorSessionId: accountId,
                             ...(command.swap
                                 ? { swap: command.swap, allowSwaps: policy.allowSwaps === true }
-                                : { unboundTxB64: command.unboundTxB64 }),
+                                : command.transfer
+                                    ? { transfer: command.transfer, allowTransfers: policy.allowTransfers === true }
+                                    : { unboundTxB64: command.unboundTxB64 }),
                             networkId: facadeCfg.networkId,
                             ...policyArgs(policy)
                         }, onSubmitIntent()));

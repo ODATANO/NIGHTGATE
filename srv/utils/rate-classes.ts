@@ -85,6 +85,8 @@ export interface RateLimitRefusal {
     limit: number;
     windowSeconds: number;
     retryAfterMs: number;
+    /** Added to the message when the limit is not a plain count, such as a value budget. */
+    detail?: string;
 }
 
 /** The one 429 answer: message with the limit, `Retry-After`, `RateLimit` headers, the metric. */
@@ -94,7 +96,8 @@ export function rejectRateLimited(req: RejectingRequest, refusal: RateLimitRefus
     setHeader(req, 'Retry-After', String(seconds));
     noteRateLimitHeaders(req, { name: refusal.name, limit: refusal.limit, remaining: 0, windowSeconds: refusal.windowSeconds, resetSeconds: seconds });
     const window = describeWindow(refusal.windowSeconds * 1000);
-    req.reject?.(429, `Rate limited (${refusal.name}: ${refusal.limit} per ${window}). Retry after ${seconds}s`);
+    const what = refusal.detail ?? `${refusal.name}: ${refusal.limit} per ${window}`;
+    req.reject?.(429, `Rate limited (${what}). Retry after ${seconds}s`);
 }
 
 // `RateLimit-Policy` lists every limit the request passed as `"name";q=<limit>;w=<window s>`,

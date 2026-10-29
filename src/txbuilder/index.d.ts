@@ -485,6 +485,23 @@ export interface TakenOffer {
     revert(): Promise<void>;
 }
 
+/** A plain transfer built for `sponsorTransfer`. */
+export interface BuiltTransfer {
+    /** The transfer as base64, for `sponsorTransfer({ transferTxB64 })`. */
+    txB64: string;
+    bound: boolean;
+    serializedBytes: number;
+    /** What was asked: the type, the amount in atoms and the recipient's shielded address. */
+    terms: { tokenType: string; amount: bigint; to: string };
+    /** Coins the transfer spends. */
+    inputs: number;
+    /** Releases the transfer's coins if it will not be handed over. */
+    revert(): Promise<void>;
+}
+
+/** Checks that a transaction is a plain shielded transfer: an offer and nothing else that nets to zero. Throws otherwise. */
+export declare function readTransferShape(tx: LedgerTransaction): { inputs: number; outputs: number };
+
 export interface SwapWallet {
     provingMode: 'wasm' | 'server';
     /** Shielded address. */
@@ -508,6 +525,11 @@ export interface SwapWallet {
      * Hand the half over soon after building it, because it refers to the current chain state.
      */
     buildHalf(input: { give: SwapLegInput; want: SwapLegInput; bind?: boolean }): Promise<BuiltSwapHalf>;
+    /**
+     * Builds and proves a plain transfer of `amount` of `tokenType` to the shielded address `to`, for `sponsorTransfer`.
+     * Its coins stay reserved until the transfer lands or `revert()` is called.
+     */
+    buildTransfer(input: { tokenType: string; amount: bigint | number | string; to: string; bind?: boolean }): Promise<BuiltTransfer>;
     /** Accepts an offer and returns both halves for `sponsorSwap`. Checks the terms against `expect` if given. */
     takeOffer(input: { offer: string | Uint8Array; expect?: SwapTermsInput }): Promise<TakenOffer>;
     /** Saves the wallet state. It contains the wallet's coins, so keep it as safe as a key. */

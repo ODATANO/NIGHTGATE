@@ -79,6 +79,28 @@ service NightgateService {
         remaining     : Integer;
     }
 
+    /** Most atoms of one token type a grant may move per UTC day through sponsored swaps, transfers and mints. */
+    type ValueBudget {
+        tokenType : Hex64;
+        amount    : String; // decimal; atoms
+    }
+
+    /** One value budget of a grant as it stands today. */
+    type ValueBudgetState {
+        tokenType : String;
+        max       : String; // decimal; atoms
+        used      : String; // decimal; atoms
+        resetsAt  : Timestamp; // when `used` returns to 0
+    }
+
+    /** A statement of the instance about a landed job, signed with its receipt key (`getReceiptKey` on the indexer service). */
+    type Receipt {
+        payload   : LargeString; // JSON; the signed bytes, keys sorted
+        signature : String; // hex; Ed25519 over the UTF-8 payload
+        publicKey : String; // hex; the instance's receipt key
+        algorithm : String; // ed25519
+    }
+
     @readonly
     entity TransactionResults    as projection on midnight.TransactionResults;
 
@@ -744,7 +766,20 @@ service NightgateService {
     action   sponsorSwap(makerHalfB64: LargeString, // required unless offerId is given
                          takerHalfB64: LargeString,
                          idempotencyKey: String, // optional
-                         offerId: UUID)                                       returns { // optional; a posted offer to use as the maker half
+                         offerId: UUID, // optional; a posted offer to use as the maker half
+                         takerSecret: String)                                 returns { // optional; required to take a directed offer
+        jobId     : UUID;
+        status    : String;
+        sessionId : UUID; // pass it to getJobStatus
+    };
+
+    /**
+     * Pays the fee for a plain shielded transfer the caller built and submits it. Recipient and amount are hidden: `tokenType` and `amount` are the caller's statement.
+     */
+    action   sponsorTransfer(transferTxB64: LargeString, // base64; bound or unbound
+                             tokenType: Hex64, // the type moved; must be in the effective allowedTokenTypes
+                             amount: String, // decimal; atoms the recipient receives
+                             idempotencyKey: String)                          returns { // optional
         jobId     : UUID;
         status    : String;
         sessionId : UUID; // pass it to getJobStatus
@@ -758,7 +793,8 @@ service NightgateService {
      */
     action   postSwapOffer(offer: LargeString, // offer file or base64
                            expiresAt: Timestamp, // optional
-                           tags: array of String) returns { // up to 8; optional
+                           tags: array of String, // up to 8; optional
+                           takerSecretHash: Hex64)                            returns { // optional; sha256 of the taker secret
         offerId     : UUID;
         status      : String;
         bound       : Boolean; // the half is already sealed
@@ -767,6 +803,7 @@ service NightgateService {
         wantsType   : String;
         wantsAmount : String;
         expiresAt   : Timestamp;
+        directed    : Boolean; // only the holder of the taker secret can take it
     };
 
     /**
@@ -797,6 +834,7 @@ service NightgateService {
         filledTxHash : String;
         closedAt     : Timestamp;
         changedAt    : Timestamp;
+        directed     : Boolean; // only the holder of the taker secret can take it
     };
 
     /** One offer by id, open or closed. An unknown id gives 404. */
@@ -815,6 +853,7 @@ service NightgateService {
         filledTxHash : String;
         closedAt     : Timestamp;
         changedAt    : Timestamp;
+        directed     : Boolean; // only the holder of the taker secret can take it
     };
 
     /** Closes an open offer. Only the user or agent token that posted it can do this. */
@@ -895,10 +934,27 @@ service NightgateService {
      * Mints a token on a token factory contract and sends it to a shielded address.
      * The session is the issuer, so the same `name` from another session is a different token.
      */
-    action   mintFactoryToken(contractAddress: String,
+    action   mintFactoryToken(contractAddress: String, // optional; default NIGHTGATE_TOKEN_FACTORY_CONTRACT
                               name: String, // UTF-8, at most 32 bytes
                               amount: String,
                               recipientCoinPublicKey: Hex64,
+                              sessionId: UUID, // optional for a token caller; default the session that pays its sponsored jobs
+                              idempotencyKey: String, // optional
+                              sponsorSessionId: UUID)                         returns { // optional
+        jobId     : UUID;
+        status    : String;
+        name      : String;
+        amount    : String;
+        issuerKey : String;
+        domain    : String;
+        tokenType : Hex64;
+    };
+
+    /** Burns `amount` of a factory token the session holds; `issuerKey` names the issuer, default the session's own. */
+    action   burnFactoryToken(contractAddress: String, // optional; default NIGHTGATE_TOKEN_FACTORY_CONTRACT
+                              name: String, // UTF-8, at most 32 bytes
+                              amount: String,
+                              issuerKey: Hex64, // optional; default the session's own issuer key
                               sessionId: UUID,
                               idempotencyKey: String, // optional
                               sponsorSessionId: UUID)                         returns { // optional
@@ -1182,17 +1238,23 @@ service NightgateService {
                               allowedCircuits: array of String, // optional, default all the platform allows
                               allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent, needs NIGHTGATE_SPONSOR_ALLOW_DEPLOY
                               maxDeploys: Integer, // optional, default 1 when allowDeploy is true
-                              allowedTokenTypes: array of Hex64 // optional, default all the platform allows
+                              allowedTokenTypes: array of Hex64, // optional, default all the platform allows
+                              allowUnshieldedOffers: Boolean, // optional; sponsored calls may move the agent's own unshielded tokens into the contract, needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
+                              allowedUnshieldedTokenTypes: array of Hex64, // optional, default all the platform allows besides NIGHT
+                              maxValuePerDay: array of ValueBudget // optional, default no value limit
     )                                                                         returns {
-        grantId           : UUID;
-        token             : String; // shown only once
-        allowedActions    : array of String;
-        allowedContracts  : array of String;
-        allowedCircuits   : array of String;
-        allowDeploy       : Boolean;
-        maxDeploys        : Integer;
-        allowedTokenTypes : array of String;
-        validUntil        : Timestamp;
+        grantId                     : UUID;
+        token                       : String; // shown only once
+        allowedActions              : array of String;
+        allowedContracts            : array of String;
+        allowedCircuits             : array of String;
+        allowDeploy                 : Boolean;
+        maxDeploys                  : Integer;
+        allowedTokenTypes           : array of String;
+        allowUnshieldedOffers       : Boolean;
+        allowedUnshieldedTokenTypes : array of String;
+        maxValuePerDay              : array of ValueBudget;
+        validUntil                  : Timestamp;
     };
 
     /**
@@ -1212,20 +1274,26 @@ service NightgateService {
                                allowedCircuits: array of String, // optional, default all the platform allows
                                allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent, needs NIGHTGATE_SPONSOR_ALLOW_DEPLOY
                                maxDeploys: Integer, // optional, default 1 when allowDeploy is true
-                               allowedTokenTypes: array of Hex64 // optional, default all the platform allows
+                               allowedTokenTypes: array of Hex64, // optional, default all the platform allows
+                               allowUnshieldedOffers: Boolean, // optional; sponsored calls may move the agent's own unshielded tokens into the contract, needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
+                               allowedUnshieldedTokenTypes: array of Hex64, // optional, default all the platform allows besides NIGHT
+                               maxValuePerDay: array of ValueBudget // optional, default no value limit
     )                                                                         returns {
-        grants            : array of {
+        grants                      : array of {
             grantId    : UUID;
             token      : String; // shown only once
             agentLabel : String;
         };
-        allowedActions    : array of String;
-        allowedContracts  : array of String;
-        allowedCircuits   : array of String;
-        allowDeploy       : Boolean;
-        maxDeploys        : Integer;
-        allowedTokenTypes : array of String;
-        validUntil        : Timestamp;
+        allowedActions              : array of String;
+        allowedContracts            : array of String;
+        allowedCircuits             : array of String;
+        allowDeploy                 : Boolean;
+        maxDeploys                  : Integer;
+        allowedTokenTypes           : array of String;
+        allowUnshieldedOffers       : Boolean;
+        allowedUnshieldedTokenTypes : array of String;
+        maxValuePerDay              : array of ValueBudget;
+        validUntil                  : Timestamp;
     };
 
     /** Revokes a grant at once. A grant of another user gives 404. */
@@ -1244,6 +1312,9 @@ service NightgateService {
                               allowedTokenTypes: array of String,
                               allowDeploy: Boolean,
                               maxDeploys: Integer,
+                              allowUnshieldedOffers: Boolean,
+                              allowedUnshieldedTokenTypes: array of String,
+                              maxValuePerDay: array of ValueBudget,
                               validUntil: Timestamp)                          returns {
         grantId : UUID;
         updated : array of String;
@@ -1275,6 +1346,7 @@ service NightgateService {
         limits        : {
             jobsPerHour : Budget;
             jobsPerDay  : Budget;
+            valuePerDay : array of ValueBudgetState;
             classes     : array of RateClassState;
         };
     };
@@ -1311,6 +1383,7 @@ service NightgateService {
         submittedAt         : Timestamp;
         startedAt           : Timestamp;
         finishedAt          : Timestamp;
+        receipt             : Receipt; // null until a sponsored swap or transfer succeeded on chain
     };
 }
 

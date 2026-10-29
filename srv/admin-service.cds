@@ -141,6 +141,9 @@ service NightgateAdminService {
             allowDeploy        : Boolean;
             allowContractMints : Boolean;
             allowSwaps         : Boolean;
+            allowTransfers     : Boolean;
+            allowUnshieldedOffers       : Boolean;
+            allowedUnshieldedTokenTypes : array of String; // empty = NIGHT only
         };
         grant          : {
             grantId           : UUID;
@@ -152,6 +155,9 @@ service NightgateAdminService {
             mintedTokenTypes  : array of String;
             allowDeploy       : Boolean;
             allowSwaps        : Boolean;
+            allowTransfers    : Boolean;
+            allowUnshieldedOffers       : Boolean;
+            allowedUnshieldedTokenTypes : array of String;
             maxDeploys        : Integer;
             deploysUsed       : Integer;
         };
@@ -165,6 +171,9 @@ service NightgateAdminService {
             allowDeploy        : Boolean;
             allowContractMints : Boolean;
             allowSwaps         : Boolean;
+            allowTransfers     : Boolean;
+            allowUnshieldedOffers       : Boolean;
+            allowedUnshieldedTokenTypes : array of String;
         };
         effectiveError : String;
     };

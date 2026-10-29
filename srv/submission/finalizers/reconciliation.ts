@@ -46,6 +46,8 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
             contractAddress: coordinates.contractAddress ?? evidence.contractAddress ?? '',
             ...(coordinates.note ? { note: coordinates.note } : {}),
             ...(deployed.length ? { deployed } : {}),
+            ...(coordinates.unshielded?.length ? { unshielded: coordinates.unshielded } : {}),
+            ...(coordinates.transfer ? { transfer: coordinates.transfer } : {}),
             feeSponsor: coordinates.feeSponsor ?? command?.sponsorSessionId ?? _job.sessionId
         };
     };

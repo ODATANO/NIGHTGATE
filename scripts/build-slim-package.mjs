@@ -34,6 +34,7 @@ const FILES = [
     { path: 'src/sdk/index.d.ts' },
     { path: 'src/sdk/client.mjs' },
     { path: 'src/sdk/client.d.ts' },
+    { path: 'src/sdk/receipt.mjs' },
     // the local builder + self-funded submission
     { path: 'src/txbuilder/index.mjs' },
     { path: 'src/txbuilder/index.d.ts' },

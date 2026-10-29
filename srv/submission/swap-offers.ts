@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import cds from '@sap/cds';
+import crypto from 'node:crypto';
 import { SwapOffers, type SwapOffer } from '#cds-models/midnight';
 import { runWithoutAmbientTx } from './background-jobs';
 import { HEX64_RE } from '../utils/hex';
@@ -41,6 +42,20 @@ export function effectiveSwapOfferStatus(row: SwapOffer, now: Date = new Date())
 export function isSwapOfferOpen(row: SwapOffer | null, now: Date = new Date()): boolean {
     if (!row || row.status !== 'open') return false;
     return !row.expiresAt || Date.parse(row.expiresAt) > now.getTime();
+}
+
+/** The hash a directed offer stores: sha256 of the secret's UTF-8 text, as hex. */
+export function hashTakerSecret(secret: string): string {
+    return crypto.createHash('sha256').update(secret, 'utf8').digest('hex');
+}
+
+/** True when the offer is open to anyone, or `secret` hashes to the stored taker secret hash. */
+export function takerSecretMatches(row: Pick<SwapOffer, 'takerSecretHash'>, secret: unknown): boolean {
+    if (!row.takerSecretHash) return true;
+    if (typeof secret !== 'string' || secret.length === 0 || secret.length > 256) return false;
+    const given = Buffer.from(hashTakerSecret(secret), 'hex');
+    const stored = Buffer.from(String(row.takerSecretHash).toLowerCase(), 'hex');
+    return given.length === stored.length && crypto.timingSafeEqual(given, stored);
 }
 
 /** Close one offer. Does nothing if it is no longer open. */

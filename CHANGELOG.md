@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.39.0 - 2026-10-28
+
+### Changes
+
+- `sponsorTransfer(transferTxB64, tokenType, amount, idempotencyKey?)`: the
+  sponsor pays the fee of a plain shielded transfer the caller built from its
+  own coins. The transfer carries an offer and nothing else, nets to zero and
+  spends at most `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS` coins; recipient and amount
+  are commitments, so the declared type and amount are recorded, not verified.
+  Off by default: `NIGHTGATE_SPONSOR_ALLOW_TRANSFERS` (policy file
+  `allowTransfers`); a token caller needs `sponsorTransfer` in its grant. Job
+  kind `sponsorTransfer`, result `transfer: { tokenType, amount }`. A landed
+  transfer closes open offers whose half spent one of its coins.
+- Unshielded offers in sponsored calls: grant right `allowUnshieldedOffers`
+  with `allowedUnshieldedTokenTypes` (floor
+  `NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS` and
+  `NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES`, both also in the policy
+  file). A call may then move the caller's own NIGHT, or a listed type, into
+  the contract it calls: the offer sits next to a call of its intent, nets to
+  zero per type, sends every output to a sponsorable contract or back to a
+  spender, and spends no UTXO of the sponsor. Caller dust actions stay refused.
+  Job result and submit intent carry `unshielded: [{ type, amount, to }]`.
+- `burnFactoryToken(contractAddress?, name, amount, issuerKey?, sessionId,
+  idempotencyKey?, sponsorSessionId?)`: burns an amount of a factory token the
+  session holds; `issuerKey` names a token another issuer minted. Grantable,
+  circuit `burn`.
+- `mintFactoryToken`: `contractAddress` defaults to
+  `NIGHTGATE_TOKEN_FACTORY_CONTRACT`; a token caller may leave out `sessionId`
+  and mints from the session that pays its sponsored jobs (the grant's pin,
+  else the first pool wallet), which is then the issuer. Rate class `sponsor`,
+  as documented. A platform-pool grant may allow `mintFactoryToken`.
+  `getBoardStatus.factoryContract` names the default factory.
+- Receipts: `getJobStatus.receipt` on a landed `sponsorSwap` or
+  `sponsorTransfer`: `{ payload, signature, publicKey, algorithm }`, Ed25519
+  over canonical JSON of the chain facts and the terms. The key is
+  `NIGHTGATE_RECEIPT_SIGNING_KEY`, else derived from the active encryption key;
+  `getReceiptKey()` on the indexer service publishes it without credentials.
+- Directed offers: `postSwapOffer(…, takerSecretHash)` and
+  `sponsorSwap(…, takerSecret)`; board rows carry `directed`. A directed offer
+  is sponsored only with the secret its poster handed out.
+- Value budgets on grants: `maxValuePerDay: [{ tokenType, amount }]` on
+  `createAgentGrant(s)` and `updateAgentGrant`. Sponsored swaps (what the
+  caller gives), transfers, mints and burns of a listed type count against it
+  per UTC day; over the limit is 429 `grant-value` with `Retry-After`.
+  `getGrantUsage.limits.valuePerDay` shows the state.
+- Admin `getSponsorPolicy`: `allowTransfers`, `allowUnshieldedOffers` and
+  `allowedUnshieldedTokenTypes` on floor, grant and effective policy.
+- Schema: `AgentGrants` gains `allowUnshieldedOffers`,
+  `allowedUnshieldedTokenTypes`, `maxValuePerDay`, `valueUsedToday` and
+  `valueWindow`; `SwapOffers` gains `takerSecretHash`. All nullable;
+  `nightgate-schema-delta` adds them.
+- `@odatano/nightgate-tx` 0.17.0: swap wallet `buildTransfer({ tokenType,
+  amount, to, bind? })` and `readTransferShape`; client `sponsorTransfer`,
+  `mintFactoryToken`, `burnFactoryToken`, `getBoardStatus`, `getReceiptKey` and
+  `verifyReceipt(receipt, publicKey)`.
+
 ## 0.38.0 - 2026-10-28
 
 ### Changes

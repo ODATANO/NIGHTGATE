@@ -5,7 +5,7 @@ using {midnight} from '../db/schema';
  *
  * The service is open to anyone and each element sets its own access rule.
  * This lets health checks call the probes without credentials.
- * The probes getLiveness, getReadiness, getMetrics, getSyncStatus, getHealth and getBoardStatus are public.
+ * The probes getLiveness, getReadiness, getMetrics, getSyncStatus, getHealth, getBoardStatus and getReceiptKey are public.
  * Everything else needs a signed-in user or an admin.
  */
 @path    : '/odata/v4/midnight-indexer'
@@ -89,7 +89,15 @@ service NightgateIndexerService {
         swapsToday         : Integer; // per UTC day; sponsored swaps that succeeded on chain
         sponsorsConfigured : Integer;
         sponsorsReady      : Integer; // synced and holding DUST to pay a fee
+        factoryContract    : String; // hex; the token factory mintFactoryToken uses without a contractAddress; null = none set
         asOf               : Timestamp;
+    };
+
+    // Public. The key that signs job receipts, so a third party can check a receipt without reading the board.
+    @requires: 'any'
+    function getReceiptKey()                      returns {
+        publicKey : String; // hex; Ed25519
+        algorithm : String; // ed25519
     };
 
 

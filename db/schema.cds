@@ -230,6 +230,11 @@ entity AgentGrants : cuid, managed {
     deployedContracts : LargeString; // JSON array of strings; always allowed
     allowedTokenTypes : LargeString; // JSON array of strings; null = platform list
     mintedTokenTypes  : LargeString; // JSON array of strings; always allowed
+    allowUnshieldedOffers : Boolean default false;
+    allowedUnshieldedTokenTypes : LargeString; // JSON array of strings; null = platform list
+    maxValuePerDay    : LargeString; // JSON object: token type to atoms; null = no limit; per UTC day
+    valueUsedToday    : LargeString; // JSON object: token type to atoms
+    valueWindow       : String(10); // YYYY-MM-DD; the UTC day valueUsedToday counts for
     validUntil        : Timestamp; // null = no expiry
     isActive          : Boolean default true;
     revokedAt         : Timestamp;
@@ -254,6 +259,7 @@ entity SwapOffers : cuid, managed {
     posterUserId  : String(200) not null;
     posterGrantId : UUID; // null = no agent grant
     sessionId     : UUID;
+    takerSecretHash : HexEncoded; // sha256 of the taker secret; null = anyone may take
     filledTxHash  : HexEncoded;
     closedAt      : Timestamp;
 }

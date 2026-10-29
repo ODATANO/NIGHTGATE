@@ -13,6 +13,7 @@ import { HEX64_RE } from '../utils/hex';
 
 export const TOKEN_FACTORY_REF = 'token-factory';
 export const TOKEN_FACTORY_MINT_CIRCUIT = 'mint';
+export const TOKEN_FACTORY_BURN_CIRCUIT = 'burn';
 /** `mint(name, amount, recipient)` takes a `Uint<64>`. */
 export const MAX_FACTORY_MINT_AMOUNT = (1n << 64n) - 1n;
 const NAME_BYTES = 32;

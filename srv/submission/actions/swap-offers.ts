@@ -65,7 +65,7 @@ function publicView(row: SwapOffer, now: Date) {
         givesType: row.givesType, givesAmount: row.givesAmount, wantsType: row.wantsType, wantsAmount: row.wantsAmount,
         tags: parseJsonStringList(row.tags), expiresAt: row.expiresAt ?? null, postedAt: row.createdAt ?? null,
         status: effectiveSwapOfferStatus(row, now), filledTxHash: row.filledTxHash ?? null, closedAt: row.closedAt ?? null,
-        changedAt: changedAtOf(row, now)
+        changedAt: changedAtOf(row, now), directed: !!row.takerSecretHash
     };
 }
 
@@ -89,6 +89,11 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         }
         const parsedTags = parseTags(tags);
         if (typeof parsedTags === 'string') return req.reject(400, parsedTags);
+        let takerSecretHash: string | null = null;
+        if (req.data.takerSecretHash !== undefined && req.data.takerSecretHash !== null && req.data.takerSecretHash !== '') {
+            takerSecretHash = String(req.data.takerSecretHash).trim().toLowerCase();
+            if (!HEX64_RE.test(takerSecretHash)) return req.reject(400, 'takerSecretHash must be 64 hex characters (sha256 of the taker secret)');
+        }
         if (!checkRate('compute', 'compute', req)) return;
 
         return runSubmission(req, async () => {
@@ -107,12 +112,14 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 ID, offer: offer.trim(), givesType: half.gives.tokenType, givesAmount: half.gives.amount,
                 wantsType: half.wants.tokenType, wantsAmount: half.wants.amount, bound: half.bound, inputs: half.inputs,
                 nullifiers: JSON.stringify(half.nullifiers), tags: JSON.stringify(parsedTags), status: 'open', expiresAt: expiry,
+                takerSecretHash,
                 ...posterOf(req), sessionId: req.agentGrant?.sessionId ?? null, createdAt: now, modifiedAt: now
             }));
             return {
                 offerId: ID, status: 'open', bound: half.bound,
                 givesType: half.gives.tokenType, givesAmount: half.gives.amount,
-                wantsType: half.wants.tokenType, wantsAmount: half.wants.amount, expiresAt: expiry
+                wantsType: half.wants.tokenType, wantsAmount: half.wants.amount, expiresAt: expiry,
+                directed: !!takerSecretHash
             };
         });
     });

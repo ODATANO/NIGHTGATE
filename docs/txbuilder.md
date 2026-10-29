@@ -290,7 +290,7 @@ it stopped. The state holds the wallet's coins: store it like a key.
 
 Returns `{ address, coinPublicKey, encryptionPublicKey, provingMode,
 maxInputs, sync, balances, pendingBalances, coins, spendable, buildHalf,
-takeOffer, serializeState, close }`.
+buildTransfer, takeOffer, serializeState, close }`.
 
 - `balances()` sums the free coins per token type. `pendingBalances()` sums
   what the halves built here bring back once their swaps land, the change of
@@ -311,6 +311,32 @@ takeOffer, serializeState, close }`.
 
 A half refers to a recent state of the coin tree and expires with it: build
 the halves and hand them over close together.
+
+### Transfers
+
+A payout or an invoice settlement needs no counterparty online: the swap
+wallet builds a plain transfer and `sponsorTransfer` pays its fee.
+
+```js
+const built = await wallet.buildTransfer({ tokenType: CREDIT, amount: 250n, to: recipientShieldedAddress });
+const { txHash, transfer, receipt } = await ng.sponsorTransfer({
+    transferTxB64: built.txB64, tokenType: CREDIT, amount: '250'
+});
+```
+
+- `buildTransfer({ tokenType, amount, to, bind? })` -> `{ txB64, bound,
+  serializedBytes, inputs, terms, revert }`. `to` is the recipient's shielded
+  address (`mn_shield-addr_...`). The wallet spends the smallest coins that fit
+  `maxInputs`, the recipient gets one coin, the wallet its change. `bind: true`
+  (default) seals the transfer; `bind: false` leaves it unbound.
+- The transfer nets to zero and shows no token type, so the server records
+  `tokenType` and `amount` as the caller's declaration (`declared: true` in the
+  receipt); it checks the shape (`readTransferShape(tx)`, the same rule the
+  sponsor applies) and that the declared type is on its list.
+- `revert()` releases the coins of a transfer that is not handed over. Until
+  then, or until it lands, they are pending in the wallet.
+- `getJobStatus` of a landed swap or transfer carries `receipt`; `verifyReceipt(receipt,
+  publicKey)` checks it against the key `ng.getReceiptKey()` publishes.
 
 ### Many small coins
 

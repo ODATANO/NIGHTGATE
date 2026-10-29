@@ -42,6 +42,12 @@ export interface SponsorPolicy {
     ownTokenTypes?: string[];
     /** Token types minted anywhere on the platform that are part of `allowedTokenTypes`. */
     sharedTokenTypes?: string[];
+    /** Sponsor plain shielded transfers of a listed token type. The platform and, for an agent, the grant must both allow it. */
+    allowTransfers?: boolean;
+    /** Sponsor a call whose intent moves the caller's own unshielded tokens into the contract. Platform and grant must both allow it. */
+    allowUnshieldedOffers?: boolean;
+    /** Raw token types an unshielded offer may move besides NIGHT. Empty means NIGHT only. */
+    allowedUnshieldedTokenTypes?: string[];
     /** Counts per rate class that replace the config keys while the file is set. */
     rateLimits?: Partial<Record<RateClass, number>>;
 }
@@ -56,6 +62,9 @@ export interface GrantPolicyInput {
     /** Token types minted under this grant. Sponsored in addition to the narrowed list while the platform sponsors contract mints. */
     mintedTokenTypes?: string[] | null;
     allowSwaps?: boolean | null;
+    allowTransfers?: boolean | null;
+    allowUnshieldedOffers?: boolean | null;
+    allowedUnshieldedTokenTypes?: string[] | null;
 }
 
 /** Maximum entries per list. A grant serves one consumer and does not need more. */
@@ -122,8 +131,10 @@ export function validateContractCircuits(name: string, raw: unknown): ContractCi
 
 function envPolicy(): SponsorPolicy {
     let allowedTokenTypes: string[];
+    let allowedUnshieldedTokenTypes: string[];
     try {
         allowedTokenTypes = validateTokenTypeList('NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES', configList('NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES'));
+        allowedUnshieldedTokenTypes = validateTokenTypeList('NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES', configList('NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES'));
     } catch (e) {
         // Refuse to sponsor rather than use a list that silently lost an entry.
         throw new SponsorPolicyUnavailableError(`${(e as Error).message}; refusing to sponsor`);
@@ -135,7 +146,10 @@ function envPolicy(): SponsorPolicy {
         allowedTokenTypes,
         allowContractMints: configFlag('NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS'),
         allowSwaps: configFlag('NIGHTGATE_SPONSOR_ALLOW_SWAPS'),
-        shareMintedTokenTypes: configFlag('NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES')
+        allowTransfers: configFlag('NIGHTGATE_SPONSOR_ALLOW_TRANSFERS'),
+        shareMintedTokenTypes: configFlag('NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES'),
+        allowUnshieldedOffers: configFlag('NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS'),
+        allowedUnshieldedTokenTypes
     };
 }
 
@@ -171,7 +185,7 @@ function readPolicyFile(filePath: string): SponsorPolicy {
     }
     const unknownKeys = Object.keys(parsed).filter(k => !POLICY_FILE_KEYS.includes(k));
     if (unknownKeys.length) throw new Error(`policy file has unknown keys: ${unknownKeys.join(', ')}`);
-    for (const flag of ['allowDeploy', 'allowContractMints', 'allowSwaps', 'shareMintedTokenTypes']) {
+    for (const flag of ['allowDeploy', 'allowContractMints', 'allowSwaps', 'allowTransfers', 'shareMintedTokenTypes', 'allowUnshieldedOffers']) {
         if (parsed[flag] !== undefined && typeof parsed[flag] !== 'boolean') throw new Error(`${flag} must be a boolean`);
     }
     const rateLimits = readRateLimits(parsed.rateLimits);
@@ -187,7 +201,10 @@ function readPolicyFile(filePath: string): SponsorPolicy {
         allowedTokenTypes: validateTokenTypeList('allowedTokenTypes', parsed.allowedTokenTypes),
         allowContractMints: parsed.allowContractMints === true,
         allowSwaps: parsed.allowSwaps === true,
+        allowTransfers: parsed.allowTransfers === true,
         shareMintedTokenTypes: parsed.shareMintedTokenTypes === true,
+        allowUnshieldedOffers: parsed.allowUnshieldedOffers === true,
+        allowedUnshieldedTokenTypes: validateTokenTypeList('allowedUnshieldedTokenTypes', parsed.allowedUnshieldedTokenTypes),
         ...(rateLimits ? { rateLimits } : {})
     };
 }
@@ -204,13 +221,17 @@ function readRateLimits(raw: unknown): Partial<Record<RateClass, number>> | unde
     return out;
 }
 
-const POLICY_FILE_KEYS = ['allowedContracts', 'allowedCircuits', 'contractCircuits', 'allowDeploy', 'allowedTokenTypes', 'allowContractMints', 'allowSwaps', 'shareMintedTokenTypes', 'rateLimits'];
+const POLICY_FILE_KEYS = [
+    'allowedContracts', 'allowedCircuits', 'contractCircuits', 'allowDeploy', 'allowedTokenTypes', 'allowContractMints', 'allowSwaps',
+    'allowTransfers', 'shareMintedTokenTypes', 'allowUnshieldedOffers', 'allowedUnshieldedTokenTypes', 'rateLimits'
+];
 
 /** Env settings the policy file replaces while it is set. */
 const SHADOWED_ENV_KEYS = [
     'NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES',
     'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_SWAPS',
-    'NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES'
+    'NIGHTGATE_SPONSOR_ALLOW_TRANSFERS', 'NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES',
+    'NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS', 'NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES'
 ];
 let shadowedEnvLogged = false;
 
@@ -265,6 +286,8 @@ export function getGlobalSponsorPolicy(): SponsorPolicy {
             `, ${policy.allowedTokenTypes?.length ?? 0} token type(s)` +
             (policy.allowContractMints ? ', contract mints sponsored' : '') +
             (policy.allowSwaps ? ', swaps sponsored' : '') +
+            (policy.allowTransfers ? ', transfers sponsored' : '') +
+            (policy.allowUnshieldedOffers ? `, unshielded offers sponsored (${policy.allowedUnshieldedTokenTypes?.length ?? 0} type(s) besides NIGHT)` : '') +
             (policy.shareMintedTokenTypes ? ', minted types shared' : '') +
             (policy.rateLimits ? `, rate limits ${Object.entries(policy.rateLimits).map(([k, v]) => `${k}=${v}`).join(' ')}` : ''));
         return policy;
@@ -366,12 +389,21 @@ export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicy
         allowedTokenTypes: [...listed, ...minted.filter(t => !listed.includes(t))],
         allowContractMints: floor.allowContractMints === true,
         allowSwaps: floor.allowSwaps === true && (grant ? grant.allowSwaps === true : true),
+        allowTransfers: floor.allowTransfers === true && (grant ? grant.allowTransfers === true : true),
         shareMintedTokenTypes: sharing,
         ...(minted.length ? { ownTokenTypes: minted } : {}),
         ...(sharedTypes.length ? { sharedTokenTypes: sharedTypes } : {}),
         allowDeploy: floor.allowDeploy === true && (grant ? grant.allowDeploy === true : true),
-        ...(deployed.length ? { ownContracts: deployed } : {})
+        ...(deployed.length ? { ownContracts: deployed } : {}),
+        allowUnshieldedOffers: floor.allowUnshieldedOffers === true && (grant ? grant.allowUnshieldedOffers === true : true),
+        allowedUnshieldedTokenTypes: narrowUnshieldedTypes(floor.allowedUnshieldedTokenTypes ?? [], grant?.allowedUnshieldedTokenTypes)
     };
+}
+
+/** NIGHT is always allowed and never listed. A grant list keeps only the types the floor lists. */
+function narrowUnshieldedTypes(floor: string[], grant: string[] | null | undefined): string[] {
+    const wanted = (grant ?? []).filter(t => typeof t === 'string' && HEX64_RE.test(t));
+    return wanted.length === 0 ? floor : wanted.filter(t => floor.includes(t));
 }
 
 function floorTokenTypes(floor: SponsorPolicy, sharedTypes: string[]): string[] {
@@ -390,6 +422,12 @@ export function grantPolicyConflict(floor: SponsorPolicy, grant: GrantPolicyInpu
     } catch (e) {
         if (e instanceof SponsorPolicyEmptyError) return e.message;
         throw e;
+    }
+    const floorUnshielded = floor.allowedUnshieldedTokenTypes ?? [];
+    const outsideUnshielded = (grant.allowedUnshieldedTokenTypes ?? []).filter(t => !floorUnshielded.includes(t));
+    if (outsideUnshielded.length > 0) {
+        return `allowedUnshieldedTokenTypes ${outsideUnshielded.join(', ')} ${outsideUnshielded.length === 1 ? 'is' : 'are'} not in the platform's unshielded token-type list` +
+            `${floorUnshielded.length === 0 ? ' (the platform lists none besides NIGHT)' : ''}; the platform policy has to list a type before a grant can`;
     }
     const floorTokens = floorTokenTypes(floor, effective.sharedTokenTypes ?? []);
     const outside = (grant.allowedTokenTypes ?? []).filter(t => !floorTokens.includes(t));

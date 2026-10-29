@@ -74,6 +74,22 @@ export function readSwapTerms(tx) {
     return { ...terms, inputs: offer.inputs.length, outputs: offer.outputs.length };
 }
 
+/** A plain transfer as the sponsor accepts it: an offer and nothing else that nets to zero. Throws otherwise; recipient and amount are commitments. */
+export function readTransferShape(tx) {
+    const refuse = (why) => { throw new Error(`not a transfer: ${why}`); };
+    if (tx?.intents !== undefined && tx?.intents !== null && sizeOf(tx.intents) !== 0) refuse('it carries an intent (a contract call, unshielded value or dust actions)');
+    if (tx?.fallibleOffer !== undefined && tx?.fallibleOffer !== null && sizeOf(tx.fallibleOffer) !== 0) refuse('it carries a fallible offer');
+    const offer = tx?.guaranteedOffer;
+    if (!offer || !Array.isArray(offer.inputs) || !Array.isArray(offer.outputs)) refuse('it carries no guaranteed offer');
+    if (sizeOf(offer.transients ?? []) !== 0) refuse('it carries a transient coin');
+    if ([...offer.inputs, ...offer.outputs].some((coin) => coin?.contractAddress !== undefined && coin?.contractAddress !== null)) refuse('it carries a contract-owned coin');
+    if (offer.inputs.length < 1) refuse('it spends no coin');
+    if (offer.outputs.length < 1 || offer.outputs.length > 2) refuse(`it creates ${offer.outputs.length} coins; a transfer creates the recipient's coin and at most its change`);
+    // The ledger drops zero entries from the deltas, so a transfer shows none.
+    if (sizeOf(offer.deltas) !== 0) refuse('it does not net to zero (a net change in a type makes it a swap half)');
+    return { inputs: offer.inputs.length, outputs: offer.outputs.length };
+}
+
 /** Default limit of coins one half may spend. Matches the sponsor's default. */
 export const SWAP_MAX_INPUTS = 4;
 
@@ -231,6 +247,46 @@ export async function createSwapWallet(opts) {
         };
     };
 
+    // A transfer is a swap of a type against itself to another address: the same build, no offer file.
+    const buildTransfer = ({ tokenType, amount, to, bind = true } = {}) => oneAtATime(async () => {
+        const leg = legOf({ tokenType, amount }, 'transfer');
+        if (typeof to !== 'string' || to.trim() === '') throw new Error('buildTransfer: to must be a shielded address (mn_shield-addr_...)');
+        let receiver;
+        try {
+            receiver = sdk.addressFormat.ShieldedAddress.codec.decode(networkId, sdk.addressFormat.MidnightBech32m.parse(to.trim()));
+        } catch (e) {
+            throw new Error(`buildTransfer: to is not a shielded address of ${networkId}: ${e?.message ?? String(e)}`);
+        }
+        const spendable = spendableWithin(await freeCoins(), leg.tokenType, maxInputs);
+        if (spendable < leg.amount) {
+            throw new Error(`buildTransfer: sending ${leg.amount} of ${leg.tokenType.slice(0, 16)} needs more than ${maxInputs} coins; the ${maxInputs} largest free coins hold ${spendable}`);
+        }
+        plan = { remaining: leg.amount, slots: maxInputs };
+        let unproven;
+        try {
+            unproven = await wallet.initSwap(keys, { [leg.tokenType]: leg.amount }, [{ type: leg.tokenType, receiverAddress: receiver, amount: leg.amount }]);
+        } finally {
+            plan = null;
+        }
+        try {
+            const inputs = unproven?.guaranteedOffer?.inputs?.length;
+            if (Number.isInteger(inputs) && inputs > maxInputs) throw new Error(`buildTransfer: the transfer spends ${inputs} coins, more than the ${maxInputs} a sponsor accepts`);
+            const proven = await sdk.provingService.prove(unproven);
+            const shape = readTransferShape(proven);
+            const tx = bind !== false ? proven.bind() : proven;
+            const bytes = new Uint8Array(tx.serialize());
+            return {
+                tx, bound: bind !== false, serializedBytes: bytes.length, txB64: Buffer.from(bytes).toString('base64'),
+                terms: { tokenType: leg.tokenType, amount: leg.amount, to: to.trim() }, inputs: shape.inputs,
+                // The wallet keeps the transfer's coins reserved until it lands or `revert` is called.
+                revert: () => wallet.revertTransaction(tx)
+            };
+        } catch (e) {
+            await wallet.revertTransaction(unproven).catch(() => { /* the build error is the one to report */ });
+            throw e;
+        }
+    });
+
     const buildHalf = ({ give, want, bind = true } = {}) => oneAtATime(async () => {
         const g = legOf(give, 'give');
         const w = legOf(want, 'want');
@@ -306,6 +362,9 @@ export async function createSwapWallet(opts) {
          * By default the half is sealed and comes with an offer file. With `bind: false` it is unsealed and only base64.
          */
         buildHalf,
+
+        /** Builds and proves a fee-free transfer of `amount` of `tokenType` to the shielded address `to`, for `sponsorTransfer`. */
+        buildTransfer,
 
         /**
          * Accepts an offer. Checks its terms against `expect` if given, builds the matching half,

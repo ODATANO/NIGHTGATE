@@ -19,7 +19,8 @@ import {
 import { checkRateClass } from './utils/rate-classes';
 import { normalizeHttpError } from './utils/http-errors';
 import { buildBoardStatus } from './submission/board-status';
-import { getBoardStatus, getReadiness, getReorgHistory, getRuntimeInfo, reindexFromHeight, resumeCrawler } from '#cds-models/NightgateIndexerService';
+import { receiptPublicKey } from './submission/receipts';
+import { getBoardStatus, getReadiness, getReceiptKey, getReorgHistory, getRuntimeInfo, reindexFromHeight, resumeCrawler } from '#cds-models/NightgateIndexerService';
 import type { Request } from '@sap/cds';
 
 const log = cds.log('nightgate:indexer');
@@ -109,6 +110,11 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         this.on(getBoardStatus, async (req) => {
             if (!checkRateClass('read', 'read', req)) return;
             return buildBoardStatus(this.db);
+        });
+
+        this.on(getReceiptKey, async (req) => {
+            if (!checkRateClass('read', 'read', req)) return;
+            return receiptPublicKey();
         });
 
         this.on(getReadiness, async (req) => {

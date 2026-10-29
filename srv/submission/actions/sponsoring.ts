@@ -13,17 +13,34 @@ import { resolveSponsorPolicyForRequest } from '../sponsor-policy';
 import { getConfiguredFeeSponsorSessions } from '../fee-sponsor';
 import { facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
 import { NightgateError, isNightgateError } from '../../utils/errors';
-import { walletDescribeSwapHalf, walletDescribeTransaction } from '../../midnight/wallet-worker-client';
+import { walletDescribeSwapHalf, walletDescribeTransaction, walletDescribeTransfer } from '../../midnight/wallet-worker-client';
 import { transactionBytesOf } from '../../utils/offer-file';
-import { expireSwapOffers, isSwapOfferOpen, loadSwapOffer } from '../swap-offers';
+import { expireSwapOffers, isSwapOfferOpen, loadSwapOffer, takerSecretMatches } from '../swap-offers';
+import { consumeValueBudget } from '../../sessions/agent-grants';
+import { HEX64_RE } from '../../utils/hex';
 import type { SubmissionContext } from './context';
 import type { Request } from '@sap/cds';
-import { sponsorFinalizedTransaction, sponsorSwap, sponsorUnboundTransaction } from '#cds-models/NightgateService';
+import { sponsorFinalizedTransaction, sponsorSwap, sponsorTransfer, sponsorUnboundTransaction } from '#cds-models/NightgateService';
 
 /** True when the worker refused the bytes themselves, not the call. */
 function isRefusal(e: unknown): boolean {
     return (isNightgateError(e) && e.code === 'SPONSOR_REFUSED')
-        || /not a proven transaction|not a swap half|is empty/.test((e as Error)?.message ?? String(e));
+        || /not a proven transaction|not a swap half|not a transfer|is empty/.test((e as Error)?.message ?? String(e));
+}
+
+/** The policy fields a sponsor job carries to the worker. */
+function policyFieldsFor(req: Request) {
+    const { allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes, allowUnshieldedOffers, allowedUnshieldedTokenTypes } = resolveSponsorPolicyForRequest(req);
+    return { allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes, allowUnshieldedOffers, allowedUnshieldedTokenTypes };
+}
+
+/** A grant's value budget takes the amount the caller moves out. Returns false after rejecting. */
+async function takeValueBudget(req: Request, db: SubmissionContext['db'], tokenType: string, amount: string): Promise<boolean> {
+    const grantId = req.agentGrant?.ID;
+    if (!grantId) return true;
+    let atoms: bigint;
+    try { atoms = BigInt(amount); } catch { return true; }
+    return consumeValueBudget(db, req, String(grantId), tokenType, atoms);
 }
 
 /**
@@ -73,7 +90,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
                 await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: req.user?.id, config: getNightgatePluginConfig() });
             }
             // The server policy, narrowed by the agent grant. Refuses here, before a job exists.
-            const { allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes } = resolveSponsorPolicyForRequest(req);
+            const policy = policyFieldsFor(req);
             // If this is a deploy, the new contract address is stored on this grant.
             const grantId: string | undefined = req.agentGrant?.ID ? String(req.agentGrant.ID) : undefined;
             // Sponsors are shared by many callers. Mixing the caller into the key
@@ -93,7 +110,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
                 },
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
-                command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes, grantId }
+                command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId: effectiveSponsor, ...policy, grantId }
             });
             // The job belongs to the sponsor session. The caller needs it to poll the job.
             return { ...job, sessionId: effectiveSponsor };
@@ -115,7 +132,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
             if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
                 await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: req.user?.id, config: getNightgatePluginConfig() });
             }
-            const { allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes } = resolveSponsorPolicyForRequest(req);
+            const policy = policyFieldsFor(req);
             const grantId: string | undefined = req.agentGrant?.ID ? String(req.agentGrant.ID) : undefined;
             const caller = String(req.user?.id ?? 'anonymous');
             const scopedIdempotencyKey = idempotencyKey
@@ -130,22 +147,78 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
                 },
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
-                command: { op: 'sponsorUnbound', unboundTxB64, sponsorSessionId: effectiveSponsor, allowedContracts, allowedCircuits, allowDeploy, ownContracts, allowedTokenTypes, grantId }
+                command: { op: 'sponsorUnbound', unboundTxB64, sponsorSessionId: effectiveSponsor, ...policy, grantId }
+            });
+            return { ...job, sessionId: effectiveSponsor };
+        });
+    });
+
+    srv.on(sponsorTransfer, async (req) => {
+        const { transferTxB64, idempotencyKey } = req.data;
+        if (!transferTxB64) return req.reject(400, 'transferTxB64 is required');
+        const tokenType = String(req.data.tokenType ?? '').trim().toLowerCase();
+        if (!HEX64_RE.test(tokenType)) return req.reject(400, 'tokenType must be 64 hex characters (a raw token type)');
+        const amount = String(req.data.amount ?? '').trim();
+        if (!/^[1-9]\d*$/.test(amount)) return req.reject(400, 'amount must be a positive integer in atoms');
+        let txB64: string;
+        try { txB64 = Buffer.from(await transactionBytesOf(transferTxB64)).toString('base64'); }
+        catch (e) { return req.reject(400, `transferTxB64: ${(e as Error).message}`); }
+        const effectiveSponsor = sponsorSessionFor(req);
+        if (!effectiveSponsor) return;
+        if (rejectIfMainnetBlocked(req)) return;
+        if (!checkRate('sponsor', 'sponsor', req)) return;
+        if (!await rejectUnlessProven(req, () => walletDescribeTransfer({ txB64 }))) return;
+        if (!await takeValueBudget(req, db, tokenType, amount)) return;
+
+        return runSubmission(req, async () => {
+            const facadeCfg = facadeConfigFromEnv();
+            await ensureNetworkId(facadeCfg.networkId);
+            if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
+                await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: req.user?.id, config: getNightgatePluginConfig() });
+            }
+            const policy = resolveSponsorPolicyForRequest(req);
+            if (policy.allowTransfers !== true) {
+                throw new NightgateError('SPONSOR_POLICY_EMPTY', 'transfers are not sponsored here (NIGHTGATE_SPONSOR_ALLOW_TRANSFERS or policy file allowTransfers, and sponsorTransfer in the grant)');
+            }
+            if (!policy.allowedTokenTypes?.includes(tokenType)) {
+                throw new NightgateError('SPONSOR_POLICY_EMPTY', `token type ${tokenType.slice(0, 16)}… is not in allowedTokenTypes for this caller`);
+            }
+            const grantId: string | undefined = req.agentGrant?.ID ? String(req.agentGrant.ID) : undefined;
+            const caller = String(req.user?.id ?? 'anonymous');
+            const scopedIdempotencyKey = idempotencyKey
+                ? bytesToHex(sha256(Buffer.from(`${caller}\u0000${idempotencyKey}`, 'utf8')))
+                : undefined;
+            const job = await startJob({
+                kind: 'sponsorTransfer', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
+                request: {
+                    feeSponsor: effectiveSponsor, caller, tokenType, amount,
+                    bytes: txB64.length,
+                    txHash: bytesToHex(sha256(Buffer.from(txB64, 'base64')))
+                },
+                requestedBy: req.user?.id,
+                grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
+                command: { op: 'sponsorUnbound', transfer: { txB64, tokenType, amount }, sponsorSessionId: effectiveSponsor, allowedTokenTypes: policy.allowedTokenTypes, grantId }
             });
             return { ...job, sessionId: effectiveSponsor };
         });
     });
 
     srv.on(sponsorSwap, async (req) => {
-        const { takerHalfB64, idempotencyKey, offerId } = req.data;
+        const { takerHalfB64, idempotencyKey, offerId, takerSecret } = req.data;
         let makerHalfB64 = req.data.makerHalfB64 as string | undefined;
         if (offerId && makerHalfB64) return req.reject(400, 'makerHalfB64 and offerId: one or the other');
+        // The value the caller moves out: what the maker wants, since the caller takes the offer.
+        let callerGives: { tokenType: string; amount: string } | undefined;
         if (offerId) {
             await expireSwapOffers(db);
             const row = await loadSwapOffer(db, String(offerId));
             if (!row) return req.reject(404, 'swap offer not found');
             if (!isSwapOfferOpen(row)) return req.reject(409, `swap offer is ${row.status === 'open' ? 'expired' : row.status}`);
+            if (row.takerSecretHash && !takerSecretMatches(row, takerSecret)) {
+                return req.reject(403, 'this offer is directed: sponsoring it needs the taker secret its poster handed out');
+            }
             makerHalfB64 = row.offer;
+            callerGives = { tokenType: row.wantsType, amount: row.wantsAmount };
         }
         if (!makerHalfB64) return req.reject(400, 'makerHalfB64 is required');
         if (!takerHalfB64) return req.reject(400, 'takerHalfB64 is required');
@@ -160,8 +233,11 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRate('sponsor', 'sponsor', req)) return;
         for (const name of offerId ? ['takerHalfB64' as const] : ['makerHalfB64' as const, 'takerHalfB64' as const]) {
-            if (!await rejectUnlessProven(req, () => walletDescribeSwapHalf({ halfB64: halves[name] }))) return;
+            let half: Awaited<ReturnType<typeof walletDescribeSwapHalf>> | undefined;
+            if (!await rejectUnlessProven(req, async () => { half = await walletDescribeSwapHalf({ halfB64: halves[name] }); })) return;
+            if (name === 'takerHalfB64' && half && !callerGives) callerGives = half.gives;
         }
+        if (callerGives && !await takeValueBudget(req, db, callerGives.tokenType, callerGives.amount)) return;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();

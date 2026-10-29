@@ -164,17 +164,56 @@ export interface NightgateClient {
     submitContractCall(p: ActionParams): Promise<JobResult>;
     submitContractCallBatch(p: ActionParams): Promise<JobResult>;
     mintShieldedTestToken(p: ActionParams): Promise<JobResult>;
+    /** Mints a named token on a token factory. Takes `name`, `amount`, `recipientCoinPublicKey`, optionally `contractAddress` and `sessionId`. */
+    mintFactoryToken(p: ActionParams): Promise<JobResult>;
+    /** Burns `amount` of a factory token the session holds. Takes `name`, `amount`, `sessionId`, optionally `contractAddress` and `issuerKey`. */
+    burnFactoryToken(p: ActionParams): Promise<JobResult>;
     sendNight(p: ActionParams): Promise<JobResult>;
 
     // the server pays the fee for a transaction built elsewhere
     sponsorFinalized(p: ActionParams): Promise<JobResult>;
     sponsorUnbound(p: ActionParams): Promise<JobResult>;
     /**
-     * Takes `makerHalfB64`, `takerHalfB64` and optionally `idempotencyKey`.
-     * Each half is either offer file text (`swapoffer1...`) or base64.
+     * Takes `makerHalfB64`, `takerHalfB64` and optionally `idempotencyKey`; with `offerId` the maker half comes from the board,
+     * and a directed offer needs its `takerSecret`. Each half is either offer file text (`swapoffer1...`) or base64.
      */
     sponsorSwap(p: ActionParams): Promise<JobResult>;
+    /** Takes `transferTxB64`, `tokenType`, `amount` and optionally `idempotencyKey`. The transfer comes from the swap wallet's `buildTransfer`. */
+    sponsorTransfer(p: ActionParams): Promise<JobResult>;
     buildSponsorable(p: ActionParams): Promise<JobResult>;
+
+    // public reads of the indexer service
+    getBoardStatus(): Promise<BoardStatus>;
+    getReceiptKey(): Promise<ReceiptKey>;
 }
+
+/** Counts of the offer board and the sponsor pool. */
+export interface BoardStatus {
+    openOffers: number;
+    offersFilledToday: number;
+    swapsToday: number;
+    sponsorsConfigured: number;
+    sponsorsReady: number;
+    /** The token factory a mint without `contractAddress` uses; null when the instance sets none. */
+    factoryContract: string | null;
+    asOf: string;
+}
+
+/** The key an instance signs job receipts with. */
+export interface ReceiptKey { publicKey: string; algorithm: string }
+
+/** A signed statement of the instance about a landed sponsored swap or transfer, as `getJobStatus` returns it. */
+export interface Receipt {
+    /** Canonical JSON, the signed bytes. */
+    payload: string;
+    /** Hex, Ed25519 over the UTF-8 payload. */
+    signature: string;
+    /** Hex, the instance's receipt key. */
+    publicKey: string;
+    algorithm: string;
+}
+
+/** Checks a receipt. Pass the key from `getReceiptKey()` so the receipt cannot vouch for itself. */
+export declare function verifyReceipt(receipt: Receipt, publicKeyHex?: string): boolean;
 
 export declare function connect(opts: ConnectOptions): NightgateClient;

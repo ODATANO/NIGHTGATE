@@ -56,15 +56,20 @@ export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
     'sponsorFinalizedTransaction',
     'sponsorUnboundTransaction',
     'sponsorSwap',
+    'sponsorTransfer',
     'postSwapOffer',
     'retireSwapOffer',
     'grantDisclosureToHolders',
     'revokeHolderDisclosure',
-    'mintFactoryToken'
+    'mintFactoryToken',
+    'burnFactoryToken'
 ];
 
 /** Actions that use no sponsor. A grant on the platform sponsor pool may allow them as well. */
 const POOL_NEUTRAL_ACTIONS: ReadonlySet<string> = new Set(['postSwapOffer', 'retireSwapOffer']);
+
+/** The pool pays these without a wallet session of the caller: the mint's issuer is the paying session. */
+const POOL_PAID_SESSION_ACTIONS: ReadonlySet<string> = new Set(['mintFactoryToken']);
 
 const SPONSOR_TRANSACTION_ACTIONS: ReadonlySet<string> = new Set([
     'sponsorFinalizedTransaction',
@@ -73,9 +78,11 @@ const SPONSOR_TRANSACTION_ACTIONS: ReadonlySet<string> = new Set([
 
 /** A grant may have swaps sponsored if `allowedActions` contains this action. */
 export const SPONSOR_SWAP_ACTION = 'sponsorSwap';
+/** A grant may have plain transfers sponsored if `allowedActions` contains this action. */
+export const SPONSOR_TRANSFER_ACTION = 'sponsorTransfer';
 
 /** Actions where a sponsor pays for a caller's transaction. Their jobs run under the sponsor session, which may be the platform pool. */
-export const SPONSOR_PHASE2_ACTIONS: ReadonlySet<string> = new Set([...SPONSOR_TRANSACTION_ACTIONS, SPONSOR_SWAP_ACTION]);
+export const SPONSOR_PHASE2_ACTIONS: ReadonlySet<string> = new Set([...SPONSOR_TRANSACTION_ACTIONS, SPONSOR_SWAP_ACTION, SPONSOR_TRANSFER_ACTION]);
 
 /**
  * Entities a token may read. Session-specific ones are filtered to the grant's session in enforceAgentGrant.
@@ -320,7 +327,8 @@ const ACTION_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
     grantDisclosure: ['grantDisclosure'],
     revokeDisclosure: ['revokeDisclosure'],
     reindexDisclosures: [],
-    mintFactoryToken: ['mint']
+    mintFactoryToken: ['mint'],
+    burnFactoryToken: ['burn']
 };
 
 export function circuitsOfRequest(event: string, d: Record<string, unknown>): string[] | null {
@@ -413,6 +421,12 @@ function budgetHeaderState(grant: AgentGrant, budget: GrantBudget): RateLimitSta
     };
 }
 
+/** One entry of `maxValuePerDay` as the API takes it. */
+interface ValueBudgetInput { tokenType?: string | null; amount?: string | null }
+/** `maxValuePerDay` as stored: token type to atoms, both as text. */
+export type ValueBudgetMap = Record<string, string>;
+const MAX_VALUE_BUDGET_ENTRIES = 64;
+
 interface GrantShapeInput {
     allowedActions?: string[] | null;
     maxJobsPerDay?: number | null;
@@ -424,6 +438,9 @@ interface GrantShapeInput {
     allowDeploy?: boolean | null;
     maxDeploys?: number | null;
     allowedTokenTypes?: string[] | null;
+    allowUnshieldedOffers?: boolean | null;
+    allowedUnshieldedTokenTypes?: string[] | null;
+    maxValuePerDay?: ValueBudgetInput[] | null;
 }
 
 /** Validated values, ready to store. An empty list means no limit. */
@@ -438,6 +455,48 @@ interface GrantShapeValues {
     allowedTokenTypes: string[];
     allowDeploy: boolean;
     maxDeploys: number | null;
+    allowUnshieldedOffers: boolean;
+    allowedUnshieldedTokenTypes: string[];
+    /** Empty means no value limit. */
+    maxValuePerDay: ValueBudgetMap;
+}
+
+/** Parses a stored `maxValuePerDay` or `valueUsedToday`. Malformed data reads as empty. */
+export function parseValueBudgetMap(raw: string | null | undefined): ValueBudgetMap {
+    if (!raw) return {};
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+        const out: ValueBudgetMap = {};
+        for (const [type, amount] of Object.entries(parsed as Record<string, unknown>)) {
+            if (HEX64_RE.test(type) && typeof amount === 'string' && /^\d+$/.test(amount)) out[type] = amount;
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+/** Validates the API form of `maxValuePerDay`; throws with the reason. */
+function validateValueBudget(raw: unknown): ValueBudgetMap {
+    if (raw === undefined || raw === null) return {};
+    if (!Array.isArray(raw)) throw new Error('maxValuePerDay must be an array of { tokenType, amount }');
+    if (raw.length > MAX_VALUE_BUDGET_ENTRIES) throw new Error(`maxValuePerDay has ${raw.length} entries; at most ${MAX_VALUE_BUDGET_ENTRIES} are allowed`);
+    const out: ValueBudgetMap = {};
+    for (const entry of raw as ValueBudgetInput[]) {
+        const type = String(entry?.tokenType ?? '').trim().toLowerCase().replace(/^0x/, '');
+        if (!HEX64_RE.test(type)) throw new Error(`maxValuePerDay: tokenType '${String(entry?.tokenType ?? '').slice(0, 32)}' is not a raw token type (64 hex)`);
+        const amount = String(entry?.amount ?? '').trim();
+        if (!/^[1-9]\d*$/.test(amount)) throw new Error(`maxValuePerDay: amount for ${type.slice(0, 16)}… must be a positive integer in atoms`);
+        if (type in out) throw new Error(`maxValuePerDay lists token type ${type.slice(0, 16)}… twice`);
+        out[type] = amount;
+    }
+    return out;
+}
+
+/** `maxValuePerDay` in the API's array form. */
+export function valueBudgetList(map: ValueBudgetMap): Array<{ tokenType: string; amount: string }> {
+    return Object.entries(map).map(([tokenType, amount]) => ({ tokenType, amount }));
 }
 
 /**
@@ -483,10 +542,18 @@ export function validateGrantShape(
         return fail('maxDeploys needs allowDeploy: true');
     }
 
+    // Moving the agent's own unshielded tokens into a contract is a separate right as well, bound to a sponsoring action.
+    const allowUnshieldedOffers = has('allowUnshieldedOffers') || !existing ? input.allowUnshieldedOffers === true : existing.allowUnshieldedOffers === true;
+    if (allowUnshieldedOffers && !effectiveActions.some(a => SPONSOR_TRANSACTION_ACTIONS.has(a))) {
+        return fail("allowUnshieldedOffers needs 'sponsorFinalizedTransaction' or 'sponsorUnboundTransaction' in allowedActions: the offer rides in a sponsored call");
+    }
+
     // Same rule as the policy file: only what both the platform policy and the grant allow is allowed.
     let allowedContracts: string[];
     let allowedCircuits: string[];
     let allowedTokenTypes: string[];
+    let allowedUnshieldedTokenTypes: string[];
+    let maxValuePerDay: ValueBudgetMap;
     try {
         allowedContracts = has('allowedContracts') || !existing
             ? validatePolicyList('allowedContracts', input.allowedContracts)
@@ -497,11 +564,21 @@ export function validateGrantShape(
         allowedTokenTypes = has('allowedTokenTypes') || !existing
             ? validateTokenTypeList('allowedTokenTypes', input.allowedTokenTypes)
             : parseGrantList(existing.allowedTokenTypes);
+        allowedUnshieldedTokenTypes = has('allowedUnshieldedTokenTypes') || !existing
+            ? validateTokenTypeList('allowedUnshieldedTokenTypes', input.allowedUnshieldedTokenTypes)
+            : parseGrantList(existing.allowedUnshieldedTokenTypes);
+        maxValuePerDay = has('maxValuePerDay') || !existing
+            ? validateValueBudget(input.maxValuePerDay)
+            : parseValueBudgetMap(existing.maxValuePerDay);
     } catch (e) {
         return fail((e as Error).message);
     }
+    if (allowedUnshieldedTokenTypes.length && !allowUnshieldedOffers) return fail('allowedUnshieldedTokenTypes needs allowUnshieldedOffers: true');
 
-    const values: GrantShapeValues = { allowedContracts, allowedCircuits, allowedTokenTypes, allowDeploy, maxDeploys };
+    const values: GrantShapeValues = {
+        allowedContracts, allowedCircuits, allowedTokenTypes, allowDeploy, maxDeploys,
+        allowUnshieldedOffers, allowedUnshieldedTokenTypes, maxValuePerDay
+    };
     if (actions) values.allowedActions = actions;
     for (const field of BUDGET_FIELDS) {
         if (existing && !has(field)) continue;
@@ -541,11 +618,12 @@ function parseTimestamp(raw: unknown): string | null | undefined {
  * A grant without own lists uses the platform's, so it is not checked here.
  */
 function policyReject(values: GrantShapeValues, deployedContracts: string[] = []): { status: number; code?: string; message: string } | null {
-    if (!values.allowedContracts.length && !values.allowedCircuits.length && !values.allowedTokenTypes.length) return null;
+    if (!values.allowedContracts.length && !values.allowedCircuits.length && !values.allowedTokenTypes.length && !values.allowedUnshieldedTokenTypes.length) return null;
     try {
         const conflict = grantPolicyConflict(getGlobalSponsorPolicy(), {
             allowedContracts: values.allowedContracts, allowedCircuits: values.allowedCircuits,
-            allowedTokenTypes: values.allowedTokenTypes, allowDeploy: values.allowDeploy, deployedContracts
+            allowedTokenTypes: values.allowedTokenTypes, allowDeploy: values.allowDeploy, deployedContracts,
+            allowUnshieldedOffers: values.allowUnshieldedOffers, allowedUnshieldedTokenTypes: values.allowedUnshieldedTokenTypes
         });
         return conflict ? { status: 400, message: conflict } : null;
     } catch (e) {
@@ -564,6 +642,9 @@ export interface GrantSponsorPolicyView {
     mintedTokenTypes: string[];
     allowDeploy: boolean;
     allowSwaps: boolean;
+    allowTransfers: boolean;
+    allowUnshieldedOffers: boolean;
+    allowedUnshieldedTokenTypes: string[];
     maxDeploys: number | null;
     deploysUsed: number;
 }
@@ -583,7 +664,10 @@ function policyView(p: SponsorPolicy): NonNullable<SponsorPolicyDescription['eff
         ownTokenTypes: p.ownTokenTypes ?? [],
         allowDeploy: p.allowDeploy ?? null,
         allowContractMints: p.allowContractMints ?? null,
-        allowSwaps: p.allowSwaps ?? null
+        allowSwaps: p.allowSwaps ?? null,
+        allowTransfers: p.allowTransfers ?? null,
+        allowUnshieldedOffers: p.allowUnshieldedOffers ?? null,
+        allowedUnshieldedTokenTypes: p.allowedUnshieldedTokenTypes ?? []
     };
 }
 
@@ -615,6 +699,9 @@ export async function describeSponsorPolicy(db: DbRunner, grantId?: string | nul
         mintedTokenTypes: parseGrantList(row.mintedTokenTypes),
         allowDeploy: row.allowDeploy === true,
         allowSwaps: parseGrantList(row.allowedActions).includes(SPONSOR_SWAP_ACTION),
+        allowTransfers: parseGrantList(row.allowedActions).includes(SPONSOR_TRANSFER_ACTION),
+        allowUnshieldedOffers: row.allowUnshieldedOffers === true,
+        allowedUnshieldedTokenTypes: parseGrantList(row.allowedUnshieldedTokenTypes),
         maxDeploys: row.maxDeploys ?? null,
         deploysUsed: row.deploysUsed ?? 0
     };
@@ -651,6 +738,9 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         allowDeploy?: boolean | null;
         maxDeploys?: number | null;
         allowedTokenTypes?: string[] | null;
+        allowUnshieldedOffers?: boolean | null;
+        allowedUnshieldedTokenTypes?: string[] | null;
+        maxValuePerDay?: ValueBudgetInput[] | null;
     }
 
     /**
@@ -681,10 +771,10 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
                 req.reject(412, `sponsorSessionId: '${PLATFORM_POOL_SENTINEL}' requires a configured NIGHTGATE_FEE_SPONSOR_SESSION pool`);
                 return undefined;
             }
-            const incompatible = actions.filter(a => !SPONSOR_PHASE2_ACTIONS.has(a) && !POOL_NEUTRAL_ACTIONS.has(a));
+            const incompatible = actions.filter(a => !SPONSOR_PHASE2_ACTIONS.has(a) && !POOL_NEUTRAL_ACTIONS.has(a) && !POOL_PAID_SESSION_ACTIONS.has(a));
             if (incompatible.length > 0) {
                 req.reject(400,
-                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction' / 'sponsorUnboundTransaction' / 'sponsorSwap' / 'postSwapOffer' / 'retireSwapOffer'; `
+                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction' / 'sponsorUnboundTransaction' / 'sponsorSwap' / 'sponsorTransfer' / 'mintFactoryToken' / 'postSwapOffer' / 'retireSwapOffer'; `
                     + `these actions resolve the sponsor directly and cannot use the pool: ${incompatible.join(', ')}`);
                 return undefined;
             }
@@ -720,7 +810,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
     }
 
     function newGrantRow(userId: string, sessionId: string, data: GrantCreationInput, values: GrantShapeValues, actions: string[], agentLabel: string | null) {
-        const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes } = values;
+        const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes, allowUnshieldedOffers, allowedUnshieldedTokenTypes, maxValuePerDay } = values;
         const token = TOKEN_PREFIX + crypto.randomBytes(TOKEN_BYTES).toString('hex');
         const grant = {
             ID: cds.utils.uuid(),
@@ -743,6 +833,11 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
             deploysUsed: 0,
             deployedContracts: null,
             allowedTokenTypes: allowedTokenTypes.length ? JSON.stringify(allowedTokenTypes) : null,
+            allowUnshieldedOffers,
+            allowedUnshieldedTokenTypes: allowedUnshieldedTokenTypes.length ? JSON.stringify(allowedUnshieldedTokenTypes) : null,
+            maxValuePerDay: Object.keys(maxValuePerDay).length ? JSON.stringify(maxValuePerDay) : null,
+            valueUsedToday: null,
+            valueWindow: null,
             validUntil: data.validUntil ?? null,
             isActive: true
         };
@@ -750,16 +845,21 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
     }
 
     function describeGrantCreation(values: GrantShapeValues, actions: string[]): string {
-        const { allowedContracts, allowedCircuits, allowedTokenTypes, maxJobsPerDay, maxJobsPerHour } = values;
+        const { allowedContracts, allowedCircuits, allowedTokenTypes, maxJobsPerDay, maxJobsPerHour, allowUnshieldedOffers, maxValuePerDay } = values;
         return `actions: ${actions.join(', ')}${maxJobsPerDay ? `, budget ${maxJobsPerDay}/day` : ''}${maxJobsPerHour ? `, budget ${maxJobsPerHour}/hour` : ''}`
             + `${allowedContracts.length ? `, contracts ${allowedContracts.map(c => c.slice(0, 12)).join('|')}` : ''}`
             + `${allowedCircuits.length ? `, circuits ${allowedCircuits.join('|')}` : ''}`
-            + `${allowedTokenTypes.length ? `, token types ${allowedTokenTypes.map(t => t.slice(0, 12)).join('|')}` : ''}`;
+            + `${allowedTokenTypes.length ? `, token types ${allowedTokenTypes.map(t => t.slice(0, 12)).join('|')}` : ''}`
+            + `${allowUnshieldedOffers ? ', unshielded offers' : ''}`
+            + `${Object.keys(maxValuePerDay).length ? `, value/day ${Object.entries(maxValuePerDay).map(([t, a]) => `${t.slice(0, 8)}=${a}`).join('|')}` : ''}`;
     }
 
     function grantShapeView(values: GrantShapeValues, actions: string[], validUntil: string | null) {
-        const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes } = values;
-        return { allowedActions: actions, allowedContracts, allowedCircuits, allowDeploy, maxDeploys, allowedTokenTypes, validUntil };
+        const { allowDeploy, maxDeploys, allowedContracts, allowedCircuits, allowedTokenTypes, allowUnshieldedOffers, allowedUnshieldedTokenTypes, maxValuePerDay } = values;
+        return {
+            allowedActions: actions, allowedContracts, allowedCircuits, allowDeploy, maxDeploys, allowedTokenTypes,
+            allowUnshieldedOffers, allowedUnshieldedTokenTypes, maxValuePerDay: valueBudgetList(maxValuePerDay), validUntil
+        };
     }
 
     srv.on(createAgentGrant, async (req) => {
@@ -854,7 +954,10 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
             allowedCircuits: v.allowedCircuits.length ? JSON.stringify(v.allowedCircuits) : null,
             allowedTokenTypes: v.allowedTokenTypes.length ? JSON.stringify(v.allowedTokenTypes) : null,
             allowDeploy: v.allowDeploy,
-            maxDeploys: v.maxDeploys
+            maxDeploys: v.maxDeploys,
+            allowUnshieldedOffers: v.allowUnshieldedOffers,
+            allowedUnshieldedTokenTypes: v.allowedUnshieldedTokenTypes.length ? JSON.stringify(v.allowedUnshieldedTokenTypes) : null,
+            maxValuePerDay: Object.keys(v.maxValuePerDay).length ? JSON.stringify(v.maxValuePerDay) : null
         };
         if (v.allowedActions) patch.allowedActions = JSON.stringify(v.allowedActions);
         if ('maxJobsPerDay' in v) patch.maxJobsPerDay = v.maxJobsPerDay;
@@ -957,6 +1060,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
             limits: {
                 jobsPerHour: budgetView(grant, HOUR_BUDGET),
                 jobsPerDay: budgetView(grant, DAY_BUDGET),
+                valuePerDay: valueBudgetView(grant),
                 classes: RATE_CLASS_NAMES.filter(c => RATE_CLASSES[c].grantVisible).map(c => {
                     const scope = c === 'prove' || c === 'deploy' ? grant.sessionId : c;
                     const state = peekRateClassForGrant(c, grant.ID, scope);
@@ -1161,10 +1265,76 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
         allowedTokenTypes: parseGrantList(grant.allowedTokenTypes),
         mintedTokenTypes: parseGrantList(grant.mintedTokenTypes),
         allowSwaps: parseGrantList(grant.allowedActions).includes(SPONSOR_SWAP_ACTION),
+        allowTransfers: parseGrantList(grant.allowedActions).includes(SPONSOR_TRANSFER_ACTION),
         // Only a first check. The deploy budget is reserved before each deploy is sent,
         // in reserveDeployBudget.
-        allowDeploy: grant.allowDeploy === true && (grant.deploysUsed ?? 0) < (grant.maxDeploys ?? 1)
+        allowDeploy: grant.allowDeploy === true && (grant.deploysUsed ?? 0) < (grant.maxDeploys ?? 1),
+        allowUnshieldedOffers: grant.allowUnshieldedOffers === true,
+        allowedUnshieldedTokenTypes: parseGrantList(grant.allowedUnshieldedTokenTypes)
     };
+}
+
+// ---- Value budgets ---------------------------------------------------------
+
+function valueBudgetView(grant: AgentGrant): Array<{ tokenType: string; max: string; used: string; resetsAt: string }> {
+    const max = parseValueBudgetMap(grant.maxValuePerDay);
+    const used = grant.valueWindow === utcDay() ? parseValueBudgetMap(grant.valueUsedToday) : {};
+    return Object.entries(max).map(([tokenType, amount]) => ({ tokenType, max: amount, used: used[tokenType] ?? '0', resetsAt: DAY_BUDGET.resetsAt().toISOString() }));
+}
+
+/**
+ * Takes `amount` of `tokenType` from the day's value budget or rejects 429. A type without a limit passes; a later 4xx gives the amount back.
+ */
+export async function consumeValueBudget(db: DbRunner, req: Request, grantId: string, tokenType: string, amount: bigint): Promise<boolean> {
+    const type = tokenType.toLowerCase();
+    if (amount <= 0n) return true;
+    const outcome = await withKeyedLock(`grant-value:${grantId}`, async () => {
+        const grant = await runWithoutAmbientTx(() => currentGrantRow(db, grantId));
+        if (!grant) return { ok: true as const };
+        const max = parseValueBudgetMap(grant.maxValuePerDay)[type];
+        if (max === undefined) return { ok: true as const };
+        const window = utcDay();
+        const used = grant.valueWindow === window ? parseValueBudgetMap(grant.valueUsedToday) : {};
+        const usedNow = BigInt(used[type] ?? '0');
+        if (usedNow + amount > BigInt(max)) return { ok: false as const, max, used: usedNow };
+        const next: ValueBudgetMap = { ...used, [type]: (usedNow + amount).toString() };
+        await runWithoutAmbientTx(() => db.run(UPDATE.entity(AgentGrants).set({ valueWindow: window, valueUsedToday: JSON.stringify(next) }).where({ ID: grantId })));
+        return { ok: true as const, taken: true as const };
+    });
+    if (!outcome.ok) {
+        const max = BigInt(outcome.max);
+        rejectRateLimited(req, {
+            name: 'grant-value', limit: Number(max > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : max),
+            windowSeconds: DAY_BUDGET.windowMs / 1000, retryAfterMs: DAY_BUDGET.resetsAt().getTime() - Date.now(),
+            detail: `grant-value: token type ${type.slice(0, 16)}… has ${outcome.used} of ${outcome.max} atoms moved today, ${amount} asked`
+        });
+        return false;
+    }
+    if ('taken' in outcome) {
+        // A 4xx started no job, so the amount goes back. 5xx keep it.
+        (req as unknown as FailureEvents).on?.('failed', (err) => {
+            const status = Number(err?.status ?? err?.statusCode ?? err?.code);
+            if (!Number.isInteger(status) || status < 400 || status >= 500) return;
+            void refundValueBudget(db, grantId, type, amount).catch((e: unknown) => log.warn(`value budget refund for grant ${grantId} failed: ${errorMessage(e)}`));
+        });
+    }
+    return true;
+}
+
+/** The request's `failed` event, which CAP's Request emits and its types leave out. */
+interface FailureEvents {
+    on?(event: 'failed', fn: (err: { status?: unknown; statusCode?: unknown; code?: unknown } | undefined) => void): void;
+}
+
+async function refundValueBudget(db: DbRunner, grantId: string, type: string, amount: bigint): Promise<void> {
+    await withKeyedLock(`grant-value:${grantId}`, async () => {
+        const grant = await runWithoutAmbientTx(() => currentGrantRow(db, grantId));
+        if (!grant || grant.valueWindow !== utcDay()) return;
+        const used = parseValueBudgetMap(grant.valueUsedToday);
+        const left = BigInt(used[type] ?? '0') - amount;
+        used[type] = (left > 0n ? left : 0n).toString();
+        await runWithoutAmbientTx(() => db.run(UPDATE.entity(AgentGrants).set({ valueUsedToday: JSON.stringify(used) }).where({ ID: grantId })));
+    });
 }
 
 async function refundBudget(db: DbRunner, grant: AgentGrant, budget: GrantBudget): Promise<void> {

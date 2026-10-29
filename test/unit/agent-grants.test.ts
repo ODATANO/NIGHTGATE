@@ -82,6 +82,7 @@ import { currentGrantPolicy,
     reserveDeployBudget,
     releaseDeployBudget,
     recordMintedTokenTypes,
+    consumeValueBudget,
     AGENT_ALLOWLISTABLE_ACTIONS
 } from '../../srv/sessions/agent-grants';
 
@@ -1047,7 +1048,7 @@ describe('agent grants', () => {
             expect(req.reject).not.toHaveBeenCalled();
             expect(req.user.id).toBe(TEST_USER_ID);
             expect(req.data.sessionId).toBe('sess-1');
-            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, sponsorSessionId: null, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], mintedTokenTypes: [], allowDeploy: false, allowSwaps: false });
+            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, sponsorSessionId: null, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], mintedTokenTypes: [], allowDeploy: false, allowSwaps: false, allowTransfers: false, allowUnshieldedOffers: false, allowedUnshieldedTokenTypes: [] });
         });
 
         it('rejects 403 on a sessionId that does not match the grant', async () => {
@@ -1418,5 +1419,106 @@ describe('agent grant circuit scope follows the action, not the request fields',
         expect(circuitsOfRequest('reindexDisclosures', {})).toEqual([]);
         expect(circuitsOfRequest('unknownAction', {})).toBeNull();
         expect(circuitsOfRequest('unknownAction', { circuit: 'attest' })).toEqual(['attest']);
+    });
+});
+
+describe('agent grants: unshielded offers and value budgets', () => {
+    const handlers: Record<string, Function> = {};
+    const srv = { on(event: string, h: Function) { handlers[event] = h; } } as any;
+    const db = { run: mockDbRun };
+    const N1 = 'ab'.repeat(32);
+    const N2 = 'cd'.repeat(32);
+
+    beforeEach(() => {
+        __resetRateLimitersForTests();
+        for (const k of SPONSOR_POLICY_ENV) delete process.env[k];
+        __resetSponsorPolicyForTests();
+        vi.clearAllMocks();
+        mockDbRun.mockResolvedValue(null);
+        updateSetSpy.mockReturnValue({ where: updateWhereSpy });
+        updateWhereSpy.mockImplementation((w: any) => ({ __update: w }));
+        selectOneWhereSpy.mockImplementation((w: any) => ({ __select: w }));
+        insertEntriesSpy.mockImplementation((e: any) => ({ __insert: e }));
+        Object.keys(handlers).forEach(k => delete handlers[k]);
+        registerAgentGrantHandlers(srv, db);
+    });
+
+    it('allowUnshieldedOffers needs a sponsor* action and is stored with its type list', async () => {
+        const noRight = makeReq({ sessionId: 'sess-1', allowedActions: ['anchorDocument'], allowUnshieldedOffers: true });
+        await handlers.createAgentGrant(noRight);
+        expect(noRight.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowUnshieldedOffers needs 'sponsorFinalizedTransaction'/));
+
+        const listOnly = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], allowedUnshieldedTokenTypes: [N1] });
+        await handlers.createAgentGrant(listOnly);
+        expect(listOnly.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowedUnshieldedTokenTypes needs allowUnshieldedOffers/));
+
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES = N1;
+        mockDbRun.mockResolvedValueOnce(activeSessionRow());
+        const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [`0x${N1.toUpperCase()}`] });
+        const result = await handlers.createAgentGrant(req);
+        expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({ allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: JSON.stringify([N1]) }));
+        expect(result).toMatchObject({ allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1] });
+        delete process.env.NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES;
+
+        const outside = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N2] });
+        await handlers.createAgentGrant(outside);
+        expect(outside.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowedUnshieldedTokenTypes cdcd/));
+    });
+
+    it('the hook hands the unshielded right, its list and the transfer right to the request', async () => {
+        const TOKEN = 'ngat_' + 'e'.repeat(64);
+        mockDbRun.mockResolvedValueOnce(grantRow({
+            allowedActions: JSON.stringify(['sponsorUnboundTransaction', 'sponsorTransfer']), allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: JSON.stringify([N1])
+        }));
+        const req = makeReq({}, { event: 'sponsorUnboundTransaction', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN } });
+        await enforceAgentGrant(req, db);
+        expect(req.agentGrant).toMatchObject({ allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1], allowTransfers: true, allowSwaps: false });
+    });
+
+    it('sponsorTransfer, burnFactoryToken and mintFactoryToken are grantable; the pool grant takes mints and transfers', async () => {
+        expect(AGENT_ALLOWLISTABLE_ACTIONS).toEqual(expect.arrayContaining(['sponsorTransfer', 'burnFactoryToken', 'mintFactoryToken']));
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        mockDbRun.mockResolvedValueOnce(activeSessionRow());
+        const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorTransfer', 'mintFactoryToken'], sponsorSessionId: '__platform_pool__' });
+        await handlers.createAgentGrant(req);
+        expect(req.reject).not.toHaveBeenCalled();
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+    });
+
+    it('maxValuePerDay is validated and stored as a map; the usage view lists it', async () => {
+        const bad = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorSwap'], maxValuePerDay: [{ tokenType: N1, amount: '0' }] });
+        await handlers.createAgentGrant(bad);
+        expect(bad.reject).toHaveBeenCalledWith(400, expect.stringMatching(/maxValuePerDay: amount for abab/));
+        const twice = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorSwap'], maxValuePerDay: [{ tokenType: N1, amount: '5' }, { tokenType: N1, amount: '6' }] });
+        await handlers.createAgentGrant(twice);
+        expect(twice.reject).toHaveBeenCalledWith(400, expect.stringMatching(/twice/));
+
+        mockDbRun.mockResolvedValueOnce(activeSessionRow());
+        const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorSwap'], maxValuePerDay: [{ tokenType: N1, amount: '1000' }] });
+        const result = await handlers.createAgentGrant(req);
+        expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({ maxValuePerDay: JSON.stringify({ [N1]: '1000' }), valueUsedToday: null, valueWindow: null }));
+        expect(result).toMatchObject({ maxValuePerDay: [{ tokenType: N1, amount: '1000' }] });
+    });
+
+    it('consumeValueBudget takes from the day, refuses over the limit with 429 and ignores unlimited types', async () => {
+        const req = makeReq({}, { event: 'sponsorSwap' });
+        const row = grantRow({ maxValuePerDay: JSON.stringify({ [N1]: '1000' }), valueUsedToday: JSON.stringify({ [N1]: '400' }), valueWindow: TODAY });
+        mockDbRun.mockResolvedValueOnce(row);
+        expect(await consumeValueBudget(db, req, 'grant-1', N1, 500n)).toBe(true);
+        expect(updateSetSpy).toHaveBeenCalledWith({ valueWindow: TODAY, valueUsedToday: JSON.stringify({ [N1]: '900' }) });
+
+        mockDbRun.mockResolvedValueOnce({ ...row, valueUsedToday: JSON.stringify({ [N1]: '900' }) });
+        expect(await consumeValueBudget(db, req, 'grant-1', N1, 200n)).toBe(false);
+        expect(req.reject).toHaveBeenCalledWith(429, expect.stringMatching(/grant-value: token type abababab.* has 900 of 1000 atoms moved today, 200 asked/));
+
+        // a new day starts at zero; a type without a limit never asks the database for a write
+        updateSetSpy.mockClear();
+        mockDbRun.mockResolvedValueOnce({ ...row, valueWindow: '2000-01-01', valueUsedToday: JSON.stringify({ [N1]: '999' }) });
+        expect(await consumeValueBudget(db, req, 'grant-1', N1, 1000n)).toBe(true);
+        expect(updateSetSpy).toHaveBeenCalledWith({ valueWindow: TODAY, valueUsedToday: JSON.stringify({ [N1]: '1000' }) });
+        updateSetSpy.mockClear();
+        mockDbRun.mockResolvedValueOnce(row);
+        expect(await consumeValueBudget(db, req, 'grant-1', N2, 10n ** 30n)).toBe(true);
+        expect(updateSetSpy).not.toHaveBeenCalled();
     });
 });

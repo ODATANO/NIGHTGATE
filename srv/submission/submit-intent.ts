@@ -20,7 +20,14 @@ export interface SubmitIntentCoordinates {
     nullifiers?: string[];
     offerId?: string;
     deployReservation?: { grantId: string; count: number };
+    /** Unshielded tokens the calls moved into a contract. */
+    unshielded?: UnshieldedMove[];
+    /** The declared terms of a sponsored transfer. */
+    transfer?: DeclaredTransfer;
 }
+
+export interface UnshieldedMove { type: string; amount: string; to: string }
+export interface DeclaredTransfer { tokenType: string; amount: string }
 
 /** Parse a row's `submitIntentData`; missing or malformed data reads as no coordinates. */
 export function parseSubmitIntent(data: string | null | undefined): SubmitIntentCoordinates {

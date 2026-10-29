@@ -87,7 +87,12 @@ export const JOB_KINDS: Readonly<Record<string, JobKindDefinition>> = {
     // Takes two swap halves instead of one transaction. After merging them it runs like the job above.
     sponsorSwap: {
         traits: { heavy: true, workflowParent: false, identifierKeyed: true }, executor: 'sponsorUnbound', finalizer: 'sponsoredSubmission'
-    }
+    },
+    // Takes a plain shielded transfer with declared terms. Runs like the job above.
+    sponsorTransfer: {
+        traits: { heavy: true, workflowParent: false, identifierKeyed: true }, executor: 'sponsorUnbound', finalizer: 'sponsoredSubmission'
+    },
+    burnFactoryToken: contract('call')
 };
 
 export const JOB_KIND_TRAITS: Readonly<Record<string, JobKindTraits>> =

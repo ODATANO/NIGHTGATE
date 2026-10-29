@@ -14,6 +14,9 @@ export interface RequestAgentGrant {
     mintedTokenTypes: string[];
     allowDeploy: boolean;
     allowSwaps: boolean;
+    allowTransfers: boolean;
+    allowUnshieldedOffers: boolean;
+    allowedUnshieldedTokenTypes: string[];
 }
 
 // Fields the plugin's before-handlers set on every CAP request.

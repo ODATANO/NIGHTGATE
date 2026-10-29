@@ -50,7 +50,7 @@ export {
 } from './submit.mjs';
 
 export {
-    SWAP_OFFER_PREFIX, SWAP_MAX_INPUTS, createSwapWallet, readSwapTerms, sameSwapTerms, encodeOffer, decodeOffer,
+    SWAP_OFFER_PREFIX, SWAP_MAX_INPUTS, createSwapWallet, readSwapTerms, readTransferShape, sameSwapTerms, encodeOffer, decodeOffer,
     chooseSwapCoin, spendableWithin
 } from './swap.mjs';
 

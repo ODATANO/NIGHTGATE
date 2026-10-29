@@ -331,6 +331,79 @@ export function tokenTypeDeriver(ledger: any): (domainSeparatorHex: string, cont
 /** Stands for a sponsored deploy in the returned call list. */
 export const DEPLOY_ENTRY_POINT = '<deploy>';
 
+/** Unshielded tokens a sponsored call moves into a contract. Amounts in atoms. */
+export interface UnshieldedMove { type: string; amount: string; to: string }
+
+/** The rules for an intent's unshielded offer. Without `allowUnshieldedOffers` every such offer is refused. */
+export interface UnshieldedOfferOptions {
+    allowUnshieldedOffers?: boolean;
+    /** Raw token types besides NIGHT. */
+    allowedUnshieldedTokenTypes?: string[];
+    /** The ledger's `addressFromKey`; without it an output to a user address is refused. */
+    addressFromKey?: (key: string) => string;
+    /** Signature verifying keys of the sponsor's own wallets. */
+    sponsorInputKeys?: string[];
+    /** Filled with the contract-owned outputs the offers create. */
+    collectUnshielded?: UnshieldedMove[];
+}
+
+const utxoValue = (v: unknown, what: string): bigint => {
+    if (typeof v === 'bigint') return v;
+    if (typeof v === 'number' && Number.isInteger(v)) return BigInt(v);
+    if (typeof v === 'string' && /^\d+$/.test(v)) return BigInt(v);
+    throw new SponsorRefusalError(`refusing to sponsor: ${what} carries a value that is not readable`);
+};
+
+/**
+ * Public offer, so every rule runs on the bytes: zero net per type, allowed types, outputs to a sponsorable contract or back to a spender.
+ */
+export function checkUnshieldedOffer(
+    offer: any, key: string,
+    ctx: {
+        nightType?: string; tokenTypes: string[];
+        /** A contract named in the allow-list or deployed under the grant. An empty allow-list names nobody here. */
+        listedContract: (address: string) => boolean;
+        /** The contracts the same intent calls. */
+        calledContracts: Set<string>;
+    } & UnshieldedOfferOptions
+): UnshieldedMove[] {
+    const inputs: any[] | undefined = Array.isArray(offer?.inputs) ? offer.inputs : undefined;
+    const outputs: any[] | undefined = Array.isArray(offer?.outputs) ? offer.outputs : undefined;
+    if (!inputs || !outputs) throw new SponsorRefusalError(`refusing to sponsor: ${key} is not inspectable (no inputs/outputs)`);
+    if (inputs.length === 0) throw new SponsorRefusalError(`refusing to sponsor: ${key} spends nothing, so it cannot net to zero`);
+    const allowedType = (type: string): boolean => (ctx.nightType !== undefined && type === ctx.nightType) || ctx.tokenTypes.includes(type);
+    const sums = new Map<string, bigint>();
+    const ownerAddresses = new Set<string>();
+    for (const input of inputs) {
+        const type = normalizeTokenType(input?.type);
+        if (!allowedType(type)) throw new SponsorRefusalError(`refusing to sponsor: ${key} spends token type ${type.slice(0, 16)}…, which is neither NIGHT nor in allowedUnshieldedTokenTypes`);
+        const owner = normalizeTokenType(input?.owner);
+        if (!HEX64_RE.test(owner)) throw new SponsorRefusalError(`refusing to sponsor: ${key} has an input without a readable owner key`);
+        if (ctx.sponsorInputKeys?.includes(owner)) throw new SponsorRefusalError(`refusing to sponsor: ${key} spends a UTXO of the sponsor itself`);
+        if (ctx.addressFromKey) ownerAddresses.add(normalizeTokenType(ctx.addressFromKey(owner)));
+        sums.set(type, (sums.get(type) ?? 0n) + utxoValue(input?.value, `${key} input`));
+    }
+    const moves: UnshieldedMove[] = [];
+    for (const output of outputs) {
+        const type = normalizeTokenType(output?.type);
+        if (!allowedType(type)) throw new SponsorRefusalError(`refusing to sponsor: ${key} creates token type ${type.slice(0, 16)}…, which is neither NIGHT nor in allowedUnshieldedTokenTypes`);
+        const to = normalizeTokenType(output?.owner);
+        if (!HEX64_RE.test(to)) throw new SponsorRefusalError(`refusing to sponsor: ${key} has an output without a readable owner`);
+        const value = utxoValue(output?.value, `${key} output`);
+        sums.set(type, (sums.get(type) ?? 0n) - value);
+        if (ctx.calledContracts.has(to) || ctx.listedContract(to)) {
+            moves.push({ type, amount: value.toString(), to });
+            continue;
+        }
+        if (ownerAddresses.has(to)) continue; // change back to a spender
+        throw new SponsorRefusalError(`refusing to sponsor: ${key} pays ${to.slice(0, 16)}…, which is neither a sponsorable contract nor an owner of its inputs`);
+    }
+    for (const [type, net] of sums) {
+        if (net !== 0n) throw new SponsorRefusalError(`refusing to sponsor: ${key} does not net to zero in token type ${type.slice(0, 16)}… (${net > 0n ? 'spends more than it creates' : 'creates more than it spends'})`);
+    }
+    return moves;
+}
+
 /**
  * Checks what a tx contains before the sponsor pays for it.
  * An allowed call could hide a deploy, transfers or dust actions in the same tx.
@@ -347,7 +420,7 @@ export function checkSponsorableShape(
         contractCircuits?: ContractCircuitRules;
         /** Set both to also pay for tokens the calls mint. */
         allowContractMints?: boolean; deriveTokenType?: (domainSeparatorHex: string, contractAddress: string) => string;
-    } = {}
+    } & UnshieldedOfferOptions = {}
 ): Array<{ address: string; entryPoint: string }> {
     const tokenTypes = (options.allowedTokenTypes ?? []).map(normalizeTokenType);
     const nightType = options.nightTokenType ? normalizeTokenType(options.nightTokenType) : undefined;
@@ -382,13 +455,19 @@ export function checkSponsorableShape(
     }
 
     const calls: Array<{ address: string; entryPoint: string }> = [];
+    const unshieldedTypes = (options.allowedUnshieldedTokenTypes ?? []).map(normalizeTokenType);
+    const listedContract = (address: string): boolean =>
+        (allowedContracts ?? []).includes(address) || (Array.isArray(options.ownContracts) && options.ownContracts.includes(address));
     for (const [, intent] of Array.from(intents.entries())) {
         // The caller pays no fee, so it has no reason to carry dust actions.
-        for (const key of ['guaranteedUnshieldedOffer', 'fallibleUnshieldedOffer', 'dustActions']) {
-            if (offerNonEmpty(intent?.[key])) {
-                throw new SponsorRefusalError(`refusing to sponsor: transaction carries ${key} alongside its contract calls`);
-            }
+        if (offerNonEmpty(intent?.dustActions)) {
+            throw new SponsorRefusalError('refusing to sponsor: transaction carries dustActions alongside its contract calls');
         }
+        const unshieldedKeys = ['guaranteedUnshieldedOffer', 'fallibleUnshieldedOffer'].filter(key => offerNonEmpty(intent?.[key]));
+        if (unshieldedKeys.length && options.allowUnshieldedOffers !== true) {
+            throw new SponsorRefusalError(`refusing to sponsor: transaction carries ${unshieldedKeys[0]} alongside its contract calls; moving the caller's own unshielded tokens needs allowUnshieldedOffers on the grant and NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS on the server`);
+        }
+        const intentCalls = new Set<string>();
         for (const action of (intent?.actions ?? [])) {
             const ep = action?.entryPoint;
             const name = typeof ep === 'string' ? ep : (ep instanceof Uint8Array ? new TextDecoder().decode(ep) : '');
@@ -431,10 +510,57 @@ export function checkSponsorableShape(
                 throw new SponsorRefusalError(`refusing to sponsor: circuit '${name}' is not sponsorable on contract ${address.slice(0, 16)}`);
             }
             calls.push({ address, entryPoint: name });
+            intentCalls.add(address);
+        }
+        // An offer rides only next to a call of its own intent, so it is the call's funding and not a transfer.
+        if (unshieldedKeys.length && intentCalls.size === 0) {
+            throw new SponsorRefusalError(`refusing to sponsor: ${unshieldedKeys[0]} sits in an intent without a contract call`);
+        }
+        for (const key of unshieldedKeys) {
+            const moves = checkUnshieldedOffer(intent[key], key, {
+                nightType, tokenTypes: unshieldedTypes, listedContract, calledContracts: intentCalls,
+                addressFromKey: options.addressFromKey, sponsorInputKeys: options.sponsorInputKeys
+            });
+            options.collectUnshielded?.push(...moves);
         }
     }
     if (calls.length === 0) throw new SponsorRefusalError('refusing to sponsor: the transaction carries no contract call');
     return calls;
+}
+
+/** Stands for a sponsored plain transfer in the returned call list. */
+export const TRANSFER_ENTRY_POINT = '<transfer>';
+
+/**
+ * An offer and nothing else that nets to zero. Recipient and amount are commitments, so only the shape is checked; the caller's terms are recorded.
+ */
+export function checkTransferShape(tx: any, maxInputs: number, prefix = 'refusing to sponsor'): { inputs: number; outputs: number; nullifiers: string[] } {
+    const refuse = (why: string): never => { throw new SponsorRefusalError(`${prefix}: the transfer ${why}`); };
+    if (tx?.intents !== undefined && tx?.intents !== null && sizeOf(tx.intents) !== 0) refuse('carries an intent (a contract call, unshielded value or dust actions)');
+    const fallible = tx?.fallibleOffer;
+    if (fallible !== undefined && fallible !== null && sizeOf(fallible) !== 0) refuse('carries a fallible offer');
+    const offer = tx?.guaranteedOffer;
+    if (!offer || !Array.isArray(offer.inputs) || !Array.isArray(offer.outputs)) return refuse('carries no readable guaranteed offer');
+    if (sizeOf(offer.transients ?? []) !== 0) refuse('carries a transient coin');
+    if ([...offer.inputs, ...offer.outputs].some((coin: any) => coin?.contractAddress !== undefined && coin?.contractAddress !== null)) {
+        refuse('carries a contract-owned coin');
+    }
+    if (offer.inputs.length < 1 || offer.inputs.length > maxInputs) refuse(`carries ${offer.inputs.length} inputs; 1 to ${maxInputs} are sponsored (NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS)`);
+    if (offer.outputs.length < 1 || offer.outputs.length > 2) refuse(`carries ${offer.outputs.length} outputs; a transfer has the recipient's coin and at most its change`);
+    // The ledger drops zero entries from the deltas, so a transfer shows none at all.
+    if (sizeOf(offer.deltas) !== 0) refuse('does not net to zero (a net change in a type makes it a swap half, not a transfer)');
+    let imbalances: Array<[unknown, unknown]>;
+    try { imbalances = Array.from(tx.imbalances(0).entries() as Iterable<[unknown, unknown]>); }
+    catch (e) { return refuse(`has a balance that is not readable (${formatErr(e).slice(0, 80)})`); }
+    if (imbalances.some(([, v]) => v !== 0n)) refuse('does not balance');
+    return { inputs: offer.inputs.length, outputs: offer.outputs.length, nullifiers: swapHalfNullifiers(tx) };
+}
+
+/** Reads a transfer's shape for the request path, before a job exists. */
+export async function describeTransfer(args: { txB64: string }): Promise<{ bound: boolean; inputs: number; outputs: number; nullifiers: string[] }> {
+    const { tx, bound } = await deserializeSwapHalf(args.txB64, 'transfer');
+    const shape = checkTransferShape(tx, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'), 'not a transfer');
+    return { bound, ...shape };
 }
 
 /** The current dust wallet state. */
@@ -559,7 +685,10 @@ export async function releaseBackingWhenSpent(sponsor: FacadeEntry, leased: any,
 export const __noteLeaseForTests = { tryLockBacking, sufficientNoteOnBacking, releaseNote, keepLeaseAlive, noteLeaseTtlMs, releaseBackingWhenSpent, held: (key: string) => noteLocks.get(key), reset: () => noteLocks.clear() };
 
 /** The sponsor adds the dust fee to a tx the caller finalized and sends it. */
-export async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated: any, site: string, replyPort?: MessagePort, calls?: Array<{ address: string; entryPoint: string }>, minted: string[] = []): Promise<string> {
+export async function sponsorAndSubmitFinalized(
+    sponsor: FacadeEntry, rehydrated: any, site: string, replyPort?: MessagePort,
+    calls?: Array<{ address: string; entryPoint: string }>, minted: string[] = [], unshielded: UnshieldedMove[] = []
+): Promise<string> {
     await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, `${site} sponsor`);
     await captureDustSnapshot(sponsor, `${site} sponsor`);
     const sponsorTtl = new Date(Date.now() + 30 * 60 * 1000);
@@ -576,7 +705,8 @@ export async function sponsorAndSubmitFinalized(sponsor: FacadeEntry, rehydrated
             deployed: calls?.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address) ?? [],
             ttl: sponsorTtl.toISOString(),
             segments: callSegments(finalized),
-            ...(minted.length ? { minted } : {})
+            ...(minted.length ? { minted } : {}),
+            ...(unshielded.length ? { unshielded } : {})
         });
     } catch (e) {
         await revertRecipeBestEffort(sponsor.facade, finalized, `${site} sponsor-intent`);
@@ -645,10 +775,31 @@ export async function buildSponsorableTx(args: {
     return { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length };
 }
 
+/** The policy a sponsor job carries into the worker. */
+export interface SponsorPolicyArgs {
+    allowedContracts?: string[]; allowedCircuits?: string[]; contractCircuits?: ContractCircuitRules; allowDeploy?: boolean; ownContracts?: string[];
+    allowedTokenTypes?: string[]; allowContractMints?: boolean; allowUnshieldedOffers?: boolean; allowedUnshieldedTokenTypes?: string[];
+}
+
+/** The shape-check options of one sponsor, with the unshielded rules bound to the ledger and the sponsor's keys. */
+function shapeOptions(sdk: any, sponsor: FacadeEntry, args: SponsorPolicyArgs, collectUnshielded: UnshieldedMove[]) {
+    const sponsorKey = (() => {
+        try { return normalizeTokenType(sponsor.unshieldedKeystore?.getPublicKey?.()); } catch { return ''; }
+    })();
+    return {
+        allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, contractCircuits: args.contractCircuits,
+        allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw,
+        allowContractMints: args.allowContractMints === true, deriveTokenType: tokenTypeDeriver(sdk.ledger),
+        allowUnshieldedOffers: args.allowUnshieldedOffers === true, allowedUnshieldedTokenTypes: args.allowedUnshieldedTokenTypes,
+        addressFromKey: (key: string) => String(sdk.ledger.addressFromKey(key)),
+        sponsorInputKeys: HEX64_RE.test(sponsorKey) ? [sponsorKey] : [],
+        collectUnshielded
+    };
+}
+
 /** Checks a caller's finalized tx against the sponsor rules, pays its fee and sends it. */
-export async function sponsorFinalizedTx(args: {
+export async function sponsorFinalizedTx(args: SponsorPolicyArgs & {
     sponsorSessionId: string; finalizedTxB64: string; networkId: string;
-    allowedContracts?: string[]; allowedCircuits?: string[]; contractCircuits?: ContractCircuitRules; allowDeploy?: boolean; ownContracts?: string[]; allowedTokenTypes?: string[]; allowContractMints?: boolean;
     /** Set by the dispatcher. Used to announce the tx before sending it. */
     __replyPort?: MessagePort;
 }) {
@@ -658,15 +809,17 @@ export async function sponsorFinalizedTx(args: {
     await ensureNetworkId(args.networkId, sdk);
     const { tx, bytes } = await deserializeFinalizedTx(args.finalizedTxB64);
 
-    const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, contractCircuits: args.contractCircuits, allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw, allowContractMints: args.allowContractMints === true, deriveTokenType: tokenTypeDeriver(sdk.ledger) });
-    log('info', `sponsorFinalizedTx: paying dust for ${calls.map(c => c.entryPoint).join('+')} (${bytes.length}B)`);
+    const unshielded: UnshieldedMove[] = [];
+    const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, shapeOptions(sdk, sponsor, args, unshielded));
+    log('info', `sponsorFinalizedTx: paying dust for ${calls.map(c => c.entryPoint).join('+')} (${bytes.length}B)${unshielded.length ? `, ${unshielded.length} unshielded output(s) into the contract` : ''}`);
     const minted = mintedTypesOf(tx, args.allowContractMints, sdk.ledger);
-    const txId = await sponsorAndSubmitFinalized(sponsor, tx, 'sponsor-endpoint', args.__replyPort, calls, minted);
+    const txId = await sponsorAndSubmitFinalized(sponsor, tx, 'sponsor-endpoint', args.__replyPort, calls, minted, unshielded);
     log('info', `sponsorFinalizedTx: LANDED txHash=${txId.slice(0, 16)}`);
     return {
         txHash: txId, circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '',
         deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address),
-        ...(minted.length ? { minted } : {})
+        ...(minted.length ? { minted } : {}),
+        ...(unshielded.length ? { unshielded } : {})
     };
 }
 
@@ -725,11 +878,12 @@ async function buildDustSpend(
  * Many of these can run at once from one wallet. It does not change the wallet's own state,
  * so only the dust build takes the session lock.
  */
-export async function sponsorUnboundTx(args: {
+export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
     sponsorSessionId: string; unboundTxB64?: string; networkId: string;
     /** The two halves of a shielded swap, used instead of one caller tx. */
     swap?: { makerHalfB64: string; takerHalfB64: string }; allowSwaps?: boolean;
-    allowedContracts?: string[]; allowedCircuits?: string[]; contractCircuits?: ContractCircuitRules; allowDeploy?: boolean; ownContracts?: string[]; allowedTokenTypes?: string[]; allowContractMints?: boolean;
+    /** A plain shielded transfer with the terms the caller declares, used instead of one caller tx. */
+    transfer?: { txB64: string; tokenType: string; amount: string }; allowTransfers?: boolean;
     /** Set by the dispatcher. Used to announce the tx before sending it. */
     __replyPort?: MessagePort;
 }) {
@@ -743,8 +897,24 @@ export async function sponsorUnboundTx(args: {
     let callerBound = false;
     let calls: Array<{ address: string; entryPoint: string }>;
     let swap: SwapTerms | undefined;
+    let transfer: { tokenType: string; amount: string } | undefined;
     let nullifiers: string[] = [];
-    if (args.swap) {
+    const unshielded: UnshieldedMove[] = [];
+    if (args.transfer) {
+        if (args.allowTransfers !== true) throw new SponsorRefusalError('refusing to sponsor: transfers are not sponsored for this caller');
+        const tokenType = normalizeTokenType(args.transfer.tokenType);
+        const listed = (args.allowedTokenTypes ?? []).map(normalizeTokenType);
+        if (!listed.includes(tokenType)) throw new SponsorRefusalError(`refusing to sponsor: the transfer declares token type ${tokenType.slice(0, 16)}…, not in allowedTokenTypes`);
+        if (tokenType === normalizeTokenType(sdk.ledger.nativeToken().raw)) throw new SponsorRefusalError('refusing to sponsor: the transfer declares NIGHT, which is never shielded');
+        const deserialized = await deserializeSwapHalf(args.transfer.txB64, 'transfer');
+        const shape = checkTransferShape(deserialized.tx, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'));
+        callerTx = deserialized.tx;
+        callerBound = deserialized.bound;
+        nullifiers = shape.nullifiers;
+        transfer = { tokenType, amount: String(args.transfer.amount) };
+        calls = [{ address: '', entryPoint: TRANSFER_ENTRY_POINT }];
+        log('info', `sponsorUnboundTx: transfer of ${transfer.amount} ${tokenType.slice(0, 12)} declared (${shape.inputs} input(s), ${callerBound ? 'bound' : 'unbound'})`);
+    } else if (args.swap) {
         if (args.allowSwaps !== true) throw new SponsorRefusalError('refusing to sponsor: swaps are not sponsored for this caller');
         const maker = await deserializeSwapHalf(args.swap.makerHalfB64, 'maker half');
         const taker = await deserializeSwapHalf(args.swap.takerHalfB64, 'taker half');
@@ -762,9 +932,9 @@ export async function sponsorUnboundTx(args: {
     } else {
         const deserialized = await deserializeFinalizedTx(String(args.unboundTxB64 ?? ''));
         callerTx = deserialized.tx;
-        calls = checkSponsorableShape(callerTx, deserialized.bytes.length, args.allowedContracts, args.allowedCircuits, { allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, contractCircuits: args.contractCircuits, allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw, allowContractMints: args.allowContractMints === true, deriveTokenType: tokenTypeDeriver(sdk.ledger) });
+        calls = checkSponsorableShape(callerTx, deserialized.bytes.length, args.allowedContracts, args.allowedCircuits, shapeOptions(sdk, sponsor, args, unshielded));
     }
-    const minted = swap ? [] : mintedTypesOf(callerTx, args.allowContractMints, sdk.ledger);
+    const minted = swap || transfer ? [] : mintedTypesOf(callerTx, args.allowContractMints, sdk.ledger);
     const contractAddress = calls[0]?.address || undefined;
 
     const dustSegment = freeSegmentId(callerTx);
@@ -838,7 +1008,9 @@ export async function sponsorUnboundTx(args: {
             ttl: ttl.toISOString(),
             segments: callSegments(bound),
             ...(minted.length ? { minted } : {}),
-            ...(nullifiers.length ? { nullifiers } : {})
+            ...(nullifiers.length ? { nullifiers } : {}),
+            ...(unshielded.length ? { unshielded } : {}),
+            ...(transfer ? { transfer } : {})
         });
         sent = true;
         const txId = await submitOnDedicatedClient(sponsor, bound, 'sponsor-unbound-submit');
@@ -848,6 +1020,8 @@ export async function sponsorUnboundTx(args: {
             deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address),
             ...(minted.length ? { minted } : {}),
             ...(swap ? { swap } : {}),
+            ...(transfer ? { transfer } : {}),
+            ...(unshielded.length ? { unshielded } : {}),
             ...(nullifiers.length ? { nullifiers } : {})
         };
     } catch (e) {
@@ -859,4 +1033,4 @@ export async function sponsorUnboundTx(args: {
     }
 }
 
-export const sponsorHandlers = { buildSponsorableTx, sponsorFinalizedTx, sponsorUnboundTx, describeSwapHalf, describeTransaction };
+export const sponsorHandlers = { buildSponsorableTx, sponsorFinalizedTx, sponsorUnboundTx, describeSwapHalf, describeTransaction, describeTransfer };

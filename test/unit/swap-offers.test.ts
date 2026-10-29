@@ -315,7 +315,7 @@ describe('offer board over HTTP', () => {
         expect(after.data.openOffers - before.data.openOffers).toBe(1);
         expect(after.data.offersFilledToday - before.data.offersFilledToday).toBe(1);
         expect(after.data).toMatchObject({ swapsToday: 0, sponsorsConfigured: 0, sponsorsReady: 0 });
-        expect(Object.keys(after.data).sort()).toEqual(['@odata.context', 'asOf', 'offersFilledToday', 'openOffers', 'sponsorsConfigured', 'sponsorsReady', 'swapsToday']);
+        expect(Object.keys(after.data).sort()).toEqual(['@odata.context', 'asOf', 'factoryContract', 'offersFilledToday', 'openOffers', 'sponsorsConfigured', 'sponsorsReady', 'swapsToday']);
         expect(a.status).toBe(200);
     });
 });
