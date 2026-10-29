@@ -121,6 +121,7 @@ and `code`; a 429 and a retryable 503 also carry `retryAfterSeconds` from
 | `proofTimeoutMs` | no | server proving: timeout of one proof request, default 300000 ms; the SDK retries up to 3 times, so set it above your slowest circuit |
 | `walletSync` | no | default `true`: every sub-wallet syncs from genesis on the calling thread for the builder's life (a full core until tip; the dust history alone takes hours on preprod). `false`: no sync; value-free calls (every vault circuit) still build, value-moving calls fail at balancing. `'shielded'`: only the shielded coins (minutes). `'coins'`: the shielded and the NIGHT coins, no dust. A sponsor pays the fee, so no sponsored call needs the dust wallet; the table below says which call needs which mode |
 | `walletState` | no | from `serializeWalletState()`: the sub-wallets named in it resume instead of syncing from genesis |
+| `shieldedWallet` | no | a started shielded wallet of the same seed, such as a swap wallet's `shieldedWallet`: the builder balances from it and neither starts nor stops it, so the swap wallet and every builder of the process share one sync and one view of the coins. Excludes `walletState.shielded`; with `walletSync: false` the builder syncs nothing more |
 | `onProgress` | no | callback for asset download, wallet start and build phases; while a wallet syncs, `{ phase: 'sync', wallet, appliedIndex, highestIndex, isConnected }` at most once a second per wallet and once more at the tip |
 
 Returns `{ attestationSecret, attesterId, zkAssets, addresses, shieldedKeys, provingMode, walletSync, waitForSync, serializeWalletState, buildSponsorable, buildDeploySponsorable, close }`.
@@ -138,8 +139,32 @@ Which sync a call needs:
 | a sponsored call that pays the builder's own NIGHT into the contract (an unshielded offer next to the call) | `'coins'` |
 | a self-funded submission, where the builder pays its own dust | `true` |
 
-`waitForSync()` resolves when every started sub-wallet reached the tip;
-`serializeWalletState()` saves the same set.
+`waitForSync()` resolves when every started sub-wallet reached the tip, a
+shared shielded wallet included; `serializeWalletState()` saves the same set.
+
+### One shielded wallet per seed
+
+A process that swaps and calls contracts on one seed runs one shielded
+wallet. Every `createTxBuilder` and `createSwapWallet` would otherwise sync
+the chain on its own (minutes from genesis, a core each) and see only the
+coins it spent itself, so two builds shortly after each other could pick the
+same coin. Create the swap wallet once and hand its wallet to every builder:
+
+```js
+const swap = await createSwapWallet({ seedHex, indexerHttpUrl, indexerWsUrl, walletState });
+const builder = await createTxBuilder({ seedHex, api, package: '@acme/contract-pay', shieldedWallet: swap.shieldedWallet, walletSync: false });
+await swap.sync();                       // or builder.waitForSync(): the same wallet
+const { finalizedTxB64 } = await builder.buildSponsorable({ contractAddress, call, bind: true });
+await builder.close();                   // leaves the wallet running
+await swap.close();                      // stops it
+```
+
+`swap.serializeState()` saves the one state. A coin a call spent is pending in
+the swap wallet until the call lands, a half's coins are pending for the
+builder. The swap wallet picks coins one build at a time, so a call's
+balancing never uses a half's coin plan. A call the wallet has to fund (a
+coin the circuit receives) needs `bind: true`: the wallet adds a balancing
+transaction, which only the bound handover carries.
 
 ### `deriveIdentity({ seedHex, networkId?, accountIndex?, attestationSecret? }) -> { attesterId, attestationSecret, addresses, shieldedKeys }`
 
@@ -302,7 +327,7 @@ it stopped. The state holds the wallet's coins: store it like a key.
 
 Returns `{ address, coinPublicKey, encryptionPublicKey, provingMode,
 maxInputs, sync, balances, pendingBalances, coins, spendable, buildHalf,
-buildTransfer, takeOffer, serializeState, close }`.
+buildTransfer, takeOffer, serializeState, shieldedWallet, close }`.
 
 - `balances()` sums the free coins per token type. `pendingBalances()` sums
   what the halves built here bring back once their swaps land, the change of
@@ -320,6 +345,10 @@ buildTransfer, takeOffer, serializeState, close }`.
   half in the offer's form (bound and unbound transactions do not merge).
 - `revert()` releases the coins of a half that is not handed over. Until then,
   or until the swap lands, they are pending in the wallet.
+
+- `shieldedWallet` is the wallet behind the swap wallet, for
+  `createTxBuilder({ shieldedWallet })`: builders of the same seed then share
+  its sync and its coins (see "One shielded wallet per seed").
 
 A half refers to a recent state of the coin tree and expires with it: build
 the halves and hand them over close together.

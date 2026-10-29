@@ -121,7 +121,11 @@ its offer file (`swapoffer1...`); `takeOffer({ offer, expect })` reads the
 offer's terms from the transaction, builds the mirror half and returns both for
 `ng.sponsorSwap({ makerHalfB64, takerHalfB64 })`.
 `serializeState()` / `walletState` resume a wallet without a sync from genesis.
-Details: `docs/txbuilder.md` in the main repo.
+A process that swaps and calls contracts on one seed runs one shielded wallet:
+`createTxBuilder({ shieldedWallet: swap.shieldedWallet, walletSync: false })`
+balances from the swap wallet's coins and neither starts nor stops it (one
+sync, one state, one view of the spent coins). Details: `docs/txbuilder.md`
+in the main repo.
 
 A contract call that moves shielded value needs the same coins only:
 `createTxBuilder({ ..., walletSync: 'shielded' })`. A call that creates a coin

@@ -102,6 +102,26 @@ export function syncedWallets(mode) {
     return [];
 }
 
+/** A shielded wallet another owner started: the builder's `start` and `stop` leave it alone. */
+export function sharedShieldedWallet(wallet) {
+    const leave = async () => { /* the owner started it and stops it */ };
+    return new Proxy(wallet, {
+        get(target, prop) {
+            if (prop === 'start' || prop === 'stop') return leave;
+            const value = Reflect.get(target, prop, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+        }
+    });
+}
+
+const SHIELDED_WALLET_METHODS = ['start', 'stop', 'balanceTransaction', 'revertTransaction', 'waitForSyncedState', 'serializeState'];
+
+/** Whether `wallet` is a shielded wallet instance of the SDK, as the facade needs it. */
+export function isShieldedWallet(wallet) {
+    return Boolean(wallet) && typeof wallet === 'object' && typeof wallet.state?.subscribe === 'function'
+        && SHIELDED_WALLET_METHODS.every(m => typeof wallet[m] === 'function');
+}
+
 const asIndex = (v) => (typeof v === 'bigint' || typeof v === 'number' ? String(v) : null);
 
 /**
@@ -547,6 +567,8 @@ export async function deriveIdentity(opts) {
  * @param {string[]} [opts.circuits]      Circuits you will call. Defaults to all circuits of the contract.
  * @param {number} [opts.ttlMinutes]      How long the transaction stays valid, default 30. The sponsor must submit it in that time.
  * @param {Uint8Array} [opts.attestationSecret] Defaults to a secret derived from the seed.
+ * @param {object} [opts.shieldedWallet] A started shielded wallet of the same seed, such as a swap wallet's
+ *                                        `shieldedWallet`. The builder balances from it and never starts or stops it.
  * @param {Function} [opts.onProgress]    Progress callback.
  */
 export async function createTxBuilder(opts) {
@@ -584,12 +606,22 @@ export async function createTxBuilder(opts) {
         throw new Error(`createTxBuilder: proofTimeoutMs must be a positive integer (ms), got ${String(opts.proofTimeoutMs)}`);
     }
     const syncMode = walletSyncMode(opts.walletSync);
-    if (apiClient && syncMode !== 'none' && !hasIndexer) {
+    const shared = opts.shieldedWallet;
+    if (shared !== undefined && !isShieldedWallet(shared)) {
+        throw new Error("createTxBuilder: shieldedWallet must be a started shielded wallet of the SDK, such as a swap wallet's shieldedWallet");
+    }
+    // The sub-wallets this builder syncs itself; a shared shielded wallet is synced by its owner.
+    const ownWallets = syncedWallets(syncMode).filter(w => w !== 'shielded' || !shared);
+    const synced = shared ? ['shielded', ...ownWallets] : ownWallets;
+    if (apiClient && ownWallets.length && !hasIndexer) {
         throw new Error('createTxBuilder: with api the wallet is not synced; pass walletSync: false, or indexerHttpUrl and indexerWsUrl for the sync');
     }
     const saved = opts.walletState;
     if (saved !== undefined && (saved === null || typeof saved !== 'object' || ['shielded', 'unshielded', 'dust'].some(k => saved[k] !== undefined && typeof saved[k] !== 'string'))) {
         throw new Error('createTxBuilder: walletState must be the object serializeWalletState() returned');
+    }
+    if (shared && saved?.shielded !== undefined) {
+        throw new Error('createTxBuilder: walletState.shielded and shieldedWallet exclude each other; the shared wallet keeps its own state');
     }
     const cacheDir = zkConfigDir ?? opts.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', contractName);
 
@@ -654,9 +686,9 @@ export async function createTxBuilder(opts) {
         // Without a node the SDK's default service would dial the relay at init.
         ...(nodeUrl ? {} : { submissionService: buildOnlySubmissionService() }),
         provingService: () => proving.makeWasmProvingService({}),
-        shielded: () => (saved?.shielded
-            ? shielded.ShieldedWallet(configuration).restore(saved.shielded)
-            : shielded.ShieldedWallet(configuration).startWithSecretKeys(zswapKeys)),
+        shielded: () => (shared ? sharedShieldedWallet(shared)
+            : saved?.shielded ? shielded.ShieldedWallet(configuration).restore(saved.shielded)
+                : shielded.ShieldedWallet(configuration).startWithSecretKeys(zswapKeys)),
         unshielded: () => (saved?.unshielded
             ? unshielded.UnshieldedWallet(configuration).restore(saved.unshielded)
             : unshielded.UnshieldedWallet(configuration).startWithPublicKey(unshielded.PublicKey.fromKeyStore(keystore))),
@@ -666,7 +698,7 @@ export async function createTxBuilder(opts) {
     });
     // Syncing a wallet reads the whole chain and keeps this thread busy; a call that moves no
     // tokens needs none. A sponsor pays the fee, so 'shielded' and 'coins' leave the dust wallet out.
-    const stopWatching = onProgress ? watchSync(facade, syncedWallets(syncMode), onProgress) : () => {};
+    const stopWatching = onProgress ? watchSync(facade, synced, onProgress) : () => {};
     if (syncMode === 'all') await facade.start(zswapKeys, dustKey);
     else if (syncMode === 'coins') await Promise.all([facade.shielded.start(zswapKeys), facade.unshielded.start()]);
     else if (syncMode === 'shielded') await facade.shielded.start(zswapKeys);
@@ -704,13 +736,13 @@ export async function createTxBuilder(opts) {
 
         async waitForSync() {
             if (syncMode === 'all') await facade.waitForSyncedState();
-            else await Promise.all(syncedWallets(syncMode).map(w => facade[w].waitForSyncedState()));
+            else await Promise.all(synced.map(w => facade[w].waitForSyncedState()));
         },
 
         /** Saves the wallet state. Pass it to `createTxBuilder({ walletState })` to skip a full sync next time. */
         async serializeWalletState() {
             const out = {};
-            for (const w of syncedWallets(syncMode)) out[w] = await facade[w].serializeState();
+            for (const w of synced) out[w] = await facade[w].serializeState();
             return out;
         },
 

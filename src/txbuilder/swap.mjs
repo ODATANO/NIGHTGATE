@@ -234,6 +234,17 @@ export async function createSwapWallet(opts) {
         queue = run.catch(() => { /* the caller has the error */ });
         return run;
     };
+    // The instance for createTxBuilder({ shieldedWallet }). Its coin picks run in the halves' lane,
+    // so a builder's balancing never uses a half's plan and a half never loses a slot to it.
+    const shieldedWallet = new Proxy(wallet, {
+        get(target, prop) {
+            if (prop === 'balanceTransaction' || prop === 'transferTransaction' || prop === 'initSwap') {
+                return (...args) => oneAtATime(() => target[prop](...args));
+            }
+            const value = Reflect.get(target, prop, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+        }
+    });
     const ownAddress = await wallet.getAddress();
     const address = sdk.addressFormat.MidnightBech32m.encode(networkId, ownAddress).toString();
 
@@ -391,6 +402,9 @@ export async function createSwapWallet(opts) {
 
         /** Saves the wallet state. Pass it to `createSwapWallet({ walletState })` to skip a full sync next time. */
         serializeState: () => wallet.serializeState(),
+
+        /** The wallet behind this one, for `createTxBuilder({ shieldedWallet })`: one sync and one view of the coins for swaps and calls. */
+        shieldedWallet,
 
         async close() { try { await wallet.stop(); } catch { /* best effort */ } }
     };

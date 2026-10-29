@@ -2,6 +2,17 @@
 // with your own key, for a NIGHTGATE server to pay the fee and submit.
 import type { ConnectOptions, NightgateClient } from '../sdk/client';
 
+/** A started shielded wallet of the SDK, as a swap wallet hands it out and a builder takes it. */
+export interface ShieldedWalletInstance {
+    state: { subscribe(observer: { next?(state: unknown): void; error?(e: unknown): void }): { unsubscribe(): void } };
+    start(secretKeys: unknown): Promise<void>;
+    stop(): Promise<void>;
+    balanceTransaction(secretKeys: unknown, tx: unknown): Promise<unknown>;
+    revertTransaction(tx: unknown): Promise<void>;
+    waitForSyncedState(): Promise<unknown>;
+    serializeState(): Promise<string>;
+}
+
 /** A call prepared by one of the `prepare*` helpers. */
 export interface PreparedCall {
     circuitId: string;
@@ -114,6 +125,12 @@ export interface CreateTxBuilderInput {
     walletSync?: boolean | 'shielded' | 'coins';
     /** Saved state from `serializeWalletState()`, to skip a full sync. */
     walletState?: WalletState;
+    /**
+     * A started shielded wallet of the same seed, such as a swap wallet's `shieldedWallet`. The builder balances
+     * from it and neither starts nor stops it, so the swap wallet and every builder of a process share one sync
+     * and one view of the coins. Excludes `walletState.shielded`.
+     */
+    shieldedWallet?: ShieldedWalletInstance;
     /** Asset download, wallet start, build phases and, while a wallet syncs, a `SyncProgressEvent` per wallet. */
     onProgress?: (e: Record<string, unknown> | SyncProgressEvent) => void;
 }
@@ -235,7 +252,7 @@ export interface TxBuilder {
     /** Another builder lists these under `recipients` to send this wallet a private coin. */
     shieldedKeys: ShieldedPublicKeys;
     walletSync: 'all' | 'coins' | 'shielded' | 'none';
-    /** Resolves once every syncing sub-wallet has caught up with the chain. */
+    /** Resolves once every syncing sub-wallet has caught up with the chain, a shared shielded wallet included. */
     waitForSync(): Promise<void>;
     /** Saves the wallet state for `createTxBuilder({ walletState })`. */
     serializeWalletState(): Promise<WalletState>;
@@ -546,6 +563,8 @@ export interface SwapWallet {
     takeOffer(input: { offer: string | Uint8Array; expect?: SwapTermsInput }): Promise<TakenOffer>;
     /** Saves the wallet state. It contains the wallet's coins, so keep it as safe as a key. */
     serializeState(): Promise<string>;
+    /** The wallet behind this one, for `createTxBuilder({ shieldedWallet })`: builders of the same seed share its sync and its coins. */
+    readonly shieldedWallet: ShieldedWalletInstance;
     close(): Promise<void>;
 }
 

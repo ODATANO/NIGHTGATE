@@ -383,6 +383,19 @@ describe('txbuilder: createTxBuilder input validation', () => {
         await expect(createTxBuilder({ ...base, api: { token: 'no-base-url' } as any })).rejects.toThrow(/options for connect/);
     });
 
+    it('shieldedWallet must be a started wallet, excludes a saved shielded state and needs no indexer with api', async () => {
+        const { createTxBuilder } = await importTxBuilder();
+        const api = { baseUrl: 'https://ng.example', agentToken: 'ngat_x' };
+        const noIndexer = { ...base, api, indexerHttpUrl: '', indexerWsUrl: '', nodeUrl: '' };
+        const wallet: any = { state: { subscribe() { /* observable stand-in */ } }, async start() { /* owner */ }, async stop() { /* owner */ }, async balanceTransaction() { /* balancing */ }, async revertTransaction() { /* revert */ }, async waitForSyncedState() { /* sync */ }, async serializeState() { /* state */ } };
+        await expect(createTxBuilder({ ...base, shieldedWallet: { state: {} } as any })).rejects.toThrow(/shieldedWallet must be a started shielded wallet/);
+        // the shared wallet is synced by its owner, so 'shielded' starts nothing here: the sync check passes and the next one fails
+        await expect(createTxBuilder({ ...noIndexer, walletSync: 'shielded', walletState: 'bad' as any })).rejects.toThrow(/walletSync: false/);
+        await expect(createTxBuilder({ ...noIndexer, walletSync: 'shielded', walletState: 'bad' as any, shieldedWallet: wallet })).rejects.toThrow(/walletState must be the object/);
+        await expect(createTxBuilder({ ...noIndexer, walletSync: 'coins', shieldedWallet: wallet })).rejects.toThrow(/walletSync: false/);
+        await expect(createTxBuilder({ ...base, shieldedWallet: wallet, walletState: { shielded: 'saved' } })).rejects.toThrow(/exclude each other/);
+    });
+
     it("server proving is an EXPLICIT opt-in: a bare proofServerUrl does not select it, and 'server' without a URL rejects", async () => {
         const { createTxBuilder } = await importTxBuilder();
         await expect(createTxBuilder({ ...base, provingMode: 'tpu' })).rejects.toThrow(/provingMode must be 'wasm' or 'server'/);
@@ -527,6 +540,35 @@ describe('txbuilder: wallet sync modes', () => {
         expect(syncedWallets('coins')).toEqual(['shielded', 'unshielded']);
         expect(syncedWallets('shielded')).toEqual(['shielded']);
         expect(syncedWallets('none')).toEqual([]);
+    });
+
+    it("sharedShieldedWallet: start and stop leave the owner's wallet alone, the rest reaches it bound", async () => {
+        const { sharedShieldedWallet, isShieldedWallet } = await importTxBuilder();
+        const calls: string[] = [];
+        class Wallet {
+            #secret = 'inside';
+            state = { subscribe: () => ({ unsubscribe() { /* nothing to release */ } }) };
+            async start() { calls.push('start'); }
+            async stop() { calls.push('stop'); }
+            async balanceTransaction() { return this.#secret; }
+            async revertTransaction() { calls.push('revert'); }
+            async waitForSyncedState() { return this.#secret; }
+            async serializeState() { return 'state'; }
+        }
+        const wallet = new Wallet();
+        expect(isShieldedWallet(wallet)).toBe(true);
+        expect(isShieldedWallet({ state: {} })).toBe(false);
+        expect(isShieldedWallet(null)).toBe(false);
+        const shared = sharedShieldedWallet(wallet);
+        await shared.start({ keys: true });
+        await shared.stop();
+        expect(calls).toEqual([]);
+        // a private field needs the real instance as `this`
+        expect(await shared.balanceTransaction()).toBe('inside');
+        expect(await shared.waitForSyncedState()).toBe('inside');
+        expect(shared.state).toBe(wallet.state);
+        await shared.revertTransaction();
+        expect(calls).toEqual(['revert']);
     });
 
     it('syncProgressEvent reads ledger-event and transaction counters alike, null when unreadable', async () => {

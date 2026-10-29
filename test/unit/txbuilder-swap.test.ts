@@ -110,7 +110,7 @@ describe('createSwapWallet', () => {
     const URLS = { indexerHttpUrl: 'https://indexer.example/api/v3/graphql', indexerWsUrl: 'wss://indexer.example/api/v3/graphql/ws' };
 
     function fakeSdk(over: { balances?: Record<string, bigint>; built?: (inputs: any, outputs: any) => any; coins?: Array<{ type: string; value: bigint }>; pendingCoins?: Array<{ type: string; value: bigint }>; unprovenInputs?: number } = {}) {
-        const calls: any = { initSwap: [], reverted: [], restored: [], started: 0, stopped: 0, proven: [], picked: [] };
+        const calls: any = { initSwap: [], reverted: [], restored: [], started: 0, stopped: 0, proven: [], picked: [], order: [] };
         const coins = over.coins ?? [{ type: A, value: 5000n }, { type: B, value: 5000n }];
         let selection: any;
         const ownAddress = { own: 'address' };
@@ -132,8 +132,14 @@ describe('createSwapWallet', () => {
             getAddress: vi.fn(async () => ownAddress),
             waitForSyncedState: vi.fn(async () => ({})),
             serializeState: vi.fn(async () => '{"saved":true}'),
+            balanceTransaction: vi.fn(async (_keys: any, tx: any) => {
+                calls.order.push('balance');
+                return { balanced: tx, picked: selection([...coins], A, 0n, {})?.value };
+            }),
             initSwap: vi.fn(async (_keys: any, inputs: any, outputs: any) => {
+                calls.order.push('initSwap');
                 calls.initSwap.push({ inputs, outputs });
+                await new Promise(resolve => setTimeout(resolve, 5));
                 // the wallet asks the configured selection for its coins, one by one
                 const [[type, amount]] = Object.entries(inputs) as Array<[string, bigint]>;
                 let pool = [...coins];
@@ -247,6 +253,21 @@ describe('createSwapWallet', () => {
         await createSwapWallet({ ...URLS, seedHex: SEED, walletState: '{"saved":true}', sdk: resumed.sdk });
         expect(resumed.calls.restored).toEqual(['{"saved":true}']);
         expect(resumed.factory.startWithSecretKeys).not.toHaveBeenCalled();
+    });
+
+    it('shieldedWallet is the wallet behind the swap wallet; its coin picks wait for a half in flight and use no plan', async () => {
+        const { createSwapWallet } = await importTxBuilder();
+        const { sdk, wallet: inner, calls } = fakeSdk({ coins: [{ type: A, value: 5000n }, { type: A, value: 100n }] });
+        const wallet = await createSwapWallet({ ...URLS, seedHex: SEED, sdk });
+        const shared = wallet.shieldedWallet;
+        expect(shared.state).toBe(inner.state);
+        expect(await shared.serializeState()).toBe('{"saved":true}');
+        const half = wallet.buildHalf({ give: { tokenType: A, amount: 5000 }, want: { tokenType: B, amount: 1 } });
+        const balanced = await shared.balanceTransaction({ keys: true }, { tx: 1 });
+        await half;
+        expect(calls.order).toEqual(['initSwap', 'balance']);
+        expect(balanced).toEqual({ balanced: { tx: 1 }, picked: 100n });   // the smallest coin, no plan
+        expect(calls.picked).toEqual([[100n, 5000n]]);                      // the half kept its plan
     });
 
     it('pendingBalances sums the coins the built halves bring back, per token type', async () => {

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.39.4 - 2026-10-29
+
+### Changes
+
+- `@odatano/nightgate-tx` 0.19.0: one shielded wallet per seed.
+  `createTxBuilder({ shieldedWallet })` takes a started shielded wallet and
+  neither starts nor stops it; `createSwapWallet` hands its own out as
+  `shieldedWallet`. A process that swaps and calls contracts on one seed runs
+  one sync, one saved state and one view of the spent coins, where every
+  builder used to sync the chain on its own from genesis and could pick a coin
+  a half had spent. The swap wallet picks coins one build at a time, so a
+  call's balancing never uses a half's coin plan. `docs/txbuilder.md` shows
+  the setup.
+
 ## 0.39.3 - 2026-10-29
 
 ### Changes
