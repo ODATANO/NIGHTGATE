@@ -354,8 +354,17 @@ const utxoValue = (v: unknown, what: string): bigint => {
     throw new SponsorRefusalError(`refusing to sponsor: ${what} carries a value that is not readable`);
 };
 
+/** The ledger's imbalance of one unshielded token type in a segment; undefined when the segment never touched it. */
+function ledgerImbalance(balance: Map<unknown, unknown>, type: string): bigint | undefined {
+    for (const [tokenType, value] of balance.entries()) {
+        const t = tokenType as { tag?: unknown; raw?: unknown } | null;
+        if (t?.tag === 'unshielded' && normalizeTokenType(t.raw) === type) return utxoValue(value, `the ledger balance of ${type.slice(0, 16)}…`);
+    }
+    return undefined;
+}
+
 /**
- * Public offer, so every rule runs on the bytes: zero net per type, allowed types, outputs to a sponsorable contract or back to a spender.
+ * Public offer, so every rule runs on the bytes. The ledger's segment balance decides the net, since it counts what the called circuit takes in.
  */
 export function checkUnshieldedOffer(
     offer: any, key: string,
@@ -365,6 +374,8 @@ export function checkUnshieldedOffer(
         listedContract: (address: string) => boolean;
         /** The contracts the same intent calls. */
         calledContracts: Set<string>;
+        /** `tx.imbalances(segment)` of the offer's segment. */
+        ledgerBalance: Map<unknown, unknown>;
     } & UnshieldedOfferOptions
 ): UnshieldedMove[] {
     const inputs: any[] | undefined = Array.isArray(offer?.inputs) ? offer.inputs : undefined;
@@ -399,9 +410,26 @@ export function checkUnshieldedOffer(
         throw new SponsorRefusalError(`refusing to sponsor: ${key} pays ${to.slice(0, 16)}…, which is neither a sponsorable contract nor an owner of its inputs`);
     }
     for (const [type, net] of sums) {
-        if (net !== 0n) throw new SponsorRefusalError(`refusing to sponsor: ${key} does not net to zero in token type ${type.slice(0, 16)}… (${net > 0n ? 'spends more than it creates' : 'creates more than it spends'})`);
+        if (net < 0n) throw new SponsorRefusalError(`refusing to sponsor: ${key} creates more of token type ${type.slice(0, 16)}… than it spends; a payout from the contract is not sponsored`);
+        const imbalance = ledgerImbalance(ctx.ledgerBalance, type);
+        if (imbalance === undefined) throw new SponsorRefusalError(`refusing to sponsor: the ledger reports no balance of token type ${type.slice(0, 16)}… for ${key}`);
+        if (imbalance !== 0n) {
+            throw new SponsorRefusalError(`refusing to sponsor: ${key} does not balance in token type ${type.slice(0, 16)}…: the offer and the calls' intake leave a ${imbalance > 0n ? 'surplus' : 'deficit'} of ${imbalance < 0n ? -imbalance : imbalance}`);
+        }
+        if (net === 0n) continue;
+        // The called circuit takes the rest in without an output of its own.
+        if (ctx.calledContracts.size !== 1) {
+            throw new SponsorRefusalError(`refusing to sponsor: ${key} pays ${net} of token type ${type.slice(0, 16)}… into ${ctx.calledContracts.size} called contracts; one contract per intent takes value`);
+        }
+        moves.push({ type, amount: net.toString(), to: [...ctx.calledContracts][0] });
     }
     return moves;
+}
+
+function ledgerBalance(tx: any, segment: number): Map<unknown, unknown> {
+    if (typeof tx?.imbalances !== 'function') throw new SponsorRefusalError('refusing to sponsor: transaction structure is not inspectable (no imbalances)');
+    try { return tx.imbalances(segment); }
+    catch (e) { throw new SponsorRefusalError(`refusing to sponsor: the balance of segment ${segment} is not readable (${formatErr(e).slice(0, 80)})`); }
 }
 
 /**
@@ -458,7 +486,7 @@ export function checkSponsorableShape(
     const unshieldedTypes = (options.allowedUnshieldedTokenTypes ?? []).map(normalizeTokenType);
     const listedContract = (address: string): boolean =>
         (allowedContracts ?? []).includes(address) || (Array.isArray(options.ownContracts) && options.ownContracts.includes(address));
-    for (const [, intent] of Array.from(intents.entries())) {
+    for (const [segmentId, intent] of Array.from(intents.entries())) {
         // The caller pays no fee, so it has no reason to carry dust actions.
         if (offerNonEmpty(intent?.dustActions)) {
             throw new SponsorRefusalError('refusing to sponsor: transaction carries dustActions alongside its contract calls');
@@ -517,8 +545,9 @@ export function checkSponsorableShape(
             throw new SponsorRefusalError(`refusing to sponsor: ${unshieldedKeys[0]} sits in an intent without a contract call`);
         }
         for (const key of unshieldedKeys) {
+            const segment = key === 'guaranteedUnshieldedOffer' ? 0 : Number(segmentId);
             const moves = checkUnshieldedOffer(intent[key], key, {
-                nightType, tokenTypes: unshieldedTypes, listedContract, calledContracts: intentCalls,
+                nightType, tokenTypes: unshieldedTypes, listedContract, calledContracts: intentCalls, ledgerBalance: ledgerBalance(tx, segment),
                 addressFromKey: options.addressFromKey, sponsorInputKeys: options.sponsorInputKeys
             });
             options.collectUnshielded?.push(...moves);

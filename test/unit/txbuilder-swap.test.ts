@@ -385,7 +385,7 @@ describe('recipients and sync modes', () => {
     it('walletSyncMode: true and absent sync everything, false nothing, shielded the coins', async () => {
         const { walletSyncMode } = await importTxBuilder();
         expect([undefined, true, false, 'shielded'].map(walletSyncMode)).toEqual(['all', 'all', 'none', 'shielded']);
-        expect(() => walletSyncMode('dust')).toThrow(/walletSync must be true, false or 'shielded'/);
+        expect(() => walletSyncMode('dust')).toThrow(/walletSync must be true, false, 'shielded' or 'coins'/);
     });
 
     it('deriveRoleSeeds validates the seed', async () => {

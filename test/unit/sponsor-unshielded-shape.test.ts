@@ -18,8 +18,22 @@ beforeAll(async () => {
 });
 
 const CALL = (address: string, entryPoint: string) => ({ address, entryPoint });
+const unshieldedKey = (raw: string) => ({ tag: 'unshielded', raw });
+// A ledger balance from the offers alone, as for a call that takes nothing in.
+function offerBalance(intents: Map<number, any>, segment: number): Map<unknown, unknown> {
+    const sums = new Map<string, bigint>();
+    for (const [id, intent] of intents) {
+        for (const [seg, key] of [[0, 'guaranteedUnshieldedOffer'], [id, 'fallibleUnshieldedOffer']] as const) {
+            if (seg !== segment) continue;
+            for (const i of intent?.[key]?.inputs ?? []) if (typeof i.value === 'bigint') sums.set(i.type, (sums.get(i.type) ?? 0n) + i.value);
+            for (const o of intent?.[key]?.outputs ?? []) if (typeof o.value === 'bigint') sums.set(o.type, (sums.get(o.type) ?? 0n) - o.value);
+        }
+    }
+    return new Map([...sums].map(([type, v]) => [unshieldedKey(type), v]));
+}
 function tx(intents: Array<Record<string, unknown>>, top: Record<string, unknown> = {}) {
-    return { intents: new Map(intents.map((i, n) => [n + 1, i])), ...top };
+    const map = new Map(intents.map((i, n) => [n + 1, i]));
+    return { intents: map, imbalances: (segment: number) => offerBalance(map, segment), ...top };
 }
 
 describe('unshielded offers next to a call', () => {
@@ -36,9 +50,9 @@ describe('unshielded offers next to a call', () => {
     const output = (value: bigint, owner: string, type = NIGHT) => ({ value, owner, type });
     const payIn = (inputs: unknown[], outputs: unknown[]) => tx([{ actions: [CALL(C, 'deposit')], fallibleUnshieldedOffer: { inputs, outputs } }]);
     const canonical = payIn([input(50n)], [output(10n, C), output(40n, ADDR_A)]);
-    const allowed = (t: unknown, extra: Record<string, unknown> = {}) => {
+    const allowed = (t: unknown, extra: Record<string, unknown> = {}, patch?: Record<string, unknown>) => {
         const collectUnshielded: unknown[] = [];
-        const calls = workerExports.checkSponsorableShape(t, 5000, [C], ['deposit'], {
+        const calls = workerExports.checkSponsorableShape(patch ? { ...(t as object), ...patch } : t, 5000, [C], ['deposit'], {
             nightTokenType: NIGHT, allowUnshieldedOffers: true, addressFromKey, sponsorInputKeys: [SPONSOR_KEY], collectUnshielded, ...extra
         });
         return { calls, collectUnshielded };
@@ -57,10 +71,38 @@ describe('unshielded offers next to a call', () => {
         expect(allowed(guaranteed).collectUnshielded).toEqual([{ type: NIGHT, amount: '10', to: C }]);
     });
 
-    it('refuses an offer that does not net to zero, in either direction', () => {
-        expect(() => allowed(payIn([input(50n)], [output(10n, C), output(30n, ADDR_A)]))).toThrow(/does not net to zero.*spends more than it creates/);
-        expect(() => allowed(payIn([input(50n)], [output(10n, C), output(50n, ADDR_A)]))).toThrow(/does not net to zero.*creates more than it spends/);
+    it('the called circuit may take the rest in without an output of its own; the ledger balance says so', () => {
+        const intake = payIn([input(5_000_000_000n)], [output(4_999_000_000n, ADDR_A)]);
+        intake.imbalances = () => new Map([[unshieldedKey(NIGHT), 0n]]);
+        expect(allowed(intake).collectUnshielded).toEqual([{ type: NIGHT, amount: '1000000', to: C }]);
+        const both = payIn([input(50n)], [output(10n, C), output(30n, ADDR_A)]);
+        both.imbalances = () => new Map([[unshieldedKey(NIGHT), 0n]]);
+        expect(allowed(both).collectUnshielded).toEqual([{ type: NIGHT, amount: '10', to: C }, { type: NIGHT, amount: '10', to: C }]);
+    });
+
+    it('refuses an offer whose segment does not balance on the ledger, in either direction', () => {
+        expect(() => allowed(payIn([input(50n)], [output(10n, C), output(30n, ADDR_A)]))).toThrow(/does not balance in token type.*surplus of 10/);
+        const deficit = payIn([input(50n)], [output(10n, C), output(40n, ADDR_A)]);
+        deficit.imbalances = () => new Map([[unshieldedKey(NIGHT), -5n]]);
+        expect(() => allowed(deficit)).toThrow(/does not balance in token type.*deficit of 5/);
+        expect(() => allowed(payIn([input(50n)], [output(10n, C), output(50n, ADDR_A)]))).toThrow(/creates more of token type.*than it spends/);
         expect(() => allowed(payIn([], [output(10n, C)]))).toThrow(/spends nothing/);
+    });
+
+    it('a remainder for the circuit needs exactly one called contract', () => {
+        const two = tx([{ actions: [CALL(C, 'deposit'), CALL(OTHER, 'deposit')], fallibleUnshieldedOffer: { inputs: [input(50n)], outputs: [output(40n, ADDR_A)] } }]);
+        two.imbalances = () => new Map([[unshieldedKey(NIGHT), 0n]]);
+        expect(() => workerExports.checkSponsorableShape(two, 5000, [C, OTHER], ['deposit'], { nightTokenType: NIGHT, allowUnshieldedOffers: true, addressFromKey }))
+            .toThrow(/into 2 called contracts/);
+    });
+
+    it("reads the balance of the offer's own segment: 0 for the guaranteed offer, the intent id for the fallible one", () => {
+        const seen: number[] = [];
+        const t = tx([{ actions: [CALL(C, 'deposit')] }, { actions: [CALL(C, 'deposit')], guaranteedUnshieldedOffer: { inputs: [input(10n)], outputs: [output(10n, C)] }, fallibleUnshieldedOffer: { inputs: [input(5n)], outputs: [output(5n, C)] } }]);
+        const balance = t.imbalances;
+        t.imbalances = (segment: number) => { seen.push(segment); return balance(segment); };
+        allowed(t);
+        expect(seen).toEqual([0, 2]);
     });
 
     it('every output goes to a sponsorable contract or back to a spender, never to a third party', () => {
@@ -89,9 +131,12 @@ describe('unshielded offers next to a call', () => {
         expect(() => allowed(payIn([input(10n, SPONSOR_KEY)], [output(10n, C)]))).toThrow(/spends a UTXO of the sponsor itself/);
     });
 
-    it('fails closed on an unreadable offer', () => {
+    it('fails closed on an unreadable offer or balance', () => {
         expect(() => allowed(tx([{ actions: [CALL(C, 'deposit')], fallibleUnshieldedOffer: { inputs: 'x', outputs: [] } }]))).toThrow(/not inspectable/);
         expect(() => allowed(payIn([input('ten')], [output(10n, C)]))).toThrow(/value that is not readable/);
+        expect(() => allowed(canonical, {}, { imbalances: undefined })).toThrow(/not inspectable \(no imbalances\)/);
+        expect(() => allowed(canonical, {}, { imbalances: () => { throw new Error('segment does not exist'); } })).toThrow(/balance of segment 1 is not readable/);
+        expect(() => allowed(canonical, {}, { imbalances: () => new Map() })).toThrow(/reports no balance of token type/);
     });
 });
 

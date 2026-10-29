@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.39.3 - 2026-10-29
+
+### Changes
+
+- `@odatano/nightgate-tx` 0.18.0: `createTxBuilder({ walletSync: 'coins' })`
+  syncs the shielded and the NIGHT coins and leaves the dust wallet out, which
+  no sponsor-paid call needs (the dust history alone takes hours on preprod);
+  `waitForSync()` and `serializeWalletState()` cover the same set. `onProgress`
+  reports `{ phase: 'sync', wallet, appliedIndex, highestIndex, isConnected }`
+  while a wallet syncs. `docs/txbuilder.md` lists which call needs which mode.
+
+### Fixes
+
+- A sponsored call that pays the caller's NIGHT into the contract is accepted.
+  The unshielded-offer check summed the offer's inputs against its outputs and
+  demanded zero, but a circuit that takes value in (`receiveUnshielded`)
+  creates no output: the offer spends the UTXO and returns the change, the
+  intake sits in the call. Every real pay-in was refused with `does not net to
+  zero`. The check now reads the ledger's balance of the offer's segment
+  (`tx.imbalances`), which counts the intake, and requires zero per offered
+  type; the offer may not create more than it spends. The job result's
+  `unshielded` list gains one entry for what the circuit takes in without an
+  output of its own, with `to` the called contract.
+
 ## 0.39.2 - 2026-10-29
 
 ### Fixes

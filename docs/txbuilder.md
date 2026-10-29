@@ -119,15 +119,27 @@ and `code`; a 429 and a retryable 503 also carry `retryAfterSeconds` from
 | `provingMode` | no | `wasm` (default, in-process) or `server` (proves on `proofServerUrl`, which receives the witnesses) |
 | `proofServerUrl` | with `server` | required by `provingMode: 'server'`, ignored otherwise |
 | `proofTimeoutMs` | no | server proving: timeout of one proof request, default 300000 ms; the SDK retries up to 3 times, so set it above your slowest circuit |
-| `walletSync` | no | default `true`: the wallet syncs from genesis on the calling thread for the builder's life (a full core until tip). `false`: no sync; value-free calls (every vault circuit) still build, value-moving calls fail at balancing. `'shielded'`: only the shielded coins sync (minutes instead of the dust history), enough for a call that moves shielded value while a sponsor pays the fee |
+| `walletSync` | no | default `true`: every sub-wallet syncs from genesis on the calling thread for the builder's life (a full core until tip; the dust history alone takes hours on preprod). `false`: no sync; value-free calls (every vault circuit) still build, value-moving calls fail at balancing. `'shielded'`: only the shielded coins (minutes). `'coins'`: the shielded and the NIGHT coins, no dust. A sponsor pays the fee, so no sponsored call needs the dust wallet; the table below says which call needs which mode |
 | `walletState` | no | from `serializeWalletState()`: the sub-wallets named in it resume instead of syncing from genesis |
-| `onProgress` | no | callback for asset download and build phases |
+| `onProgress` | no | callback for asset download, wallet start and build phases; while a wallet syncs, `{ phase: 'sync', wallet, appliedIndex, highestIndex, isConnected }` at most once a second per wallet and once more at the tip |
 
 Returns `{ attestationSecret, attesterId, zkAssets, addresses, shieldedKeys, provingMode, walletSync, waitForSync, serializeWalletState, buildSponsorable, buildDeploySponsorable, close }`.
 `close()` stops the wallet sync and the indexer sockets; otherwise both run
 until the process exits. `serializeWalletState()` returns the state of the
 syncing sub-wallets (`{ shielded, unshielded?, dust? }`); it holds the wallet's
 coins, store it like a key.
+
+Which sync a call needs:
+
+| call | `walletSync` |
+|---|---|
+| vault circuits, a token-factory mint, any call that moves no coin of the builder | `false` |
+| a sponsored swap half, a call with a shielded coin argument | `'shielded'` |
+| a sponsored call that pays the builder's own NIGHT into the contract (an unshielded offer next to the call) | `'coins'` |
+| a self-funded submission, where the builder pays its own dust | `true` |
+
+`waitForSync()` resolves when every started sub-wallet reached the tip;
+`serializeWalletState()` saves the same set.
 
 ### `deriveIdentity({ seedHex, networkId?, accountIndex?, attestationSecret? }) -> { attesterId, attestationSecret, addresses, shieldedKeys }`
 

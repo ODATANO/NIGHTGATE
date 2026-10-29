@@ -653,14 +653,19 @@ Refused by default. With `allowUnshieldedOffers` on the grant and
 the offer sits next to a contract call of the same intent; every input and
 output type is NIGHT or in `allowedUnshieldedTokenTypes` (floor
 `NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES`, a grant only narrows);
-inputs equal outputs per type; every output goes to the contract called, a
-contract on the allow-list, a contract deployed under the grant, or back to
-the address of an input owner (change); no input belongs to the sponsor's own
-wallet. An unshielded offer is public, so every rule is checked on the bytes;
-the sponsor adds dust only, never value. Caller dust actions stay refused. The
-job result carries `unshielded: [{ type, amount, to }]`, one entry per
-contract-owned output. A payout from the contract to the caller is not covered:
-without an input of the caller its address cannot be derived from the offer.
+the segment balances on the ledger in every offered type, so inputs equal
+outputs plus what the called circuit takes in (`receiveUnshielded`), which the
+offer alone does not show; the offer creates no more than it spends; every
+output goes to the contract called, a contract on the allow-list, a contract
+deployed under the grant, or back to the address of an input owner (change);
+no input belongs to the sponsor's own wallet. An unshielded offer is public,
+so every rule is checked on the bytes; the sponsor adds dust only, never
+value. Caller dust actions stay refused. The job result carries `unshielded:
+[{ type, amount, to }]`: one entry per contract-owned output, and one for what
+the circuit takes in without an output of its own, with `to` the called
+contract (one called contract per intent in that case). A payout from the
+contract to the caller is not covered: without an input of the caller its
+address cannot be derived from the offer.
 
 ### `sponsorSwap(makerHalfB64 | offerId, takerHalfB64, idempotencyKey?, takerSecret?) → { jobId, status, sessionId }`
 

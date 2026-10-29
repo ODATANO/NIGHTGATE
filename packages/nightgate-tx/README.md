@@ -126,7 +126,11 @@ Details: `docs/txbuilder.md` in the main repo.
 A contract call that moves shielded value needs the same coins only:
 `createTxBuilder({ ..., walletSync: 'shielded' })`. A call that creates a coin
 for another wallet takes that wallet's keys as
-`recipients: [{ coinPublicKey, encryptionPublicKey }]`.
+`recipients: [{ coinPublicKey, encryptionPublicKey }]`. A sponsored call that
+pays the wallet's own NIGHT into the contract needs the NIGHT coins too:
+`walletSync: 'coins'` (shielded and unshielded, no dust; the dust history alone
+takes hours). `onProgress` reports `{ phase: 'sync', wallet, appliedIndex,
+highestIndex }` while a wallet syncs.
 
 ## Token factory
 

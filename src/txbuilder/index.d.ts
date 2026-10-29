@@ -108,12 +108,24 @@ export interface CreateTxBuilderInput {
     /**
      * `true` (default) syncs the wallet. This reads the whole chain and keeps a CPU core busy until it catches up.
      * `false` skips the sync. Calls that move no tokens, like all vault calls, work without it.
-     * `'shielded'` syncs only the private coins, which is enough when a sponsor pays the fee.
+     * `'shielded'` syncs only the private coins, `'coins'` the private and the NIGHT coins; both leave
+     * the dust wallet out, which a sponsor-paid call never needs.
      */
-    walletSync?: boolean | 'shielded';
+    walletSync?: boolean | 'shielded' | 'coins';
     /** Saved state from `serializeWalletState()`, to skip a full sync. */
     walletState?: WalletState;
-    onProgress?: (e: Record<string, unknown>) => void;
+    /** Asset download, wallet start, build phases and, while a wallet syncs, a `SyncProgressEvent` per wallet. */
+    onProgress?: (e: Record<string, unknown> | SyncProgressEvent) => void;
+}
+
+/** Where a syncing sub-wallet stands, at most once a second per wallet and once more when it reaches the tip. */
+export interface SyncProgressEvent {
+    phase: 'sync';
+    wallet: 'shielded' | 'unshielded' | 'dust';
+    /** Decimal; the unshielded wallet counts transactions, the others ledger events. */
+    appliedIndex: string;
+    highestIndex: string;
+    isConnected: boolean;
 }
 
 /** Saved wallet state. It contains the wallet's coins, so keep it as safe as a key. */
@@ -222,8 +234,8 @@ export interface TxBuilder {
     addresses: { night: string; shielded: string };
     /** Another builder lists these under `recipients` to send this wallet a private coin. */
     shieldedKeys: ShieldedPublicKeys;
-    walletSync: 'all' | 'shielded' | 'none';
-    /** Resolves once the wallet has caught up with the chain. */
+    walletSync: 'all' | 'coins' | 'shielded' | 'none';
+    /** Resolves once every syncing sub-wallet has caught up with the chain. */
     waitForSync(): Promise<void>;
     /** Saves the wallet state for `createTxBuilder({ walletState })`. */
     serializeWalletState(): Promise<WalletState>;

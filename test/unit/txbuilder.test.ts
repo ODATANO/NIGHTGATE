@@ -513,3 +513,50 @@ describe('txbuilder: deriveIdentity validates the seed before touching the SDK',
         await expect(deriveIdentity(undefined as any)).rejects.toThrow(/128 hex chars/);
     });
 });
+
+describe('txbuilder: wallet sync modes', () => {
+    it('walletSyncMode accepts true, false, shielded and coins; syncedWallets names the sub-wallets each starts', async () => {
+        const { walletSyncMode, syncedWallets } = await importTxBuilder();
+        expect(walletSyncMode(undefined)).toBe('all');
+        expect(walletSyncMode(true)).toBe('all');
+        expect(walletSyncMode(false)).toBe('none');
+        expect(walletSyncMode('shielded')).toBe('shielded');
+        expect(walletSyncMode('coins')).toBe('coins');
+        expect(() => walletSyncMode('dust')).toThrow(/true, false, 'shielded' or 'coins'/);
+        expect(syncedWallets('all')).toEqual(['shielded', 'unshielded', 'dust']);
+        expect(syncedWallets('coins')).toEqual(['shielded', 'unshielded']);
+        expect(syncedWallets('shielded')).toEqual(['shielded']);
+        expect(syncedWallets('none')).toEqual([]);
+    });
+
+    it('syncProgressEvent reads ledger-event and transaction counters alike, null when unreadable', async () => {
+        const { syncProgressEvent } = await importTxBuilder();
+        expect(syncProgressEvent('shielded', { progress: { appliedIndex: 10n, highestIndex: 25n, isConnected: true } }))
+            .toEqual({ phase: 'sync', wallet: 'shielded', appliedIndex: '10', highestIndex: '25', isConnected: true });
+        expect(syncProgressEvent('unshielded', { progress: { appliedId: 3n, highestTransactionId: 3n } }))
+            .toEqual({ phase: 'sync', wallet: 'unshielded', appliedIndex: '3', highestIndex: '3', isConnected: false });
+        expect(syncProgressEvent('dust', { progress: { appliedIndex: 'x' } })).toBeNull();
+        expect(syncProgressEvent('dust', {})).toBeNull();
+    });
+
+    it('watchSync reports a change at most once a second per wallet and the tip always; unsubscribes on stop', async () => {
+        const { watchSync } = await importTxBuilder();
+        let t = 0;
+        const listeners: Array<(s: unknown) => void> = [];
+        const unsubscribed: string[] = [];
+        const wallet = (name: string) => ({ state: { subscribe: (o: { next: (s: unknown) => void }) => { listeners.push(o.next); return { unsubscribe: () => unsubscribed.push(name) }; } } });
+        const facade = { shielded: wallet('shielded'), unshielded: wallet('unshielded') };
+        const events: Array<Record<string, unknown>> = [];
+        const stop = watchSync(facade, ['shielded', 'unshielded', 'dust'], (e: Record<string, unknown>) => events.push(e), 1000, () => t);
+        const [shielded] = listeners;
+        shielded({ progress: { appliedIndex: 1n, highestIndex: 100n } });
+        shielded({ progress: { appliedIndex: 2n, highestIndex: 100n } });   // within the second
+        t = 1000;
+        shielded({ progress: { appliedIndex: 3n, highestIndex: 100n } });
+        shielded({ progress: { appliedIndex: 3n, highestIndex: 100n } });   // unchanged
+        shielded({ progress: { appliedIndex: 100n, highestIndex: 100n } }); // the tip, within the second
+        expect(events.map(e => e.appliedIndex)).toEqual(['1', '3', '100']);
+        stop();
+        expect(unsubscribed.sort()).toEqual(['shielded', 'unshielded']);
+    });
+});

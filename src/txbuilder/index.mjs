@@ -90,8 +90,56 @@ export function recipientKeyMap(recipients) {
 export function walletSyncMode(walletSync) {
     if (walletSync === undefined || walletSync === true) return 'all';
     if (walletSync === false) return 'none';
-    if (walletSync === 'shielded') return 'shielded';
-    throw new Error(`createTxBuilder: walletSync must be true, false or 'shielded' (got ${String(walletSync)})`);
+    if (walletSync === 'shielded' || walletSync === 'coins') return walletSync;
+    throw new Error(`createTxBuilder: walletSync must be true, false, 'shielded' or 'coins' (got ${String(walletSync)})`);
+}
+
+/** The sub-wallets a sync mode starts, in the facade's names. */
+export function syncedWallets(mode) {
+    if (mode === 'all') return ['shielded', 'unshielded', 'dust'];
+    if (mode === 'coins') return ['shielded', 'unshielded'];
+    if (mode === 'shielded') return ['shielded'];
+    return [];
+}
+
+const asIndex = (v) => (typeof v === 'bigint' || typeof v === 'number' ? String(v) : null);
+
+/**
+ * One `onProgress` event from a sub-wallet's state. The unshielded wallet counts transactions
+ * (`appliedId`, `highestTransactionId`), the others ledger events (`appliedIndex`, `highestIndex`).
+ */
+export function syncProgressEvent(wallet, state) {
+    const p = state?.progress;
+    if (!p || typeof p !== 'object') return null;
+    const appliedIndex = asIndex(p.appliedIndex ?? p.appliedId);
+    const highestIndex = asIndex(p.highestIndex ?? p.highestTransactionId);
+    if (appliedIndex === null || highestIndex === null) return null;
+    return { phase: 'sync', wallet, appliedIndex, highestIndex, isConnected: p.isConnected === true };
+}
+
+// Reports every wallet's position while it syncs: a change at most once a second, the arrival at the tip always.
+export function watchSync(facade, wallets, onProgress, intervalMs = 1000, now = Date.now) {
+    const subscriptions = [];
+    for (const wallet of wallets) {
+        const observable = facade?.[wallet]?.state;
+        if (!observable || typeof observable.subscribe !== 'function') continue;
+        let last = null;
+        let lastAt = -intervalMs;
+        subscriptions.push(observable.subscribe({
+            next: (state) => {
+                const e = syncProgressEvent(wallet, state);
+                if (!e) return;
+                const key = `${e.appliedIndex}/${e.highestIndex}/${e.isConnected}`;
+                const atTip = e.appliedIndex === e.highestIndex;
+                const t = now();
+                if (key === last || (!atTip && t - lastAt < intervalMs)) return;
+                last = key; lastAt = t;
+                try { onProgress(e); } catch { /* a listener must not stop the sync */ }
+            },
+            error: () => { /* waitForSync reports the failure */ }
+        }));
+    }
+    return () => { for (const s of subscriptions) { try { s.unsubscribe(); } catch { /* already closed */ } } };
 }
 
 /** The circuits of the attestation vault contract. Their proving files are fetched by default. */
@@ -616,11 +664,11 @@ export async function createTxBuilder(opts) {
             ? dust.DustWallet(configuration).restore(saved.dust)
             : dust.DustWallet(configuration).startWithSecretKey(dustKey, ledger.LedgerParameters.initialParameters().dust))
     });
-    // Syncing a wallet reads the whole chain and keeps this thread busy.
-    // A call that moves no tokens needs no synced wallet, so `walletSync: false` skips it.
-    // A call that does move tokens then fails at balancing.
-    // `'shielded'` syncs only the private coins, which is enough when a sponsor pays the fee.
+    // Syncing a wallet reads the whole chain and keeps this thread busy; a call that moves no
+    // tokens needs none. A sponsor pays the fee, so 'shielded' and 'coins' leave the dust wallet out.
+    const stopWatching = onProgress ? watchSync(facade, syncedWallets(syncMode), onProgress) : () => {};
     if (syncMode === 'all') await facade.start(zswapKeys, dustKey);
+    else if (syncMode === 'coins') await Promise.all([facade.shielded.start(zswapKeys), facade.unshielded.start()]);
     else if (syncMode === 'shielded') await facade.shielded.start(zswapKeys);
 
     const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
@@ -656,17 +704,13 @@ export async function createTxBuilder(opts) {
 
         async waitForSync() {
             if (syncMode === 'all') await facade.waitForSyncedState();
-            else if (syncMode === 'shielded') await facade.shielded.waitForSyncedState();
+            else await Promise.all(syncedWallets(syncMode).map(w => facade[w].waitForSyncedState()));
         },
 
         /** Saves the wallet state. Pass it to `createTxBuilder({ walletState })` to skip a full sync next time. */
         async serializeWalletState() {
-            if (syncMode === 'none') return {};
-            const out = { shielded: await facade.shielded.serializeState() };
-            if (syncMode === 'all') {
-                out.unshielded = await facade.unshielded.serializeState();
-                out.dust = await facade.dust.serializeState();
-            }
+            const out = {};
+            for (const w of syncedWallets(syncMode)) out[w] = await facade[w].serializeState();
             return out;
         },
 
@@ -854,6 +898,7 @@ export async function createTxBuilder(opts) {
 
         /** Stops the wallet sync and closes the indexer connections. */
         async close() {
+            stopWatching();
             try { await facade.stop(); } catch { /* best effort */ }
             sockets?.closeAll();
         }
