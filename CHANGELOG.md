@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.39.2 - 2026-10-29
+
+### Fixes
+
+- A queued job keeps the grant's transfer and unshielded-offer rights. The
+  executor re-reads the grant when the job runs, and that reading lacked
+  `allowTransfers`, `allowUnshieldedOffers` and `allowedUnshieldedTokenTypes`,
+  so the worker refused `sponsorTransfer` and sponsored calls with an unshielded
+  offer for every grant holder while the request check and the admin
+  `getSponsorPolicy` had allowed them. One mapping of the grant row now serves
+  the request check, the job executor and the admin view
+  (`grantRowPolicy` in `srv/sessions/agent-grants.ts`).
+
 ## 0.39.1 - 2026-10-29
 
 ### Fixes

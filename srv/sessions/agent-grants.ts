@@ -23,6 +23,7 @@ import { checkRateClass, peekRateClassForGrant, rejectRateLimited, noteRateLimit
 import { isSessionExpired } from '../utils/session-expiry';
 import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER, PUBLIC_VERIFY_TRANSPORT_USER } from '../utils/agent-token-transport';
 import type { DbRunner } from '../utils/db-types';
+import type { RequestAgentGrant } from '../utils/request-types';
 import { errorMessage } from '../utils/errors';
 import { HEX64_RE } from '../utils/hex-patterns';
 import { createAgentGrant, createAgentGrants, getGrantUsage, revokeAgentGrant, rotateAgentGrantToken, updateAgentGrant } from '#cds-models/NightgateService';
@@ -218,15 +219,26 @@ export async function releaseDeployBudget(db: DbRunner, grantId: string, count: 
  */
 export async function currentGrantPolicy(runner: DbRunner, grantId: string): Promise<GrantPolicyInput | null> {
     const grant = await currentGrantRow(runner, grantId);
-    if (!grant) return null;
+    return grant ? grantRowPolicy(grant) : null;
+}
+
+/** The policy part of a grant row. */
+export type GrantRowPolicy = Omit<RequestAgentGrant, 'ID' | 'sessionId' | 'userId' | 'sponsorSessionId'>;
+
+/** The one mapping of a grant row to its policy, shared by the request check, the job executor and the admin view. */
+export function grantRowPolicy(row: AgentGrant): GrantRowPolicy {
+    const actions = parseGrantList(row.allowedActions);
     return {
-        allowedContracts: parseGrantList(grant.allowedContracts),
-        allowedCircuits: parseGrantList(grant.allowedCircuits),
-        deployedContracts: parseGrantList(grant.deployedContracts),
-        allowedTokenTypes: parseGrantList(grant.allowedTokenTypes),
-        mintedTokenTypes: parseGrantList(grant.mintedTokenTypes),
-        allowDeploy: grant.allowDeploy === true,
-        allowSwaps: parseGrantList(grant.allowedActions).includes(SPONSOR_SWAP_ACTION)
+        allowedContracts: parseGrantList(row.allowedContracts),
+        allowedCircuits: parseGrantList(row.allowedCircuits),
+        deployedContracts: parseGrantList(row.deployedContracts),
+        allowedTokenTypes: parseGrantList(row.allowedTokenTypes),
+        mintedTokenTypes: parseGrantList(row.mintedTokenTypes),
+        allowDeploy: row.allowDeploy === true,
+        allowSwaps: actions.includes(SPONSOR_SWAP_ACTION),
+        allowTransfers: actions.includes(SPONSOR_TRANSFER_ACTION),
+        allowUnshieldedOffers: row.allowUnshieldedOffers === true,
+        allowedUnshieldedTokenTypes: parseGrantList(row.allowedUnshieldedTokenTypes)
     };
 }
 
@@ -632,19 +644,9 @@ function policyReject(values: GrantShapeValues, deployedContracts: string[] = []
     }
 }
 
-export interface GrantSponsorPolicyView {
+export interface GrantSponsorPolicyView extends GrantRowPolicy {
     grantId: string;
     active: boolean;
-    allowedContracts: string[];
-    allowedCircuits: string[];
-    allowedTokenTypes: string[];
-    deployedContracts: string[];
-    mintedTokenTypes: string[];
-    allowDeploy: boolean;
-    allowSwaps: boolean;
-    allowTransfers: boolean;
-    allowUnshieldedOffers: boolean;
-    allowedUnshieldedTokenTypes: string[];
     maxDeploys: number | null;
     deploysUsed: number;
 }
@@ -692,16 +694,7 @@ export async function describeSponsorPolicy(db: DbRunner, grantId?: string | nul
     const grant: GrantSponsorPolicyView = {
         grantId: row.ID,
         active,
-        allowedContracts: parseGrantList(row.allowedContracts),
-        allowedCircuits: parseGrantList(row.allowedCircuits),
-        allowedTokenTypes: parseGrantList(row.allowedTokenTypes),
-        deployedContracts: parseGrantList(row.deployedContracts),
-        mintedTokenTypes: parseGrantList(row.mintedTokenTypes),
-        allowDeploy: row.allowDeploy === true,
-        allowSwaps: parseGrantList(row.allowedActions).includes(SPONSOR_SWAP_ACTION),
-        allowTransfers: parseGrantList(row.allowedActions).includes(SPONSOR_TRANSFER_ACTION),
-        allowUnshieldedOffers: row.allowUnshieldedOffers === true,
-        allowedUnshieldedTokenTypes: parseGrantList(row.allowedUnshieldedTokenTypes),
+        ...grantRowPolicy(row),
         maxDeploys: row.maxDeploys ?? null,
         deploysUsed: row.deploysUsed ?? 0
     };
@@ -1259,18 +1252,10 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
     req.agentGrant = {
         ID: grant.ID, sessionId: grant.sessionId, userId: grant.userId,
         sponsorSessionId: grant.sponsorSessionId ?? null,
-        allowedContracts: parseGrantList(grant.allowedContracts),
-        allowedCircuits: parseGrantList(grant.allowedCircuits),
-        deployedContracts: parseGrantList(grant.deployedContracts),
-        allowedTokenTypes: parseGrantList(grant.allowedTokenTypes),
-        mintedTokenTypes: parseGrantList(grant.mintedTokenTypes),
-        allowSwaps: parseGrantList(grant.allowedActions).includes(SPONSOR_SWAP_ACTION),
-        allowTransfers: parseGrantList(grant.allowedActions).includes(SPONSOR_TRANSFER_ACTION),
+        ...grantRowPolicy(grant),
         // Only a first check. The deploy budget is reserved before each deploy is sent,
         // in reserveDeployBudget.
-        allowDeploy: grant.allowDeploy === true && (grant.deploysUsed ?? 0) < (grant.maxDeploys ?? 1),
-        allowUnshieldedOffers: grant.allowUnshieldedOffers === true,
-        allowedUnshieldedTokenTypes: parseGrantList(grant.allowedUnshieldedTokenTypes)
+        allowDeploy: grant.allowDeploy === true && (grant.deploysUsed ?? 0) < (grant.maxDeploys ?? 1)
     };
 }
 

@@ -86,7 +86,7 @@ import { currentGrantPolicy,
     AGENT_ALLOWLISTABLE_ACTIONS
 } from '../../srv/sessions/agent-grants';
 
-import { __resetSponsorPolicyForTests } from '../../srv/submission/sponsor-policy';
+import { __resetSponsorPolicyForTests, effectiveSponsorPolicy } from '../../srv/submission/sponsor-policy';
 
 const SPONSOR_POLICY_ENV = ['NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES', 'NIGHTGATE_SPONSOR_POLICY_FILE'];
 const TEST_USER_ID = 'operator-1';
@@ -859,7 +859,7 @@ describe('agent grants', () => {
             mockDbRun.mockResolvedValueOnce(grantRow({ allowedContracts: JSON.stringify(['c1']), allowedCircuits: null, deployedContracts: JSON.stringify(['d1']), allowDeploy: true }));
             expect(await currentGrantPolicy(db, 'g1')).toEqual({
                 allowedContracts: ['c1'], allowedCircuits: [], deployedContracts: ['d1'], allowedTokenTypes: [], mintedTokenTypes: [],
-                allowDeploy: true, allowSwaps: false
+                allowDeploy: true, allowSwaps: false, allowTransfers: false, allowUnshieldedOffers: false, allowedUnshieldedTokenTypes: []
             });
             mockDbRun.mockResolvedValueOnce(grantRow({ isActive: false }));
             expect(await currentGrantPolicy(db, 'g1')).toBeNull();
@@ -867,6 +867,20 @@ describe('agent grants', () => {
             expect(await currentGrantPolicy(db, 'g1')).toBeNull();
             mockDbRun.mockResolvedValueOnce(null);
             expect(await currentGrantPolicy(db, 'g1')).toBeNull();
+        });
+
+        it('currentGrantPolicy carries the transfer and unshielded-offer rights, so a queued job keeps what the request check saw', async () => {
+            const N1 = 'a'.repeat(64);
+            mockDbRun.mockResolvedValueOnce(grantRow({
+                allowedActions: JSON.stringify(['sponsorTransfer', 'sponsorUnboundTransaction']),
+                allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: JSON.stringify([N1])
+            }));
+            const grant = await currentGrantPolicy(db, 'g1');
+            expect(grant).toMatchObject({ allowTransfers: true, allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1] });
+            const floor = { allowedContracts: [], allowedCircuits: [], allowTransfers: true, allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1] };
+            expect(effectiveSponsorPolicy(floor, grant)).toMatchObject({ allowTransfers: true, allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1] });
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']) }));
+            expect(effectiveSponsorPolicy(floor, await currentGrantPolicy(db, 'g1'))).toMatchObject({ allowTransfers: false, allowUnshieldedOffers: false });
         });
 
         it('currentGrantPolicy: an expired grant yields no policy, a future validUntil does', async () => {
