@@ -12,7 +12,9 @@ const ENV_KEYS = [
     'NIGHTGATE_NODE_URL',
     'NIGHTGATE_CRAWLER_NODE_URL',
     'NIGHTGATE_CRAWLER_ENABLED',
-    'NIGHTGATE_REPLICA_COUNT'
+    'NIGHTGATE_REPLICA_COUNT',
+    'NIGHTGATE_INDEXER_HTTP_URL',
+    'NIGHTGATE_INDEXER_WS_URL'
 ] as const;
 const originalEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]])) as Record<(typeof ENV_KEYS)[number], string | undefined>;
 
@@ -383,6 +385,7 @@ describe('runtime initialize', () => {
         delete (cds.env as any).requires.nightgate.network;
         process.env.NIGHTGATE_NETWORK = 'preprod';
         process.env.NIGHTGATE_NODE_URL = 'wss://node.example.test';
+        process.env.NIGHTGATE_INDEXER_HTTP_URL = 'https://indexer.example.test/api/v4/graphql';
         process.env.NIGHTGATE_CRAWLER_NODE_URL = 'wss://crawler.example.test';
 
         try {

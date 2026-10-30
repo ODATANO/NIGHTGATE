@@ -26,6 +26,7 @@ vi.mock('../../srv/sessions/wallet-sessions', () => ({
 }));
 
 import cds from '@sap/cds';
+import { pinEnv } from '../fixtures/pin-env';
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
 // (would shadow Vitest's global test()). We use the HTTP client `cap` for the
@@ -488,6 +489,8 @@ describe('ContractActions', () => {
 // ContractStates
 // ----------------------------------------------------------------------------
 describe('ContractStates', () => {
+    // Preview has a built-in indexer, so the state lookup has one without local config.
+    pinEnv({ NIGHTGATE_NETWORK: 'preview' });
     const ADDRESS = 'ab'.repeat(32);
 
     beforeEach(async () => {

@@ -29,6 +29,7 @@ vi.spyOn(crawlerNative, 'stopCrawler').mockImplementation(mockStopCrawler);
 vi.spyOn(crawlerNative, 'isCrawlerRunning').mockImplementation(mockIsCrawlerRunning);
 
 import cds from '@sap/cds';
+import { pinEnv } from '../fixtures/pin-env';
 
 // Same reason: the booted service reads buildReadiness off this module object.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -135,6 +136,8 @@ describe('getSyncStatus', () => {
 });
 
 describe('getHealth', () => {
+    pinEnv({ NIGHTGATE_CRAWLER_ENABLED: 'false' });
+
     it('returns unknown defaults when SyncState is absent', async () => {
         await db.run(cds.ql.DELETE.from(SYNC_STATE));
 

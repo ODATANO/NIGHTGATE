@@ -133,6 +133,7 @@ import {
 import path from 'path';
 import { HEX64_RE } from '../../srv/utils/hex-patterns';
 import { runFinalizer } from '../fixtures/run-finalizer';
+import { pinEnv } from '../fixtures/pin-env';
 
 // ---- Fakes ----------------------------------------------------------------
 
@@ -1091,6 +1092,8 @@ describe('anchorDocument', () => {
 // ---- verifyDocument -------------------------------------------------------
 
 describe('verifyDocument', () => {
+    // Preview has a built-in indexer, so the live state check runs without local config.
+    pinEnv({ NIGHTGATE_NETWORK: 'preview' });
     const VALID_SHA = 'a'.repeat(64);
     const DOC_ID = '00000000-0000-4000-8000-000000000001';
     const TX_ID = '00000000-0000-4000-8000-000000000002';
