@@ -1,9 +1,5 @@
-/**
- * Each contract call in a transaction sits in a numbered segment. The SDK picks the
- * numbers at random, and the ledger applies calls by ascending number.
- * The proof provider is the last point where the numbers can still be changed,
- * so the wrapper renumbers the calls into call order there.
- */
+// The SDK numbers each call's segment at random, and the ledger applies calls by ascending number.
+// The proof provider is the last point to change the numbers, so the wrapper renumbers them there.
 import { errorMessage } from '../utils/errors';
 
 const utf8 = new TextDecoder();
@@ -98,10 +94,7 @@ export function batchCallStages(tx: any): BatchCallStage[] {
     }));
 }
 
-/**
- * `calls` lets a caller split the batch without parsing the message.
- * The message repeats the list because the SDK may pass on only the message.
- */
+/** The message repeats `calls` because the SDK may pass on only the message. */
 export class BatchCausalityError extends Error {
     readonly code = 'BatchCausalityViolation';
     readonly calls: BatchCallStage[];
@@ -135,10 +128,7 @@ export interface BatchOrderOptions {
     orderedPrefix?: number;
 }
 
-/**
- * Give the calls the existing segment ids in call order.
- * Returns false and leaves `tx` unchanged when the calls do not match the list.
- */
+/** Gives the calls the existing segment ids in call order. Returns false and leaves `tx` unchanged on a mismatch. */
 export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: BatchOrderOptions = {}): boolean {
     const intents: Map<number, any> | undefined = tx?.intents;
     if (!intents || typeof intents.entries !== 'function') return false;

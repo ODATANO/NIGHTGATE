@@ -1,8 +1,6 @@
-/**
- * Downloads missing prover keys when first needed and checks them against `keys/manifest.json`.
- * The contract's digest covers the manifest but not the keys, so a download does not change the digest.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Downloads missing prover keys when first needed and checks them against `keys/manifest.json`.
+// The contract's digest covers the manifest but not the keys, so a download does not change the digest.
+// SPDX-License-Identifier: Apache-2.0
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -43,10 +41,7 @@ export interface ZkAssetSource {
     layout: ZkAssetLayout;
 }
 
-/**
- * Uses `NIGHTGATE_ZK_ASSET_URL` if set, else the release files of the installed contract package.
- * Null when downloads are turned off or no source is known.
- */
+/** Uses `NIGHTGATE_ZK_ASSET_URL` if set, else the release files of the installed contract package. Null when downloads are off or no source is known. */
 export function resolveZkAssetSource(
     name: string,
     reg: ProverKeySourceInput,

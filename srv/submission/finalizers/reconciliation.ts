@@ -1,11 +1,8 @@
-/**
- * Writes a job's database results once its transaction is proven to be on chain.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Writes a job's database results once its transaction is proven to be on chain.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { assertArtifactGeneration } from '../contract-registry';
-import type { ReconciliationEvidence } from '../job-store';
-import { Documents, DisclosureGrants, PendingSubmissions, type PendingSubmission, type BackgroundJob } from '#cds-models/midnight';
+import { Documents, DisclosureGrants, PendingSubmissions, type PendingSubmission } from '#cds-models/midnight';
 import { parseSubmitIntent } from '../submit-intent';
 import { recordDeployedContracts } from '../../sessions/agent-grants';
 import { recordPlatformMint } from '../platform-mints';
@@ -13,6 +10,8 @@ import { closeSwapOffer, closeSwapOffersByNullifiers } from '../swap-offers';
 import { ContractCommandV1, ContractCommandV1WithProvenance } from '../actions/common';
 import type { SubmissionContext } from '../actions/context';
 import { errorMessage } from '../../utils/errors';
+import type { BackgroundJobReconciliationFinalizer } from '../job-registry';
+import { attemptRowOf } from '../job-store';
 
 const { UPDATE, SELECT } = cds.ql;
 
@@ -21,25 +20,25 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
 
     const { db, contractResolver, confirmedDisclosureLevel, heightStamp, notNewerThan, reindexAfterSubmit } = ctx;
 
-    const finalizeSponsoredSubmission = async (raw: unknown, _job: BackgroundJob, evidence: ReconciliationEvidence): Promise<unknown> => {
+    const finalizeSponsoredSubmission: BackgroundJobReconciliationFinalizer = async (raw, job, evidence, tx, afterCommit) => {
         const command = raw as { grantId?: string; sponsorSessionId?: string };
-        const submission: PendingSubmission | undefined = evidence.submissionId
-            ? await db.run(SELECT.one.from(PendingSubmissions).where({ ID: evidence.submissionId }))
-            : await db.run(SELECT.one.from(PendingSubmissions).where({ txHash: evidence.txHash }));
+        const submission: PendingSubmission | undefined = await tx.run(SELECT.one.from(PendingSubmissions).where(attemptRowOf(evidence)));
         const coordinates = parseSubmitIntent(submission?.submitIntentData);
         const deployed: string[] = Array.isArray(coordinates.deployed) ? coordinates.deployed.map(String) : [];
         const grantId = coordinates.deployReservation?.grantId ?? command?.grantId;
-        if (deployed.length && grantId) await recordDeployedContracts(db, String(grantId), deployed);
+        if (deployed.length && grantId) await recordDeployedContracts(tx, String(grantId), deployed);
         const minted: string[] = Array.isArray(coordinates.minted) ? coordinates.minted.map(String) : [];
-        if (minted.length) await recordPlatformMint(db, minted, { grantId: grantId ? String(grantId) : null, sponsorSessionId: command?.sponsorSessionId ?? null, txHash: evidence.txHash ?? null });
+        if (minted.length) await recordPlatformMint(tx, minted, { grantId: grantId ? String(grantId) : null, sponsorSessionId: command?.sponsorSessionId ?? null, txHash: evidence.txHash });
         const nullifiers: string[] = Array.isArray(coordinates.nullifiers) ? coordinates.nullifiers.map(String) : [];
         // The swap is already on chain. A failed write to the offer board must not fail the job.
-        try {
-            if (coordinates.offerId) await closeSwapOffer(db, String(coordinates.offerId), 'filled', evidence.txHash ?? null);
-            if (nullifiers.length) await closeSwapOffersByNullifiers(db, nullifiers, evidence.txHash ?? null);
-        } catch (e) {
-            cds.log('nightgate').warn(`swap offers of ${evidence.txHash ?? 'the reconciled swap'} not closed: ${errorMessage(e)}`);
-        }
+        afterCommit(async () => {
+            try {
+                if (coordinates.offerId) await closeSwapOffer(db, String(coordinates.offerId), 'filled', evidence.txHash);
+                if (nullifiers.length) await closeSwapOffersByNullifiers(db, nullifiers, evidence.txHash);
+            } catch (e) {
+                cds.log('nightgate').warn(`swap offers of ${evidence.txHash} not closed: ${errorMessage(e)}`);
+            }
+        });
         return {
             reconciled: true, ...evidence, status: 'finalized',
             circuits: Array.isArray(coordinates.circuits) ? coordinates.circuits : [],
@@ -48,14 +47,14 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
             ...(deployed.length ? { deployed } : {}),
             ...(coordinates.unshielded?.length ? { unshielded: coordinates.unshielded } : {}),
             ...(coordinates.transfer ? { transfer: coordinates.transfer } : {}),
-            feeSponsor: coordinates.feeSponsor ?? command?.sponsorSessionId ?? _job.sessionId
+            feeSponsor: coordinates.feeSponsor ?? command?.sponsorSessionId ?? job.sessionId
         };
     };
 
-    const finalizeFactoryMint = async (raw: unknown, job: BackgroundJob, evidence: ReconciliationEvidence): Promise<unknown> => {
+    const finalizeFactoryMint: BackgroundJobReconciliationFinalizer = async (raw, job, evidence, tx) => {
         const command = raw as Extract<ContractCommandV1, { op: 'call' }>;
         const tokenType = command?.mintedTokenType;
-        if (tokenType) await recordPlatformMint(db, [tokenType], { grantId: job.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: evidence.txHash ?? null });
+        if (tokenType) await recordPlatformMint(tx, [tokenType], { grantId: job.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: evidence.txHash });
         return {
             reconciled: true, txHash: evidence.txHash, status: 'finalized',
             contractAddress: command?.contractAddress ?? evidence.contractAddress ?? '',
@@ -64,18 +63,26 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         };
     };
 
-    const finalizeContractProjection = async (raw: unknown, _job: BackgroundJob, evidence: ReconciliationEvidence): Promise<unknown> => {
+    const finalizeContractProjection: BackgroundJobReconciliationFinalizer = async (raw, job, evidence, tx, afterCommit) => {
         const command = raw as ContractCommandV1WithProvenance;
 
         if (typeof command.compiledArtifactRef === 'string') {
             assertArtifactGeneration(
                 command.compiledArtifactRef,
                 command.artifactDigest,
-                `Reconciled '${command.op}' command of job ${_job.ID}`);
+                `Reconciled '${command.op}' command of job ${job.ID}`);
         }
         const changedAt = evidence.finalizedAt ?? new Date().toISOString();
+        const landed = evidence.blockHeight;
+        // The state rebuild reads through its own connection, so it runs after the commit.
+        const reindexLater = (contractAddress: string) => afterCommit(async () => {
+            const resolved = await contractResolver(command.compiledArtifactRef, command.artifactDigest).catch(err => {
+                throw new Error(`disclosure reindex of ${contractAddress.slice(0, 16)} skipped, run reindexDisclosures: ${errorMessage(err)}`);
+            });
+            await reindexAfterSubmit(contractAddress, resolved, landed, job, command.compiledArtifactRef);
+        });
         if (command.op === 'anchorDocument') {
-            await db.run(UPDATE.entity(Documents).set({
+            await tx.run(UPDATE.entity(Documents).set({
                 anchoredTxHash: evidence.txHash, anchoredAt: changedAt, modifiedAt: changedAt
             }).where({ ID: command.documentId }));
             return {
@@ -86,13 +93,12 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         }
         if (command.op === 'grantDisclosure' || command.op === 'revokeDisclosure') {
             const isGrant = command.op === 'grantDisclosure';
-            const landed = evidence.blockHeight ?? null;
             if (isGrant) {
-                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants)
+                await tx.run(notNewerThan(UPDATE.entity(DisclosureGrants)
                     .set(confirmedDisclosureLevel(command.level, evidence.txHash, changedAt, landed))
                     .where({ ID: command.disclosureGrantId }), landed));
             } else {
-                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({
+                await tx.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({
                     revokedTxHash: evidence.txHash, active: false, modifiedAt: changedAt, ...heightStamp(landed)
                 }).where({
                     contractAddress: command.contractAddress,
@@ -101,10 +107,7 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
                     grantee: command.grantee
                 }), landed));
             }
-            const resolved = await contractResolver(
-                command.compiledArtifactRef,
-                (command as ContractCommandV1WithProvenance).artifactDigest);
-            await reindexAfterSubmit(command.contractAddress, resolved, evidence.blockHeight ?? null, _job, command.compiledArtifactRef);
+            reindexLater(command.contractAddress);
             return {
                 reconciled: true,
                 ...(isGrant ? { disclosureGrantId: command.disclosureGrantId, level: command.level } : {}),
@@ -121,13 +124,8 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         if (command.op === 'retract') {
             if (command.mode === 0) {
                 // Same database update the executor makes after a normal submit.
-                const changedAt = new Date().toISOString();
-                const landed = evidence.blockHeight ?? null;
-                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ active: false, revokedTxHash: evidence.txHash, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.key, active: true }), landed));
-                const resolved = await contractResolver(
-                    command.compiledArtifactRef,
-                    (command as ContractCommandV1WithProvenance).artifactDigest);
-                await reindexAfterSubmit(command.contractAddress, resolved, landed, _job, command.compiledArtifactRef);
+                await tx.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ active: false, revokedTxHash: evidence.txHash, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.key, active: true }), landed));
+                reindexLater(command.contractAddress);
             }
             return {
                 reconciled: true, mode: command.mode, key: command.key,

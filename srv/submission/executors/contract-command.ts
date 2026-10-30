@@ -1,7 +1,5 @@
-/**
- * Runs contract jobs: deploys, circuit calls, batches and the proof steps of workflows.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Runs contract jobs: deploys, circuit calls, batches and the proof steps of workflows.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { assertArtifactGeneration } from '../contract-registry';
 import { resolveFeeSponsor, ensureFeeSponsorFacade } from '../fee-sponsor';
@@ -17,8 +15,16 @@ import { currentGrantRow, grantJobScopeViolation } from '../../sessions/agent-gr
 import { hexToBytes } from '../../utils/hex';
 import { recordProven, claimValidUntil, MerkleProofBundle, ContractCommandV1, ContractCommandV1WithProvenance, facadeConfigFromEnv } from '../actions/common';
 import type { SubmissionContext } from '../actions/context';
+import type { CallResult } from '../TransactionSubmitter';
 
 const { UPDATE, SELECT } = cds.ql;
+
+/** What a workflow reads from a finished child call. */
+type ChildCall = Pick<CallResult, 'txHash'>;
+
+function hasArtifactRef(command: unknown): command is { compiledArtifactRef: string; artifactDigest?: string } {
+    return !!command && typeof command === 'object' && typeof (command as { compiledArtifactRef?: unknown }).compiledArtifactRef === 'string';
+}
 
 export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' | 'walletFactory' | 'contractResolver' | 'submitterFactory' | 'argTypesLoader' | 'confirmedDisclosureLevel' | 'heightStamp' | 'notNewerThan' | 'clearPendingDisclosureLevel' | 'reindexAfterSubmit' | 'buildSubmitterDeps'>) {
     const { db, walletFactory, contractResolver, submitterFactory, argTypesLoader, confirmedDisclosureLevel, heightStamp, notNewerThan, clearPendingDisclosureLevel, reindexAfterSubmit, buildSubmitterDeps } = ctx;
@@ -35,14 +41,9 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
 
         // A contract name can later point to another build. Refuse to run if the build
         // differs from the one the command was created for, or if no digest was stored.
-        {
-            const cmd = command as ContractCommandV1WithProvenance;
-            if (typeof (cmd as any).compiledArtifactRef === 'string') {
-                assertArtifactGeneration(
-                    (cmd as any).compiledArtifactRef,
-                    cmd.artifactDigest,
-                    `Persisted '${command.op}' command of job ${job.ID}`);
-            }
+        const provenance = command as ContractCommandV1WithProvenance;
+        if (hasArtifactRef(provenance)) {
+            assertArtifactGeneration(provenance.compiledArtifactRef, provenance.artifactDigest, `Persisted '${command.op}' command of job ${job.ID}`);
         }
         // Read the agent grant again when the job runs. Step jobs carry the parent's grant.
         // A grant revoked, expired or narrowed after the job was queued stops it.
@@ -63,13 +64,11 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         }
         // Step jobs get the parent's contract digest. If the name changes between steps,
         // the step fails instead of mixing two contract builds in one workflow.
-        const parentArtifactDigest = (command as ContractCommandV1WithProvenance).artifactDigest;
+        const parentArtifactDigest = provenance.artifactDigest;
         const runChild = <T,>(args: Parameters<typeof runChildCommand>[0]): Promise<T> => runChildCommand<T>({
             ...args,
-            command: (args.command && typeof args.command === 'object'
-                && typeof (args.command as any).compiledArtifactRef === 'string'
-                && (args.command as any).artifactDigest === undefined)
-                ? { ...(args.command as object), artifactDigest: parentArtifactDigest }
+            command: hasArtifactRef(args.command) && args.command.artifactDigest === undefined
+                ? { ...args.command, artifactDigest: parentArtifactDigest }
                 : args.command
         });
 
@@ -81,7 +80,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                     command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
-            const proof: any = await runChild<any>({
+            const proof = await runChild<ChildCall>({
                 parent: job, kind: 'fieldPredicateProof', step: 'proveFieldPredicate', commandVersion: 1,
                 request: { circuit: 'proveFieldPredicate', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
@@ -109,7 +108,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 });
             }
             // The digest is a public circuit argument. Only the Merkle path stays private.
-            const proof: any = await runChild<any>({
+            const proof = await runChild<ChildCall>({
                 parent: job, kind: 'fieldEqualityProof', step: 'proveFieldEquality', commandVersion: 1,
                 request: { circuit: 'proveFieldEquality', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
@@ -136,7 +135,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                     command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
-            const proof: any = await runChild<any>({
+            const proof = await runChild<ChildCall>({
                 parent: job, kind: 'fieldMembershipProof', step: 'proveFieldMembership', commandVersion: 1,
                 request: { circuit: 'proveFieldMembership', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
@@ -182,8 +181,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
             const isIntegrity = command.op === 'documentIntegrityWorkflow';
             // One circuit serves both comparisons through a mode argument, because each circuit
             // adds deploy size. The unused mode gets harmless values, mask 0 or k 1.
-            const proof: any = isIntegrity
-                ? await runChild<any>({
+            const proof = isIntegrity
+                ? await runChild<ChildCall>({
                     parent: job, kind: 'documentIntegrityProof', step: 'proveDocumentComparison-integrity', commandVersion: 1,
                     request: { circuit: 'proveDocumentComparison', mode: 'integrity', payloadHashA: command.payloadHashA, payloadHashB: command.payloadHashB },
                     command: {
@@ -192,7 +191,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                         merkleProof: { docPair: { schema: command.schema, openingA: command.openingA, openingB: command.openingB } }, sponsorSessionId: command.sponsorSessionId
                     }
                 })
-                : await runChild<any>({
+                : await runChild<ChildCall>({
                     parent: job, kind: 'documentDiffProof', step: 'proveDocumentComparison-diff', commandVersion: 1,
                     request: { circuit: 'proveDocumentComparison', mode: 'diff', payloadHashA: command.payloadHashA, payloadHashB: command.payloadHashB },
                     command: {
@@ -259,7 +258,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                     });
                 }
             }
-            const proof: any = await runChild<any>({
+            const proof = await runChild<ChildCall>({
                 parent: job, kind: 'fieldPredicateBatchProof', step: 'proveFieldPredicateBatch', commandVersion: 1,
                 request: { circuits: calls.map(c => c.circuit), payloadHash: command.payloadHash, claimCount: command.claims.length },
                 // The claims do not depend on each other, so their order is free.

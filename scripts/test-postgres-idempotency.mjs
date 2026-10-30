@@ -1,27 +1,6 @@
-/**
- * PostgreSQL integration test for the concurrent-insert idempotency guard that
- * startJob (srv/submission/background-jobs.ts) relies on.
- *
- * SQLite does NOT abort a transaction on a constraint violation, so the unit
- * suite cannot prove the savepoint is actually required. Postgres does: a failed
- * INSERT poisons the whole transaction until it is rolled back. This test proves
- * the two behaviours the guard depends on, against a real Postgres, with two
- * concurrent transactions:
- *
- *   1. Without a savepoint, the loser's aborted transaction rejects every
- *      subsequent statement (SQLSTATE 25P02) - i.e. the raw catch-and-recover
- *      on the ambient tx cannot work on Postgres.
- *   2. With SAVEPOINT / ROLLBACK TO SAVEPOINT, the loser recovers: it reads the
- *      winner's committed row and its outer transaction stays usable and commits.
- *
- * Connection: standard libpq env vars (PGHOST, PGPORT, PGUSER, PGPASSWORD,
- * PGDATABASE) or NIGHTGATE_PG_URL / DATABASE_URL. If no Postgres is reachable
- * the test SKIPS (exit 0) so it never breaks a SQLite-only CI. Point it at any
- * Postgres, e.g.:
- *
- *   PGHOST=localhost PGPORT=5432 PGUSER=... PGPASSWORD=... PGDATABASE=... \
- *     npm run test:pg-idempotency
- */
+// Checks on real PostgreSQL that startJob's insert guard needs a savepoint, and that it recovers with one. Skips without PostgreSQL.
+// Run: npm run test:pg-idempotency
+// Env: PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE, or NIGHTGATE_PG_URL or DATABASE_URL.
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);

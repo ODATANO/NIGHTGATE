@@ -1,15 +1,6 @@
-/* eslint-disable no-console -- a healthcheck's only channel to the operator is
-   docker's captured output; there is no logger in this process. */
-/**
- * Container healthcheck: does NIGHTGATE work, not merely does the port answer.
- *
- * The plugin deliberately keeps its CAP host alive when Nightgate itself is
- * offline (an un-migrated database, a submission pipeline that did not start),
- * so probing `/` reports such a container as healthy while nothing works.
- * `getReadiness()` is anonymous at the model level and answers 503 in exactly
- * those cases. Anything but a 2xx, including 401 and 404, is a failure: a
- * probe that cannot see readiness must not claim the container is fine.
- */
+/* eslint-disable no-console -- docker's captured output is this process's only channel to the operator. */
+// Checks that NIGHTGATE works, not just that the port answers. The plugin keeps CAP alive while NIGHTGATE is offline.
+// `getReadiness()` answers 503 in that case. Any status but 2xx, including 401 and 404, counts as unhealthy.
 
 const PORT = process.env.PORT || '4004';
 // 127.0.0.1, not localhost: where that name resolves to ::1 first and the

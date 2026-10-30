@@ -1,8 +1,5 @@
-// `@odatano/nightgate/browser`, the entry point for browser apps that use a Midnight wallet.
-// Everything here runs in a browser. Nothing depends on CAP or Node.
-//
-// The compiled contracts are large, so each has its own import path:
-//   import { Contract, ledger } from '@odatano/nightgate/browser/attestation-vault';
+// Entry point for browser apps that use a Midnight wallet. Nothing here depends on CAP or Node.
+// Each compiled contract has its own import path, for example `@odatano/nightgate/browser/attestation-vault`.
 
 export {
     deriveAttestationSecret,
@@ -36,10 +33,7 @@ export {
     prepareProveFieldsDiffer
 } from './attestation-vault-calls.mjs';
 
-/**
- * Fixed facts about the contracts this package ships for the browser.
- * The deployed address and the key URL come from the server's `/contract-manifest` route.
- */
+/** Fixed facts about the shipped contracts. Address and key URL come from the server's `/contract-manifest` route. */
 export const CONTRACTS = {
     'attestation-vault': {
         name: 'attestation-vault',

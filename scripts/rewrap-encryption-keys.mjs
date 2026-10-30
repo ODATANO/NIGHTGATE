@@ -1,28 +1,7 @@
 #!/usr/bin/env node
-// Re-encrypt every stored ciphertext under the ACTIVE encryption key.
-//
-//   npx nightgate-rewrap-keys [--dry-run] [--batch 200] [--drop-legacy-sync-state]
-//
-// Key ring from the environment: ENCRYPTION_KEYS="id=secret,id=secret" plus
-// ENCRYPTION_KEY_ACTIVE=<id>; the legacy ENCRYPTION_KEY is id `1`. Keep the
-// OLD key in the ring while this runs; remove it afterwards. Refuses to write
-// when a stored ciphertext names a key id that is not in the ring.
-//
-// Database like the server: NIGHTGATE_DB_URL (postgres://...) or the SQLite
-// file (first argument, NIGHTGATE_DB_PATH, default db/midnight.db). Stop the
-// server first: a running process would keep writing under its own ring.
-//
-// Rewraps every ring-sealed value (WalletSessions.encryptedViewingKey /
-// encryptedSeedKey, BackgroundJobs.command aes-gcm-v1, AccountKeys.wrappedDek,
-// the per-account data key that private states, signing keys and sync-state
-// blobs are encrypted under) without any wallet secret. Rows written BEFORE
-// the account key (keyScheme null) need the wallet's viewing key: they are
-// migrated for every session whose viewing key the ring still opens and
-// reported otherwise. Exit codes: 0 = nothing legacy remains, the old key may
-// leave the ring; 1 = legacy rows remain (or an error), keep the old key;
-// 2 = usage. --drop-legacy-sync-state deletes the legacy sync-state rows of
-// accounts without a readable session (those wallets re-sync from genesis);
-// private state and signing keys are never dropped by this tool.
+// Re-encrypts every stored ciphertext under the active key. Stop the server first; exit 0 means the old key may leave the ring.
+// Run: npx nightgate-rewrap-keys [--dry-run] [--batch 200] [--drop-legacy-sync-state]
+// Env: ENCRYPTION_KEYS="id=secret,..." with the old key, ENCRYPTION_KEY_ACTIVE, and NIGHTGATE_DB_URL or NIGHTGATE_DB_PATH.
 
 import { createRequire } from 'node:module';
 import fs from 'node:fs';

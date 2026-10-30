@@ -1,8 +1,5 @@
-/**
- * Builds the witnesses (private inputs) for each contract.
- * Inputs are plain values only, so they can be passed to the worker thread.
- * Contracts without a builder get empty witnesses.
- */
+// Builds the witnesses (private inputs) for each contract. Inputs are plain values only, so they can be passed to the worker thread.
+// Contracts without a builder get empty witnesses.
 import {
     buildAttestationVaultWitnesses as buildVaultWitnesses,
     deriveAttestationSecret as deriveVaultSecret,

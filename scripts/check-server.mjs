@@ -1,12 +1,7 @@
 #!/usr/bin/env node
-// Quick health check against a running NIGHTGATE server (local or hosted).
-//
-// Usage: node --env-file=.env scripts/check-server.mjs [baseUrl]
-// Env:   NIGHTGATE_URL                 default http://localhost:4004; argv wins
-//        NIGHTGATE_HTTP_USER/_PASSWORD basic auth of a hosted server
-//        NIGHTGATE_SPONSOR_SESSION_ID  optional; adds dust/balance + sync checks
-//
-// Exit 0 = everything green, 1 = at least one FAIL.
+// Health check against a running NIGHTGATE server; exits 1 on any FAIL.
+// Run: node --env-file=.env scripts/check-server.mjs [baseUrl]
+// Env: NIGHTGATE_URL, NIGHTGATE_HTTP_USER, NIGHTGATE_HTTP_PASSWORD, optional NIGHTGATE_SPONSOR_SESSION_ID.
 
 const BASE = (process.argv[2] || process.env.NIGHTGATE_URL || 'http://localhost:4004').replace(/\/$/, '');
 const SPONSOR = process.env.NIGHTGATE_SPONSOR_SESSION_ID || '';

@@ -1,28 +1,15 @@
-/**
- * Background pass that decodes the stored ledger transactions, behind the indexed tip.
- *
- * It reads `Transactions.raw`, which the crawler already stored.
- * To decode blocks again, reset the cursor. Nothing has to be fetched from the chain again.
- * Each row stores the result in `payloadDecode`, so "no payload" and "decoding failed" stay distinguishable.
- */
+// Background pass that decodes the ledger transactions stored in `Transactions.raw`, behind the indexed tip.
+// To decode blocks again, reset the cursor. Nothing has to be fetched from the chain again.
+// `payloadDecode` on each row keeps "no payload" and "decoding failed" apart.
 
 import cds from '@sap/cds';
 import { parseExtrinsicCall } from '../utils/scale';
 import { extractLedgerPayload, carriesShieldedCoins, carriesProof, callFreeTxType, type LedgerPayloadFacts } from './ledger-payload';
 import { readCapBinary } from './cap-binary';
 import { replaceTransactionIdentifiers } from './transaction-identifiers';
-import { lockReorgGeneration } from '../submission/reorg-generation';
-import { Blocks, Transactions, ContractActions, SyncState, type Block, type Transaction, type ContractAction } from '#cds-models/midnight';
+import { advancePassCursor, blocksInRange, readPassWindow, windowIsEmpty, PassPause, type PassPosition } from './cursor-pass';
+import { Transactions, ContractActions, type Transaction, type ContractAction } from '#cds-models/midnight';
 import type { DbRunner, Row } from '../utils/db-types';
-
-/**
- * Cursor and rollback counter at the start of a pass.
- * Both must be unchanged when the pass saves its new cursor.
- */
-interface PassPosition {
-    cursor: number | null;
-    generation: number;
-}
 
 const { SELECT, UPDATE } = cds.ql;
 const log = cds.log('nightgate:crawler');
@@ -55,6 +42,7 @@ export class LedgerPayloadDecoder {
     private db!: cds.DatabaseService;
     private running = false;
     private loop: Promise<void> | null = null;
+    private readonly pause = new PassPause();
 
     constructor(private readonly config: LedgerDecoderConfig) {}
 
@@ -73,13 +61,14 @@ export class LedgerPayloadDecoder {
                 } catch (err) {
                     log.warn(`ledger payload decode pass failed: ${(err as Error).message}`);
                 }
-                await this.sleep(progressed > 0 ? this.config.intervalMs : this.config.intervalMs * 4);
+                await this.pause.sleep(progressed > 0 ? this.config.intervalMs : this.config.intervalMs * 4);
             }
         })();
     }
 
     async stop(): Promise<void> {
         this.running = false;
+        this.pause.wake();
         if (this.loop) {
             await this.loop.catch(() => { /* reported in the loop */ });
             this.loop = null;
@@ -87,29 +76,11 @@ export class LedgerPayloadDecoder {
     }
 
     async runOnce(): Promise<DecodeRunResult> {
-        const sync: any = await this.db.run(
-            // Cursor and rollback counter are read together.
-            // With two reads, a rollback in between could pair an old cursor with a new counter,
-            // and the final check would not notice.
-            SELECT.one.from(SyncState)
-                .columns('lastDecodedHeight', 'lastIndexedHeight', 'reorgGeneration')
-                .where({ ID: 'SINGLETON' })
-        );
-        if (!sync) return EMPTY_RUN;
+        const window = await readPassWindow(this.db, 'lastDecodedHeight', this.config.lagBlocks);
+        if (!window || windowIsEmpty(window)) return EMPTY_RUN;
+        const { start, from, ceiling } = window;
 
-        const indexed = Number(sync.lastIndexedHeight ?? 0);
-        const ceiling = indexed - this.config.lagBlocks;
-        const cursor = sync.lastDecodedHeight == null ? null : Number(sync.lastDecodedHeight);
-        const from = cursor == null ? 0 : cursor + 1;
-        const generation = Number(sync.reorgGeneration ?? 0);
-        const start: PassPosition = { cursor, generation: Number.isFinite(generation) ? generation : 0 };
-        if (!Number.isFinite(ceiling) || from > ceiling) return EMPTY_RUN;
-
-        const blocks: Row<Block, 'ID' | 'height'>[] = await this.db.run(
-            SELECT.from(Blocks).columns('ID', 'height')
-                .where({ height: { '>=': from } }).and({ height: { '<=': ceiling } })
-                .orderBy('height asc').limit(this.config.batchSize)
-        ) || [];
+        const blocks = await blocksInRange(this.db, from, ceiling, this.config.batchSize);
         if (blocks.length === 0) {
             // No blocks are indexed in this range, so move the cursor past it.
             await this.setCursor(start, Math.min(from + this.config.batchSize - 1, ceiling));
@@ -254,38 +225,8 @@ export class LedgerPayloadDecoder {
         }
     }
 
-    /**
-     * Saves the new cursor only if the cursor and the rollback counter are unchanged since the pass started.
-     * Otherwise a reorg during the pass would be overwritten and the re-indexed blocks skipped.
-     * The counter matters because a rollback to exactly the cursor height leaves the cursor unchanged.
-     */
-    private async setCursor(expected: PassPosition, height: number): Promise<boolean> {
-        let advanced = false;
-        await this.db.tx(async (tx) => {
-            const generation = await lockReorgGeneration(tx);
-            const current: any = await tx.run(
-                SELECT.one.from(SyncState).columns('lastDecodedHeight').where({ ID: 'SINGLETON' })
-            );
-            const now = current?.lastDecodedHeight == null ? null : Number(current.lastDecodedHeight);
-            if (generation !== expected.generation || now !== expected.cursor) {
-                log.info(
-                    `ledger payload decode pass dropped: started at cursor ${expected.cursor} generation ` +
-                    `${expected.generation}, found ${now} / ${generation}`
-                );
-                return;
-            }
-            await tx.run(
-                UPDATE.entity(SyncState).set({ lastDecodedHeight: height }).where({ ID: 'SINGLETON' })
-            );
-            advanced = true;
-        });
-        return advanced;
-    }
 
-    private sleep(ms: number): Promise<void> {
-        return new Promise(resolve => {
-            const timer = setTimeout(resolve, ms);
-            (timer as any).unref?.();
-        });
+    private setCursor(expected: PassPosition, height: number): Promise<boolean> {
+        return advancePassCursor(this.db, 'lastDecodedHeight', expected, height, 'ledger payload decode');
     }
 }

@@ -1,10 +1,9 @@
-/**
- * Sends a tx in three steps, each with its own timeout: connect, wait for the first status, wait for the block.
- * A single timeout around the SDK's submit cannot tell whether the tx was sent at all.
- * Only a failure while connecting means the tx was surely not sent.
- */
+// Sends a tx in three timed steps: connect, first status, block. One timeout around the SDK's submit cannot tell if the tx was sent.
+// Only a failure while connecting means the tx was surely not sent.
 import { log as workerLog } from './context';
 import { NightgateError } from '../../utils/errors';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { withTimeout } from '../../utils/timeout';
 
 export type SubmitPhase = 'connect' | 'request' | 'watch';
 
@@ -119,7 +118,7 @@ export function createPhasedSubmitService(opts: {
         // Creating the client and connecting share one timeout.
         let adapter: SubmitNodeAdapter;
         try {
-            adapter = await withTimeout(getAdapter().then(async (a) => { mark('client-ready'); await a.connect(); return a; }), opts.timeouts.connectMs);
+            adapter = await withTimeout(getAdapter().then(async (a) => { mark('client-ready'); await a.connect(); return a; }), opts.timeouts.connectMs, () => new PhaseTimeout());
             mark('connected');
         } catch (e) {
             const err = e instanceof PhaseTimeout
@@ -162,7 +161,7 @@ export function createPhasedSubmitService(opts: {
         };
         try {
             try {
-                await withTimeout(Promise.race([first, streamFailure]), opts.timeouts.requestMs);
+                await withTimeout(Promise.race([first, streamFailure]), opts.timeouts.requestMs, () => new PhaseTimeout());
             } catch (e) {
                 if (e instanceof PhaseTimeout) {
                     keepListening();
@@ -174,7 +173,7 @@ export function createPhasedSubmitService(opts: {
                 throw e; // the node's own error, classified later by its text
             }
             try {
-                const ev = await withTimeout(Promise.race([wanted, streamFailure]), opts.timeouts.watchMs);
+                const ev = await withTimeout(Promise.race([wanted, streamFailure]), opts.timeouts.watchMs, () => new PhaseTimeout());
                 settled = true;
                 if (waitFor === 'InBlock') ac.abort(); // stop listening
                 log('info', phaseLine('watch', `OK ${waitFor} after ${Date.now() - firstAt}ms`));
@@ -209,20 +208,14 @@ export function createPhasedSubmitService(opts: {
             const a = adapterP; adapterP = null;
             if (!a) return;
             const deadline = Date.now() + (lateWindows.size ? opts.timeouts.lateGraceMs : 0) + opts.timeouts.closeMs;
-            while (lateWindows.size && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
-            try { await withTimeout(a.then((x) => x.close()), opts.timeouts.closeMs); } catch { /* bounded, best effort */ }
+            while (lateWindows.size && Date.now() < deadline) await sleep(50);
+            try { await withTimeout(a.then((x) => x.close()), opts.timeouts.closeMs, () => new PhaseTimeout()); } catch { /* bounded, best effort */ }
         }
     };
 }
 
 class PhaseTimeout extends Error { constructor() { super('phase timeout'); this.name = 'PhaseTimeout'; } }
 class StreamEnded extends Error { constructor() { super('stream ended'); this.name = 'StreamEnded'; } }
-
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-    let timer: NodeJS.Timeout | undefined;
-    const t = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new PhaseTimeout()), ms); });
-    return Promise.race([p, t]).finally(() => { if (timer) clearTimeout(timer); }) as Promise<T>;
-}
 
 function requestSentAt(timeline: readonly SubmitTimelineEntry[], t0: number): number {
     return timeline.find((e) => e.event === 'request-sent')?.at ?? t0;

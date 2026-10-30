@@ -1,8 +1,5 @@
-/**
- * The indexer's public data provider on its own, for code that only reads contract state.
- * One provider per indexer, kept for the life of the thread.
- * This module does not import `@sap/cds`, because the decode worker loads it too.
- */
+// The indexer's public data provider alone, for code that only reads contract state.
+// Does not import `@sap/cds`, because the decode worker loads it too.
 
 import WebSocket from 'ws';
 import { loadMidnightSdk } from './sdk-loader';

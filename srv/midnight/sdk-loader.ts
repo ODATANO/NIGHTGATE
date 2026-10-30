@@ -1,9 +1,5 @@
-/**
- * Loads the Midnight JS SDK once and caches it.
- * The SDK is ESM only and this project is CommonJS, so a normal import would fail.
- * A dynamic `import()` works.
- * This covers only what the main thread needs. The wallet worker loads its own SDK packages.
- */
+// Loads the Midnight JS SDK once with a dynamic `import()`, because the SDK is ESM only.
+// Covers only the main thread. The wallet worker loads its own SDK packages.
 
 type MidnightSdkIndexerProvider = any;
 type MidnightSdkProofProvider = any;

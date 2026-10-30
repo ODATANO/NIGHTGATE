@@ -1,8 +1,5 @@
-/**
- * Reads an attestation directly from the live vault contract, without the crawler.
- * An attestation is found by attester id plus payload hash, or by a document id bound to it.
- * Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
- */
+// Reads an attestation directly from the live vault contract, by attester id plus payload hash or by a document id bound to it.
+// Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
 import { hexToBytes } from '../utils/hex';
 import { importArtifact } from './artifact-import';
 import { buildPublicDataProvider } from '../midnight/public-data-provider';
@@ -57,8 +54,7 @@ export interface ReadAttestationStateDeps {
 const ZERO_ID = '00'.repeat(32);
 
 /**
- * A given payloadHash or attesterId must match the attestation found.
- * Returns null when the contract has no state, so callers answer "not found" instead of a server error.
+ * A given payloadHash or attesterId must match the attestation found. Null when the contract has no state, so callers answer "not found" instead of a server error.
  */
 export async function readAttestationState(
     deps: ReadAttestationStateDeps

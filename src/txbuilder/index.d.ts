@@ -33,6 +33,10 @@ export interface ZkAssetResult {
     fetched: number;
     /** Files that were already there. */
     cached: number;
+    /** Cached files that no longer matched the manifest and were downloaded again. Absent for a local directory. */
+    refreshed?: number;
+    /** The files were checked against a key manifest. Absent for a local directory. */
+    verified?: boolean;
     /** Where the files came from: a server, a local directory or a contract package. */
     source?: 'remote' | 'local' | 'package';
 }
@@ -63,7 +67,9 @@ export interface CreateTxBuilderInput {
     accountIndex?: number;
     /**
      * A NIGHTGATE server to read the chain through: the options for `connect()` or a connected client.
-     * Replaces the indexer and the node. Needs `walletSync: false` unless the indexer URLs are given as well.
+     * Replaces the indexer and the node. A wallet sync needs the indexer URLs as well, unless `api` is the
+     * options object with a gateway key (`token: 'oda_…'`): then the wallet syncs through the gateway's
+     * indexer lane. A connected client carries no key, so it never takes the lane.
      */
     api?: ConnectOptions | NightgateClient;
     /**
@@ -71,9 +77,9 @@ export interface CreateTxBuilderInput {
      * because a build on a stale state can fail on chain. Default 60.
      */
     maxLagBlocks?: number;
-    /** Required without `api`. */
+    /** Required without `api`; with `api` only for a wallet sync. */
     indexerHttpUrl?: string;
-    /** Required without `api`. */
+    /** Required without `api`; with `api` only for a wallet sync. */
     indexerWsUrl?: string;
     /** Node RPC URL. Required without `api`. */
     nodeUrl?: string;
@@ -305,7 +311,7 @@ export declare function deserializeTransaction(bytesOrB64: Uint8Array | string):
 export declare function txIdentifiers(tx: LedgerTransaction): string[];
 
 export interface SubmitOptions {
-    /** Node WebSocket URL, for example `wss://rpc.preprod.midnight.network/`. */
+    /** Node WebSocket RPC URL (`ws://` or `wss://`), your own node or a hosted one with its token in the URL. */
     nodeUrl: string;
     /** Node HTTP URL. Derived from `nodeUrl` when omitted. */
     nodeHttpUrl?: string;
@@ -375,6 +381,12 @@ export interface LandedProbeSource {
     api?: ConnectOptions | NightgateClient;
     fetchFn?: typeof fetch;
 }
+
+/** Why a lineage package cannot run on this compact-runtime (major.minor differ); null when it can or its contract.json says nothing. */
+export declare function runtimeVersionProblem(manifest: { compactRuntime?: string } | undefined, installed?: string): string | null;
+
+/** The gateway's indexer lane for `connect()` options with a gateway key (`oda_…`), the key in the query string; null otherwise. */
+export declare function gatewayIndexerUrls(api: unknown): { indexerHttpUrl: string; indexerWsUrl: string } | null;
 
 /** Asks the indexer or the NIGHTGATE server whether a transaction landed. Returns null while this is not known yet. */
 export declare function probeLanded(identifier: string, opts: LandedProbeSource & { timeoutMs?: number }): Promise<LandedProbeResult | null>;
@@ -472,8 +484,11 @@ export interface CreateSwapWalletInput {
     seedHex: string;
     networkId?: string;
     accountIndex?: number;
-    indexerHttpUrl: string;
-    indexerWsUrl: string;
+    /** The indexer the wallet syncs from. Required unless `api` holds a gateway key. */
+    indexerHttpUrl?: string;
+    indexerWsUrl?: string;
+    /** The `connect()` options of an ODATANO gateway (`{ baseUrl, token: 'oda_…' }`): the wallet syncs through its indexer lane. */
+    api?: ConnectOptions;
     /** Not needed for swapping. */
     nodeUrl?: string;
     /**
@@ -494,6 +509,8 @@ export interface CreateSwapWalletInput {
 export interface BuiltSwapHalf {
     /** The half as base64, for `sponsorSwap`. */
     halfB64: string;
+    /** The deserialized half, for `SwapWallet.revert` or `txIdentifiers`. */
+    tx: LedgerTransaction;
     /** Offer file text. Only for a sealed half. */
     offer?: string;
     bound: boolean;
@@ -518,6 +535,8 @@ export interface TakenOffer {
 export interface BuiltTransfer {
     /** The transfer as base64, for `sponsorTransfer({ transferTxB64 })`. */
     txB64: string;
+    /** The deserialized transfer, for `SwapWallet.revert` or `txIdentifiers`. */
+    tx: LedgerTransaction;
     bound: boolean;
     serializedBytes: number;
     /** What was asked: the type, the amount in atoms and the recipient's shielded address. */
@@ -546,6 +565,14 @@ export interface SwapWallet {
     pendingBalances(): Promise<Record<string, bigint>>;
     /** The unreserved coins, smallest first. */
     coins(): Promise<SwapLeg[]>;
+    /** The coins the halves and transfers built from this seed keep reserved, each with the instant the SDK stops waiting for it (null when unknown). */
+    pending(): Promise<Array<{ tokenType: string; amount: bigint; ttl: string | null }>>;
+    /**
+     * Releases the coins of a half or transfer whose build-time `revert()` is gone with its process: the offer
+     * file, base64 or bytes of the transaction (the board keeps an offer's file, also past its expiry).
+     * Only for a transaction that did not land; a landed one spent the coins and the sync removes them.
+     */
+    revert(input: string | Uint8Array): Promise<void>;
     /** The most one half can give of a token type. */
     spendable(tokenType: string): Promise<bigint>;
     /**

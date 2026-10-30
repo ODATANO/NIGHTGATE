@@ -1,11 +1,9 @@
-/**
- * JSON-RPC client that talks to a Midnight node over WebSocket.
- * The crawler reads its blocks through it, without depending on the Midnight Indexer.
- */
+// JSON-RPC client for a Midnight node over WebSocket. The crawler reads blocks through it, without the Midnight Indexer.
 
 import WebSocket from 'ws';
 import cds from '@sap/cds';
 import { redactUrlCredentials } from '../utils/redact-url';
+import { errorMessage } from '../utils/errors';
 const log = cds.log('nightgate:node');
 
 export interface NodeProviderConfig {
@@ -154,10 +152,8 @@ export class MidnightNodeProvider {
         });
     }
 
-    /**
-     * A connection dropped silently, for example by a proxy, never reports an error.
-     * Closing the socket after one silent interval lets the reconnect start.
-     */
+    /** A connection dropped silently, for example by a proxy, never reports an error.
+     *  Closing the socket after one silent interval lets the reconnect start. */
     private startHeartbeat(socket: WebSocket): void {
         this.stopHeartbeat();
         this.alive = true;
@@ -371,10 +367,6 @@ export class MidnightNodeProvider {
         this.pendingRequests.clear();
     }
 
-    async getLatestHeader(): Promise<BlockHeader> {
-        return this.rpc('chain_getHeader');
-    }
-
     async getHeader(hash?: string): Promise<BlockHeader> {
         return this.rpc('chain_getHeader', hash ? [hash] : []);
     }
@@ -404,41 +396,23 @@ export class MidnightNodeProvider {
         return this.rpc('state_getMetadata', blockHash ? [blockHash] : []);
     }
 
-    async health(): Promise<{ peers: number; isSyncing: boolean; shouldHavePeers: boolean }> {
-        return this.rpc('system_health');
-    }
-
-    async chain(): Promise<string> {
-        return this.rpc('system_chain');
-    }
-
-    async name(): Promise<string> {
-        return this.rpc('system_name');
-    }
-
-    async version(): Promise<string> {
-        return this.rpc('system_version');
-    }
 
     private invokeSubscriptionCallback(callback: SubscriptionCallback, result: any): void {
         try {
             const r = callback(result);
             if (r && typeof (r as any).then === 'function') {
                 void (r as Promise<any>).catch((err: unknown) => {
-                    const errMsg = err instanceof Error ? err.message : String(err);
+                    const errMsg = errorMessage(err);
                     log.error('Subscription callback failed:', errMsg);
                 });
             }
         } catch (err) {
-            const errMsg = err instanceof Error ? err.message : String(err);
+            const errMsg = errorMessage(err);
             log.error('Subscription callback failed:', errMsg);
         }
     }
 
-    /**
-     * Kept small on purpose. Late notifications for an id that is already unsubscribed
-     * would otherwise pile up until the next reconnect.
-     */
+    /** Kept small on purpose. Late notifications for an id that is already unsubscribed would otherwise pile up until the next reconnect. */
     private bufferOrphan(subscriptionId: string, result: any): void {
         let buf = this.orphanNotifications.get(subscriptionId);
         if (!buf) {
@@ -462,11 +436,6 @@ export class MidnightNodeProvider {
         }
     }
 
-    async subscribeNewHeads(callback: (header: BlockHeader) => void): Promise<string> {
-        const subscriptionId = await this.rpc('chain_subscribeNewHeads', []);
-        this.registerSubscription(subscriptionId, callback);
-        return subscriptionId;
-    }
 
     async subscribeFinalizedHeads(callback: (header: BlockHeader) => void): Promise<string> {
         const subscriptionId = await this.rpc('chain_subscribeFinalizedHeads', []);
@@ -474,11 +443,6 @@ export class MidnightNodeProvider {
         return subscriptionId;
     }
 
-    async unsubscribeNewHeads(subscriptionId: string): Promise<boolean> {
-        this.subscriptions.delete(subscriptionId);
-        this.orphanNotifications.delete(subscriptionId);
-        return this.rpc('chain_unsubscribeNewHeads', [subscriptionId]);
-    }
 
     async unsubscribeFinalizedHeads(subscriptionId: string): Promise<boolean> {
         this.subscriptions.delete(subscriptionId);

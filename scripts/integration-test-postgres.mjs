@@ -1,26 +1,6 @@
-// PostgreSQL integration lane: the plugin's database paths against a REAL
-// PostgreSQL, the dialect the standalone image runs on. Everything else in
-// the suite runs on SQLite, which never exercises the BYTEA write path, the
-// index DDL or the SQLSTATE-based retry classifier.
-//
-// Proves:
-//   1. the CDS model deploys on the postgres dialect (`cds.deploy`, the same
-//      call the image runs on every boot),
-//   2. `Transactions.raw` round-trips as BYTES through the BlockProcessor's
-//      write path (base64 in, Readable of bytes out, `.columns('raw')`),
-//   3. `ensureIndexes` creates the secondary indexes and is idempotent,
-//   4. `isLockContention` classifies REAL PostgreSQL errors by SQLSTATE:
-//      55P03 (lock timeout), 40P01 (deadlock), 57014 (statement timeout),
-//      40001 (serialization failure), and a non-contention error stays out,
-//   5. `withLockContentionRetry` completes a write once the blocking
-//      transaction releases the row.
-//
-// Database: `NIGHTGATE_PG_URL` (CI: a service container) or, when unset, a
-// throwaway `postgres:16` container on port 15432 that is removed at the end.
-// The schema-delta script is SQLite-only (sqlite_master, node:sqlite) and is
-// not part of this lane; on PostgreSQL the image redeploys with `cds deploy`.
-//
-// Run: npm run integration:postgres        (needs Docker or NIGHTGATE_PG_URL)
+// Checks deploy, BYTEA round trip, indexes and lock-contention retry against a real PostgreSQL.
+// Run: npm run integration:postgres
+// Env: NIGHTGATE_PG_URL, else a throwaway postgres:16 container on port 15432 is used (needs Docker).
 
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';

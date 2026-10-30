@@ -1,19 +1,4 @@
-// Typecheck the browser declarations the way a CONSUMER does: skipLibCheck OFF, resolved through
-// package.json#exports.
-//
-// Why: the repo's tsconfig has `skipLibCheck: true`, which does not typecheck `.d.ts`/`.d.mts`
-// contents at all. Every consumer that leaves skipLibCheck at its default (false) does. Errors
-// that only surface there:
-//   - a `.d.mts` importing a type from a declaration-less `.mjs` (TS7016);
-//   - a `.d.ts` referencing a name that `export { … } from` re-exports but does NOT bind
-//     locally (TS2304).
-// A full pack+install round trip catches these too but takes minutes. This does it in seconds.
-//
-// The probe lives INSIDE the repo and imports by PACKAGE NAME, using Node/TS self-referencing, so
-// resolution goes through `exports` exactly as a consumer's does. That matters: the browser entry
-// ships `.mjs` with a `.d.ts` sibling, which NodeNext resolves ONLY via the exports map's `types`
-// condition and never from a file path.
-//
+// Typechecks the browser declarations as a consumer does: skipLibCheck off, resolved by package name through exports.
 // Run: npm run check:browser-types
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -58,10 +43,7 @@ const meta = CONTRACTS['attestation-vault-32'];
 const dims: [number, number] = [meta.slotWidth, meta.merkleDepth];
 void dims;
 
-// txbuilder: the DEFAULT (bound) build keeps finalizedTxB64 as a plain string under strict
-// TypeScript (0.18 made the return a discriminated union; a 0.17 consumer that
-// reads finalizedTxB64 without narrowing must still compile), and bind:false
-// narrows to unboundTxB64.
+// The default bound build keeps finalizedTxB64 a plain string; bind:false narrows to unboundTxB64.
 import type { TxBuilder } from '@odatano/nightgate/txbuilder';
 async function txb(b: TxBuilder, call: PreparedCall) {
     const bound = await b.buildSponsorable({ contractAddress: 'c', call });

@@ -4,7 +4,8 @@
  * Tests for isTransientError() and calcBackoff() from srv/utils/retry.ts.
  */
 
-import { isTransientError, isUniqueViolation, calcBackoff } from '../../srv/utils/retry';
+import { isTransientError, calcBackoff } from '../../srv/utils/retry';
+import { isUniqueViolation } from '../../srv/utils/db-errors';
 
 describe('isTransientError', () => {
   it('should classify timeout errors as transient', () => {

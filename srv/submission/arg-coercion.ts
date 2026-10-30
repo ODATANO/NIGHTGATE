@@ -1,8 +1,5 @@
-/**
- * Converts JSON circuit arguments into the byte arrays and bigints that Compact circuits expect.
- * A `$bytes` or `$uint` tag decides first. Otherwise the types in contract-info.json decide.
- * Untagged arguments without type info are rejected.
- */
+// Converts JSON circuit arguments into the byte arrays and bigints that Compact circuits expect.
+// A `$bytes` or `$uint` tag decides first, then the types in contract-info.json. Untagged arguments without type info are rejected.
 
 import fs from 'fs';
 import path from 'path';

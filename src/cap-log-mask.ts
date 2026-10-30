@@ -1,8 +1,5 @@
-/**
- * CAP's JSON log format writes every request header and hides only those in `cds.env.log.mask_headers`.
- * Without this entry, the agent token would appear in plain text in the logs.
- * CAP fixes the list when it first logs, so this runs when the plugin loads.
- */
+// CAP's JSON log format writes every request header except those in `cds.env.log.mask_headers`.
+// This entry keeps the agent token out of the logs. CAP fixes the list on its first log line.
 export const AGENT_TOKEN_HEADER_MASK = '/x-agent-token/i';
 const AGENT_TOKEN_HEADER = 'x-agent-token';
 

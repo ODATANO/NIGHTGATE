@@ -1,7 +1,5 @@
-/**
- * Register NIGHT UTXOs for dust generation, or deregister them.
- * The caller must have loaded the wallet for `cacheKey` in the worker first.
- */
+// Registers NIGHT UTXOs for dust generation, or deregisters them.
+// The caller must have loaded the wallet for `cacheKey` in the worker first.
 
 import { walletRegisterDustGeneration, walletDeregisterDustGeneration, type RegisterDustGenerationOutcome, type SubmitIntentHook } from '../midnight/wallet-worker-client';
 import type { WalletFacadeBuildArgs } from './wallet-facade-builder';

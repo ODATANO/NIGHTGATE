@@ -1,9 +1,4 @@
-// Drives contract-registry resolution against the real compiled counter contract.
-// Two checks:
-//   1. Plain dynamic import of the artifact works (proves the JS is loadable).
-//   2. The production resolveContract path returns the Contract class ,
-//      same code that srv/submission/handlers.ts hits at runtime.
-//
+// Checks that the compiled counter contract imports and that resolveContract returns its Contract class.
 // Run: node scripts/integration-test-contract-registry.mjs
 
 import path from 'node:path';
@@ -61,10 +56,8 @@ ok('registry: artifactPath surfaced',          resolved.artifactPath === artifac
 ok('registry: compiledContract resolves to a wrapper object',
     resolved.compiledContract && typeof resolved.compiledContract === 'object');
 
-// ---- Check 3: atomic generation-pinned resolve -----------------------------
-// resolveContract(name, expectedDigest) recomputes the digest from the
-// captured snapshot's current file bytes and imports exactly that snapshot:
-// the correct digest resolves, a wrong one refuses BEFORE any import.
+// ---- Check 3: generation-pinned resolve ------------------------------------
+// The correct digest resolves; a wrong one is refused before any import.
 const digest = registry.getArtifactGenerationDigest('counter');
 ok('digest: 64-hex generation digest', /^[0-9a-f]{64}$/.test(digest));
 const pinned = await registry.resolveContract('counter', digest);

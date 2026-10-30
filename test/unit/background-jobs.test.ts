@@ -1138,6 +1138,37 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         expect(rows.get('job-recon-throw')?.status).toBe('reconciliation_required');
     });
 
+    test('the finalizer writes through the job transaction and its deferred work runs only after a commit', async () => {
+        const afterCommitted = vi.fn(async () => undefined);
+        const afterThrown = vi.fn(async () => undefined);
+        let seenTx: unknown;
+        registerBackgroundJobReconciliationFinalizer('sponsorUnboundTransaction', 1, async (cmd: any, _job, _evidence, tx, afterCommit) => {
+            seenTx = tx;
+            afterCommit(cmd.op === 'throw' ? afterThrown : afterCommitted);
+            if (cmd.op === 'throw') throw new Error('grant write failed');
+            return { reconciled: true };
+        });
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
+        const now = new Date().toISOString();
+        const base = {
+            kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', status: 'reconciliation_required',
+            idempotencyKey: null, request: '{}', result: null, errorCode: null, errorMessage: null,
+            startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now, chainStatus: 'pending', commandVersion: 1, commandEncoding: null
+        };
+        rows.set('job-recon-tx', { ...base, ID: 'job-recon-tx', txHash: '00txok'.padEnd(64, '0'), command: JSON.stringify({ op: 'ok' }) } as any);
+        let n = await confirmChainOutcomesViaIndexer();
+        if (n === 0) n = await confirmChainOutcomesViaIndexer();
+        expect(n).toBe(1);
+        expect(seenTx).toBeDefined();
+        expect(afterCommitted).toHaveBeenCalledTimes(1);
+
+        rows.set('job-recon-tx-throw', { ...base, ID: 'job-recon-tx-throw', txHash: '00txno'.padEnd(64, '0'), command: JSON.stringify({ op: 'throw' }) } as any);
+        await confirmChainOutcomesViaIndexer();
+        await confirmChainOutcomesViaIndexer();
+        expect(rows.get('job-recon-tx-throw')?.status).toBe('reconciliation_required');
+        expect(afterThrown).not.toHaveBeenCalled();
+    });
+
     test('skips workflow parents (chainStatus is aggregated from children)', async () => {
         const confirmer = vi.fn(async () => ({ status: 'success' as const, blockHeight: 4711 }));
         registerChainOutcomeConfirmer(confirmer);

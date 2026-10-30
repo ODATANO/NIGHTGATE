@@ -1,25 +1,5 @@
-// Live lane for `@odatano/nightgate/txbuilder`: the AGENT side of cross-server
-// fee sponsoring. Everything that touches the caller's key happens HERE, in
-// this process; the server only ever sees ~5 KB of finalized transaction.
-//
-// What runs:
-//   1. A throwaway caller identity is derived locally from a fresh seed.
-//   2. The prover keys are fetched from the sponsor's public /zk-config and
-//      cached on disk (second run is offline).
-//   3. `attest` is built, PROVEN IN-PROCESS (wasm), signed and finalized
-//      locally. Nothing is submitted; nothing secret leaves this process.
-//   4. Only the base64 transaction is POSTed to the sponsor, whose pool
-//      (NIGHTGATE_FEE_SPONSOR_SESSION) pays the dust and submits.
-//   5. The attestation is verified on chain to carry OUR attester id.
-//
-// This is what an autonomous agent does: it proves under its own identity and
-// pays for the API call, while the sponsor covers the chain fee.
-//
-// Server (separate terminal): npm run dev
-// Then:  NIGHTGATE_VAULT=<vault> node --env-file=.env scripts/run-txbuilder-e2e.mjs
-//
-// The server needs a sponsor pool; the caller side needs no funds at all.
-//
+// Builds, proves and signs an attest locally with a throwaway key, then the server's sponsor pool pays and submits it.
+// Run: NIGHTGATE_VAULT=<vault> node --env-file=.env scripts/run-txbuilder-e2e.mjs against `npm run dev`
 // SPDX-License-Identifier: Apache-2.0
 
 import { randomBytes } from 'node:crypto';

@@ -1,8 +1,6 @@
-/**
- * The worker regularly reports whether each sponsor wallet is synced and ready.
- * The main thread reads these reports. Pool selection prefers ready sponsors.
- * SPDX-License-Identifier: Apache-2.0
- */
+// The worker regularly reports whether each sponsor wallet is synced and ready.
+// The main thread reads these reports, and pool selection prefers ready sponsors.
+// SPDX-License-Identifier: Apache-2.0
 
 import { walletGetSyncProgress } from '../midnight/wallet-worker-client';
 import { configMs, configNumber } from '../utils/config';

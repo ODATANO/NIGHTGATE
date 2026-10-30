@@ -15,7 +15,8 @@ const decodeLedgerPayload = vi.fn();
 
 import { LedgerPayloadDecoder } from '../../srv/crawler/LedgerPayloadDecoder';
 import { IndexerSupplement, RATE_LIMIT_BACKOFF_MS } from '../../srv/crawler/IndexerSupplement';
-import { IndexerHttpError, createIndexerClient, isIndexerRateLimit } from '../../srv/crawler/indexer-supplement';
+import { createIndexerClient } from '../../srv/crawler/indexer-supplement';
+import { IndexerHttpError, isIndexerRateLimit } from '../../srv/utils/indexer-graphql';
 import { rollbackIndexedDataFromHeight } from '../../srv/crawler/rollback';
 import { redecodeFromHeight } from '../../srv/crawler/redecode';
 import { readCapBinary } from '../../srv/crawler/cap-binary';
@@ -704,7 +705,7 @@ describe('cursor against a reorg', () => {
         let clock = 1_000_000;
         (pass as any).now = () => clock;
         const waits: number[] = [];
-        (pass as any).sleep = vi.fn(async (ms: number) => { waits.push(ms); clock += ms; });
+        (pass as any).pause.sleep = vi.fn(async (ms: number) => { waits.push(ms); clock += ms; });
 
         await pass.runOnce();
 
@@ -729,7 +730,7 @@ describe('cursor against a reorg', () => {
         );
         await pass.init(db);
         const waits: number[] = [];
-        (pass as any).sleep = vi.fn(async (ms: number) => {
+        (pass as any).pause.sleep = vi.fn(async (ms: number) => {
             waits.push(ms);
             if (waits.length === 3) (pass as any).running = false;
         });
@@ -761,7 +762,7 @@ describe('cursor against a reorg', () => {
         try {
             pass.start();
             // Until the loop sleeps its first minute.
-            while (!(pass as any).wake) await new Promise(resolve => setTimeout(resolve, 5));
+            while (!(pass as any).pause.wakeUp) await new Promise(resolve => setTimeout(resolve, 5));
             const outcome = await Promise.race([
                 pass.stop().then(() => 'stopped'),
                 new Promise<string>(resolve => setTimeout(() => resolve('still sleeping'), 2000))

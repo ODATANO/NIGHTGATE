@@ -1,11 +1,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { assertLeaseHeld } from '../utils/instance-lease';
 
-/**
- * The node surely rejected the attempt, but saving that result to the database failed.
- * The job waits under this code and `settleRejectedSponsorAttempts` retries the save on every tick.
- * The indexer cannot resolve it, because the transaction never reached a mempool.
- */
+// The node surely rejected the attempt, but saving that to the database failed. `settleRejectedSponsorAttempts` retries the save every tick.
+// The indexer cannot resolve it, because the transaction never reached a mempool.
 export const REJECTED_ATTEMPT_BOOKKEEPING_PENDING = 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING';
 
 export class SponsorAttemptBookkeepingPendingError extends Error {
@@ -52,10 +49,7 @@ export async function reportExternalExecution(handle: ExternalSubmissionHandle):
     await storage.getStore()?.reportExternalExecution(handle);
 }
 
-/**
- * Mark the job as broadcast inside the caller's database transaction.
- * The job update then commits together with the attempt row and the deploy budget reservation.
- */
+/** Marks the job as broadcast inside the caller's transaction, so it commits with the attempt row and the deploy budget reservation. */
 export async function reportBroadcastOn(runner: StatementRunner, handle: ExternalSubmissionHandle): Promise<void> {
     // A process that lost its instance lease throws here, so its worker never broadcasts.
     await assertLeaseHeld(runner);
@@ -63,9 +57,7 @@ export async function reportBroadcastOn(runner: StatementRunner, handle: Externa
 }
 
 /**
- * Remove a rejected transaction id from the job inside the caller's database transaction.
- * The attempt row, the deploy refund and the job update then commit together.
- * Throws if the job's stored id changed in the meantime.
+ * Removes a rejected transaction id from the job inside the caller's transaction, so it commits with the attempt row and the deploy refund. Throws if the job's stored id changed meanwhile.
  */
 export async function reportSubmissionRejectedOn(runner: StatementRunner, handle: ExternalSubmissionHandle): Promise<void> {
     await storage.getStore()?.markSubmissionRejectedOn(runner, handle);

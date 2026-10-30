@@ -1,18 +1,6 @@
-// Native-ESM integration check for srv/utils/wallet-info.ts
-// (deriveWalletInfo): derives the connectable identity of a wallet from a
-// mnemonic and verifies it against the KNOWN Lace account.
-//
-// The decisive assertion: at accountIndex 0 / network preprod, the derived
-// shielded address must equal the real Lace wallet's shielded address (the
-// same reference value scripts/probe-seed-derivation.mjs validated the HD
-// derivation against). That proves deriveWalletInfo lands on exactly the
-// account Lace (and connectWalletForSigning) uses, so a wallet created
-// programmatically from a fresh phrase behaves identically.
-//
-// The mnemonic never leaves this machine and is never printed.
-//
+// Checks that deriveWalletInfo at account 0 on preprod yields the known Lace shielded address. Never prints the mnemonic.
 // Run: node --env-file=.env scripts/integration-test-derive-wallet-info.mjs
-//      (needs LACE_MNEMONIC in .env; LACE_SHIELD_ADDR overrides the target)
+// Env: LACE_MNEMONIC; LACE_SHIELD_ADDR overrides the expected address.
 
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);

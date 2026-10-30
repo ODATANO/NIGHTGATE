@@ -61,6 +61,6 @@ describe('typed action parameters are validated by CAP', () => {
             sessionId: '00000000-0000-4000-8000-000000000001', contractAddress: '0xVAULT'
         }, AUTH);
         expect(r.status).toBe(400);
-        expect(r.data.error.message).toMatch(/each siblings entry must be 64 hex/);
+        expect(r.data.error.message).toMatch(/siblings entries must be 64 hex/);
     });
 });

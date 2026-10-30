@@ -1,11 +1,5 @@
-// Live lane for mintShieldedTestToken + deriveTokenType, driven
-// entirely through the client SDK (`src/sdk/client.mjs`): deploy the bundled
-// shielded-token contract, mint, and pin that the job's tokenTypeHex equals
-// the compute-only derivation.
-//
-// Server (separate terminal): npm run serve
-// Then: node --env-file=.env scripts/run-mint-token-e2e.mjs
-//
+// Checks through the client SDK that a minted shielded token's tokenTypeHex equals deriveTokenType.
+// Run: node --env-file=.env scripts/run-mint-token-e2e.mjs against `npm run serve`
 // SPDX-License-Identifier: Apache-2.0
 
 import bip39 from 'bip39';

@@ -1,32 +1,6 @@
-// Live e2e for the 32-slot vault variant as a REGISTERED contract
-// (attestation-vault-32, no config override) and the txbuilder's multi-call
-// batch (buildSponsorable({ calls })).
-//
-// Walks:
-//   1. server width check: /zk-config/attestation-vault-32 serves the 32er
-//   2. connectWallet + connectWalletForSigning (LACE session = the deploying wallet;
-//      the server's sponsor pool pays the txbuilder calls)
-//   3. deployContract('attestation-vault-32') via the SERVER (the registrar
-//      constructor arg derives from the vault-family name prefix)
-//   4. prepareDocumentProof via the SERVER action (24 real fields -> 32
-//      slots, depth-5 paths) for documents A and B
-//   5. TXBUILDER BATCH: [attest, anchorContentRoot] per document in ONE
-//      transaction each (shared witness holder), sponsored via
-//      sponsorFinalizedTransaction: one fee event per document pair, no
-//      attest-counter race inside a pair. (A 4-call batch works on a young
-//      vault too, but attest's gas class moves as the vault grows and the
-//      causality pre-check then splits it anyway; two 2-call batches are
-//      the stable shape.)
-//   6. server-side issueFieldEqualityAttestation on the 32er (depth-5
-//      inclusion path through the worker witness path)
-//   7. txbuilder compare mode 1 (k of 32) + crawler-free verifyPredicateState
-//   8. 32-bit mask pin: verifyPredicateState documentIntegrity with bit 31
-//      set returns a CLEAN negative (CAP Integer passthrough)
-//
-// Inputs (env): NIGHTGATE_URL (default http://localhost:4004),
-// LACE_VIEWING_KEY, LACE_MNEMONIC; indexer/node URLs from env or defaults.
-// Server: standard config (`npm run serve`), which registers the 32er.
-// Run: npm run width32:e2e
+// Checks the 32-slot attestation vault live: deploy, document proofs, sponsored txbuilder batches and predicate checks.
+// Run: npm run width32:e2e against `npm run serve`
+// Env: NIGHTGATE_URL, LACE_VIEWING_KEY, LACE_MNEMONIC.
 
 import { randomBytes } from 'node:crypto';
 import { statSync } from 'node:fs';
@@ -68,7 +42,8 @@ const IWS = process.env.NIGHTGATE_INDEXER_WS_URL
     || (process.env.NIGHTGATE_INDEXER_HTTP_URL && cfgMod.deriveIndexerWsUrl
         ? cfgMod.deriveIndexerWsUrl(process.env.NIGHTGATE_INDEXER_HTTP_URL)
         : cfgMod.DEFAULT_INDEXER_URLS?.[NETWORK]?.ws);
-const NODE = process.env.NIGHTGATE_NODE_URL || cfgMod.DEFAULT_NODE_URL;
+const NODE = process.env.NIGHTGATE_NODE_URL || cfgMod.DEFAULT_NODE_URLS?.[NETWORK];
+if (!IHTTP || !NODE) { console.error(`no indexer or node URL for network ${NETWORK}: set NIGHTGATE_INDEXER_HTTP_URL and NIGHTGATE_NODE_URL`); process.exit(2); }
 
 const ng = connect({ baseUrl: BASE, timeoutMs: 60 * 60 * 1000 });
 
@@ -165,10 +140,8 @@ const b = await createTxBuilder({
 });
 console.log(`     attester ${b.attesterId.slice(0, 12)}..., proving: ${b.provingMode}`);
 
-// `build` is a zero-arg async function returning { finalizedTxB64 }. On a
-// 104/170/196 node reject the tx was built against a state the node has
-// moved past; resubmitting the SAME bytes sticks, so the retry REBUILDS
-// against fresh contract state before sponsoring again.
+// On a 104, 170 or 196 node reject the tx was built on stale state.
+// Resending the same bytes keeps failing, so the retry rebuilds first.
 async function sponsorWithRetry(label, build) {
     let built = await build();
     for (let attempt = 1, jobRetries = 0; ; attempt++) {
@@ -191,11 +164,8 @@ async function sponsorWithRetry(label, build) {
     }
 }
 
-// One 2-call batch per document: attest + anchor land in ONE tx (one fee
-// event, no attest-counter race between the pair). A 4-call batch also
-// lands on a young vault, but attest's gas class moves as the vault grows
-// and the causality pre-check then splits it anyway; the 2-call pair is
-// the shape that stays valid longest.
+// One attest plus anchor batch per document, in one tx each.
+// Larger batches split once the vault grows, because attest's gas class changes.
 for (const [doc, label] of [[A, 'A'], [B, 'B']]) {
     await sponsorWithRetry(`batch-${label}`, async () => {
         const t0 = Date.now();

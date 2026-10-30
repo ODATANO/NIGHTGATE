@@ -1,13 +1,13 @@
-// Helpers for callers that pay their own fee and submit to the node themselves, without a sponsor.
-// On Midnight the fee is paid in DUST.
-//
-// The node's HTTP gateway rejects large request bodies, so transactions are submitted over WebSocket.
-//
+// Helpers for callers that pay their own DUST fee and submit to the node themselves, without a sponsor.
+// Transactions go over WebSocket, because the node's HTTP gateway rejects large request bodies.
 // SPDX-License-Identifier: Apache-2.0
 
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
+const { indexerQuery } = require('../../srv/utils/indexer-graphql.js');
+
+const TX_LANDED_QUERY = 'query($offset: TransactionOffset!) { transactions(offset: $offset) { block { height } ... on RegularTransaction { transactionResult { status segments { id success } } } } }';
 
 const DESERIALIZE_TAGS = [
     ['signature', 'proof', 'binding'],
@@ -34,10 +34,8 @@ export async function deserializeTransaction(bytesOrB64) {
     throw new Error('could not deserialize the transaction (tried binding and pre-binding tags): ' + String(lastError?.message ?? lastError));
 }
 
-/**
- * Returns the transaction's identifiers. Use the last one to look the transaction up in the indexer.
- * Resend the same bytes only after `probeLanded` says the first send did not land.
- */
+/** Returns the transaction's identifiers. Use the last one to look the transaction up in the indexer.
+ *  Resend the same bytes only after `probeLanded` says the first send did not land. */
 export function txIdentifiers(tx) {
     if (typeof tx?.identifiers !== 'function') {
         throw new Error('txIdentifiers: expected a deserialized ledger Transaction (see deserializeTransaction)');
@@ -58,47 +56,29 @@ function rejectHaystack(err) {
     return parts.join(' ').replace(/:\d+:\d+/g, '');
 }
 
-/**
- * Whether the node refused the transaction before it entered the mempool (codes 1010, 1014, 1016).
- * No fee was spent. If the transaction paid its own fee, restore the DUST wallet with `withDustGuard`.
- */
+/** Whether the node refused the transaction before the mempool (codes 1010, 1014, 1016). No fee was spent.
+ *  If the transaction paid its own fee, restore the DUST wallet with `withDustGuard`. */
 export function isPreMempoolReject(err) {
     return /\b101[046]\s*:|priority is too low|immediately dropped|invalid transaction/i.test(rejectHaystack(err));
 }
 
-/**
- * Whether the node says the transaction is already in the pool (code 1013).
- * After a resend this means the first send worked. Wait for it with `waitLanded`, do not treat it as a failure.
- */
+/** Whether the node says the transaction is already in the pool (code 1013).
+ *  After a resend this means the first send worked. Wait for it with `waitLanded`. */
 export function isAlreadyImported(err) {
     return /\b1013\s*:|already imported/i.test(rejectHaystack(err));
 }
 
-/**
- * Whether the connection failed while sending. The transaction may still have reached the node.
- * Check with `probeLanded`, then resend the same bytes. Never rebuild, or both transactions may land.
- */
+/** Whether the connection failed while sending. The transaction may still have reached the node.
+ *  Check with `probeLanded`, then resend the same bytes. Never rebuild, or both transactions may land. */
 export function isTransportFailure(err) {
     if (isPreMempoolReject(err)) return false;
     return /disconnected from|Normal Closure|Abnormal Closure|WebSocket is not connected|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket hang up|Unable to connect|TimeoutError|TimeoutException|timed? ?out|no reply|no response|request timeout/i
         .test(rejectHaystack(err));
 }
 
-/**
- * Explains a node rejection by its ledger error code, and what to do about it.
- *
- *   'stale-dust-proof'  Codes 170, 171, 196. The fee was proven against an outdated state.
- *                       Sync the wallet, rebuild and submit again.
- *   'funds'             Codes 138, 173. The wallet cannot pay. Retrying does not help.
- *   'sequencing'        Codes 219-224 and 188. The batch's call order is not allowed.
- *                       Send the calls as separate transactions.
- *   'malformed'         Code 117, often a zero fee. Retrying does not help.
- *   'stale-transcript'  Code 104. Another transaction changed the contract first. No fee was spent.
- *                       Build the call again, for example with `rebuildOnStaleTranscript`.
- *   'unknown'           Any other rejection.
- *
- * After a rejection, always build new bytes. Resend the same bytes only after a connection failure.
- */
+/** Maps a node rejection to a kind by its ledger error code. Only 'stale-dust-proof' and 'stale-transcript' are worth a rebuild.
+ *  'sequencing' means the batch's call order is not allowed, so send the calls as separate transactions.
+ *  After a rejection always build new bytes. Resend the same bytes only after a connection failure. */
 export function classifyNodeReject(err) {
     const haystack = rejectHaystack(err);
     const custom = /custom error:?\s*(\d+)/i.exec(haystack) ?? /\b1010\/(\d+)\b/.exec(haystack);
@@ -115,11 +95,8 @@ export function classifyNodeReject(err) {
     return { kind: 'unknown', subCode };
 }
 
-/**
- * Runs `attempt` again after a 'stale-transcript' rejection, up to `retries` times.
- * `attempt` must build a new transaction each time, because the same bytes are refused again.
- * The pause gives the indexer time to show the contract's new state.
- */
+/** Runs `attempt` again after a 'stale-transcript' rejection, up to `retries` times, with a pause for the indexer.
+ *  `attempt` must build a new transaction each time, because the same bytes are refused again. */
 export async function rebuildOnStaleTranscript(attempt, { retries = 2, backoffMs = 15_000, onRetry, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
     for (let retry = 0; ; retry++) {
         try {
@@ -143,10 +120,7 @@ export function nodeHttpUrlFor(nodeUrl) {
     return u.toString().replace(/\/$/, '');
 }
 
-/**
- * Submits an encoded extrinsic over a new WebSocket and returns its hash.
- * A rejection throws an Error. Pass it to `classifyNodeReject`.
- */
+/** Submits an encoded extrinsic over a new WebSocket and returns its hash. A rejection throws, pass it to `classifyNodeReject`. */
 export function submitExtrinsic(extrinsicHex, { nodeUrl, timeoutMs = 30_000, WebSocketImpl } = {}) {
     if (!nodeUrl) throw new Error('submitExtrinsic: nodeUrl is required (the node WebSocket RPC)');
     const WsImpl = WebSocketImpl ?? require('ws');
@@ -192,12 +166,10 @@ export function submitExtrinsic(extrinsicHex, { nodeUrl, timeoutMs = 30_000, Web
     });
 }
 
-/**
- * Submits a sealed transaction with its fee paid and returns the extrinsic hash.
- * Needs the optional dependency `@polkadot/api`. To look the transaction up in the indexer, use `txIdentifiers`.
- */
+/** Submits a sealed transaction with its fee paid and returns the extrinsic hash.
+ *  Needs the optional dependency `@polkadot/api`. To look the transaction up in the indexer, use `txIdentifiers`. */
 export async function submitFinalized(tx, { nodeUrl, nodeHttpUrl, timeoutMs = 30_000, WebSocketImpl } = {}) {
-    if (!nodeUrl) throw new Error('submitFinalized: nodeUrl is required (the node WebSocket RPC, e.g. wss://rpc.preprod.midnight.network/)');
+    if (!nodeUrl) throw new Error('submitFinalized: nodeUrl is required (the node WebSocket RPC: your own node, or a hosted one with its token in the URL)');
     const bytes = typeof tx?.serialize === 'function' ? new Uint8Array(tx.serialize()) : toBytes(tx);
     let polkadot;
     try {
@@ -216,27 +188,15 @@ export async function submitFinalized(tx, { nodeUrl, nodeHttpUrl, timeoutMs = 30
     return submitExtrinsic(extrinsicHex, { nodeUrl, timeoutMs, WebSocketImpl });
 }
 
-/**
- * Asks the indexer whether a transaction landed. Returns null while this is not known yet.
- * `applied: false` means the transaction is in a block but its call failed. The fee was still spent.
- * Always check by identifier. Watching the contract address could pick up someone else's call.
- */
+/** Asks the indexer whether a transaction landed, or null while not known. `applied: false` means the call failed but the fee was spent.
+ *  Always check by identifier. Watching the contract address could pick up someone else's call. */
 export async function probeLanded(identifier, { indexerHttpUrl, api, fetchFn, timeoutMs = 15_000 } = {}) {
     if (!identifier) throw new Error('probeLanded: identifier is required (txIdentifiers(tx).at(-1))');
     if (api) return probeLandedOnApi(identifier, api);
     if (!indexerHttpUrl) throw new Error('probeLanded: indexerHttpUrl or api is required');
-    const doFetch = fetchFn || fetch;
     try {
-        const r = await doFetch(indexerHttpUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query: `{ transactions(offset:{identifier:"${identifier}"}) { block { height } ... on RegularTransaction { transactionResult { status segments { id success } } } } }` }),
-            signal: AbortSignal.timeout(timeoutMs)
-        });
-        if (!r.ok) return null;
-        const j = await r.json();
-        if (Array.isArray(j?.errors) && j.errors.length > 0) return null;
-        const t = j?.data?.transactions?.[0];
+        const data = await indexerQuery(indexerHttpUrl, TX_LANDED_QUERY, { variables: { offset: { identifier: String(identifier) } }, timeoutMs, fetchFn });
+        const t = data?.transactions?.[0];
         const height = t?.block?.height;
         if (height == null) return null;
         // A landed transaction always has a status. Without one the indexer answer is incomplete.
@@ -270,14 +230,13 @@ async function probeLandedOnApi(identifier, api) {
     return { height: String(found.blockHeight), status: String(found.status), failedSegments, applied: found.status === 'SUCCESS', txHash: found.ledgerTxHash ?? undefined };
 }
 
-/**
- * Calls `probeLanded` until the transaction is found or `timeoutMs` has passed. It asks at least once.
- * Use it when a resend is rejected. The first send may already be on chain while the indexer lags behind.
- */
+/** Calls `probeLanded` at least once, until the transaction is found or `timeoutMs` has passed.
+ *  Use it when a resend is rejected. The first send may already be on chain while the indexer lags behind. */
 export async function waitLanded(identifier, { indexerHttpUrl, api, timeoutMs = 30_000, pollMs = 5_000, fetchFn } = {}) {
     const deadline = Date.now() + timeoutMs;
     for (; ;) {
-        const found = await probeLanded(identifier, { indexerHttpUrl, api, fetchFn });
+        const probeMs = Math.max(1, Math.min(15_000, deadline - Date.now()));
+        const found = await probeLanded(identifier, { indexerHttpUrl, api, fetchFn, timeoutMs: probeMs });
         if (found) return found;
         const left = deadline - Date.now();
         if (left <= 0) return null;
@@ -285,18 +244,9 @@ export async function waitLanded(identifier, { indexerHttpUrl, api, timeoutMs = 
     }
 }
 
-/**
- * Runs `fn`, which builds and submits one transaction that pays its own fee.
- * If the node rejects it before the mempool, the SDK's DUST wallet wrongly keeps the fee reserved.
- * Enough of these and the wallet can no longer pay. So this saves the DUST wallet first and restores it after such a rejection.
- * The rethrown error then has `dustRestored = true`. If you save the wallet to disk, save the restored state.
- * Run only one guarded build per wallet at a time.
- *
- * @param facade  The wallet facade whose DUST wallet to protect.
- * @param opts    The configuration the facade was created with, the DUST secret key,
- *                and optionally your own DustWallet factory.
- * @param fn      Builds, balances and submits one transaction.
- */
+/** Runs `fn`, which builds and submits one self-paid transaction. After a pre-mempool rejection it restores the DUST wallet,
+ *  because the SDK would keep the fee reserved. The rethrown error then has `dustRestored = true`, so save the restored state.
+ *  Run only one guarded build per wallet at a time. */
 export async function withDustGuard(facade, { configuration, dustKey, dustWalletFactory } = {}, fn) {
     if (!facade?.dust) throw new Error('withDustGuard: facade with a dust sub-wallet is required');
     if (!configuration || !dustKey) throw new Error('withDustGuard: configuration and dustKey are required (the values the facade was created with)');

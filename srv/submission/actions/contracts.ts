@@ -1,16 +1,15 @@
-/**
- * Contract deploy, call, batch and build-only actions.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Contract deploy, call, batch and build-only actions.
+// SPDX-License-Identifier: Apache-2.0
 import { coerceCircuitArgs } from '../arg-coercion';
 import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
 import { vaultDims } from '../verify-state';
 import { SET_DEPTH } from '../set-root';
-import { MerkleProofBundle, validateSchemaSlots, validateOpening, facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { MerkleProofBundle, inclusionPathOrThrow, readArgsJson, type InclusionPath, validateSchemaSlots, validateOpening, facadeConfigFromEnv, rejectIfMainnetBlocked, runSubmission } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
 import { buildSponsorable, deployContract, submitContractCall, submitContractCallBatch } from '#cds-models/NightgateService';
+import { checkRateClass } from '../../utils/rate-classes';
 
 export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'contractResolver' | 'argTypesLoader' | 'resolveSponsorForRequest'>): void {
     const { srv, db, walletFactory, contractResolver, argTypesLoader, resolveSponsorForRequest } = ctx;
@@ -23,7 +22,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('deploy', sessionId, req)) return;
+        if (!checkRateClass('deploy', sessionId, req)) return;
 
         if (Array.isArray(initialPrivateState)) return req.reject(400, 'initialPrivateState must be a JSON object');
         const parsedInitialState: unknown = initialPrivateState ?? {};
@@ -62,18 +61,10 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', sessionId, req)) return;
+        if (!checkRateClass('prove', sessionId, req)) return;
 
-        let parsedArgs: unknown[] = [];
-        if (args) {
-            try {
-                const v = JSON.parse(args);
-                if (!Array.isArray(v)) return req.reject(400, 'args must be a JSON array');
-                parsedArgs = v;
-            } catch {
-                return req.reject(400, 'args must be valid JSON');
-            }
-        }
+        const parsedArgs = readArgsJson(args);
+        if (typeof parsedArgs === 'string') return req.reject(400, parsedArgs);
 
         // Used only when the wallet has no private state for this contract yet.
         if (Array.isArray(initialPrivateState)) return req.reject(400, 'initialPrivateState must be a JSON object');
@@ -118,9 +109,9 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', sessionId, req)) return;
-        let parsedArgs: unknown[] = [];
-        if (args) { try { const v = JSON.parse(args); if (!Array.isArray(v)) return req.reject(400, 'args must be a JSON array'); parsedArgs = v; } catch { return req.reject(400, 'args must be valid JSON'); } }
+        if (!checkRateClass('prove', sessionId, req)) return;
+        const parsedArgs = readArgsJson(args);
+        if (typeof parsedArgs === 'string') return req.reject(400, parsedArgs);
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -148,7 +139,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (!calls) return req.reject(400, 'calls is required');
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', sessionId, req)) return;
+        if (!checkRateClass('prove', sessionId, req)) return;
 
         // The batch size is limited: each call carries a proof,
         // and one rejected call fails the whole batch.
@@ -202,42 +193,21 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                         }
                         fieldSalt = mp.fieldSalt.toLowerCase();
                     }
-                    if (!Array.isArray(mp.siblings) || mp.siblings.length !== rawBatchDepth) {
-                        throw new Error(`calls[${i}].merkleProof.siblings must be a JSON array of ${rawBatchDepth} hashes`);
-                    }
-                    for (const s of mp.siblings) {
-                        if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) throw new Error(`calls[${i}].merkleProof.siblings entries must be 64 hex chars (32 bytes)`);
-                    }
-                    if (!Array.isArray(mp.dirs) || mp.dirs.length !== rawBatchDepth) {
-                        throw new Error(`calls[${i}].merkleProof.dirs must be a JSON array of ${rawBatchDepth} booleans`);
-                    }
-                    for (const d of mp.dirs) {
-                        if (typeof d !== 'boolean') throw new Error(`calls[${i}].merkleProof.dirs entries must be booleans`);
-                    }
-                    let setProof: { siblings: string[]; dirs: boolean[] } | undefined;
+                    const path = inclusionPathOrThrow(mp.siblings, mp.dirs, rawBatchDepth,
+                        { siblings: `calls[${i}].merkleProof.siblings`, dirs: `calls[${i}].merkleProof.dirs` });
+                    let setProof: InclusionPath | undefined;
                     if (mp.setProof !== undefined) {
                         const sp = mp.setProof;
                         if (!sp || typeof sp !== 'object') throw new Error(`calls[${i}].merkleProof.setProof must be an object`);
-                        if (!Array.isArray(sp.siblings) || sp.siblings.length !== SET_DEPTH) {
-                            throw new Error(`calls[${i}].merkleProof.setProof.siblings must be a JSON array of ${SET_DEPTH} hashes`);
-                        }
-                        for (const s of sp.siblings) {
-                            if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) throw new Error(`calls[${i}].merkleProof.setProof.siblings entries must be 64 hex chars (32 bytes)`);
-                        }
-                        if (!Array.isArray(sp.dirs) || sp.dirs.length !== SET_DEPTH) {
-                            throw new Error(`calls[${i}].merkleProof.setProof.dirs must be a JSON array of ${SET_DEPTH} booleans`);
-                        }
-                        for (const d of sp.dirs) {
-                            if (typeof d !== 'boolean') throw new Error(`calls[${i}].merkleProof.setProof.dirs entries must be booleans`);
-                        }
-                        setProof = { siblings: sp.siblings.map((s: string) => s.toLowerCase()), dirs: sp.dirs as boolean[] };
+                        setProof = inclusionPathOrThrow(sp.siblings, sp.dirs, SET_DEPTH,
+                            { siblings: `calls[${i}].merkleProof.setProof.siblings`, dirs: `calls[${i}].merkleProof.setProof.dirs` });
                     }
                     merkleProof = {
                         ...(fieldValueStr !== undefined ? { fieldValue: fieldValueStr } : {}),
                         ...(fieldDigest !== undefined ? { fieldDigest } : {}),
                         ...(fieldSalt !== undefined ? { fieldSalt } : {}),
-                        siblings: mp.siblings.map((s: string) => s.toLowerCase()),
-                        dirs: mp.dirs as boolean[],
+                        siblings: path.siblings,
+                        dirs: path.dirs,
                         ...(setProof ? { setProof } : {})
                     };
                 }

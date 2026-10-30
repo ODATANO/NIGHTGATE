@@ -1,14 +1,12 @@
-/**
- * Profiles the current thread for a few seconds while it keeps working.
- * Returns a CPU summary plus heap and garbage collection figures.
- * The raw profile is saved to disk so it can be opened in DevTools.
- */
+// Profiles the current thread for a few seconds while it keeps working.
+// Returns CPU, heap and GC figures and saves the raw profile to disk for DevTools.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import v8 from 'node:v8';
 import { PerformanceObserver } from 'node:perf_hooks';
 import { summarizeCpuProfile, type CpuProfileSummary } from './cpu-profile-summary';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 export interface HeapFigures {
     usedMb: number;
@@ -63,8 +61,13 @@ export function resolveProfileDir(dir: string | null | undefined): string | null
     return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)) ? resolved : null;
 }
 
+/** A profile length in whole seconds, 1 to 120; 20 when unset. */
+export function profileSeconds(seconds: unknown): number {
+    return Math.min(120, Math.max(1, Math.floor(Number(seconds) || 20)));
+}
+
 export async function profileCurrentThread(seconds: number, opts: { dir?: string; filePrefix?: string; top?: number } = {}): Promise<ThreadProfile> {
-    const secs = Math.min(120, Math.max(1, Math.floor(Number(seconds) || 20)));
+    const secs = profileSeconds(seconds);
     const inspector = await import('node:inspector');
     const session = new inspector.Session();
     session.connect();
@@ -84,7 +87,7 @@ export async function profileCurrentThread(seconds: number, opts: { dir?: string
         await post('Profiler.enable');
         await post('Profiler.setSamplingInterval', { interval: 1000 });
         await post('Profiler.start');
-        await new Promise(r => setTimeout(r, secs * 1000));
+        await sleep(secs * 1000);
         const { profile } = await post('Profiler.stop');
         observer.disconnect();
         const heapAfter = heapFigures();

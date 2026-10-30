@@ -1,35 +1,6 @@
-// Disclosure-grants end-to-end.
-//
-// Walks the full on-chain entitlement lifecycle against a LIVE deployed
-// AttestationVault, exercising every disclosure-grants surface:
-//   connectWallet → connectWalletForSigning (await prewarm) →
-//   deployContract(attestation-vault) →
-//   registerGranteeIdentity        (principal → granteeId) →
-//   anchorDocument (attest a payload so it has an on-chain owner) →
-//   grantDisclosure(level=1)       (write) →
-//   GET DisclosureGrants           (read: poll until active=true) →
-//   revokeDisclosure               (write) →
-//   GET DisclosureGrants           (read: poll until active=false)
-//
-// Why this is the meaningful live check: the gate itself (attachDisclosureRole
-// with contractAddress) is what a CONSUMER wires into a specific read, so the
-// allowed/403 assertion lives in the consumer and is covered at unit level
-// here (test/unit/disclosure-role.test.ts → "on-chain ACL"). What only a live
-// run can prove is the READ-BACK path: that the post-submit reindex's
-// publicDataProvider.queryContractState(addr) feeds ledger() and the
-// non-iterable-outer-map enumeration (scripts/spike-disclosure-indexer.mjs
-// drives the same logic in-process). When `active` flips to true after the
-// grant and false after the revoke, that path is confirmed against the chain.
-//
-// We tie the on-chain grantee to the registered identity by granting to the
-// EXACT granteeId that registerGranteeIdentity returns (the server's
-// deriveGranteeId is deterministic), so write-side and read-side ids match
-// regardless of the configured binding kind.
-//
-// Inputs (env): NIGHTGATE_URL (default http://localhost:4004), LACE_VIEWING_KEY,
-// LACE_MNEMONIC. Optional: DISCLOSURE_CONTRACT_ADDRESS (reuse an already
-// deployed vault and skip the deploy step). Run:
-//   node --env-file=.env scripts/run-disclosure-e2e.mjs
+// Checks the disclosure-grant lifecycle live: register grantee, anchor, grant, read active, revoke, read inactive.
+// Run: node --env-file=.env scripts/run-disclosure-e2e.mjs
+// Env: NIGHTGATE_URL, LACE_VIEWING_KEY, LACE_MNEMONIC, optional DISCLOSURE_CONTRACT_ADDRESS to reuse a vault.
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';

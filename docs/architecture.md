@@ -74,7 +74,7 @@ No shield/unshield: NIGHT is unshielded-only.
 
 Reading contract state and ledger transactions runs the ledger's wasm, which blocks the thread it runs on. A second `worker_threads` worker does it, so a burst of verify calls or a crawler catch-up never stalls HTTP:
 
-- `srv/midnight/decode-worker.ts`: entry; `decode-worker/dispatch.ts`: the message dispatcher, one reply per call.
+- `srv/midnight/decode-worker.ts` is the entry. The message dispatcher in `srv/midnight/worker-rpc/dispatch.ts` sends one reply per call.
 - Methods: `readPredicateState`, `readAttestationState`, `readDisclosureGrants`, `readHolderRegistration` (the readers in `srv/submission/*-state.ts`, `disclosure-grants.ts`, `holder-registry.ts`, which import no `@sap/cds`) and `decodeLedgerPayload` (the crawler's trailing pass).
 - `srv/midnight/decode-worker-client.ts`: main-thread client, one `MessageChannel` per call, timeout `NIGHTGATE_DECODE_WORKER_RPC_TIMEOUT_MS`. The worker starts on the first call and again after a crash. Every answer is plain data; the database writes stay on the main thread.
 - The wallet worker is not involved: a slow verify never delays a sync or a submit.

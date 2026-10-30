@@ -1,10 +1,13 @@
 /** Builds the answers of the health, readiness, metrics and status functions of the indexer service. */
 
 import cds from '@sap/cds';
+import { errorMessage } from '../utils/errors';
+import { withTimeout } from '../utils/timeout';
 const { SELECT } = cds.ql;
 
 import { SyncState, BackgroundJobs } from '#cds-models/midnight';
 import { getRuntimeTopology } from '../utils/runtime-topology';
+import { packageVersion } from '../utils/package-version';
 import {
     getNightgatePluginConfig,
     resolveNightgateRuntimeConfig,
@@ -37,6 +40,13 @@ export const processStartTime = Date.now();
 
 const OPEN_JOB_STATUSES = ['pending', 'running', 'external_execution', 'submitted', 'reconciliation_required'];
 
+/** A crawler that indexed nothing for this long counts as cut off from its node. */
+const CRAWLER_ACTIVITY_WINDOW_MS = 5 * 60 * 1000;
+
+function crawlerEnabledFor(pluginConfig: ReturnType<typeof getNightgatePluginConfig>): boolean {
+    return resolveNightgateRuntimeConfig(pluginConfig).crawlerConfig?.enabled !== false;
+}
+
 
 export function buildLiveness(): Record<string, unknown> {
     const topology = getRuntimeTopology(getNightgatePluginConfig());
@@ -49,7 +59,8 @@ export function buildLiveness(): Record<string, unknown> {
 }
 
 export async function buildHealth(db: DbRunner): Promise<Record<string, unknown>> {
-    const topology = getRuntimeTopology(getNightgatePluginConfig());
+    const pluginConfig = getNightgatePluginConfig();
+    const topology = getRuntimeTopology(pluginConfig);
     const syncState = await db.run(SELECT.one.from(SyncState).where({ ID: 'SINGLETON' }));
 
     if (!syncState) {
@@ -77,9 +88,11 @@ export async function buildHealth(db: DbRunner): Promise<Record<string, unknown>
     const finalizedHeight = Number(syncState.lastFinalizedHeight || 0);
     const lag = Math.max(chainHeight - indexedHeight, 0);
     const finalizedLag = Math.max(chainHeight - finalizedHeight, 0);
+    const halted = crawlerEnabledFor(pluginConfig) && (syncState.syncStatus === 'error' || syncState.syncStatus === 'stopped');
+    const idle = syncState.lastIndexedAt != null && Date.now() - new Date(syncState.lastIndexedAt).getTime() >= CRAWLER_ACTIVITY_WINDOW_MS;
     let status = 'healthy';
-    if (lag > 100) status = 'unhealthy';
-    else if (lag > 10) status = 'degraded';
+    if (halted || lag > 100) status = 'unhealthy';
+    else if (lag > 10 || (crawlerEnabledFor(pluginConfig) && idle)) status = 'degraded';
 
     return {
         status,
@@ -101,16 +114,13 @@ export async function buildHealth(db: DbRunner): Promise<Record<string, unknown>
 
 export type ReadinessPhase = 'starting' | 'warming' | 'catching-up' | 'ready' | 'degraded' | 'failed';
 
-/**
- * Readiness answers in bounded time: the database read has its own timeout, everything else is read from memory.
- * While the sponsor pool warms, the process is `ready` on the memory checks alone. A saturated start must not be
- * restarted for a slow database read.
- */
+/** Answers in bounded time. The database read has its own timeout, all other checks read memory.
+ *  While the sponsor pool warms, memory checks alone make it `ready`, so a slow start is not restarted. */
 export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<ReturnType<typeof getReadiness>>>> {
     const pluginConfig = getNightgatePluginConfig();
     const topology = getRuntimeTopology(pluginConfig);
     // A disabled crawler does not make the server unready. Its checks simply pass.
-    const crawlerEnabled = (resolveNightgateRuntimeConfig(pluginConfig).crawlerConfig as any)?.enabled !== false;
+    const crawlerEnabled = crawlerEnabledFor(pluginConfig);
 
     // Both conditions are needed. `initialized` is also set when startup ended offline.
     const runtime = readRuntimeStatus();
@@ -139,7 +149,7 @@ export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<
 
             if (syncState.lastIndexedAt) {
                 const lastActivity = new Date(syncState.lastIndexedAt).getTime();
-                checks.node = (Date.now() - lastActivity) < 5 * 60 * 1000;
+                checks.node = (Date.now() - lastActivity) < CRAWLER_ACTIVITY_WINDOW_MS;
             }
         }
     } catch {
@@ -174,17 +184,7 @@ export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<
     };
 }
 
-function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms);
-        work.then(v => { clearTimeout(timer); resolve(v); }, e => { clearTimeout(timer); reject(e); });
-    });
-}
-
-/**
- * Turns the startup error into a short public reason.
- * The raw error can contain the database path and SQL, and anyone can call getReadiness.
- */
+/** Turns the startup error into a short public reason. The raw error can contain the database path and SQL, and anyone can call getReadiness. */
 function summariseInitFailure(runtime: { mode?: string; lastError?: string } | null): string {
     if (!runtime || runtime.mode === 'idle') {
         return 'not initialized: Nightgate has not completed startup in this process';
@@ -386,21 +386,13 @@ export async function buildMetricsText(db: DbRunner): Promise<string> {
     return lines.join('\n') + '\n';
 }
 
-/**
- * Version, network, proving mode and a hash of each contract's compiled files.
- * The hashes show why writes are refused after contract files changed on disk.
- */
+/** Version, network, proving mode and a hash of each contract's compiled files.
+ *  The hashes show why writes are refused after contract files changed on disk. */
 export function buildRuntimeInfo(): NonNullable<Awaited<ReturnType<typeof getRuntimeInfo>>> {
     const config = getNightgatePluginConfig();
     const topology = getRuntimeTopology(config);
 
-    let version = 'unknown';
-    try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        version = String((require('../../package.json') as { version?: string }).version ?? 'unknown');
-    } catch {
-        // Some package layouts do not ship package.json. The rest of the answer still works.
-    }
+    const version = packageVersion();
 
     const contracts = listRegisteredContracts().map(name => {
         const registration = getContractRegistration(name);
@@ -411,7 +403,7 @@ export function buildRuntimeInfo(): NonNullable<Awaited<ReturnType<typeof getRun
             artifactDigest = getArtifactGenerationDigest(name);
             currentDigest = getCurrentArtifactDigest(name);
         } catch (err) {
-            digestError = err instanceof Error ? err.message : String(err);
+            digestError = errorMessage(err);
         }
         return {
             name,
@@ -440,10 +432,7 @@ export function buildRuntimeInfo(): NonNullable<Awaited<ReturnType<typeof getRun
     };
 }
 
-/**
- * Wallet worker health. On purpose not part of readiness, which would take the server
- * out of service whenever the worker is only busy.
- */
+/** Wallet worker health. On purpose not part of readiness, which would take the server out of service whenever the worker is only busy. */
 export function buildWorkerStatus(isAdmin = false): Record<string, unknown> {
     const worker = getWalletWorkerStatus();
     // The main thread's list is the truth. The worker's progress data fills in later.

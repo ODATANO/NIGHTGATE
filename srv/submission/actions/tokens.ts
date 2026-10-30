@@ -1,7 +1,5 @@
-/**
- * Shielded test-token mint, token-factory mint and token-type derivation.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Shielded test-token mint, token-factory mint and token-type derivation.
+// SPDX-License-Identifier: Apache-2.0
 import crypto from 'node:crypto';
 import { ensureNetworkId } from '../../midnight/providers';
 import { deriveRawTokenType, TokenTypeError, SHIELDED_TEST_TOKEN_REF, SHIELDED_TEST_TOKEN_CIRCUIT } from '../token-type';
@@ -12,11 +10,12 @@ import { configString } from '../../utils/config';
 import { getConfiguredFeeSponsorSessions } from '../fee-sponsor';
 import { getNightgatePluginConfig } from '../../utils/nightgate-config';
 import { PLATFORM_POOL_SENTINEL } from '../sponsor-pool';
-import { consumeValueBudget } from '../../sessions/agent-grants';
-import { facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+
+import { facadeConfigFromEnv, rejectIfMainnetBlocked, runSubmission, takeValueBudget } from './common';
 import type { SubmissionContext } from './context';
 import type { Request } from '@sap/cds';
 import { burnFactoryToken, deriveTokenType, mintFactoryToken, mintShieldedTestToken } from '#cds-models/NightgateService';
+import { checkRateClass } from '../../utils/rate-classes';
 
 /** The factory a call names, else the instance default. Rejects and returns undefined without either. */
 function factoryAddressFor(req: Request, raw: unknown): string | undefined {
@@ -26,23 +25,18 @@ function factoryAddressFor(req: Request, raw: unknown): string | undefined {
     return address;
 }
 
-/** A token caller without `sessionId` mints from the session that pays its jobs: the grant's pin, else the first pool wallet. */
-function mintSessionFor(req: Request, raw: unknown): string | undefined {
-    if (raw) return String(raw);
+// Without `sessionId`, a mint uses the session that pays the caller's jobs. That is the grant's pinned wallet, else the first pool wallet.
+// `ownerUserId` is the user who must own that session; undefined for a platform wallet the grant pays from.
+function mintSessionFor(req: Request, raw: unknown): { sessionId: string; ownerUserId: string | undefined } | undefined {
+    if (raw) return { sessionId: String(raw), ownerUserId: req.user?.id };
     if (!req.agentGrant) { req.reject(400, 'sessionId is required'); return undefined; }
-    const pinned = req.agentGrant.sponsorSessionId;
-    if (pinned && pinned !== PLATFORM_POOL_SENTINEL) return String(pinned);
     const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
-    if (pool.length === 0) { req.reject(503, 'no fee sponsor is configured on this server (NIGHTGATE_FEE_SPONSOR_SESSION), so there is no session to mint from'); return undefined; }
-    return pool[0];
+    const pinned = req.agentGrant.sponsorSessionId;
+    const sessionId = pinned && pinned !== PLATFORM_POOL_SENTINEL ? String(pinned) : pool[0];
+    if (!sessionId) { req.reject(503, 'no fee sponsor is configured on this server (NIGHTGATE_FEE_SPONSOR_SESSION), so there is no session to mint from'); return undefined; }
+    return { sessionId, ownerUserId: pool.includes(sessionId) ? undefined : req.user?.id };
 }
 
-/** A grant's value budget takes the amount a mint or burn moves. Returns false after rejecting. */
-async function takeValueBudget(req: Request, db: SubmissionContext['db'], tokenType: string, amount: bigint): Promise<boolean> {
-    const grantId = req.agentGrant?.ID;
-    if (!grantId) return true;
-    return consumeValueBudget(db, req, String(grantId), tokenType, amount);
-}
 
 export function registerTokenActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'contractResolver' | 'resolveSponsorForRequest' | 'tokenFactory'>): void {
     const { srv, db, walletFactory, contractResolver, resolveSponsorForRequest, tokenFactory } = ctx;
@@ -59,17 +53,18 @@ export function registerTokenActions(ctx: Pick<SubmissionContext, 'srv' | 'db' |
         if (!parsedAmount.ok) return req.reject(400, parsedAmount.message);
         const recipient = String(recipientCoinPublicKey ?? '').trim().toLowerCase();
         if (!HEX64_RE.test(recipient)) return req.reject(400, 'recipientCoinPublicKey must be 64 hex characters (a Zswap coin public key)');
-        const sessionId = mintSessionFor(req, req.data.sessionId);
-        if (!sessionId) return;
+        const mintSession = mintSessionFor(req, req.data.sessionId);
+        if (!mintSession) return;
+        const { sessionId, ownerUserId } = mintSession;
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('sponsor', 'sponsor', req)) return;
+        if (!checkRateClass('sponsor', 'sponsor', req)) return;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(TOKEN_FACTORY_REF);
-            await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
-            const issuerKey = await tokenFactory.issuerKeyForSession({ sessionId, db, expectedUserId: req.user?.id });
+            await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: ownerUserId });
+            const issuerKey = await tokenFactory.issuerKeyForSession({ sessionId, db, expectedUserId: ownerUserId });
             const token = await tokenFactory.describeToken({ issuerKey, name: parsedName.name, contractAddress: address });
             if (!await takeValueBudget(req, db, token.tokenType, parsedAmount.amount)) return undefined;
             const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
@@ -110,7 +105,7 @@ export function registerTokenActions(ctx: Pick<SubmissionContext, 'srv' | 'db' |
         if (issuerKey && !HEX64_RE.test(issuerKey)) return req.reject(400, 'issuerKey must be 64 hex characters');
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', sessionId, req)) return;
+        if (!checkRateClass('prove', sessionId, req)) return;
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -152,7 +147,7 @@ export function registerTokenActions(ctx: Pick<SubmissionContext, 'srv' | 'db' |
         if (!contractAddress) return req.reject(400, 'contractAddress is required (deploy shielded-token first)');
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', sessionId, req)) return;
+        if (!checkRateClass('prove', sessionId, req)) return;
 
         // The result assumes the test token's separator and amount.
         // Another contract would get a wrong tokenTypeHex.

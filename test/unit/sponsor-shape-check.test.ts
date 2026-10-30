@@ -10,6 +10,7 @@ import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { importArtifactGeneration } from '../../srv/submission/artifact-import';
 
 // The worker module refuses to load outside a worker thread; hand it a fake
 // parentPort (same approach as wallet-worker-dispatch.test.ts).
@@ -420,9 +421,9 @@ describe('importArtifactGeneration: generation-pinned loading for ESM and Common
     it('an ESM artifact rewritten in place loads as the NEW class under a new generation', async () => {
         const file = path.join(dir, 'esm.mjs');
         fs.writeFileSync(file, 'export class Contract { static gen = 1 }\n');
-        const a = (await workerExports.importArtifactGeneration(file, 'g1')).Contract;
+        const a = (await importArtifactGeneration(file, 'g1') as { Contract: { gen: number } }).Contract;
         fs.writeFileSync(file, 'export class Contract { static gen = 2 }\n');
-        const b = (await workerExports.importArtifactGeneration(file, 'g2')).Contract;
+        const b = (await importArtifactGeneration(file, 'g2') as { Contract: { gen: number } }).Contract;
         expect(a.gen).toBe(1);
         expect(b.gen).toBe(2);
         expect(a).not.toBe(b);
@@ -431,17 +432,17 @@ describe('importArtifactGeneration: generation-pinned loading for ESM and Common
     it('a CommonJS artifact rewritten in place loads as the NEW class under a new generation', async () => {
         const file = path.join(dir, 'cjs.cjs');
         fs.writeFileSync(file, 'exports.Contract = class Contract { static gen = 1 };\n');
-        const a = (await workerExports.importArtifactGeneration(file, 'g1')).Contract;
+        const a = (await importArtifactGeneration(file, 'g1') as { Contract: { gen: number } }).Contract;
         fs.writeFileSync(file, 'exports.Contract = class Contract { static gen = 2 };\n');
-        const b = (await workerExports.importArtifactGeneration(file, 'g2')).Contract;
+        const b = (await importArtifactGeneration(file, 'g2') as { Contract: { gen: number } }).Contract;
         expect(a.gen).toBe(1);
         expect(b.gen).toBe(2);
         expect(a).not.toBe(b);
     });
 });
 
-// The worker recomputes the pinned digest from the module and zk assets on disk and refuses a mismatch before loading anything.
-describe('assertArtifactGenerationOnDisk: the worker verifies the pinned generation against the files', () => {
+// The worker loads a pinned generation only from a snapshot that hashes to the pinned digest.
+describe('artifact snapshots: the worker verifies the pinned generation against the files', () => {
     let dir: string;
     beforeAll(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-artifact-verify-')); });
     const layout = (name: string) => {
@@ -455,20 +456,6 @@ describe('assertArtifactGenerationOnDisk: the worker verifies the pinned generat
         fs.writeFileSync(path.join(base, 'contract', 'index.mjs'), 'export class Contract {}\n');
         return { artifactPath: path.join(base, 'contract', 'index.mjs'), zkConfigPath: base, privateStateId: 'ps' };
     };
-
-    it('accepts files that still hash to the pinned generation, refuses a swapped prover key or module', async () => {
-        const { computeArtifactGenerationDigest } = await import('../../srv/submission/artifact-digest.js');
-        const reg = layout('a');
-        const pinned = computeArtifactGenerationDigest(reg);
-        expect(() => workerExports.assertArtifactGenerationOnDisk('a', { ...reg, artifactDigest: pinned })).not.toThrow();
-        fs.writeFileSync(path.join(reg.zkConfigPath, 'keys', 'attest.prover'), 'pk-2');
-        expect(() => workerExports.assertArtifactGenerationOnDisk('a', { ...reg, artifactDigest: pinned }))
-            .toThrow(/on disk is artifact generation .* but this job was pinned to/);
-        fs.writeFileSync(path.join(reg.zkConfigPath, 'keys', 'attest.prover'), 'pk-1');
-        expect(() => workerExports.assertArtifactGenerationOnDisk('a', { ...reg, artifactDigest: pinned })).not.toThrow();
-        fs.writeFileSync(reg.artifactPath, 'export class Contract { static v = 2 }\n');
-        expect(() => workerExports.assertArtifactGenerationOnDisk('a', { ...reg, artifactDigest: pinned })).toThrow(/pinned to/);
-    });
 
     it('the class is imported from the SNAPSHOT: a rewrite of the original between two loads of the same pinned generation cannot reach the job', async () => {
         const { computeArtifactGenerationDigest } = await import('../../srv/submission/artifact-digest.js');
@@ -740,10 +727,6 @@ describe('assertArtifactGenerationOnDisk: the worker verifies the pinned generat
         expect(h.has('y')).toBe(true);
     });
 
-    it('a registration without a digest (older caller) has nothing to verify', () => {
-        const reg = layout('b');
-        expect(() => workerExports.assertArtifactGenerationOnDisk('b', reg)).not.toThrow();
-    });
 });
 
 describe('ownContracts: circuits of a grant-deployed contract are sponsorable under a circuit floor', () => {

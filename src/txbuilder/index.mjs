@@ -1,26 +1,5 @@
-// `@odatano/nightgate/txbuilder` builds, proves and signs a Midnight transaction on your machine, with your key.
-// The result has no fee paid yet. A NIGHTGATE server (the sponsor) pays the fee and submits it.
-// Your seed and secrets never leave this process.
-//
-//   import { prepareAttest } from '@odatano/nightgate/browser';
-//   import { Contract } from '@odatano/nightgate/browser/attestation-vault';
-//   import { createTxBuilder } from '@odatano/nightgate/txbuilder';
-//
-//   const b = await createTxBuilder({
-//       seedHex, networkId: 'preprod',
-//       api: { baseUrl: 'https://sponsor.example', agentToken },   // or indexerHttpUrl, indexerWsUrl, nodeUrl
-//       walletSync: false,
-//       zkConfigBaseUrl: 'https://sponsor.example/zk-config/attestation-vault',
-//       contractClass: Contract
-//   });
-//   const call = prepareAttest({ payloadHash, metadataHash, attestationSecret: b.attestationSecret });
-//   const { finalizedTxB64 } = await b.buildSponsorable({ contractAddress, call });
-//   // POST finalizedTxB64 to the sponsor's sponsorFinalizedTransaction
-//   await b.close();
-//
-// By default proofs are made in this process, so no proof server is needed.
-// The proving keys are downloaded once and then cached on disk.
-//
+// Builds, proves and signs a Midnight transaction on your machine, with your key. The seed never leaves this process.
+// A NIGHTGATE server pays the fee and submits it. Proofs are made in this process by default, with keys cached on disk.
 // SPDX-License-Identifier: Apache-2.0
 
 import { createRequire } from 'node:module';
@@ -38,6 +17,7 @@ import {
 import * as compactRuntime from '@midnight-ntwrk/compact-runtime';
 
 const require = createRequire(import.meta.url);
+const { assertSeedHex, HEX64_RE, HEX64_ANY_CASE_RE } = require('../../srv/utils/hex-patterns.js');
 
 // Each writer gets its own temporary file, so builders sharing a cache directory never mix their bytes.
 const partFileFor = (dest) => `${dest}.${process.pid}.${randomUUID()}.part`;
@@ -57,8 +37,8 @@ export {
 export { holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from './holder.mjs';
 
 // Reading the chain through the NIGHTGATE API instead of an indexer.
-export { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService } from './api-provider.mjs';
-import { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService } from './api-provider.mjs';
+export { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
+import { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
 
 // With `api` and no wallet sync the facade dials neither a node nor an indexer, so these are never used.
 const UNUSED_INDEXER = { indexerHttpUrl: 'http://unused.invalid/', indexerWsUrl: 'ws://unused.invalid/' };
@@ -68,7 +48,7 @@ export { tokenFactoryIssuerSecret, deriveTokenFactoryIssuerSecret, tokenName, na
 
 /** Derives the night, zswap and dust seeds from a BIP39 seed, the same way the Lace wallet does. */
 export async function deriveRoleSeeds(seedHex, accountIndex = 0) {
-    if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) throw new Error('seedHex must be 128 hex chars (64-byte BIP39 seed)');
+    assertSeedHex(seedHex);
     return require('../../srv/utils/wallet-hd.js').deriveRoleSeeds(new Uint8Array(Buffer.from(seedHex, 'hex')), accountIndex);
 }
 
@@ -80,8 +60,8 @@ export function recipientKeyMap(recipients) {
     for (const r of recipients) {
         const coin = String(r?.coinPublicKey ?? '').trim().toLowerCase();
         const enc = String(r?.encryptionPublicKey ?? '').trim().toLowerCase();
-        if (!/^[0-9a-f]{64}$/.test(coin)) throw new Error('recipients: coinPublicKey must be 64 hex chars');
-        if (!/^[0-9a-f]{64}$/.test(enc)) throw new Error('recipients: encryptionPublicKey must be 64 hex chars');
+        if (!HEX64_RE.test(coin)) throw new Error('recipients: coinPublicKey must be 64 hex chars');
+        if (!HEX64_RE.test(enc)) throw new Error('recipients: encryptionPublicKey must be 64 hex chars');
         map.set(coin, enc);
     }
     return map.size > 0 ? map : undefined;
@@ -124,10 +104,7 @@ export function isShieldedWallet(wallet) {
 
 const asIndex = (v) => (typeof v === 'bigint' || typeof v === 'number' ? String(v) : null);
 
-/**
- * One `onProgress` event from a sub-wallet's state. The unshielded wallet counts transactions
- * (`appliedId`, `highestTransactionId`), the others ledger events (`appliedIndex`, `highestIndex`).
- */
+/** One `onProgress` event from a sub-wallet's state. The unshielded wallet counts transactions, the others count ledger events. */
 export function syncProgressEvent(wallet, state) {
     const p = state?.progress;
     if (!p || typeof p !== 'object') return null;
@@ -171,10 +148,8 @@ export const ATTESTATION_VAULT_CIRCUITS = [
 
 const exists = (p) => access(p).then(() => true, () => false);
 
-/**
- * Downloads the proving files of a contract into `cacheDir`, skipping files already there.
- * With `package`, it fills in the missing prover keys of an installed contract package instead.
- */
+/** Downloads a contract's proving files into `cacheDir`, skipping files already there.
+ *  With `package`, it fills in the missing prover keys of an installed contract package instead. */
 export async function ensureZkAssets(input) {
     if (input?.package) return ensurePackageProverKeys(input);
     const { zkConfigBaseUrl, cacheDir, circuits = ATTESTATION_VAULT_CIRCUITS, verifierCircuits, fetchFn, onProgress } = input ?? {};
@@ -250,10 +225,7 @@ export async function ensureZkAssets(input) {
     return { cacheDir, fetched, cached, refreshed, verified: Boolean(manifest), source: 'remote' };
 }
 
-/**
- * A contract package ships everything except the large prover keys.
- * This downloads the missing prover keys and checks each against the package's keys/manifest.json.
- */
+/** Downloads the prover keys a contract package does not ship and checks each against its keys/manifest.json. */
 async function ensurePackageProverKeys({ package: packageName, from, circuits, fetchFn, onProgress }) {
     const pkg = resolveContractPackage(packageName, from ?? process.cwd());
     const zkConfigPath = pkg.zkConfigPath;
@@ -291,15 +263,19 @@ async function ensurePackageProverKeys({ package: packageName, from, circuits, f
     return { ...local, fetched, cached: local.cached - fetched, refreshed: 0, verified: true, source: 'package' };
 }
 
-/**
- * Loads an installed contract package (`@odatano/contract-<name>`) for the builder.
- * Fails if the package files do not match the build described in its contract.json.
- */
+/** Why a lineage package cannot run on this compact-runtime (major.minor differ); null when it can or says nothing. */
+export function runtimeVersionProblem(manifest, installed = compactRuntime.versionString) {
+    return require('../../srv/utils/runtime-version.js').runtimeVersionProblem(manifest, String(installed));
+}
+
+/** Loads an installed contract package for the builder. Fails if its files do not match the build in its contract.json. */
 export async function resolveBuilderPackage({ package: packageName, from }) {
     if (!packageName) throw new Error('resolveBuilderPackage: package is required');
     const pkg = resolveContractPackage(packageName, from ?? process.cwd());
     const problem = contractPackageDigestProblem(pkg);
     if (problem) throw new Error(`contract package ${packageName} is not the generation its contract.json describes: ${problem}`);
+    const runtimeProblem = runtimeVersionProblem(pkg.manifest);
+    if (runtimeProblem) throw new Error(`contract package ${packageName} ${runtimeProblem}`);
     const mod = await import(pathToFileURL(pkg.artifactPath).href);
     const contractClass = mod.Contract ?? mod.default?.Contract;
     if (typeof contractClass !== 'function') throw new Error(`contract package ${packageName}: ${pkg.artifactPath} exports no Contract class`);
@@ -337,18 +313,9 @@ export async function runSingleCall(single, fn) {
     return fn(...(single.args ?? []));
 }
 
-/**
- * A wallet provider that signs the transaction and then stops instead of submitting it.
- * The unsubmitted transaction is kept in `holder.captured`.
- * submitTx throws on purpose. A fake id would make the SDK wait forever for a confirmation.
- *
- * `bind` chooses what is handed to the sponsor:
- *  - true: a sealed transaction, for sponsorFinalizedTransaction.
- *  - false: a signed transaction that is not sealed yet, for sponsorUnboundTransaction.
- *    The sponsor adds its fee payment and seals it. Only this form lets one sponsor pay for several transactions at once.
- *
- * Exported for the unit tests only.
- */
+/** Wallet provider that signs and keeps the transaction in `holder.captured` instead of submitting. Exported for unit tests.
+ *  submitTx throws on purpose, because a fake id would make the SDK wait forever for a confirmation.
+ *  `bind` false leaves sealing to the sponsor, which lets one sponsor pay for several transactions at once. */
 export function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes, bind) {
     return {
         getCoinPublicKey: () => zswapKeys.coinPublicKey,
@@ -380,10 +347,7 @@ export function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, ho
     };
 }
 
-/**
- * `findDeployedContract` with one retry.
- * Right after a block lands, the indexer can briefly return an empty contract state.
- */
+/** `findDeployedContract` with one retry. Right after a block lands, the indexer can briefly return an empty state. */
 async function findDeployedWithRetry(contracts, providers, args) {
     try {
         return await contracts.findDeployedContract(providers, args);
@@ -445,10 +409,7 @@ export async function describeLocalZkAssets(zkConfigDir, circuits = [], proveCir
     return { cacheDir: zkConfigDir, fetched: 0, cached, source: 'local' };
 }
 
-/**
- * A `ws` subclass that remembers its open sockets, so `close()` can end them.
- * The SDK's indexer provider has no close method of its own.
- */
+/** A `ws` subclass that remembers its open sockets, so `close()` can end them. The SDK's indexer provider cannot. */
 export function trackingWebSocket(WebSocketImpl) {
     const open = new Set();
     class TrackedWebSocket extends WebSocketImpl {
@@ -472,9 +433,7 @@ export function trackingWebSocket(WebSocketImpl) {
 
 /** All keys derived from the seed. `deriveIdentity` is the public version without secret keys. */
 async function deriveKeyMaterial({ seedHex, networkId = 'preprod', accountIndex = 0, attestationSecret: ownSecret }) {
-    if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) {
-        throw new Error('seedHex must be 128 hex chars (64-byte BIP39 seed)');
-    }
+    assertSeedHex(seedHex);
     const [unshielded, { deriveAttestationSecret }, ledger, addressFormat] = await Promise.all([
         import('@midnightntwrk/wallet-sdk-unshielded-wallet'),
         import('../browser/witnesses.mjs'),
@@ -503,16 +462,13 @@ async function deriveKeyMaterial({ seedHex, networkId = 'preprod', accountIndex 
     };
 }
 
-/**
- * Computes the key under which the vault stores an attester's attestation of a payload, as hex.
- * Gives the same result as the vault's `recordKey` circuit.
- */
+/** The vault's storage key for an attester's attestation of a payload, as hex. Matches the vault's `recordKey` circuit. */
 export function computeRecordKey(attesterId, payloadHash) {
     const rt = compactRuntime;
     const u8 = new rt.CompactTypeUnsignedInteger(255n, 1);
     const b32 = new rt.CompactTypeBytes(32);
     const hexToBytes = (h, name) => {
-        if (!/^[0-9a-fA-F]{64}$/.test(String(h ?? ''))) throw new Error(`${name} must be 64 hex chars (32 bytes)`);
+        if (!HEX64_ANY_CASE_RE.test(String(h ?? ''))) throw new Error(`${name} must be 64 hex chars (32 bytes)`);
         return Uint8Array.from(Buffer.from(h, 'hex'));
     };
     const type = {
@@ -522,66 +478,23 @@ export function computeRecordKey(attesterId, payloadHash) {
     return Buffer.from(rt.persistentHash(type, { tag: 21n, owner: hexToBytes(attesterId, 'attesterId'), payload_hash: hexToBytes(payloadHash, 'payloadHash') })).toString('hex');
 }
 
-/**
- * Derives the attester id, attestation secret and addresses of a seed.
- * Needs no network and gives the same result as `createTxBuilder`.
- *
- * @param {{ seedHex: string, networkId?: string, accountIndex?: number, attestationSecret?: Uint8Array }} opts
- * @returns {Promise<{ attesterId: string, attestationSecret: Uint8Array, addresses: { night: string, shielded: string }, shieldedKeys: { coinPublicKey: string, encryptionPublicKey: string } }>}
- */
+/** Derives the attester id, attestation secret and addresses of a seed, as `createTxBuilder` does, without a network. */
 export async function deriveIdentity(opts) {
     const { attesterId, attestationSecret, addresses, shieldedKeys } = await deriveKeyMaterial(opts ?? {});
     return { attesterId, attestationSecret, addresses, shieldedKeys };
 }
 
-/**
- * Creates a transaction builder for your seed.
- *
- * @param {object} opts
- * @param {string} opts.seedHex           128 hex chars (64-byte BIP39 seed). Never leaves this process.
- * @param {string} [opts.networkId]       Defaults to 'preprod'.
- * @param {number} [opts.accountIndex]    BIP32 account index. Defaults to 0.
- * @param {object|import('../sdk/client.mjs').NightgateClient} [opts.api]
- *                                        A NIGHTGATE server to read the chain through: the options for `connect()`
- *                                        ({ baseUrl, agentToken, ... }) or a connected client. Replaces the indexer and
- *                                        the node; needs `walletSync: false` unless the indexer URLs are given as well.
- * @param {number} [opts.maxLagBlocks]    With `api`: refuse a contract state from a server whose database is further
- *                                        behind the chain, default 60 blocks. A build on a stale state can fail on chain.
- * @param {string} [opts.indexerHttpUrl]  Required without `api`.
- * @param {string} [opts.indexerWsUrl]    Required without `api`.
- * @param {string} [opts.nodeUrl]         Node RPC URL, for example wss://rpc.preprod.midnight.network/. Required without `api`.
- * @param {string} [opts.proofServerUrl] Only used with provingMode 'server'.
- * @param {number} [opts.proofTimeoutMs]  Server proving only. Timeout of one proof request in ms, default 300000.
- *                                        The SDK retries a timed-out proof, so set it above your slowest circuit.
- * @param {'wasm'|'server'} [opts.provingMode] 'wasm' (default) proves in this process.
- *                                        'server' proves on opts.proofServerUrl, which is faster for large circuits.
- *                                        The proof server sees your private inputs, so only use one you run yourself.
- * @param {string} [opts.package]         An installed contract package (`@odatano/contract-<name>`).
- *                                        It supplies the contract class, names and proving files.
- * @param {string} [opts.from]            Directory to resolve the package from. Defaults to process.cwd().
- * @param {string} opts.zkConfigBaseUrl   A server's /zk-config/<contract> URL. Not needed with `package` or `zkConfigDir`.
- * @param {Function} opts.contractClass   The compiled contract class. Not needed with `package`.
- * @param {string} [opts.contractName]    Defaults to 'attestation-vault'.
- * @param {string} [opts.privateStateId]  Defaults to 'attestationVaultPrivateState'.
- * @param {string} [opts.cacheDir]        Where proving files are cached. Defaults to ~/.cache/nightgate-txbuilder/<contractName>.
- * @param {string[]} [opts.circuits]      Circuits you will call. Defaults to all circuits of the contract.
- * @param {number} [opts.ttlMinutes]      How long the transaction stays valid, default 30. The sponsor must submit it in that time.
- * @param {Uint8Array} [opts.attestationSecret] Defaults to a secret derived from the seed.
- * @param {object} [opts.shieldedWallet] A started shielded wallet of the same seed, such as a swap wallet's
- *                                        `shieldedWallet`. The builder balances from it and never starts or stops it.
- * @param {Function} [opts.onProgress]    Progress callback.
- */
+/** Creates a transaction builder for your seed. The options are typed and documented as `CreateTxBuilderInput` in index.d.ts. */
 export async function createTxBuilder(opts) {
     const {
         seedHex, networkId = 'preprod', accountIndex = 0,
-        indexerHttpUrl, indexerWsUrl, nodeUrl, zkConfigBaseUrl,
+        nodeUrl, zkConfigBaseUrl,
         circuits, ttlMinutes = 30, onProgress
     } = opts ?? {};
-    if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) {
-        throw new Error('createTxBuilder: seedHex must be 128 hex chars (64-byte BIP39 seed)');
-    }
+    let { indexerHttpUrl, indexerWsUrl } = opts ?? {};
+    assertSeedHex(seedHex, 'createTxBuilder');
     const apiClient = opts.api ? apiClientFor(opts.api) : null;
-    const hasIndexer = Boolean(indexerHttpUrl && indexerWsUrl);
+    let hasIndexer = Boolean(indexerHttpUrl && indexerWsUrl);
     if (!apiClient) {
         if (!hasIndexer) throw new Error('createTxBuilder: indexerHttpUrl and indexerWsUrl are required, or api');
         if (!nodeUrl) throw new Error('createTxBuilder: nodeUrl is required (the Substrate RPC the wallet SDK talks to), or api');
@@ -614,7 +527,11 @@ export async function createTxBuilder(opts) {
     const ownWallets = syncedWallets(syncMode).filter(w => w !== 'shielded' || !shared);
     const synced = shared ? ['shielded', ...ownWallets] : ownWallets;
     if (apiClient && ownWallets.length && !hasIndexer) {
-        throw new Error('createTxBuilder: with api the wallet is not synced; pass walletSync: false, or indexerHttpUrl and indexerWsUrl for the sync');
+        // connect() options with a gateway key sync through the gateway's indexer lane; a connected client carries no key.
+        const lane = gatewayIndexerUrls(opts.api);
+        if (!lane) throw new Error('createTxBuilder: with api the wallet is not synced; pass walletSync: false, indexerHttpUrl and indexerWsUrl for the sync, or api as the connect() options with a gateway key (token: oda_…), which syncs through the gateway');
+        ({ indexerHttpUrl, indexerWsUrl } = lane);
+        hasIndexer = true;
     }
     const saved = opts.walletState;
     if (saved !== undefined && (saved === null || typeof saved !== 'object' || ['shielded', 'unshielded', 'dust'].some(k => saved[k] !== undefined && typeof saved[k] !== 'string'))) {
@@ -746,17 +663,8 @@ export async function createTxBuilder(opts) {
             return out;
         },
 
-        /**
-         * Builds, proves and signs one transaction without submitting it.
-         * It holds one call (`call`) or up to 8 calls (`calls`). Send the result to a sponsor, which pays the fee and submits.
-         *
-         * All calls of a batch share one witnesses object, the functions that supply private inputs.
-         * Pass it as `witnesses`, or give every call the same one.
-         * For the attestation vault the builder supplies it. Use a call's `before` hook for what differs per call.
-         *
-         * @param {{ contractAddress: string, call?: { circuitId: string, args: unknown[], witnesses: object }, calls?: Array<{ circuitId: string, args: unknown[], merkleProof?: object, slotWidth?: number }>, initialPrivateState?: unknown, bind?: boolean, attestationSecret?: Uint8Array }} input
-         * @returns {Promise<{ finalizedTxB64: string, serializedBytes: number }>}
-         */
+        /** Builds, proves and signs one transaction of up to 8 calls for a sponsor to pay and submit.
+         *  All calls share one witnesses object. A call's `before` hook sets what differs per call. */
         async buildSponsorable({ contractAddress, call, calls, witnesses: sharedWitnesses, initialPrivateState, bind = true, attestationSecret: batchSecret, independentCalls = false, orderedPrefix = 0, recipients }) {
             if (!contractAddress) throw new Error('buildSponsorable: contractAddress is required');
             const recipientKeys = recipientKeyMap(recipients);
@@ -882,13 +790,8 @@ export async function createTxBuilder(opts) {
                 : { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: true };
         },
 
-        /**
-         * Builds, proves and signs a contract deploy without submitting it. A sponsor pays the fee.
-         * The server must allow sponsored deploys, and an agent token needs `allowDeploy` with budget left.
-         *
-         * @param {{ initialPrivateState?: unknown, constructorArgs?: unknown[], witnesses?: object, bind?: boolean }} input
-         * @returns {Promise<{ finalizedTxB64?: string, unboundTxB64?: string, serializedBytes: number, bound: boolean, contractAddress: string }>}
-         */
+        /** Builds, proves and signs a contract deploy for a sponsor to pay and submit.
+         *  The server must allow sponsored deploys, and an agent token needs `allowDeploy` with budget left. */
         async buildDeploySponsorable({ initialPrivateState, constructorArgs, witnesses, bind = true, recipients } = {}) {
             const recipientKeys = recipientKeyMap(recipients);
             onProgress?.({ phase: 'build', circuit: '<deploy>' });

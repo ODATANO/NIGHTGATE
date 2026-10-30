@@ -41,6 +41,7 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => {
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';
 import { SessionNotFoundError } from '../../srv/submission/wallet-material-factory';
 import { registerContract, unregisterContract, getArtifactGenerationDigest } from '../../srv/submission/contract-registry';
+import { runFinalizer } from '../fixtures/run-finalizer';
 
 cds.test(__dirname + '/../..');
 
@@ -146,9 +147,9 @@ describe('level request on an existing active grant', () => {
         expect(pending).toMatchObject({ level: 1, pendingLevel: 2, active: true });
 
         const finalizer = registeredFinalizers.get('grantDisclosure\x001')!;
-        await finalizer(grantCommand(ID, 2), { ID: 'job-1', kind: 'grantDisclosure' }, {
+        await runFinalizer(finalizer, grantCommand(ID, 2), { ID: 'job-1', kind: 'grantDisclosure' }, {
             submissionId: null, txHash: '0xincluded', contractAddress: CONTRACT, finalizedAt: null, blockHeight: 0
-        });
+        }, db);
 
         const confirmed = await grantRow(ID);
         expect(confirmed).toMatchObject({ level: 2, pendingLevel: null, grantedTxHash: '0xincluded', active: true });

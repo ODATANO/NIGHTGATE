@@ -187,7 +187,7 @@ describe('System.Events outcome decoding', () => {
     });
 });
 
-describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
+describe('block timestamp: SCALE u64 LE parsing', () => {
     const provider = {
         getStorage: vi.fn()
     } as any;
@@ -202,13 +202,13 @@ describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
         // LE bytes: 00 68 E5 CF 8B 01 00 00
         const hex = '0x0068e5cf8b010000';
         provider.getStorage.mockResolvedValueOnce(hex);
-        await expect((processor as any).getBlockTimestamp('0xblock')).resolves.toBe(1700000000);
+        await expect((processor as any).getBlockTimestampHex('0xblock').then((hex: string | null) => (processor as any).parseTimestampHex(hex))).resolves.toBe(1700000000);
     });
 
     it('parses zero timestamp', async () => {
         const hex = '0x0000000000000000';
         provider.getStorage.mockResolvedValueOnce(hex);
-        await expect((processor as any).getBlockTimestamp('0xblock')).resolves.toBe(0);
+        await expect((processor as any).getBlockTimestampHex('0xblock').then((hex: string | null) => (processor as any).parseTimestampHex(hex))).resolves.toBe(0);
     });
 
     it('handles typical Substrate timestamp (ms precision)', async () => {
@@ -218,7 +218,7 @@ describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
         buf.writeBigUInt64LE(ms);
         const hex = '0x' + buf.toString('hex');
         provider.getStorage.mockResolvedValueOnce(hex);
-        await expect((processor as any).getBlockTimestamp('0xblock')).resolves.toBe(1577836800);
+        await expect((processor as any).getBlockTimestampHex('0xblock').then((hex: string | null) => (processor as any).parseTimestampHex(hex))).resolves.toBe(1577836800);
     });
 
     it('returns null (never the wall clock) when the storage lookup fails', async () => {
@@ -226,7 +226,7 @@ describe('getBlockTimestamp: SCALE u64 LE parsing', () => {
         provider.getStorage.mockRejectedValueOnce(new Error('storage unavailable'));
 
         try {
-            await expect((processor as any).getBlockTimestamp('0xblock')).resolves.toBeNull();
+            await expect((processor as any).getBlockTimestampHex('0xblock').then((hex: string | null) => (processor as any).parseTimestampHex(hex))).resolves.toBeNull();
             expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to read on-chain timestamp'));
         } finally {
             warnSpy.mockRestore();

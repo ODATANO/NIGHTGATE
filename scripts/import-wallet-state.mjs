@@ -1,17 +1,7 @@
 #!/usr/bin/env node
-// Loads wallet states written by `scripts/presync-wallets.mjs` into this
-// server's WalletSyncStates, so the sponsor wallets restore at the next start
-// instead of syncing. Stop the server first: a running wallet overwrites the
-// row at its next save.
-//
-//   node scripts/import-wallet-state.mjs [--dry-run] <export.json>...
-//
-// Needs the server's environment: the database (NIGHTGATE_DB_URL or the SQLite
-// file), the encryption key ring (ENCRYPTION_KEY / ENCRYPTION_KEYS) and
-// NIGHTGATE_FEE_SPONSOR_SESSION, because each file is matched to a platform
-// sponsor session by its `sessionId`. The file is refused when its seed
-// fingerprint, network or SDK version does not match what the server would
-// restore. Exit 0 = every file imported, 1 = at least one refused.
+// Loads wallet states from presync-wallets.mjs into WalletSyncStates. Stop the server first; exits 1 if a file is refused.
+// Run: node scripts/import-wallet-state.mjs [--dry-run] <export.json>...
+// Env: the server's database, ENCRYPTION_KEY or ENCRYPTION_KEYS, and NIGHTGATE_FEE_SPONSOR_SESSION.
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';

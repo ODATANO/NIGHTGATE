@@ -1,12 +1,9 @@
 using {midnight} from '../db/schema';
-using { Hex64 } from '../db/types';
+using { Hex64, TxType } from '../db/types';
 
-/**
- * Midnight chain data, attestations, zero-knowledge proofs, wallet sessions and transaction jobs.
- * Actions that write to the chain return a `jobId`. Poll `getJobStatus` for the result.
- * A retry with the same `idempotencyKey` returns the first job. `sponsorSessionId` is a second session that pays the fee.
- * Amounts are decimal strings in the smallest unit.
- */
+/** Midnight chain data, attestations, zero-knowledge proofs, wallet sessions and transaction jobs.
+ * Actions that write to the chain return a `jobId` to poll with `getJobStatus`. A retry with the same `idempotencyKey` returns the first job.
+ * `sponsorSessionId` is a second session that pays the fee. Amounts are decimal strings in the smallest unit. */
 @path    : '/odata/v4/midnight'
 @requires: 'authenticated-user'
 service NightgateService {
@@ -22,10 +19,11 @@ service NightgateService {
             @cds.odata.bindingparameter.collection
             function latest()                                                            returns Blocks;
 
-            function byHeight(height: Integer)                                           returns Blocks;
+            @cds.odata.bindingparameter.collection
+            function byHeight(@assert.range: [0, _] height: Integer)                                           returns Blocks;
 
             @cds.odata.bindingparameter.collection
-            function range(startHeight: Integer64, endHeight: Integer64, limit: Integer) returns array of Blocks;
+            function range(startHeight: Integer64, endHeight: Integer64, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of Blocks;
         };
 
     @readonly
@@ -42,11 +40,12 @@ service NightgateService {
             dustLedgerEvents
         }
         actions {
-            function byHash(hash: String)                   returns Transactions;
-
-            // txType: a TxType value
+            // The same extrinsic hash can land in more than one block. Newest first, limit default 100.
             @cds.odata.bindingparameter.collection
-            function byType(txType: String, limit: Integer) returns array of Transactions;
+            function byHash(hash: String, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of Transactions;
+
+            @cds.odata.bindingparameter.collection
+            function byType(@assert.range txType: TxType, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of Transactions;
 
             // identifier: a ledger identifier of the transaction, hex. 404 while the indexer has not seen it.
             @cds.odata.bindingparameter.collection
@@ -119,10 +118,13 @@ service NightgateService {
             unshieldedBalances
         }
         actions {
+            // Oldest first, limit default 100. Page with skip to read every action.
             @cds.odata.bindingparameter.collection
-            function byAddress(address: String) returns array of ContractActions;
+            function byAddress(address: String, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of ContractActions;
 
-            function history(address: String)   returns array of ContractActions;
+            // Newest first, limit default 100.
+            @cds.odata.bindingparameter.collection
+            function history(address: String, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer)   returns array of ContractActions;
         };
 
     @readonly
@@ -165,11 +167,13 @@ service NightgateService {
             spentAtTransaction
         }
         actions {
+            // Newest first, limit default 1000.
             @cds.odata.bindingparameter.collection
-            function byOwner(owner: String) returns array of UnshieldedUtxos;
+            function byOwner(owner: String, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of UnshieldedUtxos;
 
+            // Newest first, limit default 1000.
             @cds.odata.bindingparameter.collection
-            function unspent()              returns array of UnshieldedUtxos;
+            function unspent(@assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer)                returns array of UnshieldedUtxos;
         };
 
     @readonly
@@ -185,8 +189,9 @@ service NightgateService {
             @cds.odata.bindingparameter.collection
             function getBalance(address: String)   returns NightBalances;
 
+            // Highest balance first, limit default 10.
             @cds.odata.bindingparameter.collection
-            function getTopHolders(limit: Integer) returns array of NightBalances;
+            function getTopHolders(@assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of NightBalances;
         };
 
     /** Transactions this server submitted. They become `finalized` once the server has indexed their block. */
@@ -203,10 +208,8 @@ service NightgateService {
     @readonly
     entity Documents             as projection on midnight.Documents;
 
-    /**
-     * Records a document hash and its public metadata on chain, signed by the session's wallet.
-     * The server does not store the document itself. Keeping the bytes at `storageRef` is up to you.
-     */
+    /** Records a document hash and its public metadata on chain, signed by the session's wallet.
+     * The server does not store the document itself. Keeping the bytes at `storageRef` is up to you. */
     action   anchorDocument(sha256: Hex64,
                             contentType: String,
                             size: Integer64,
@@ -373,11 +376,9 @@ service NightgateService {
         predicateAttestationId : UUID;
     };
 
-    /**
-     * Proves up to 8 claims about one document in a single transaction, 7 if `contentRoot` is given.
+    /** Proves up to 8 claims about one document in a single transaction, 7 if `contentRoot` is given.
      * Each entry in `claims` has the inputs of the matching single action, selected by `predicate`.
-     * If only part of the transaction succeeds on chain, the job fails. Then verify each claim on its own.
-     */
+     * If only part of the transaction succeeds on chain, the job fails. Then verify each claim on its own. */
     action   issueFieldPredicateAttestationBatch(payloadHash: Hex64,
                                                  attesterId: Hex64, // optional, default the session's attester
                                                  contentRoot: Hex64, // optional
@@ -396,10 +397,8 @@ service NightgateService {
         droppedDuplicates : Integer;
     };
 
-    /**
-     * Proves that a text field holds exactly the value behind `expectedDigest`.
-     * This proves authenticity, not secrecy. A short or common value can be guessed from its digest.
-     */
+    /** Proves that a text field holds exactly the value behind `expectedDigest`.
+     * This proves authenticity, not secrecy. A short or common value can be guessed from its digest. */
     action   issueFieldEqualityAttestation(payloadHash: Hex64,
                                            attesterId: Hex64, // optional, default the session's attester
                                            fieldKey: Hex64,
@@ -422,10 +421,8 @@ service NightgateService {
         predicateAttestationId : UUID;
     };
 
-    /**
-     * Proves that a hidden text field is one of up to 64 allowed values.
-     * Pass the allowed values as `allowedValues`, or the set from prepareMembershipSet as `setRoot` with its path.
-     */
+    /** Proves that a hidden text field is one of up to 64 allowed values.
+     * Pass the allowed values as `allowedValues`, or the set from prepareMembershipSet as `setRoot` with its path. */
     action   issueFieldMembershipAttestation(payloadHash: Hex64,
                                              attesterId: Hex64, // optional, default the session's attester
                                              fieldKey: Hex64,
@@ -452,10 +449,8 @@ service NightgateService {
         predicateAttestationId : UUID;
     };
 
-    /**
-     * Proves that document B differs from document A only in the fields allowed by `allowedMask`, without revealing values.
-     * Both documents must be prepared with the same field list. The order of A and B is part of the proof.
-     */
+    /** Proves that document B differs from document A only in the fields allowed by `allowedMask`, without revealing values.
+     * Both documents must be prepared with the same field list. The order of A and B is part of the proof. */
     action   issueDocumentIntegrityAttestation(payloadHashA: Hex64,
                                                payloadHashB: Hex64,
                                                attesterIdA: Hex64, // optional, default the session's attester
@@ -479,10 +474,8 @@ service NightgateService {
         predicateAttestationId : UUID;
     };
 
-    /**
-     * Proves that at least `k` fields differ between two documents, without revealing which.
-     * A field present in only one document counts as different. Inputs work as in issueDocumentIntegrityAttestation.
-     */
+    /** Proves that at least `k` fields differ between two documents, without revealing which.
+     * A field present in only one document counts as different. Inputs work as in issueDocumentIntegrityAttestation. */
     action   issueDocumentDiffAttestation(payloadHashA: Hex64,
                                           payloadHashB: Hex64,
                                           attesterIdA: Hex64, // optional, default the session's attester
@@ -522,11 +515,9 @@ service NightgateService {
         provenAt       : Timestamp;
     };
 
-    /**
-     * Checks on chain whether an attester has attested a payload hash.
+    /** Checks on chain whether an attester has attested a payload hash.
      * Only the attester vouches for its attestation, so check `attesterId` against attesters you trust.
-     * If nothing is found, the result is `verified: false`, not an error.
-     */
+     * If nothing is found, the result is `verified: false`, not an error. */
     function verifyAttestationState(contractAddress: String,
                                     attesterId: Hex64,
                                     payloadHash: Hex64,
@@ -547,11 +538,9 @@ service NightgateService {
         documentId        : String;
     };
 
-    /**
-     * Checks on chain whether a proof about a document field was recorded as true.
+    /** Checks on chain whether a proof about a document field was recorded as true.
      * The inputs must be exactly those of the proof, otherwise the result is `verified: false`.
-     * For a comparison of two documents, A and B must be in the same order as when proving.
-     */
+     * For a comparison of two documents, A and B must be in the same order as when proving. */
     function verifyPredicateState(contractAddress: String,
                                   attesterId: Hex64,
                                   payloadHash: Hex64, // document A when comparing two documents
@@ -623,14 +612,11 @@ service NightgateService {
         status : String;
     };
 
-    /**
-     * Manages which attester may attest a document id. Modes 0 to 2 need the registrar's session, modes 3 and 4 the recovery identity's.
-     * Mode 0 assigns `documentId` to `ownerId`, 1 removes the assignment, 2 hands the registrar role to `ownerId`.
-     * Assigning an id that already has an owner moves it and removes the previous owner's binding.
-     * Mode 3 sets a new registrar, 4 hands the recovery role to `ownerId`.
-     */
+    /** Manages which attester may attest a document id. Modes 0 to 2 need the registrar's session, modes 3 and 4 the recovery identity's.
+     * Mode 0 assigns `documentId` to `ownerId` and removes a previous owner's binding. Mode 1 removes the assignment.
+     * Mode 2 hands the registrar role to `ownerId`. Mode 3 sets a new registrar. Mode 4 hands the recovery role to `ownerId`. */
     action   registerPassport(documentId: Hex64,
-                              passportId: String, // same as documentId
+                              passportId: Hex64, // optional; default documentId
                               ownerId: Hex64,
                               mode: Integer, // optional, default 0
                               sessionId: UUID,
@@ -643,10 +629,8 @@ service NightgateService {
         status : String;
     };
 
-    /**
-     * Withdraws an attestation. Only its attester can do this.
-     * Its stored content root, disclosure grants and document binding are removed too, so proofs about the document stop verifying.
-     */
+    /** Withdraws an attestation. Only its attester can do this.
+     * Its stored content root, disclosure grants and document binding are removed too, so proofs about the document stop verifying. */
     action   retractAttestation(payloadHash: Hex64,
                                 sessionId: UUID,
                                 contractAddress: String,
@@ -678,11 +662,9 @@ service NightgateService {
     @readonly
     entity GranteeIdentities     as projection on midnight.GranteeIdentities;
 
-    /**
-     * Links the caller to a grantee id, the id that disclosure grants name.
+    /** Links the caller to a grantee id, the id that disclosure grants name.
      * `bindingInput` depends on the server setting `cds.requires.nightgate.granteeBinding`.
-     * It is the wallet's coin public key for 'wallet' (default), a DID for 'did', or the 64 hex id for 'custom'.
-     */
+     * It is the wallet's coin public key for 'wallet' (default), a DID for 'did', or the 64 hex id for 'custom'. */
     action   registerGranteeIdentity(bindingInput: String,
                                      scope: String // optional, default a global link
     )                                                                         returns {
@@ -705,11 +687,9 @@ service NightgateService {
         status : String;
     };
 
-    /**
-     * Calls a circuit on a deployed contract.
+    /** Calls a circuit on a deployed contract.
      * `initialPrivateState` is used only if the wallet has no private state for the contract yet.
-     * A sponsor session must be your own signing session or a platform fee sponsor.
-     */
+     * A sponsor session must be your own signing session or a platform fee sponsor. */
     action   submitContractCall(contractAddress: String,
                                 circuit: String,
                                 compiledArtifactRef: String,
@@ -723,10 +703,8 @@ service NightgateService {
         status : String;
     };
 
-    /**
-     * Builds, proves and signs a contract call as the caller, without paying the fee and without submitting it.
-     * A sponsor then submits the result with sponsorFinalizedTransaction.
-     */
+    /** Builds, proves and signs a contract call as the caller, without paying the fee and without submitting it.
+     * A sponsor then submits the result with sponsorFinalizedTransaction. */
     action   buildSponsorable(contractAddress: String,
                               circuit: String,
                               compiledArtifactRef: String,
@@ -736,10 +714,8 @@ service NightgateService {
         status : String;
     };
 
-    /**
-     * Pays the fee for a signed transaction built by someone else and submits it.
-     * The sponsor only pays for contracts and circuits its policy allows.
-     */
+    /** Pays the fee for a signed transaction built by someone else and submits it.
+     * The sponsor only pays for contracts and circuits its policy allows. */
     action   sponsorFinalizedTransaction(finalizedTxB64: LargeString,
                                          idempotencyKey: String)              returns { // optional
         jobId     : UUID;
@@ -747,10 +723,8 @@ service NightgateService {
         sessionId : UUID; // pass it to getJobStatus
     };
 
-    /**
-     * Pays the fee for a signed transaction that is not yet sealed and submits it.
-     * Such a transaction comes from the transaction builder with `bind: false`. One sponsor can pay several at once.
-     */
+    /** Pays the fee for a signed transaction that is not yet sealed and submits it.
+     * Such a transaction comes from the transaction builder with `bind: false`. One sponsor can pay several at once. */
     action   sponsorUnboundTransaction(unboundTxB64: LargeString,
                                        idempotencyKey: String)                returns { // optional
         jobId     : UUID;
@@ -758,11 +732,9 @@ service NightgateService {
         sessionId : UUID; // pass it to getJobStatus
     };
 
-    /**
-     * Pays the fee for a shielded token swap and submits it.
+    /** Pays the fee for a shielded token swap and submits it.
      * The swap comes as two matching halves, each an offer file (`swapoffer1...`) or base64.
-     * Both token types must be allowed for the sponsor, and the server needs `NIGHTGATE_SPONSOR_ALLOW_SWAPS`.
-     */
+     * Both token types must be allowed for the sponsor, and the server needs `NIGHTGATE_SPONSOR_ALLOW_SWAPS`. */
     action   sponsorSwap(makerHalfB64: LargeString, // required unless offerId is given
                          takerHalfB64: LargeString,
                          idempotencyKey: String, // optional
@@ -787,10 +759,8 @@ service NightgateService {
 
     // ---- Swap offer board ----
 
-    /**
-     * Posts one half of a swap so that others can find it and complete the swap. Posting holds or moves nothing.
-     * The offer closes when a sponsored swap uses it, when it expires or when the poster retires it.
-     */
+    /** Posts one half of a swap so that others can find it and complete the swap. Posting holds or moves nothing.
+     * The offer closes when a sponsored swap uses it, when it expires or when the poster retires it. */
     action   postSwapOffer(offer: LargeString, // offer file or base64
                            expiresAt: Timestamp, // optional
                            tags: array of String, // up to 8; optional
@@ -806,11 +776,9 @@ service NightgateService {
         directed    : Boolean; // only the holder of the taker secret can take it
     };
 
-    /**
-     * Lists offers, by default the open ones, newest first.
+    /** Lists offers, by default the open ones, newest first.
      * With `status: 'all'` and `since`, polling returns every change since the last call.
-     * With `waitMs` the call holds while nothing matches, until an offer matches or the time is up, so one call replaces many polls.
-     */
+     * With `waitMs` the call holds while nothing matches, until an offer matches or the time is up, so one call replaces many polls. */
     function listSwapOffers(givesType: Hex64, // optional
                             wantsType: Hex64, // optional
                             tag: String, // optional
@@ -856,18 +824,16 @@ service NightgateService {
         directed     : Boolean; // only the holder of the taker secret can take it
     };
 
-    /** Closes an open offer. Only the user or agent token that posted it can do this. */
+    /** Closes an open offer. Only the user or agent token that posted it can do this. An offer already closed answers its status. */
     action   retireSwapOffer(offerId: UUID)                                   returns {
         offerId : UUID;
-        status  : String;
+        status  : String; // retired; expired | filled when the offer was closed before the call
     };
 
     // ---- Disclosure to token holders ----
 
-    /**
-     * Lets every holder of `tokenType` read a document. Holders prove their holding through the registry at `registryAddress`.
-     * `content` is stored encrypted and must hash to `payloadHash`, as blake2b-256 or sha256 of the UTF-8 text.
-     */
+    /** Lets every holder of `tokenType` read a document. Holders prove their holding through the registry at `registryAddress`.
+     * `content` is stored encrypted and must hash to `payloadHash`, as blake2b-256 or sha256 of the UTF-8 text. */
     action   grantDisclosureToHolders(payloadHash: Hex64,
                                       tokenType: Hex64,
                                       registryAddress: String,
@@ -889,10 +855,8 @@ service NightgateService {
         status        : String;
     };
 
-    /**
-     * Proves a token holding and returns what the issuer disclosed to holders.
-     * `claimSecret` is the secret used when registering in the holder registry. Without entitlement the result is `entitled: false`.
-     */
+    /** Proves a token holding and returns what the issuer disclosed to holders.
+     * `claimSecret` is the secret used when registering in the holder registry. Without entitlement the result is `entitled: false`. */
     action   claimDisclosure(payloadHash: Hex64,
                              tokenType: Hex64,
                              claimSecret: Hex64)                              returns {
@@ -912,11 +876,9 @@ service NightgateService {
 
     // ---- Batches and tokens ----
 
-    /**
-     * Runs up to 8 circuit calls on one contract in a single transaction, in the given order.
+    /** Runs up to 8 circuit calls on one contract in a single transaction, in the given order.
      * Calls to the same circuit have no fixed order among themselves.
-     * If only part of the transaction succeeds on chain, the job fails.
-     */
+     * If only part of the transaction succeeds on chain, the job fails. */
     action   submitContractCallBatch(contractAddress: String,
                                      calls: LargeString, // JSON array of { circuit, args }
                                      compiledArtifactRef: String,
@@ -930,10 +892,8 @@ service NightgateService {
         status : String;
     };
 
-    /**
-     * Mints a token on a token factory contract and sends it to a shielded address.
-     * The session is the issuer, so the same `name` from another session is a different token.
-     */
+    /** Mints a token on a token factory contract and sends it to a shielded address.
+     * The session is the issuer, so the same `name` from another session is a different token. */
     action   mintFactoryToken(contractAddress: String, // optional; default NIGHTGATE_TOKEN_FACTORY_CONTRACT
                               name: String, // UTF-8, at most 32 bytes
                               amount: String,
@@ -1013,11 +973,9 @@ service NightgateService {
     /** Closes a session and deletes its stored keys. */
     action   disconnectWallet(sessionId: UUID);
 
-    /**
-     * Lets a session sign transactions. The seed is stored encrypted and must belong to the session's viewing key.
+    /** Lets a session sign transactions. The seed is stored encrypted and must belong to the session's viewing key.
      * Keys are derived from the seed the same way the Lace wallet does, so the addresses match Lace.
-     * The wallet then syncs with the chain in the background, tracked by `prewarmJobId`.
-     */
+     * The wallet then syncs with the chain in the background, tracked by `prewarmJobId`. */
     action   connectWalletForSigning(sessionId: UUID,
                                      mnemonic: String, // BIP39 phrase; required unless seedHex is given
                                      seedHex: String, // 128 hex; optional
@@ -1063,10 +1021,8 @@ service NightgateService {
         status : String;
     };
 
-    /**
-     * Sends NIGHT, or the token `tokenTypeHex`, to an address.
-     * An `mn_shield-addr_` address is paid from the shielded balance, an `mn_addr_` address from the unshielded one.
-     */
+    /** Sends NIGHT, or the token `tokenTypeHex`, to an address.
+     * An `mn_shield-addr_` address is paid from the shielded balance, an `mn_addr_` address from the unshielded one. */
     action   sendNight(sessionId: UUID,
                        receiverAddress: String,
                        amount: String,
@@ -1154,11 +1110,9 @@ service NightgateService {
 
     // ---- Proof preparation, agent output, agent grants, jobs ----
 
-    /**
-     * Prepares a JSON document for the proof actions. Nothing is stored.
+    /** Prepares a JSON document for the proof actions. Nothing is stored.
      * Keep the field order of `proofFields` the same for every document of a kind.
-     * Store `opening`. Without it no later proof about this document is possible.
-     */
+     * Store `opening`. Without it no later proof about this document is possible. */
     action   prepareDocumentProof(document: Map, // the JSON document
                                   proofFields: array of ProofField, // at most 16 or 32 entries depending on the contract
                                   saltSeed: Hex64, // optional, default random
@@ -1175,10 +1129,8 @@ service NightgateService {
         opening           : DocumentOpening;
     };
 
-    /**
-     * Builds the set of allowed values for issueFieldMembershipAttestation.
-     * With `value` or `valueDigest` it also returns the path that proves the value is in the set.
-     */
+    /** Builds the set of allowed values for issueFieldMembershipAttestation.
+     * With `value` or `valueDigest` it also returns the path that proves the value is in the set. */
     action   prepareMembershipSet(allowedValues: array of String, // up to 64 distinct values
                                   value: String, // optional
                                   valueDigest: Hex64, // optional; blake2b-256 of value
@@ -1190,10 +1142,8 @@ service NightgateService {
         setDirs         : array of Boolean; // empty without value or valueDigest
     };
 
-    /**
-     * Records on chain that an agent produced an output from an input, signed by the session's wallet.
-     * Anyone can check it by hashing `envelopeJson` and calling verifyAttestationState.
-     */
+    /** Records on chain that an agent produced an output from an input, signed by the session's wallet.
+     * Anyone can check it by hashing `envelopeJson` and calling verifyAttestationState. */
     action   attestAgentOutput(agentId: String, // at most 200 characters
                                inputHash: Hex64,
                                outputHash: Hex64,
@@ -1222,11 +1172,9 @@ service NightgateService {
             tokenHash
         };
 
-    /**
-     * Creates a token that lets an agent act as the caller on one wallet session. The agent sends it in the `x-agent-token` header.
+    /** Creates a token that lets an agent act as the caller on one wallet session. The agent sends it in the `x-agent-token` header.
      * The agent may only call `allowedActions`, the verify functions and getJobStatus.
-     * The allowed lists can only narrow what the platform's sponsor policy allows.
-     */
+     * The allowed lists can only narrow what the platform's sponsor policy allows. */
     action   createAgentGrant(sessionId: UUID,
                               allowedActions: array of String,
                               maxJobsPerDay: Integer, // optional; default NIGHTGATE_GRANT_DEFAULT_JOBS_PER_DAY, else unlimited
@@ -1239,7 +1187,7 @@ service NightgateService {
                               allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent, needs NIGHTGATE_SPONSOR_ALLOW_DEPLOY
                               maxDeploys: Integer, // optional, default 1 when allowDeploy is true
                               allowedTokenTypes: array of Hex64, // optional, default all the platform allows
-                              allowUnshieldedOffers: Boolean, // optional; sponsored calls may move the agent's own unshielded tokens into the contract, needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
+                              allowUnshieldedOffers: Boolean, // optional; sponsored calls may pay the agent's own unshielded tokens in and the contract's payouts out, needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
                               allowedUnshieldedTokenTypes: array of Hex64, // optional, default all the platform allows besides NIGHT
                               maxValuePerDay: array of ValueBudget // optional, default no value limit
     )                                                                         returns {
@@ -1257,10 +1205,8 @@ service NightgateService {
         validUntil                  : Timestamp;
     };
 
-    /**
-     * Creates up to 50 grants with the same settings, each with its own token.
-     * Without `labels` they are named `<agentLabel>-1` to `<agentLabel>-n`.
-     */
+    /** Creates up to 50 grants with the same settings, each with its own token.
+     * Without `labels` they are named `<agentLabel>-1` to `<agentLabel>-n`. */
     action   createAgentGrants(count: Integer,
                                sessionId: UUID,
                                allowedActions: array of String,
@@ -1275,7 +1221,7 @@ service NightgateService {
                                allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent, needs NIGHTGATE_SPONSOR_ALLOW_DEPLOY
                                maxDeploys: Integer, // optional, default 1 when allowDeploy is true
                                allowedTokenTypes: array of Hex64, // optional, default all the platform allows
-                               allowUnshieldedOffers: Boolean, // optional; sponsored calls may move the agent's own unshielded tokens into the contract, needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
+                               allowUnshieldedOffers: Boolean, // optional; sponsored calls may pay the agent's own unshielded tokens in and the contract's payouts out, needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
                                allowedUnshieldedTokenTypes: array of Hex64, // optional, default all the platform allows besides NIGHT
                                maxValuePerDay: array of ValueBudget // optional, default no value limit
     )                                                                         returns {
@@ -1351,11 +1297,9 @@ service NightgateService {
         };
     };
 
-    /**
-     * Returns the status of a background job. Poll until `status` is `succeeded` or `failed`.
+    /** Returns the status of a background job. Poll until `status` is `succeeded` or `failed`.
      * `result` is the action's result as JSON. This is a POST but changes nothing.
-     * With `waitMs` the call holds until the job settles or the time is up, so one call replaces many polls.
-     */
+     * With `waitMs` the call holds until the job settles or the time is up, so one call replaces many polls. */
 
     action   getJobStatus(jobId: UUID,
                           sessionId: UUID,

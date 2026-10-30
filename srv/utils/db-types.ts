@@ -1,7 +1,5 @@
-/**
- * Minimal database types that fit `cds.db`, a CAP transaction and a test stub.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Minimal database types that fit `cds.db`, a CAP transaction and a test stub.
+// SPDX-License-Identifier: Apache-2.0
 
 export interface DbRunner {
     run(query: unknown, args?: unknown): Promise<any>;
@@ -18,3 +16,10 @@ export type TxCapableDb = DbRunner & Partial<Pick<DbService, 'tx'>>;
 
 /** An entity row where the columns `K` are known to be set. Generated types mark every field optional. */
 export type Row<T, K extends keyof T> = Omit<T, K> & { [P in K]-?: Exclude<T[P], undefined> };
+
+/** Rows an UPDATE or DELETE changed. Drivers answer with a count or with `{ changes }`. */
+export function affectedRows(result: unknown): number {
+    if (typeof result === 'number') return result;
+    const changes = (result as { changes?: unknown } | null | undefined)?.changes;
+    return typeof changes === 'number' ? changes : 0;
+}

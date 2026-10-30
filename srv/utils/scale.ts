@@ -1,3 +1,4 @@
+import { bareHex } from './hex-patterns';
 
 interface ParsedAddress {
     address: string;
@@ -119,7 +120,7 @@ function parseAddress(buf: Buffer, offset: number): ParsedAddress | null {
 function parseExtrinsicCore(hex: string): ParsedExtrinsicCore | null {
     if (!hex || hex.length < 8) return null;
 
-    const cleanHex = hex.startsWith('0x') ? hex.slice(2) : hex;
+    const cleanHex = bareHex(hex);
     if (cleanHex.length < 8) return null;
 
     let buf: Buffer;

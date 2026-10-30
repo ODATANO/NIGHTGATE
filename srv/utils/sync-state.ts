@@ -1,11 +1,12 @@
 import cds from '@sap/cds';
 import { NightgateError } from './errors';
+import { isUniqueViolation } from './db-errors';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
 import { SyncState, Blocks } from '#cds-models/midnight';
 import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './nightgate-config';
 import { redactUrlCredentials } from './redact-url';
-import { formatErr } from './format-error';
+
 import { configString } from './config';
 
 export class SyncStateNetworkMismatchError extends NightgateError {
@@ -72,7 +73,7 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
             }));
         } catch (err: unknown) {
             // Another caller inserted the row first.
-            if (!/unique constraint|duplicate key/i.test(formatErr(err))) throw err;
+            if (!isUniqueViolation(err)) throw err;
         }
     }
 }

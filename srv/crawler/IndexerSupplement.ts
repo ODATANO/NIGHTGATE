@@ -1,12 +1,10 @@
-/**
- * Background pass that adds data from the Midnight indexer that the node's blocks do not contain.
- * It has its own cursor, and the crawler works the same whether it runs or not.
- * Rows are matched on `Transactions.ledgerTxHash`, the hash the indexer uses for transactions.
- */
+// Background pass that adds data from the Midnight indexer that the node's blocks do not contain.
+// It has its own cursor. The crawler works the same whether it runs or not.
+// Rows are matched on `Transactions.ledgerTxHash`, the hash the indexer uses for transactions.
 
 import cds from '@sap/cds';
 import {
-    createIndexerClient, isIndexerRateLimit, type IndexerClient, type SupplementBlock,
+    createIndexerClient, type IndexerClient, type SupplementBlock,
     type SupplementTransaction, type SupplementLedgerEvent, type SupplementDustEvent
 } from './indexer-supplement';
 import { readCapBinary, capBinaryInput } from './cap-binary';
@@ -14,15 +12,10 @@ import {
     DEFAULT_CONTRACT_STATE_POLICY, digestOfBase64, keepsStateHistory, upsertCurrentState,
     type ContractStatePolicy
 } from './contract-state';
-import { lockReorgGeneration } from '../submission/reorg-generation';
-import type { DbRunner, Row } from '../utils/db-types';
-import { Blocks, Transactions, TransactionResults, TransactionSegments, TransactionFees, ContractActions, ContractBalances, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, SyncState, type Block, type Transaction, type ContractAction } from '#cds-models/midnight';
-
-/** Cursor and rollback counter at the start of a pass. Both must be unchanged when the pass saves its cursor. */
-interface PassPosition {
-    cursor: number | null;
-    generation: number;
-}
+import { advancePassCursor, blocksInRange, readPassWindow, windowIsEmpty, PassPause, type PassPosition } from './cursor-pass';
+import { affectedRows, type DbRunner } from '../utils/db-types';
+import { isIndexerRateLimit } from '../utils/indexer-graphql';
+import { Blocks, Transactions, TransactionResults, TransactionSegments, TransactionFees, ContractActions, ContractBalances, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, type Block, type Transaction, type ContractAction, type TransactionResult } from '#cds-models/midnight';
 
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 const log = cds.log('nightgate:crawler');
@@ -64,7 +57,7 @@ export class IndexerSupplement {
     private running = false;
     private loop: Promise<void> | null = null;
     private stopping = false;
-    private wake: (() => void) | null = null;
+    private readonly pause = new PassPause();
     private lastLedgerParameters: string | null = null;
     /** Rollback counter the cache belongs to. A rollback can delete the block holding the cached parameters. */
     private cachedGeneration: number | null = null;
@@ -102,7 +95,7 @@ export class IndexerSupplement {
                         delay = this.config.intervalMs * 4;
                     }
                 }
-                await this.sleep(delay);
+                await this.pause.sleep(delay);
             }
         })();
     }
@@ -110,7 +103,7 @@ export class IndexerSupplement {
     async stop(): Promise<void> {
         this.running = false;
         this.stopping = true;
-        this.wake?.();
+        this.pause.wake();
         if (this.loop) {
             await this.loop.catch(() => { /* reported in the loop */ });
             this.loop = null;
@@ -118,32 +111,17 @@ export class IndexerSupplement {
     }
 
     async runOnce(): Promise<SupplementRunResult> {
-        const sync: any = await this.db.run(
-            // Read cursor and rollback counter together. With two reads, a rollback in between
-            // could pair an old cursor with a new counter, and the final check would not notice.
-            SELECT.one.from(SyncState)
-                .columns('lastSupplementedHeight', 'lastIndexedHeight', 'reorgGeneration')
-                .where({ ID: 'SINGLETON' })
-        );
-        if (!sync) return EMPTY_RUN;
-
-        const ceiling = Number(sync.lastIndexedHeight ?? 0) - this.config.lagBlocks;
-        const cursor = sync.lastSupplementedHeight == null ? null : Number(sync.lastSupplementedHeight);
-        const from = cursor == null ? 0 : cursor + 1;
-        const generation = Number(sync.reorgGeneration ?? 0);
-        const start: PassPosition = { cursor, generation: Number.isFinite(generation) ? generation : 0 };
+        const window = await readPassWindow(this.db, 'lastSupplementedHeight', this.config.lagBlocks);
+        if (!window) return EMPTY_RUN;
+        const { start, from, ceiling } = window;
         // A rollback can delete the block that stored the cached parameters, so the cache is cleared.
         if (this.cachedGeneration !== start.generation) {
             this.lastLedgerParameters = null;
             this.cachedGeneration = start.generation;
         }
-        if (!Number.isFinite(ceiling) || from > ceiling) return EMPTY_RUN;
+        if (windowIsEmpty(window)) return EMPTY_RUN;
 
-        const blocks: Row<Block, 'ID' | 'height'>[] = await this.db.run(
-            SELECT.from(Blocks).columns('ID', 'height')
-                .where({ height: { '>=': from } }).and({ height: { '<=': ceiling } })
-                .orderBy('height asc').limit(this.config.batchSize)
-        ) || [];
+        const blocks = await blocksInRange(this.db, from, ceiling, this.config.batchSize);
         if (blocks.length === 0) {
             await this.setCursor(start, Math.min(from + this.config.batchSize - 1, ceiling));
             return EMPTY_RUN;
@@ -212,7 +190,7 @@ export class IndexerSupplement {
         const rows: Transaction[] = await this.db.run(
             SELECT.from(Transactions).columns('ID', 'ledgerTxHash').where({ ledgerTxHash: { in: hashes } })
         ) || [];
-        const byHash = new Map<string, string>(rows.map((r: any) => [r.ledgerTxHash, r.ID]));
+        const byHash = new Map<string, string>(rows.map(r => [String(r.ledgerTxHash), String(r.ID)]));
 
         for (const tx of transactions) {
             const transactionId = byHash.get(tx.ledgerTxHash);
@@ -236,12 +214,12 @@ export class IndexerSupplement {
         const changed = await dbTx.run(
             UPDATE.entity(TransactionFees).set({ paidFees: tx.fee }).where({ transaction_ID: transactionId })
         );
-        return Number(changed ?? 0) > 0 ? 1 : 0;
+        return affectedRows(changed) > 0 ? 1 : 0;
     }
 
     private async applySegments(dbTx: DbRunner, transactionId: string, tx: SupplementTransaction): Promise<number> {
         if (tx.segments.length === 0) return 0;
-        const resultRow: any = await dbTx.run(
+        const resultRow: Pick<TransactionResult, 'ID'> | undefined = await dbTx.run(
             SELECT.one.from(TransactionResults).columns('ID').where({ transaction_ID: transactionId })
         );
         if (!resultRow) return 0;
@@ -380,37 +358,9 @@ export class IndexerSupplement {
                     .set({ registeredForDustGeneration: true })
                     .where({ intentHash: output.intentHash, outputIndex: output.outputIndex })
             );
-            if (Number(changed ?? 0) > 0) updated++;
+            if (affectedRows(changed) > 0) updated++;
         }
         return updated;
-    }
-
-    /**
-     * Saves the cursor only if cursor and rollback counter are unchanged since the pass started.
-     * Otherwise a reorg during the pass would be overwritten and re-indexed blocks skipped.
-     * The counter is needed because a rollback to exactly the cursor height leaves the cursor unchanged.
-     */
-    private async setCursor(expected: PassPosition, height: number): Promise<boolean> {
-        let advanced = false;
-        await this.db.tx(async (tx) => {
-            const generation = await lockReorgGeneration(tx);
-            const current: any = await tx.run(
-                SELECT.one.from(SyncState).columns('lastSupplementedHeight').where({ ID: 'SINGLETON' })
-            );
-            const now = current?.lastSupplementedHeight == null ? null : Number(current.lastSupplementedHeight);
-            if (generation !== expected.generation || now !== expected.cursor) {
-                log.info(
-                    `indexer supplement pass dropped: started at cursor ${expected.cursor} generation ` +
-                    `${expected.generation}, found ${now} / ${generation}`
-                );
-                return;
-            }
-            await tx.run(
-                UPDATE.entity(SyncState).set({ lastSupplementedHeight: height }).where({ ID: 'SINGLETON' })
-            );
-            advanced = true;
-        });
-        return advanced;
     }
 
     private async endBefore(start: PassPosition, blocks: any[], index: number, result: SupplementRunResult): Promise<SupplementRunResult> {
@@ -424,7 +374,7 @@ export class IndexerSupplement {
         const cap = this.config.maxBlocksPerSecond ?? 0;
         if (cap <= 0) return;
         const wait = this.lastRequestAt + 1000 / cap - this.now();
-        if (wait > 0) await this.sleep(wait);
+        if (wait > 0) await this.pause.sleep(wait);
         this.lastRequestAt = this.now();
     }
 
@@ -432,17 +382,8 @@ export class IndexerSupplement {
         return Date.now();
     }
 
-    /** stop() can wake this early, because a backoff can last minutes and must not delay a shutdown. */
-    private sleep(ms: number): Promise<void> {
-        return new Promise(resolve => {
-            const done = () => {
-                clearTimeout(timer);
-                this.wake = null;
-                resolve();
-            };
-            const timer = setTimeout(done, ms);
-            (timer as any).unref?.();
-            this.wake = done;
-        });
+
+    private setCursor(expected: PassPosition, height: number): Promise<boolean> {
+        return advancePassCursor(this.db, 'lastSupplementedHeight', expected, height, 'indexer supplement');
     }
 }

@@ -1,8 +1,5 @@
-/**
- * Entry point of the dust verify worker thread, started by the wallet worker.
- * Restoring a collapsed dust state through the ledger wasm blocks the thread it runs on for
- * seconds and grows with the chain, so it runs here and never on the wallet thread.
- */
+// Dust verify worker thread, started by the wallet worker.
+// Restoring a collapsed dust state blocks for seconds, so it never runs on the wallet thread.
 
 import { parentPort } from 'node:worker_threads';
 import { createDispatcher, type WorkerRpcHandlers } from './worker-rpc/dispatch';

@@ -1,8 +1,5 @@
-/**
- * Main-thread side of the decode worker: contract state and ledger transactions are decoded there,
- * so wasm never runs on the server thread. One worker per process, one message channel per call.
- * The worker starts on the first call and again after a crash.
- */
+// Main-thread side of the decode worker, so wasm decoding never runs on the server thread.
+// One worker per process. It starts on the first call and again after a crash.
 
 import cds from '@sap/cds';
 import path from 'node:path';

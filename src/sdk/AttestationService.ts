@@ -15,21 +15,18 @@ const REQUIRED: Record<AttestationTier, DisclosureRoleValue> = {
     Authority: 'authority'
 };
 
-/**
- * Call this from `init()`. It sets `req.disclosureRole` on every request.
- * A read of a view the caller's role does not allow fails with 403 instead of returning nothing.
- */
+/** Call this from `init()`. A read of a view the caller's role does not allow fails with 403, not with an empty result. */
 export function registerAttestationServiceHandlers(
     srv: cds.ApplicationService,
     db: cds.DatabaseService
 ): void {
-    (srv as any).before('*', async (req: cds.Request) => {
+    srv.before('*', async (req: cds.Request) => {
         await attachDisclosureRole(req, db);
     });
 
     // CAP runs before-handlers in parallel, so the role may not be set yet when these checks run.
-    (srv as any).before('READ', 'Disclosed', makeTierGate('Disclosed', db));
-    (srv as any).before('READ', 'Authority', makeTierGate('Authority', db));
+    srv.before('READ', 'Disclosed', makeTierGate('Disclosed', db));
+    srv.before('READ', 'Authority', makeTierGate('Authority', db));
 }
 
 function makeTierGate(tier: AttestationTier, db: cds.DatabaseService) {
@@ -45,10 +42,7 @@ function makeTierGate(tier: AttestationTier, db: cds.DatabaseService) {
     };
 }
 
-/**
- * A proof result in a portable format. The field names are public and must not change.
- * `proofValue` is the hash of the transaction that carried the proof.
- */
+/** A proof result in a portable format with public field names that must not change. `proofValue` is the hash of the transaction that carried the proof. */
 export interface PredicateAttestationEnvelope {
     digestMultibase: string | null;
     claim: {

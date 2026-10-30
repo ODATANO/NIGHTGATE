@@ -1,8 +1,5 @@
-/**
- * Proof provider that proves in this process instead of on a proof server (NIGHTGATE_PROVING_MODE=wasm).
- * Keys come from the contract's files, or from the SDK for the standard circuits.
- * Proving blocks the calling thread.
- */
+// Proves in this process instead of on a proof server, under NIGHTGATE_PROVING_MODE=wasm.
+// Keys come from the contract's files, or from the SDK for standard circuits. Proving blocks the thread.
 
 interface WasmProofDeps {
     zkir: any;
@@ -41,6 +38,7 @@ export async function getSharedKeyMaterialProvider(): Promise<{ lookupKey(loc: s
 }
 
 import { runtimeConfigEnum } from './runtime-config';
+import { errorMessage } from '../utils/errors';
 
 /** Uses runtime-config because this file also ships in the nightgate-tx package, which has no server config. */
 export function isWasmProvingMode(): boolean {
@@ -62,7 +60,7 @@ export async function buildWasmProofProvider(zkConfigProvider: any): Promise<{ p
             }
             const material = await fallbackKeys.lookupKey(keyLocation);
             if (material === undefined) {
-                const cause = zkConfigError instanceof Error ? zkConfigError.message : String(zkConfigError);
+                const cause = errorMessage(zkConfigError);
                 throw new Error(
                     `No proving key material for '${keyLocation}': not in the contract's zkConfig ` +
                     `(${cause}) and not a standard circuit the fallback provider knows`

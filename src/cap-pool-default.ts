@@ -1,9 +1,5 @@
-/**
- * Makes CAP use the `generic-pool` package for database connections.
- * CAP's built-in pool loses a connection each time a request times out while waiting, until no connection is left.
- * CAP reads this flag when its database layer loads, so it is set when the plugin loads.
- * A value the host app sets itself is kept.
- */
+// Makes CAP use `generic-pool` for database connections, unless the host app set the flag itself.
+// CAP's built-in pool loses a connection each time a request times out while waiting for one.
 export function applyPoolDefault(env: { features?: Record<string, unknown> }): boolean {
     const features = (env.features ??= {});
     if (features.use_generic_pool === undefined) {

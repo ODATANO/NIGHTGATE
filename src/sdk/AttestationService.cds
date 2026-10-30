@@ -1,14 +1,8 @@
 using {midnight} from '../../db/schema';
 
-/**
- * Base service with three views of `midnight.Attestations`, each showing more data.
- * Extend it and call `registerAttestationServiceHandlers(this, this.db)` in `init()`.
- * That helper checks the caller's disclosure role. All views need a logged-in user even without it.
- *
- *   Public:    any logged-in user. Shows only that an attestation exists.
- *   Disclosed: role `legitimate_interest` or higher. Adds the attester and metadata.
- *   Authority: role `authority` only. Shows the full row, including the encrypted payload.
- */
+/** Base service with three views of `midnight.Attestations`. Public needs a logged-in user and shows only that an attestation exists.
+ *  Disclosed needs role `legitimate_interest` and adds attester and metadata. Authority needs role `authority` and shows the full row.
+ *  Extend it and call `registerAttestationServiceHandlers(this, this.db)` in `init()`. */
 @abstract
 service AttestationService {
 

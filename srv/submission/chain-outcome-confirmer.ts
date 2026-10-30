@@ -1,8 +1,6 @@
-/**
- * Asks the Midnight indexer whether a submitted transaction landed, so `chainStatus`
- * updates without our own crawler. Uses a single fetch rather than `watchForTxData`,
- * whose polling would never stop for a transaction that was dropped.
- */
+// Asks the Midnight indexer whether a submitted transaction landed, so `chainStatus` updates without our own crawler.
+// It uses one fetch instead of `watchForTxData`, whose polling never stops for a dropped transaction.
+import { indexerQuery, indexerTimestampMs, IndexerQueryError } from '../utils/indexer-graphql';
 
 /** Maps the indexer's result status to `chainStatus`. An unknown status gives null, never a result. */
 export function mapIndexerStatus(status: string): 'success' | 'failure' | null {
@@ -22,9 +20,7 @@ export function nonNegativeInteger(raw: unknown): number | null {
 }
 
 /**
- * A confirmed result with the block it landed in. A chain reorg can only match
- * a job by block height, because the three transaction hashes all differ.
- * So a result always carries a block height.
+ * A confirmed result with the block it landed in. A reorg can match a job only by block height, because the three transaction hashes all differ.
  */
 export type ChainOutcome = {
     status: 'success' | 'failure';
@@ -39,9 +35,7 @@ export type ChainOutcome = {
 };
 
 /**
- * The indexer does not know the transaction, which suggests it never landed.
- * `null` instead means it is known but has no final result yet.
- * `asOfMs` is the time of the indexer's latest block in the same answer. null means no conclusion.
+ * The indexer does not know the transaction, so it likely never landed. `asOfMs` is the indexer's latest block time in that answer; null means no conclusion.
  */
 export type ChainAbsent = { status: 'absent'; asOfMs: number | null };
 export function chainAbsent(asOfMs: number | null): ChainAbsent { return { status: 'absent', asOfMs }; }
@@ -69,12 +63,6 @@ const TX_STATUS_QUERY =
     ' ... on RegularTransaction { hash block { hash height } transactionResult { status segments { id success } } } }' +
     ' block { height timestamp } }';
 
-function tipMsOf(body: any): number | null {
-    const raw = body?.data?.block?.timestamp;
-    const n = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : NaN;
-    if (!Number.isFinite(n) || n <= 0) return null;
-    return n > 1e12 ? n : n * 1000; // seconds stay below 1e12 until 2286
-}
 
 interface IndexedTxSlice {
     status: string;
@@ -85,8 +73,7 @@ interface IndexedTxSlice {
 }
 
 /**
- * Looks a transaction up by identifier, then by hash.
- * Returns the result, "absent", or null when it is known but not final. Throws on network or query errors.
+ * Looks a transaction up by identifier, then by hash. Returns the result, "absent", or null when known but not final. Throws on network or query errors.
  */
 export function createHttpTxConfirmer(
     cfg: IndexerTxConfirmerConfig
@@ -99,21 +86,18 @@ export function createHttpTxConfirmer(
     // The lookup by hash covers rows that stored a hash instead.
     type Lookup = { present: false; asOfMs: number | null; keyInvalid: boolean } | { present: true; slice: IndexedTxSlice | null };
     const lookup = async (offset: Record<string, string>): Promise<Lookup> => {
-        const res = await doFetch(cfg.indexerHttpUrl, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ query: TX_STATUS_QUERY, variables: { offset } }),
-            signal: AbortSignal.timeout(timeoutMs)
-        });
-        if (!res.ok) throw new Error(`Indexer tx lookup HTTP ${res.status}`);
-        const body: any = await res.json();
-        if (body?.errors?.length) {
+        let data: any;
+        try {
+            data = await indexerQuery(cfg.indexerHttpUrl, TX_STATUS_QUERY, { variables: { offset }, timeoutMs, fetchFn: doFetch });
+        } catch (err) {
             // The value has the wrong form for this lookup. That proves nothing, so try the other one.
-            if (/invalid transaction (hash|identifier)|cannot convert/i.test(String(body.errors[0]?.message))) return { present: false, asOfMs: null, keyInvalid: true };
-            throw new Error(`Indexer tx lookup GraphQL error: ${body.errors[0]?.message ?? 'unknown'}`);
+            if (err instanceof IndexerQueryError && /invalid transaction (hash|identifier)|cannot convert/i.test(err.messages[0] ?? '')) {
+                return { present: false, asOfMs: null, keyInvalid: true };
+            }
+            throw err;
         }
-        const tx = body?.data?.transactions?.[0];
-        if (!tx || typeof tx !== 'object') return { present: false, asOfMs: tipMsOf(body), keyInvalid: false };
+        const tx = data?.transactions?.[0];
+        if (!tx || typeof tx !== 'object') return { present: false, asOfMs: indexerTimestampMs(data?.block?.timestamp), keyInvalid: false };
         const status = tx?.transactionResult?.status;
         if (typeof status !== 'string') return { present: true, slice: null };
         // Without a block height a reorg could not undo the result, so do not confirm it.

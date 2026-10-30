@@ -1,7 +1,5 @@
-/**
- * Refuses write actions with a retryable 503 until the plugin has started successfully.
- * Accepting them earlier would leave half-written state. Reads stay available.
- */
+// Refuses write actions with a retryable 503 until the plugin has started. Reads stay available.
+// Accepting writes earlier would leave half-written state.
 import cds from '@sap/cds';
 import { isBackgroundFenced } from './instance-lease';
 import { readRuntimeState, type RuntimeState } from './runtime-state';
@@ -25,10 +23,8 @@ export const RUNTIME_RETRY_AFTER_SECONDS = 15;
 
 export const RUNTIME_UNAVAILABLE_CODE = 'RUNTIME_UNAVAILABLE';
 
-/**
- * Why write actions are refused, or null when they are allowed.
- * With SKIP_AUTO_INIT the caller starts things itself, so "not started" is not an error.
- */
+/** Why write actions are refused, or null when they are allowed.
+ *  With SKIP_AUTO_INIT the caller starts things itself, so "not started" is not an error. */
 export function runtimeUnavailableReason(state: RuntimeState = readRuntimeState()): string | null {
     if (isBackgroundFenced()) {
         return 'this process lost the database instance lease to another NIGHTGATE process; write actions are refused until it restarts';

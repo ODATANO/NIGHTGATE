@@ -1,12 +1,6 @@
-/**
- * Exports the signing key of one deployed contract.
- * midnight-js creates this key at deploy time. Whoever holds it can update the contract.
- * The key is stored in `ContractSigningKeys`, encrypted with the account's data key.
- *
- * The export is sealed under a password the caller chooses. It uses the same
- * format as the private-state provider's export, so `importSigningKeys` can restore it.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Exports a deployed contract's signing key. midnight-js creates it at deploy time, and whoever holds it can update the contract.
+// The key is stored in `ContractSigningKeys` under the account's data key. The export is sealed under a caller-chosen password that `importSigningKeys` can restore.
+// SPDX-License-Identifier: Apache-2.0
 
 import cds from '@sap/cds';
 import { decrypt, KeyRing } from '../utils/crypto';
@@ -34,8 +28,7 @@ export interface ContractSigningKeyExport extends SigningKeyExport {
 }
 
 /**
- * Export the signing key of `contractAddress` from the account behind `sessionId`.
- * A key row in the older encryption format is refused. Opening the session once upgrades it.
+ * Exports the signing key of `contractAddress` from the account behind `sessionId`. A key row in the older encryption format is refused until the session is opened once.
  */
 export async function exportContractSigningKeyForSession(
     db: Runner,

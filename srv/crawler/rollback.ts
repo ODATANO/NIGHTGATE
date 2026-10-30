@@ -1,14 +1,13 @@
-/**
- * Removes indexed blocks from a given height upwards, after a reorg or for a manual reindex.
- * `NightBalances` is updated step by step during indexing, so affected addresses are recomputed from the remaining rows.
- */
+// Removes indexed blocks from a given height upwards, after a reorg or for a manual reindex.
+// `NightBalances` of affected addresses are then recomputed from the remaining rows.
 
 import cds from '@sap/cds';
+import { toBigInt } from '../utils/numbers';
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
-import { Blocks, Transactions, ContractActions, ContractBalances, ContractStates, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults, TransactionSegments, TransactionIdentifiers, NightBalances, SyncState, PendingSubmissions, BackgroundJobs, type Block, type Transaction } from '#cds-models/midnight';
+import { Blocks, Transactions, ContractActions, ContractBalances, ContractStates, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults, TransactionSegments, TransactionIdentifiers, NightBalances, SyncState, PendingSubmissions, BackgroundJobs, type Block, type Transaction, type UnshieldedUtxo } from '#cds-models/midnight';
 import { bumpReorgGeneration } from '../submission/reorg-generation';
 import { NIGHT_RAW_TOKEN_TYPE } from './block-events';
-import type { DbRunner } from '../utils/db-types';
+import { affectedRows, type DbRunner } from '../utils/db-types';
 
 // PostgreSQL allows at most 65535 parameters per statement, so long ID lists are split.
 const IN_CHUNK = 5000;
@@ -132,7 +131,7 @@ export async function rollbackIndexedDataFromHeight(
     const forkHeight = forkBlock?.height ?? 0;
     // The decode and indexer passes must not stay above the new tip.
     // Their results for the removed blocks were deleted with the rows.
-    const current: any = await tx.run(
+    const current: Pick<SyncState, 'lastDecodedHeight' | 'lastSupplementedHeight'> | undefined = await tx.run(
         SELECT.one.from(SyncState).columns('lastDecodedHeight', 'lastSupplementedHeight').where({ ID: 'SINGLETON' })
     );
     const clampCursor = (value: unknown): number | null => {
@@ -161,12 +160,9 @@ export async function rollbackIndexedDataFromHeight(
     };
 }
 
-/**
- * Clears the inclusion data that submissions and jobs recorded from `fromHeight` upwards.
- * They are matched by block height, because the crawler and the submission side share no common hash.
- * Jobs that failed on-chain are checked again, because the transaction may apply differently when it lands again.
- * Anchor hashes recorded on documents are not cleared.
- */
+// Clears inclusion data that submissions and jobs recorded from `fromHeight` upwards, matched by block height.
+// Jobs that failed on-chain are checked again, because the transaction may apply differently next time.
+// Anchor hashes recorded on documents are not cleared.
 async function revertSubmissionEvidence(
     tx: DbRunner,
     fromHeight: number
@@ -199,12 +195,6 @@ async function revertSubmissionEvidence(
     return { submissionsReverted: submissionsReverted + failedAttemptsReverted, jobsReverted: failedReverted + outcomesReverted };
 }
 
-function affectedRows(result: unknown): number {
-    if (typeof result === 'number') return result;
-    if (result && typeof result === 'object' && typeof (result as any).changes === 'number') return (result as any).changes;
-    return 0;
-}
-
 async function selectForkBlock(
     tx: DbRunner,
     fromHeight: number
@@ -228,13 +218,11 @@ export interface NightBalanceFigures {
     lastActivityHeight: number | null;
 }
 
-/**
- * Computes the balance values of one address from the indexed rows. Null if the address has no NIGHT activity.
- * Must give the same result as `applyBalanceDelta` in BlockProcessor, which updates them block by block.
- */
+// Balance values of one address from the indexed rows, or null without NIGHT activity.
+// Must match `applyBalanceDelta` in BlockProcessor, which updates them block by block.
 export async function computeNightBalance(tx: DbRunner, address: string): Promise<NightBalanceFigures | null> {
     // Only NIGHT counts. Other tokens of the same address are ignored.
-    const utxos: any[] = await tx.run(
+    const utxos: Pick<UnshieldedUtxo, 'value' | 'spentAtTransaction_ID' | 'createdAtTransaction_ID'>[] = await tx.run(
         SELECT.from(UnshieldedUtxos)
             .columns('value', 'spentAtTransaction_ID', 'createdAtTransaction_ID')
             .where({ owner: address, tokenType: NIGHT_RAW_TOKEN_TYPE })
@@ -348,15 +336,3 @@ export async function recomputeNightBalance(tx: DbRunner, address: string): Prom
     }
 }
 
-function toBigInt(value: unknown): bigint {
-    if (typeof value === 'bigint') return value;
-    if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.trunc(value));
-    if (typeof value === 'string' && value.trim() !== '') {
-        try {
-            return BigInt(value.trim());
-        } catch {
-            return 0n;
-        }
-    }
-    return 0n;
-}

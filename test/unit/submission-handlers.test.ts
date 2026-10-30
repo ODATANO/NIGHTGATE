@@ -132,6 +132,7 @@ import {
 } from '../../srv/submission/arg-coercion';
 import path from 'path';
 import { HEX64_RE } from '../../srv/utils/hex-patterns';
+import { runFinalizer } from '../fixtures/run-finalizer';
 
 // ---- Fakes ----------------------------------------------------------------
 
@@ -323,9 +324,9 @@ describe('submitContractCallBatch: argument validation', () => {
         [{ merkleProof: 'nope' }, /calls\[0\]\.merkleProof must be an object/],
         [{ merkleProof: { fieldValue: '4.2', siblings: SIBS4, dirs: [true, false, true, false] } }, /merkleProof\.fieldValue must be an integer/],
         [{ merkleProof: { fieldValue: '-1', siblings: SIBS4, dirs: [true, false, true, false] } }, /merkleProof\.fieldValue must be a non-negative integer/],
-        [{ merkleProof: { fieldValue: '1', siblings: SIBS4.slice(0, 2), dirs: [true, false, true, false] } }, /merkleProof\.siblings must be a JSON array of 4 hashes/],
+        [{ merkleProof: { fieldValue: '1', siblings: SIBS4.slice(0, 2), dirs: [true, false, true, false] } }, /merkleProof\.siblings must be an array of 4 hashes/],
         [{ merkleProof: { fieldValue: '1', siblings: [...SIBS4.slice(0, 3), 'short'], dirs: [true, false, true, false] } }, /merkleProof\.siblings entries must be 64 hex/],
-        [{ merkleProof: { fieldValue: '1', siblings: SIBS4, dirs: [true] } }, /merkleProof\.dirs must be a JSON array of 4 booleans/],
+        [{ merkleProof: { fieldValue: '1', siblings: SIBS4, dirs: [true] } }, /merkleProof\.dirs must be an array of 4 booleans/],
         [{ merkleProof: { fieldValue: '1', siblings: SIBS4, dirs: [true, false, 'false', true] } }, /merkleProof\.dirs entries must be booleans/],
         [{ merkleProof: { fieldValue: '1', fieldSalt: 'abc', siblings: SIBS4, dirs: [true, false, true, false] } }, /merkleProof\.fieldSalt must be 64 hex/]
     ])('rejects a malformed per-call merkleProof %o', async (patch, msg) => {
@@ -422,6 +423,25 @@ describe('mintFactoryToken', () => {
         expect(JSON.stringify(call.request)).not.toMatch(/issuerSecret/);
     });
 
+    test('a token caller without sessionId mints from the pool wallet without owning it, but never names a pool wallet itself', async () => {
+        const { srv, tokenFactory } = setup();
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        try {
+            const viaGrant = makeReq({ ...valid, sessionId: undefined });
+            // No grant ID, so the value budget that needs the real job store is not touched here.
+            (viaGrant as any).agentGrant = { sponsorSessionId: null };
+            await srv.handlers['mintFactoryToken'](viaGrant);
+            expect(viaGrant.reject).not.toHaveBeenCalled();
+            expect(tokenFactory.issuerKeyForSession).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'pool-1', expectedUserId: undefined }));
+
+            const named = makeReq({ ...valid, sessionId: 'pool-1' });
+            await srv.handlers['mintFactoryToken'](named);
+            expect(tokenFactory.issuerKeyForSession).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'pool-1', expectedUserId: 'test-user' }));
+        } finally {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        }
+    });
+
     test('the executor records the landed type as learned and on the grant, and returns it with the call result', async () => {
         const submitter = makeSuccessfulSubmitter();
         setup({ submitterFactory: vi.fn(() => submitter) });
@@ -445,7 +465,7 @@ describe('mintFactoryToken', () => {
         recordLearnedSpy.mockClear(); recordMintedSpy.mockClear();
         const finalizer = registeredFinalizers.get('mintFactoryToken\u00001')!;
         expect(finalizer).toBeTypeOf('function');
-        const finalized: any = await finalizer(command, { ID: 'job-z', kind: 'mintFactoryToken', sessionId: 'mint-f1', grantId: 'grant-9' }, { submissionId: null, txHash: 'ab'.repeat(32), contractAddress: FACTORY, finalizedAt: null, blockHeight: 7 });
+        const finalized: any = await runFinalizer(finalizer, command, { ID: 'job-z', kind: 'mintFactoryToken', sessionId: 'mint-f1', grantId: 'grant-9' }, { submissionId: null, txHash: 'ab'.repeat(32), contractAddress: FACTORY, finalizedAt: null, blockHeight: 7 }, { run: vi.fn(async () => undefined) });
         expect(finalized).toMatchObject({ reconciled: true, txHash: 'ab'.repeat(32), tokenType: TOKEN.tokenType, contractAddress: FACTORY });
         expect(recordLearnedSpy).toHaveBeenCalledWith(expect.anything(), [TOKEN.tokenType], expect.objectContaining({ grantId: 'grant-9', txHash: 'ab'.repeat(32) }));
         expect(recordMintedSpy).toHaveBeenCalledWith(expect.anything(), 'grant-9', [TOKEN.tokenType]);
@@ -978,9 +998,9 @@ describe('anchorDocument', () => {
         expect(started.request).toMatchObject({ attesterId: ATTESTER_ID });
         expect(started.request).not.toHaveProperty('producedAt');
 
-        // INSERT (sync) + attesterId UPDATE (sync) + anchoredTxHash UPDATE (executor) = 3 db.run calls.
-        expect(db.run).toHaveBeenCalledTimes(3);
-        expect(JSON.stringify(db.run.mock.calls[1][0])).toContain(ATTESTER_ID);
+        // INSERT with the attester id (sync) + anchoredTxHash UPDATE (executor) = 2 db.run calls.
+        expect(db.run).toHaveBeenCalledTimes(2);
+        expect(JSON.stringify(db.run.mock.calls[0][0])).toContain(ATTESTER_ID);
 
         // ONE transaction: attest(payload_hash, metadata_hash). The record key
         // is derived in-circuit from the caller, so nothing else travels.
@@ -1001,11 +1021,11 @@ describe('anchorDocument', () => {
         const { db } = setupHandlersWithDb();
         db.run.mockClear();
         const finalizer = registeredFinalizers.get('anchorDocument\0' + '1')!;
-        const result = await finalizer({
+        const result = await runFinalizer(finalizer, {
             op: 'anchorDocument', documentId: 'doc-reconciled', payloadHash: VALID_SHA256,
             metadataHash: 'b'.repeat(64), contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
             artifactDigest: getArtifactGenerationDigest('attestation-vault')
-        }, {}, { txHash: '0xanchor', finalizedAt: '2026-07-22T10:00:00Z' });
+        }, {}, { txHash: '0xanchor', finalizedAt: '2026-07-22T10:00:00Z' }, db);
 
         expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('doc-reconciled');
         expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('0xanchor');
@@ -1047,8 +1067,8 @@ describe('anchorDocument', () => {
         });
         const req = makeReq(VALID_ANCHOR_ARGS());
         const result: any = await srv.handlers['anchorDocument'](req);
-        // INSERT + attesterId UPDATE ran (2); the anchoredTxHash UPDATE did NOT (work threw before reaching it)
-        expect(db.run).toHaveBeenCalledTimes(2);
+        // Only the INSERT ran; the anchoredTxHash UPDATE did not, because the work threw first.
+        expect(db.run).toHaveBeenCalledTimes(1);
         // The handler still returns successfully; failure is in the job row.
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toMatchObject({ jobId: expect.any(String), status: 'pending' });
@@ -1455,11 +1475,11 @@ describe('grantDisclosure', () => {
         const { db } = setupHandlersWithDb();
         db.run.mockClear();
         reindexer.mockClear();
-        const result = await registeredFinalizers.get('grantDisclosure\0' + '1')!({
+        const result = await runFinalizer(registeredFinalizers.get('grantDisclosure\0' + '1')!, {
             op: 'grantDisclosure', disclosureGrantId: 'grant-reconciled', payloadHash: VALID_PAYLOAD,
             grantee: VALID_GRANTEE, level: 2, contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
             artifactDigest: getArtifactGenerationDigest('attestation-vault')
-        }, {}, { txHash: '0xgrant', finalizedAt: null });
+        }, {}, { txHash: '0xgrant', finalizedAt: null }, db);
 
         expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('0xgrant');
         expect(reindexer).toHaveBeenCalledTimes(1);
@@ -1660,11 +1680,11 @@ describe('revokeDisclosure', () => {
         const reindexer = vi.fn().mockResolvedValue({ indexed: 0, deactivated: 1 });
         const { db } = setupHandlersWithDb({ disclosureReindexer: reindexer });
         db.run.mockClear();
-        const result = await registeredFinalizers.get('revokeDisclosure\0' + '1')!({
+        const result = await runFinalizer(registeredFinalizers.get('revokeDisclosure\0' + '1')!, {
             op: 'revokeDisclosure', payloadHash: VALID_PAYLOAD, grantee: VALID_GRANTEE,
             contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
             artifactDigest: getArtifactGenerationDigest('attestation-vault')
-        }, {}, { txHash: '0xrevoke', finalizedAt: null });
+        }, {}, { txHash: '0xrevoke', finalizedAt: null }, db);
 
         const update = JSON.stringify(db.run.mock.calls[0][0]);
         expect(update).toContain('0xrevoke');
@@ -1786,11 +1806,11 @@ describe('registerPassport', () => {
         const reindexer = vi.fn().mockResolvedValue({ indexed: 0, deactivated: 0 });
         const { db } = setupHandlersWithDb({ disclosureReindexer: reindexer });
         const payload = 'e'.repeat(64);
-        const result = await registeredFinalizers.get('retract\0' + '1')!({
+        const result = await runFinalizer(registeredFinalizers.get('retract\0' + '1')!, {
             op: 'retract', mode: 0, key: payload,
             contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
             artifactDigest: getArtifactGenerationDigest('attestation-vault')
-        }, {}, { txHash: '0xretract', finalizedAt: null, blockHeight: 700 });
+        }, {}, { txHash: '0xretract', finalizedAt: null, blockHeight: 700 }, db);
         expect(result).toEqual({ reconciled: true, mode: 0, key: payload, contractAddress: '0xVAULT', txHash: '0xretract' });
         expect(db.run).toHaveBeenCalledTimes(1);
         const q: any = (db.run as Mock).mock.calls[0][0];
@@ -2196,7 +2216,7 @@ describe('issueFieldPredicateAttestation', () => {
         [{ predicate: 'between' }, /lessOrEqual.*greaterOrEqual/],
         [{ siblings: SIBLINGS.slice(0, 2) }, /array of 4 hashes/],
         [{ dirs: [true] }, /array of 4 booleans/],
-        [{ siblings: [...SIBLINGS.slice(0, 3), 'short'] }, /each siblings entry must be 64 hex/],
+        [{ siblings: [...SIBLINGS.slice(0, 3), 'short'] }, /siblings entries must be 64 hex/],
         [{ dirs: [true, false, 'false', true] }, /dirs entries must be booleans/],
         [{ sessionId: undefined }, /sessionId is required/],
         [{ contractAddress: undefined }, /contractAddress is required/]
@@ -2400,7 +2420,8 @@ describe('issueFieldPredicateAttestationBatch', () => {
                 fieldKey: expect.stringMatching(HEX64_RE),
                 predicate: 'lessOrEqual',
                 threshold: expect.any(String),
-                unit: 'kgCO2e/kWh'
+                unit: 'kgCO2e/kWh',
+                expectedDigest: null, setRoot: null, payloadHashB: null, allowedMask: null, k: null
             });
         }
 

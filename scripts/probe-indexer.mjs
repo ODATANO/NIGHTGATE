@@ -1,11 +1,6 @@
-// Probes the local Midnight indexer container for liveness and progress.
-//
-// Reports: GraphQL HTTP status, latest indexed block, distance to chain tip,
-// caught-up status, and a sample block query to confirm data delivery.
-//
-// Run:
-//   npm run sync:probe                       (defaults to http://localhost:8088)
-//   INDEXER_URL=http://other:8088 node scripts/probe-indexer.mjs
+// Probes a Midnight indexer for liveness, latest indexed block and distance to the chain tip.
+// Run: npm run sync:probe
+// Env: INDEXER_URL, default http://localhost:8088.
 
 const URL_BASE = process.env.INDEXER_URL || 'http://localhost:8088';
 const ENDPOINT = `${URL_BASE}/api/v4/graphql`;

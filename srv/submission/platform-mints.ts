@@ -1,8 +1,6 @@
-/**
- * Bookkeeping for a token mint that landed on chain, whatever path sent it.
- * The token types become known platform-wide. Under a grant they are also stored on the grant.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Bookkeeping for a token mint that landed on chain, whatever path sent it.
+// The token types become known platform-wide. Under a grant they are also stored on the grant.
+// SPDX-License-Identifier: Apache-2.0
 import type { DbRunner } from '../utils/db-types';
 import { recordLearnedTokenTypes } from './learned-token-types';
 import { recordMintedTokenTypes } from '../sessions/agent-grants';

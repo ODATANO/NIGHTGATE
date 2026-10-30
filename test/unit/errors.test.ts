@@ -99,6 +99,19 @@ describe('normalizeHttpError', () => {
         expect(err.details.map((d: any) => d.code)).toEqual(['INVALID_ARGUMENT', 'X_CODE']);
     });
 
+    it('gives a combined input error without own status the status of its parts, not 500', () => {
+        process.env.NODE_ENV = 'production';
+        const err: any = { message: 'MULTIPLE_ERRORS', details: [
+            { status: 400, code: 'ASSERT_DATA_TYPE', message: 'not a Map', target: 'document' },
+            { status: 400, code: 'ASSERT_ARRAY', message: 'Value must be an array', target: 'proofFields' }] };
+        normalizeHttpError(err);
+        expect([err.status, err.code, err.message]).toEqual([400, 'INVALID_ARGUMENT', 'MULTIPLE_ERRORS']);
+        expect(err.details.map((d: any) => d.target)).toEqual(['document', 'proofFields']);
+        const mixed: any = { message: 'MULTIPLE_ERRORS', details: [{ status: 400, message: 'a' }, { status: 503, message: 'b' }] };
+        normalizeHttpError(mixed);
+        expect(mixed.status).toBe(500);
+    });
+
     it('withholds a 5xx message in production itself, so the code survives', () => {
         process.env.NODE_ENV = 'production';
         const err: any = { code: 503, message: 'secret upstream detail' };

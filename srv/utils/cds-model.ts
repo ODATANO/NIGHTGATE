@@ -1,10 +1,7 @@
 import cds from '@sap/cds';
 
-/**
- * Loads the CDS model if CAP has not attached it yet.
- * Without a model, INSERT, UPDATE and DELETE queries that name an entity by string fail.
- * The `typeof` checks exist because unit tests often mock only part of `cds`.
- */
+/** Loads the CDS model if CAP has not attached it yet. Queries that name an entity by string fail without it.
+ *  The `typeof` checks exist because unit tests often mock only part of `cds`. */
 export async function ensureNightgateModelLoaded(): Promise<void> {
     if (cds.model) return;
     if (typeof cds.load !== 'function') return;

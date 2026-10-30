@@ -144,6 +144,20 @@ describe('buildHealth', () => {
         expect((await buildHealth(db)).lag).toBe(0);
     });
 
+    it('is unhealthy while an enabled crawler has stopped, whatever the frozen lag says', async () => {
+        mockDbRun.mockResolvedValueOnce({ chainHeight: '1000', lastIndexedHeight: '1000', syncStatus: 'error' });
+        expect((await buildHealth(db)).status).toBe('unhealthy');
+        mockRuntimeConfig.mockReturnValue({ crawlerConfig: { enabled: false } });
+        mockDbRun.mockResolvedValueOnce({ chainHeight: '1000', lastIndexedHeight: '1000', syncStatus: 'stopped' });
+        expect((await buildHealth(db)).status).toBe('healthy');
+    });
+
+    it('is degraded when an enabled crawler indexed nothing for five minutes', async () => {
+        const stale = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+        mockDbRun.mockResolvedValueOnce({ chainHeight: '1000', lastIndexedHeight: '1000', syncStatus: 'synced', lastIndexedAt: stale });
+        expect((await buildHealth(db)).status).toBe('degraded');
+    });
+
     it('answers `unknown` rather than throwing when there is no sync state row', async () => {
         const health = await buildHealth(db);
         expect(health.status).toBe('unknown');

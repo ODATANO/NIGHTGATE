@@ -51,19 +51,8 @@ export interface GetWalletBalanceArgs {
     rpcTimeoutMs?: number;
 }
 
-export interface WalletBalanceSnapshot {
-    shieldedNight: string;
-    unshieldedNight: string;
-    shieldedTokens: Array<{ tokenType: string; amount: string }>;
-    dustBalance: string;
-    registeredNightUtxoCount: number;
-    totalNightUtxoCount: number;
-    dustUtxoCount: number;
-    dustPendingCount: number;
-    dustPendingValue: string;
-    /** How often this process restored the dust wallet from a snapshot taken before a build. */
-    dustRestoreCount: number;
-}
+import type { WalletBalanceSnapshot } from '../midnight/wallet-worker-client';
+export type { WalletBalanceSnapshot };
 
 export async function getWalletBalance(args: GetWalletBalanceArgs): Promise<WalletBalanceSnapshot> {
     return walletGetBalance({

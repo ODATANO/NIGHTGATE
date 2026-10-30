@@ -1,7 +1,5 @@
-/**
- * OData handlers for the submit actions. They validate and start jobs.
- * The SDK calls happen in TransactionSubmitter.
- */
+// OData handlers for the submit actions. They validate and start jobs.
+// The SDK calls happen in TransactionSubmitter.
 
 import cds from '@sap/cds';
 import { TransactionSubmitter, type TransactionSubmitterDeps } from './TransactionSubmitter';

@@ -1,16 +1,12 @@
-/**
- * Picks a sponsor wallet from the pool and decides what to do when one fails.
- * State is kept in memory, so each server process needs its own set of wallets.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Picks a sponsor wallet from the pool and decides what to do when one fails.
+// State is kept in memory, so each server process needs its own set of wallets.
+// SPDX-License-Identifier: Apache-2.0
 
 import { classifySubmitFailure } from '../midnight/submit-error-classification';
 import { findNightgateError } from '../utils/errors';
+import { setTimeout as sleep } from 'node:timers/promises';
 
-/**
- * Stands for "any sponsor from the pool" instead of one sponsor session.
- * It is a UUID because every field that carries it is typed as UUID in OData.
- */
+/** Stands for any sponsor from the pool. It is a UUID because every field that carries it is typed as UUID in OData. */
 export const PLATFORM_POOL_SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
 
 interface SponsorLane {
@@ -69,7 +65,7 @@ export async function acquireSponsor(poolIds: string[], waitMs: number, atGate?:
         if (Date.now() >= deadline) {
             throw new Error(`all ${poolIds.length} pool sponsors are busy or cooling down; resubmit shortly`);
         }
-        await new Promise(r => setTimeout(r, 500));
+        await sleep(500);
     }
 }
 
@@ -85,8 +81,7 @@ export function benchSponsor(id: string, cooldownMs: number): void {
 }
 
 /**
- * True for failures caused by the sponsor's own state, where the next sponsor may succeed.
- * Failures caused by the caller's transaction return false, so they do not pause every sponsor.
+ * True for failures caused by the sponsor's own state, where the next sponsor may succeed. Failures caused by the caller's transaction return false, so they do not pause every sponsor.
  */
 export function isRetryableSponsorFailure(err: unknown): boolean {
     const coded = findNightgateError(err)?.code;
@@ -119,17 +114,13 @@ export function isPreInclusionReject(err: unknown): boolean {
         && (info.ledgerCode === 'closing-socket' || info.ledgerCode === 'not-sent' || info.ledgerCode === 'wallet-not-synced');
 }
 
-/**
- * The tx may still land. Never rebuild, or the fee could be paid twice.
- * The job goes to reconciliation_required.
- */
+/** The tx may still land, so never rebuild or the fee could be paid twice. The job goes to reconciliation_required. */
 export function isAmbiguousSubmitOutcome(err: unknown): boolean {
     return classifySubmitFailure(err).code === 'ambiguous';
 }
 
 /**
- * The node rejected the tx without a reason. That looks the same as an invalid caller tx.
- * Each retry costs the sponsor a dust proof, so it gets at most one rebuild.
+ * The node rejected the tx without a reason, which looks the same as an invalid caller tx. Each retry costs the sponsor a dust proof, so it gets at most one rebuild.
  */
 export function isGenericInvalidFailure(err: unknown): boolean {
     const info = classifySubmitFailure(err);
@@ -150,10 +141,7 @@ export function decideSponsorFailure(err: unknown): { decision: SponsorFailureDe
     return { decision: 'fail', generic: false, preInclusion };
 }
 
-/**
- * Sponsor order for unbound transactions. Reserves nothing, since the worker locks single dust notes.
- * Paused sponsors are left out.
- */
+/** Sponsor order for unbound transactions, without paused sponsors. Reserves nothing, since the worker locks single dust notes. */
 export function sponsorCandidatesNonExclusive(poolIds: string[], now: number = Date.now(), atGate?: SponsorAtGate): string[] {
     return poolIds
         .filter((id) => lane(id).cooldownUntil <= now)

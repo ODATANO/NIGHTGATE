@@ -7,7 +7,7 @@ import { TypeRegistry } from '@polkadot/types/create';
 import { Metadata } from '@polkadot/types/metadata';
 import { MidnightNodeProvider, SignedBlock } from '../providers/MidnightNodeProvider';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
-import { isUniqueViolation } from '../utils/retry';
+import { isUniqueViolation } from '../utils/db-errors';
 import {
     getNightgatePluginConfig, getConfiguredNightgateNetwork, normalizeNightgateNetwork
 } from '../utils/nightgate-config';
@@ -21,6 +21,9 @@ import {
     Blocks, Transactions, TransactionResults, TransactionFees, ContractActions,
     UnshieldedUtxos, NightBalances, SyncState, type UnshieldedUtxo
 } from '#cds-models/midnight';
+import { bareHex } from '../utils/hex-patterns';
+import { toBigInt, toInt } from '../utils/numbers';
+import { hexToBase64 } from './cap-binary';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 const log = cds.log('nightgate:crawler');
@@ -81,10 +84,6 @@ const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     50: { name: 'SystemParameters', txType: 'system', isSystem: true },
     51: { name: 'Throttle', txType: 'system', isSystem: true }
 };
-
-function hexToBinaryValue(hex: string): string {
-    return Buffer.from(hex.startsWith('0x') ? hex.slice(2) : hex, 'hex').toString('base64');
-}
 
 /** Entries from `cds.requires.nightgate.palletMap` override both the defaults and the runtime metadata. */
 function configPalletOverrides(): Map<number, PalletMapping> {
@@ -213,10 +212,8 @@ export class BlockProcessor {
     /** System::Events = twox128("System") + twox128("Events"). */
     private static readonly SYSTEM_EVENTS_STORAGE_KEY =
         '0x26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7';
-    /**
-     * System::LastRuntimeUpgrade = twox128("System") + twox128("LastRuntimeUpgrade").
-     * Reading it is cheap. `state_getRuntimeVersion` at an old block makes the node compile that runtime.
-     */
+    // twox128("System") + twox128("LastRuntimeUpgrade"). Reading it is cheap.
+    // `state_getRuntimeVersion` at an old block makes the node compile that runtime.
     private static readonly LAST_RUNTIME_UPGRADE_STORAGE_KEY =
         '0x26aa394eea5630e07c48ae0c9558cef7f9cce9c888469bb1a0dceaa129672ef8';
     /** Runtime version per raw LastRuntimeUpgrade value, so the node is asked once per value and not per block. */
@@ -250,10 +247,7 @@ export class BlockProcessor {
         return this.processFromNode(hash, Date.now(), { requireParent: true });
     }
 
-    /**
-     * Fetches a range of heights in two JSON-RPC batches.
-     * The first gets all hashes, the second the block data for every hash not indexed yet.
-     */
+    /** Fetches a range of heights in two JSON-RPC batches. The second batch skips blocks already indexed. */
     async fetchBlockBatch(heights: number[]): Promise<PreparedBlock[]> {
         if (heights.length === 0) return [];
         const fetchStartedAt = Date.now();
@@ -342,7 +336,7 @@ export class BlockProcessor {
     /** Timestamp::Now is a little-endian u64 in milliseconds. Returns UNIX seconds, or null. */
     private parseTimestampHex(hex: string | null | undefined): number | null {
         if (!hex) return null;
-        const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+        const clean = bareHex(hex);
         try {
             return Number(Buffer.from(clean, 'hex').readBigUInt64LE(0) / 1000n);
         } catch {
@@ -513,7 +507,7 @@ export class BlockProcessor {
                     hash: extrinsicHash,
                     ledgerTxHash: events?.ledgerTxHash ?? null,
                     protocolVersion,
-                    raw: hexToBinaryValue(extrinsicHex),
+                    raw: hexToBase64(extrinsicHex),
                     transactionType: classification.isSystem ? 'SYSTEM' : 'REGULAR',
                     txType: txTypeFromEvents(events) ?? classification.txType,
                     isShielded: shielded,
@@ -642,10 +636,8 @@ export class BlockProcessor {
         return this.resolvedNetwork;
     }
 
-    /**
-     * A UTXO whose address or nonce cannot be derived is skipped with a warning instead of failing the block.
-     * `initialNonce` cannot be null.
-     */
+    // A UTXO whose address or nonce cannot be derived is skipped with a warning instead of failing the block.
+    // `initialNonce` cannot be null.
     private async projectEvents(
         extrinsicEvents: Map<number, ExtrinsicEvents> | null,
         timestamp: number,
@@ -705,10 +697,8 @@ export class BlockProcessor {
         return events.partialSuccess ? 'PARTIAL_SUCCESS' : 'SUCCESS';
     }
 
-    /**
-     * The pallet's events win. The pallet map is only a fallback for an extrinsic without events,
-     * because a pallet index cannot tell a contract call from a token transfer.
-     */
+    // The pallet's events win. The pallet map is only a fallback for an extrinsic without events,
+    // because a pallet index cannot tell a contract call from a token transfer.
     private contractActionsFor(
         events: ExtrinsicEvents | undefined,
         classification: ExtrinsicClassification
@@ -752,7 +742,7 @@ export class BlockProcessor {
             spentBy.set(spend.txId, ids);
             if (row.tokenType !== NIGHT_RAW_TOKEN_TYPE) continue;
             const delta = deltaFor(row.owner);
-            delta.balance -= this.toBigInt(row.value);
+            delta.balance -= toBigInt(row.value);
             delta.utxoCount -= 1;
         }
         for (const [txId, ids] of spentBy) {
@@ -760,10 +750,7 @@ export class BlockProcessor {
         }
     }
 
-    /**
-     * Must give the same result as `recomputeNightBalance` in rollback.ts,
-     * which rebuilds the values from scratch after a reorg.
-     */
+    /** Must give the same result as `recomputeNightBalance` in rollback.ts, which rebuilds balances after a reorg. */
     private async applyBalanceDelta(tx: DbRunner, address: string, delta: BalanceDelta, height: number): Promise<void> {
         const nowIso = new Date().toISOString();
         const existing = await tx.run(
@@ -794,12 +781,12 @@ export class BlockProcessor {
 
         const priorFirstSeen = Number(existing.firstSeenHeight);
         await tx.run(UPDATE.entity(NightBalances).set({
-            balance: (this.toBigInt(existing.balance) + delta.balance).toString(),
-            utxoCount: this.toInt(existing.utxoCount) + delta.utxoCount,
-            totalReceived: (this.toBigInt(existing.totalReceived) + delta.totalReceived).toString(),
-            txReceivedCount: this.toInt(existing.txReceivedCount) + delta.txReceivedCount,
-            totalSent: (this.toBigInt(existing.totalSent) + delta.totalSent).toString(),
-            txSentCount: this.toInt(existing.txSentCount) + delta.txSentCount,
+            balance: (toBigInt(existing.balance) + delta.balance).toString(),
+            utxoCount: toInt(existing.utxoCount) + delta.utxoCount,
+            totalReceived: (toBigInt(existing.totalReceived) + delta.totalReceived).toString(),
+            txReceivedCount: toInt(existing.txReceivedCount) + delta.txReceivedCount,
+            totalSent: (toBigInt(existing.totalSent) + delta.totalSent).toString(),
+            txSentCount: toInt(existing.txSentCount) + delta.txSentCount,
             firstSeenHeight: Number.isFinite(priorFirstSeen) ? Math.min(priorFirstSeen, height) : height,
             lastActivityHeight: height,
             lastActivityAt: nowIso,
@@ -830,7 +817,7 @@ export class BlockProcessor {
     }
 
     private extrinsicSize(hex: string): number {
-        const cleanHex = hex.startsWith('0x') ? hex.slice(2) : hex;
+        const cleanHex = bareHex(hex);
         return Math.ceil(cleanHex.length / 2);
     }
 
@@ -874,31 +861,9 @@ export class BlockProcessor {
         };
     }
 
-    private toBigInt(value: unknown): bigint {
-        if (typeof value === 'bigint') return value;
-        if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.trunc(value));
-        if (typeof value === 'string' && value.trim() !== '') {
-            try {
-                return BigInt(value);
-            } catch {
-                return 0n;
-            }
-        }
-        return 0n;
-    }
-
-    private toInt(value: unknown): number {
-        if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
-        if (typeof value === 'string' && value.trim() !== '') {
-            const parsed = Number(value);
-            if (Number.isFinite(parsed)) return Math.trunc(parsed);
-        }
-        return 0;
-    }
-
     /** blake2b-256 of the raw extrinsic bytes, the standard extrinsic hash used by block explorers. */
     private hashExtrinsic(hex: string): string {
-        const cleanHex = hex.startsWith('0x') ? hex.slice(2) : hex;
+        const cleanHex = bareHex(hex);
         const bytes = Buffer.from(cleanHex, 'hex');
         const hash = blake2b(bytes, { dkLen: 32 });
         return '0x' + bytesToHex(hash);
@@ -951,10 +916,8 @@ export class BlockProcessor {
         return map;
     }
 
-    /**
-     * A block with extrinsics but without readable events is never stored.
-     * Its UTXOs and balance changes would otherwise be missing for good.
-     */
+    // A block with extrinsics but without readable events is never stored.
+    // Its UTXOs and balance changes would otherwise be missing for good.
     private decodeBlockEvents(
         rawEvents: string | null | undefined,
         registry: TypeRegistry | undefined,
@@ -983,10 +946,6 @@ export class BlockProcessor {
     }
 
     /** Never falls back to the local clock. */
-    private async getBlockTimestamp(blockHash: string): Promise<number | null> {
-        return this.parseTimestampHex(await this.getBlockTimestampHex(blockHash));
-    }
-
     private async getBlockTimestampHex(blockHash: string): Promise<string | null> {
         try {
             return (await this.nodeProvider.getStorage(BlockProcessor.TIMESTAMP_STORAGE_KEY, blockHash)) ?? null;
@@ -1005,12 +964,9 @@ export class BlockProcessor {
         }
     }
 
-    /**
-     * The node is asked for the runtime version once per `System.LastRuntimeUpgrade` value, because the call is expensive.
-     * An answer that differs from the decoded value is used for that block only and not cached.
-     * This happens on the block that performs an upgrade, which still carries the old value.
-     * Without a stored value, the node is asked for every block.
-     */
+    // Asks the node for the runtime version once per `System.LastRuntimeUpgrade` value, because the call is expensive.
+    // An upgrade block still carries the old value. A differing node answer is used for that block only and not cached.
+    // Without a stored value, the node is asked for every block.
     private async resolveSpecVersion(upgradeHex: string | null | undefined, blockHash: string, where: string): Promise<number> {
         if (typeof upgradeHex !== 'string' || !/^0x[0-9a-fA-F]{2,}$/.test(upgradeHex)) {
             return this.getProtocolVersion(blockHash, where);
@@ -1045,7 +1001,7 @@ export class BlockProcessor {
 
     /** Reads `spec_version` from a SCALE `LastRuntimeUpgradeInfo`. Null if the bytes do not decode. */
     static decodeLastRuntimeUpgrade(hex: string): number | null {
-        const bytes = Buffer.from(hex.startsWith('0x') ? hex.slice(2) : hex, 'hex');
+        const bytes = Buffer.from(bareHex(hex), 'hex');
         if (bytes.length === 0) return null;
         switch (bytes[0] & 0b11) {
             case 0: return bytes[0] >>> 2;
@@ -1071,7 +1027,7 @@ export class BlockProcessor {
         if (!digestLogs || digestLogs.length === 0) return null;
 
         for (const logHex of digestLogs) {
-            const clean = logHex.startsWith('0x') ? logHex.slice(2) : logHex;
+            const clean = bareHex(logHex);
             if (clean.length < 10) continue;
 
             const logType = parseInt(clean.slice(0, 2), 16);

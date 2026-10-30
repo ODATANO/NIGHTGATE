@@ -138,6 +138,21 @@ describe('CapDbPrivateStateProvider: password fallbacks', () => {
         expect(await strict.getSigningKey(CONTRACT)).toBe('sk-1');
     });
 
+    test('exporting signing keys reads a row under an older password through the fallback', async () => {
+        const { provider: old, db } = newProvider();
+        await old.setSigningKey(CONTRACT, 'sk-1');
+        const current = new CapDbPrivateStateProvider({
+            accountId: ACCOUNT,
+            privateStoragePasswordProvider: () => PASSWORD + '-rotated',
+            privateStoragePasswordFallbacks: () => [PASSWORD],
+            db
+        });
+        const exported = await current.exportSigningKeys({ password: 'export-password-long-enough' });
+        expect(exported.format).toBe('midnight-signing-key-export');
+        const strict = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD + '-rotated', db });
+        expect(await strict.getSigningKey(CONTRACT)).toBe('sk-1');
+    });
+
     test('without a matching fallback the original decrypt error surfaces', async () => {
         const { provider: old, db } = newProvider();
         await old.setContractAddress(CONTRACT);

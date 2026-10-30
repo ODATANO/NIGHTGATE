@@ -60,7 +60,7 @@ describe('unshielded offers next to a call', () => {
 
     it('stays refused without the right, naming the offer and the switch', () => {
         expect(() => workerExports.checkSponsorableShape(canonical, 5000, [C], ['deposit'], { nightTokenType: NIGHT }))
-            .toThrow(/fallibleUnshieldedOffer alongside its contract calls; moving the caller's own unshielded tokens needs allowUnshieldedOffers/);
+            .toThrow(/fallibleUnshieldedOffer alongside its contract calls; moving unshielded tokens needs allowUnshieldedOffers/);
     });
 
     it('accepts the canonical pay-in: NIGHT in, the contract gets some, the spender gets the change', () => {
@@ -86,7 +86,7 @@ describe('unshielded offers next to a call', () => {
         deficit.imbalances = () => new Map([[unshieldedKey(NIGHT), -5n]]);
         expect(() => allowed(deficit)).toThrow(/does not balance in token type.*deficit of 5/);
         expect(() => allowed(payIn([input(50n)], [output(10n, C), output(50n, ADDR_A)]))).toThrow(/creates more of token type.*than it spends/);
-        expect(() => allowed(payIn([], [output(10n, C)]))).toThrow(/spends nothing/);
+        expect(() => allowed(payIn([], [output(10n, C)]))).toThrow(/spends nothing and pays out nothing a called contract claims/);
     });
 
     it('a remainder for the circuit needs exactly one called contract', () => {
@@ -129,6 +129,44 @@ describe('unshielded offers next to a call', () => {
             .toThrow(/sits in an intent without a contract call/);
         expect(() => allowed(tx([{ actions: [CALL(C, 'deposit')], dustActions: { spends: [{}], registrations: [] } }]))).toThrow(/dustActions/);
         expect(() => allowed(payIn([input(10n, SPONSOR_KEY)], [output(10n, C)]))).toThrow(/spends a UTXO of the sponsor itself/);
+    });
+
+    describe('payouts the called contract claims', () => {
+        const claim = (entries: Array<[string, string, bigint]>, at = C) => ({
+            address: at, entryPoint: 'deposit',
+            fallibleTranscript: { effects: { claimedUnshieldedSpends: new Map(entries.map(([type, to, v]) => [[unshieldedKey(type), { tag: 'user', address: to }], v])) } }
+        });
+        const payout = (claims: Array<[string, string, bigint]>, inputs: unknown[], outputs: unknown[], balance = 0n) => {
+            const t = tx([{ actions: [claim(claims)], fallibleUnshieldedOffer: { inputs, outputs } }]);
+            t.imbalances = () => new Map([[unshieldedKey(NIGHT), balance], [unshieldedKey(CREDIT), balance]]);
+            return t;
+        };
+
+        it('accepts a payout to any address the contract names, with or without inputs of the caller', () => {
+            expect(allowed(payout([[NIGHT, ADDR_B, 30n]], [], [output(30n, ADDR_B)])).collectUnshielded).toEqual([]);
+            const mixed = payout([[NIGHT, ADDR_B, 30n]], [input(50n)], [output(10n, C), output(40n, ADDR_A), output(30n, ADDR_B)]);
+            expect(allowed(mixed).collectUnshielded).toEqual([{ type: NIGHT, amount: '10', to: C }]);
+            expect(allowed(payout([[NIGHT, ADDR_B, 20n], [NIGHT, ADDR_B, 10n]], [], [output(20n, ADDR_B), output(10n, ADDR_B)])).calls).toHaveLength(1);
+        });
+
+        it('refuses what the claims do not cover: a larger amount, another recipient, another token type', () => {
+            expect(() => allowed(payout([[NIGHT, ADDR_B, 20n]], [], [output(30n, ADDR_B)]))).toThrow(/no called contract claims that payout/);
+            expect(() => allowed(payout([[NIGHT, ADDR_A, 30n]], [], [output(30n, ADDR_B)]))).toThrow(/no called contract claims that payout/);
+            expect(() => allowed(payout([[CREDIT, ADDR_B, 30n]], [], [output(30n, ADDR_B)]))).toThrow(/no called contract claims that payout/);
+            expect(() => allowed(payout([[NIGHT, ADDR_B, 30n]], [], [output(30n, ADDR_B), output(30n, ADDR_B)]))).toThrow(/no called contract claims that payout/);
+        });
+
+        it('still needs a balanced segment and an allowed token type', () => {
+            expect(() => allowed(payout([[NIGHT, ADDR_B, 30n]], [], [output(30n, ADDR_B)], -30n))).toThrow(/deficit of 30/);
+            expect(() => allowed(payout([[CREDIT, ADDR_B, 5n]], [], [output(5n, ADDR_B, CREDIT)]))).toThrow(/neither NIGHT nor in allowedUnshieldedTokenTypes/);
+            expect(allowed(payout([[CREDIT, ADDR_B, 5n]], [], [output(5n, ADDR_B, CREDIT)]), { allowedUnshieldedTokenTypes: [CREDIT] }).calls).toHaveLength(1);
+        });
+
+        it('reads claims only from calls on the given contracts and skips unreadable entries', () => {
+            const actions = [claim([[NIGHT, ADDR_B, 30n]]), claim([[NIGHT, ADDR_A, 7n]], OTHER), { address: C, guaranteedTranscript: { effects: { claimedUnshieldedSpends: new Map<unknown, unknown>([['x', 1n], [[{ tag: 'shielded', raw: NIGHT }, { address: ADDR_A }], 2n]]) } } }];
+            expect(workerExports.claimedPayouts(actions, new Set([C]))).toEqual(new Map([[`${NIGHT}:${ADDR_B}`, 30n]]));
+            expect(workerExports.claimedPayouts(undefined, new Set([C]))).toEqual(new Map());
+        });
     });
 
     it('fails closed on an unreadable offer or balance', () => {

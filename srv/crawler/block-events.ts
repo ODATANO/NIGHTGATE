@@ -1,10 +1,7 @@
-/**
- * Reads the result of each extrinsic from a block's decoded `System.Events`.
- *
- * The Midnight pallet reports what a ledger transaction actually did.
- * That covers the unshielded UTXOs it spent and created, the contracts it touched, and whether all of it succeeded.
- * The extrinsic itself only holds what the transaction asked for, not the result.
- */
+// Reads the result of each extrinsic from a block's decoded `System.Events`.
+// The extrinsic only says what the transaction asked for. The Midnight pallet events say what it did.
+import { bareHex } from '../utils/hex-patterns';
+import { toBigInt, toInt } from '../utils/numbers';
 
 export interface UtxoEvent {
     /** Raw 32-byte owner, lower-case hex without `0x`. */
@@ -15,10 +12,8 @@ export interface UtxoEvent {
     outputNo: number;
 }
 
-/**
- * A contract action that was applied. The pallet reports no event for a failed action,
- * so a partly successful transaction reports fewer actions than it contains.
- */
+// A contract action that was applied. A failed action has no event,
+// so a partly successful transaction reports fewer actions than it contains.
 export interface ContractEvent {
     actionType: 'DEPLOY' | 'CALL' | 'UPDATE';
     /** Plain 32-byte address, as used by the Midnight indexer and the submission code. */
@@ -27,10 +22,7 @@ export interface ContractEvent {
 
 export interface ExtrinsicEvents {
     outcome?: 'SUCCESS' | 'FAILURE';
-    /**
-     * Hash of the ledger transaction inside the extrinsic.
-     * This is not the extrinsic hash. The Midnight indexer identifies transactions by this hash.
-     */
+    /** Hash of the ledger transaction, not the extrinsic hash. The Midnight indexer identifies transactions by it. */
     ledgerTxHash?: string;
     applied: boolean;
     /** True on `TxPartialSuccess`: the transaction was applied, but not every part succeeded. */
@@ -46,27 +38,9 @@ const CONTRACT_ACTION_BY_METHOD: Record<string, ContractEvent['actionType']> = {
     ContractMaintain: 'UPDATE'
 };
 
-/** `toHuman()` writes integers with thousands separators. */
-function toBigInt(value: unknown): bigint {
-    if (typeof value === 'bigint') return value;
-    if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.trunc(value));
-    const text = String(value ?? '').replace(/[,_\s]/g, '');
-    if (!/^\d+$/.test(text)) return 0n;
-    return BigInt(text);
-}
-
-function toInt(value: unknown): number {
-    const big = toBigInt(value);
-    return big <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(big) : 0;
-}
-
-function hex(value: unknown): string {
-    return String(value ?? '').replace(/^0x/i, '').toLowerCase();
-}
-
 /** Events carry `midnight:contract-address[vN]:` plus the 32 bytes. Everywhere else only the 32 bytes are used. */
 export function stripContractAddressPrefix(rawHex: string): string {
-    const clean = hex(rawHex);
+    const clean = bareHex(rawHex);
     if (clean.length <= 64 || clean.length % 2 !== 0) return clean;
     const prefixBytes = Buffer.from(clean.slice(0, clean.length - 64), 'hex');
     const prefix = prefixBytes.toString('latin1');
@@ -80,12 +54,12 @@ function readUtxoList(list: unknown): UtxoEvent[] {
     for (const entry of list) {
         if (!entry || typeof entry !== 'object') continue;
         const e = entry as Record<string, unknown>;
-        const intentHash = hex(e.intentHash);
-        const address = hex(e.address);
+        const intentHash = bareHex(e.intentHash);
+        const address = bareHex(e.address);
         if (!intentHash || !address) continue;
         out.push({
             address,
-            tokenType: hex(e.tokenType),
+            tokenType: bareHex(e.tokenType),
             intentHash,
             value: toBigInt(e.value),
             outputNo: toInt(e.outputNo)
@@ -126,7 +100,7 @@ export function readBlockEvents(records: Iterable<any>): Map<number, ExtrinsicEv
         try { payload = record.event.data.toHuman()?.[0]; } catch { continue; }
         if (payload == null) continue;
 
-        const txHash = hex(payload.txHash);
+        const txHash = bareHex(payload.txHash);
         if (txHash) at(index).ledgerTxHash = txHash;
 
         if (method === 'UnshieldedTokens') {
@@ -175,10 +149,8 @@ export interface TransferProjection {
     nightAmount: bigint | null;
 }
 
-/**
- * Filled only for a transfer from one address to one other address.
- * With several senders or receivers the fields stay null, because no single one is "the" sender.
- */
+// Filled only for a transfer from one address to one other address.
+// With several senders or receivers the fields stay null.
 export function projectTransfer(events: ExtrinsicEvents | undefined): TransferProjection {
     const none: TransferProjection = { senderAddress: null, receiverAddress: null, nightAmount: null };
     if (!events) return none;

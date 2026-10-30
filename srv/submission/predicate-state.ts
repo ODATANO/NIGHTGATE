@@ -1,9 +1,6 @@
-/**
- * Checks proven claims directly in the live contract state, without the crawler.
- * A claim key is the map key under which the contract stores one proven claim.
- * `@odatano/contract-kit` computes the keys. This module picks the right key for each claim type.
- * Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
- */
+// Checks proven claims directly in the live contract state, without the crawler.
+// A claim key is the map key under which the contract stores one proven claim. This module picks the key for each claim type.
+// Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
 import {
     CLAIM_TAG,
     readPredicateResult,
@@ -75,8 +72,7 @@ export interface ReadPredicateStateForContractArgs {
 }
 
 /**
- * Recompute the claim key from the document root stored on chain right now, then look it up.
- * A claim made against an older root of the same document is therefore not found.
+ * Recomputes the claim key from the document root on chain right now, then looks it up. A claim made against an older root of the same document is not found.
  */
 export async function readPredicateStateForContract(
     args: ReadPredicateStateForContractArgs

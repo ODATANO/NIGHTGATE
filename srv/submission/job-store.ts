@@ -1,15 +1,13 @@
-/**
- * Database access for background job rows: status changes, leases and job admission errors.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Database access for background job rows: status changes, leases and job admission errors.
+// SPDX-License-Identifier: Apache-2.0
 import { withLockContentionRetry, LOCK_CONTENTION_ATTEMPTS } from './db-write-retry';
 import cds from '@sap/cds';
 import crypto from 'crypto';
 import { AsyncResource } from 'async_hooks';
 import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
 import { type SubmissionErrorClassification } from './TransactionSubmitter';
-import { configString } from '../utils/config';
-import type { DbRunner } from '../utils/db-types';
+import { configString, configMs } from '../utils/config';
+import { affectedRows, type DbRunner } from '../utils/db-types';
 import { NightgateError, errorMessage } from '../utils/errors';
 
 const { SELECT, UPDATE } = cds.ql;
@@ -38,11 +36,23 @@ export class WorkflowReconciliationRequiredError extends Error {
 }
 
 /**
- * Runs `fn` outside the request's transaction, so each query commits on its own.
- * It cannot see the request's uncommitted writes, so call it before the handler writes.
+ * Runs `fn` outside the request's transaction, so each query commits on its own. It cannot see the request's uncommitted writes, so call it before the handler writes.
  */
 export function runWithoutAmbientTx<T>(fn: () => Promise<T>): Promise<T> {
     return detachedJobScope.runInAsyncScope(fn);
+}
+
+/** Where-clause of a job's attempt row: by its id when recorded, else by the transaction hash. */
+export function attemptRowOf(ref: { submissionId?: string | null; txHash?: string | null }): Record<string, unknown> {
+    return ref.submissionId ? { ID: ref.submissionId } : { txHash: ref.txHash };
+}
+
+/** Why a workflow fails with its child: the child's error and the steps already on chain. */
+export function childFailedMessage(failed: BackgroundJob, siblings: BackgroundJob[]): string {
+    const landed = siblings.filter(child => child.status === 'succeeded').map(child => child.workflowStep ?? child.ID);
+    return `Child job ${failed.ID} (workflow step '${failed.workflowStep ?? '?'}') failed [${failed.errorCode ?? 'UNKNOWN'}]: ${String(failed.errorMessage ?? 'unknown error').slice(0, 1500)}` +
+        (landed.length ? ` Steps already on chain: ${landed.join(', ')}.` : ' No step of this workflow is on chain.') +
+        ' A new attempt needs a new idempotencyKey.';
 }
 
 export async function getJobById(jobId: string): Promise<BackgroundJob | null> {
@@ -52,10 +62,7 @@ export async function getJobById(jobId: string): Promise<BackgroundJob | null> {
     return (row as BackgroundJob | undefined) || null;
 }
 
-/**
- * Fails pending jobs whose wallet session was closed at restart.
- * Must run before jobs start, since such a job could no longer decrypt its keys.
- */
+/** Fails pending jobs whose wallet session was closed at restart. Must run before jobs start, since such a job can no longer decrypt its keys. */
 export async function dropPendingJobsForClosedSessions(sessionIds: string[]): Promise<number> {
     if (sessionIds.length === 0) return 0;
     const db = await cds.connect.to('db');
@@ -94,9 +101,7 @@ export async function findLatestJob(kind: string, sessionId: string): Promise<{ 
 }
 
 /**
- * Marks older pending or running jobs of `kind` for the session as SUPERSEDED.
- * A running job keeps running, but its result is ignored. Inside a request this
- * uses the request's transaction, so it commits together with the new job.
+ * Marks older pending or running jobs of `kind` for the session as SUPERSEDED. A running one keeps running, but its result is ignored. Inside a request this commits together with the new job.
  */
 export async function supersedeQueuedJobs(kind: string, sessionId: string, excludeJobId?: string): Promise<number> {
     const db = await cds.connect.to('db');
@@ -144,7 +149,6 @@ export async function supersedeQueuedJobs(kind: string, sessionId: string, exclu
     return count;
 }
 
-export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 
 /** The `BackgroundJobs.idempotencyKey` column width. */
@@ -179,10 +183,6 @@ export class JobAdmissionBusyError extends NightgateError {
 
 export { isUniqueViolation } from '../utils/db-errors';
 
-export function affectedRows(value: unknown): number {
-    return typeof value === 'number' ? value : Number((value as any)?.changes ?? value ?? 0);
-}
-
 export async function markRunning(jobId: string): Promise<boolean> {
     const db = await cds.connect.to('db');
     const affected = await withLockContentionRetry(`markRunning(${jobId})`, async () => {
@@ -194,7 +194,7 @@ export async function markRunning(jobId: string): Promise<boolean> {
                         startedAt: new Date().toISOString(),
                         leaseOwner: getRuntimeWorkerId(),
                         heartbeatAt: new Date().toISOString(),
-                        leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
+                        leaseExpiresAt: leaseExpiry()
                     })
                     .where({ ID: jobId, status: 'pending' })
             );
@@ -296,7 +296,8 @@ export async function markReconciliationRequired(jobId: string, classification: 
     }
 }
 
-const JOB_LEASE_MS = 120_000;
+/** When the reclaimer may take the job over: the last heartbeat plus NIGHTGATE_JOB_LEASE_TTL_MS. */
+const leaseExpiry = (): string => new Date(Date.now() + configMs('NIGHTGATE_JOB_LEASE_TTL_MS')).toISOString();
 
 const JOB_HEARTBEAT_MS = 30_000;
 
@@ -319,7 +320,7 @@ export function startLeaseHeartbeat(jobId: string): () => void {
                 UPDATE.entity(BackgroundJobs)
                     .set({
                         heartbeatAt: new Date().toISOString(),
-                        leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
+                        leaseExpiresAt: leaseExpiry()
                     })
                     .where({ ID: jobId, status: { in: ['running', 'external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId() })
             );
@@ -330,8 +331,7 @@ export function startLeaseHeartbeat(jobId: string): () => void {
 }
 
 /**
- * Moves a job from `running` to `external_execution`, the point after which it may have
- * changed the chain. Allowed once per job: restart recovery assumes one submission per job.
+ * Moves a job from `running` to `external_execution`, after which it may have changed the chain. Allowed once per job, because restart recovery assumes one submission per job.
  */
 export async function markJobExternalExecution(jobId: string, submission: { submissionId?: string }): Promise<void> {
     const db = await cds.connect.to('db');
@@ -342,7 +342,7 @@ export async function markJobExternalExecution(jobId: string, submission: { subm
                 submissionId: submission.submissionId ?? null,
                 externalExecutionAt: new Date().toISOString(),
                 heartbeatAt: new Date().toISOString(),
-                leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
+                leaseExpiresAt: leaseExpiry()
             })
             .where({ ID: jobId, status: 'running', leaseOwner: getRuntimeWorkerId() })
     ));
@@ -357,8 +357,7 @@ export async function markJobExternalExecution(jobId: string, submission: { subm
 }
 
 /**
- * Marks the job submitted with its tx hash, inside the caller's transaction.
- * `firstBoundary` means the job comes from `running`. A rebuild updates a job already past it.
+ * Marks the job submitted with its tx hash, inside the caller's transaction. `firstBoundary` means the job comes from `running`. A rebuild updates a job already past it.
  */
 export async function markJobBroadcastOn(
     runner: { run: (q: unknown) => Promise<unknown> },
@@ -377,7 +376,7 @@ export async function markJobBroadcastOn(
                 ...(first ? { externalExecutionAt: now } : {}),
                 submittedAt: now,
                 heartbeatAt: now,
-                leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
+                leaseExpiresAt: leaseExpiry()
             })
             .where(first
                 ? { ID: jobId, status: 'running', leaseOwner: getRuntimeWorkerId() }
@@ -401,7 +400,7 @@ export async function markJobSubmissionRejectedOn(
                 chainStatus: null,
                 submissionId: submission.submissionId ?? null,
                 heartbeatAt: new Date().toISOString(),
-                leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
+                leaseExpiresAt: leaseExpiry()
             })
             .where({ ID: jobId, status: { in: ['external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId(), ...(submission.txHash ? { txHash: submission.txHash } : {}) })
     );
@@ -422,7 +421,7 @@ export async function markJobSubmitted(jobId: string, submission: { submissionId
                     chainStatus: 'pending',
                     submittedAt: new Date().toISOString(),
                     heartbeatAt: new Date().toISOString(),
-                    leaseExpiresAt: new Date(Date.now() + JOB_LEASE_MS).toISOString()
+                    leaseExpiresAt: leaseExpiry()
                 })
                 .where({ ID: jobId, status: { in: ['external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId() })
         );

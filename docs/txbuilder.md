@@ -22,11 +22,6 @@ balance own side, sign, finalize
 Nothing secret leaves the process. The on-chain attestation carries **your**
 attester id; the sponsor only pays the dust.
 
-## Why it exists
-
-The caller keeps its identity and key; the hosted side reduces to a metered
-"submit these bytes" endpoint, the shape a pay-per-call gate needs.
-
 ## Install
 
 `@odatano/nightgate-tx` is the same builder as a standalone package (under 1 MB).
@@ -42,9 +37,8 @@ Imports differ only in the package name: `@odatano/nightgate/txbuilder` ->
 -> `@odatano/nightgate-tx/attestation-vault`. The builder pulls only the
 Midnight SDK packages; no CAP setup.
 
-Version pairing: the package ships the vault modules it builds calls for.
-nightgate-tx 0.6.x builds lineage-4 calls (vaults deployed with server 0.24),
-0.5.x lineage 3, 0.4.x lineage 2; a mismatched pair fails against the vault.
+The package ships the vault modules it builds calls for. A call built for another vault version fails
+against the vault, so use a builder release that matches the vault you call.
 
 ## Use
 
@@ -100,9 +94,9 @@ and `code`; a 429 and a retryable 503 also carry `retryAfterSeconds` from
 | option | required | meaning |
 | --- | --- | --- |
 | `seedHex` | yes | 128 hex chars (64-byte BIP39 seed); HD derivation matches Lace |
-| `api` | yes, unless the indexer URLs and `nodeUrl` | a NIGHTGATE server to read the chain through: the options for `connect()` (`{ baseUrl, agentToken, ... }`) or a connected client. Contract state, the deploy and `probeLanded` then come from `ContractStates/stateAt`, `ContractActions` and `Transactions/byIdentifier`. Needs `walletSync: false` unless the indexer URLs are given as well |
+| `api` | yes, unless the indexer URLs and `nodeUrl` | a NIGHTGATE server to read the chain through: the options for `connect()` (`{ baseUrl, agentToken, ... }`) or a connected client. Contract state, the deploy and `probeLanded` then come from `ContractStates/stateAt`, `ContractActions` and `Transactions/byIdentifier`. A wallet sync needs the indexer URLs as well, unless `api` is the options object with a gateway key (`token: 'oda_…'`): then the wallet syncs through the gateway's indexer lane (`/indexer/api/v4/graphql`, priced in units). A connected client carries no key and never takes the lane |
 | `maxLagBlocks` | no | with `api`: a contract state from a server whose database is more blocks behind the chain is refused, default 60. A server's states trail the chain by some ten blocks in normal operation. A build on a stale state can fail on chain and the fee is spent |
-| `indexerHttpUrl`, `indexerWsUrl` | yes, unless `api` | a Midnight indexer you can reach (the public preprod indexer was switched off in October 2026); WS = HTTP URL + `/ws`, copy the versioned path. With `api` they are only needed for a wallet sync |
+| `indexerHttpUrl`, `indexerWsUrl` | yes, unless `api` | a Midnight indexer you can reach: your own, or a hosted one with its token in the URL; WS = HTTP URL + `/ws`, copy the versioned path. With `api` they are only needed for a wallet sync, and a gateway key needs them not at all |
 | `nodeUrl` | yes, unless `api` | Substrate RPC (the wallet SDK's `relayURL`). With `api` the builder dials no node |
 | `package` | no | an installed lineage package (`@odatano/contract-<name>`): supplies `contractClass`, `contractName`, `privateStateId` and, without `zkConfigBaseUrl` or `zkConfigDir`, the keys directory inside the package (missing prover keys are fetched from its release assets into it, verified against `keys/manifest.json`). An explicit option still wins: with `zkConfigBaseUrl` the keys come from that server into `cacheDir` |
 | `from` | no | directory `package` resolves from, default `process.cwd()` |
@@ -313,7 +307,8 @@ const { txHash, swap } = await ng.sponsorSwap({
 | Option | Required | Meaning |
 |---|---|---|
 | `seedHex` | yes | 64-byte BIP39 seed, 128 hex. Never leaves the process |
-| `indexerHttpUrl`, `indexerWsUrl` | yes | the indexer the wallet syncs from |
+| `indexerHttpUrl`, `indexerWsUrl` | yes, unless `api` | the indexer the wallet syncs from |
+| `api` | no | the `connect()` options of an ODATANO gateway (`{ baseUrl, token: 'oda_…' }`): the wallet syncs through the gateway's indexer lane, no indexer of your own |
 | `networkId` | no | default `preprod` |
 | `accountIndex` | no | default 0 |
 | `provingMode` | no | `wasm` (default, in-process, about 200 s per half) or `server` (on `proofServerUrl`, 11 to 17 s; it sees the coins you spend, so only a proof server you run) |
@@ -326,8 +321,16 @@ on one core; a wallet resumed from its saved state (about 5 kB) continues where
 it stopped. The state holds the wallet's coins: store it like a key.
 
 Returns `{ address, coinPublicKey, encryptionPublicKey, provingMode,
-maxInputs, sync, balances, pendingBalances, coins, spendable, buildHalf,
-buildTransfer, takeOffer, serializeState, shieldedWallet, close }`.
+maxInputs, sync, balances, pendingBalances, pending, coins, spendable, buildHalf,
+buildTransfer, takeOffer, revert, serializeState, shieldedWallet, close }`.
+
+- `pending()` lists the reserved coins one by one with the instant the SDK stops
+  waiting for each (`ttl`). `revert(offer)` releases the coins of a half or
+  transfer whose build-time `revert()` is gone with its process: pass the offer
+  file (the board keeps it, also past the offer's expiry), the base64 or the
+  bytes. The saved state carries reservations across restarts, so a half that
+  was never handed over keeps its coins locked until this call; a half that
+  landed spent them and the sync removes them on its own.
 
 - `balances()` sums the free coins per token type. `pendingBalances()` sums
   what the halves built here bring back once their swaps land, the change of
@@ -504,9 +507,8 @@ session); `npm run txbuilder:e2e` runs the real split.
   hash instance and leave nothing wasm-provable). `payloadHash` is stable.
   Keep the `opening` of every anchored document: a vault on a new generation
   is a redeploy, and the holder re-anchors and re-proves from it.
-- **The sponsor decides what it pays for**: fail-closed shape check (allow-listed
-  contract calls only, nothing else in the envelope, size cap
-  `NIGHTGATE_SPONSOR_MAX_TX_BYTES`).
+- **The sponsor decides what it pays for.** Its policy is described under
+  [cross-server fee sponsoring](actions.md#cross-server-fee-sponsoring).
 
 ## Batches on your own contract, and sponsored deploys
 
@@ -567,8 +569,8 @@ const landed = await withDustGuard(facade, { configuration, dustKey }, async () 
     );
     const finalized = await facade.finalizeRecipe(recipe);
     const identifier = txIdentifiers(finalized).at(-1);
-    const nodeUrl = 'wss://rpc.preprod.midnight.network/';
-    const indexerHttpUrl = 'https://indexer.preprod.midnight.network/api/v4/graphql';
+    const nodeUrl = process.env.NIGHTGATE_NODE_URL;               // your node, or Blockfrost with ?project_id=
+    const indexerHttpUrl = process.env.NIGHTGATE_INDEXER_HTTP_URL;
 
     // Transport failure: the tx MAY be in the mempool. Probe, then resend the SAME bytes.
     for (let attempt = 0; ; attempt++) {

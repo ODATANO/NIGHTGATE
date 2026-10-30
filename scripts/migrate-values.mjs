@@ -1,16 +1,5 @@
-// Value conversion for nightgate-db-migrate (SQLite row -> CAP insert).
-// Integers are read with better-sqlite3's safeIntegers, so they arrive as
-// BigInt: exact for Integer64, converted for the small types.
-//
-// Decimal: CAP's SQLite column is `DECIMAL` (NUMERIC affinity; `REAL_DECIMAL`
-// only with `decimal_affinity: real`). SQLite keeps an integral value as a
-// 64-bit INTEGER (exact, arrives as BigInt) and anything else as an IEEE-754
-// REAL (15-17 significant digits, arrives as a number). A REAL whose
-// magnitude is 2^53 or more was rounded when SQLite stored it; nothing can
-// recover the digits, so the run aborts instead of copying a wrong number.
-// Double keeps SQLite's representation. A large value never goes through
-// Number().
-//
+// Converts SQLite row values for nightgate-db-migrate. Integers arrive as BigInt.
+// A Decimal stored as a REAL of 2^53 or more was already rounded by SQLite, so the run aborts.
 // SPDX-License-Identifier: Apache-2.0
 const SMALL_INTS = new Set(['cds.Integer', 'cds.Int32', 'cds.Int16', 'cds.UInt8']);
 const BIG_INTS = new Set(['cds.Integer64', 'cds.Int64']);

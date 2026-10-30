@@ -1,12 +1,5 @@
-// Runs `cds-serve` with a 12 GB Node heap.
-//
-// Use this for the wallet cold-sync (or any long-running submission flow).
-// Unlike `cds watch` (scripts/dev.mjs), cds-serve does NOT restart when the
-// SQLite DB grows on disk, which matters once the wallet sync starts writing
-// 100s of MB of shielded-state into midnight.db.
-//
-// NODE_OPTIONS has to be set before Node starts; .env can't do this because
-// it's read by the app after Node is already running.
+// Runs `cds-serve` with a 12 GB Node heap for long wallet syncs.
+// Unlike `cds watch` it does not restart when the SQLite file grows. NODE_OPTIONS must be set before Node starts.
 
 import { spawn } from 'node:child_process';
 

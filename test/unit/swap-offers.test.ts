@@ -130,14 +130,16 @@ describe('offer board over HTTP', () => {
         expect(retired.status).toBe(200);
         expect(String(retired.headers['ratelimit-policy'])).toContain('"compute"');
         expect((await post('retireSwapOffer', { offerId: byA.data.offerId }, asA)).data).toMatchObject({ status: 'retired' });
-        // retired twice: not open any more
-        expect((await post('retireSwapOffer', { offerId: byA.data.offerId }, asA)).status).toBe(409);
+        // retired twice: nothing left to retire, the answer says what closed it
+        const again = await post('retireSwapOffer', { offerId: byA.data.offerId }, asA);
+        expect(again.status).toBe(200);
+        expect(again.data).toMatchObject({ offerId: byA.data.offerId, status: 'retired' });
         expect((await post('retireSwapOffer', { offerId: '00000000-0000-4000-8000-000000000000' }, asA)).status).toBe(404);
         const open = await list({ wantsType: T_CREDIT }, asA);
         expect(open.data.value.map((o: any) => o.offerId)).not.toContain(byA.data.offerId);
     });
 
-    it('an expired offer leaves the board and cannot be retired or filled', async () => {
+    it('an expired offer leaves the board; retiring it answers expired, filling it fails', async () => {
         describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '12'], nullifiers: [nullifier(41)] });
         const soon = new Date(Date.now() + 1500).toISOString();
         const res = await post('postSwapOffer', { offer: halfText(7), expiresAt: soon }, asA);
@@ -145,7 +147,9 @@ describe('offer board over HTTP', () => {
         expect((await list({ wantsType: T_CREDIT }, asA)).data.value.map((o: any) => o.offerId)).toContain(res.data.offerId);
         await new Promise(r => setTimeout(r, 1600));
         expect((await list({ wantsType: T_CREDIT }, asA)).data.value.map((o: any) => o.offerId)).not.toContain(res.data.offerId);
-        expect((await post('retireSwapOffer', { offerId: res.data.offerId }, asA)).status).toBe(409);
+        const retire = await post('retireSwapOffer', { offerId: res.data.offerId }, asA);
+        expect(retire.status).toBe(200);
+        expect(retire.data).toMatchObject({ offerId: res.data.offerId, status: 'expired' });
         const db = await cds.connect.to('db');
         const row = await db.run(cds.ql.SELECT.one.from('midnight.SwapOffers').where({ ID: res.data.offerId }));
         expect(row.status).toBe('expired');
@@ -315,7 +319,7 @@ describe('offer board over HTTP', () => {
         expect(after.data.openOffers - before.data.openOffers).toBe(1);
         expect(after.data.offersFilledToday - before.data.offersFilledToday).toBe(1);
         expect(after.data).toMatchObject({ swapsToday: 0, sponsorsConfigured: 0, sponsorsReady: 0 });
-        expect(Object.keys(after.data).sort()).toEqual(['@odata.context', 'asOf', 'factoryContract', 'offersFilledToday', 'openOffers', 'sponsorsConfigured', 'sponsorsReady', 'swapsToday']);
+        expect(Object.keys(after.data).sort()).toEqual(['@odata.context', 'asOf', 'factoryContract', 'offersFilledToday', 'openOffers', 'sponsorsConfigured', 'sponsorsReady', 'swapsToday', 'version']);
         expect(a.status).toBe(200);
     });
 });

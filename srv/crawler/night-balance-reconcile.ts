@@ -1,8 +1,5 @@
-/**
- * Checks the stored NightBalances rows against the values computed from the indexed UTXOs.
- * Uses `computeNightBalance`, the same rule a reorg rollback uses to rebuild balances. Writes nothing.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Checks stored NightBalances rows against `computeNightBalance` over the indexed UTXOs. Writes nothing.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { NightBalances, UnshieldedUtxos } from '#cds-models/midnight';
 import { NIGHT_RAW_TOKEN_TYPE } from './block-events';

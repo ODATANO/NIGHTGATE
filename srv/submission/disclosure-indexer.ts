@@ -1,13 +1,11 @@
-/**
- * Copies the vault contract's on-chain disclosure grants into `DisclosureGrants`.
- * The chain state is read at a block height. A row changed at a later height is
- * never overwritten, so an old read cannot undo a revoke or lower a level.
- */
+// Copies the vault contract's on-chain disclosure grants into `DisclosureGrants`.
+// The chain state is read at a block height. A row changed at a later height is never overwritten, so an old read cannot undo a revoke or lower a level.
 import cds from '@sap/cds';
 import { DisclosureGrants, type DisclosureGrant } from '#cds-models/midnight';
 import { readDisclosureGrantsInWorker } from '../midnight/decode-worker-client';
 import { enumerateGrants, type DisclosureLedger, type DisclosureGrantRecord } from './disclosure-grants';
 import type { DbRunner } from '../utils/db-types';
+import { indexerQuery } from '../utils/indexer-graphql';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -23,10 +21,7 @@ export interface ReindexDeps {
     atHeight?: number | null;
     /** Latest indexed block height. Used when `atHeight` is not given. */
     queryTipHeight?: () => Promise<number | null>;
-    /**
-     * Rows without a height that changed within this window (default 10 min) stay active.
-     * The chain state read may be older than a grant that was just submitted.
-     */
+    /** Rows without a height that changed within this window stay active, because the chain read may predate a just-submitted grant. Default 10 min. */
     sweepGraceMs?: number;
 }
 
@@ -49,10 +44,7 @@ function heightOf(row: any): number | null {
     return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
-/**
- * Writes one contract's grants into the table and marks active rows that are gone on-chain inactive.
- * Safe to repeat. Keeps an existing `grantedTxHash`.
- */
+/** Writes one contract's grants into the table and marks active rows that are gone on-chain inactive. Safe to repeat. Keeps an existing `grantedTxHash`. */
 export function reindexDisclosures(deps: ReindexDeps): Promise<ReindexResult> {
     const key = deps.contractAddress.toLowerCase();
     const previous = reindexChains.get(key) ?? Promise.resolve();
@@ -141,14 +133,8 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
 /** Latest indexer block height, or null on failure. The reindex then runs without a height. */
 export async function queryIndexerTipHeight(indexerHttpUrl: string, fetchFn: typeof fetch = fetch): Promise<number | null> {
     try {
-        const r = await fetchFn(indexerHttpUrl, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ query: '{ block { height } }' })
-        });
-        if (!r.ok) return null;
-        const j: any = await r.json();
-        const h = Number(j?.data?.block?.height);
+        const data = await indexerQuery<{ block?: { height?: unknown } }>(indexerHttpUrl, '{ block { height } }', { fetchFn });
+        const h = Number(data?.block?.height);
         return Number.isInteger(h) && h >= 0 ? h : null;
     } catch {
         return null;
@@ -166,8 +152,7 @@ export interface ReindexForContractArgs {
 }
 
 /**
- * Reindexes one contract from the live chain state, decoded in the decode worker.
- * Callers treat a failure as non-fatal, it must not fail the grant or revoke.
+ * Reindexes one contract from the live chain state, decoded in the decode worker. Callers treat a failure as non-fatal, so it never fails the grant or revoke.
  */
 export async function reindexDisclosuresForContract(
     args: ReindexForContractArgs

@@ -1,15 +1,13 @@
-/**
- * Retry a short database write that lost a lock.
- * Use it only for status updates, never for job work, which could then submit twice.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Retries a short database write that lost a lock.
+// Use it only for status updates, never for job work, which could then submit twice.
+// SPDX-License-Identifier: Apache-2.0
 import { errorMessage } from '../utils/errors';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 export const LOCK_CONTENTION_ATTEMPTS = 5;
 const DEFAULT_BACKOFF_MS: readonly number[] = [0, 500, 1500, 4000, 8000];
 let backoffMs: readonly number[] = DEFAULT_BACKOFF_MS;
 
-const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 /** Serialization failure, deadlock, lock not available, statement/lock timeout cancel. */
 const PG_RETRY_SQLSTATES = new Set(['40001', '40P01', '55P03', '57014']);

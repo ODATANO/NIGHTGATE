@@ -1,25 +1,6 @@
-// Live lane for parallel sponsoring: prebuild N UNBOUND attest txs (each
-// caller proves its OWN circuit locally via the txbuilder SDK), then BURST them
-// concurrently at the server's sponsor pool and report which backings paid and
-// in which blocks the txs landed. Decouples caller build time from sponsor
-// throughput.
-//
-// Server: `npm run serve` (NOT cds watch) with a sponsor pool and the vaults allow-listed:
-//   NIGHTGATE_FEE_SPONSOR_SESSION=<sponsor session>
-//   NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS=<vault1>,<vault2>
-//   NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS=attest
-//   NIGHTGATE_SPONSORED_CALLER_SYNC=skip
-// Two vaults keep same-contract writes apart (those still conflict at the ledger).
-// Set NIGHTGATE_NOTE_LEASE_MS=0 on the SERVER to force two sponsorings onto the
-// same dust note and watch the dust-race rebuild-retry heal the loser.
-//
-// Then: NIGHTGATE_VAULT=<v1> NIGHTGATE_VAULT2=<v2> npm run burst-sponsor:e2e
-// Env: NIGHTGATE_INDEXER_HTTP_URL, NIGHTGATE_NODE_URL, NIGHTGATE_BURST_N (default 4),
-//      REUSE=1 (reuse prebuilt txs from scratch/unbound, only within their 30 min
-//      TTL), NIGHTGATE_URL (default http://localhost:4004), NIGHTGATE_HTTP_USER /
-//      NIGHTGATE_HTTP_PASSWORD (basic auth of a hosted server), NIGHTGATE_AGENT_TOKEN
-//      (run the burst under an agent grant's token).
-// Passes when every burst member landed.
+// Bursts N prebuilt unbound attest txs at the server's sponsor pool in parallel and passes when every one landed.
+// Run: NIGHTGATE_VAULT=<v1> NIGHTGATE_VAULT2=<v2> npm run burst-sponsor:e2e against `npm run serve` with both vaults allow-listed.
+// Env: NIGHTGATE_INDEXER_HTTP_URL, NIGHTGATE_NODE_URL, NIGHTGATE_BURST_N, NIGHTGATE_URL, optional REUSE=1.
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';

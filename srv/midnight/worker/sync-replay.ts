@@ -1,8 +1,6 @@
-/**
- * Detects a restored wallet part (dust or shielded) whose saved position is behind its saved state.
- * The ledger then rejects every event it replays, and the SDK only prints the error and retries forever.
- * The printed error names no wallet, so the wallet is found by watching which one stops moving.
- */
+// Detects a restored dust or shielded wallet part whose saved position is behind its saved state.
+// The ledger then rejects every replayed event and the SDK retries forever. Its error names no wallet,
+// so the stuck wallet is found by watching which one stops moving.
 
 export type ReplayKind = 'dust' | 'shielded';
 

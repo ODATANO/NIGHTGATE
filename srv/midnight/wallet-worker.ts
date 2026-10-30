@@ -1,8 +1,5 @@
-/**
- * Entry point of the wallet worker thread.
- * A wallet sync keeps the SDK busy for long stretches, so it runs here and not on the server thread.
- * The worker's code lives in `worker/`. The callable methods are in `worker/rpc.ts`.
- */
+// Wallet worker thread. A wallet sync keeps the SDK busy for long stretches, so it runs off the server thread.
+// The worker's code lives in `worker/`. The callable methods are in `worker/rpc.ts`.
 
 import { parentPort, workerData } from 'node:worker_threads';
 import { setKeyRing } from '../utils/crypto';

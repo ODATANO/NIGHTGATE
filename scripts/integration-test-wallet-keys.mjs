@@ -1,8 +1,4 @@
-// Native-ESM integration check for ledger-v8 seed-key derivation.
-// Verifies that ZswapSecretKeys.fromSeed and DustSecretKey.fromSeed accept the
-// shapes that srv/submission/wallet-material-factory.ts uses, and that the
-// derived public keys are stable across runs for a fixed seed.
-//
+// Checks that ledger-v8 seed-key derivation accepts our shapes and gives stable public keys for a fixed seed.
 // Run: node scripts/integration-test-wallet-keys.mjs
 
 import { ZswapSecretKeys, DustSecretKey } from '@midnight-ntwrk/ledger-v8';

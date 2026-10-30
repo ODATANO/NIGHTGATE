@@ -15,10 +15,8 @@ service NightgateAdminService {
     @readonly
     entity DisclosureRoles as projection on midnight.DisclosureRoles;
 
-    /**
-     * Background jobs without their payloads.
-     * This is a database view. An existing database gets it only after `cds deploy` or `nightgate-schema-delta`.
-     */
+    /** Background jobs without their payloads.
+     * This is a database view. An existing database gets it only after `cds deploy` or `nightgate-schema-delta`. */
     @readonly
     entity BackgroundJobs  as
         projection on midnight.BackgroundJobs
@@ -39,11 +37,9 @@ service NightgateAdminService {
     action invalidateSession(sessionId: UUID);
     action invalidateAllSessions();
 
-    /**
-     * Exports the key that may upgrade a contract, taken from the session that deployed it.
-     * The export is encrypted with `password`, at least 16 characters. Restore it with `importSigningKeys`.
-     * Whoever holds this key can change how the contract verifies proofs.
-     */
+    /** Exports the key that may upgrade a contract, taken from the session that deployed it.
+     * The export is encrypted with `password`, at least 16 characters. No action restores it.
+     * Whoever holds this key can change how the contract verifies proofs. */
     action exportContractSigningKey(sessionId: UUID, contractAddress: String, password: String) returns {
         format          : String;
         encryptedPayload: LargeString;
@@ -52,11 +48,9 @@ service NightgateAdminService {
         accountId       : String;
     };
 
-    /**
-     * Lists the contracts from the config and those registered at runtime.
+    /** Lists the contracts from the config and those registered at runtime.
      * `artifactDigest` identifies the exact build. Saved jobs only run on that build.
-     * When `hasProverKeys` is false, this server can deploy and verify but not create proofs.
-     */
+     * When `hasProverKeys` is false, this server can deploy and verify but not create proofs. */
     function listContracts() returns array of {
         name           : String;
         source         : String; // 'config' or 'runtime'
@@ -68,11 +62,9 @@ service NightgateAdminService {
         hasProverKeys  : Boolean;
     };
 
-    /**
-     * Registers a compiled contract at runtime. It is checked first, saved, and loaded again on every start.
+    /** Registers a compiled contract at runtime. It is checked first, saved, and loaded again on every start.
      * Both paths must lie inside `NIGHTGATE_CONTRACTS_DIR`. A name from the config answers 409.
-     * Registering a new build under an existing name makes saved jobs for the old build fail.
-     */
+     * Registering a new build under an existing name makes saved jobs for the old build fail. */
     action registerContract(name: String,
                             artifactPath: String,
                             zkConfigPath: String,
@@ -94,11 +86,9 @@ service NightgateAdminService {
         removed : Boolean;
     };
 
-    /**
-     * Records a CPU profile of a running thread and summarizes where the time went.
+    /** Records a CPU profile of a running thread and summarizes where the time went.
      * `seconds` is 1 to 120, default 20. `thread` is 'worker', the default, or 'main'.
-     * The .cpuprofile file goes to `nightgate-profiles/` in the OS temp folder, or to the subfolder `dir`.
-     */
+     * The .cpuprofile file goes to `nightgate-profiles/` in the OS temp folder, or to the subfolder `dir`. */
     action profileWorker(seconds: Integer, dir: String, thread: String) returns {
         thread        : String;
         seconds       : Integer;
@@ -123,10 +113,8 @@ service NightgateAdminService {
         circuits    : array of String;  // empty when allCircuits
     };
 
-    /**
-     * Shows what the fee sponsor may pay for. `floor` holds the platform lists.
-     * With `grantId`, `effective` holds what the grant may use. `effectiveError` says why it may use nothing.
-     */
+    /** Shows what the fee sponsor may pay for. `floor` holds the platform lists.
+     * With `grantId`, `effective` holds what the grant may use. `effectiveError` says why it may use nothing. */
     function getSponsorPolicy(grantId: UUID) returns {
         source         : String; // 'file' or 'env'
         path           : String;
@@ -194,10 +182,8 @@ service NightgateAdminService {
         oldestQueuedSeconds : Integer;
     };
 
-    /**
-     * Finds NightBalances rows that do not match the indexed UTXOs. Changes nothing.
-     * Checks one `address`, or up to `limit` addresses after `after`. `limit` is at most 500.
-     */
+    /** Finds NightBalances rows that do not match the indexed UTXOs. Changes nothing.
+     * Checks one `address`, or up to `limit` addresses after `after`. `limit` is at most 500. */
     function reconcileNightBalances(address: String, after: String, limit: Integer) returns {
         checked : Integer;
         next    : String; // null = done; pass as `after` for the next page
@@ -209,10 +195,8 @@ service NightgateAdminService {
         };
     };
 
-    /**
-     * Decodes the stored transactions again from `height` up and rewrites the fields taken from them.
-     * The decoder never moves forward this way. `changed` is false when it already stood below `height`.
-     */
+    /** Decodes the stored transactions again from `height` up and rewrites the fields taken from them.
+     * The decoder never moves forward this way. `changed` is false when it already stood below `height`. */
     action redecodeFromHeight(height: Integer64) returns {
         fromHeight            : Integer64;
         previousDecodedHeight : Integer64;

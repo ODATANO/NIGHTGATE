@@ -1,12 +1,10 @@
-/**
- * Derives a wallet's viewing key, addresses and attester id from a mnemonic or seed, without a session.
- * The derivation must match the one used for signing.
- * The seed is never logged or returned, and all secret material is wiped after use.
- */
+// Derives a wallet's viewing key, addresses and attester id from a mnemonic or seed, without a session.
+// The derivation must match signing. The seed is never logged or returned, and secrets are wiped after use.
 import { persistentHash, CompactTypeBytes } from '@midnight-ntwrk/compact-runtime';
 import { mnemonicToBip39SeedHex, deriveRoleSeeds, type RoleSeeds } from './wallet-hd';
 import { deriveAttestationSecret } from '../submission/contract-witnesses';
 import { loadLedgerV8 } from '../midnight/sdk-loader';
+import { assertSeedHex } from './hex-patterns';
 
 export interface WalletInfo {
     viewingKey: string;      // shielded encryption public key, 64 hex chars, the input of connectWallet
@@ -37,7 +35,6 @@ async function loadUnshielded(): Promise<any> {
     return cachedUnshielded;
 }
 
-const BIP39_SEED_HEX_RE = /^[0-9a-fA-F]{128}$/;
 
 /** The wallet's attester id. It is the same value the vault contract computes with `caller_id()`. */
 export function deriveAttesterId(zswapSeed: Uint8Array): string {
@@ -78,9 +75,7 @@ export function resolveBip39SeedHex(opts: Pick<DeriveWalletInfoOptions, 'mnemoni
         return mnemonicToBip39SeedHex(opts.mnemonic);
     }
     if (opts.seedHex) {
-        if (!BIP39_SEED_HEX_RE.test(opts.seedHex)) {
-            throw new Error('seedHex must be 128 hex characters (64-byte BIP39 seed)');
-        }
+        assertSeedHex(opts.seedHex);
         return opts.seedHex.toLowerCase();
     }
     throw new Error('either mnemonic or seedHex (64-byte BIP39 seed, 128 hex chars) is required');

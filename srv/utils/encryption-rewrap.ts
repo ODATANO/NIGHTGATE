@@ -1,9 +1,6 @@
-/**
- * Startup check that every stored encryption key id is in the key ring, and the `nightgate-rewrap-keys` tool.
- * Ring-encrypted values start with their key id, so they can be re-encrypted without any wallet secret.
- * "Legacy rows" (`keyScheme` null) use an older scheme that needs the wallet's viewing key to decrypt.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Startup check that every stored encryption key id is in the key ring, plus the `nightgate-rewrap-keys` tool.
+// Ring values need no wallet secret to re-encrypt. Legacy rows have `keyScheme` null and need the wallet viewing key.
+// SPDX-License-Identifier: Apache-2.0
 
 import cds from '@sap/cds';
 import {
@@ -114,11 +111,8 @@ export async function countLegacyRows(db: DbService): Promise<LegacyRowCensus> {
     return { tables, accounts: [...accounts].sort(), total };
 }
 
-/**
- * Fails when a stored value uses a key id that is not in the ring.
- * Otherwise a seed that cannot be decrypted would look like a missing seed.
- * Legacy rows only cause a warning.
- */
+/** Fails when a stored value uses a key id that is not in the ring. Legacy rows only cause a warning.
+ *  Otherwise a seed that cannot be decrypted would look like a missing seed. */
 export async function assertStoredKeyIdsKnown(db: DbService, ring: KeyRing = getEncryptionKey(), opts: { reportLegacy?: boolean } = {}): Promise<void> {
     const unknown = new Map<string, string[]>();
     for (const { column, keyIds } of await scanStoredKeyIds(db)) {
@@ -164,10 +158,7 @@ export interface RewrapReport {
     migratableAccounts: string[];
 }
 
-/**
- * Re-encrypts all ring-encrypted values with the active key.
- * Also migrates legacy rows whose viewing key is still available in a wallet session.
- */
+/** Re-encrypts all ring-encrypted values with the active key. Also migrates legacy rows whose viewing key is still available in a wallet session. */
 export async function rewrapStoredCiphertexts(db: DbService, opts: RewrapOptions = {}): Promise<RewrapReport> {
     const ring = opts.ring ?? getEncryptionKey();
     const dryRun = opts.dryRun === true;

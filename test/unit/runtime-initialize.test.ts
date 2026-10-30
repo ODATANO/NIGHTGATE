@@ -216,8 +216,7 @@ describe('runtime initialize', () => {
             expect(mockDbDeploy).not.toHaveBeenCalled();
             expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
                 enabled: true,
-                nodeUrl: 'ws://localhost:9944',
-                requestTimeout: 30000
+                nodeUrl: 'ws://localhost:9944'
             }));
             expect(logSpy).toHaveBeenCalledWith('Initializing crawler and starting catch-up...');
             expect(logSpy).toHaveBeenCalledWith('Startup state: syncing (crawler started)');
@@ -391,8 +390,7 @@ describe('runtime initialize', () => {
 
             expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
                 enabled: true,
-                nodeUrl: 'wss://crawler.example.test',
-                requestTimeout: 30000
+                nodeUrl: 'wss://crawler.example.test'
             }));
             expect(logSpy).toHaveBeenCalledWith('Network: preprod');
             expect(logSpy).toHaveBeenCalledWith('Node: wss://node.example.test');

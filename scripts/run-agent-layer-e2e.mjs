@@ -1,31 +1,6 @@
-// Agent-layer end-to-end (AgentGrants + prepareDocumentProof +
-// attestAgentOutput).
-//
-// Operator lane (normal auth): connectWallet → connectWalletForSigning →
-// deployContract(attestation-vault) → createAgentGrant (allowlist:
-// anchorDocument, issueFieldPredicateAttestationBatch, attestAgentOutput;
-// maxJobsPerDay=3).
-//
-// Agent lane (ONLY the x-agent-token header changes):
-//   NEGATIVE  sendNight → 403 (never grantable)
-//   NEGATIVE  issueFieldPredicateAttestation → 403 (not on the allowlist)
-//   NEGATIVE  anchorDocument with a foreign sessionId → 403 (grant pinning),
-//             and the request consumes NO budget
-//   POSITIVE  prepareDocumentProof (always allowed, no budget) → payloadHash,
-//             contentRoot, per-field proofs
-//   POSITIVE  anchorDocument WITHOUT sessionId in the body (the grant injects
-//             it) → job succeeds                                   [budget 1/3]
-//   POSITIVE  issueFieldPredicateAttestationBatch: contentRoot in-batch + 2
-//             claims from the prepared fields → ONE tx             [budget 2/3]
-//   VERIFY    per-claim crawler-free verifyPredicateState → verified=true
-//   POSITIVE  attestAgentOutput → envelope re-hashed locally (blake2b-256)
-//             must equal payloadHash; verifyAttestationState=true [budget 3/3]
-//   NEGATIVE  4th write action → 429 (daily budget exhausted, no job started)
-//   REVOKE    operator revokes the grant → agent request → 401
-//
-// Inputs (env): NIGHTGATE_URL (default http://localhost:4004),
-// LACE_VIEWING_KEY, LACE_MNEMONIC.
-// Run:  node --env-file=.env scripts/run-agent-layer-e2e.mjs
+// Checks agent grants live: allowlist, session pinning, daily budget, prepareDocumentProof, attestAgentOutput and revoke.
+// Run: node --env-file=.env scripts/run-agent-layer-e2e.mjs
+// Env: NIGHTGATE_URL, LACE_VIEWING_KEY, LACE_MNEMONIC.
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';

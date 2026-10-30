@@ -1,9 +1,6 @@
-/**
- * Database rows of the swap offer board.
- * An offer closes when it is filled on chain, withdrawn by its poster, or expires.
- * The board only lists offers. It holds no funds.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Database rows of the swap offer board. The board only lists offers and holds no funds.
+// An offer closes when it is filled on chain, withdrawn by its poster, or expires.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import crypto from 'node:crypto';
 import { SwapOffers, type SwapOffer } from '#cds-models/midnight';
@@ -68,10 +65,7 @@ export async function closeSwapOffer(db: DbRunner, offerId: string, status: Excl
     return typeof n === 'number' ? n > 0 : !!n;
 }
 
-/**
- * Close every open offer that uses an input spent by a confirmed transaction.
- * That input is gone, so the offer can never be filled.
- */
+/** Closes every open offer that uses an input spent by a confirmed transaction, because such an offer can never be filled. */
 export async function closeSwapOffersByNullifiers(db: DbRunner, nullifiers: unknown[], txHash?: string | null): Promise<string[]> {
     const landed = new Set(nullifiers.map(n => String(n ?? '').trim().toLowerCase()).filter(n => HEX64_RE.test(n)));
     if (landed.size === 0) return [];

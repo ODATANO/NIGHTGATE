@@ -1,11 +1,4 @@
-// Derives a Midnight wallet's seedHex (for connectWalletForSigning) and a
-// viewing-key-shaped 64-hex value (for connectWallet) from a BIP39 mnemonic.
-//
-// The "viewing key" here is the encryptionPublicKey from ZswapSecretKeys.fromSeed,
-// which is a stable 64-hex identifier per wallet. NIGHTGATE only uses it as a
-// stable seed for HMAC-derived accountId, so any deterministic-per-wallet hex
-// string works; encryptionPublicKey is the cleanest choice.
-//
+// Derives a wallet's seedHex and its encryptionPublicKey, used as a stable viewing-key value, from a BIP39 mnemonic.
 // Run: LACE_MNEMONIC="word1 word2 ..." node scripts/derive-keys.mjs
 
 import bip39 from 'bip39';

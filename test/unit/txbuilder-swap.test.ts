@@ -278,6 +278,24 @@ describe('createSwapWallet', () => {
         expect(await wallet.pendingBalances()).toEqual({ [A]: 1355n, [B]: 150n });
     });
 
+    it('pending lists each reserved coin with its ttl, and revert releases a half by its offer text after the process is gone', async () => {
+        const { createSwapWallet, encodeOffer } = await importTxBuilder();
+        const { sdk, wallet: inner, calls, proven } = fakeSdk({ pendingCoins: [{ type: A, value: 1000n }] });
+        const wallet = await createSwapWallet({ ...URLS, seedHex: SEED, sdk });
+        expect(await wallet.pending()).toEqual([{ tokenType: A, amount: 1000n, ttl: null }]);
+        // a half built by an earlier process: only its offer file survived (the board keeps it)
+        const tx = proven([[A, 1000n], [B, 300n * -1n]]);
+        const bound = tx.bind();
+        const offer = await encodeOffer(bound.serialize());
+        await wallet.revert(offer);
+        expect(calls.reverted).toEqual([bound]);
+        expect(inner.revertTransaction).toHaveBeenCalledTimes(1);
+        // base64 of an unbound half works the same
+        await wallet.revert(Buffer.from(tx.serialize()).toString('base64'));
+        expect(calls.reverted).toEqual([bound, tx]);
+        await expect(wallet.revert('swapoffer1garbage')).rejects.toThrow();
+    });
+
     it('buildHalf: bound with its offer file by default, unbound as base64 only', async () => {
         const { createSwapWallet, decodeOffer } = await importTxBuilder();
         const { sdk, calls, ownAddress } = fakeSdk();

@@ -1,28 +1,6 @@
-// Live acceptance lane for the dust wedge protection: force a dust-spending
-// submission to die provably PRE-MEMPOOL, then prove the wallet is NOT
-// wedged: the pre-build
-// dust snapshot restore kicked in (server log), getWalletBalance still shows
-// the dust UTXO with nothing stuck pending, and a follow-up normal send
-// succeeds end-to-end.
-//
-// The reject is forced via a transaction TTL that is valid at request time
-// (the API rejects past TTLs with a 400) but expires while the in-process
-// proving runs (minutes for a transfer in wasm mode): the build+prove
-// pipeline runs for real (the dust spend IS booked), and the node rejects
-// the finalized tx at validity check (1010 invalid, the same pre-mempool
-// guard branch as a 1014 reject).
-//
-// Server (separate terminal): npm run dev
-// Then:  node --env-file=.env scripts/run-dust-wedge-e2e.mjs
-//
-// Inputs (env vars):
-//   NIGHTGATE_URL             default http://localhost:4004
-//   LACE_VIEWING_KEY          required (64 hex)
-//   LACE_MNEMONIC             required (BIP39 phrase)
-//   DUST_E2E_AMOUNT           default '1000000' NIGHT atoms, sent to own address
-//   DUST_E2E_TTL_OFFSET_MS    default 30000 (tx TTL 30s ahead; must expire before proving finishes)
-//   E2E_PREWARM_TIMEOUT_MIN   default 240
-//   E2E_JOB_POLL_INTERVAL_MS  default 5000
+// Checks that a dust spend rejected before the mempool, forced by a short TTL, leaves the wallet usable.
+// Run: node --env-file=.env scripts/run-dust-wedge-e2e.mjs against `npm run dev`
+// Env: NIGHTGATE_URL, LACE_VIEWING_KEY, LACE_MNEMONIC, DUST_E2E_AMOUNT, DUST_E2E_TTL_OFFSET_MS (must expire before proving ends).
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';

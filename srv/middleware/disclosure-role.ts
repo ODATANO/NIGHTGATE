@@ -1,7 +1,5 @@
-/**
- * Finds out how much the caller may see: 0 public, 1 legitimate interest, 2 authority.
- * This decides which fields a response contains. `@requires` decides service access.
- */
+// Finds out how much the caller may see: 0 public, 1 legitimate interest, 2 authority.
+// This decides which fields a response contains. `@requires` decides service access.
 import cds from '@sap/cds';
 import { DisclosureRoles, DisclosureGrants, type DisclosureRole } from '#cds-models/midnight';
 import { resolveGranteeId } from '../submission/grantee-identity';
@@ -37,10 +35,8 @@ export interface AttachDisclosureRoleOptions {
     attesterId?: string;
 }
 
-/**
- * Sets and returns `req.disclosureRole`. With `contractAddress` it reads the on-chain
- * grants in `DisclosureGrants`. Otherwise it reads the operator's `DisclosureRoles` table.
- */
+/** Sets and returns `req.disclosureRole`. With `contractAddress` it reads the on-chain
+ *  grants in `DisclosureGrants`. Otherwise it reads the operator's `DisclosureRoles` table. */
 export async function attachDisclosureRole(
     req: Request,
     db: cds.DatabaseService,
@@ -78,10 +74,8 @@ export async function attachDisclosureRole(
     return highest.role;
 }
 
-/**
- * Returns the highest active grant for the caller. A payload hash without an attester
- * gives public_only, so a grant from another attester on the same hash cannot unlock it.
- */
+/** Returns the highest active grant for the caller. A payload hash without an attester
+ *  gives public_only, so a grant from another attester on the same hash cannot unlock it. */
 async function resolveOnChainRole(
     req: cds.Request,
     db: cds.DatabaseService,

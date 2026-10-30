@@ -1,8 +1,7 @@
-/**
- * CAP returns a `LargeBinary` as a Buffer, a base64 string or a byte stream, depending on the driver.
- * A stream that is not drained looks like a plain object instead of failing.
- */
+// CAP returns a `LargeBinary` as a Buffer, a base64 string or a byte stream, depending on the driver.
+// A stream that is not drained looks like a plain object instead of failing.
 import type { Readable } from 'node:stream';
+import { bareHex } from '../utils/hex-patterns';
 
 export async function readCapBinary(value: unknown): Promise<Buffer | null> {
     if (value == null) return null;
@@ -23,4 +22,11 @@ export async function readCapBinary(value: unknown): Promise<Buffer | null> {
 // as text and is stored as the text's bytes. cds-typer types the column as a stream.
 export function capBinaryInput(base64: string): Readable {
     return Buffer.from(base64, 'base64') as unknown as Readable;
+}
+
+/** Hex, with or without `0x`, as the base64 string a CAP INSERT takes for a `LargeBinary`. Null when empty or of odd length. */
+export function hexToBase64(value: unknown): string | null {
+    const clean = bareHex(value);
+    if (!clean || clean.length % 2 !== 0) return null;
+    return Buffer.from(clean, 'hex').toString('base64');
 }

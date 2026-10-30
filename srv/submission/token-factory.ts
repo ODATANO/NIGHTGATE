@@ -1,9 +1,6 @@
-/**
- * Server-side minting with the `token-factory` contract. The wallet session is the issuer.
- * Its issuer secret comes from the session's seed. So each token name belongs
- * to one session, and nobody else can mint more of it.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Server-side minting with the `token-factory` contract. The wallet session is the issuer.
+// The issuer secret comes from the session's seed, so each token name belongs to one session and nobody else can mint more of it.
+// SPDX-License-Identifier: Apache-2.0
 import { issuerKeyOf, tokenTypeOf } from '@odatano/contract-kit';
 import { importRegisteredArtifact, getContractRegistration } from './contract-registry';
 import { deriveTokenFactoryIssuerSecret } from './contract-witnesses';

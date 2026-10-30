@@ -1,23 +1,22 @@
-/**
- * Main-thread side of the wallet workers. A pool of worker threads, one message channel per call.
- * A wallet always lives in the same worker: its facade key picks the worker, so the per-wallet
- * locks inside a worker stay valid. Pool sponsors can get a worker each (`NIGHTGATE_SPONSOR_WORKERS`).
- */
+// Main-thread side of the wallet worker pool. A wallet's facade key always picks the same worker,
+// so the per-wallet locks inside a worker stay valid. See `NIGHTGATE_SPONSOR_WORKERS` for sponsors.
 
 import cds from '@sap/cds';
 import { Worker, MessageChannel } from 'node:worker_threads';
 import path from 'node:path';
 import type { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
 import type { MerkleProofBundle } from '../submission/contract-witnesses';
-import type { ContractCircuitRules } from '../submission/sponsor-policy';
 import type { DeclaredTransfer, UnshieldedMove } from '../submission/submit-intent';
-import { errorName, formatErr } from '../utils/format-error';
+import { errorName } from '../utils/format-error';
 import { nightgateErrorFromPayload, errorMessage, NightgateError } from '../utils/errors';
-import { isSubmittingMethod, WORKER_ROTATING, WORKER_ROTATED, WorkerSubmitError, isSubmitFailureCode } from './wallet-worker-protocol';
+import { isSubmittingMethod, WORKER_ROTATING, WORKER_ROTATED, WorkerSubmitError, isSubmitFailureCode, type SponsorPolicyArgs } from './wallet-worker-protocol';
 import { getEncryptionKey } from '../utils/crypto';
 import { configEnum, configMs, configNumber, configNumberFrom, resolvedConfigSnapshot } from '../utils/config';
 import { recordDustCollapseSample, forgetDustCollapseStats, type DustCollapseSample } from './dust-collapse-stats';
 import type { profileWorker } from '#cds-models/NightgateAdminService';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { profileSeconds } from './cpu-profile';
+import type { SyncProgressSnapshot } from './worker/facades';
 
 const log = cds.log('nightgate:worker-client');
 
@@ -48,36 +47,8 @@ export type StateSaveSink = (event: {
     blobs: SerializedBlobs;
 }) => void | Promise<void>;
 
-/** Copy of the worker's `SyncProgressSnapshot`. Importing it would load the ESM SDK. */
-export interface WalletSyncProgress {
-    sessionId: string;
-    /** Dust ledger events applied so far. Decimal string. */
-    appliedIndex: string;
-    /** Latest dust ledger event on the chain. Decimal string, '-1' when unknown. */
-    streamTip: string;
-    behindEvents: string | null;
-    eventsPerSecond: number | null;
-    etaSeconds: number | null;
-    blockHeight: string | null;
-    isConnected: boolean;
-    indexerFresh: boolean;
-    indexerTipAgeMs?: number | null;
-    indexerError?: string | null;
-    caughtUp: boolean;
-    elapsedMs: number;
-    label: string;
-    updatedAt: string;
-    lastProgressAt?: string;
-    dust?: {
-        balance: string;
-        availableNotes: number;
-        pendingNotes: number;
-        restoreCount: number;
-        registeredNightUtxos: number;
-        totalNightUtxos: number;
-        at: string;
-    };
-}
+/** A wallet's sync progress as the worker pushes it. A type import loads nothing at run time. */
+export type WalletSyncProgress = SyncProgressSnapshot;
 
 const syncProgressCache = new Map<string, WalletSyncProgress>();
 /** Which worker a wallet reported from, so a crash clears only that worker's wallets. */
@@ -114,10 +85,7 @@ let lastExitCode: number | null = null;
 let lastExitAt: string | null = null;
 let workerRotationCount = 0;
 
-/**
- * How long a planned restart waits for running calls. Killing the worker after that is safe,
- * because every submit reported its tx id before sending, so it can still be looked up.
- */
+/** How long a planned restart waits for running calls. Killing after that is safe, because each submit reported its tx id first. */
 function drainMaxMs(): number {
     return configMs('NIGHTGATE_WORKER_DRAIN_MAX_MS');
 }
@@ -184,10 +152,7 @@ export function walletWorkerPoolConfig(): { walletWorkers: number; sponsorWorker
     return poolConfig;
 }
 
-/**
- * Gives a pool sponsor's wallet a worker of its own under `NIGHTGATE_SPONSOR_WORKERS=dedicated`.
- * Call it before the wallet is loaded; a wallet never moves once it lives in a worker.
- */
+/** Gives a pool sponsor's wallet its own worker. Call it before the wallet is loaded, because a wallet never moves. */
 export function assignDedicatedWorker(facadeKey: string): void {
     if (walletWorkerPoolConfig().sponsorWorkers !== 'dedicated') return;
     if (dedicatedFacades.has(facadeKey)) return;
@@ -224,10 +189,7 @@ function facadeKeyOf(args: unknown): string | undefined {
     return undefined;
 }
 
-/**
- * A call that uses the caller's wallet AND a sponsor's wallet runs inside one worker. With the two
- * wallets in different workers it is refused here, before any work: run such sponsors `shared`.
- */
+/** Refuses a call whose caller and sponsor wallets live in different workers. Run such sponsors `shared`. */
 function assertSameWorker(method: string, args: unknown): void {
     const a = args as { sessionId?: unknown; sponsorSessionId?: unknown } | null;
     if (typeof a?.sessionId !== 'string' || typeof a?.sponsorSessionId !== 'string' || !a.sponsorSessionId) return;
@@ -283,9 +245,8 @@ async function startWorkerSlot(slot: WorkerSlot): Promise<void> {
         };
         worker.on('message', onReady);
         worker.once('error', err => reject(err));
-        worker.once('exit', code => {
-            if (code !== 0) reject(new Error(`wallet-worker ${slot.id} exited with code ${code} before ready`));
-        });
+        // Any exit before ready fails the start; after ready this reject does nothing.
+        worker.once('exit', code => reject(new Error(`wallet-worker ${slot.id} exited with code ${code} before ready`)));
     });
 
     slot.worker = worker;
@@ -298,14 +259,15 @@ async function startWorkerSlot(slot: WorkerSlot): Promise<void> {
             // because a restored dust state relies on the last save winning.
             const key = String(msg.sessionId ?? '');
             const chain = (stateSaveChains.get(key) ?? Promise.resolve())
-                .then(() => {
-                    if (!stateSaveSink) throw new Error('no state-save sink wired');
-                    return stateSaveSink(msg);
-                })
-                .then(() => {
+                .then(async () => {
+                    if (!stateSaveSink) {
+                        log.error(`${tag}: state save of ${key.slice(0, 16)} dropped, no state-save sink is wired`);
+                        return;
+                    }
+                    await stateSaveSink(msg);
                     if (msg.seq != null) worker.postMessage({ kind: 'state-save-ack', sessionId: msg.sessionId, seq: msg.seq });
                 })
-                .catch(() => { /* no ack; sink already logged the failure */ });
+                .catch(() => { /* no ack; the sink logs its own failures */ });
             stateSaveChains.set(key, chain);
             void chain.then(() => { if (stateSaveChains.get(key) === chain) stateSaveChains.delete(key); });
         } else if (msg?.kind === 'log') {
@@ -342,7 +304,7 @@ async function startWorkerSlot(slot: WorkerSlot): Promise<void> {
 
     worker.on('error', err => {
         log.error(`${tag} error:`, err);
-        rejectPendingRpcs(slot, `wallet-worker crashed: ${err instanceof Error ? err.message : String(err)}`);
+        rejectPendingRpcs(slot, `wallet-worker crashed: ${errorMessage(err)}`);
     });
     worker.on('exit', code => {
         // A newer worker may already run. The old worker's late exit must not clear it.
@@ -379,14 +341,17 @@ async function startWorkerSlot(slot: WorkerSlot): Promise<void> {
 /** Drops the cached progress of the wallets that lived in the worker. Returns their keys. */
 function forgetWorkerSessions(slotId: string): string[] {
     const gone = sessionsOf(slotId);
-    for (const s of gone) { syncProgressCache.delete(s); sessionWorker.delete(s); }
+    for (const s of gone) forgetSession(s);
     return gone;
 }
 
-/**
- * Unloads every wallet after its final save is confirmed, then stops every worker.
- * Call this before dropping the encryption keys, because saving needs them.
- */
+function forgetSession(sessionId: string): void {
+    syncProgressCache.delete(sessionId);
+    sessionWorker.delete(sessionId);
+    forgetDustCollapseStats(sessionId);
+}
+
+/** Unloads every wallet after its final save, then stops every worker. Call it before dropping the encryption keys. */
 export async function stopWalletWorker(timeoutMs = 60_000): Promise<void> {
     // A later call must not restart a worker that was stopped on purpose.
     everStarted = false;
@@ -410,10 +375,10 @@ async function stopWorkerSlot(slot: WorkerSlot, timeoutMs: number): Promise<void
             if (!slot.drainingWorker) slot.drainingWorker = w;
             await Promise.race([
                 new Promise<void>(resolve => { w.once('exit', () => resolve()); if (slot.drainingWorker !== w) resolve(); }),
-                new Promise<void>(resolve => { const t = setTimeout(resolve, timeoutMs); (t as any).unref?.(); })
+                sleep(timeoutMs, undefined, { ref: false })
             ]);
         } else {
-            log.warn(`${tag} shutdown flush did not complete: ${err instanceof Error ? err.message : String(err)}; terminating`);
+            log.warn(`${tag} shutdown flush did not complete: ${errorMessage(err)}; terminating`);
         }
     }
     if (slot.worker !== w) return; // replaced or already gone
@@ -426,11 +391,7 @@ async function stopWorkerSlot(slot: WorkerSlot, timeoutMs: number): Promise<void
     await notifyWorkerGone('stop', { workerId: slot.id, facades: gone });
 }
 
-/**
- * Why a worker is gone. Its loaded wallets are gone with it.
- * After `exit` (a crash) listeners keep only what queued jobs still need.
- * After `stop` (a planned shutdown) they may release everything.
- */
+/** Why a worker is gone. After a crash (`exit`) listeners keep what queued jobs need. After `stop` they may release everything. */
 export type WorkerGoneReason = 'exit' | 'stop';
 /** The worker that went and the wallets it held, as far as they reported progress. */
 export interface WorkerGoneInfo { workerId: string; facades: string[] }
@@ -508,7 +469,7 @@ async function waitForDrainingWorker(slot: WorkerSlot): Promise<void> {
             log.warn(`worker ${slot.id} rotation drain exceeded ${ceiling}ms; terminating the draining worker (in-flight submits announced their identifiers, reconciliation resolves them)`);
             void w.terminate().catch(() => undefined);
         }, ceiling);
-        (timer as any).unref?.();
+        timer.unref();
     });
 }
 
@@ -656,7 +617,7 @@ function dispatchPrivateStateRpc(msg: any): void {
         try {
             provider.setContractAddress(...(args as [string]));
         } catch (err) {
-            log.warn('setContractAddress failed:', formatErr(err));
+            log.warn('setContractAddress failed:', errorMessage(err));
         }
         return;
     }
@@ -684,7 +645,7 @@ function dispatchPrivateStateRpc(msg: any): void {
                 ok: false,
                 error: {
                     name: errorName(err),
-                    message: formatErr(err)
+                    message: errorMessage(err)
                 }
             });
         } finally {
@@ -732,18 +693,13 @@ export async function walletEvict(sessionId: string): Promise<{ evicted: boolean
         // The caller stops tracking saves for this session once we reply, so the final save must be stored first.
         return await rpc('evict', { sessionId, awaitSaveAck: true });
     } finally {
-        syncProgressCache.delete(sessionId);
-        sessionWorker.delete(sessionId);
-        forgetDustCollapseStats(sessionId);
+        forgetSession(sessionId);
     }
 }
 
-/**
- * Profiles one worker thread for 1 to 120 seconds: the one with the most calls in flight, else the
- * first user worker. The raw profile is saved to disk.
- */
+/** Profiles the busiest worker, else the first user worker, for 1 to 120 seconds. Saves the raw profile to disk. */
 export function walletCpuProfile(seconds: number, dir?: string): Promise<NonNullable<Awaited<ReturnType<typeof profileWorker>>>> {
-    const secs = Math.min(120, Math.max(1, Math.floor(Number(seconds) || 20)));
+    const secs = profileSeconds(seconds);
     const busiest = [...slots.values()].filter(s => s.worker).sort((a, b) => b.pendingRpcs.size - a.pendingRpcs.size)[0];
     const slot = busiest ?? slotOf(DEFAULT_SLOT);
     log.info(`cpu profile of worker ${slot.id} for ${secs}s`);
@@ -863,13 +819,8 @@ export function walletTransferNight(args: {
     return rpc('transferNight', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
-/** Amounts are decimal strings. */
-export function walletGetBalance(args: {
-    sessionId: string;
-    syncTimeoutMs?: number;
-    /** Timeout for the call itself, so polling a stuck worker does not pile up calls. */
-    rpcTimeoutMs?: number;
-}): Promise<{
+/** A wallet's balances as the worker reports them. Amounts are decimal strings in atoms. */
+export interface WalletBalanceSnapshot {
     shieldedNight: string;
     unshieldedNight: string;
     /** All other shielded tokens with a balance. Raw 64-hex type and amount in atoms. */
@@ -878,10 +829,20 @@ export function walletGetBalance(args: {
     registeredNightUtxoCount: number;
     totalNightUtxoCount: number;
     dustUtxoCount: number;
+    /** Dust notes free to pay a fee now. */
+    dustAvailableCount: number;
     dustPendingCount: number;
     dustPendingValue: string;
+    /** How often this process restored the dust wallet from a snapshot taken before a build. */
     dustRestoreCount: number;
-}> {
+}
+
+export function walletGetBalance(args: {
+    sessionId: string;
+    syncTimeoutMs?: number;
+    /** Timeout for the call itself, so polling a stuck worker does not pile up calls. */
+    rpcTimeoutMs?: number;
+}): Promise<WalletBalanceSnapshot> {
     const { rpcTimeoutMs, ...rest } = args;
     return rpc('getBalance', rest, rpcTimeoutMs);
 }
@@ -953,6 +914,8 @@ export function walletDeployContract(args: WalletDeployContractArgs, onSubmitInt
 export function walletSubmitContractCall(args: WalletSubmitContractCallArgs, onSubmitIntent?: SubmitIntentHook): Promise<{
     txHash: string;
     onChainStatus: string;
+    /** Height of the block the transaction landed in; null when the node did not report it. */
+    blockHeight: number | null;
 }> {
     return rpc('submitContractCall', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
@@ -965,26 +928,10 @@ export function walletBuildSponsorableTx(
 }
 
 /** Pays the dust fee for a tx the caller finalized and sends it, if the sponsor rules allow it. */
-export function walletSponsorFinalizedTx(args: {
+export function walletSponsorFinalizedTx(args: SponsorPolicyArgs & {
     sponsorSessionId: string;
     finalizedTxB64: string;
     networkId: WalletSubmitContractCallArgs['networkId'];
-    allowedContracts?: string[];
-    allowedCircuits?: string[];
-    /** Replaces `allowedCircuits` for calls on the listed contracts. */
-    contractCircuits?: ContractCircuitRules;
-    /** Both the server rules and the grant allow a contract deploy in this tx. */
-    allowDeploy?: boolean;
-    /** Contracts deployed under this grant. Calls on them skip `allowedCircuits`. */
-    ownContracts?: string[];
-    /** Shielded token types whose zswap offers the sponsor pays for. Unset means none. */
-    allowedTokenTypes?: string[];
-    /** Also pay for the offer of a token that a call in this tx mints. */
-    allowContractMints?: boolean;
-    /** Both the server rules and the grant let the calls move the caller's own unshielded tokens into the contract. */
-    allowUnshieldedOffers?: boolean;
-    /** Unshielded token types besides NIGHT such an offer may move. */
-    allowedUnshieldedTokenTypes?: string[];
 }, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; deployed?: string[]; minted?: string[]; unshielded?: UnshieldedMove[] }> {
     return rpc('sponsorFinalizedTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
@@ -1001,6 +948,8 @@ export function walletSubmitContractCallBatch(args: WalletSubmitContractCallBatc
     txHash: string;
     onChainStatus: string;
     circuits: string[];
+    /** Height of the block the transaction landed in; null when the node did not report it. */
+    blockHeight: number | null;
 }> {
     return rpc('submitContractCallBatch', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
@@ -1028,11 +977,8 @@ export interface SponsoredSwapTerms {
     wants: { tokenType: string; amount: string };
 }
 
-/**
- * Pays the fee of a caller tx that is not bound yet, so the sponsor can still add its dust spend.
- * Many of these can run in parallel from one sponsor wallet.
- */
-export function walletSponsorUnboundTx(args: {
+/** Pays the fee of a caller tx that is not bound yet, so the sponsor can still add its dust spend. */
+export function walletSponsorUnboundTx(args: SponsorPolicyArgs & {
     sponsorSessionId: string;
     /** The caller's transaction; absent for a swap. */
     unboundTxB64?: string;
@@ -1043,22 +989,6 @@ export function walletSponsorUnboundTx(args: {
     transfer?: { txB64: string; tokenType: string; amount: string };
     allowTransfers?: boolean;
     networkId: WalletSubmitContractCallArgs['networkId'];
-    allowedContracts?: string[];
-    allowedCircuits?: string[];
-    /** Replaces `allowedCircuits` for calls on the listed contracts. */
-    contractCircuits?: ContractCircuitRules;
-    /** Both the server rules and the grant allow a contract deploy in this tx. */
-    allowDeploy?: boolean;
-    /** Contracts deployed under this grant. Calls on them skip `allowedCircuits`. */
-    ownContracts?: string[];
-    /** Shielded token types whose zswap offers the sponsor pays for. Unset means none. */
-    allowedTokenTypes?: string[];
-    /** Also pay for the offer of a token that a call in this tx mints. */
-    allowContractMints?: boolean;
-    /** Both the server rules and the grant let the calls move the caller's own unshielded tokens into the contract. */
-    allowUnshieldedOffers?: boolean;
-    /** Unshielded token types besides NIGHT such an offer may move. */
-    allowedUnshieldedTokenTypes?: string[];
 }, onSubmitIntent?: SubmitIntentHook): Promise<{
     txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[]; minted?: string[];
     swap?: SponsoredSwapTerms; transfer?: DeclaredTransfer; unshielded?: UnshieldedMove[]; nullifiers?: string[];

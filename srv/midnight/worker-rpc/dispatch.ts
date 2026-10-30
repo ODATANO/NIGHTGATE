@@ -1,8 +1,5 @@
-/**
- * Receives calls from the owning thread and runs the matching method.
- * One reply per call on the call's own port: `{ ok: true, result }` or `{ ok: false, error }`.
- * This module does not import `@sap/cds`, because the worker threads load it.
- */
+// Runs calls from the owning thread. One reply per call: `{ ok: true, result }` or `{ ok: false, error }`.
+// Does not import `@sap/cds`, because the worker threads load it.
 
 import type { MessagePort } from 'node:worker_threads';
 import { errorName, formatErrWithCauses } from '../../utils/format-error';

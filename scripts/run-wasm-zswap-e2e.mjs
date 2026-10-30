@@ -1,31 +1,6 @@
-// zswap in-process proving measurement.
-//
-// NIGHT is unshielded-only, so no NIGHT flow can ever exercise the zswap
-// prover circuits. This runner creates the missing shielded funds itself:
-//   1. deploy @odatano/contract-shielded-token (mint circuit, compiled artifact)
-//   2. submitContractCall mint() → 100000000 atoms of the contract's
-//      shielded token to the caller's own zswap public key
-//   3. wait for the wallet to sync the minted coin, then
-//   4. sendNight with tokenTypeHex → shielded SELF-transfer of the custom
-//      token. The wallet-side build of that tx spends + recreates a
-//      shielded coin: zswap/spend + zswap/output prove IN-PROCESS when the
-//      server runs NIGHTGATE_PROVING_MODE=wasm.
-//
-// The proof server must be reachable for steps 1-2 (contract circuit,
-// separate midnight-js stack); step 4 is pure wallet proving.
-//
-// Server (separate terminal):
-//   NIGHTGATE_PROVING_MODE=wasm npm run dev
-// Then:
-//   node --env-file=.env scripts/run-wasm-zswap-e2e.mjs
-//   (or: npm run wasm-zswap:e2e)
-//
-// Extra env vars on top of the shared ones:
-//   ZSWAP_E2E_CONTRACT       reuse an already-deployed shielded-token address
-//                            (skips deploy; mint still runs)
-//   ZSWAP_E2E_SKIP_MINT      '1' to skip mint (coin already in wallet)
-//   ZSWAP_E2E_SEND_AMOUNT    default '1000000'
-//   ZSWAP_E2E_SYNC_RETRIES   default 20 (x30s = 10 min for the mint to sync)
+// Mints a shielded test token, then sends it to itself so the zswap circuits prove in-process. Mint needs a proof server.
+// Run: npm run wasm-zswap:e2e against `NIGHTGATE_PROVING_MODE=wasm npm run dev`
+// Env: ZSWAP_E2E_CONTRACT, ZSWAP_E2E_SKIP_MINT=1, ZSWAP_E2E_SEND_AMOUNT, ZSWAP_E2E_SYNC_RETRIES, plus the shared LACE_* vars.
 
 import bip39 from 'bip39';
 import { createRequire } from 'node:module';

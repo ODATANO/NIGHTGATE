@@ -1,7 +1,4 @@
-// Integration check: real Midnight SDK is callable with the shapes that
-// srv/midnight/providers.ts expects. Does NOT make any network calls; just
-// constructs providers and verifies the SDK functions accept our arg shapes.
-//
+// Checks that the Midnight SDK provider factories accept the argument shapes srv/midnight/providers.ts uses. No network calls.
 // Run: node scripts/integration-test-providers.mjs
 
 import WebSocket from 'ws';
@@ -11,6 +8,9 @@ import { NodeZkConfigProvider }      from '@midnight-ntwrk/midnight-js-node-zk-c
 import { levelPrivateStateProvider } from '@midnight-ntwrk/midnight-js-level-private-state-provider';
 import path from 'node:path';
 import os from 'node:os';
+import { createRequire } from 'node:module';
+
+const { deriveIndexerWsUrl } = createRequire(import.meta.url)('../srv/utils/indexer-url.js');
 
 let failures = 0;
 function ok(name, value) {
@@ -27,10 +27,11 @@ const zkConfigProvider = new NodeZkConfigProvider('/tmp/managed/test');
 ok('NodeZkConfigProvider construct', zkConfigProvider);
 ok('NodeZkConfigProvider.directory', zkConfigProvider.directory);
 
-// 2. publicDataProvider, (httpUrl, wsUrl, optionalWsImpl)
+// 2. publicDataProvider, (httpUrl, wsUrl, optionalWsImpl); nothing is dialed here, so any well-formed URL does
+const indexerHttpUrl = process.env.NIGHTGATE_INDEXER_HTTP_URL || 'http://127.0.0.1:8088/api/v4/graphql';
 const publicDataProvider = indexerPublicDataProvider(
-    'https://indexer.preprod.midnight.network/api/v4/graphql',
-    'wss://indexer.preprod.midnight.network/api/v4/graphql/ws',
+    indexerHttpUrl,
+    process.env.NIGHTGATE_INDEXER_WS_URL || deriveIndexerWsUrl(indexerHttpUrl),
     WebSocket
 );
 ok('indexerPublicDataProvider', publicDataProvider);

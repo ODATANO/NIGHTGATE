@@ -1,19 +1,11 @@
 // Sets up the midnight-js providers a browser app needs to build and prove a contract call.
-// They use the server's /contract-manifest and /zk-config routes and a connected Midnight wallet.
 // The SDK packages load only when used, so importing `@odatano/nightgate/browser` stays cheap.
-//
 // Paying the fee and submitting the transaction are left to the app.
-// The wallet API passes transactions as strings, while midnight-js expects ledger objects,
-// and how to connect the two depends on the app.
 
 import { FetchZkConfigProvider } from './zk-config.mjs';
 import { InMemoryPrivateStateProvider } from './private-state.mjs';
 
-/**
- * Turns a manifest URL into an absolute URL.
- * The server sends relative URLs unless a public base URL is configured.
- * An app on another origin must therefore resolve them against the manifest's own URL.
- */
+/** Turns a manifest URL into an absolute URL. The server sends relative URLs unless a public base URL is configured. */
 export function resolveManifestUrl(url, manifestUrl) {
     const raw = String(url ?? '');
     if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
@@ -22,18 +14,8 @@ export function resolveManifestUrl(url, manifestUrl) {
     throw new Error(`createNightgateConnectorProviders: manifest URL '${raw}' is relative; pass opts.manifestUrl (the URL the manifest was fetched from)`);
 }
 
-/**
- * @param {object}   opts
- * @param {object}   opts.connector  A connected wallet, the ConnectedAPI of `@midnight-ntwrk/dapp-connector-api`.
- * @param {object}   opts.manifest   The parsed `/contract-manifest` JSON.
- * @param {string}   [opts.manifestUrl]  The URL the manifest was loaded from. Needed when the manifest
- *                                       has relative URLs and the app runs on another origin.
- * @param {string}   opts.contract   Contract name, for example 'attestation-vault'.
- * @param {typeof fetch} [opts.fetchFn]    Defaults to the global fetch.
- * @param {any}      [opts.webSocket]      Defaults to the global WebSocket.
- * @param {'server'|'wallet'|'auto'} [opts.proving='server']  Where proofs are made. See buildProofProvider.
- * @returns The providers, the wallet's public keys and the connector.
- */
+/** Builds the providers for one contract from a connected wallet and the parsed `/contract-manifest`.
+ *  Pass `manifestUrl` when the manifest has relative URLs and the app runs on another origin. */
 export async function createNightgateConnectorProviders(opts = {}) {
     const { connector, manifest, manifestUrl, contract, fetchFn, webSocket, proving = 'server' } = opts;
     if (!connector) throw new Error('createNightgateConnectorProviders: connector is required');
@@ -71,10 +53,7 @@ export async function createNightgateConnectorProviders(opts = {}) {
         publicDataProvider,
         zkConfigProvider,
         proofProvider,
-        /**
-         * Where proofs are actually made: 'server', 'wallet' or 'none'.
-         * Log or show it. With 'server', the private inputs of the transaction are sent to the proof server.
-         */
+        /** Where proofs are made: 'server', 'wallet' or 'none'. With 'server' the private inputs go to the proof server. */
         provingModality,
         privateStateProvider,
         connector,
@@ -85,27 +64,13 @@ export async function createNightgateConnectorProviders(opts = {}) {
             shieldedAddress: addrs && addrs.shieldedAddress
         },
         zkConfigBaseUrl: entry.zkConfigBaseUrl,
-        /**
-         * The key source for proving in the wallet:
-         *   const pp = await connector.getProvingProvider(providers.keyMaterialProvider());
-         */
+        /** Key source for wallet proving: `connector.getProvingProvider(providers.keyMaterialProvider())`. */
         keyMaterialProvider: () => zkConfigProvider.asKeyMaterialProvider()
     };
 }
 
-/**
- * Creates the proof provider for the chosen proving mode.
- *
- *   'server' - sends proofs to the proof server at `proverServerUri`. This is the default.
- *              The proof server must be reachable from the browser.
- *   'wallet' - lets the connected wallet make the proofs. No proof server is needed, and the
- *              private inputs stay on the user's machine. Throws if the wallet cannot prove,
- *              so the private inputs never go to a server without the caller asking for it.
- *   'auto'   - uses the wallet if it can prove, else the server.
- *
- * In wallet mode, `zkConfigProvider` only has the keys of this contract.
- * The wallet brings the keys for the standard Midnight circuits itself.
- */
+/** Creates the proof provider. 'auto' uses the wallet when it can prove, else the proof server.
+ *  'wallet' throws when the wallet cannot prove, so private inputs never reach a server unasked. */
 export async function buildProofProvider({ proving = 'server', connector, zkConfigProvider, proverServerUri, proofMod }) {
     if (proving !== 'server' && proving !== 'wallet' && proving !== 'auto') {
         throw new Error(`createNightgateConnectorProviders: unknown proving modality '${proving}'`);

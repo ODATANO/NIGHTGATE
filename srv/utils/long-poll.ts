@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Request } from '@sap/cds';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 /** Longest hold of a long-polling call, in ms. */
 export const LONG_POLL_MAX_MS = 25_000;
@@ -24,7 +25,7 @@ export async function holdUntil<T>(req: Request, waitMs: number, pool: WaiterPoo
     pool.count++;
     try {
         while (!done(current) && Date.now() < deadline && !clientGone(req)) {
-            await new Promise(r => setTimeout(r, Math.min(STEP_MS, deadline - Date.now())));
+            await sleep(Math.min(STEP_MS, deadline - Date.now()));
             if (clientGone(req)) break;
             current = await read();
         }

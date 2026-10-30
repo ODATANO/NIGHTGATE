@@ -423,7 +423,7 @@ describe('NightgateAdminService', () => {
             const handler = registeredHandlers['grantRole'];
             const bad = createMockRequest({ userId: 'bob', role: 'authority', validUntil: 'soon' }, 'admin-1');
             await handler(bad);
-            expect(bad.reject).toHaveBeenCalledWith(400, 'validUntil must be an ISO timestamp');
+            expect(bad.reject).toHaveBeenCalledWith(400, 'validUntil must be an ISO-8601 timestamp');
 
             const past = createMockRequest(
                 { userId: 'bob', role: 'authority', validUntil: new Date(Date.now() - 1000).toISOString() },

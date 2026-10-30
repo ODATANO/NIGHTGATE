@@ -1,9 +1,6 @@
-/**
- * Lets the main thread cancel a worker call after its timeout.
- * The call stops at its next wait point. Once the call announced its tx, it is never
- * cancelled, because the tx may already be on its way.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Lets the main thread cancel a worker call after its timeout. The call stops at its next wait point.
+// A call that announced its tx is never cancelled, because the tx may already be on its way.
+// SPDX-License-Identifier: Apache-2.0
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 interface RpcScope { method: string; signal: AbortSignal; announced: boolean }

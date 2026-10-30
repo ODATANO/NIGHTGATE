@@ -1,13 +1,8 @@
 using {midnight} from '../db/schema';
 
-/**
- * Sync state, health checks and reorg history of the block indexer.
- *
- * The service is open to anyone and each element sets its own access rule.
- * This lets health checks call the probes without credentials.
- * The probes getLiveness, getReadiness, getMetrics, getSyncStatus, getHealth, getBoardStatus and getReceiptKey are public.
- * Everything else needs a signed-in user or an admin.
- */
+/** Sync state, health checks and reorg history of the block indexer. Each element sets its own access rule.
+ * getLiveness, getReadiness, getMetrics, getSyncStatus, getHealth, getBoardStatus and getReceiptKey are public, so health checks need no credentials.
+ * Everything else needs a signed-in user or an admin. */
 @path    : '/odata/v4/midnight-indexer'
 @requires: 'any'
 service NightgateIndexerService {
@@ -90,6 +85,7 @@ service NightgateIndexerService {
         sponsorsConfigured : Integer;
         sponsorsReady      : Integer; // synced and holding DUST to pay a fee
         factoryContract    : String; // hex; the token factory mintFactoryToken uses without a contractAddress; null = none set
+        version            : String; // the running NIGHTGATE version
         asOf               : Timestamp;
     };
 

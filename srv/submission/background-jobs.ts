@@ -1,9 +1,6 @@
-/**
- * Runs long work as background jobs stored in the database.
- * The request only inserts the job row. The work runs later in short database
- * transactions, so no connection stays open for hours.
- * A unique (sessionId, kind, idempotencyKey) prevents duplicate jobs.
- */
+// Runs long work as background jobs stored in the database. The request only inserts the job row.
+// The work runs later in short transactions, so no connection stays open for hours.
+// A unique (sessionId, kind, idempotencyKey) prevents duplicate jobs.
 
 import { isLockContention, lockContentionBackoffMs, __resetLockContentionBackoffForTests, LOCK_CONTENTION_ATTEMPTS, withLockContentionRetry } from './db-write-retry';
 import cds from '@sap/cds';
@@ -14,11 +11,12 @@ import { jobCommandBinding } from '../utils/envelope-bindings';
 import { getArtifactGenerationDigest } from './contract-registry';
 import { configInt, configMs } from '../utils/config';
 import type { DbRunner } from '../utils/db-types';
-import { safeStringify, sleep, IDEMPOTENCY_KEY_MAX_LENGTH, IdempotencyKeyInvalidError, JobAdmissionBusyError, isUniqueViolation, WorkflowReconciliationRequiredError, getJobById, IdempotencyConflictError, __resetStoreForTests } from './job-store';
+import { childFailedMessage, safeStringify, IDEMPOTENCY_KEY_MAX_LENGTH, IdempotencyKeyInvalidError, JobAdmissionBusyError, isUniqueViolation, WorkflowReconciliationRequiredError, getJobById, IdempotencyConflictError, __resetStoreForTests } from './job-store';
 import { processors, processorKey } from './job-registry';
 import { scheduleJob, __resetSchedulerForTests } from './job-scheduler';
 import { __resetReconciliationForTests } from './job-reconciliation';
 import { errorMessage } from '../utils/errors';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 export { declareJobKind, jobKindTraits, kindsWithTrait, __workflowParentKindsForTests, registerBackgroundJobProcessor, undeclaredOrUnregisteredJobKinds, registerBackgroundJobReconciliationFinalizer, type BackgroundJobProcessor, type BackgroundJobReconciliationFinalizer } from './job-registry';
 export { type ReconciliationEvidence, WorkflowReconciliationRequiredError, runWithoutAmbientTx, getJobById, dropPendingJobsForClosedSessions, findLatestJob, supersedeQueuedJobs, IDEMPOTENCY_KEY_MAX_LENGTH, IdempotencyKeyInvalidError, IdempotencyConflictError, JobAdmissionBusyError, markJobExternalExecution, markJobBroadcastOn, markJobSubmissionRejectedOn, markJobSubmitted } from './job-store';
@@ -62,7 +60,7 @@ export interface StartJobResult<TOut = unknown, TIn = unknown> {
 /** Inserts the job row in the caller's transaction and starts the work in the background. Returns at once. */
 export async function startJob<TIn, TOut>(
     args: StartJobArgs<TIn, TOut>
-): Promise<StartJobResult<TOut>> {
+): Promise<StartJobResult<TOut, TIn>> {
     const { kind, sessionId, idempotencyKey, request, idempotencyPayload, requestedBy, grantId, command, commandVersion, encryptCommand, parentJobId, workflowStep, work } = args;
     if (!kind) throw new Error('startJob: kind is required');
     if (!sessionId) throw new Error('startJob: sessionId is required');
@@ -173,24 +171,10 @@ export async function startJob<TIn, TOut>(
             if (dup) return dup;
             throw insertErr;
         }
-    } else if (pinnedRunner) {
-        for (let attempt = 0; ; attempt++) {
-            if (lockContentionBackoffMs()[attempt]) await sleep(lockContentionBackoffMs()[attempt]);
-            try {
-                await pinnedRunner.run(buildInsert());
-                break;
-            } catch (insertErr) {
-                if (isLockContention(insertErr) && attempt + 1 < LOCK_CONTENTION_ATTEMPTS) {
-                    cds.log('nightgate').warn(`startJob(${kind}): admission insert lost the SQLite lock (attempt ${attempt + 1}/${LOCK_CONTENTION_ATTEMPTS})`);
-                    continue;
-                }
-                if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
-                throw insertErr;
-            }
-        }
     } else {
+        const runner = pinnedRunner ?? db;
         try {
-            await withLockContentionRetry(`startJob(${kind}) admission insert`, () => db.run(buildInsert()));
+            await withLockContentionRetry(`startJob(${kind}) admission insert`, () => runner.run(buildInsert()));
         } catch (insertErr) {
             if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
             throw insertErr;
@@ -235,10 +219,7 @@ async function hasCompletedChild(parentJobId: string): Promise<boolean> {
     }
 }
 
-/**
- * Runs one workflow step as its own job and waits for its result.
- * A re-run parent finds the same step job again through its fixed idempotency key.
- */
+/** Runs one workflow step as its own job and waits for its result. A re-run parent finds the same step job by its fixed idempotency key. */
 export async function runChildCommand<T>(args: {
     parent: BackgroundJob;
     kind: string;
@@ -284,7 +265,12 @@ export async function runChildCommand<T>(args: {
         if (!row) throw new Error(`Child job ${child.jobId} disappeared`);
         if (row.status === 'succeeded') return (row.result ? JSON.parse(row.result) : undefined) as T;
         if (row.status === 'reconciliation_required') throw new ChildReconciliationRequiredError(row.ID, step);
-        if (row.status === 'failed') throw new Error(`Child job ${row.ID} failed [${row.errorCode ?? 'UNKNOWN'}]: ${row.errorMessage ?? 'unknown error'}`);
+        if (row.status === 'failed') {
+            const siblings = await (await cds.connect.to('db')).run(SELECT.from(BackgroundJobs).where({ parentJobId: parent.ID })) as BackgroundJob[];
+            const message = childFailedMessage(row, siblings);
+            // Same code the reconciler writes when it fails the parent of a failed child.
+            throw Object.assign(new Error(message), { classification: { code: 'CHILD_FAILED', retryable: false, message } });
+        }
         if (Date.now() >= deadline) {
             throw new WorkflowReconciliationRequiredError(
                 `Timed out waiting for child job ${row.ID} at workflow step '${step}' while it remained ${row.status}; the child may still cross the external-effect boundary`

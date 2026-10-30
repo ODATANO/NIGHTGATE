@@ -1,8 +1,5 @@
-/**
- * Settles jobs whose outcome is open: after a restart, after a send whose result was lost,
- * and by checking sent transactions against the chain indexer.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Settles jobs with an open outcome: after a restart, after a send whose result was lost, and by checking sent transactions against the indexer.
+// SPDX-License-Identifier: Apache-2.0
 import { REJECTED_ATTEMPT_BOOKKEEPING_PENDING } from './job-execution-context';
 import cds from '@sap/cds';
 import { BackgroundJobs, PendingSubmissions, type PendingSubmission, type BackgroundJob } from '#cds-models/midnight';
@@ -11,11 +8,12 @@ import { isChainOutcome, isChainAbsent, type ChainOutcome, type ChainLookup } fr
 import { configMs } from '../utils/config';
 import { carriedSubmitFailure } from '../midnight/wallet-worker-protocol';
 import { readReorgGeneration, lockReorgGeneration } from './reorg-generation';
-import type { DbRunner, DbService } from '../utils/db-types';
+import { affectedRows, type DbRunner, type DbService } from '../utils/db-types';
 import { kindsWithTrait, jobKindTraits, runReconciliationFinalizer } from './job-registry';
-import { affectedRows, safeStringify, ReconciliationEvidence, getRuntimeWorkerId, markReconciliationRequired } from './job-store';
+import { attemptRowOf, childFailedMessage, safeStringify, ReconciliationEvidence, getRuntimeWorkerId, markReconciliationRequired } from './job-store';
 import { errorMessage } from '../utils/errors';
 import { withLockContentionRetry, LOCK_CONTENTION_ATTEMPTS } from './db-write-retry';
+import { deployRefund } from '../sessions/deploy-refund';
 
 const { SELECT, UPDATE } = cds.ql;
 
@@ -122,8 +120,7 @@ function chainEvidencePatch(outcome: ChainOutcome): Record<string, unknown> {
 }
 
 /**
- * Which calls of a batch applied on chain. Combines the call names stored per transaction part
- * before sending with the parts the indexer reports as failed. Null when nothing was stored.
+ * Which calls of a batch applied on chain, from the call names stored per transaction part and the parts the indexer reports as failed. Null when nothing was stored.
  */
 export function chainSegmentsOf(submitIntentData: string | null | undefined, outcome: ChainOutcome): string | null {
     const segments = parseSubmitIntent(submitIntentData).segments;
@@ -156,14 +153,11 @@ export const BROADCAST_NOT_INCLUDED = 'BROADCAST_NOT_INCLUDED';
 /** For rows without a stored ttl. The longest ttl any send path sets. */
 const LEGACY_BROADCAST_TTL_MS = 60 * 60 * 1000;
 
-/**
- * Fails a parked job as never included once the indexer that reported it missing is past its ttl
- * plus a margin. Only that indexer's tip counts. A lagging replica must not turn a landed
- * transaction into a lost one, or the caller would pay twice.
- */
+// Fails a parked job as never included once the indexer that reported it missing is past its ttl plus a margin.
+// Only that indexer's tip counts. A lagging replica must not turn a landed transaction into a lost one, or the caller would pay twice.
 async function finalizeLostBroadcast(db: DbService, job: BackgroundJob, tipMs: number | null, generation: number): Promise<number> {
     if (tipMs === null || job.errorCode === REJECTED_ATTEMPT_BOOKKEEPING_PENDING || jobKindTraits(job.kind).workflowParent) return 0;
-    const submission: PendingSubmission | undefined = await db.run(SELECT.one.from(PendingSubmissions).where(job.submissionId ? { ID: job.submissionId } : { txHash: job.txHash }));
+    const submission: PendingSubmission | undefined = await db.run(SELECT.one.from(PendingSubmissions).where(attemptRowOf(job)));
     const coordinates = parseSubmitIntent(submission?.submitIntentData);
     const reservation = coordinates.deployReservation ?? null;
     const recorded = typeof coordinates.ttl === 'string' ? Date.parse(coordinates.ttl) : NaN;
@@ -191,11 +185,7 @@ async function finalizeLostBroadcast(db: DbService, job: BackgroundJob, tipMs: n
         }
         // Refund the reserved deploy exactly once. Only the row closed here can still hold it.
         if (rowClosed === 1 && reservation?.grantId && Number.isInteger(reservation.count) && (reservation.count as number) > 0) {
-            await tx.run(
-                UPDATE.entity('midnight.AgentGrants')
-                    .set({ deploysUsed: { '-=': reservation.count } })
-                    .where({ ID: reservation.grantId, deploysUsed: { '>=': reservation.count } })
-            );
+            await tx.run(deployRefund(reservation.grantId, reservation.count as number));
         }
         if (affected === 1) cds.log('nightgate').warn(`${job.kind} job ${job.ID}: ${message}${rowClosed === 1 && reservation?.count ? ` (refunded ${reservation.count} deploy reservation(s) on grant ${String(reservation.grantId).slice(0, 8)})` : ''}`);
         return affected;
@@ -203,9 +193,7 @@ async function finalizeLostBroadcast(db: DbService, job: BackgroundJob, tipMs: n
 }
 
 /**
- * Finishes a job and its attempt row in one transaction. A job settled after a lost send
- * gets the same result a normal run returns, rebuilt from the data stored before sending.
- * For a `succeeded` job only chainStatus moves forward.
+ * Finishes a job and its attempt row in one transaction. A job settled after a lost send gets the same result as a normal run. A `succeeded` job only moves chainStatus forward.
  */
 async function finalizeIdentifierKeyedJob(
     db: DbService, job: BackgroundJob, outcome: ChainOutcome,
@@ -214,7 +202,7 @@ async function finalizeIdentifierKeyedJob(
     const status = outcome.status;
     const evidence = chainEvidencePatch(outcome);
     const now = new Date().toISOString();
-    const submission: PendingSubmission | undefined = await db.run(SELECT.one.from(PendingSubmissions).where(job.submissionId ? { ID: job.submissionId } : { txHash: job.txHash }));
+    const submission: PendingSubmission | undefined = await db.run(SELECT.one.from(PendingSubmissions).where(attemptRowOf(job)));
     const coordinates = parseSubmitIntent(submission?.submitIntentData);
     const canonicalResult = {
         txHash: job.txHash,
@@ -225,31 +213,26 @@ async function finalizeIdentifierKeyedJob(
         reconciled: true
     };
     const terminal = opts.fromStatus === 'reconciliation_required' || opts.fromStatus === 'in_flight';
-    // The job kind's result writer runs first. If it throws, the job stays parked.
-    let finalizedResult: unknown = canonicalResult;
-    if (opts.fromStatus === 'reconciliation_required' && status === 'success') {
-        const reconciliationEvidence: ReconciliationEvidence = {
-            submissionId: submission?.ID ?? job.submissionId ?? null,
-            txHash: job.txHash!,
-            contractAddress: submission?.contractAddress ?? null,
-            finalizedAt: submission?.finalizedAt ?? null,
-            blockHeight: outcome.blockHeight
-        };
-        const fromFinalizer = await runReconciliationFinalizer(job, reconciliationEvidence);
-        if (fromFinalizer !== undefined) finalizedResult = { ...canonicalResult, ...(fromFinalizer as object) };
-    }
-    const jobPatch: Record<string, unknown> = {
+    const runsFinalizer = opts.fromStatus === 'reconciliation_required' && status === 'success';
+    const reconciliationEvidence: ReconciliationEvidence = {
+        submissionId: submission?.ID ?? job.submissionId ?? null,
+        txHash: job.txHash!,
+        contractAddress: submission?.contractAddress ?? null,
+        finalizedAt: submission?.finalizedAt ?? null,
+        blockHeight: outcome.blockHeight
+    };
+    const segments = chainSegmentsOf(submission?.submitIntentData, outcome);
+    const jobPatchFor = (finalizedResult: unknown): Record<string, unknown> => ({
         ...(terminal
             ? (status === 'success'
                 ? { status: 'succeeded', chainStatus: 'success', chainFinalizedAt: now, errorCode: null, errorMessage: null, finishedAt: now, result: safeStringify(finalizedResult) }
                 : { status: 'failed', chainStatus: 'failure', chainFinalizedAt: now, finishedAt: now,
                     errorCode: 'CHAIN_EXECUTION_FAILED', errorMessage: `Transaction ${job.txHash} is on-chain but its contract call did not apply (ledger result failure)` })
             : { chainStatus: status, chainFinalizedAt: now }),
-        ...evidence
-    };
-    const segments = chainSegmentsOf(submission?.submitIntentData, outcome);
-    if (segments) jobPatch.chainSegments = segments;
-    if (opts.fromStatus === 'in_flight') Object.assign(jobPatch, { leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null });
+        ...evidence,
+        ...(segments ? { chainSegments: segments } : {}),
+        ...(opts.fromStatus === 'in_flight' ? { leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null } : {})
+    });
     const jobWhere: Record<string, unknown> = opts.fromStatus === 'reconciliation_required'
         ? { ID: job.ID, status: 'reconciliation_required' }
         : opts.fromStatus === 'in_flight'
@@ -261,23 +244,34 @@ async function finalizeIdentifierKeyedJob(
         ...evidence,
         ...(status === 'failure' ? { errorCode: 'CHAIN_EXECUTION_FAILED', errorMessage: 'contract call did not apply (ledger result failure)' } : {})
     };
-    return withLockContentionRetry(`finalizeIdentifierKeyedJob(${job.ID})`, () => db.tx(async (tx) => {
+    let deferred: Array<() => Promise<void>> = [];
+    const affected = await withLockContentionRetry(`finalizeIdentifierKeyedJob(${job.ID})`, () => db.tx(async (tx) => {
+        deferred = [];
         // A chain rollback since the lookup means the outcome may be from the old fork.
         if (await lockReorgGeneration(tx) !== opts.generation) return 0;
-        const affected = affectedRows(await tx.run(UPDATE.entity(BackgroundJobs).set(jobPatch).where(jobWhere)));
-        if (affected === 1 && submission?.ID) {
+        // The job kind's result writer shares this transaction. If it throws, the job stays parked.
+        let finalizedResult: unknown = canonicalResult;
+        if (runsFinalizer) {
+            const fromFinalizer = await runReconciliationFinalizer(job, reconciliationEvidence, tx, work => { deferred.push(work); });
+            if (fromFinalizer !== undefined) finalizedResult = { ...canonicalResult, ...(fromFinalizer as object) };
+        }
+        const changed = affectedRows(await tx.run(UPDATE.entity(BackgroundJobs).set(jobPatchFor(finalizedResult)).where(jobWhere)));
+        if (changed === 1 && submission?.ID) {
             await tx.run(UPDATE.entity(PendingSubmissions).set(subPatch).where({ ID: submission.ID }));
         }
-        return affected;
+        return changed;
     }));
+    if (affected === 1) {
+        for (const work of deferred) {
+            await work().catch(err => cds.log('nightgate').warn(`job ${job.ID}: follow-up after reconciliation failed: ${errorMessage(err)}`));
+        }
+    }
+    return affected;
 }
 
 let settleRejectedCursor: string | undefined;
 
-/**
- * Finishes the cleanup for rejected sends whose database writes failed earlier.
- * One transaction per job, safe to repeat.
- */
+/** Finishes the cleanup for rejected sends whose database writes failed earlier. One transaction per job, safe to repeat. */
 export async function settleRejectedSponsorAttempts(existingDb?: DbService): Promise<number> {
     const db = existingDb ?? await cds.connect.to('db');
     const page = await scanBackgroundJobPage(db, {
@@ -303,11 +297,7 @@ export async function settleRejectedSponsorAttempts(existingDb?: DbService): Pro
                 }
                 // Only a row closed here can still hold the reserved deploy.
                 if (rowClosed === 1 && reservation?.grantId && Number.isInteger(reservation.count) && (reservation.count as number) > 0) {
-                    await tx.run(
-                        UPDATE.entity('midnight.AgentGrants')
-                            .set({ deploysUsed: { '-=': reservation.count } })
-                            .where({ ID: reservation.grantId, deploysUsed: { '>=': reservation.count } })
-                    );
+                    await tx.run(deployRefund(reservation.grantId, reservation.count as number));
                 }
                 return affectedRows(await tx.run(
                     UPDATE.entity(BackgroundJobs)
@@ -345,8 +335,7 @@ export function triggerChainConfirmPass(): void {
 }
 
 /**
- * Reads one page and moves past every row read, including rows that keep failing, then wraps.
- * Cursors live in memory, which is enough because only one server instance runs.
+ * Reads one page and moves past every row read, including rows that keep failing, then wraps. Cursors live in memory, which is enough because only one server instance runs.
  */
 async function scanBackgroundJobPage(
     db: DbRunner,
@@ -369,50 +358,42 @@ async function scanBackgroundJobPage(
 }
 
 /**
- * Re-queues parked workflow jobs once all their child jobs succeeded. The re-run builds the
- * result without sending again. Other jobs are settled only by the indexer check.
+ * Re-queues parked workflow jobs once all their child jobs succeeded. The re-run builds the result without sending again. Other jobs settle only through the indexer check.
  */
 export async function reconcileBackgroundJobs(existingDb?: DbRunner): Promise<number> {
     const db = existingDb ?? await cds.connect.to('db');
+    // Only workflow parents are settled here. Identifier-keyed jobs settle through the chain-outcome pass.
     const page = await scanBackgroundJobPage(
-        db, { status: 'reconciliation_required' }, reconciliationCursor
+        db, { status: 'reconciliation_required', kind: { in: kindsWithTrait('workflowParent') } }, reconciliationCursor
     );
     reconciliationCursor = page.cursor;
-    const candidates = page.rows;
     let resolved = 0;
 
-    for (const job of candidates) {
-        if (jobKindTraits(job.kind).workflowParent) {
-            const children = await db.run(
-                SELECT.from(BackgroundJobs).where({ parentJobId: job.ID })
-            ) as BackgroundJob[];
-            if (children.length > 0 && children.every(child => child.status === 'succeeded')) {
-                const affected = await withLockContentionRetry(`requeueReconciledParent(${job.ID})`, () => db.run(
-                    UPDATE.entity(BackgroundJobs).set({
-                        status: 'pending', errorCode: null, errorMessage: null,
-                        startedAt: null, leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null
-                    }).where({ ID: job.ID, status: 'reconciliation_required' })
-                ));
-                resolved += affectedRows(affected);
-                continue;
-            }
-            // A failed child can never run again under its fixed step key, so the parent fails too.
-            const failedChild = children.find(child => child.status === 'failed');
-            if (failedChild) {
-                const landed = children.filter(child => child.status === 'succeeded').map(child => child.workflowStep ?? child.ID);
-                const affected = await withLockContentionRetry(`failReconciledParent(${job.ID})`, () => db.run(
-                    UPDATE.entity(BackgroundJobs).set({
-                        status: 'failed', errorCode: 'CHILD_FAILED', finishedAt: new Date().toISOString(),
-                        errorMessage: `Child job ${failedChild.ID} (workflow step '${failedChild.workflowStep ?? '?'}') failed [${failedChild.errorCode ?? 'UNKNOWN'}]: ${String(failedChild.errorMessage ?? 'unknown error').slice(0, 1500)}` +
-                            (landed.length ? ` Steps already on chain: ${landed.join(', ')}.` : ' No step of this workflow is on chain.') +
-                            ' A new attempt needs a new idempotencyKey.'
-                    }).where({ ID: job.ID, status: 'reconciliation_required' })
-                ));
-                resolved += affectedRows(affected);
-            }
+    for (const job of page.rows) {
+        const children = await db.run(
+            SELECT.from(BackgroundJobs).where({ parentJobId: job.ID })
+        ) as BackgroundJob[];
+        if (children.length > 0 && children.every(child => child.status === 'succeeded')) {
+            const affected = await withLockContentionRetry(`requeueReconciledParent(${job.ID})`, () => db.run(
+                UPDATE.entity(BackgroundJobs).set({
+                    status: 'pending', errorCode: null, errorMessage: null,
+                    startedAt: null, leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null
+                }).where({ ID: job.ID, status: 'reconciliation_required' })
+            ));
+            resolved += affectedRows(affected);
             continue;
         }
-
+        // A failed child can never run again under its fixed step key, so the parent fails too.
+        const failedChild = children.find(child => child.status === 'failed');
+        if (failedChild) {
+            const affected = await withLockContentionRetry(`failReconciledParent(${job.ID})`, () => db.run(
+                UPDATE.entity(BackgroundJobs).set({
+                    status: 'failed', errorCode: 'CHILD_FAILED', finishedAt: new Date().toISOString(),
+                    errorMessage: childFailedMessage(failedChild, children)
+                }).where({ ID: job.ID, status: 'reconciliation_required' })
+            ));
+            resolved += affectedRows(affected);
+        }
     }
     return resolved;
 }
@@ -449,8 +430,7 @@ export async function refreshSucceededChainOutcomes(existingDb?: DbRunner): Prom
 }
 
 /**
- * Looks up each job's transaction in the indexer. Moves `chainStatus` forward on succeeded jobs
- * and settles parked ones. Stores the block height, which a chain rollback uses to revert.
+ * Looks up each job's transaction in the indexer, moves `chainStatus` forward and settles parked jobs. Stores the block height, which a chain rollback uses to revert.
  */
 export async function confirmChainOutcomesViaIndexer(existingDb?: DbService): Promise<number> {
     const confirmer = chainOutcomeConfirmer;
@@ -470,11 +450,15 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: DbService): Pr
     }, confirmerReconcileCursor);
     confirmerReconcileCursor = reconcilePage.cursor;
     let updated = 0;
+    // Counted for the warning at the end of the pass; the per-job detail stays at debug level.
+    let lookupErrors = 0;
+    let writeErrors = 0;
     // Rollback counter read before the lookups. Each write compares it again under the row lock.
     let generation = await readReorgGeneration(db);
     for (const job of reconcilePage.rows) {
         let outcome: ChainLookup;
         try { outcome = await confirmer(job.txHash!); } catch (err) {
+            lookupErrors++;
             cds.log('nightgate').debug(`Reconciliation lookup for ${job.kind} job ${job.ID} deferred: ${errorMessage(err)}`);
             continue;
         }
@@ -482,6 +466,7 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: DbService): Pr
             // Only a clear "not found" counts. A transaction that is found but not yet confirmed may land.
             if (isChainAbsent(outcome)) {
                 try { updated += await finalizeLostBroadcast(db, job, outcome.asOfMs, generation); } catch (err) {
+                    writeErrors++;
                     cds.log('nightgate').debug(`Lost-broadcast finalization of ${job.kind} job ${job.ID} deferred: ${errorMessage(err)}`);
                 }
             }
@@ -490,13 +475,12 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: DbService): Pr
         try {
             updated += await finalizeIdentifierKeyedJob(db, job, outcome, { fromStatus: 'reconciliation_required', generation });
         } catch (err) {
+            writeErrors++;
             cds.log('nightgate').debug(`Crawler-free reconciliation of ${job.kind} job ${job.ID} deferred: ${errorMessage(err)}`);
         }
     }
     const jobs = [...pendingPage.rows, ...legacyPage.rows]
         .filter(job => !jobKindTraits(job.kind).workflowParent);
-    let lookupErrors = 0;
-    let writeErrors = 0;
     generation = await readReorgGeneration(db);
     let staleGeneration = 0;
     await mapWithConcurrency(jobs, CHAIN_CONFIRM_CONCURRENCY, async job => {
@@ -519,7 +503,7 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: DbService): Pr
                 const now = new Date().toISOString();
                 const evidence = chainEvidencePatch(outcome);
                 const attempt = await db.run(SELECT.one.from(PendingSubmissions).columns('submitIntentData')
-                    .where(job.submissionId ? { ID: job.submissionId } : { txHash: job.txHash }));
+                    .where(attemptRowOf(job)));
                 const segments = chainSegmentsOf(attempt?.submitIntentData, outcome);
                 // One transaction, because a finished job leaves the scan and its attempt row must not stay behind.
                 const n: number = await withLockContentionRetry(`confirmChainOutcome(${job.ID})`, () => db.tx(async (tx): Promise<number> => {
@@ -558,15 +542,14 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: DbService): Pr
     }
     if (lookupErrors > 0 || writeErrors > 0) {
         cds.log('nightgate').warn(
-            `Crawler-free chain confirm: ${lookupErrors} lookup / ${writeErrors} write error(s) of ${jobs.length} this pass`
+            `Crawler-free chain confirm: ${lookupErrors} lookup and ${writeErrors} write error(s) over ${jobs.length + reconcilePage.rows.length} job(s) this pass`
         );
     }
     return updated;
 }
 
 /**
- * Runs at most `limit` items at once and resolves only when all finished. Errors are swallowed
- * per item, so the caller's run-once guard covers the whole pass.
+ * Runs at most `limit` items at once and resolves when all finished. Errors are swallowed per item, so the caller's run-once guard covers the whole pass.
  */
 async function mapWithConcurrency<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
     let next = 0;

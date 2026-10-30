@@ -1,8 +1,6 @@
 # syntax=docker/dockerfile:1
-# NIGHTGATE standalone image: the repo itself is a complete CAP app, this
-# packages it so `docker run` (or the compose service in docker/) yields a
-# working attestation server. Zero-config proving default is in-process wasm;
-# point NIGHTGATE_PROOF_SERVER_URL at a proof-server container to switch.
+# NIGHTGATE standalone image. The repo is a complete CAP app, so `docker run` gives a working attestation server.
+# Proving runs in-process by default. Set NIGHTGATE_PROOF_SERVER_URL to use a proof server.
 
 FROM node:22.23.4-slim AS build
 # better-sqlite3 falls back to a source build when no prebuilt binary matches.
@@ -37,9 +35,8 @@ ENV NODE_ENV=production
 # default heap; override to match the container's memory limit.
 ENV NODE_OPTIONS=--max-old-space-size=8192
 ENV NIGHTGATE_DB_PATH=/data/nightgate.db
-# The plugin only initializes with an EXPLICIT network (an unconfigured
-# plugin must not start crawling/submitting inside a host app). For the
-# standalone image, preprod is the explicit default; override per run.
+# The plugin only initializes with an explicit network; preprod is the image's default. The entrypoint
+# refuses preprod and mainnet without NIGHTGATE_NODE_URL and NIGHTGATE_INDEXER_HTTP_URL (docs/self-hosted.md).
 ENV NIGHTGATE_NETWORK=preprod
 # Attestation-server default: the verify surface is crawler-free, and a
 # fresh container crawling the whole chain into SQLite is rarely what a
@@ -53,10 +50,7 @@ RUN chmod +x /app/docker/entrypoint.sh && mkdir -p /data && chown node:node /dat
 USER node
 VOLUME /data
 EXPOSE 4004
-# Ask NIGHTGATE whether it can work, not merely whether the HTTP port answers:
-# the plugin keeps its CAP host alive when Nightgate itself is offline, so a
-# probe against `/` calls such a container healthy while nothing works.
-# docker/healthcheck.mjs asks the anonymous getReadiness() function.
+# docker/healthcheck.mjs asks getReadiness(), because the plugin keeps CAP alive while NIGHTGATE is offline.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
     CMD node /app/docker/healthcheck.mjs
 ENTRYPOINT ["/app/docker/entrypoint.sh"]

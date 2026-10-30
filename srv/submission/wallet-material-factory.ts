@@ -1,10 +1,8 @@
-/**
- * Turns a stored wallet session into the keys and providers a job needs.
- * The account id and storage passwords are derived from the viewing key, so a
- * reconnect finds the same encrypted state.
- */
+// Turns a stored wallet session into the keys and providers a job needs.
+// The account id and storage passwords derive from the viewing key, so a reconnect finds the same encrypted state.
 
 import cds from '@sap/cds';
+import { assertSeedHex } from '../utils/hex-patterns';
 const { SELECT } = cds.ql;
 import { WalletSessions } from '#cds-models/midnight';
 import crypto from 'crypto';
@@ -155,10 +153,7 @@ export function derivePrivateStatePassword(ring: KeyRing, keyId: string, viewing
     return deriveBoundSecret(ring, keyId, deriveStoragePassword(viewingKey), PRIVATE_STATE_INFO).toString('hex');
 }
 
-/**
- * All older private-state passwords to try when reading, the active master key first.
- * Also used by the re-encryption tool.
- */
+/** All private-state passwords to try when reading, the active master key first. Also used by the re-encryption tool. */
 export function privateStatePasswordCandidates(ring: KeyRing, viewingKey: string): Array<{ keyId: string | null; password: string; legacy: boolean }> {
     const out = [ring.activeId, ...ring.ids().filter(i => i !== ring.activeId)].map(id => ({
         keyId: id as string | null, password: derivePrivateStatePassword(ring, id, viewingKey), legacy: false
@@ -185,9 +180,7 @@ async function createFacadeBackedWalletAdapter(
     seedHex: string,
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex'>
 ): Promise<any> {
-    if (!/^[0-9a-fA-F]{128}$/.test(seedHex)) {
-        throw new Error('Invalid seed: must be 128 hex characters (64-byte BIP39 seed)');
-    }
+    assertSeedHex(seedHex);
 
     // Derive the keys now, because the key getters are synchronous.
     // They come from the Zswap HD role, not from the raw seed.
@@ -213,9 +206,7 @@ async function createFacadeBackedWalletAdapter(
 
 /** Wallet adapter for a seed session without worker config. Public keys are real, signing throws. */
 async function createSigningCapableWalletAdapter(seedHex: string, accountIndex: number = 0): Promise<any> {
-    if (!/^[0-9a-fA-F]{128}$/.test(seedHex)) {
-        throw new Error('Invalid seed: must be 128 hex characters (64-byte BIP39 seed)');
-    }
+    assertSeedHex(seedHex);
 
     const bip39Seed = new Uint8Array(Buffer.from(seedHex, 'hex'));
     const roleSeeds = await deriveRoleSeeds(bip39Seed, accountIndex);

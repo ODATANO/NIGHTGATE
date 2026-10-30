@@ -1,23 +1,12 @@
-// Swaps of private (shielded) tokens between two wallets, without a contract.
-// Each side builds one half: a proven transaction that gives one token and wants another.
-// A half alone is not valid. Two matching halves are joined into one transaction, so both sides trade or neither does.
-// The sponsor pays the fee (`sponsorSwap`), so a trader only needs its shielded coins.
-//
-//   import { createSwapWallet, readSwapTerms, decodeOffer } from '@odatano/nightgate/txbuilder';
-//
-//   const maker = await createSwapWallet({ seedHex, indexerHttpUrl, indexerWsUrl });
-//   const { offer } = await maker.buildHalf({ give: { tokenType: A, amount: 1000n }, want: { tokenType: B, amount: 300n } });
-//   // publish `offer` (text, `swapoffer1...`)
-//
-//   const taker = await createSwapWallet({ seedHex: other, indexerHttpUrl, indexerWsUrl });
-//   const halves = await taker.takeOffer({ offer, expect: { gives: { tokenType: A, amount: 1000n }, wants: { tokenType: B, amount: 300n } } });
-//   await ng.sponsorSwap({ makerHalfB64: halves.makerHalfB64, takerHalfB64: halves.takerHalfB64 });
-//
+// Swaps of private tokens between two wallets, without a contract. Each side builds and proves one half.
+// Two matching halves join into one transaction, so both sides trade or neither does. The sponsor pays the fee.
 // SPDX-License-Identifier: Apache-2.0
 
 import { createRequire } from 'node:module';
+import { gatewayIndexerUrls } from './api-provider.mjs';
 
 const require = createRequire(import.meta.url);
+const { assertSeedHex, bareHex, HEX64_RE } = require('../../srv/utils/hex-patterns.js');
 
 /** Prefix of an offer file, the text form of a swap half. */
 export const SWAP_OFFER_PREFIX = 'swapoffer';
@@ -26,11 +15,9 @@ const offerFile = () => require('../../srv/utils/offer-file.js');
 const midnightAddress = () => require('../../srv/utils/midnight-address.js');
 const loadLedger = () => import('@midnight-ntwrk/ledger-v8');
 
-const RAW_TOKEN_TYPE = /^[0-9a-f]{64}$/;
-
-function tokenTypeOf(value, name) {
-    const type = String(value ?? '').trim().toLowerCase().replace(/^0x/, '');
-    if (!RAW_TOKEN_TYPE.test(type)) throw new Error(`${name} must be a raw token type (64 hex)`);
+function rawTokenTypeOf(value, name) {
+    const type = bareHex(value);
+    if (!HEX64_RE.test(type)) throw new Error(`${name} must be a raw token type (64 hex)`);
     return type;
 }
 
@@ -42,15 +29,13 @@ function amountOf(value, name) {
 }
 
 function legOf(leg, name) {
-    return { tokenType: tokenTypeOf(leg?.tokenType, `${name}.tokenType`), amount: amountOf(leg?.amount, `${name}.amount`) };
+    return { tokenType: rawTokenTypeOf(leg?.tokenType, `${name}.tokenType`), amount: amountOf(leg?.amount, `${name}.amount`) };
 }
 
 const sizeOf = (v) => (Array.isArray(v) ? v.length : typeof v?.size === 'number' ? v.size : typeof v?.length === 'number' ? v.length : null);
 
-/**
- * Reads what a swap half gives and wants from the transaction itself.
- * Throws unless it is a plain swap half that gives one token type and wants another, as the sponsor requires.
- */
+/** Reads what a swap half gives and wants from the transaction itself.
+ *  Throws unless it is a plain half that gives one token type and wants another, as the sponsor requires. */
 export function readSwapTerms(tx) {
     const refuse = (why) => { throw new Error(`not a swap half: ${why}`); };
     if (tx?.intents !== undefined && tx?.intents !== null && sizeOf(tx.intents) !== 0) refuse('it carries an intent (a contract call, unshielded value or dust actions)');
@@ -68,8 +53,8 @@ export function readSwapTerms(tx) {
     if (gives.length + wants.length !== deltas.length) refuse('its offer exposes a delta that is not a non-zero amount');
     if (gives.length !== 1 || wants.length !== 1) refuse(`it gives ${gives.length} token type(s) and wants ${wants.length}; a half gives one and wants one`);
     const terms = {
-        gives: { tokenType: tokenTypeOf(gives[0][0], 'the given type'), amount: gives[0][1] },
-        wants: { tokenType: tokenTypeOf(wants[0][0], 'the wanted type'), amount: -wants[0][1] }
+        gives: { tokenType: rawTokenTypeOf(gives[0][0], 'the given type'), amount: gives[0][1] },
+        wants: { tokenType: rawTokenTypeOf(wants[0][0], 'the wanted type'), amount: -wants[0][1] }
     };
     if (terms.gives.tokenType === terms.wants.tokenType) refuse('it gives and wants the same token type');
     return { ...terms, inputs: offer.inputs.length, outputs: offer.outputs.length };
@@ -101,11 +86,8 @@ export function spendableWithin(coins, tokenType, maxInputs = SWAP_MAX_INPUTS) {
     return coins.filter((c) => c.type === tokenType).sort(byValue).slice(-maxInputs).reduce((sum, c) => sum + c.value, 0n);
 }
 
-/**
- * Picks the next coin to spend: the smallest one that still lets the remaining slots cover the rest.
- * Spending small coins first merges them over time, and a half never needs more coins than allowed.
- * Updates `plan`. Returns undefined when no coin fits.
- */
+/** Picks the smallest coin that still lets the remaining slots cover the rest, and updates `plan`. Undefined when none fits.
+ *  Spending small coins first merges them over time, so a half never needs more coins than allowed. */
 export function chooseSwapCoin(coins, tokenType, plan) {
     if (plan.slots <= 0 || plan.remaining <= 0n) return undefined;
     const own = coins.filter((c) => c.type === tokenType).sort(byValue);
@@ -135,10 +117,7 @@ export async function encodeOffer(txOrBytes) {
     return offerFile().encodeOfferFile(bytes);
 }
 
-/**
- * Decodes an offer file, base64 or bytes into a transaction.
- * `bound` tells whether the transaction is already sealed. Offer files are always sealed.
- */
+/** Decodes an offer file, base64 or bytes into a transaction. `bound` tells whether it is sealed, and offer files always are. */
 export async function decodeOffer(input) {
     const bytes = input instanceof Uint8Array ? input : await offerFile().transactionBytesOf(String(input ?? ''));
     const ledger = await loadLedger();
@@ -172,26 +151,17 @@ export async function swapProvingService({ provingMode = 'wasm', proofServerUrl 
     return proving.makeServerProvingService({ provingServerUrl: new URL(proofServerUrl) });
 }
 
-/**
- * Creates a wallet for swapping. It syncs only the shielded coins of the seed.
- *
- * @param {object} opts
- * @param {string} opts.seedHex          128 hex chars (64-byte BIP39 seed). Never leaves this process.
- * @param {string} [opts.networkId]      Defaults to 'preprod'.
- * @param {number} [opts.accountIndex]   Defaults to 0.
- * @param {string} opts.indexerHttpUrl
- * @param {string} opts.indexerWsUrl
- * @param {string} [opts.nodeUrl]        Not needed for swapping.
- * @param {'wasm'|'server'} [opts.provingMode]
- * @param {string} [opts.proofServerUrl]
- * @param {string} [opts.walletState]    Saved state from `serializeState()`.
- * @param {number} [opts.maxInputs]      Most coins one half may spend. Defaults to 4.
- * @param {object} [opts.sdk]            Replaces the SDK modules, for tests.
- */
+/** Creates a wallet for swapping that syncs only the seed's shielded coins. The seed never leaves this process.
+ *  It needs `indexerHttpUrl`, or an `api` with a gateway key to sync through the gateway's indexer. */
 export async function createSwapWallet(opts) {
-    const { seedHex, networkId = 'preprod', accountIndex = 0, indexerHttpUrl, indexerWsUrl, nodeUrl, walletState } = opts ?? {};
-    if (!/^[0-9a-fA-F]{128}$/.test(String(seedHex ?? ''))) throw new Error('createSwapWallet: seedHex must be 128 hex chars (64-byte BIP39 seed)');
-    if (!indexerHttpUrl || !indexerWsUrl) throw new Error('createSwapWallet: indexerHttpUrl and indexerWsUrl are required');
+    const { seedHex, networkId = 'preprod', accountIndex = 0, nodeUrl, walletState } = opts ?? {};
+    assertSeedHex(seedHex, 'createSwapWallet');
+    let { indexerHttpUrl, indexerWsUrl } = opts ?? {};
+    if (!indexerHttpUrl || !indexerWsUrl) {
+        const lane = gatewayIndexerUrls(opts?.api);
+        if (!lane) throw new Error('createSwapWallet: indexerHttpUrl and indexerWsUrl are required, or api as the connect() options with a gateway key (token: oda_…), which syncs through the gateway');
+        ({ indexerHttpUrl, indexerWsUrl } = lane);
+    }
     const provingMode = opts.provingMode ?? 'wasm';
     if (provingMode !== 'wasm' && provingMode !== 'server') throw new Error(`createSwapWallet: provingMode must be 'wasm' or 'server' (got ${String(provingMode)})`);
     if (provingMode === 'server' && !opts.proofServerUrl) throw new Error("createSwapWallet: provingMode 'server' requires proofServerUrl (a proof server YOU run; it sees the coins you spend)");
@@ -359,6 +329,20 @@ export async function createSwapWallet(opts) {
             return pending;
         },
 
+        /** The coins the halves and transfers built from this seed keep reserved, with the instant the SDK stops waiting for each. */
+        async pending() {
+            const state = await latest(wallet.state, 'wallet state');
+            return (state?.pendingCoins ?? []).map(({ coin, ttl }) => ({
+                tokenType: String(coin.type).toLowerCase(), amount: BigInt(coin.value), ttl: ttl ? new Date(ttl).toISOString() : null
+            }));
+        },
+
+        /** Releases the coins of a half or transfer whose build-time `revert` is gone: its offer file, base64 or bytes. */
+        async revert(input) {
+            const { tx } = await decodeOffer(input);
+            await wallet.revertTransaction(tx);
+        },
+
         /** The unreserved coins, smallest first. */
         async coins() {
             return (await freeCoins()).sort(byValue).map((c) => ({ tokenType: String(c.type).toLowerCase(), amount: c.value }));
@@ -366,22 +350,17 @@ export async function createSwapWallet(opts) {
 
         /** The most one half can give of a token type. */
         async spendable(tokenType) {
-            return spendableWithin(await freeCoins(), tokenTypeOf(tokenType, 'tokenType'), maxInputs);
+            return spendableWithin(await freeCoins(), rawTokenTypeOf(tokenType, 'tokenType'), maxInputs);
         },
 
-        /**
-         * Builds and proves one half of a swap that gives `give` and receives `want`.
-         * By default the half is sealed and comes with an offer file. With `bind: false` it is unsealed and only base64.
-         */
+        /** Builds and proves one half of a swap that gives `give` and receives `want`.
+         *  By default the half is sealed and comes with an offer file. With `bind: false` it is unsealed and only base64. */
         buildHalf,
 
         /** Builds and proves a fee-free transfer of `amount` of `tokenType` to the shielded address `to`, for `sponsorTransfer`. */
         buildTransfer,
 
-        /**
-         * Accepts an offer. Checks its terms against `expect` if given, builds the matching half,
-         * and returns both halves for `sponsorSwap`.
-         */
+        /** Accepts an offer. Checks its terms against `expect` if given and returns both halves for `sponsorSwap`. */
         async takeOffer({ offer, expect } = {}) {
             const maker = await decodeOffer(offer);
             const terms = readSwapTerms(maker.tx);

@@ -1,8 +1,5 @@
-/**
- * Removes credentials from a URL before it is stored, logged or returned over OData.
- * A URL can carry secrets as `user:pass@` or as query parameters such as `?apikey=`.
- * Strings that are not valid URLs come back unchanged.
- */
+/** Removes credentials such as `user:pass@` or `?apikey=` from a URL before it is stored, logged or returned.
+ *  Strings that are not valid URLs come back unchanged. */
 export function redactUrlCredentials(url: string | undefined | null): string {
     if (!url) return '';
     try {

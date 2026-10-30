@@ -1,8 +1,5 @@
-/**
- * Resets the cursor of the ledger payload decode pass.
- * The pass decodes every block above the cursor, so lowering the cursor decodes those blocks again.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Resets the cursor of the ledger payload decode pass, so blocks above it are decoded again.
+// SPDX-License-Identifier: Apache-2.0
 
 import cds from '@sap/cds';
 import { lockReorgGeneration } from '../submission/reorg-generation';
@@ -27,11 +24,8 @@ export class RedecodeError extends Error {
     }
 }
 
-/**
- * Moves the decode cursor to `height - 1`, so the pass decodes again from `height` upwards.
- * The cursor is only ever lowered, because raising it would skip blocks.
- * Runs under the reorg lock, so a pass that is running at the same time discards its own cursor update.
- */
+// Moves the decode cursor down to `height - 1`. It is never raised, because that would skip blocks.
+// Runs under the reorg lock, so a pass running at the same time discards its own cursor update.
 export async function redecodeFromHeight(db: cds.DatabaseService, height: unknown): Promise<RedecodeResult> {
     // An Integer64 arrives as a number or a decimal string. Anything else is rejected.
     const from = typeof height === 'number' || (typeof height === 'string' && /^\d+$/.test(height)) ? Number(height) : NaN;
@@ -40,13 +34,13 @@ export async function redecodeFromHeight(db: cds.DatabaseService, height: unknow
     let result: RedecodeResult | null = null;
     await db.tx(async (tx) => {
         await lockReorgGeneration(tx);
-        const sync: any = await tx.run(
+        const sync: Pick<SyncState, 'lastDecodedHeight' | 'lastIndexedHeight'> | undefined = await tx.run(
             SELECT.one.from(SyncState).columns('lastDecodedHeight', 'lastIndexedHeight').where({ ID: 'SINGLETON' })
         );
         if (!sync) throw new RedecodeError('the index has no sync state yet');
         const cursor = sync.lastDecodedHeight == null ? null : Number(sync.lastDecodedHeight);
         const indexed = Number(sync.lastIndexedHeight ?? 0);
-        const counted: any = await tx.run(
+        const counted: { blocks?: number | string } | undefined = await tx.run(
             SELECT.one.from(Blocks).columns('count(*) as blocks')
                 .where({ height: { '>=': from } }).and({ height: { '<=': indexed } })
         );

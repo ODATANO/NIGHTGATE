@@ -29,6 +29,7 @@ const updateWhereSpy = vi.hoisted(() => (vi.fn()));
 vi.mock('@sap/cds', () => {
     const cds: any = {
         env: { requires: { nightgate: {} } },
+        User: class { id: string; constructor(id: string) { this.id = id; } },
         ql: {
             SELECT: {
                 one: { from: vi.fn().mockReturnValue({ where: selectOneWhereSpy }) },

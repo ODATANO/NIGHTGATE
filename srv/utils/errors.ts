@@ -1,9 +1,6 @@
-/**
- * The error type used across NIGHTGATE. Every error has a fixed code, an HTTP status and a retryable flag.
- * ERROR_CODES lists all codes. The error table in the docs is generated from it.
- * This module does not import `@sap/cds`, because the wallet worker loads it too.
- * SPDX-License-Identifier: Apache-2.0
- */
+// The NIGHTGATE error type. Each code in ERROR_CODES has an HTTP status and a retryable flag, and feeds the docs error table.
+// This module does not import `@sap/cds`, because the wallet worker loads it too.
+// SPDX-License-Identifier: Apache-2.0
 
 export interface ErrorCodeSpec {
     status: number;
@@ -57,7 +54,6 @@ export const ERROR_CODES = {
     SPONSOR_POLICY_UNAVAILABLE: { status: 503, retryable: true, doc: 'The sponsor policy file cannot be read; fail-closed.' },
     SPONSOR_REFUSED: { status: 403, doc: 'The sponsor refused the transaction under its policy.' },
     SWAP_OFFER_INVALID: { status: 400, doc: 'The posted text is not a swap half the offer board can carry.' },
-    SWAP_OFFER_NOT_OPEN: { status: 409, doc: 'The swap offer is filled, retired or expired.' },
     SPONSORED_CALL_NOT_APPLIED: { status: 409, doc: 'The sponsored call landed but did not apply (the caller\'s transcript is stale).' },
     SUBMIT_INTENT_REJECTED: { status: 409, doc: 'The server refused to record the broadcast; nothing was sent.' },
     SUBMIT_INTENT_TIMEOUT: { status: 503, retryable: true, doc: 'The broadcast was not acknowledged in time; nothing was sent.' },
@@ -133,9 +129,15 @@ export class NightgateError extends Error {
     }
 }
 
-/** The message of a thrown value, or the value itself as text. */
+/** The message of a thrown value. Objects without a `.message`, as some SDK errors are, become JSON. */
 export function errorMessage(err: unknown): string {
-    return String((err as Error)?.message ?? err);
+    if (err instanceof Error) return err.message;
+    if (err == null) return String(err);
+    if (typeof err === 'string') return err;
+    const message = (err as { message?: unknown }).message;
+    if (typeof message === 'string') return message;
+    try { return JSON.stringify(err); }
+    catch { return String(err); }
 }
 
 export function isNightgateError(err: unknown): err is NightgateError {

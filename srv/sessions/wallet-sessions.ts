@@ -2,7 +2,7 @@ import cds from '@sap/cds';
 import { WalletSessions, type WalletSession } from '#cds-models/midnight';
 import { getEncryptionKey, encrypt, decrypt, hashViewingKey } from '../utils/crypto';
 import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../utils/envelope-bindings';
-import { validateViewingKey } from '../utils/validation';
+import { validateViewingKey, futureTimeProblem } from '../utils/validation';
 import { deriveAccountId, deriveStoragePassword } from '../submission/wallet-material-factory';
 import { resolveAccountDek } from '../submission/account-keys';
 import { getWalletBalance, estimateSendNightFee } from '../submission/token-ops';
@@ -18,12 +18,15 @@ import { isSessionExpired } from '../utils/session-expiry';
 import { checkRateClass } from '../utils/rate-classes';
 import { configMs, configNumber } from '../utils/config';
 import { syncGateReading } from '../submission/sponsor-sync-gate';
-import { formatErr } from '../utils/format-error';
+
 import type { DbRunner, Row } from '../utils/db-types';
-import { WALLET_COMMAND_KINDS, executeWalletCommand, loadSigningSessionAccountId, evictFacadeUnlessShared } from './wallet-session-lifecycle';
+import { WALLET_COMMAND_KINDS, executeWalletCommand, checkSigningSession, loadSigningSessionAccountId, evictFacadeUnlessShared } from './wallet-session-lifecycle';
 import { errorMessage } from '../utils/errors';
 import { connectWallet, connectWalletForSigning, deregisterFromDustGeneration, disconnectWallet, getSponsorPoolStatus, getWalletSyncProgress, registerForDustGeneration, sendNight, deriveWalletInfo as deriveWalletInfoAction, getWalletBalance as getWalletBalanceAction, estimateSendNightFee as estimateSendNightFeeAction } from '#cds-models/NightgateService';
 import type { Request } from '@sap/cds';
+import { requireUserId } from '../utils/request-types';
+import { SEED_HEX_RE } from '../utils/hex-patterns';
+import { receiverKind, RECEIVER_PREFIXES } from '../utils/midnight-address';
 
 export { closeSessionsFromPreviousProcess, startSessionCleanup } from './wallet-session-sweep';
 
@@ -46,23 +49,20 @@ async function startJobOrRetryAfter(req: Request, input: Parameters<typeof start
     } catch (err) {
         if (err instanceof JobAdmissionBusyError) {
             try { req.http?.res?.set?.('Retry-After', String(err.retryAfterSeconds)); } catch { /* courtesy header */ }
-            return req.reject({ status: err.httpStatus, code: err.code, message: err.message, $sanitize: false } as any);
+            const busy = { status: err.httpStatus, code: err.code, message: err.message, $sanitize: false };
+            return req.reject(busy);
         }
         throw err;
     }
 }
 
 function rejectWorkerReadError(req: Request, action: string, err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = errorMessage(err);
     if (/sync timeout/i.test(msg)) {
         // CAP hides 5xx messages in production. `$sanitize: false` keeps this one, because it tells the client to retry.
         try { req.http?.res?.set?.('Retry-After', '15'); } catch { /* courtesy header */ }
-        return req.reject({
-            code: 'WALLET_SYNCING',
-            status: 503,
-            message: `${action}: wallet is still syncing to the indexer tip; retry shortly`,
-            $sanitize: false
-        } as any);
+        const syncing = { code: 'WALLET_SYNCING', status: 503, message: `${action}: wallet is still syncing to the indexer tip; retry shortly`, $sanitize: false };
+        return req.reject(syncing);
     }
     return req.reject(500, `${action} failed: ${msg}`);
 }
@@ -93,26 +93,6 @@ function parseNightAmount(raw: string | null | undefined, customToken = false): 
     }
     return { ok: true, value };
 }
-
-function validateOptionalTtl(ttlIso: string | null | undefined): string | null {
-    if (!ttlIso) return null;
-    const t = new Date(ttlIso);
-    if (Number.isNaN(t.getTime())) return 'ttlIso must be a valid ISO-8601 timestamp';
-    if (t.getTime() <= Date.now()) return 'ttlIso must be in the future';
-    return null;
-}
-
-/**
- * Returns the caller's user id, or rejects with 401 and returns undefined.
- * Session actions must stop on undefined, so a leaked sessionId alone gives no access.
- */
-function requireUserId(req: Request): string | undefined {
-    const uid = req.user?.id;
-    if (!uid) { req.reject?.(401, 'authentication required'); return undefined; }
-    return uid as string;
-}
-
-const BIP39_SEED_HEX_LENGTH = 128; // 64-byte BIP39 seed
 
 export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: DbRunner): void {
     for (const kind of WALLET_COMMAND_KINDS) {
@@ -226,9 +206,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
                 return req.reject(400, 'mnemonic is not a valid BIP39 phrase');
             }
         } else if (seedHex) {
-            if (!/^[0-9a-fA-F]+$/.test(seedHex) || seedHex.length !== BIP39_SEED_HEX_LENGTH) {
-                return req.reject(400, `seedHex must be ${BIP39_SEED_HEX_LENGTH} hex characters (64-byte BIP39 seed)`);
-            }
+            if (!SEED_HEX_RE.test(seedHex)) return req.reject(400, 'seedHex must be 128 hex chars (64-byte BIP39 seed)');
             bip39SeedHex = seedHex.toLowerCase();
         } else {
             return req.reject(400, 'either mnemonic or seedHex (64-byte BIP39 seed, 128 hex chars) is required');
@@ -302,7 +280,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
             try {
                 await supersedeQueuedJobs('connectWalletForSigning', sessionId, job.jobId);
             } catch (err: unknown) {
-                log.warn('prewarm supersede sweep failed:', formatErr(err));
+                log.warn('prewarm supersede sweep failed:', errorMessage(err));
             }
 
             return {
@@ -312,7 +290,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
                 prewarmStatus: job.status
             };
         } catch (err: unknown) {
-            log.warn('pre-warm scheduling failed:', formatErr(err));
+            log.warn('pre-warm scheduling failed:', errorMessage(err));
             return { sessionId, signingEnabled: true, prewarmJobId: null, prewarmStatus: null };
         }
     });
@@ -369,15 +347,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         const { sessionId, dustReceiverAddress, idempotencyKey } = req.data;
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
-        const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
-        );
-        if (!session) return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
-        if (isSessionExpired(sessionId, session.expiresAt)) {
-            return req.reject(410, 'Session expired');
-        }
+        const signing = await checkSigningSession(db, sessionId, userId);
+        if (!signing.ok) return req.reject(signing.status, signing.msg);
 
         return startJobOrRetryAfter(req, {
             kind: 'registerForDustGeneration',
@@ -400,15 +371,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         const { sessionId, idempotencyKey, sponsorSessionId } = req.data;
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
-        const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
-        );
-        if (!session) return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
-        if (isSessionExpired(sessionId, session.expiresAt)) {
-            return req.reject(410, 'Session expired');
-        }
+        const signing = await checkSigningSession(db, sessionId, userId);
+        if (!signing.ok) return req.reject(signing.status, signing.msg);
 
         let sponsor: Awaited<ReturnType<typeof resolveFeeSponsor>> | null = null;
         if (sponsorSessionId) {
@@ -451,10 +415,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         // The SDK compares token types as exact strings, and raw token types are lowercase.
         const tokenType = tokenTypeHex ? tokenTypeHex.toLowerCase() : undefined;
 
-        const hrpOK = receiverAddress.startsWith('mn_shield-addr_') || receiverAddress.startsWith('mn_addr_');
-        if (!hrpOK) {
-            return req.reject(400,
-                `receiverAddress must start with 'mn_shield-addr_' (shielded) or 'mn_addr_' (unshielded), got '${receiverAddress.slice(0, 24)}...'`);
+        if (!receiverKind(receiverAddress)) {
+            return req.reject(400, `receiverAddress must start with ${RECEIVER_PREFIXES}, got '${receiverAddress.slice(0, 24)}...'`);
         }
         if (receiverAddress.length < 50) {
             return req.reject(400, `receiverAddress too short (${receiverAddress.length} chars; expected Bech32m of >= 50)`);
@@ -463,18 +425,11 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         const amountCheck = parseNightAmount(amount, !!tokenType);
         if (!amountCheck.ok) return req.reject(400, amountCheck.msg);
 
-        const ttlErr = validateOptionalTtl(ttlIso);
+        const ttlErr = futureTimeProblem(ttlIso, 'ttlIso');
         if (ttlErr) return req.reject(400, ttlErr);
 
-        const session = await db.run(
-            SELECT.one.from(WalletSessions).where({ sessionId, isActive: true, userId })
-        );
-        if (!session) return req.reject(404, 'Session not found or inactive');
-        if (!session.encryptedViewingKey) return req.reject(404, 'Session has no viewing key');
-        if (!session.encryptedSeedKey) return req.reject(412, 'Session has no signing key. Call connectWalletForSigning first.');
-        if (isSessionExpired(sessionId, session.expiresAt)) {
-            return req.reject(410, 'Session expired');
-        }
+        const signing = await checkSigningSession(db, sessionId, userId);
+        if (!signing.ok) return req.reject(signing.status, signing.msg);
 
         return startJobOrRetryAfter(req, {
             kind: 'sendNight',
@@ -539,6 +494,11 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         // A busy worker must not make the pool look empty. In that case the last known dust
         // figures are returned instead, marked stale and not usable.
         const resolved = new Map<string, { accountId: string; maySeeAmounts: boolean }>();
+        const unusable = (sessionId: string, lastError: string) => ({
+            sessionId, configured: true, usable: false, dustBalance: null, unshieldedNight: null,
+            totalNightUtxoCount: 0, registeredNightUtxos: 0, dustNotes: 0, pendingDustNotes: 0, dustRestoreCount: 0,
+            caughtUp: false, stale: false, asOf: null, lastError
+        });
         const lastKnown = (sessionId: string, lastError: string) => {
             const r = resolved.get(sessionId);
             const progress = r ? walletGetSyncProgress(r.accountId) : null;
@@ -563,36 +523,19 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         };
 
         const readSponsor = async (sessionId: string) => {
-            const unusable = (lastError: string) => ({
-                sessionId,
-                configured: true,
-                usable: false,
-                dustBalance: null,
-                unshieldedNight: null,
-                totalNightUtxoCount: 0,
-                registeredNightUtxos: 0,
-                dustNotes: 0,
-                pendingDustNotes: 0,
-                dustRestoreCount: 0,
-                caughtUp: false,
-                stale: false,
-                asOf: null,
-                lastError
-            });
-
             const session: WalletSession | undefined = await runWithoutAmbientTx(() => db.run(
                 SELECT.one.from(WalletSessions).where({ sessionId, isActive: true })
             ));
-            if (!session) return unusable('configured sponsor session is missing or inactive');
+            if (!session) return unusable(sessionId, 'configured sponsor session is missing or inactive');
             if (!session.encryptedSeedKey) {
-                return unusable('sponsor session has no signing key; call connectWalletForSigning for it');
+                return unusable(sessionId, 'sponsor session has no signing key; call connectWalletForSigning for it');
             }
 
             const maySeeAmounts = isAdmin || session.userId === userId;
 
             // Platform fee sponsors have no owner check and no expiry, same as in resolveFeeSponsor.
             const sess = await loadSigningSessionAccountId(db, sessionId, undefined, true);
-            if (!sess.ok) return unusable(sess.msg);
+            if (!sess.ok) return unusable(sessionId, sess.msg);
             resolved.set(sessionId, { accountId: sess.accountId, maySeeAmounts });
 
             const progress = walletGetSyncProgress(sess.accountId);
@@ -600,12 +543,12 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
             // Both checks are needed, because a just-loaded wallet has no progress yet.
             if (!progress && !hasWalletFacade(sess.accountId)) {
                 return {
-                    ...unusable('sponsor facade is not warm yet; ask again once it has synced'),
+                    ...unusable(sessionId, 'sponsor facade is not warm yet; ask again once it has synced'),
                     caughtUp: false
                 };
             }
             try {
-                const balance: any = await getWalletBalance({
+                const balance = await getWalletBalance({
                     cacheKey: sess.accountId,
                     syncTimeoutMs: readSyncTimeoutMs(),
                     // Pass the timeout to the worker call too, or abandoned calls pile up.
@@ -613,33 +556,31 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
                 });
                 // How many transactions a sponsor can pay at once depends on its free dust notes.
                 // Its own registrations do not matter, because another wallet's NIGHT can generate its dust.
-                const ownRegistered = Number(balance?.registeredNightUtxoCount ?? 0);
-                const pendingNotes = Number(balance?.dustPendingCount ?? 0);
-                const dustNotes = balance?.dustAvailableCount !== undefined
-                    ? Number(balance.dustAvailableCount)
-                    : Math.max(0, Number(balance?.dustUtxoCount ?? 0) - pendingNotes);
+                const ownRegistered = balance.registeredNightUtxoCount;
+                const pendingNotes = balance.dustPendingCount;
+                const dustNotes = balance.dustAvailableCount;
                 const gate = syncGateReading(walletGetSyncProgress(sess.accountId));
                 return {
                     sessionId,
                     configured: true,
                     // Own registrations are deliberately not required.
-                    usable: gate.caughtUp && dustNotes > 0 && BigInt(String(balance?.dustBalance ?? '0')) > 0n,
-                    dustBalance: maySeeAmounts ? String(balance?.dustBalance ?? '0') : null,
-                    unshieldedNight: maySeeAmounts ? String(balance?.unshieldedNight ?? '0') : null,
-                    totalNightUtxoCount: Number(balance?.totalNightUtxoCount ?? 0),
+                    usable: gate.caughtUp && dustNotes > 0 && BigInt(balance.dustBalance) > 0n,
+                    dustBalance: maySeeAmounts ? balance.dustBalance : null,
+                    unshieldedNight: maySeeAmounts ? balance.unshieldedNight : null,
+                    totalNightUtxoCount: balance.totalNightUtxoCount,
                     registeredNightUtxos: ownRegistered,
                     dustNotes,
                     pendingDustNotes: pendingNotes,
-                    dustRestoreCount: Number(balance?.dustRestoreCount ?? 0),
+                    dustRestoreCount: balance.dustRestoreCount,
                     caughtUp: gate.caughtUp,
                     stale: false,
                     asOf: new Date().toISOString(),
                     lastError: gate.reason
                 };
             } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
+                const msg = errorMessage(err);
                 return lastKnown(sessionId, msg) ?? {
-                    ...unusable(msg),
+                    ...unusable(sessionId, msg),
                     caughtUp: syncGateReading(walletGetSyncProgress(sess.accountId)).caughtUp
                 };
             }
@@ -656,23 +597,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
                 try {
                     rows[index] = await withCap(readSponsor(id), 'sponsor status read');
                 } catch (err) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    rows[index] = lastKnown(id, msg) ?? {
-                        sessionId: id,
-                        configured: true,
-                        usable: false,
-                        dustBalance: null,
-                        unshieldedNight: null,
-                        totalNightUtxoCount: 0,
-                        registeredNightUtxos: 0,
-                        dustNotes: 0,
-                        pendingDustNotes: 0,
-                        dustRestoreCount: 0,
-                        caughtUp: false,
-                        stale: false,
-                        asOf: null,
-                        lastError: msg
-                    };
+                    const msg = errorMessage(err);
+                    rows[index] = lastKnown(id, msg) ?? unusable(id, msg);
                 }
             }
         }));
@@ -748,15 +674,13 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
 
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (!receiverAddress) return req.reject(400, 'receiverAddress is required');
-        const hrpOK = receiverAddress.startsWith('mn_shield-addr_') || receiverAddress.startsWith('mn_addr_');
-        if (!hrpOK) {
-            return req.reject(400,
-                `receiverAddress must start with 'mn_shield-addr_' (shielded) or 'mn_addr_' (unshielded), got '${receiverAddress.slice(0, 24)}...'`);
+        if (!receiverKind(receiverAddress)) {
+            return req.reject(400, `receiverAddress must start with ${RECEIVER_PREFIXES}, got '${receiverAddress.slice(0, 24)}...'`);
         }
         if (!amount) return req.reject(400, 'amount is required');
         const amountCheck = parseNightAmount(amount);
         if (!amountCheck.ok) return req.reject(400, amountCheck.msg);
-        const ttlErr = validateOptionalTtl(ttlIso);
+        const ttlErr = futureTimeProblem(ttlIso, 'ttlIso');
         if (ttlErr) return req.reject(400, ttlErr);
 
         const sess = await loadSigningSessionAccountId(db, sessionId, userId);

@@ -17,12 +17,13 @@ Running NIGHTGATE: scripts, configuration, wallet sync, upgrades, monitoring, tr
 | `npm run wasm-contract:e2e` | Contract flow in wasm mode | `deployContract(counter)` + `increment()` |
 | `npm run wasm-zswap:e2e` | zswap circuits in-process | Deploys `shielded-token`, mints, shielded self-transfer via `sendNight` `tokenTypeHex` |
 | `npm run width32:e2e` | 32-slot vault | Deploys `attestation-vault-32`, 24-field document, attest+anchor batch, k-of-32 diff, crawler-free verify |
-| `npm run check:server` | Check a running server | Health/readiness; sponsor dust/balance/sync with `NIGHTGATE_SPONSOR_SESSION_ID`; optional URL argument |
+| `npm run check:server` | Check a running server | Health/readiness; sponsor dust/balance/sync with `NIGHTGATE_SPONSOR_SESSION_ID`; optional URL argument; `check:server:hosted` runs it against the hosted preprod server |
 | `node scripts/profile-workers.mjs [s]` | A thread is busy and the log does not say why | CPU profile of the main thread and every worker thread through the inspector (`kill -USR1 <pid>` first); self time per function, callers of the hot wasm frames |
 | `npm run build` | Before publish, after schema changes | `@cds-models/` types + in-place TS compile |
 | `npm run typecheck` | Pre-commit | `tsc --noEmit` |
 | `npm test` | Pre-commit | Vitest suite with coverage |
-| Integration scripts | SDK wiring | `smoke:sdk`, `integration:providers`, `integration:wallet-keys`, `integration:wallet-facade`, `integration:contract-registry` |
+| Other e2e lanes | One feature against a running server | `field-predicate-batch:e2e`, `membership:e2e`, `document-diff:e2e`, `anchor-batch:e2e`, `dust-wedge:e2e`, `agent-layer:e2e`, `disclosure:e2e`, `state-verify:e2e`, `txbuilder:e2e`, `burst-sponsor:e2e`, `mint-token:e2e`; each script's header names its env vars |
+| Integration scripts | SDK wiring | `smoke:sdk`, `integration:providers`, `integration:wallet-keys`, `integration:wallet-facade`, `integration:contract-registry`, `integration:connector-routes`, `integration:schema-delta`, `integration:derive-wallet-info`, `integration:utxo-identity` |
 | `npm run integration:postgres` | Before a tag; after changes to crawler writes, indexes or lock retry | Against PostgreSQL 16: model deploy, `Transactions.raw` BYTEA round trip, `ensureIndexes` idempotency, SQLSTATE classification (55P03, 40P01, 57014, 40001; not 23505), `withLockContentionRetry`. Throwaway `postgres:16` container on port 15432 unless `NIGHTGATE_PG_URL` is set. `check:release:full` = `check:release` + this lane |
 
 ### Why `serve:sync` and not `dev` for long runs
@@ -38,16 +39,16 @@ Two layers: `.env` (read by both CDS and our scripts) and CDS config under `cds.
 ```env
 # Network selection
 NIGHTGATE_NETWORK=preprod                                 # preview | testnet | preprod | mainnet | undeployed
-NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/    # Substrate RPC
+# Node and indexer of the network (self-hosted.md): required on preprod and mainnet,
+# built in on preview. Own instances, or Blockfrost with the project id in the URL.
+NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=<token>
+NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=<token>
+# NIGHTGATE_INDEXER_WS_URL=                               # derived from the HTTP URL unless set
 
 # Crawler control
 NIGHTGATE_CRAWLER_ENABLED=false                           # Turn off during wallet-sync runs
 # NIGHTGATE_CRAWLER_START_HEIGHT=2351371                  # Index from here instead of genesis (empty index only)
 # NIGHTGATE_CRAWLER_MAX_BPS=20                            # Cap catch-up so it shares the host with submissions
-
-# Local indexer override (only if running the docker container)
-# NIGHTGATE_INDEXER_HTTP_URL=http://localhost:8088/api/v4/graphql
-# NIGHTGATE_INDEXER_WS_URL=ws://localhost:8088/api/v4/graphql/ws
 
 # Wallet credentials for npm scripts (sync:start, deploy:e2e); per-role keys are
 # HD-derived from the mnemonic like Lace. .env is gitignored; never commit a mnemonic.
@@ -65,9 +66,9 @@ Without an encryption key a random per-process dev key is used (warning logged):
 
 All other settings: `cds.requires.nightgate`, see [reference.md#configuration](reference.md#configuration).
 
-## Local Midnight indexer (optional)
+## Own Midnight indexer
 
-Self-hosted alternative to the hosted indexer (which returns occasional 503s): `midnightntwrk/indexer-standalone:4.3.3` in `docker/docker-compose.yml`.
+The alternative to a hosted indexer with a token ([self-hosted.md](self-hosted.md) compares both): `midnightntwrk/indexer-standalone` in `docker/docker-compose.yml`.
 
 ### Bring it up
 
@@ -75,7 +76,7 @@ Self-hosted alternative to the hosted indexer (which returns occasional 503s): `
 docker compose -f docker/docker-compose.yml up -d indexer
 ```
 
-It uses the hosted Substrate RPC by default and stores SQLite in a named volume.
+It reads the node in `INDEXER_UPSTREAM_NODE_URL` (your own, or Blockfrost with the project id) and stores SQLite in a named volume.
 
 ### Verify it's up
 
@@ -93,10 +94,9 @@ Indexes from genesis; a full preprod sync takes days. Wait for `"caught_up":true
 
 ### Flip NIGHTGATE to use it
 
-In `.env`, uncomment:
+In `.env`:
 ```env
 NIGHTGATE_INDEXER_HTTP_URL=http://localhost:8088/api/v4/graphql
-NIGHTGATE_INDEXER_WS_URL=ws://localhost:8088/api/v4/graphql/ws
 ```
 
 Restart with `npm run serve:sync`.
@@ -124,7 +124,7 @@ Sponsor wallets can be synced on any machine and imported, so a fresh server
 restores instead of syncing at full CPU:
 
 ```bash
-# any machine, against the public indexer; wallets.json carries the seeds, keep it out of git
+# any machine, against the configured indexer; wallets.json carries the seeds, keep it out of git
 node scripts/presync-wallets.mjs wallets.json --out presync
 # the server's machine, server stopped, server env loaded (database, ENCRYPTION_KEY, NIGHTGATE_FEE_SPONSOR_SESSION)
 node scripts/import-wallet-state.mjs --dry-run presync/*.json
@@ -204,79 +204,34 @@ docker exec odatano-nightgate node scripts/apply-schema-delta.mjs   # in the ima
 Without it the startup preflight names the missing objects and NIGHTGATE
 stays offline; the host process keeps running.
 
-### PostgreSQL: NOT NULL columns and removed columns
+### PostgreSQL: changes `cds deploy` cannot make
 
 The image runs `cds deploy` on every boot. Two kinds of change need a step by
-hand first.
+hand first; the release that makes one says so in its changelog entry.
 
-A column that becomes `NOT NULL` fails the deploy while a row holds NULL in it.
-Check before the upgrade; every count must be 0. For 0.30.4:
-
-```sql
-SELECT count(*) FROM midnight_backgroundjobs WHERE status IS NULL OR attempt IS NULL OR maxattempts IS NULL;
-SELECT count(*) FROM midnight_pendingsubmissions WHERE status IS NULL;
-```
-
-CAP's schema evolution never drops a column and refuses a model that removed
-one. Remove the element from the stored model before the first boot of the new
-image, then drop the column once it is up. For 0.30.4 (`Transactions.proofHash`):
-
-```sql
--- before the first boot
-UPDATE cds_model SET csn = (
-  SELECT jsonb_set(s.m, '{definitions}', jsonb_object_agg(d.k, CASE WHEN d.v->'elements' ? 'proofHash'
-      THEN jsonb_set(d.v, '{elements}', (d.v->'elements') - 'proofHash') ELSE d.v END))::text
-  FROM (SELECT cds_model.csn::jsonb AS m) s, jsonb_each(s.m->'definitions') AS d(k, v)
-  GROUP BY s.m);
--- after the boot
-ALTER TABLE midnight_Transactions DROP COLUMN proofHash;
-```
+- A column that becomes `NOT NULL` fails the deploy while a row holds NULL in
+  it: count such rows before the upgrade and fix them.
+- A removed column: CAP's schema evolution refuses a model that dropped one.
+  Remove the element from the stored model (`cds_model.csn`) before the first
+  boot, then `ALTER TABLE ... DROP COLUMN` once it is up.
 
 SQLite: `nightgate-schema-delta` sets NULL rows of a `NOT NULL` column to its
 default and leaves a removed column in place.
 
-### PostgreSQL: binary columns written before 0.33.2
+### Older databases
 
-Up to 0.33.1 the server handed PostgreSQL a base64 string for a binary column
-it updated, and the database stored the text. `ContractStates.state` /
-`zswapState`, `ContractActions.state` / `zswapState` and
-`Blocks.ledgerParameters` read back base64-encoded twice, which a builder
-on `stateAt` reports as `expected header tag 'midnight:contract-state[v6]:'`.
-Once, after the first boot of 0.33.2 (every ledger serialization starts with
-`midnight:`, base64 `bWlkbmlnaHQ6`; the guard leaves repaired rows alone):
-
-```sql
-UPDATE midnight_contractstates SET state = decode(convert_from(state, 'UTF8'), 'base64')
-  WHERE convert_from(substring(state from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';
-UPDATE midnight_contractstates SET zswapstate = decode(convert_from(zswapstate, 'UTF8'), 'base64')
-  WHERE convert_from(substring(zswapstate from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';
-UPDATE midnight_contractactions SET state = decode(convert_from(state, 'UTF8'), 'base64')
-  WHERE convert_from(substring(state from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';
-UPDATE midnight_contractactions SET zswapstate = decode(convert_from(zswapstate, 'UTF8'), 'base64')
-  WHERE convert_from(substring(zswapstate from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';
-UPDATE midnight_blocks SET ledgerparameters = decode(convert_from(ledgerparameters, 'UTF8'), 'base64')
-  WHERE convert_from(substring(ledgerparameters from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';
-```
-
-SQLite stores a base64 string and a Buffer the same way; nothing to do.
-
-### Contract state from before the hash layout
-
-Earlier releases stored the full contract state on every `ContractActions`
-row (hundreds of KB each). The supplement now writes a sha256 and the size per
-action and the newest state per contract into `ContractStates`; existing rows
-move once, with the server (or its supplement) stopped:
-
-```bash
-npx nightgate-compact-contract-state --dry-run   # counts only
-npx nightgate-compact-contract-state             # same DB settings as the server
-docker exec <container> node scripts/compact-contract-state.mjs   # in the image
-```
-
-It honours `NIGHTGATE_CRAWLER_CONTRACT_STATE_HISTORY` / `_WATCH` (states kept
-under `watched` or `all` stay) and is idempotent. The space returns only after
-`VACUUM FULL midnight_contractactions;` (PostgreSQL, exclusive lock, needs room
-for the rewritten table) or `VACUUM` (SQLite).
+- Binary columns written by releases before 0.33.2 on PostgreSQL hold base64
+  text instead of bytes (`ContractStates.state` / `zswapState`,
+  `ContractActions.state` / `zswapState`, `Blocks.ledgerParameters`); a builder
+  on `stateAt` reports `expected header tag 'midnight:contract-state[v6]:'`.
+  Repair once, per column: `UPDATE <table> SET <col> = decode(convert_from(<col>,
+  'UTF8'), 'base64') WHERE convert_from(substring(<col> from 1 for 12), 'UTF8') =
+  'bWlkbmlnaHQ6';` (the base64 of `midnight:`; repaired rows are left alone).
+- Contract states stored in full on every `ContractActions` row move into
+  `ContractStates` once, server stopped: `npx nightgate-compact-contract-state
+  --dry-run`, then without the flag (in the image: `docker exec <container> node
+  scripts/compact-contract-state.mjs`). Idempotent; the space returns after
+  `VACUUM FULL midnight_contractactions` (PostgreSQL) or `VACUUM` (SQLite).
 
 ## Monitoring endpoints
 
@@ -325,16 +280,10 @@ database pool wait depth) when the p99 exceeds `NIGHTGATE_EVENT_LOOP_LAG_WARN_MS
   state for the verify functions and ledger payloads for the crawler, and
   restarts on its next call after a crash.
 - With `NIGHTGATE_DUST_SNAPSHOT_COLLAPSE=true`, `getMetrics()` reports the
-  cost of the dust snapshot collapse per wallet: `dust_collapse_ms{session}`
-  (last save tick, restore check included), `dust_collapse_p99_ms{session}`
-  and `dust_collapse_runs_total{session,outcome}` with `collapsed`,
-  `uncollapsed` (check failed or over `NIGHTGATE_DUST_COLLAPSE_BUDGET_MS`)
-  and `skipped` (dust state unchanged since the confirmed save). The restore
-  check runs in a helper thread of the wallet worker, one wallet at a time:
-  save ticks queue behind each other, and a timer that fires while its wallet's
-  previous tick still runs is skipped. A tick slower than 5 s logs
-  `dust snapshot collapsed ... in <ms>ms` at INFO. A rising `p99` tracks the
-  growth of the dust tree, which never shrinks.
+  dust snapshot collapse per wallet: `dust_collapse_ms`, `dust_collapse_p99_ms`
+  and `dust_collapse_runs_total{outcome}` (`collapsed`, `uncollapsed` over
+  `NIGHTGATE_DUST_COLLAPSE_BUDGET_MS`, `skipped` when unchanged). A rising p99
+  tracks the growth of the dust tree, which never shrinks.
 
 ## Reading the indexer health endpoint
 
@@ -479,20 +428,22 @@ Less DUST than the fee (typically `deployContract`).
 
 ### "Wallet.Sync: [object ErrorEvent]" spamming the log
 
-The indexer GraphQL-WS subscription dropped, usually an indexer 503. Check:
+The indexer GraphQL-WS subscription dropped, usually an indexer 503. Check the configured indexer:
 
 ```bash
 curl -s -o /dev/null -w "HTTP %{http_code}\n" \
   -X POST -H "Content-Type: application/json" \
-  -d '{"query":"{__typename}"}' https://indexer.preprod.midnight.network/api/v4/graphql
+  -d '{"query":"{__typename}"}' "$NIGHTGATE_INDEXER_HTTP_URL"
 ```
 
 - `HTTP 200`: indexer fine; likely a transient WS issue
+- `HTTP 403`: a hosted indexer refuses the token (missing, or for the other network)
+- `HTTP 410`: the host is shut down; Midnight's old preprod and mainnet indexer hosts answer this, see [self-hosted.md](self-hosted.md)
 - `HTTP 503`: indexer down; restart the sync once it is back, or use the local container
 
-### Submissions stall on the 5th+ call of a long session (public indexer)
+### Submissions stall on the 5th+ call of a long session (hosted indexer)
 
-The hosted indexer's graphql-ws subscription degrades over long multi-call sessions; later calls can hang inside the SDK's balance/submit (only the pre-balance sync wait is bounded, `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180 s). Mitigation: short sessions, a server restart for a fresh subscription, or a caught-up local indexer.
+A hosted indexer's graphql-ws subscription can degrade over long multi-call sessions; later calls can hang inside the SDK's balance/submit (only the pre-balance sync wait is bounded, `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`, default 180 s). Mitigation: short sessions, a server restart for a fresh subscription, or a caught-up local indexer.
 
 ### Contract calls feel slow: read the phase timing
 
@@ -515,39 +466,13 @@ The RPC closed the websocket during send, or the dedicated client never connecte
 
 Point `NIGHTGATE_CONTRACTS_DIR` at the directory. The artifact's bare `@midnight-ntwrk/compact-runtime` import resolves from NIGHTGATE's own node_modules; the directory needs no node_modules. On a running server: admin `registerContract`, then `createAgentGrant` with `allowedContracts`; no restart. The platform allow-list can live in `NIGHTGATE_SPONSOR_POLICY_FILE` (re-read per call).
 
-### Server is up but OData requests hang
+### Requests hang or no state is saved while a wallet syncs
 
-A worker syncing at full CPU can starve the main thread's CAP request pipeline (`getHealth` times out while `state-save` events still arrive).
-
-**Workarounds:**
-- Wait until the wallet reaches tip; the load drops.
-- Monitor via direct DB queries during the sync.
-
-### Zombie node processes / port 4004 in use
-
-```powershell
-Get-NetTCPConnection -LocalPort 4004 -State Listen
-```
-
-Kill stale PIDs before starting a new run.
-
-### Sync seems stuck - no new persist events
-
-No `save-tick #N pushed` lines (`DEBUG=nightgate:worker`) for several minutes:
-
-1. Unchanged state is not pushed (`save-tick #N unchanged, skipping push`); check `getWalletSyncProgress`.
-2. Look for `Wallet.Sync` errors (dead subscription).
-3. Otherwise restart the server; the facade rebuilds from the last save.
-
-### After a code change, `serve:sync` says "module not found"
-
-The compiled `.js` files are stale:
-
-```bash
-npm run build
-```
-
-Then restart (or iterate with `npm run dev`).
+A cold sync saturates the worker and, through the save traffic, slows the main
+thread; `getHealth` can time out while `state-save` events still arrive. Wait
+for the tip. No `save-tick` lines for minutes (`DEBUG=nightgate:worker`) and a
+static `appliedIndex` point at a dead indexer subscription (see above); a
+restart rebuilds the facade from the last save.
 
 ## Rotating the encryption key
 
@@ -571,7 +496,7 @@ POST /odata/v4/midnight-admin/exportContractSigningKey
 { "sessionId": "<deploying session>", "contractAddress": "<address>", "password": "<16+ characters>" }
 ```
 
-Result: a `midnight-signing-key-export` envelope (`encryptedPayload`, `salt`) sealed under the password, restorable with `importSigningKeys`. Needs the admin role and the session's viewing key; refuses a key row no session has read since the account key was introduced.
+Result: a `midnight-signing-key-export` envelope (`encryptedPayload`, `salt`) sealed under the password. In code, `CapDbPrivateStateProvider.importSigningKeys` reads it back; there is no action for it. Needs the admin role and the session's viewing key; refuses a key row no session has read since the account key was introduced.
 
 ## Database operations
 
@@ -603,7 +528,7 @@ The next `connectWalletForSigning` starts a cold sync (hours).
 - [ ] after a key rotation: `nightgate-rewrap-keys` exited 0 before the old key was removed
 - [ ] Database is PostgreSQL or HANA (image: `NIGHTGATE_DB_URL`, migration via `nightgate-db-migrate`, see docs/docker.md). Production SQLite is rejected at startup; `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is for migration only
 - [ ] One replica (`NIGHTGATE_REPLICA_COUNT=1`); more replicas, CAP multitenancy or `CF_INSTANCE_INDEX > 0` fail startup. A second process on the same database waits `NIGHTGATE_INSTANCE_LEASE_TTL_MS` for the `InstanceLeases` row to expire, then refuses to start; a process whose lease was taken over reports offline and refuses job dispatch, write actions and broadcasts until restarted
-- [ ] `NIGHTGATE_CRAWLER_ENABLED` true or unset (default on)
+- [ ] Crawler on where the indexed entities are needed: the plugin indexes unless `NIGHTGATE_CRAWLER_ENABLED=false`, the image sets `false`
 - [ ] CAP auth configured (`dummy` admits everyone)
 - [ ] Rate limits reviewed for production load
 - [ ] Local indexer (if used): `caught_up: true` and enough disk

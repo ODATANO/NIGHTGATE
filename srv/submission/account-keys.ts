@@ -1,11 +1,6 @@
-/**
- * Each account has a random 32-byte data key (DEK). The passwords for its private state,
- * signing keys and saved wallet state are derived from it.
- * The DEK is stored twice. `wrappedDek` is encrypted with the server's key ring, the set of
- * server encryption keys, so it can be re-encrypted without the viewing key.
- * `wrappedDekByViewingKey` needs both the server key and the viewing key, so a session must prove its viewing key.
- * If a server key is removed before its DEKs were re-encrypted, those DEKs are lost.
- */
+// Each account has a random 32-byte data key (DEK). The passwords for its private state, signing keys and wallet state derive from it.
+// `wrappedDek` is encrypted with the server's encryption keys only. `wrappedDekByViewingKey` also needs the viewing key.
+// A server key removed before its DEKs are re-encrypted loses those DEKs.
 
 import crypto from 'node:crypto';
 import cds from '@sap/cds';
@@ -165,8 +160,7 @@ export interface ResolveAccountDekArgs {
 }
 
 /**
- * Returns the account's DEK and re-encrypts stored copies that use an older server key.
- * Null only when the account has none and none may be created.
+ * Returns the account's DEK and re-encrypts stored copies that use an older server key. Null only when the account has none and none may be created.
  */
 export async function resolveAccountDek(args: ResolveAccountDekArgs): Promise<Buffer | null> {
     const { accountId, storagePassword } = args;

@@ -1,8 +1,5 @@
-/**
- * Entry point of the decode worker thread.
- * Decoding contract state and ledger transactions runs in wasm and blocks the thread it runs on,
- * so it runs here and not on the server thread. Every call returns plain data; no SDK object crosses the boundary.
- */
+// Decode worker thread. Wasm decoding blocks its thread, so it runs here and not on the server thread.
+// Every call returns plain data. No SDK object crosses the boundary.
 
 import { parentPort } from 'node:worker_threads';
 import { setConfigWarnSink } from '../utils/config';

@@ -1,9 +1,6 @@
-/**
- * Removes the NULLS FIRST or NULLS LAST clause from ORDER BY on PostgreSQL for columns that cannot be NULL.
- * The CAP Postgres driver always adds such a clause, and it does not match the order of a normal Postgres index.
- * So Postgres would sort the whole table instead of reading the index. For non-null columns the clause has no effect anyway.
- * SPDX-License-Identifier: Apache-2.0
- */
+// On PostgreSQL, removes NULLS FIRST or NULLS LAST from ORDER BY for columns that cannot be NULL.
+// The CAP driver always adds the clause, which makes Postgres sort the whole table instead of reading the index.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 
 const log = cds.log('nightgate:pg-order-nulls');
@@ -32,10 +29,8 @@ function termRef(term: OrderTerm, columns: SelectShape['columns']): string[] | u
     return ref;
 }
 
-/**
- * Removes the NULLS clause for key and NOT NULL columns of the main table.
- * A column reached through a join keeps it, because an outer join can produce NULL.
- */
+/** Removes the NULLS clause for key and NOT NULL columns of the main table.
+ *  A column reached through a join keeps it, because an outer join can produce NULL. */
 export function stripNullsForNotNull(orderBy: OrderTerm[], rendered: string[], select?: SelectShape): string[] {
     const alias = sourceAlias(select?.from);
     if (alias === undefined) return rendered;

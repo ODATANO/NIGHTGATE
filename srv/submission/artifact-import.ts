@@ -1,7 +1,5 @@
-/**
- * Imports a compiled contract module pinned to one build.
- * This module does not import `@sap/cds`, because the decode worker loads it too.
- */
+// Imports a compiled contract module pinned to one build.
+// This module does not import `@sap/cds`, because the decode worker loads it too.
 
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -14,10 +12,7 @@ export function artifactImportSpec(artifactPath: string, generation: string): st
     return url.href;
 }
 
-/**
- * Imports the module of one specific build. Node caches CommonJS by file name and
- * ignores the query, so the CommonJS cache entry is removed first.
- */
+/** Imports the module of one build. Node caches CommonJS by file name and ignores the query, so that cache entry is removed first. */
 export async function importArtifactGeneration(artifactPath: string, generation: string): Promise<unknown> {
     if (path.isAbsolute(artifactPath)) {
         try {

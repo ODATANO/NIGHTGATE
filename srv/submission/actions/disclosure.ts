@@ -1,23 +1,23 @@
-/**
- * Disclosure grants, reindexing and grantee identities.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Disclosure grants, reindexing and grantee identities.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { getNightgatePluginConfig } from '../../utils/nightgate-config';
 import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
-import { DEFAULT_ATTESTATION_VAULT_REF, liveProviderConfigured, contractProvidersConfigFromEnv } from '../verify-state';
+import { vaultRef, liveProviderConfigured } from '../verify-state';
 import { deriveGranteeId } from '../grantee-identity';
 import { getConfiguredGranteeBinding, isSelfServiceGranteeRegistrationAllowed } from '../../utils/nightgate-config';
-import { DisclosureGrants, GranteeIdentities, type DisclosureGrant } from '#cds-models/midnight';
+import { DisclosureGrants, GranteeIdentities, type DisclosureGrant, type GranteeIdentity } from '#cds-models/midnight';
 import { grantDisclosure, revokeDisclosure, reindexDisclosures, registerGranteeIdentity } from '#cds-models/NightgateService';
-import { facadeConfigFromEnv, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { facadeConfigFromEnv, rejectIfMainnetBlocked, runSubmission } from './common';
 import type { SubmissionContext } from './context';
+import { errorMessage } from '../../utils/errors';
+import { checkRateClass } from '../../utils/rate-classes';
 
 const { INSERT, UPDATE, SELECT, DELETE } = cds.ql;
 
-export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'attesterIdResolver' | 'contractResolver' | 'disclosureReindexer' | 'resolveSponsorForRequest'>): void {
-    const { srv, db, walletFactory, attesterIdResolver, contractResolver, disclosureReindexer, resolveSponsorForRequest } = ctx;
+export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'attesterIdResolver' | 'contractResolver' | 'runDisclosureReindex' | 'resolveSponsorForRequest'>): void {
+    const { srv, db, walletFactory, attesterIdResolver, contractResolver, runDisclosureReindex, resolveSponsorForRequest } = ctx;
 
     srv.on(grantDisclosure, async (req) => {
         const data = req.data;
@@ -34,12 +34,10 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', data.sessionId, req)) return;
+        if (!checkRateClass('prove', data.sessionId, req)) return;
 
         const payloadHashLc = data.payloadHash.toLowerCase();
         const granteeLc = data.grantee.toLowerCase();
@@ -145,12 +143,10 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', data.sessionId, req)) return;
+        if (!checkRateClass('prove', data.sessionId, req)) return;
 
         const payloadHashLc = data.payloadHash.toLowerCase();
         const granteeLc = data.grantee.toLowerCase();
@@ -195,12 +191,10 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
 
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
         const contractAddressLc = data.contractAddress.toLowerCase();
 
-        if (!checkRate('compute', contractAddressLc, req)) return;
+        if (!checkRateClass('compute', contractAddressLc, req)) return;
 
         // Without a live provider, answer with zero counts instead of a server error.
         if (!liveProviderConfigured()) {
@@ -213,13 +207,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
         }
 
         return runSubmission(req, async () => {
-            const resolved = await contractResolver(compiledRef);
-            const result = await disclosureReindexer({
-                db,
-                contractAddress: contractAddressLc,
-                artifactPath: resolved.artifactPath,
-                contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
-            });
+            const result = await runDisclosureReindex(contractAddressLc, await contractResolver(compiledRef), null);
             // `indexed` counts the grants found on chain after the sync.
             return {
                 contractAddress: contractAddressLc,
@@ -249,14 +237,14 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
         try {
             granteeId = deriveGranteeId(bindingKind, bindingInput);
         } catch (err) {
-            return req.reject(400, err instanceof Error ? err.message : String(err));
+            return req.reject(400, errorMessage(err));
         }
 
         const scopeNorm = scope && scope.length > 0 ? scope : null;
         const now = new Date().toISOString();
 
         // One row per user and scope. Registering again updates it.
-        const existing: any = await db.run(
+        const existing: GranteeIdentity | undefined = await db.run(
             SELECT.one.from(GranteeIdentities).where({ userId, scope: scopeNorm })
         );
         if (existing) {

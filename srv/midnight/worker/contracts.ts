@@ -15,11 +15,7 @@ import { createPrivateStateProxy } from './private-state';
 import { BoundSubmitIntent, buildSponsoredWalletProvider, buildWorkerWalletProvider } from './submit';
 import { DEPLOY_ENTRY_POINT, resolveSponsorEntry } from './sponsor';
 
-/**
- * The attestation vault constructors take the deployer's attester id and a recovery id as plain arguments.
- * A constructor that read them from witnesses would exceed the node's cost limit.
- * A recovery id of all zeros means none.
- */
+/** Vault constructors take attester and recovery id as plain arguments, because witness reads exceed the node's cost limit. All-zero recovery id means none. */
 export async function deployConstructorArgs(contractName: string, entry: FacadeEntry, recoveryId?: string): Promise<unknown[]> {
     if (!contractName.startsWith('attestation-vault')) return [];
     const rt: any = await import('@midnight-ntwrk/compact-runtime');
@@ -28,11 +24,7 @@ export async function deployConstructorArgs(contractName: string, entry: FacadeE
     return [attesterId, recovery];
 }
 
-/**
- * Witnesses for a contract we hold no witness code for.
- * Every name exists, so the constructor's check passes, but calling one throws.
- * A proxy is needed because the contract does not export the names.
- */
+/** Witnesses for a contract we hold no witness code for. A proxy answers every name, so the constructor check passes, but each call throws. */
 export function unregisteredWitnessStub(contractName: string): Record<string, unknown> {
     return new Proxy({}, {
         has: () => true,
@@ -184,10 +176,7 @@ export class PhaseTimer {
     }
 }
 
-/**
- * Measures proving, balancing and sending.
- * Also stops before proving or balancing when the caller cancelled.
- */
+/** Measures proving, balancing and sending, and stops before proving or balancing when the caller cancelled. */
 export function wrapProvidersForTiming(providers: any, timer: PhaseTimer, callRegion: { start: number }): any {
     const timed = async <T>(label: string, run: () => Promise<T>): Promise<T> => {
         const t = Date.now();
@@ -223,7 +212,51 @@ export function wrapProvidersForTiming(providers: any, timer: PhaseTimer, callRe
 }
 
 
-/** Private state goes through the main thread under `proxyId`. */
+/** The providers one contract call needs: indexer and proof server for the artifact, a private-state proxy to the main thread under `proxyId`, and the paying wallet. */
+export async function contractCallProviders(a: {
+    contractName: string; registration: ContractRegistration; proxyId: string;
+    indexerHttpUrl: string; indexerWsUrl: string; proofServerUrl: string;
+    walletProvider: any;
+    /** Caches findDeployedContract's indexer reads; a deploy has nothing to find. */
+    cacheFindQueries: boolean;
+}) {
+    const contractProviders = await buildWorkerContractProviders({
+        indexerHttpUrl: a.indexerHttpUrl, indexerWsUrl: a.indexerWsUrl, proofServerUrl: a.proofServerUrl,
+        zkConfigPath: artifactAssetPath(a.contractName, a.registration), generation: a.registration.artifactDigest
+    });
+    const privateStateProvider = createPrivateStateProxy(a.proxyId);
+    const providers = {
+        ...contractProviders,
+        ...(a.cacheFindQueries ? { publicDataProvider: withFindContractQueryCache(contractProviders.publicDataProvider, a.indexerHttpUrl) } : {}),
+        privateStateProvider,
+        walletProvider: a.walletProvider,
+        midnightProvider: a.walletProvider
+    };
+    return { providers, privateStateProvider };
+}
+
+/** Finds a deployed contract for this wallet. Seeds initial private state only when none exists, because seeding overwrites. */
+export async function findContractForWallet(contracts: any, providers: any, privateStateProvider: any, a: {
+    contractAddress: string; compiledContract: unknown; privateStateId: string; initialPrivateState?: unknown;
+    /** Names the caller in the seeding log line; none logs nothing. */
+    site?: string;
+    /** Runs between the private-state read and the lookup, for phase timing. */
+    onProbed?: () => void;
+}): Promise<any> {
+    // The address must be set before the read.
+    privateStateProvider.setContractAddress(a.contractAddress);
+    const existing = await privateStateProvider.get(a.privateStateId);
+    const seed = existing === undefined || existing === null;
+    if (seed && a.site) log('info', `${a.site}: no private state at '${a.privateStateId}' for this wallet, seeding the contract's initial private state`);
+    a.onProbed?.();
+    return contracts.findDeployedContract(providers, {
+        contractAddress: a.contractAddress,
+        compiledContract: a.compiledContract,
+        privateStateId: a.privateStateId,
+        ...(seed ? { initialPrivateState: a.initialPrivateState ?? {} } : {})
+    });
+}
+
 export async function deployContract({
     sessionId, proxyId, contractName, registration,
     indexerHttpUrl, indexerWsUrl, proofServerUrl,
@@ -251,22 +284,11 @@ export async function deployContract({
     await ensureNetworkId(networkId, sdk);
 
     const compiledContract = await getOrCompileContract(contractName, registration, entry);
-    const contractProviders = await buildWorkerContractProviders({
-        indexerHttpUrl, indexerWsUrl, proofServerUrl,
-        zkConfigPath: artifactAssetPath(contractName, registration), generation: registration.artifactDigest
-    });
-    const privateStateProvider = createPrivateStateProxy(proxyId);
     const intent: BoundSubmitIntent = { replyPort: __replyPort, note: 'deploy', circuits: [DEPLOY_ENTRY_POINT] };
-    const walletProvider = sponsorEntry
-        ? buildSponsoredWalletProvider(entry, sponsorEntry, intent)
-        : buildWorkerWalletProvider(entry, intent);
-
-    const providers = {
-        ...contractProviders,
-        privateStateProvider,
-        walletProvider,
-        midnightProvider: walletProvider
-    };
+    const { providers } = await contractCallProviders({
+        contractName, registration, proxyId, indexerHttpUrl, indexerWsUrl, proofServerUrl, cacheFindQueries: false,
+        walletProvider: sponsorEntry ? buildSponsoredWalletProvider(entry, sponsorEntry, intent) : buildWorkerWalletProvider(entry, intent)
+    });
 
     const { contracts } = await loadContractsSdk();
     log('info', `deployContract: starting ${contractName} sess=${sessionId.slice(0, 16)}` +
@@ -326,46 +348,21 @@ export async function submitContractCall({
 
         const compiledContract = await getOrCompileContract(contractName, registration, entry, merkleProof);
         timer.mark('compile');
-        const contractProviders = await buildWorkerContractProviders({
-            indexerHttpUrl, indexerWsUrl, proofServerUrl,
-            zkConfigPath: artifactAssetPath(contractName, registration), generation: registration.artifactDigest
+        const intent: BoundSubmitIntent = { replyPort: __replyPort, contractAddress, circuits: [circuit] };
+        const built = await contractCallProviders({
+            contractName, registration, proxyId, indexerHttpUrl, indexerWsUrl, proofServerUrl, cacheFindQueries: true,
+            walletProvider: sponsorEntry ? buildSponsoredWalletProvider(entry, sponsorEntry, intent) : buildWorkerWalletProvider(entry, intent)
         });
         timer.mark('providers');
-        const privateStateProvider = createPrivateStateProxy(proxyId);
-        const intent: BoundSubmitIntent = { replyPort: __replyPort, contractAddress, circuits: [circuit] };
-        const walletProvider = sponsorEntry
-            ? buildSponsoredWalletProvider(entry, sponsorEntry, intent)
-            : buildWorkerWalletProvider(entry, intent);
-
-        const providers = wrapProvidersForTiming({
-            ...contractProviders,
-            publicDataProvider: withFindContractQueryCache(contractProviders.publicDataProvider, indexerHttpUrl),
-            privateStateProvider,
-            walletProvider,
-            midnightProvider: walletProvider
-        }, timer, callRegion);
+        const providers = wrapProvidersForTiming(built.providers, timer, callRegion);
 
         const { contracts } = await loadContractsSdk();
         log('info', `submitContractCall: ${contractName}.${circuit}@${contractAddress.slice(0, 12)}` +
             (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
 
-        // A wallet that did not deploy the contract has no private state, and findDeployedContract
-        // then throws. Pass initial state only when none exists, because it overwrites.
-        // The address must be set before the read.
-        privateStateProvider.setContractAddress(contractAddress);
-        const existingPrivateState = await privateStateProvider.get(registration.privateStateId);
-        const seed = existingPrivateState === undefined || existingPrivateState === null;
-        if (seed) {
-            log('info',
-                `submitContractCall: no private state at '${registration.privateStateId}' for this wallet, ` +
-                `seeding the contract's initial private state`);
-        }
-        timer.mark('stateProbe');
-        const found = await contracts.findDeployedContract(providers, {
-            contractAddress,
-            compiledContract,
-            privateStateId: registration.privateStateId,
-            ...(seed ? { initialPrivateState: initialPrivateState ?? {} } : {})
+        const found = await findContractForWallet(contracts, providers, built.privateStateProvider, {
+            contractAddress, compiledContract, privateStateId: registration.privateStateId, initialPrivateState,
+            site: 'submitContractCall', onProbed: () => timer.mark('stateProbe')
         });
         timer.mark('findContract');
         const fn = found?.callTx?.[circuit];
@@ -388,11 +385,7 @@ export async function submitContractCall({
     }
 }
 
-/**
- * Several calls on one contract in one transaction.
- * A failure before sending sends nothing. After sending, the tx can land with only some
- * calls applied, so callers must check the contract state.
- */
+/** Several calls on one contract in one tx. The tx can land with only some calls applied, so callers must check the contract state. */
 export async function submitContractCallBatch({
     sessionId, proxyId, contractName, registration,
     contractAddress, calls,
@@ -453,44 +446,21 @@ export async function submitContractCallBatch({
             holderMode ? holder : undefined
         );
         timer.mark('compile');
-        const contractProviders = await buildWorkerContractProviders({
-            indexerHttpUrl, indexerWsUrl, proofServerUrl,
-            zkConfigPath: artifactAssetPath(contractName, registration), generation: registration.artifactDigest
+        const intent: BoundSubmitIntent = { replyPort: __replyPort, contractAddress, circuits };
+        const built = await contractCallProviders({
+            contractName, registration, proxyId, indexerHttpUrl, indexerWsUrl, proofServerUrl, cacheFindQueries: true,
+            walletProvider: sponsorEntry ? buildSponsoredWalletProvider(entry, sponsorEntry, intent) : buildWorkerWalletProvider(entry, intent)
         });
         timer.mark('providers');
-        const privateStateProvider = createPrivateStateProxy(proxyId);
-        const intent: BoundSubmitIntent = { replyPort: __replyPort, contractAddress, circuits: calls.map(c => c.circuit) };
-        const walletProvider = sponsorEntry
-            ? buildSponsoredWalletProvider(entry, sponsorEntry, intent)
-            : buildWorkerWalletProvider(entry, intent);
-
-        const providers = wrapProvidersForTiming({
-            ...contractProviders,
-            publicDataProvider: withFindContractQueryCache(contractProviders.publicDataProvider, indexerHttpUrl),
-            privateStateProvider,
-            walletProvider,
-            midnightProvider: walletProvider
-        }, timer, callRegion);
+        const providers = wrapProvidersForTiming(built.providers, timer, callRegion);
 
         const { contracts } = await loadContractsSdk();
         log('info', `submitContractCallBatch: ${contractName}.[${circuits.join('+')}]@${contractAddress.slice(0, 12)}` +
             (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
 
-        // Same initial private state handling as in submitContractCall.
-        privateStateProvider.setContractAddress(contractAddress);
-        const existingPrivateState = await privateStateProvider.get(registration.privateStateId);
-        const seed = existingPrivateState === undefined || existingPrivateState === null;
-        if (seed) {
-            log('info',
-                `submitContractCallBatch: no private state at '${registration.privateStateId}' for this wallet, ` +
-                `seeding the contract's initial private state`);
-        }
-        timer.mark('stateProbe');
-        const found = await contracts.findDeployedContract(providers, {
-            contractAddress,
-            compiledContract,
-            privateStateId: registration.privateStateId,
-            ...(seed ? { initialPrivateState: initialPrivateState ?? {} } : {})
+        const found = await findContractForWallet(contracts, providers, built.privateStateProvider, {
+            contractAddress, compiledContract, privateStateId: registration.privateStateId, initialPrivateState,
+            site: 'submitContractCallBatch', onProbed: () => timer.mark('stateProbe')
         });
         timer.mark('findContract');
         callRegion.start = Date.now();

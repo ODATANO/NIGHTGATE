@@ -1,10 +1,6 @@
-/**
- * Reads NIGHTGATE_* settings for code that also ships in the `@odatano/nightgate-tx` package.
- * Inside the server the settings come from the server config.
- * The package has no server config, so it reads the environment directly.
- *
- * SPDX-License-Identifier: Apache-2.0
- */
+// Reads NIGHTGATE_* settings for code that also ships in `@odatano/nightgate-tx`.
+// The server reads its config. The package has none, so it reads the environment.
+// SPDX-License-Identifier: Apache-2.0
 
 type ConfigModule = typeof import('../utils/config');
 

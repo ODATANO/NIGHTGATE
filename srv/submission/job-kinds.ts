@@ -1,8 +1,5 @@
-/**
- * The one table of all background job kinds and how each one runs.
- * The job runner and the processor registrations are built from it.
- * A kind missing here, or without a processor, fails at startup.
- */
+// The one table of all background job kinds and how each one runs. The job runner and the processor registrations are built from it.
+// A kind missing here, or without a processor, fails at startup.
 export interface JobKindTraits {
     /** Runs a full ZK proof. All heavy kinds share one limit on how many run at once. */
     heavy: boolean;

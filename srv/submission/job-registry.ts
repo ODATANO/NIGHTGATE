@@ -1,13 +1,12 @@
-/**
- * Registry of background job kinds, their processors and their finalizers.
- * A finalizer does the database writes that must follow a confirmed transaction.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Registry of background job kinds, their processors and their finalizers.
+// A finalizer does the database writes that must follow a confirmed transaction.
+// SPDX-License-Identifier: Apache-2.0
 import type { BackgroundJob } from '#cds-models/midnight';
 import { JOB_KIND_TRAITS, LIGHT_KIND, type JobKindTraits } from './job-kinds';
 import { decrypt as decryptAtRest, getEncryptionKey } from '../utils/crypto';
 import { jobCommandBinding } from '../utils/envelope-bindings';
 import { ReconciliationEvidence } from './job-store';
+import type { DbRunner } from '../utils/db-types';
 
 const kindTraits = new Map<string, JobKindTraits>();
 
@@ -35,10 +34,13 @@ export function __workflowParentKindsForTests(): ReadonlySet<string> { return ne
 
 export type BackgroundJobProcessor = (command: unknown, row: BackgroundJob) => Promise<unknown>;
 
+/** Runs inside the transaction that confirms the job; `afterCommit` work runs only once that commits. */
 export type BackgroundJobReconciliationFinalizer = (
     command: unknown,
     row: BackgroundJob,
-    evidence: ReconciliationEvidence
+    evidence: ReconciliationEvidence,
+    tx: DbRunner,
+    afterCommit: (work: () => Promise<void>) => void
 ) => Promise<unknown>;
 
 export const processors = new Map<string, BackgroundJobProcessor>();
@@ -73,23 +75,26 @@ export function registerBackgroundJobReconciliationFinalizer(
     reconciliationFinalizers.set(processorKey(kind, version), finalizer);
 }
 
-export async function executePersistedCommand(row: BackgroundJob): Promise<unknown> {
-    const processor = processors.get(processorKey(row.kind, row.commandVersion!));
-    if (!processor) throw new Error(`No background-job processor registered for '${row.kind}' v${row.commandVersion}`);
+function storedCommand(row: BackgroundJob): unknown {
     const serialized = row.commandEncoding === 'aes-gcm-v1'
         ? decryptAtRest(row.command!, getEncryptionKey(), jobCommandBinding(String(row.ID)))
         : row.command!;
-    return processor(JSON.parse(serialized), row);
+    return JSON.parse(serialized);
+}
+
+export async function executePersistedCommand(row: BackgroundJob): Promise<unknown> {
+    const processor = processors.get(processorKey(row.kind, row.commandVersion!));
+    if (!processor) throw new Error(`No background-job processor registered for '${row.kind}' v${row.commandVersion}`);
+    return processor(storedCommand(row), row);
 }
 
 /** Every path that confirms a job runs this, so no job succeeds without its finalizer's writes. */
-export async function runReconciliationFinalizer(job: BackgroundJob, evidence: ReconciliationEvidence): Promise<unknown | undefined> {
+export async function runReconciliationFinalizer(
+    job: BackgroundJob, evidence: ReconciliationEvidence, tx: DbRunner, afterCommit: (work: () => Promise<void>) => void
+): Promise<unknown | undefined> {
     const finalizer = job.commandVersion
         ? reconciliationFinalizers.get(processorKey(job.kind, job.commandVersion))
         : undefined;
     if (!finalizer) return undefined;
-    const serialized = job.commandEncoding === 'aes-gcm-v1'
-        ? decryptAtRest(job.command!, getEncryptionKey(), jobCommandBinding(String(job.ID)))
-        : job.command!;
-    return finalizer(JSON.parse(serialized), job, evidence);
+    return finalizer(storedCommand(job), job, evidence, tx, afterCommit);
 }

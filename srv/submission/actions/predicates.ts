@@ -1,21 +1,21 @@
-/**
- * Actions that prove facts about document fields, and comparisons between two documents.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Actions that prove facts about document fields, and comparisons between two documents.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { type NightgateNetwork, VALID_NIGHTGATE_NETWORKS } from '../../utils/nightgate-config';
 import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
-import { DEFAULT_ATTESTATION_VAULT_REF, UINT64_MAX, vaultDims, parsePredicate, coerceMask, liveProviderConfigured } from '../verify-state';
+import { vaultRef, UINT64_MAX, vaultDims, parsePredicate, coerceMask, liveProviderConfigured } from '../verify-state';
 import { blake2b256Hex, PureCircuitsUnavailableError } from '../document-proof';
 import { membershipPathFor, SET_DEPTH } from '../set-root';
-import { Transactions, TransactionResults, PredicateAttestations, type Transaction } from '#cds-models/midnight';
-import { parseValidUntil, SchemaSlotWire, OpeningWire, parseInclusionPath, validateSchemaSlots, validateOpening, isVacuousMask, INT64_MAX, parseDocPairInputs, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { PredicateAttestations, type PredicateAttestation } from '#cds-models/midnight';
+import { startJobWithRows, readUnsignedArg, VALUE_EXCEEDS, THRESHOLD_EXCEEDS, parseValidUntil, SchemaSlotWire, OpeningWire, parseInclusionPath, inclusionPathOrThrow, type InclusionPath, validateSchemaSlots, validateOpening, isVacuousMask, INT64_MAX, parseDocPairInputs, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, runSubmission, landedOnChain } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
-import { issueDocumentDiffAttestation, issueDocumentIntegrityAttestation, issueFieldEqualityAttestation, issueFieldMembershipAttestation, issueFieldPredicateAttestation, issueFieldPredicateAttestationBatch, verifyPredicateAttestation } from '#cds-models/NightgateService';
+import { issueDocumentDiffAttestation, issueDocumentIntegrityAttestation, issueFieldEqualityAttestation, issueFieldMembershipAttestation, issueFieldPredicateAttestation, issueFieldPredicateAttestationBatch, verifyPredicateAttestation, type IssuedClaim } from '#cds-models/NightgateService';
+import { int64Value } from '../../utils/numbers';
+import { checkRateClass } from '../../utils/rate-classes';
 
-const { INSERT, SELECT, DELETE } = cds.ql;
+const { INSERT, SELECT } = cds.ql;
 
 export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'contractResolver' | 'pureCircuitsLoader' | 'verifyPredicateViaState' | 'resolveAttester' | 'resolveSponsorForRequest'>): void {
     const { srv, db, walletFactory, contractResolver, pureCircuitsLoader, verifyPredicateViaState, resolveAttester, resolveSponsorForRequest } = ctx;
@@ -28,22 +28,14 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
         if (!data.fieldKey) return req.reject(400, 'fieldKey is required');
-        if (data.value === undefined || data.value === null || data.value === '') {
-            return req.reject(400, 'value is required');
-        }
-        let valueBig: bigint;
-        try { valueBig = BigInt(data.value); } catch { return req.reject(400, 'value must be an integer (decimal string)'); }
-        if (valueBig < 0n) return req.reject(400, 'value must be a non-negative integer');
-        if (valueBig > UINT64_MAX) return req.reject(400, 'value exceeds Uint<64>');
+        const valueBig = readUnsignedArg(data.value, 'value', UINT64_MAX, VALUE_EXCEEDS);
+        if (typeof valueBig === 'string') return req.reject(400, valueBig);
         if (!data.fieldSalt) {
             return req.reject(400, 'fieldSalt is required (v4 salted leaves; prepareDocumentProof returns it per field)');
         }
 
-        if (data.threshold === undefined || data.threshold === null) return req.reject(400, 'threshold is required');
-        let thresholdBig: bigint;
-        try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
-        if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
-        if (thresholdBig > INT64_MAX) return req.reject(400, 'threshold exceeds the recorded range (at most 9223372036854775807)');
+        const thresholdBig = readUnsignedArg(data.threshold, 'threshold', INT64_MAX, THRESHOLD_EXCEEDS);
+        if (typeof thresholdBig === 'string') return req.reject(400, thresholdBig);
 
         const parsedPredicate = parsePredicate(data.predicate);
         if (!parsedPredicate || parsedPredicate.kind !== 'numeric') {
@@ -63,18 +55,16 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         const contractAddress = data.contractAddress;
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', data.sessionId, req)) return;
+        if (!checkRateClass('prove', data.sessionId, req)) return;
 
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
         if (!attesterId) return;
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
-        await db.run(INSERT.into(PredicateAttestations).entries({
+        const insertRows = INSERT.into(PredicateAttestations).entries({
             ID: predicateAttestationId,
             payloadHash: data.payloadHash.toLowerCase(),
             attesterId,
@@ -92,7 +82,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             provenAt: null,
             createdAt: insertedAt,
             modifiedAt: insertedAt
-        }));
+        });
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -101,7 +91,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
-            const job = await startJob({
+            const job = await startJobWithRows(db, PredicateAttestations, [predicateAttestationId], insertRows, () => startJob({
                 kind: 'issueFieldPredicateAttestation',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
@@ -136,10 +126,9 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     dirs: dirsBool, contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
-            });
+            }));
 
-            if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
-            const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
+            const stablePredicateId = job.originalRequest?.predicateAttestationId ?? predicateAttestationId;
             return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
         });
     });
@@ -170,19 +159,17 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', data.sessionId, req)) return;
+        if (!checkRateClass('prove', data.sessionId, req)) return;
 
         // No operator or threshold here. The claim is the expected digest itself.
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
         if (!attesterId) return;
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
-        await db.run(INSERT.into(PredicateAttestations).entries({
+        const insertRows = INSERT.into(PredicateAttestations).entries({
             ID: predicateAttestationId,
             payloadHash: data.payloadHash.toLowerCase(),
             attesterId,
@@ -200,7 +187,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             provenAt: null,
             createdAt: insertedAt,
             modifiedAt: insertedAt
-        }));
+        });
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -209,7 +196,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
-            const job = await startJob({
+            const job = await startJobWithRows(db, PredicateAttestations, [predicateAttestationId], insertRows, () => startJob({
                 kind: 'issueFieldEqualityAttestation',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
@@ -243,10 +230,9 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
-            });
+            }));
 
-            if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
-            const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
+            const stablePredicateId = job.originalRequest?.predicateAttestationId ?? predicateAttestationId;
             return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
         });
     });
@@ -285,9 +271,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         // Build the set before the rate limit check, so a value missing from the list costs no budget.
         let setRoot: string;
@@ -328,14 +312,14 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         }
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', data.sessionId, req)) return;
+        if (!checkRateClass('prove', data.sessionId, req)) return;
 
         // Only the set root is public. The value digest and the paths stay private proof inputs.
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
         if (!attesterId) return;
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
-        await db.run(INSERT.into(PredicateAttestations).entries({
+        const insertRows = INSERT.into(PredicateAttestations).entries({
             ID: predicateAttestationId,
             payloadHash: data.payloadHash.toLowerCase(),
             attesterId,
@@ -353,7 +337,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             provenAt: null,
             createdAt: insertedAt,
             modifiedAt: insertedAt
-        }));
+        });
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -362,7 +346,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
-            const job = await startJob({
+            const job = await startJobWithRows(db, PredicateAttestations, [predicateAttestationId], insertRows, () => startJob({
                 kind: 'issueFieldMembershipAttestation',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
@@ -398,10 +382,9 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
-            });
+            }));
 
-            if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
-            const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
+            const stablePredicateId = job.originalRequest?.predicateAttestationId ?? predicateAttestationId;
             return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
         });
     });
@@ -437,12 +420,10 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', data.sessionId, req)) return;
+        if (!checkRateClass('prove', data.sessionId, req)) return;
 
         // Document A is stored in the payloadHash column.
         const attesterIdA = await resolveAttester(req, data.sessionId, data.attesterIdA, Boolean(data.contentRootA));
@@ -451,7 +432,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!attesterIdB) return;
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
-        await db.run(INSERT.into(PredicateAttestations).entries({
+        const insertRows = INSERT.into(PredicateAttestations).entries({
             ID: predicateAttestationId,
             payloadHash: data.payloadHashA.toLowerCase(),
             attesterId: attesterIdA,
@@ -473,7 +454,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             provenAt: null,
             createdAt: insertedAt,
             modifiedAt: insertedAt
-        }));
+        });
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -482,7 +463,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
-            const job = await startJob({
+            const job = await startJobWithRows(db, PredicateAttestations, [predicateAttestationId], insertRows, () => startJob({
                 kind: 'issueDocumentIntegrityAttestation',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
@@ -521,10 +502,9 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     schemaId: data.schemaId?.toLowerCase(),
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
-            });
+            }));
 
-            if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
-            const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
+            const stablePredicateId = job.originalRequest?.predicateAttestationId ?? predicateAttestationId;
             return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
         });
     });
@@ -553,12 +533,10 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', data.sessionId, req)) return;
+        if (!checkRateClass('prove', data.sessionId, req)) return;
 
         // k is stored in the threshold column.
         const attesterIdA = await resolveAttester(req, data.sessionId, data.attesterIdA, Boolean(data.contentRootA));
@@ -567,7 +545,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!attesterIdB) return;
         const predicateAttestationId = cds.utils.uuid();
         const insertedAt = new Date().toISOString();
-        await db.run(INSERT.into(PredicateAttestations).entries({
+        const insertRows = INSERT.into(PredicateAttestations).entries({
             ID: predicateAttestationId,
             payloadHash: data.payloadHashA.toLowerCase(),
             attesterId: attesterIdA,
@@ -589,7 +567,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             provenAt: null,
             createdAt: insertedAt,
             modifiedAt: insertedAt
-        }));
+        });
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -598,7 +576,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
-            const job = await startJob({
+            const job = await startJobWithRows(db, PredicateAttestations, [predicateAttestationId], insertRows, () => startJob({
                 kind: 'issueDocumentDiffAttestation',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
@@ -637,10 +615,9 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     schemaId: data.schemaId?.toLowerCase(),
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
-            });
+            }));
 
-            if (job.deduplicated) await db.run(DELETE.from(PredicateAttestations).where({ ID: predicateAttestationId }));
-            const stablePredicateId = (job.originalRequest as any)?.predicateAttestationId ?? predicateAttestationId;
+            const stablePredicateId = job.originalRequest?.predicateAttestationId ?? predicateAttestationId;
             return { jobId: job.jobId, status: job.status, predicateAttestationId: stablePredicateId };
         });
     });
@@ -675,22 +652,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             payloadHashB?: string; attesterIdB?: string; allowedMask?: number; k?: number;
             schema?: SchemaSlotWire[]; openingA?: OpeningWire; openingB?: OpeningWire;
         }
-        const parsePath = (sibs: unknown, ds: unknown, i: number, depth: number, sibName: string, dirName: string): { siblings: string[]; dirs: boolean[] } => {
-            if (!Array.isArray(sibs) || sibs.length !== depth) {
-                throw new Error(`claims[${i}].${sibName} must be an array of ${depth} hashes`);
-            }
-            for (const s of sibs) {
-                if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) throw new Error(`claims[${i}].${sibName} entries must be 64 hex chars (32 bytes)`);
-            }
-            if (!Array.isArray(ds) || ds.length !== depth) {
-                throw new Error(`claims[${i}].${dirName} must be an array of ${depth} booleans`);
-            }
-            for (const d of ds) {
-                // Only real booleans. Boolean("false") is true and would give a wrong path.
-                if (typeof d !== 'boolean') throw new Error(`claims[${i}].${dirName} entries must be booleans`);
-            }
-            return { siblings: (sibs as string[]).map(s => s.toLowerCase()), dirs: ds as boolean[] };
-        };
+        const parsePath = (sibs: unknown, ds: unknown, i: number, depth: number, sibName: string, dirName: string): InclusionPath =>
+            inclusionPathOrThrow(sibs, ds, depth, { siblings: `claims[${i}].${sibName}`, dirs: `claims[${i}].${dirName}` });
         const { width: batchWidth, depth: batchDepth, maxMask: batchMaxMask } = vaultDims(data.compiledArtifactRef);
         let claims: BatchClaim[];
         try {
@@ -795,27 +758,17 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     return { ...base, valueDigest, setRoot: entry.setRoot.toLowerCase(), setSiblings: setPath.siblings, setDirs: setPath.dirs };
                 }
 
-                if (entry.value === undefined || entry.value === null || entry.value === '') {
-                    throw new Error(`claims[${i}].value is required`);
-                }
-                let valueBig: bigint;
-                try { valueBig = BigInt(entry.value); } catch { throw new Error(`claims[${i}].value must be an integer (decimal string)`); }
-                if (valueBig < 0n) throw new Error(`claims[${i}].value must be a non-negative integer`);
-                if (valueBig > UINT64_MAX) throw new Error(`claims[${i}].value exceeds Uint<64>`);
-                if (entry.threshold === undefined || entry.threshold === null) throw new Error(`claims[${i}].threshold is required`);
-                let thresholdBig: bigint;
-                try { thresholdBig = BigInt(entry.threshold); } catch { throw new Error(`claims[${i}].threshold must be an integer`); }
-                if (thresholdBig < 0n) throw new Error(`claims[${i}].threshold must be a non-negative integer`);
-                if (thresholdBig > INT64_MAX) throw new Error(`claims[${i}].threshold exceeds the recorded range (at most 9223372036854775807)`);
+                const valueBig = readUnsignedArg(entry.value, `claims[${i}].value`, UINT64_MAX, VALUE_EXCEEDS);
+                if (typeof valueBig === 'string') throw new Error(valueBig);
+                const thresholdBig = readUnsignedArg(entry.threshold, `claims[${i}].threshold`, INT64_MAX, THRESHOLD_EXCEEDS);
+                if (typeof thresholdBig === 'string') throw new Error(thresholdBig);
                 return { ...base, value: valueBig.toString(), threshold: thresholdBig.toString(), opCode: parsed.opCode! };
             });
         } catch (e: unknown) {
             return req.reject(400, e instanceof Error && /^claims\[/.test(e.message) ? e.message : 'claims entries must match the predicate\'s inputs');
         }
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         // Build the sets first. Duplicate removal needs the set root, and a value
         // missing from the list must not count against the rate limit.
@@ -862,20 +815,20 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         if (rejectIfMainnetBlocked(req)) return;
         // Each claim counts against the rate limit, so a batch cannot bypass it.
-        if (!checkRate('prove', data.sessionId, req, uniqueClaims.length)) return;
+        if (!checkRateClass('prove', data.sessionId, req, uniqueClaims.length)) return;
 
         const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
         if (!attesterId) return;
         const insertedAt = new Date().toISOString();
         const rowedClaims = uniqueClaims.map(c => ({ ...c, predicateAttestationId: cds.utils.uuid() }));
-        await db.run(INSERT.into(PredicateAttestations).entries(rowedClaims.map(c => ({
+        const insertRows = INSERT.into(PredicateAttestations).entries(rowedClaims.map(c => ({
             ID: c.predicateAttestationId,
             payloadHash: data.payloadHash!.toLowerCase(),
             attesterId,
             contractAddress,
             predicate: c.predicate,
             op: c.opCode ?? null,
-            threshold: (c.predicate === 'documentDiff' ? c.k : c.threshold ?? null) as any,
+            threshold: int64Value(c.predicate === 'documentDiff' ? c.k : c.threshold),
             unit: c.unit ?? null,
             fieldKey: c.fieldKey ?? null,
             expectedDigest: c.expectedDigest ?? null,
@@ -890,7 +843,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             provenAt: null,
             createdAt: insertedAt,
             modifiedAt: insertedAt
-        }))));
+        })));
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
@@ -899,16 +852,21 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
-            const publicClaims = rowedClaims.map(c => ({
-                predicateAttestationId: c.predicateAttestationId, fieldKey: c.fieldKey,
-                predicate: c.predicate,
-                ...(c.predicate === 'bytesEquality' ? { expectedDigest: c.expectedDigest }
-                    : c.predicate === 'setMembership' ? { setRoot: c.setRoot }
-                    : c.predicate === 'documentIntegrity' ? { payloadHashB: c.payloadHashB, allowedMask: c.allowedMask }
-                    : c.predicate === 'documentDiff' ? { payloadHashB: c.payloadHashB, k: c.k }
-                    : { threshold: c.threshold, unit: c.unit ?? null })
-            }));
-            const job = await startJob({
+            // Each claim lists every field; the ones its predicate does not use are null.
+            const publicClaims = rowedClaims.map((c): IssuedClaim => {
+                const is = (p: string) => c.predicate === p;
+                const numeric = !['bytesEquality', 'setMembership', 'documentIntegrity', 'documentDiff'].includes(c.predicate);
+                return {
+                    predicateAttestationId: c.predicateAttestationId, fieldKey: c.fieldKey ?? null, predicate: c.predicate,
+                    threshold: numeric ? int64Value(c.threshold) : null, unit: numeric ? c.unit ?? null : null,
+                    expectedDigest: is('bytesEquality') ? c.expectedDigest ?? null : null,
+                    setRoot: is('setMembership') ? c.setRoot ?? null : null,
+                    payloadHashB: is('documentIntegrity') || is('documentDiff') ? c.payloadHashB ?? null : null,
+                    allowedMask: is('documentIntegrity') ? c.allowedMask ?? null : null,
+                    k: is('documentDiff') ? c.k ?? null : null
+                };
+            });
+            const job = await startJobWithRows(db, PredicateAttestations, rowedClaims.map(c => c.predicateAttestationId), insertRows, () => startJob({
                 kind: 'issueFieldPredicateAttestationBatch',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
@@ -959,15 +917,11 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     })),
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
-            });
+            }));
 
-            // A repeated request reuses the first job. Delete the rows made for this
-            // request and return the rows of the first one.
-            if (job.deduplicated) {
-                await db.run(DELETE.from(PredicateAttestations).where({ ID: { in: rowedClaims.map(c => c.predicateAttestationId) } }));
-            }
+            // A repeated request reuses the first job and returns its rows.
             const stableClaims = job.deduplicated
-                ? ((job.originalRequest as any)?.claims ?? publicClaims)
+                ? (job.originalRequest?.claims ?? publicClaims)
                 : publicClaims;
             return {
                 jobId: job.jobId, status: job.status,
@@ -980,8 +934,9 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
     srv.on(verifyPredicateAttestation, async (req) => {
         const { predicateAttestationId } = req.data;
         if (!predicateAttestationId) return req.reject(400, 'predicateAttestationId is required');
+        if (!checkRateClass('read', 'read', req)) return;
 
-        const row: any = await db.run(
+        const row: PredicateAttestation | undefined = await db.run(
             SELECT.one.from(PredicateAttestations).where({ ID: predicateAttestationId })
         );
         if (!row) return req.reject(404, `PredicateAttestation ${predicateAttestationId} not found`);
@@ -991,16 +946,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         // because a claim can expire or be removed after it landed.
         let included = false;
         if (provenOk) {
-            const txRow: Transaction | undefined = await db.run(
-                SELECT.one.from(Transactions).columns('ID', 'hash').where({ hash: row.provenTxHash })
-            );
-            if (txRow?.ID) {
-                const result: any = await db.run(
-                    SELECT.one.from(TransactionResults).columns('status', 'outcomeSource').where({ transaction_ID: txRow.ID })
-                );
-                included = result?.status === 'SUCCESS'
-                    && result?.outcomeSource === 'substrate-system-events';
-            }
+            included = await landedOnChain(db, row.provenTxHash);
         }
 
         const rowNetwork = row.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(row.network)

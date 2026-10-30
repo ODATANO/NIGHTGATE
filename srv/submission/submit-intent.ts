@@ -1,7 +1,5 @@
-/**
- * Data stored in an attempt row's `submitIntentData` just before a transaction is sent.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Data stored in an attempt row's `submitIntentData` just before a transaction is sent.
+// SPDX-License-Identifier: Apache-2.0
 
 export interface SubmitIntentSegment { segment: number; calls: string[] }
 

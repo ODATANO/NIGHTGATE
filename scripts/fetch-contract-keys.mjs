@@ -1,22 +1,6 @@
 #!/usr/bin/env node
-// Fetch a contract lineage's PROVER keys into the installed package.
-//
-// Prover keys are tens of megabytes each and ship neither in npm nor in git:
-// a lineage package carries its module, verifier keys, zkir and a
-// keys/manifest.json (sha256 + size per prover key), and names the release
-// assets the keys come from (contract.json#zkAssetUrl). A running server
-// fetches a missing key on first need; this CLI does the same ahead of time,
-// for an install that will run offline or behind a firewall.
-//
-//   npx nightgate-fetch-keys attestation-vault-32
-//   npx nightgate-fetch-keys @odatano/contract-attestation-vault-32
-//   npx nightgate-fetch-keys attestation-vault-32 --from https://host/zk-config/attestation-vault-32
-//
-// `--from` takes any NIGHTGATE's /zk-config of that contract. Every downloaded
-// key is verified against the manifest; a mismatch is never written. Prover
-// keys are not part of the artifact generation digest, so fetching them
-// changes nothing a job or evidence row was pinned to, and the server needs
-// no restart.
+// Fetches a contract's prover keys into the installed package ahead of time and verifies each against its manifest.
+// Run: npx nightgate-fetch-keys attestation-vault-32 [--from https://host/zk-config/attestation-vault-32]
 
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';

@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.39.4",
+  "version": "0.40.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -177,6 +177,7 @@
     "prepack": "npm run build:plugin",
     "prepublishOnly": "npm run check:release && npm run build:plugin",
     "integration:derive-wallet-info": "node --env-file=.env scripts/integration-test-derive-wallet-info.mjs",
+    "integration:utxo-identity": "node scripts/integration-test-utxo-identity.mjs",
     "check:fresh-tree": "bash scripts/check-fresh-tree.sh",
     "txbuilder:e2e": "node --env-file=.env scripts/run-txbuilder-e2e.mjs",
     "burst-sponsor:e2e": "node --env-file=.env scripts/run-burst-sponsor-e2e.mjs",
@@ -225,6 +226,7 @@
     "bip39": "^3.1.0",
     "effect": "^3.21.4",
     "generic-pool": "^3.9.0",
+    "rxjs": "^7.8.2",
     "ws": "^8"
   },
   "peerDependencies": {
@@ -331,6 +333,7 @@
     "url": "https://github.com/ODATANO/NIGHTGATE/issues"
   },
   "overrides": {
-    "qs": "^6.16.0"
+    "qs": "^6.17.1",
+    "body-parser@1": "^1.20.9"
   }
 }

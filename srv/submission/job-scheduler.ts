@@ -1,7 +1,5 @@
-/**
- * Starts background jobs, limits how many run at once, and picks up jobs left behind.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Starts background jobs, limits how many run at once, and picks up jobs left behind.
+// SPDX-License-Identifier: Apache-2.0
 import { SponsorAttemptBookkeepingPendingError } from './job-execution-context';
 import { isBackgroundFenced } from '../utils/instance-lease';
 import cds from '@sap/cds';
@@ -11,9 +9,9 @@ import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../util
 import { runInJobExecutionContext } from './job-execution-context';
 import { isCallNotAppliedFailure } from './sponsor-pool';
 import { configMs } from '../utils/config';
-import type { DbRunner } from '../utils/db-types';
+import { affectedRows, type DbRunner } from '../utils/db-types';
 import { jobKindTraits, executePersistedCommand, undeclaredOrUnregisteredJobKinds, processors, processorKey } from './job-registry';
-import { WorkflowReconciliationRequiredError, runWithoutAmbientTx, getJobById, markRunning, markSucceeded, markFailed, markReconciliationRequired, startLeaseHeartbeat, markJobExternalExecution, markJobBroadcastOn, markJobSubmissionRejectedOn, markJobSubmitted, affectedRows } from './job-store';
+import { WorkflowReconciliationRequiredError, runWithoutAmbientTx, getJobById, markRunning, markSucceeded, markFailed, markReconciliationRequired, startLeaseHeartbeat, markJobExternalExecution, markJobBroadcastOn, markJobSubmissionRejectedOn, markJobSubmitted } from './job-store';
 import { BROADCAST_UNCONFIRMED, BROADCAST_NOT_INCLUDED, markChainFailureAfterBroadcast, settleRejectedSponsorAttempts, triggerChainConfirmPass, reconcileBackgroundJobs, refreshSucceededChainOutcomes, SCAN_PAGE_SIZE } from './job-reconciliation';
 import { errorMessage } from '../utils/errors';
 import { LOCK_CONTENTION_ATTEMPTS, withLockContentionRetry } from './db-write-retry';
@@ -51,11 +49,8 @@ class Semaphore {
 
 const semaphores: Map<string, Semaphore> = new Map();
 
-/**
- * All heavy jobs share one limit, since their proofs compete for the same prover.
- * Workflow parents get their own limit: a parent waits for heavy child jobs and
- * must not take a slot the children need.
- */
+// All heavy jobs share one limit, since their proofs compete for the same prover.
+// Workflow parents get their own limit, because a parent waits for heavy child jobs and must not take a slot they need.
 function concurrencyClass(kind: string): { key: string; cap: 'heavy' | 'light' | 'serial' } {
     const traits = jobKindTraits(kind);
     if (traits.serial) return { key: `serial:${kind}`, cap: 'serial' };
@@ -90,8 +85,7 @@ function getNetwork(): 'preprod' | 'testnet' | 'mainnet' {
 }
 
 /**
- * Starts the job once the request's transaction has committed, never on rollback.
- * Must use the same `cds.context` check as startJob's insert. The poller catches any job missed here.
+ * Starts the job once the request's transaction has committed, never on rollback. Must use the same `cds.context` check as startJob's insert. The poller catches any job missed here.
  */
 export function scheduleJob(jobId: string, kind: string, legacyWork?: () => Promise<unknown>): void {
     const ctx = cds.context as { on?: (event: string, handler: () => void) => void } | undefined;
@@ -229,21 +223,15 @@ let commandPollTimer: ReturnType<typeof setInterval> | undefined;
 
 let commandPollActive = false;
 
-/**
- * Starts the job poller. Call after the processors and the wallet worker are ready.
- * The atomic `pending -> running` update keeps a job from running twice.
- */
+/** Starts the job poller after the processors and the wallet worker are ready. The atomic `pending -> running` update keeps a job from running twice. */
 export async function startBackgroundJobProcessor(): Promise<void> {
     if (commandPollTimer) return;
     const missing = undeclaredOrUnregisteredJobKinds();
     if (missing.length > 0) {
         throw new Error(`background-job kinds declared without a processor: ${missing.join(', ')} (srv/submission/job-kinds.ts vs the registrations)`);
     }
+    // One poll also runs the settle, reconcile and chain-outcome passes.
     await pollPersistedCommands();
-    await settleRejectedSponsorAttempts();
-    await reconcileBackgroundJobs();
-    await refreshSucceededChainOutcomes();
-    triggerChainConfirmPass();
     commandPollTimer = setInterval(() => void pollPersistedCommands().catch(err => {
         cds.log('nightgate').warn(`Background-job poll failed: ${errorMessage(err)}`);
     }), 2000);
@@ -256,8 +244,7 @@ export function stopBackgroundJobProcessor(): void {
 }
 
 /**
- * Only `running` jobs are re-queued. A job that may already have submitted could
- * pay a second fee if run again, so reconciliation handles those.
+ * Only `running` jobs are re-queued. A job that may already have submitted could pay a second fee if run again, so reconciliation handles those.
  */
 const JOB_LEASE_TTL_MS = configMs('NIGHTGATE_JOB_LEASE_TTL_MS');
 
@@ -282,7 +269,7 @@ export async function reclaimExpiredLeases(existingDb?: DbRunner): Promise<numbe
         const terminal = !row.commandVersion
             ? 'its work was an in-process closure that died with the lease owner'
             : attempt > MAX_LEASE_RECLAIMS + 1
-                ? `its lease expired ${MAX_LEASE_RECLAIMS} times`
+                ? `its lease expired ${attempt - 1} times`
                 : null;
         const patch: Record<string, unknown> = terminal
             ? {

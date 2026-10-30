@@ -1,16 +1,8 @@
-/**
- * Shrinks the saved dust state.
- * The dust state holds a tree with an entry for every NIGHT UTXO that generates dust, including
- * those of other wallets. The ledger keeps expanding the other wallets' entries and never shrinks
- * them, so the saved state grows with the chain. Only the wallet's own entries are needed to spend.
- * Collapsed parts keep their hash, so the tree roots stay the same.
- *
- * Collapsing is cheap. Restoring the collapsed bytes to check them is not, so `verifyCollapsedDust`
- * runs in a helper thread (`dust-verify-worker.ts`) and this module stays free of thread code.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Shrinks the saved dust state. Its tree holds entries for other wallets' NIGHT UTXOs, which the ledger never shrinks.
+// Only our own entries are needed to spend. Collapsed parts keep their hash, so the tree roots stay the same.
+// SPDX-License-Identifier: Apache-2.0
 
-import { formatErr } from '../../utils/format-error';
+import { errorMessage } from '../../utils/errors';
 
 export interface OwnGeneration {
     firstFree: bigint;
@@ -44,10 +36,7 @@ export function foreignRanges(keep: Iterable<bigint>, firstFree: bigint): Array<
     return out;
 }
 
-/**
- * Collapses every entry of other wallets.
- * Throws when one of our own dust UTXOs has no entry, because collapsing it would crash the ledger wasm later.
- */
+/** Collapses every entry of other wallets. Throws when one of our dust UTXOs has no entry, because collapsing it would crash the ledger wasm later. */
 export function collapseForeignGeneration(state: any): { state: any; ranges: number; ownLeaves: number } {
     const own = parseOwnGeneration(state.toString(true));
     if (!own) throw new Error('dust state string form has no generating_tree_first_free / night_indices');
@@ -82,10 +71,7 @@ export interface CollapsedDust {
     ownLeaves: number;
 }
 
-/**
- * Collapses the dust state of an SDK dust wallet state and records what a restore must reproduce.
- * Throws when the collapse refuses; the caller then saves `walletState.serialize()`.
- */
+/** Collapses an SDK dust wallet state and records what a restore must reproduce. On a throw the caller saves `walletState.serialize()`. */
 export function collapseDustState(walletState: any): CollapsedDust {
     const fullBlob: string = walletState.serialize();
     const snapshot = JSON.parse(fullBlob);
@@ -123,7 +109,7 @@ export function verifyCollapsedDust(bytes: Uint8Array, expect: CollapsedDustExpe
         if (!same) return { ok: false, reason: 'collapsed state does not restore to the same roots, balance and UTXOs' };
         return { ok: true };
     } catch (err: unknown) {
-        return { ok: false, reason: formatErr(err) };
+        return { ok: false, reason: errorMessage(err) };
     }
 }
 
@@ -134,10 +120,7 @@ export function collapsedDustBlob(fullBlob: string, bytes: Uint8Array): string {
     return JSON.stringify(snapshot);
 }
 
-/**
- * Changes with every applied ledger event and every spend of the wallet, so an equal key
- * means the saved dust state is still current. Null when the state does not expose the figures.
- */
+/** Changes with every applied ledger event and spend, so an equal key means the saved dust state is current. Null when the figures are missing. */
 export function dustSaveKey(walletState: any): string | null {
     const applied = walletState?.progress?.appliedIndex ?? walletState?.state?.progress?.appliedIndex;
     if (applied == null) return null;

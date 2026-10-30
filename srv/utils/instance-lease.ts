@@ -1,13 +1,12 @@
-/**
- * Only one process per database may run background work such as jobs and the crawler.
- * That process holds a row in `InstanceLeases` (the "lease") and refreshes it regularly. A clean shutdown deletes the row.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Only one process per database may run background work such as jobs and the crawler.
+// It holds a lease row in `InstanceLeases` and refreshes it regularly. A clean shutdown deletes the row.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { NightgateError } from './errors';
 import { InstanceLeases } from '#cds-models/midnight';
 import type { DbRunner } from './db-types';
 import { isUniqueViolation } from './db-errors';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 
@@ -46,10 +45,8 @@ export function isBackgroundFenced(): boolean {
     return fenced;
 }
 
-/**
- * Called right before a transaction is sent. Throws unless the lease row still names this process.
- * A process without a lease, as in tests or with SKIP_AUTO_INIT, is not checked.
- */
+/** Called right before a transaction is sent. Throws unless the lease row still names this process.
+ *  A process without a lease, as in tests or with SKIP_AUTO_INIT, is not checked. */
 export async function assertLeaseHeld(db: DbRunner): Promise<void> {
     if (fenced) throw leaseLostError();
     if (!activeLease) return;
@@ -75,10 +72,7 @@ function affected(value: unknown): number {
     return typeof value === 'number' ? value : Number((value as { changes?: number } | null)?.changes ?? 0);
 }
 
-/**
- * Takes the lease when it is ours, free, or not refreshed for `ttlMs`.
- * Otherwise returns the process that holds it.
- */
+/** Takes the lease when it is ours, free, or not refreshed for `ttlMs`. Otherwise returns the process that holds it. */
 export async function tryAcquireInstanceLease(
     db: DbRunner, role: string, holder: string, ttlMs: number, now: number = Date.now(), afterInsertRace = false
 ): Promise<LeaseAttempt> {
@@ -107,10 +101,8 @@ export async function tryAcquireInstanceLease(
     return { acquired: false, holder: String(row.instanceId), heartbeatAgeMs: age };
 }
 
-/**
- * Like `tryAcquireInstanceLease`, but waits for a lease left by a killed process to expire.
- * Throws InstanceLeaseHeldError when the holder keeps refreshing it.
- */
+/** Like `tryAcquireInstanceLease`, but waits for a lease left by a killed process to expire.
+ *  Throws InstanceLeaseHeldError when the holder keeps refreshing it. */
 export async function acquireInstanceLease(
     db: DbRunner, role: string, holder: string, ttlMs: number,
     opts: { pollMs?: number; onWait?: (holder: string, waitMs: number) => void } = {}
@@ -125,7 +117,7 @@ export async function acquireInstanceLease(
         deadline ??= now + ttlMs;
         if (now >= deadline) throw new InstanceLeaseHeldError(attempt.holder, attempt.heartbeatAgeMs);
         opts.onWait?.(attempt.holder, deadline - now);
-        await new Promise(resolve => setTimeout(resolve, Math.min(pollMs, deadline! - now)));
+        await sleep(Math.min(pollMs, deadline! - now));
     }
 }
 
@@ -139,10 +131,8 @@ export async function releaseInstanceLease(db: DbRunner, role: string, holder: s
     await db.run(DELETE.from(InstanceLeases).where({ role, instanceId: holder }));
 }
 
-/**
- * Refreshes the lease every `intervalMs`. Calls `onLost` once when another process holds it.
- * A failed write is only reported. The next tick retries before the lease expires.
- */
+/** Refreshes the lease every `intervalMs`. Calls `onLost` once when another process holds it.
+ *  A failed write is only reported. The next tick retries before the lease expires. */
 export function startInstanceLeaseHeartbeat(
     db: DbRunner, role: string, holder: string, intervalMs: number,
     onLost: () => void, onError: (err: unknown) => void

@@ -290,7 +290,7 @@ describe('MidnightNodeProvider RPC wrappers', () => {
         const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
         const rpcSpy = vi.spyOn(provider, 'rpc').mockResolvedValue(undefined);
 
-        await provider.getLatestHeader();
+        await provider.getHeader();
         await provider.getHeader('0xhash');
         await provider.getBlock('0xhash');
         await provider.getBlockHash(42);
@@ -298,12 +298,8 @@ describe('MidnightNodeProvider RPC wrappers', () => {
         await provider.getStorage('0xkey', '0xblock');
         await provider.getRuntimeVersion('0xblock');
         await provider.getMetadata('0xblock');
-        await provider.health();
-        await provider.chain();
-        await provider.name();
-        await provider.version();
 
-        expect(rpcSpy).toHaveBeenNthCalledWith(1, 'chain_getHeader');
+        expect(rpcSpy).toHaveBeenNthCalledWith(1, 'chain_getHeader', []);
         expect(rpcSpy).toHaveBeenNthCalledWith(2, 'chain_getHeader', ['0xhash']);
         expect(rpcSpy).toHaveBeenNthCalledWith(3, 'chain_getBlock', ['0xhash']);
         expect(rpcSpy).toHaveBeenNthCalledWith(4, 'chain_getBlockHash', [42]);
@@ -311,10 +307,6 @@ describe('MidnightNodeProvider RPC wrappers', () => {
         expect(rpcSpy).toHaveBeenNthCalledWith(6, 'state_getStorage', ['0xkey', '0xblock']);
         expect(rpcSpy).toHaveBeenNthCalledWith(7, 'state_getRuntimeVersion', ['0xblock']);
         expect(rpcSpy).toHaveBeenNthCalledWith(8, 'state_getMetadata', ['0xblock']);
-        expect(rpcSpy).toHaveBeenNthCalledWith(9, 'system_health');
-        expect(rpcSpy).toHaveBeenNthCalledWith(10, 'system_chain');
-        expect(rpcSpy).toHaveBeenNthCalledWith(11, 'system_name');
-        expect(rpcSpy).toHaveBeenNthCalledWith(12, 'system_version');
     });
 });
 
@@ -434,11 +426,11 @@ describe('MidnightNodeProvider core RPC flow', () => {
         (provider as any).ws = { close, send: vi.fn() };
         (provider as any).connected = true;
 
-        await provider.subscribeNewHeads(vi.fn());
+        await provider.subscribeFinalizedHeads(vi.fn());
         await provider.subscribeFinalizedHeads(vi.fn());
         expect(provider.getSubscriptionCount()).toBe(2);
 
-        await provider.unsubscribeNewHeads('sub-1');
+        await provider.unsubscribeFinalizedHeads('sub-1');
         expect(provider.getSubscriptionCount()).toBe(1);
 
         await provider.unsubscribeFinalizedHeads('sub-2');
@@ -447,7 +439,7 @@ describe('MidnightNodeProvider core RPC flow', () => {
         await provider.disconnect();
         expect(close).toHaveBeenCalled();
         expect(provider.isConnected()).toBe(false);
-        expect(rpcSpy).toHaveBeenNthCalledWith(1, 'chain_subscribeNewHeads', []);
+        expect(rpcSpy).toHaveBeenNthCalledWith(1, 'chain_subscribeFinalizedHeads', []);
         expect(rpcSpy).toHaveBeenNthCalledWith(2, 'chain_subscribeFinalizedHeads', []);
     });
 

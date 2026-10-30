@@ -1,9 +1,6 @@
-/**
- * A counter on SyncState that goes up with every chain rollback.
- * Indexer lookups run outside the database transaction that saves their result.
- * So read the counter before the lookup, then lock and compare it when writing.
- * SPDX-License-Identifier: Apache-2.0
- */
+// A counter on SyncState that goes up with every chain rollback.
+// Indexer lookups run outside the transaction that saves their result, so read the counter first, then lock and compare it when writing.
+// SPDX-License-Identifier: Apache-2.0
 
 import cds from '@sap/cds';
 import { SyncState } from '#cds-models/midnight';
@@ -27,8 +24,7 @@ export async function lockReorgGeneration(tx: DbRunner): Promise<number> {
 }
 
 /**
- * Must be the first write of the rollback transaction. Its lock makes confirmations wait,
- * so none can save data from the abandoned fork after the cleanup.
+ * Must be the first write of the rollback transaction. Its lock makes confirmations wait, so none can save data from the abandoned fork after the cleanup.
  */
 export async function bumpReorgGeneration(tx: DbRunner): Promise<number> {
     await tx.run("UPDATE midnight_SyncState SET reorgGeneration = COALESCE(reorgGeneration, 0) + 1 WHERE ID = 'SINGLETON'");

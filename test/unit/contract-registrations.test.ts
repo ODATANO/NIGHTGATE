@@ -20,6 +20,7 @@ vi.mock('@sap/cds', () => {
     return cds;
 });
 
+import { ContractRegistrations } from '#cds-models/midnight';
 import { clearRegistry, loadRegistryFromConfig, getContractRegistration, listRegisteredContracts, getArtifactGenerationDigest } from '../../srv/submission/contract-registry';
 import {
     registerContractAtRuntime,
@@ -132,7 +133,7 @@ describe('registerContractAtRuntime / unregisterContractAtRuntime', () => {
         expect(out.artifactDigest).toBe(getArtifactGenerationDigest('customer-vault'));
         expect(getContractRegistration('customer-vault')?.slotWidth).toBe(32);
         const upsert = db.queries.find(q => q.UPSERT);
-        expect(upsert.UPSERT.into).toBe('midnight.ContractRegistrations');
+        expect(upsert.UPSERT.into).toBe(ContractRegistrations);
         expect(upsert.UPSERT.entries[0]).toMatchObject({ name: 'customer-vault', slotWidth: 32, registeredBy: 'admin-1', networkId: 'preprod' });
         expect(listContracts()).toEqual([expect.objectContaining({ name: 'customer-vault', source: 'runtime' })]);
     });
@@ -266,7 +267,7 @@ describe('registerContractAtRuntime / unregisterContractAtRuntime', () => {
         await registerContractAtRuntime(db, { name: 'v', privateStateId: 'ps', ...a });
         expect(await unregisterContractAtRuntime(db, 'v')).toEqual({ removed: true });
         expect(listRegisteredContracts()).toEqual([]);
-        expect(db.queries.find(q => q.DELETE).DELETE).toMatchObject({ from: 'midnight.ContractRegistrations', where: { name: 'v' } });
+        expect(db.queries.find(q => q.DELETE).DELETE).toMatchObject({ from: ContractRegistrations, where: { name: 'v' } });
     });
 });
 

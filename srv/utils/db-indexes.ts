@@ -1,10 +1,8 @@
-/**
- * Extra database indexes for frequent queries. CDS only creates primary keys and unique constraints.
- * Without these indexes, the lookups below would scan whole tables.
- * They are created at startup if missing. HANA is skipped because it manages indexes through its own deployer.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Extra indexes for frequent queries, created at startup if missing. CDS only creates keys and unique constraints.
+// HANA is skipped because its own deployer manages indexes.
+// SPDX-License-Identifier: Apache-2.0
 import { errorMessage } from './errors';
+import type { DbRunner } from './db-types';
 
 export interface IndexSpec {
     name: string;
@@ -26,7 +24,7 @@ export const NIGHTGATE_INDEXES: readonly IndexSpec[] = [
     { name: 'ng_transactions_createdat_desc', table: 'midnight_Transactions', columns: ['createdAt DESC'], postgres: 'createdAt DESC NULLS LAST' },
     { name: 'ng_transactions_type_createdat', table: 'midnight_Transactions', columns: ['txType', 'createdAt DESC'], postgres: 'txType, createdAt DESC NULLS LAST' },
     { name: 'ng_contractactions_createdat_desc', table: 'midnight_ContractActions', columns: ['createdAt DESC'], postgres: 'createdAt DESC NULLS LAST' },
-    { name: 'ng_transactions_hash', table: 'midnight_Transactions', columns: ['hash'] },
+    { name: 'ng_transactions_hash_createdat', table: 'midnight_Transactions', columns: ['hash', 'createdAt DESC'], postgres: 'hash, createdAt DESC NULLS LAST', replaces: 'ng_transactions_hash' },
     { name: 'ng_transactions_ledgerhash', table: 'midnight_Transactions', columns: ['ledgerTxHash'] },
     { name: 'ng_transactions_block', table: 'midnight_Transactions', columns: ['block_ID'] },
     { name: 'ng_transactions_sender', table: 'midnight_Transactions', columns: ['senderAddress'] },
@@ -38,10 +36,11 @@ export const NIGHTGATE_INDEXES: readonly IndexSpec[] = [
     { name: 'ng_contractbalances_action', table: 'midnight_ContractBalances', columns: ['contractAction_ID'] },
     { name: 'ng_zswapledgerevents_tx', table: 'midnight_ZswapLedgerEvents', columns: ['transaction_ID'] },
     { name: 'ng_dustledgerevents_tx', table: 'midnight_DustLedgerEvents', columns: ['transaction_ID'] },
-    { name: 'ng_contractactions_address', table: 'midnight_ContractActions', columns: ['address'] },
+    { name: 'ng_contractactions_address_createdat', table: 'midnight_ContractActions', columns: ['address', 'createdAt'], replaces: 'ng_contractactions_address' },
     { name: 'ng_contractactions_tx', table: 'midnight_ContractActions', columns: ['transaction_ID'] },
-    { name: 'ng_unshieldedutxos_owner', table: 'midnight_UnshieldedUtxos', columns: ['owner'] },
-    { name: 'ng_unshieldedutxos_spent', table: 'midnight_UnshieldedUtxos', columns: ['spentAtTransaction_ID'] },
+    { name: 'ng_unshieldedutxos_owner_createdat', table: 'midnight_UnshieldedUtxos', columns: ['owner', 'createdAt DESC'], postgres: 'owner, createdAt DESC NULLS LAST', replaces: 'ng_unshieldedutxos_owner' },
+    { name: 'ng_unshieldedutxos_spent_createdat', table: 'midnight_UnshieldedUtxos', columns: ['spentAtTransaction_ID', 'createdAt DESC'], postgres: 'spentAtTransaction_ID, createdAt DESC NULLS LAST', replaces: 'ng_unshieldedutxos_spent' },
+    { name: 'ng_nightbalances_balance_desc', table: 'midnight_NightBalances', columns: ['balance DESC'], postgres: 'balance DESC NULLS LAST' },
     { name: 'ng_unshieldedutxos_created', table: 'midnight_UnshieldedUtxos', columns: ['createdAtTransaction_ID'] },
     { name: 'ng_pendingsubmissions_txhash', table: 'midnight_PendingSubmissions', columns: ['txHash'] },
     { name: 'ng_backgroundjobs_status', table: 'midnight_BackgroundJobs', columns: ['status', 'kind'] },
@@ -55,12 +54,10 @@ export function indexStatement(spec: IndexSpec, kind?: string): string {
     return `CREATE ${spec.unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${columns})`;
 }
 
-/**
- * Creates every missing index. `kind` is the CAP database kind.
- * A failing index is logged and skipped. If a unique index fails because of duplicates, the old index stays.
- */
+/** Creates every missing index. `kind` is the CAP database kind.
+ *  A failing index is logged and skipped. If a unique index fails because of duplicates, the old index stays. */
 export async function ensureIndexes(
-    db: { run: (q: unknown) => Promise<unknown> },
+    db: DbRunner,
     kind: string | undefined,
     warn: (msg: string) => void = () => undefined
 ): Promise<number> {

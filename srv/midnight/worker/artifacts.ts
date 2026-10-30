@@ -1,9 +1,5 @@
-/**
- * Loads compiled contracts in the worker.
- * A "generation" is one exact version of a compiled contract, named by a hash (digest)
- * of its module and keys. Each generation is copied to a read-only folder, the snapshot,
- * so a later change to the registered files cannot affect a running job.
- */
+// Loads compiled contracts in the worker. A generation is one exact build, named by a digest of module and keys.
+// Each generation is copied to a read-only snapshot, so later changes to the registered files cannot affect a running job.
 
 // Must stay the first import. The worker modules import each other in a cycle,
 // and config is read at load time.
@@ -12,7 +8,6 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { pathToFileURL } from 'node:url';
 import { computeArtifactGenerationDigest, effectiveModuleFormat, runtimeNodeModulesDir, proverKeyManifestProblems } from '../../submission/artifact-digest';
 import { BoundedCache } from './bounded-cache';
 import { importArtifactGeneration } from '../../submission/artifact-import';
@@ -67,11 +62,7 @@ export async function getContractScaffold(name: string, registration: ContractRe
     return scaffold;
 }
 
-/**
- * The SDK reads keys only when it proves, so it must never read from the registered folder,
- * which can change. A snapshot is built under a temp name, checked against the digest,
- * renamed into place and never written again.
- */
+/** Keys are read at proving time, so never from the registered folder. A snapshot is built, checked against the digest, renamed and never written again. */
 export interface ArtifactSnapshot {
     digest: string;
     zkConfigPath: string;
@@ -90,10 +81,7 @@ export function installKey(): string {
     return crypto.createHash('sha256').update(runtimeNodeModulesDir()).digest('hex').slice(0, 16);
 }
 
-/**
- * Shared by all processes of this installation.
- * A process that uses a snapshot leaves a file under `.holders/`, so no other process deletes it.
- */
+/** Shared by all processes of this installation. A process using a snapshot leaves a file under `.holders/`, so no other process deletes it. */
 export function artifactSnapshotRoot(): string {
     return path.join(artifactSnapshotBase(), installKey());
 }
@@ -220,10 +208,7 @@ export function copyDirFiltered(from: string, to: string, filter: (f: string) =>
     for (const f of files) fs.copyFileSync(path.join(from, f), path.join(to, f));
 }
 
-/**
- * The snapshot sits outside the package whose package.json decides if `.js` is ESM,
- * so the file gets an explicit `.mjs` or `.cjs` extension.
- */
+/** The snapshot sits outside the package that decides whether `.js` is ESM, so it gets an explicit `.mjs` or `.cjs`. */
 export function snapshotModuleName(registration: ContractRegistration): string {
     return effectiveModuleFormat(registration.artifactPath) === 'module' ? 'artifact.mjs' : 'artifact.cjs';
 }
@@ -368,15 +353,3 @@ export function artifactAssetPath(name: string, registration: ContractRegistrati
     return materializeArtifactSnapshot(name, registration)?.zkConfigPath ?? registration.zkConfigPath;
 }
 
-export function assertArtifactGenerationOnDisk(name: string, registration: ContractRegistration): void {
-    if (!registration.artifactDigest) return;
-    const onDisk = computeArtifactGenerationDigest(registration);
-    if (onDisk !== registration.artifactDigest) {
-        throw new Error(
-            `Contract '${name}' on disk is artifact generation ${onDisk.slice(0, 16)}… but this job was pinned to ` +
-            `${registration.artifactDigest.slice(0, 16)}…; the module or its zk assets changed since the job was resolved. ` +
-            `Refusing to load a different generation; re-register the artifact (or re-issue the action against the current one).`);
-    }
-}
-
-export { importArtifactGeneration } from '../../submission/artifact-import';

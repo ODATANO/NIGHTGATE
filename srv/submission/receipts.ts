@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { getEncryptionKey } from '../utils/crypto';
 import { configString } from '../utils/config';
 import type { BackgroundJob } from '#cds-models/midnight';
+import { HEX64_RE } from '../utils/hex-patterns';
 
 export const RECEIPT_ALGORITHM = 'ed25519';
 const RECEIPT_VERSION = 1;
@@ -27,7 +28,7 @@ let cached: { seedHex: string; key: ReceiptKey } | undefined;
 function seedHex(): string {
     const raw = String(configString('NIGHTGATE_RECEIPT_SIGNING_KEY') ?? '').trim().toLowerCase();
     if (raw) {
-        if (!/^[0-9a-f]{64}$/.test(raw)) throw new Error('NIGHTGATE_RECEIPT_SIGNING_KEY must be 64 hex characters (a 32-byte Ed25519 seed)');
+        if (!HEX64_RE.test(raw)) throw new Error('NIGHTGATE_RECEIPT_SIGNING_KEY must be 64 hex characters (a 32-byte Ed25519 seed)');
         return raw;
     }
     const ring = getEncryptionKey();
@@ -69,7 +70,7 @@ export function signReceipt(payload: Record<string, unknown>): Receipt {
 
 /** Checks a receipt against a public key. Exported for the tests and the SDK's mirror. */
 export function verifyReceipt(receipt: Receipt, publicKeyHex = receipt.publicKey): boolean {
-    if (receipt.algorithm !== RECEIPT_ALGORITHM || !/^[0-9a-f]{64}$/.test(publicKeyHex)) return false;
+    if (receipt.algorithm !== RECEIPT_ALGORITHM || !HEX64_RE.test(publicKeyHex)) return false;
     try {
         const spki = Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(publicKeyHex, 'hex')]);
         const key = crypto.createPublicKey({ key: spki, format: 'der', type: 'spki' });

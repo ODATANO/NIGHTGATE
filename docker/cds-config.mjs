@@ -1,32 +1,12 @@
 #!/usr/bin/env node
-// Builds the CDS_CONFIG JSON for the standalone image from the environment.
-// Called by docker/entrypoint.sh; kept in its own file so the mapping is unit
-// tested (test/unit/docker-cds-config.test.ts).
-//
-//   NIGHTGATE_DB_URL      postgres://user:pw@host:5432/db  -> kind postgres
-//                         (postgresql:// accepted); anything else is refused
-//   NIGHTGATE_DB_PATH     SQLite file (default /data/nightgate.db) when no URL
-//   NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS  SQLite writer wait (default 30000)
-//   NIGHTGATE_AUTH        basic (default) | dummy
-//   NIGHTGATE_HTTP_USER / NIGHTGATE_HTTP_PASSWORD / NIGHTGATE_HTTP_ROLES
-//
-// Prints the JSON on stdout; exits 2 with a message on stderr when the
-// environment is unusable.
-/**
- * `@cap-js/postgres` takes pg Pool fields (host, port, user, password,
- * database, ssl), not a connection string: split the URL. The `sslmode`
- * values node-postgres can honour exactly:
- *   (none) | disable          -> no TLS
- *   require (or ssl=true/1)   -> TLS, certificate NOT verified
- *   verify-full               -> TLS, chain AND hostname verified against the
- *                                system CAs or `sslrootcert=<pem file>`
- * `allow`/`prefer` (opportunistic TLS) and `verify-ca` (chain without
- * hostname; needs a checkServerIdentity function, which JSON config cannot
- * carry) are refused rather than approximated, as is anything unknown.
- */
+// Builds the CDS_CONFIG JSON for the standalone image from the environment. Called by docker/entrypoint.sh.
+// Reads NIGHTGATE_DB_URL or NIGHTGATE_DB_PATH, NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS, NIGHTGATE_AUTH and NIGHTGATE_HTTP_USER, _PASSWORD, _ROLES.
+// Prints the JSON on stdout. Exits 2 with a message on stderr when the environment is unusable.
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 
+// Splits the URL into the pg Pool fields that `@cap-js/postgres` takes. Supported sslmode values are disable, require and verify-full.
+// require encrypts but does not check the certificate. Other modes are refused, because JSON config cannot express them exactly.
 export function postgresCredentials(url) {
     let u;
     try { u = new URL(url); } catch { throw new Error('NIGHTGATE_DB_URL is not a valid URL'); }
@@ -63,16 +43,8 @@ function sslOptions(params) {
     throw new Error(`unsupported sslmode='${mode}' in NIGHTGATE_DB_URL (use: disable | require | verify-full)`);
 }
 
-/**
- * Pool + client settings for PostgreSQL. CAP's kind defaults (max 10,
- * acquire 1 s, destroy 1 s) are sized for an idle dev box: under checkpoint
- * stalls the 1 s acquire timeout fires, and the built-in pool of
- * @cap-js/db-service 3.0.x then leaks the connection it was about to hand
- * over (see cdsConfig: `features.use_generic_pool`). Wide timeouts, a
- * connect timeout so a hung TCP connect cannot pin a slot, and a pool that
- * survives the worker's snapshot writes. Any of these can be overridden by
- * CAP's own `cds_requires_db_pool_*` / `cds_requires_db_client_*` env vars.
- */
+/** Pool and client settings for PostgreSQL. CAP's defaults suit an idle dev box, and their 1 s acquire timeout fires under checkpoint stalls.
+ *  CAP's `cds_requires_db_pool_*` and `cds_requires_db_client_*` env vars override any of these. */
 export const POSTGRES_POOL = Object.freeze({
     min: 0, max: 20, testOnBorrow: true,
     acquireTimeoutMillis: 30000, destroyTimeoutMillis: 5000,
@@ -103,12 +75,7 @@ export function authConfig(env = process.env) {
     return { kind: 'basic', impl: '@odatano/cap-auth', realm: 'nightgate', users: { [user]: { password, roles } } };
 }
 
-/**
- * The `postgres` kind is registered by the `@cap-js/postgres` plugin, which
- * CAP only discovers among devDependencies while NODE_ENV is not production.
- * The image runs in production, so the kind definition is injected from the
- * plugin's own package.json (impl, dialect, pool, schema_evolution).
- */
+/** CAP finds `@cap-js/postgres` only among devDependencies outside production, so the image injects the kind from its package.json. */
 export function postgresKind() {
     let pkg;
     try { pkg = createRequire(import.meta.url)('@cap-js/postgres/package.json'); }
@@ -118,17 +85,10 @@ export function postgresKind() {
     return kind;
 }
 
-/**
- * `dbOnly` (CLI `--db-only`): the database binding alone, for the image's
- * `migrate` mode, which deploys and copies data but serves nothing, so it
- * needs neither HTTP credentials nor the wallet encryption key.
- */
-// CAP's JSON log format writes every request header into each line and masks
-// only its defaults (authorization, cookie, cert, ssl, api-key). The agent
-// token header is added here for the image, and by the plugin at load for
-// any host; the image states it explicitly so it holds before the plugin runs.
+// CAP logs every request header except the masked ones. The image adds the agent token here, so the mask holds before the plugin loads.
 export const LOG_MASK_HEADERS = ['/authorization/i', '/cookie/i', '/cert/i', '/ssl/i', '/api-key/i', '/x-agent-token/i'];
 
+/** With `dbOnly` it returns only the database binding, for the image's `migrate` mode. */
 export function cdsConfig(env = process.env, { dbOnly = false } = {}) {
     const db = databaseConfig(env);
     const requires = dbOnly ? { db } : { db, auth: authConfig(env) };

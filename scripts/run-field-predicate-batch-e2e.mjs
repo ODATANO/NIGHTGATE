@@ -1,24 +1,6 @@
-// Field-predicate BATCH end-to-end (issueFieldPredicateAttestationBatch).
-//
-// Walks: connectWallet → connectWalletForSigning (await prewarm sync) →
-// deployContract(attestation-vault) → prepareDocumentProof (salted content
-// tree built by the server with the artifact's pure circuits) → anchorDocument
-// (attest the document's payload hash so the session owns the record) → then:
-//
-//   POSITIVE  ONE batch: contentRoot anchored IN-BATCH (call 0) + 3 field
-//             claims (+1 exact duplicate that must be dropped server-side).
-//             Expect: job SUCCEEDS, ONE txHash for everything,
-//             droppedDuplicates=1, and every claim independently
-//             verified=true via crawler-free verifyPredicateState.
-//   NEGATIVE  second batch (root already anchored, no contentRoot): one TRUE
-//             claim + one FALSE claim. Expect: job FAILS at local circuit
-//             execution ("predicate false"-class error, NOT a sync issue) and
-//             the accompanying TRUE claim did NOT land on-chain (atomic
-//             abort, nothing submitted).
-//
-// Inputs (env): NIGHTGATE_URL (default http://localhost:4004),
-// LACE_VIEWING_KEY, LACE_MNEMONIC.
-// Run:  node --env-file=.env scripts/run-field-predicate-batch-e2e.mjs
+// Checks field-predicate batches live: one tx with duplicates dropped, and a batch with a false claim that lands nothing.
+// Run: node --env-file=.env scripts/run-field-predicate-batch-e2e.mjs
+// Env: NIGHTGATE_URL, LACE_VIEWING_KEY, LACE_MNEMONIC.
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -129,9 +111,7 @@ async function waitForServer() {
 }
 
 // ---- Off-chain content-root tree ------------------------------------------
-// Depth-4 tree, 16 leaves; unused leaves are a fixed empty leaf. Hashing goes
-// through the contract's EXPORTED pureCircuits so the off-chain root is
-// byte-identical to the in-circuit fold.
+// Depth-4 tree with 16 leaves, hashed with the contract's pureCircuits so the root matches the circuit.
 
 (async () => {
     await waitForServer();

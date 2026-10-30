@@ -1,11 +1,8 @@
-/**
- * Runs contract deploys and calls on the wallet worker thread.
- * The PendingSubmissions row is written before the worker starts, so a crash leaves a trace.
- * Only rejects that a fresh build can fix are retried here. Other retries are up to the caller.
- */
+// Runs contract deploys and calls on the wallet worker thread. The PendingSubmissions row is written before the worker starts, so a crash leaves a trace.
+// Only rejects that a fresh build can fix are retried here. Other retries are up to the caller.
 
 import cds from '@sap/cds';
-import { classificationHaystack } from '../utils/format-error';
+import { classificationHaystack, ledgerErrorCode } from '../utils/format-error';
 import { findNightgateError, errorMessage } from '../utils/errors';
 import { DUST_RACE_LEDGER_CODES, dustRaceLedgerCode } from './dust-race';
 import { classifySubmitFailure } from '../midnight/submit-error-classification';
@@ -14,6 +11,7 @@ import { reportExternalExecution, reportExternalSubmission, reportBroadcastOn, r
 import { withLockContentionRetry } from './db-write-retry';
 import { isPreInclusionReject } from './sponsor-pool';
 import type { SubmitIntentHook } from '../midnight/wallet-worker-client';
+import { setTimeout as sleep } from 'node:timers/promises';
 const { INSERT, UPDATE } = cds.ql;
 import { PendingSubmissions, type PendingSubmission } from '#cds-models/midnight';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
@@ -102,8 +100,7 @@ export interface CallBatchArgs {
     merkleProof?: MerkleProofBundle;
     initialPrivateState?: unknown;
     /**
-     * The calls after `orderedPrefix` do not depend on each other. The ledger runs cheap calls in an
-     * earlier stage than expensive ones, so these may be reordered to match before proving.
+     * The calls after `orderedPrefix` do not depend on each other. The ledger runs cheap calls before expensive ones, so these may be reordered to match before proving.
      */
     independentCalls?: boolean;
     orderedPrefix?: number;
@@ -168,9 +165,7 @@ export class TransactionSubmitter {
     }
 
     /**
-     * Rebuilds after rejects that happen before the transaction reaches the node's pool and that a fresh
-     * build fixes: a dust race (1010/170, 1010/196) or an outdated contract state (1010/104).
-     * Each kind has its own retry budget.
+     * Rebuilds after rejects before the node's pool that a fresh build fixes, a dust race (1010/170, 1010/196) or an outdated contract state (1010/104). Each kind has its own retry budget.
      */
     private async withRebuildRetry<T>(what: string, ledger: BoundAttemptLedger, attempt: () => Promise<T>): Promise<T> {
         const dustRetries = configNumber('NIGHTGATE_DUST_RACE_RETRIES');
@@ -205,16 +200,13 @@ export class TransactionSubmitter {
                 // Remove the rejected hash from the job before the rebuild records a new one.
                 // If that write fails, this throws and no rebuild happens.
                 await ledger.rejectAnnouncedAttempt(`${reason}; rebuilt`);
-                await new Promise(resolve => setTimeout(resolve, backoffMs));
+                await sleep(backoffMs);
             }
         }
     }
 
-    /**
-     * Tracks the send attempts of one submission. Each send and each reject updates row and job
-     * in one transaction. So the job's txHash is the only hash that can be on chain,
-     * and no txHash means nothing was sent.
-     */
+    // Tracks the send attempts of one submission. Each send and each reject updates row and job in one transaction.
+    // So the job's txHash is the only hash that can be on chain, and no txHash means nothing was sent.
     private boundAttemptLedger(firstRowId: string, shape: { actionType: ActionType; contractAddress: string | null; circuitName: string | null; sessionId: string }): BoundAttemptLedger {
         let rowId: string | null = firstRowId;
         let txHash: string | null = null;
@@ -294,137 +286,72 @@ export class TransactionSubmitter {
                 errorMessage: `outcome unknown after broadcast: ${classification.message}`.slice(0, 500)
             }).where({ ID: submissionId, status: 'pending' }));
         } catch (err) {
-            log.warn(`noteAmbiguousFailure persist failed for ${submissionId}: ${err instanceof Error ? err.message : String(err)}`);
+            log.warn(`noteAmbiguousFailure persist failed for ${submissionId}: ${errorMessage(err)}`);
         }
     }
 
     async deploy<PS = unknown>(args: DeployArgs<PS>): Promise<DeployResult> {
-        const submissionId = await this.insertPending('DEPLOY', null, null, args.sessionId);
-
         const deployFn = this.deps.walletDeployContractImpl ?? walletDeployContract;
-        const ledger = this.boundAttemptLedger(submissionId, { actionType: 'DEPLOY', contractAddress: null, circuitName: null, sessionId: args.sessionId });
-        let release: (() => void) | null = null;
-        let workerResult: { txHash: string; contractAddress: string; onChainStatus: string };
-        try {
-            const proxy = await this.registerPrivateStateProxy();
-            release = proxy.release;
-            await reportExternalExecution({ submissionId });
-            workerResult = await this.withRebuildRetry('deploy', ledger, () => deployFn(this.makeDeployRpcArgs(args, proxy.proxyId), ledger.onSubmitIntent));
-        } catch (err) {
-            release?.();
-            if (err instanceof SponsorAttemptBookkeepingPendingError) throw err;
-            const classification = classifySubmissionError(err, this.deps.network);
-            const named = await this.settleFailedAttempt(ledger, submissionId, err, classification);
-            throw new SubmissionError(named, classification, err);
-        }
-        release?.();
-        const rowId = ledger.current().rowId ?? submissionId;
-
-        const { txHash, contractAddress, onChainStatus } = workerResult;
-        if (!txHash || !contractAddress) {
-            const classification: SubmissionErrorClassification = {
-                code: 'MalformedResult',
-                retryable: false,
-                message: 'Worker deployContract returned without txHash/contractAddress'
-            };
-            await this.markFailed(rowId, classification);
-            throw new SubmissionError(rowId, classification);
-        }
-        await reportExternalSubmission({ submissionId: rowId, txHash });
-
-        const newStatus: SubmissionStatus = onChainStatus === 'SucceedEntirely' ? 'included' : 'failed';
-        await this.updateAfterSdk(rowId, {
-            txHash,
-            contractAddress,
-            status: newStatus,
-            errorCode:    newStatus === 'failed' ? `OnChainStatus:${onChainStatus}` : undefined,
-            errorMessage: newStatus === 'failed' ? `On-chain status was ${onChainStatus}, expected SucceedEntirely` : undefined
+        const { rowId, result, status } = await this.runSubmit({
+            shape: { actionType: 'DEPLOY', contractAddress: null, circuitName: null, sessionId: args.sessionId },
+            label: 'deploy', worker: 'deployContract', what: 'Deploy',
+            send: (proxyId, onSubmitIntent) => deployFn(this.makeDeployRpcArgs(args, proxyId), onSubmitIntent),
+            contractAddressOf: r => r.contractAddress
         });
-
-        if (newStatus === 'failed') {
-            throw new SubmissionError(rowId, {
-                code: `OnChainStatus:${onChainStatus}`,
-                retryable: false,
-                message: `Deploy on-chain status ${onChainStatus}`
-            });
-        }
-
-        return { submissionId: rowId, txHash, contractAddress, status: newStatus };
+        return { submissionId: rowId, txHash: result.txHash, contractAddress: result.contractAddress, status };
     }
 
     async call(args: CallArgs): Promise<CallResult> {
-        const submissionId = await this.insertPending('CALL', args.contractAddress, args.circuit, args.sessionId);
-
         const callFn = this.deps.walletSubmitContractCallImpl ?? walletSubmitContractCall;
-        const ledger = this.boundAttemptLedger(submissionId, { actionType: 'CALL', contractAddress: args.contractAddress, circuitName: args.circuit, sessionId: args.sessionId });
-        let release: (() => void) | null = null;
-        let workerResult: { txHash: string; onChainStatus: string; blockHeight?: number | null };
-        try {
-            const proxy = await this.registerPrivateStateProxy();
-            release = proxy.release;
-            await reportExternalExecution({ submissionId });
-            workerResult = await this.withRebuildRetry(`call ${args.circuit}`, ledger, () => callFn(this.makeCallRpcArgs(args, proxy.proxyId), ledger.onSubmitIntent));
-        } catch (err) {
-            release?.();
-            if (err instanceof SponsorAttemptBookkeepingPendingError) throw err;
-            const classification = classifySubmissionError(err, this.deps.network);
-            const named = await this.settleFailedAttempt(ledger, submissionId, err, classification);
-            throw new SubmissionError(named, classification, err);
-        }
-        release?.();
-        const rowId = ledger.current().rowId ?? submissionId;
-
-        const { txHash, onChainStatus } = workerResult;
-        if (!txHash) {
-            const classification: SubmissionErrorClassification = {
-                code: 'MalformedResult',
-                retryable: false,
-                message: 'Worker submitContractCall returned without txHash'
-            };
-            await this.markFailed(rowId, classification);
-            throw new SubmissionError(rowId, classification);
-        }
-        await reportExternalSubmission({ submissionId: rowId, txHash });
-
-        const newStatus: SubmissionStatus = onChainStatus === 'SucceedEntirely' ? 'included' : 'failed';
-        await this.updateAfterSdk(rowId, {
-            txHash,
-            contractAddress: args.contractAddress,
-            status: newStatus,
-            errorCode:    newStatus === 'failed' ? `OnChainStatus:${onChainStatus}` : undefined,
-            errorMessage: newStatus === 'failed' ? `On-chain status was ${onChainStatus}, expected SucceedEntirely` : undefined
+        const { rowId, result, status } = await this.runSubmit({
+            shape: { actionType: 'CALL', contractAddress: args.contractAddress, circuitName: args.circuit, sessionId: args.sessionId },
+            label: `call ${args.circuit}`, worker: 'submitContractCall', what: 'Call',
+            send: (proxyId, onSubmitIntent) => callFn(this.makeCallRpcArgs(args, proxyId), onSubmitIntent),
+            contractAddressOf: () => args.contractAddress
         });
-
-        if (newStatus === 'failed') {
-            throw new SubmissionError(rowId, {
-                code: `OnChainStatus:${onChainStatus}`,
-                retryable: false,
-                message: `Call on-chain status ${onChainStatus}`
-            });
-        }
-
-        return { submissionId: rowId, txHash, contractAddress: args.contractAddress, status: newStatus, blockHeight: workerResult.blockHeight ?? null };
+        return { submissionId: rowId, txHash: result.txHash, contractAddress: args.contractAddress, status, blockHeight: result.blockHeight ?? null };
     }
 
     /**
-     * Several calls on one contract in one transaction with one row. If only some calls
-     * applied on chain, the row fails and the caller must check the contract state.
+     * Several calls on one contract in one transaction with one row. If only some calls applied on chain, the row fails and the caller must check the contract state.
      */
     async callBatch(args: CallBatchArgs): Promise<CallBatchResult> {
         const circuits = args.calls.map(c => c.circuit);
         // The circuitName column holds 100 characters.
         const circuitLabel = circuits.join('+').slice(0, 100);
-        const submissionId = await this.insertPending('CALL', args.contractAddress, circuitLabel, args.sessionId);
-
         const batchFn = this.deps.walletSubmitContractCallBatchImpl ?? walletSubmitContractCallBatch;
-        const ledger = this.boundAttemptLedger(submissionId, { actionType: 'CALL', contractAddress: args.contractAddress, circuitName: circuitLabel, sessionId: args.sessionId });
+        const { rowId, result, status } = await this.runSubmit({
+            shape: { actionType: 'CALL', contractAddress: args.contractAddress, circuitName: circuitLabel, sessionId: args.sessionId },
+            label: `batch ${circuitLabel}`, worker: 'submitContractCallBatch', what: 'Batched call',
+            send: (proxyId, onSubmitIntent) => batchFn(this.makeCallBatchRpcArgs(args, proxyId), onSubmitIntent),
+            contractAddressOf: () => args.contractAddress
+        });
+        return { submissionId: rowId, txHash: result.txHash, contractAddress: args.contractAddress, status, circuits, blockHeight: result.blockHeight ?? null };
+    }
+
+    /**
+     * One worker submit with its attempt row. Sends with rebuild retries, books a failure, checks the result and records the on-chain status. Throws a SubmissionError for every outcome but success.
+     */
+    private async runSubmit<R extends { txHash: string; onChainStatus: string; blockHeight?: number | null }>(o: {
+        shape: { actionType: ActionType; contractAddress: string | null; circuitName: string | null; sessionId: string };
+        /** Names the attempt in retry logs. */
+        label: string;
+        /** The worker method, for the malformed-result message. */
+        worker: string;
+        /** Starts the on-chain failure message. */
+        what: string;
+        send: (proxyId: string, onSubmitIntent: SubmitIntentHook) => Promise<R>;
+        contractAddressOf: (result: R) => string | undefined;
+    }): Promise<{ rowId: string; result: R; status: SubmissionStatus }> {
+        const submissionId = await this.insertPending(o.shape.actionType, o.shape.contractAddress, o.shape.circuitName, o.shape.sessionId);
+        const ledger = this.boundAttemptLedger(submissionId, o.shape);
         let release: (() => void) | null = null;
-        let workerResult: { txHash: string; onChainStatus: string; circuits: string[]; blockHeight?: number | null };
+        let result: R;
         try {
             const proxy = await this.registerPrivateStateProxy();
             release = proxy.release;
             await reportExternalExecution({ submissionId });
-            workerResult = await this.withRebuildRetry(`batch ${circuitLabel}`, ledger, () => batchFn(this.makeCallBatchRpcArgs(args, proxy.proxyId), ledger.onSubmitIntent));
+            result = await this.withRebuildRetry(o.label, ledger, () => o.send(proxy.proxyId, ledger.onSubmitIntent));
         } catch (err) {
             release?.();
             if (err instanceof SponsorAttemptBookkeepingPendingError) throw err;
@@ -435,44 +362,40 @@ export class TransactionSubmitter {
         release?.();
         const rowId = ledger.current().rowId ?? submissionId;
 
-        const { txHash, onChainStatus } = workerResult;
-        if (!txHash) {
+        const { txHash, onChainStatus } = result;
+        const contractAddress = o.contractAddressOf(result);
+        if (!txHash || !contractAddress) {
             const classification: SubmissionErrorClassification = {
                 code: 'MalformedResult',
                 retryable: false,
-                message: 'Worker submitContractCallBatch returned without txHash'
+                message: `Worker ${o.worker} returned without txHash${o.shape.actionType === 'DEPLOY' ? '/contractAddress' : ''}`
             };
             await this.markFailed(rowId, classification);
             throw new SubmissionError(rowId, classification);
         }
         await reportExternalSubmission({ submissionId: rowId, txHash });
 
-        const newStatus: SubmissionStatus = onChainStatus === 'SucceedEntirely' ? 'included' : 'failed';
+        const status: SubmissionStatus = onChainStatus === 'SucceedEntirely' ? 'included' : 'failed';
         await this.updateAfterSdk(rowId, {
             txHash,
-            contractAddress: args.contractAddress,
-            status: newStatus,
-            errorCode:    newStatus === 'failed' ? `OnChainStatus:${onChainStatus}` : undefined,
-            errorMessage: newStatus === 'failed' ? `On-chain status was ${onChainStatus}, expected SucceedEntirely` : undefined
+            contractAddress,
+            status,
+            errorCode:    status === 'failed' ? `OnChainStatus:${onChainStatus}` : undefined,
+            errorMessage: status === 'failed' ? `On-chain status was ${onChainStatus}, expected SucceedEntirely` : undefined
         });
-
-        if (newStatus === 'failed') {
+        if (status === 'failed') {
             throw new SubmissionError(rowId, {
                 code: `OnChainStatus:${onChainStatus}`,
                 retryable: false,
-                message: `Batched call on-chain status ${onChainStatus}`
+                message: `${o.what} on-chain status ${onChainStatus}`
             });
         }
-
-        return { submissionId: rowId, txHash, contractAddress: args.contractAddress, status: newStatus, circuits, blockHeight: workerResult.blockHeight ?? null };
+        return { rowId, result, status };
     }
 
     // -- Internals -----------------------------------------------------------
 
-    /**
-     * Registers a private state store on the main thread that the worker calls into.
-     * Only 'cap-db' works, because the LevelDB store cannot be shared across threads.
-     */
+    /** Registers a private state store on the main thread for the worker. Only 'cap-db' works, because the LevelDB store cannot be shared across threads. */
     private async registerPrivateStateProxy(): Promise<{ proxyId: string; release: () => void }> {
         const backend = this.deps.walletMaterial.privateStateBackend ?? 'cap-db';
         if (backend !== 'cap-db') {
@@ -615,7 +538,7 @@ export class TransactionSubmitter {
                 }).where({ ID: submissionId })
             );
         } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
+            const msg = errorMessage(err);
             log.warn(`markFailed persist failed for ${submissionId}: ${msg}`);
         }
     }
@@ -635,7 +558,7 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
         return prior;
     }
 
-    const message = err instanceof Error ? err.message : String(err);
+    const message = errorMessage(err);
     const name = err instanceof Error ? err.name : 'Error';
 
     const carried = carriedSubmitFailure(err);
@@ -657,42 +580,19 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
     // Stack traces are left out, so a position like `x.js:1010:27` cannot match.
     const haystack = `${message} ${classificationHaystack(err)}`;
     // Checked first, so the priority numbers in its text are not read as a 1010 code.
-    if (/priority is too low/i.test(haystack)) {
-        return { code: '1014', retryable: false, message: `Pool priority reject (Substrate 1014, priority too low): ${message}` };
-    }
+    if (/priority is too low/i.test(haystack)) return priorityReject(message);
     if (/\b1010\s*:|invalid transaction/i.test(haystack)) {
-        const dustRace = dustRaceLedgerCode(err);
-        if (dustRace) {
-            return {
-                code: dustRace,
-                retryable: true,
-                transient: 'dust-race',
-                message: `Transient dust race (Substrate 1010, ledger error ${dustRace.slice(5)}): the dust spend was built against a dust state the node has already moved past; nothing entered the pool and no fee was spent, rebuild and resubmit: ${message}`
-            };
-        }
-        const custom = /custom error:?\s*(\d+)/i.exec(haystack);
-        if (custom?.[1] === '104') return { code: STALE_TRANSCRIPT_CODE, retryable: false, message: staleTranscriptMessage(message) };
-        if (custom?.[1] === '103') return { code: ZSWAP_INVALID_CODE, retryable: false, message: zswapInvalidMessage(message) };
-        return {
-            code: custom ? `1010/${custom[1]}` : '1010',
-            retryable: false,
-            message: `Invalid transaction (Substrate 1010${custom ? `, ledger error ${custom[1]}` : ''}): ${message}`
-        };
+        const raced = dustRaceLedgerCode(err);
+        if (raced) return dustRace(raced, message);
+        const custom = ledgerErrorCode(haystack);
+        if (custom === '104') return { code: STALE_TRANSCRIPT_CODE, retryable: false, message: staleTranscriptMessage(message) };
+        if (custom === '103') return { code: ZSWAP_INVALID_CODE, retryable: false, message: zswapInvalidMessage(message) };
+        return invalidTransaction(custom ? `1010/${custom}` : '1010', custom, message);
     }
     if (/\b1014\s*:/.test(haystack)) {
         return { code: '1014', retryable: false, message: `Pool reject (Substrate 1014): ${message}` };
     }
-    if (/\b1016\s*:|Immediately\s*Dropped/i.test(haystack)) {
-        if (network === 'mainnet') {
-            return {
-                code: '1016',
-                retryable: false,
-                knownIssueRef: KNOWN_ISSUE_1016_MAINNET,
-                message: `Mainnet deterministic rejection (1016 Immediately Dropped). Known issue; see ${KNOWN_ISSUE_1016_MAINNET}`
-            };
-        }
-        return { code: '1016', retryable: true, message: `Transaction pool full or immediately dropped: ${message}` };
-    }
+    if (/\b1016\s*:|Immediately\s*Dropped/i.test(haystack)) return poolDropped(network, message);
 
     if (/ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|socket hang up|timeout|disconnected from|Normal Closure|Abnormal Closure|WebSocket is not connected/i.test(haystack)) {
         return { code: 'NetworkOrTimeout', retryable: true, message };
@@ -728,6 +628,19 @@ const STALE_TRANSCRIPT_CODE = '1010/104';
 const staleTranscriptMessage = (message: string): string =>
     `Transaction refused against the current contract state (Substrate 1010, ledger error 104: the call's transcript no longer fits, typically its gas budget after another transaction on the same contract grew a map); nothing entered the pool and no fee was spent; build the call again against the current state and submit the new bytes: ${message}`;
 
+// The classifications both paths share: the text match and the worker's coded failure.
+const priorityReject = (message: string): SubmissionErrorClassification =>
+    ({ code: '1014', retryable: false, message: `Pool priority reject (Substrate 1014, priority too low): ${message}` });
+const poolDropped = (network: NightgateNetwork, message: string): SubmissionErrorClassification => network === 'mainnet'
+    ? { code: '1016', retryable: false, knownIssueRef: KNOWN_ISSUE_1016_MAINNET, message: `Mainnet deterministic rejection (1016 Immediately Dropped). Known issue; see ${KNOWN_ISSUE_1016_MAINNET}` }
+    : { code: '1016', retryable: true, message: `Transaction pool full or immediately dropped: ${message}` };
+const invalidTransaction = (code: string, ledgerError: string | null, message: string): SubmissionErrorClassification =>
+    ({ code, retryable: false, message: `Invalid transaction (Substrate 1010${ledgerError ? `, ledger error ${ledgerError}` : ''}): ${message}` });
+const dustRace = (code: string, message: string): SubmissionErrorClassification => ({
+    code, retryable: true, transient: 'dust-race',
+    message: `Transient dust race (Substrate 1010, ledger error ${code.slice(5)}): the dust spend was built against a dust state the node has already moved past; nothing entered the pool and no fee was spent, rebuild and resubmit: ${message}`
+});
+
 function classificationFromSubmitFailure(
     info: { code: string; ledgerCode?: string; retryable: boolean; calls?: BatchCallStageInfo[] },
     message: string,
@@ -738,27 +651,16 @@ function classificationFromSubmitFailure(
             if (info.ledgerCode === 'pool-invalid') {
                 return { code: 'PoolInvalid', retryable: true, transient: 'dust-race', message: `Pool status Invalid (a competing transaction consumed a note first, or the transaction is invalid); rebuild and resubmit: ${message}` };
             }
-            return {
-                code: info.ledgerCode ?? '1010',
-                retryable: true,
-                transient: 'dust-race',
-                message: `Transient dust race (Substrate 1010, ledger error ${(info.ledgerCode ?? '').slice(5)}): the dust spend was built against a dust state the node has already moved past; nothing entered the pool and no fee was spent, rebuild and resubmit: ${message}`
-            };
+            return dustRace(info.ledgerCode ?? '1010', message);
         case 'pre-mempool-reject': {
             const ledger = info.ledgerCode ?? '1010';
             if (ledger === 'intent-rejected') return { code: 'SubmitIntentRejected', retryable: false, message };
             if (ledger === 'intent-timeout') return { code: 'SubmitIntentTimeout', retryable: false, message: `The announced transaction was not recorded in time; nothing was broadcast, a new idempotencyKey may retry: ${message}` };
-            if (ledger === '1014') return { code: '1014', retryable: false, message: `Pool priority reject (Substrate 1014, priority too low): ${message}` };
-            if (ledger === '1016') {
-                if (network === 'mainnet') {
-                    return { code: '1016', retryable: false, knownIssueRef: KNOWN_ISSUE_1016_MAINNET, message: `Mainnet deterministic rejection (1016 Immediately Dropped). Known issue; see ${KNOWN_ISSUE_1016_MAINNET}` };
-                }
-                return { code: '1016', retryable: true, message: `Transaction pool full or immediately dropped: ${message}` };
-            }
+            if (ledger === '1014') return priorityReject(message);
+            if (ledger === '1016') return poolDropped(network, message);
             if (ledger === STALE_TRANSCRIPT_CODE) return { code: ledger, retryable: false, message: staleTranscriptMessage(message) };
             if (ledger === ZSWAP_INVALID_CODE) return { code: ledger, retryable: false, message: zswapInvalidMessage(message) };
-            const custom = ledger.startsWith('1010/') ? ledger.slice(5) : null;
-            return { code: ledger, retryable: false, message: `Invalid transaction (Substrate 1010${custom ? `, ledger error ${custom}` : ''}): ${message}` };
+            return invalidTransaction(ledger, ledger.startsWith('1010/') ? ledger.slice(5) : null, message);
         }
         case 'transport':
             return { code: 'NetworkOrTimeout', retryable: true, message };

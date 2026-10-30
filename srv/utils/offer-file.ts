@@ -1,8 +1,5 @@
-/**
- * Offer files: a serialized swap transaction written as bech32m text with the prefix `swapoffer`.
- * Unlike addresses, they have no 90-character limit.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Offer files hold a serialized swap transaction as bech32m text with the prefix `swapoffer`. They have no 90-character limit.
+// SPDX-License-Identifier: Apache-2.0
 import { errorMessage } from './errors';
 import { loadBech32m } from './bech32m';
 
@@ -15,10 +12,8 @@ export class OfferFileError extends Error {
     }
 }
 
-/**
- * True for text that is meant as an offer file, even an invalid one.
- * It starts with the prefix or has the bech32 shape. Bech32 uses one case only, base64 mixes cases.
- */
+/** True for text that is meant as an offer file, even an invalid one.
+ *  It starts with the prefix or has the bech32 shape. Bech32 uses one case only, base64 mixes cases. */
 export function looksLikeOfferFile(text: unknown): boolean {
     if (typeof text !== 'string') return false;
     const s = text.trim();

@@ -1,20 +1,5 @@
-// Builds `@odatano/nightgate-tx` (packages/nightgate-tx) out of THIS tree.
-//
-// The slim package is the caller half of cross-server fee sponsoring on its
-// own: build + prove + sign a Midnight contract transaction locally, hand the
-// fee-unpaid bytes to a sponsor. The contract classes come from the
-// @odatano/contract-* lineage packages and the companion code from
-// @odatano/contract-kit (dependencies); prover keys are fetched from a public
-// /zk-config at runtime, which pins the artifact generation to the sponsor's
-// deployed contract.
-//
-// There is NO second source tree: every file is copied from here, at the SAME
-// relative path, so the relative requires inside them keep working untouched.
-// Only the doc/identity strings are rewritten to the slim package name.
-//
-// Run AFTER `npm run build` (the .js twins of the two srv/ helpers are build
-// output). `npm run check:slim` builds and then verifies the result.
-//
+// Builds @odatano/nightgate-tx into packages/nightgate-tx by copying files from this tree at the same relative paths.
+// Run after `npm run build`: node scripts/build-slim-package.mjs (`npm run check:slim` builds and verifies)
 // SPDX-License-Identifier: Apache-2.0
 
 import { readFile, writeFile, mkdir, rm, access, readdir, stat } from 'node:fs/promises';
@@ -24,10 +9,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(ROOT, 'packages', 'nightgate-tx');
 
-/**
- * Everything the slim package ships, as repo-relative paths. `required: false`
- * marks type twins that are nice to have but not load-bearing.
- */
+// Repo-relative paths the slim package ships; `required: false` marks optional type twins.
 const FILES = [
     // the SDK entry + hosted-endpoint client
     { path: 'src/sdk/index.mjs' },
@@ -63,9 +45,17 @@ const FILES = [
     { path: 'src/browser/providers.mjs' },
     { path: 'src/browser/providers.d.mts' },
     { path: 'src/browser/zk-config.mjs' },
-    // two helpers the builder requires by relative path (BUILD OUTPUT)
+    // helpers the builder requires by relative path (BUILD OUTPUT)
     { path: 'srv/utils/wallet-hd.js', buildOutput: true },
     { path: 'srv/utils/wallet-hd.d.ts', buildOutput: true },
+    { path: 'srv/utils/indexer-url.js', buildOutput: true },
+    { path: 'srv/utils/indexer-url.d.ts', buildOutput: true },
+    { path: 'srv/utils/hex-patterns.js', buildOutput: true },
+    { path: 'srv/utils/hex-patterns.d.ts', buildOutput: true },
+    { path: 'srv/utils/indexer-graphql.js', buildOutput: true },
+    { path: 'srv/utils/indexer-graphql.d.ts', buildOutput: true },
+    { path: 'srv/utils/runtime-version.js', buildOutput: true },
+    { path: 'srv/utils/runtime-version.d.ts', buildOutput: true },
     // offer files and addresses (bech32m); @scure/base only
     { path: 'srv/utils/bech32m.js', buildOutput: true },
     { path: 'srv/utils/bech32m.d.ts', buildOutput: true },

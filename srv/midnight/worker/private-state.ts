@@ -1,7 +1,4 @@
-/**
- * The worker reads and writes contract private state through the main thread,
- * which stores it in the database.
- */
+// The worker reads and writes contract private state through the main thread, which stores it in the database.
 
 import { parentPort, MessageChannel } from 'node:worker_threads';
 
@@ -15,7 +12,7 @@ export function privateStateRpc<T>(proxyId: string, method: string, args: unknow
             port2.close();
             reject(new Error(`private-state rpc '${method}' was not answered by the main thread within ${PRIVATE_STATE_RPC_TIMEOUT_MS}ms`));
         }, PRIVATE_STATE_RPC_TIMEOUT_MS);
-        (timer as any).unref?.();
+        timer.unref();
         port2.once('message', (msg: any) => {
             clearTimeout(timer);
             port2.close();

@@ -1,7 +1,5 @@
-/**
- * Job executors that pay the fees of a caller's transaction and submit it.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Job executors that pay the fees of a caller's transaction and submit it.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { resolveFeeSponsor, ensureFeeSponsorFacade, getConfiguredFeeSponsorSessions } from '../fee-sponsor';
 import { getNightgatePluginConfig } from '../../utils/nightgate-config';
@@ -17,12 +15,13 @@ import { closeSwapOffer, closeSwapOffersByNullifiers } from '../swap-offers';
 import { sponsorAtSyncGate } from '../sponsor-sync-gate';
 import { configMs, configNumber } from '../../utils/config';
 import type { DbRunner } from '../../utils/db-types';
-import { liveSponsorPolicyForJob, facadeConfigFromEnv, runInOneTransaction } from '../actions/common';
+import { liveSponsorPolicyForJob, facadeConfigFromEnv, runInOneTransaction, type SponsorJobCommand } from '../actions/common';
 import type { SponsorPolicy } from '../sponsor-policy';
 import type { SubmissionContext } from '../actions/context';
 import type { SubmitIntentCoordinates } from '../submit-intent';
 import { errorMessage } from '../../utils/errors';
 import { withLockContentionRetry } from '../db-write-retry';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 const { INSERT, UPDATE } = cds.ql;
 
@@ -30,11 +29,9 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     const { db } = ctx;
 
     /**
-     * Tracks the broadcast attempts of one sponsoring job.
-     * Each attempt gets its own PendingSubmissions row. A new attempt first closes
-     * the previous row as REJECTED or REBUILT.
+     * Tracks the broadcast attempts of one sponsoring job. Each attempt gets its own PendingSubmissions row, and a new attempt first closes the previous row as REJECTED or REBUILT.
      */
-    const sponsorAttemptLedger = (db: DbRunner, job: BackgroundJob, command: any, feeSponsorSessionId: () => string) => {
+    const sponsorAttemptLedger = (db: DbRunner, job: BackgroundJob, command: SponsorJobCommand, feeSponsorSessionId: () => string) => {
         let boundaryCrossed = false;
         let currentSubmissionId: string | null = null;
         let currentTxHash: string | null = null;
@@ -125,7 +122,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     };
 
     /** Sponsor wallets to try, in order. A named sponsor is never swapped for another, since grants pin it. */
-    const sponsorCandidates = (command: any, fromPool: (pool: string[]) => string[]): string[] => {
+    const sponsorCandidates = (command: SponsorJobCommand, fromPool: (pool: string[]) => string[]): string[] => {
         if (command.sponsorSessionId !== PLATFORM_POOL_SENTINEL) return [String(command.sponsorSessionId)];
         const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
         if (pool.length === 0) throw new Error('platform sponsor pool is empty (NIGHTGATE_FEE_SPONSOR_SESSION)');
@@ -134,7 +131,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
 
     const sponsorAttempt = async <T extends { contractAddress?: string; circuits?: string[] }>(
         sessionId: string,
-        command: any,
+        command: SponsorJobCommand,
         job: BackgroundJob,
         facadeCfg: ReturnType<typeof facadeConfigFromEnv>,
         ledger: ReturnType<typeof sponsorAttemptLedger>,
@@ -163,7 +160,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     });
 
     /** Records what a landed job produced: minted token types, closed offers and deployed contracts. */
-    const recordOnGrant = async (command: any, out: { deployed?: string[]; minted?: string[]; txHash?: string; nullifiers?: string[] }): Promise<void> => {
+    const recordOnGrant = async (command: SponsorJobCommand, out: { deployed?: string[]; minted?: string[]; txHash?: string; nullifiers?: string[] }): Promise<void> => {
         if (out.minted?.length) await recordPlatformMint(db, out.minted, { grantId: command.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: out.txHash ?? null });
         // A transfer may spend a coin an open offer reserved; that offer is closed like a filled one.
         if (command.swap || command.transfer) await closeSwapOffersOf(command, out.nullifiers ?? [], out.txHash ?? null);
@@ -172,7 +169,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     };
 
     /** A landed swap closes the offer it filled and every other open half that shared an input. */
-    const closeSwapOffersOf = async (command: any, nullifiers: string[], txHash: string | null): Promise<void> => {
+    const closeSwapOffersOf = async (command: SponsorJobCommand, nullifiers: string[], txHash: string | null): Promise<void> => {
         // The swap is already on chain, so a failed write here must not fail the job.
         try {
             if (command?.swap?.offerId) await closeSwapOffer(db, String(command.swap.offerId), 'filled', txHash);
@@ -183,7 +180,9 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     };
 
     // Sponsors a transaction the caller already finalized and bound.
-    const executeSponsorFinalized = async (command: any, job: BackgroundJob): Promise<unknown> => {
+    const executeSponsorFinalized = async (raw: unknown, job: BackgroundJob): Promise<unknown> => {
+        const command = raw as SponsorJobCommand;
+        if (command?.op !== 'sponsorFinalized') throw new Error(`Invalid persisted sponsor command for job ${job.ID}`);
         let activeSponsorSessionId = String(command.sponsorSessionId ?? job.sessionId);
         const ledger = sponsorAttemptLedger(db, job, command, () => activeSponsorSessionId);
         const facadeCfg = facadeConfigFromEnv();
@@ -236,7 +235,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                         const budget = verdict.generic ? Math.min(1, dustRetries) : dustRetries;
                         if (attempt < budget) {
                             cds.log('nightgate').warn(`sponsor ${sessionId.slice(0, 8)} hit a dust race, rebuild-retry ${attempt + 1}/${budget} on the same sponsor: ${String((e as Error).message).slice(-120)}`);
-                            await new Promise(resolve => setTimeout(resolve, dustBackoffMs));
+                            await sleep(dustBackoffMs);
                             continue;
                         }
                         // No rebuilds left. A known dust race may pass with another wallet.
@@ -261,7 +260,9 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     // Sponsors a caller's transaction that is not yet bound.
     // Many jobs can share one wallet, because the worker locks single dust notes.
     // This loop only spreads the load and moves to the next wallet on failure.
-    const executeSponsorUnbound = async (command: any, job: BackgroundJob): Promise<unknown> => {
+    const executeSponsorUnbound = async (raw: unknown, job: BackgroundJob): Promise<unknown> => {
+        const command = raw as SponsorJobCommand;
+        if (command?.op !== 'sponsorUnbound') throw new Error(`Invalid persisted sponsor command for job ${job.ID}`);
         const facadeCfg = facadeConfigFromEnv();
         await ensureNetworkId(facadeCfg.networkId);
 
@@ -323,7 +324,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                         const budget = verdict.generic ? Math.min(1, dustRetries) : dustRetries;
                         if (attempt < budget) {
                             cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} hit a dust race with ${attemptHash} (1010/170|171|196 or pool Invalid), rebuild-retry ${attempt + 1}/${budget}: ${String((e as Error).message).slice(-120)}`);
-                            await new Promise(resolve => setTimeout(resolve, dustBackoffMs));
+                            await sleep(dustBackoffMs);
                             continue; // rebuild the dust payment with the same sponsor
                         }
                         // No rebuilds left. The problem is the caller's tx, so the sponsor is not paused.

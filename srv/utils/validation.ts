@@ -12,3 +12,14 @@ export function validateViewingKey(viewingKey: string | undefined | null): strin
   }
   return undefined;
 }
+
+/** An optional ISO-8601 time that must lie ahead, and at most `maxAheadMs` ahead when given.
+ *  Returns the problem as text, or null when the value is absent or fine. */
+export function futureTimeProblem(raw: unknown, name: string, maxAheadMs?: number, maxText?: string): string | null {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const ms = Date.parse(String(raw));
+  if (!Number.isFinite(ms)) return `${name} must be an ISO-8601 timestamp`;
+  if (ms <= Date.now()) return `${name} must be in the future`;
+  if (maxAheadMs !== undefined && ms - Date.now() > maxAheadMs) return `${name}: at most ${maxText} ahead`;
+  return null;
+}

@@ -1,7 +1,5 @@
-/**
- * Maps a user to the 32-byte grantee id that disclosure grants use.
- * This module does not prove that the user owns the DID or wallet. The deployment must do that.
- */
+// Maps a user to the 32-byte grantee id that disclosure grants use.
+// It does not prove that the user owns the DID or wallet. The deployment must do that.
 import cds from '@sap/cds';
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
@@ -14,10 +12,8 @@ import { HEX64_ANY_CASE_RE } from '../utils/hex-patterns';
 const { SELECT } = cds.ql;
 
 
-/**
- * custom uses the 64-hex id as is. wallet hashes the coin public key with sha256. did hashes the UTF-8 text.
- * Grant issuers must use the same rule, or the ids will not match.
- */
+// `custom` uses the 64-hex id as is. `wallet` hashes the coin public key with sha256. `did` hashes the UTF-8 text.
+// Grant issuers must use the same rule, or the ids will not match.
 export function deriveGranteeId(kind: GranteeBinding, input: string): string {
     if (input == null || input === '') {
         throw new Error('grantee-identity: input is required');

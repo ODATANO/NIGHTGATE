@@ -3,6 +3,7 @@ import { deriveIndexerWsUrl } from './indexer-url';
 import { DEFAULT_PROOF_TIMEOUT_MS } from './proof-timeout';
 import { configBool, configEnum, configInt, configList, configString, setConfigOverrideSource, setConfigWarnSink } from './config';
 import { configSpec, parseConfigValue } from './config-table';
+import type { CrawlerConfig } from '../crawler/Crawler';
 
 // Lets the getters in `./config` also read `cds.requires.nightgate`, and log through cds.
 setConfigOverrideSource(() => getNightgatePluginConfig() as Record<string, unknown>);
@@ -25,7 +26,6 @@ export interface NightgatePluginConfig {
     proofTimeoutMs?: number | string;
     /** Base folder of the proving keys for contracts registered by path. Default `./contracts`. */
     zkConfigBasePath?: string;
-    crawlerNodeUrl?: string;
     privateStateBackend?: PrivateStateBackend;
     sessionTtlMs?: number;
     runtimeMode?: 'single-instance';
@@ -34,38 +34,25 @@ export interface NightgatePluginConfig {
     /** Allows SQLite in production. Emergency use only. */
     allowProductionSqlite?: boolean;
     palletMap?: Record<string, { name: string; txType: string; isShielded?: boolean; isSystem?: boolean }>;
-    crawler?: {
-        enabled?: boolean;
-        nodeUrl?: string;
-        fetchConcurrency?: number;
-        rpcBatchSize?: number;
-        requestTimeout?: number;
-        /** Indexer the crawler reads extra block data from. Defaults to the indexer used for submissions. */
-        indexerUrl?: string;
-        supplementBlocksPerSecond?: number;
-    };
+    crawler?: Partial<CrawlerConfig>;
     contracts?: Record<string, {
         /** An installed contract package. The paths come from its contract.json. */
         package?: string;
         artifactPath?: string;
         privateStateId?: string;
         zkConfigPath?: string;
-        /** Number of document slots of an attestation vault contract: 8, 16 (default) or 32. Must match the compiled contract. */
+        /** Number of document slots of an attestation vault contract: 16 (default) or 32. Must match the compiled contract. */
         slotWidth?: number;
         /** Deployed address or addresses, published in `GET /contract-manifest`. */
         address?: string | string[];
     }>;
     /** Allows sending transactions on mainnet. Default false. Indexing works either way. */
     allowMainnetSubmission?: boolean;
-    /**
-     * How a user is turned into the 32-byte grantee id the vault contract uses.
-     * 'wallet' (default) uses the coin public key. The issuer of a grant must use the same method.
-     */
+    /** How a user is turned into the 32-byte grantee id the vault contract uses.
+     *  'wallet' (default) uses the coin public key. The issuer of a grant must use the same method. */
     granteeBinding?: GranteeBinding;
-    /**
-     * Lets any user register their own grantee id. Default false.
-     * Ownership of the input is not verified, so a caller could take over someone else's on-chain grants.
-     */
+    /** Lets any user register their own grantee id. Default false.
+     *  Ownership of the input is not verified, so a caller could take over someone else's on-chain grants. */
     allowSelfServiceGranteeRegistration?: boolean;
     closeSessionsOnRestart?: boolean;
     /** Indexer URLs per network, used only when a verify call asks for a network other than the configured one. */
@@ -83,31 +70,25 @@ export function getNightgatePluginConfig(): NightgatePluginConfig {
 }
 
 export const DEFAULT_NETWORK: NightgateNetwork = 'preprod';
-export const DEFAULT_NODE_URL = 'wss://rpc.preprod.midnight.network/';
 
-/** Default node URL per network. Networks not listed use DEFAULT_NODE_URL. */
+// Built-in node and indexer endpoints. Only networks with a public, keyless endpoint have one:
+// preprod and mainnet need `nodeUrl` and `indexerHttpUrl` configured (an own node and indexer, or
+// Blockfrost with the project id in the URL), see docs/self-hosted.md.
 export const DEFAULT_NODE_URLS: Partial<Record<NightgateNetwork, string>> = {
     preview: 'wss://rpc.preview.midnight.network/',
-    mainnet: 'wss://rpc.mainnet.midnight.network/',
+    testnet: 'ws://127.0.0.1:9944',
     undeployed: 'ws://127.0.0.1:9944'
 };
 
-export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: string }> = {
+export const DEFAULT_INDEXER_URLS: Partial<Record<NightgateNetwork, { http: string; ws: string }>> = {
     preview: {
         http: 'https://indexer.preview.midnight.network/api/v4/graphql',
         ws: 'wss://indexer.preview.midnight.network/api/v4/graphql/ws'
     },
-    preprod: {
-        http: 'https://indexer.preprod.midnight.network/api/v4/graphql',
-        ws: 'wss://indexer.preprod.midnight.network/api/v4/graphql/ws'
-    },
+    // 127.0.0.1, not localhost: Node resolves localhost to ::1 first, which a node bound to IPv4 refuses.
     testnet: {
-        http: 'http://localhost:8088/api/v4/graphql',
-        ws: 'ws://localhost:8088/api/v4/graphql/ws'
-    },
-    mainnet: {
-        http: 'https://indexer.mainnet.midnight.network/api/v4/graphql',
-        ws: 'wss://indexer.mainnet.midnight.network/api/v4/graphql/ws'
+        http: 'http://127.0.0.1:8088/api/v4/graphql',
+        ws: 'ws://127.0.0.1:8088/api/v4/graphql/ws'
     },
     // An older local indexer that serves only /api/v3 needs the indexer URLs set explicitly.
     undeployed: {
@@ -115,6 +96,17 @@ export const DEFAULT_INDEXER_URLS: Record<NightgateNetwork, { http: string; ws: 
         ws: 'ws://127.0.0.1:8088/api/v4/graphql/ws'
     }
 };
+
+/** What a network without built-in endpoints still lacks; null when node and indexer are set. */
+export function missingEndpointsMessage(network: NightgateNetwork, nodeUrl: string, indexerHttpUrl: string): string | null {
+    const missing = [!nodeUrl && 'NIGHTGATE_NODE_URL (cds.requires.nightgate.nodeUrl)', !indexerHttpUrl && 'NIGHTGATE_INDEXER_HTTP_URL (cds.requires.nightgate.indexerHttpUrl)'].filter(Boolean);
+    if (!missing.length) return null;
+    const what = !nodeUrl && !indexerHttpUrl ? 'node or indexer' : !nodeUrl ? 'node' : 'indexer';
+    const hosted = network === 'preprod' || network === 'mainnet'
+        ? ` Use your own, or Blockfrost with the project id in the URL (https://midnight-${network}.blockfrost.io/api/v0?project_id=<token>, wss://rpc.midnight-${network}.blockfrost.io?project_id=<token>).`
+        : '';
+    return `network "${network}" has no built-in ${what}: set ${missing.join(' and ')}.${hosted} See docs/self-hosted.md.`;
+}
 
 export const DEFAULT_PROOF_SERVER_URL = 'http://localhost:6300';
 export const DEFAULT_ZK_CONFIG_BASE = './contracts';
@@ -149,10 +141,8 @@ export function isSelfServiceGranteeRegistrationAllowed(config?: NightgatePlugin
     return config?.allowSelfServiceGranteeRegistration === true;
 }
 
-/**
- * Whether startup closes the wallet sessions of the previous process. Default on.
- * Otherwise old sessions keep the encrypted seed in the database until they expire.
- */
+/** Whether startup closes the wallet sessions of the previous process. Default on.
+ *  Otherwise old sessions keep the encrypted seed in the database until they expire. */
 export function isCloseSessionsOnRestartEnabled(config?: NightgatePluginConfig): boolean {
     const env = configBool('NIGHTGATE_CLOSE_SESSIONS_ON_RESTART');
     if (env !== undefined) return env;
@@ -230,17 +220,15 @@ export function resolveSubmissionEndpoints(
     const httpOverride = configString('NIGHTGATE_INDEXER_HTTP_URL') || config?.indexerHttpUrl;
     const wsOverride = configString('NIGHTGATE_INDEXER_WS_URL') || config?.indexerWsUrl;
     return {
-        indexerHttpUrl: httpOverride || defaults.http,
-        indexerWsUrl: wsOverride || (httpOverride ? deriveIndexerWsUrl(httpOverride) : defaults.ws),
+        indexerHttpUrl: httpOverride || defaults?.http || '',
+        indexerWsUrl: wsOverride || (httpOverride ? deriveIndexerWsUrl(httpOverride) : defaults?.ws || ''),
         proofServerUrl: configString('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl || DEFAULT_PROOF_SERVER_URL,
         zkConfigBasePath: process.env.NIGHTGATE_ZK_CONFIG_BASE?.trim() || config?.zkConfigBasePath || DEFAULT_ZK_CONFIG_BASE
     };
 }
 
-/**
- * Indexer URLs for a verify call on another network.
- * The top-level indexer settings are ignored here, because they belong to the configured network.
- */
+/** Indexer URLs for a verify call on another network.
+ *  The top-level indexer settings are ignored here, because they belong to the configured network. */
 export function resolveOverrideIndexerEndpoints(
     network: NightgateNetwork,
     config?: NightgatePluginConfig
@@ -249,8 +237,8 @@ export function resolveOverrideIndexerEndpoints(
     const perNetwork = config?.networks?.[network] ?? {};
     const http = perNetwork.indexerHttpUrl;
     return {
-        indexerHttpUrl: http || defaults.http,
-        indexerWsUrl: perNetwork.indexerWsUrl || (http ? deriveIndexerWsUrl(http) : defaults.ws)
+        indexerHttpUrl: http || defaults?.http || '',
+        indexerWsUrl: perNetwork.indexerWsUrl || (http ? deriveIndexerWsUrl(http) : defaults?.ws || '')
     };
 }
 
@@ -265,7 +253,7 @@ export function warnIfCrawlerlessChainConfirmSet(config?: NightgatePluginConfig,
 export function resolveNightgateRuntimeConfig(config: NightgatePluginConfig = {}): {
     network: NightgateNetwork;
     nodeUrl: string;
-    crawlerConfig: Record<string, unknown>;
+    crawlerConfig: Partial<CrawlerConfig>;
     crawlerNodeUrl: string;
     submissionEndpoints: SubmissionEndpointsConfig;
     invalidNetwork?: string;
@@ -281,7 +269,7 @@ export function resolveNightgateRuntimeConfig(config: NightgatePluginConfig = {}
     const supplementBlocksPerSecondEnv = configInt('NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS');
     const contractStateHistoryEnv = configEnum<string>('NIGHTGATE_CRAWLER_CONTRACT_STATE_HISTORY');
     const contractStateWatchEnv = configList('NIGHTGATE_CRAWLER_CONTRACT_STATE_WATCH');
-    const crawlerConfig: Record<string, unknown> = {
+    const crawlerConfig: Partial<CrawlerConfig> = {
         ...rawCrawlerConfig,
         ...(fetchConcurrencyEnv != null && { fetchConcurrency: fetchConcurrencyEnv }),
         ...(rpcBatchSizeEnv != null && { rpcBatchSize: rpcBatchSizeEnv }),
@@ -296,7 +284,7 @@ export function resolveNightgateRuntimeConfig(config: NightgatePluginConfig = {}
     };
     const configuredNetwork = getConfiguredNightgateNetwork(config);
     const { network, invalidNetwork } = normalizeNightgateNetwork(configuredNetwork);
-    const nodeUrl = getConfiguredNightgateNodeUrl(config) || DEFAULT_NODE_URLS[network] || DEFAULT_NODE_URL;
+    const nodeUrl = getConfiguredNightgateNodeUrl(config) || DEFAULT_NODE_URLS[network] || '';
     const crawlerNodeUrl = getConfiguredNightgateCrawlerNodeUrl(config) || nodeUrl;
     const submissionEndpoints = resolveSubmissionEndpoints(network, config);
     // A separate private indexer for the crawler is useful because the public one
@@ -312,6 +300,11 @@ export function resolveNightgateRuntimeConfig(config: NightgatePluginConfig = {}
         submissionEndpoints,
         invalidNetwork
     };
+}
+
+/** What the crawler starts with: the resolved crawler settings on the crawler's node. Defaults are the crawler's own. */
+export function crawlerStartConfig(resolved: Pick<ReturnType<typeof resolveNightgateRuntimeConfig>, 'crawlerConfig' | 'crawlerNodeUrl'>): CrawlerConfig & { nodeUrl: string } {
+    return { ...resolved.crawlerConfig, enabled: true, nodeUrl: resolved.crawlerNodeUrl };
 }
 
 export function mainnetSubmissionBlockReason(config: NightgatePluginConfig): string | null {

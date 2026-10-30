@@ -117,8 +117,8 @@ describe('verifyAttestationState network override', () => {
         const r = await srv.handlers['verifyAttestationState'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'preview' }));
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractProvidersConfig: expect.objectContaining({
-                indexerHttpUrl: DEFAULT_INDEXER_URLS.preview.http,
-                indexerWsUrl: DEFAULT_INDEXER_URLS.preview.ws,
+                indexerHttpUrl: DEFAULT_INDEXER_URLS.preview!.http,
+                indexerWsUrl: DEFAULT_INDEXER_URLS.preview!.ws,
                 proofServerUrl: 'http://proof',
                 zkConfigPath: RESOLVED.zkConfigPath
             })
@@ -157,7 +157,7 @@ describe('verifyAttestationState network override', () => {
         const r = await srv.handlers['verifyAttestationState'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'preview' }));
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractProvidersConfig: expect.objectContaining({
-                indexerHttpUrl: DEFAULT_INDEXER_URLS.preview.http
+                indexerHttpUrl: DEFAULT_INDEXER_URLS.preview!.http
             })
         }));
         expect(r.verified).toBe(true);
@@ -184,8 +184,8 @@ describe('verifyPredicateState network override', () => {
         const r = await srv.handlers['verifyPredicateState'](makeReq({ ...ARGS, network: 'preview' }));
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractProvidersConfig: expect.objectContaining({
-                indexerHttpUrl: DEFAULT_INDEXER_URLS.preview.http,
-                indexerWsUrl: DEFAULT_INDEXER_URLS.preview.ws,
+                indexerHttpUrl: DEFAULT_INDEXER_URLS.preview!.http,
+                indexerWsUrl: DEFAULT_INDEXER_URLS.preview!.ws,
                 proofServerUrl: 'http://proof'
             })
         }));

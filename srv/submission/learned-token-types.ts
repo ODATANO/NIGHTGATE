@@ -1,8 +1,6 @@
-/**
- * Shielded token types minted by sponsored calls on this server.
- * With `shareMintedTokenTypes` in the server policy, every grant may use them, not only the minting one.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Shielded token types minted by sponsored calls on this server.
+// With `shareMintedTokenTypes` in the server policy, every grant may use them, not only the minting one.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { LearnedTokenTypes } from '#cds-models/midnight';
 import { withKeyedLock } from '../utils/keyed-lock';
@@ -10,6 +8,7 @@ import { runWithoutAmbientTx } from './background-jobs';
 import { HEX64_RE } from '../utils/hex';
 import { errorMessage } from '../utils/errors';
 import type { DbRunner } from '../utils/db-types';
+import { bareHex } from '../utils/hex-patterns';
 
 const log = cds.log('nightgate:learned-token-types');
 const { SELECT, INSERT } = cds.ql;
@@ -29,7 +28,7 @@ export interface LearnedTokenTypeOrigin {
 
 /** Keeps valid 64-hex token types, lower-cased and without duplicates. Drops everything else. */
 export function normalizeTokenTypes(types: unknown[]): string[] {
-    return [...new Set(types.map(t => String(t ?? '').trim().toLowerCase()).filter(t => HEX64_RE.test(t)))];
+    return [...new Set(types.map(bareHex).filter(t => HEX64_RE.test(t)))];
 }
 
 export async function refreshLearnedTokenTypes(db: DbRunner): Promise<string[]> {
@@ -39,10 +38,7 @@ export async function refreshLearnedTokenTypes(db: DbRunner): Promise<string[]> 
     return types;
 }
 
-/**
- * The known types as of the last refresh. An old cache refreshes in the background.
- * Before the first refresh the list is empty.
- */
+/** The known types as of the last refresh, empty before the first one. An old cache refreshes in the background. */
 export function sharedLearnedTokenTypes(): string[] {
     const age = cache ? Date.now() - cache.at : Infinity;
     if (age > CACHE_TTL_MS && !refreshing && cds.db) {

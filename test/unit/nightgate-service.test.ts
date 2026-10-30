@@ -649,17 +649,15 @@ describe('NightBalances', () => {
         expect(res.length).toBe(3);
     });
 
-    it('getTopHolders() clamps a too-small limit to 1', async () => {
+    it('getTopHolders() refuses a limit below 1 and pages with skip', async () => {
         await seedBalance('addr-a', 10);
         await seedBalance('addr-b', 20);
 
-        const res = await srv.send({
-            event: 'getTopHolders', entity: 'NightBalances',
-            data: { limit: -5 }
-        });
-        // Clamped to 1; highest balance comes back.
-        expect(res.length).toBe(1);
-        expect(Number(res[0].balance)).toBe(20);
+        await expect(srv.send({ event: 'getTopHolders', entity: 'NightBalances', data: { limit: -5 } }))
+            .rejects.toMatchObject({ code: 'ASSERT_RANGE', target: 'limit' });
+        const second = await srv.send({ event: 'getTopHolders', entity: 'NightBalances', data: { limit: 1, skip: 1 } });
+        expect(second.length).toBe(1);
+        expect(Number(second[0].balance)).toBe(10);
     });
 });
 

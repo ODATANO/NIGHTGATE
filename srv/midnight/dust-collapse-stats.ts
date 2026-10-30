@@ -1,8 +1,5 @@
-/**
- * Cost of the dust snapshot collapse per wallet, as the wallet worker reports it with every save tick.
- * Kept on the main thread for `getMetrics()`. This module does not import `@sap/cds`, so the
- * worker can import the sample type.
- */
+// Per-wallet cost of the dust snapshot collapse, kept on the main thread for `getMetrics()`.
+// Does not import `@sap/cds`, so the worker can import the sample type.
 
 export type DustCollapseOutcome = 'collapsed' | 'uncollapsed' | 'skipped';
 

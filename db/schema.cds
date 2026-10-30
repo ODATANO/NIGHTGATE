@@ -202,12 +202,9 @@ entity WalletSessions : cuid, managed {
     isActive            : Boolean default true;
 }
 
-/**
- * A bearer token that lets an agent act on one wallet session within limits.
- * Requests with the token run as `userId` and only on `sessionId`.
- * A grant can only narrow what the session may do. Only the token's hash is stored.
- * The allowed contracts, circuits and token types are the platform lists narrowed by the grant.
- */
+/** A bearer token that lets an agent act on one wallet session within limits. Only the token's hash is stored.
+ *  Requests with the token run as `userId` and only on `sessionId`. A grant can only narrow what the session may do.
+ *  The allowed contracts, circuits and token types are the platform lists narrowed by the grant. */
 @assert.unique.tokenHash: [tokenHash]
 entity AgentGrants : cuid, managed {
     userId            : String(200) not null;
@@ -240,10 +237,8 @@ entity AgentGrants : cuid, managed {
     revokedAt         : Timestamp;
 }
 
-/**
- * Swap offers posted for others to take. A row only advertises the offer.
- * The tokens move when someone completes the swap on chain.
- */
+/** Swap offers posted for others to take. A row only advertises the offer.
+ *  The tokens move when someone completes the swap on chain. */
 entity SwapOffers : cuid, managed {
     offer         : LargeString not null; // offer file or base64
     givesType     : HexEncoded not null;
@@ -264,10 +259,8 @@ entity SwapOffers : cuid, managed {
     closedAt      : Timestamp;
 }
 
-/**
- * A document text that holders of a shielded token type may read.
- * A reader proves on the holder registry contract `registryAddress` that it holds the token.
- */
+/** A document text that holders of a shielded token type may read.
+ *  A reader proves on the holder registry contract `registryAddress` that it holds the token. */
 entity HolderDisclosureGrants : cuid, managed {
     payloadHash     : HexEncoded not null;
     tokenType       : HexEncoded not null;
@@ -292,10 +285,7 @@ entity LearnedTokenTypes : managed {
         txHash           : HexEncoded;
 }
 
-/**
- * Contracts registered at runtime, in addition to those in the config.
- * A name from the config cannot be registered here.
- */
+/** Contracts registered at runtime, in addition to those in the config. A name from the config cannot be registered here. */
 entity ContractRegistrations : managed {
     key name           : String(100);
         artifactPath   : String(1000) not null; // absolute path inside NIGHTGATE_CONTRACTS_DIR; compiled contract JS module
@@ -339,10 +329,8 @@ entity ReorgLog : cuid, managed {
     status           : String(20); // 'completed' or 'failed'
 }
 
-/**
- * Transactions submitted through this server.
- * `txHash` and, for deploys, `contractAddress` stay null until the SDK returns them.
- */
+/** Transactions submitted through this server.
+ *  `txHash` and, for deploys, `contractAddress` stay null until the SDK returns them. */
 entity PendingSubmissions : cuid, managed {
     txHash           : HexEncoded;
     contractAddress  : HexEncoded;
@@ -423,11 +411,9 @@ entity ContractSigningKeys {
         updatedAt       : Timestamp;
 }
 
-/**
- * The key that encrypts an account's private states, signing keys and wallet state ('dek1').
- * It is stored twice. One copy opens with the server key ring, so the operator can rotate the ring.
- * The other opens with the account's viewing key, so data stays readable after a ring change.
- */
+/** The key that encrypts an account's private states, signing keys and wallet state ('dek1'). It is stored twice.
+ *  One copy opens with the server key ring, so the operator can rotate the ring.
+ *  The other opens with the account's viewing key, so data stays readable after a ring change. */
 entity AccountKeys {
     key accountId              : String(200);
         wrappedDek             : LargeString not null;
@@ -460,10 +446,8 @@ entity Attestations : cuid, managed {
     anchoredAt      : Timestamp;
 }
 
-/**
- * Documents whose hash was written to an attestation contract.
- * Agent tokens see only rows of their own session. Rows with a null `sessionId` are visible to the owner only.
- */
+/** Documents whose hash was written to an attestation contract.
+ *  Agent tokens see only rows of their own session. Rows with a null `sessionId` are visible to the owner only. */
 entity Documents : cuid, managed {
     sha256              : HexEncoded not null;
     contentType         : String(100);
@@ -511,11 +495,8 @@ entity DisclosureRoles : cuid, managed {
     validUntil : Timestamp;
 }
 
-/**
- * Who may read an attested document, mirrored from the attestation contract.
- * The contract decides access. `grantDisclosure` inserts a row as inactive.
- * It turns active once the grant shows up in the contract state.
- */
+/** Who may read an attested document, mirrored from the attestation contract. The contract decides access.
+ *  `grantDisclosure` inserts a row as inactive. It turns active once the grant shows up in the contract state. */
 @assert.unique.logicalGrant: [
     contractAddress,
     attesterId,
@@ -535,10 +516,7 @@ entity DisclosureGrants : cuid, managed {
     changedAtHeight : Integer64; // block of the last applied change
 }
 
-/**
- * Links a user to the grantee id the attestation contract checks.
- * A row with a scope wins over a global one.
- */
+/** Links a user to the grantee id the attestation contract checks. A row with a scope wins over a global one. */
 entity GranteeIdentities : cuid, managed {
     userId      : String(200) not null;
     granteeId   : HexEncoded not null;
@@ -565,10 +543,7 @@ entity NightBalances {
         lastUpdatedAt      : Timestamp;
 }
 
-/**
- * The server instance that runs the background work on this database.
- * It renews the lease while running and releases it on stop.
- */
+/** The server instance that runs the background work on this database. It renews the lease while running and releases it on stop. */
 entity InstanceLeases {
     key role        : String(20);
         instanceId  : String(200);

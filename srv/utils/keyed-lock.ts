@@ -1,7 +1,5 @@
-/**
- * Async lock per key. Callers with the same key run one after another. Different keys run in parallel.
- * An in-memory lock is enough because only one NIGHTGATE process may run (see runtime-topology.ts).
- */
+// Async lock per key. Callers with the same key run one after another. Different keys run in parallel.
+// An in-memory lock is enough because only one NIGHTGATE process may run (see runtime-topology.ts).
 
 const chains = new Map<string, Promise<unknown>>();
 

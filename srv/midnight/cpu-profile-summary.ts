@@ -1,7 +1,5 @@
-/**
- * Turns a V8 CPU profile into a short summary of where a thread spent its time.
- * The raw profile is megabytes large, so only the summary goes over OData.
- */
+// Turns a V8 CPU profile into a short summary of where a thread spent its time.
+// The raw profile is megabytes large, so only the summary goes over OData.
 export interface CpuProfileLike {
     nodes: Array<{ id: number; callFrame: { functionName: string; url: string; lineNumber: number }; children?: number[] }>;
     samples: number[];

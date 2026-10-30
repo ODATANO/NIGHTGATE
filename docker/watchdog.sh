@@ -1,29 +1,7 @@
 #!/bin/sh
-# NIGHTGATE container watchdog. Docker marks the container unhealthy but never
-# restarts it (`restart: unless-stopped` acts on exits only), so cron runs this
-# every minute. After 3 consecutive unhealthy checks:
-#
-#   stage 1  readiness reports the crawler down and the rest fine (database,
-#            runtime, initialization; `node` goes stale with the crawler and is
-#            not read): cycle the crawler in place, pauseCrawler + resumeCrawler
-#            through the operator API. A halted crawler is a crawler problem;
-#            the sponsor facades in the same process take ten minutes and more
-#            to warm and must not die for it.
-#   stage 2  still unhealthy 3 checks after the cycle (or any other check
-#            failing): docker restart -t 5. A hung main thread ignores SIGTERM,
-#            so the 90 s grace gains nothing.
-#
-# `starting` and `healthy` reset the counter. A restart is skipped while the
-# host itself is stalled (host-guard.sh, optional: exit 1 = stalled), and for
-# NIGHTGATE_WATCHDOG_START_GRACE seconds after the container started: the
-# sponsor wallets warm for minutes at full CPU, and a restart in that window
-# only starts the warm-up again. Every skipped restart is logged.
-#
-#   cp docker/watchdog.sh /root/nightgate-api/watchdog.sh
-#   crontab -l | { cat; echo '* * * * * /root/nightgate-api/watchdog.sh'; } | crontab -
-#
-# The container defaults to the compose file's `odatano-nightgate`; a
-# different name goes in the cron line: `NIGHTGATE_CONTAINER=<name> /root/...`.
+# Restarts an unhealthy NIGHTGATE container, which docker only marks. Cron runs it every minute: `* * * * * /root/nightgate-api/watchdog.sh`.
+# After 3 unhealthy checks with only the crawler down, it cycles the crawler, because the sponsor wallets take minutes to warm after a restart.
+# Otherwise, or 3 checks after the cycle, it restarts the container. Never while the host stalls or within NIGHTGATE_WATCHDOG_START_GRACE seconds of the start.
 
 C=${NIGHTGATE_CONTAINER:-odatano-nightgate}
 STATE=/run/nightgate-watchdog.count

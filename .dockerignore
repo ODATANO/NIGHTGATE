@@ -39,3 +39,18 @@ packages
 deploy
 .github
 scripts/zz-*
+# local notes, agent files, wallet files and one-off probes (all gitignored) stay out of every image
+local_docs
+.claude
+.vscode
+.idea
+CLAUDE.md
+AGENTS.md
+**/*.local.md
+**/*.local.json
+presync
+db/enhancements.md
+scripts/probe-*.mjs
+!scripts/probe-indexer.mjs
+scripts/split-night-utxos.mjs
+.ng-types-probe

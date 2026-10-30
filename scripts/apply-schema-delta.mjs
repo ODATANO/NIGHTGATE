@@ -1,28 +1,7 @@
 #!/usr/bin/env node
-// Additive schema migration for an EXISTING db/midnight.db.
-//
-// `cds deploy` recreates (drops) all tables: destructive, would wipe the
-// synced wallet/block state and force a multi-hour cold re-sync. This instead:
-//   - CREATE TABLE only when the table is ABSENT (existing data untouched)
-//   - ALTER TABLE ADD COLUMN for columns missing from an EXISTING table
-//     (additive fields like PredicateAttestations.fieldKey; data untouched)
-//   - rebuilds a table whose NOT NULL was relaxed or tightened (NULL rows take
-//     the column DEFAULT first) or whose unique keys changed
-//     (SQLite cannot alter a constraint; rows are copied)
-//   - DROP + CREATE every VIEW (views are stateless; refreshes projections so
-//     new service entities like DisclosureGrants/GranteeIdentities are queryable)
-//
-// DDL is taken from `cds compile srv --to sql --dialect sqlite`. Run with the
-// server STOPPED (it holds the DB):  node scripts/apply-schema-delta.mjs
-// (installed package: `npx nightgate-schema-delta`).
-//
-// Target file: first CLI arg > NIGHTGATE_DB_PATH > db/midnight.db. The Docker
-// image sets NIGHTGATE_DB_PATH=/data/nightgate.db, so running this inside the
-// container (or with that env var) migrates the right file.
-//
-// SQLITE ONLY: this tool rewrites a SQLite file in place. PostgreSQL/HANA
-// deployments migrate through their own deployer (`cds deploy` against the
-// managed service / `@cap-js/hana` delta handling), not through this script.
+// Additive SQLite schema migration: creates missing tables and columns, rebuilds changed constraints, refreshes views.
+// Run with the server stopped: node scripts/apply-schema-delta.mjs [dbPath] (installed: npx nightgate-schema-delta)
+// Target: first CLI arg, else NIGHTGATE_DB_PATH, else db/midnight.db. PostgreSQL and HANA use their own deployer.
 
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -34,11 +13,8 @@ import { createRequire } from 'node:module';
 // AND from an installed node_modules/@odatano/nightgate via the bin alias).
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// SQLite driver: prefer Node's BUILT-IN `node:sqlite` (>= 22.5), so neither
-// CI nor a consumer needs a native module. better-sqlite3 is only an OPTIONAL
-// peer of @cap-js/sqlite, i.e. not guaranteed to be installed; it stays as a
-// fallback for older runtimes. Both expose the prepare/all/get/exec surface
-// this script uses; only transactions differ (handled explicitly below).
+// Prefer the built-in node:sqlite so no native module is needed.
+// better-sqlite3 is an optional fallback; only its transaction API differs.
 const require = createRequire(import.meta.url);
 let openDatabase;
 try {
@@ -61,11 +37,7 @@ if (!fs.existsSync(DB_PATH)) {
 }
 console.log(`[delta] target: ${DB_PATH}`);
 
-/**
- * The SQLite DDL of the shipped model. Compiled IN-PROCESS with @sap/cds
- * (a dependency of every consumer); the `cds` CLI lives in @sap/cds-dk,
- * which a host app does not have, so it is only the fallback.
- */
+/** SQLite DDL of the shipped model, compiled in-process with @sap/cds; the cds CLI is only the fallback. */
 async function compileSqliteDdl() {
     try {
         const cds = require('@sap/cds');
@@ -139,10 +111,7 @@ function uniqueKeysChanged(name, createStmt) {
 let rebuiltTables = 0;
 
 /**
- * Columns whose NOT NULL was RELAXED in the target schema (e.g.
- * PredicateAttestations.op/threshold). SQLite cannot ALTER a
- * constraint, so the table is rebuilt: create the target shape under a temp
- * name, copy the shared columns (data untouched), drop the old table, rename.
+ * Columns whose NOT NULL was relaxed. SQLite cannot alter a constraint, so the table is rebuilt.
  */
 function relaxedColumns(name, createStmt) {
     const info = new Map(
@@ -158,10 +127,7 @@ function relaxedColumns(name, createStmt) {
     return relaxed;
 }
 
-/**
- * Columns the target makes NOT NULL with a DEFAULT; their NULL rows take the
- * default before the rebuild. A tightened column without a DEFAULT stays nullable.
- */
+/** Columns made NOT NULL with a DEFAULT; their NULL rows take the default before the rebuild. */
 function tightenedColumns(name, createStmt) {
     const info = new Map(
         db.prepare(`PRAGMA table_info("${name}")`).all().map(r => [r.name, r])
@@ -181,11 +147,8 @@ function rebuildTable(name, createStmt) {
     const have = new Set(db.prepare(`PRAGMA table_info("${name}")`).all().map(r => r.name));
     const shared = parseColumns(createStmt).map(c => c.name).filter(n => have.has(n));
     const colList = shared.map(n => `"${n}"`).join(', ');
-    // DROP TABLE also drops every index and trigger attached to it; snapshot
-    // them from sqlite_master first and recreate them after the rename (same
-    // transaction), so a rebuild never silently loses operator-added indexes
-    // or triggers. Auto-indexes (PK/UNIQUE) carry NULL sql and recreate
-    // themselves with the table.
+    // DROP TABLE also drops attached indexes and triggers, so they are saved first and recreated after the rename.
+    // Auto-indexes for PK and UNIQUE have NULL sql and come back with the table.
     const attached = db.prepare(
         "SELECT type, name, sql FROM sqlite_master WHERE type IN ('index','trigger') AND tbl_name = ? AND sql IS NOT NULL"
     ).all(name);
@@ -212,12 +175,8 @@ function rebuildTable(name, createStmt) {
 let restoredViews = 0;
 
 const migrate = () => {
-    // Drop ALL views up front: they are stateless and may reference tables
-    // that get rebuilt below (DROP TABLE fails on dependent views otherwise).
-    // Views managed by the DDL are recreated in this same transaction; any
-    // OTHER view (consumer-added, manual) is snapshotted here and restored
-    // from its original SQL afterwards, so the migration never silently
-    // deletes a view it does not own.
+    // Drop all views first, since DROP TABLE fails on dependent views.
+    // Views not in the DDL are saved here and restored from their SQL afterwards.
     const preViews = db.prepare("SELECT name, sql FROM sqlite_master WHERE type='view'").all();
     for (const v of preViews) {
         db.exec(`DROP VIEW IF EXISTS "${v.name}";`);
@@ -299,14 +258,8 @@ const migrate = () => {
         console.warn(`[delta] ! indexes skipped (${err.message}); the server creates them at startup`);
     }
 
-    // A Transactions.raw value stored as "0x..." TEXT is LOSSY: it went
-    // through CAP's binary transport, which base64-DECODES a string (invalid
-    // characters dropped, a trailing partial group truncated), so no
-    // re-encoding gives the extrinsic back. Such values start with "0x"
-    // because full base64 groups round-trip, and a genuine extrinsic never
-    // encodes to "0x..." (0xd3 is no valid compact length prefix). Clear them
-    // and the copy ContractActions.state held; reindexFromHeight(0) restores
-    // them from the chain.
+    // A Transactions.raw stored as "0x..." text is lossy and cannot be re-encoded.
+    // Clear it and the ContractActions.state copy; reindexFromHeight(0) restores both from the chain.
     try {
         if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='midnight_Transactions'").get()) {
             const lossy = db.prepare("SELECT count(*) AS n FROM midnight_Transactions WHERE typeof(raw) = 'text' AND raw LIKE '0x%'").get()?.n ?? 0;
@@ -317,13 +270,8 @@ const migrate = () => {
             }
             if (lossy > 0 || stateCleared > 0) {
                 console.log(`[delta] ~ cleared ${lossy} lossy Transactions.raw value(s) written before 0.23.0 and ${stateCleared} ContractActions.state copy(ies); run reindexFromHeight(0) on the indexer service to restore the extrinsic bytes`);
-            // Values derived from the extrinsic ENVELOPE (a "contract address"
-            // minted from the extrinsic hash, a NIGHT "transfer" read from any
-            // signed extrinsic whose args parsed as MultiAddress + Compact) are
-            // junk: the current crawler reads these columns off the chain's own
-            // events. Clear them and the derived rows; a re-index writes the
-            // real ones. Reached only from a pre-0.23.0 database, which is what
-            // the lossy `raw` above identifies.
+            // Values derived from the extrinsic envelope are wrong; the crawler now reads them from chain events.
+            // Clear them; a re-index writes the real ones. Only a database with lossy raw values reaches this.
             const addrCleared = db.prepare("UPDATE midnight_ContractActions SET address = NULL WHERE address IS NOT NULL").run()?.changes ?? 0;
             const txCleared = db.prepare("UPDATE midnight_Transactions SET contractAddress = NULL, senderAddress = NULL, receiverAddress = NULL, nightAmount = NULL WHERE contractAddress IS NOT NULL OR senderAddress IS NOT NULL OR receiverAddress IS NOT NULL OR nightAmount IS NOT NULL").run()?.changes ?? 0;
             let utxoCleared = 0, balanceCleared = 0;
@@ -363,11 +311,7 @@ const migrate = () => {
             console.log(`[delta] = restored unmanaged view ${v.name}`);
             restoredViews++;
         } catch (err) {
-            // A custom view may reference something this migration changed.
-            // Rethrow so the WHOLE transaction rolls back: the database stays
-            // exactly as it was (view included) and the operator resolves the
-            // conflict first, instead of the migration committing with the
-            // view deleted.
+            // Rethrow so the whole transaction rolls back and the view is not lost.
             console.error(`[delta] ! could not restore unmanaged view ${v.name}: ${err.message}`);
             console.error(`[delta] ! original SQL was:\n${v.sql}`);
             console.error('[delta] ! aborting: the migration rolls back, nothing was changed.');

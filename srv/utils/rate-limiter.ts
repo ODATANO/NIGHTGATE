@@ -6,10 +6,8 @@ interface RateLimiterOptions {
     maxRequests: number | (() => number);
     maxKeys?: number;           // Max tracked keys (default: 10000)
     sweepIntervalMs?: number;   // How often unused keys are removed (default: 60000)
-    /**
-     * Max keys per caller (default 64). The caller is the part of the key before the first ':'.
-     * This stops one caller from pushing every other caller out of the table.
-     */
+    /** Max keys per caller (default 64). The caller is the part of the key before the first ':'.
+     *  This stops one caller from pushing every other caller out of the table. */
     maxKeysPerGroup?: number;
 }
 
@@ -31,11 +29,8 @@ function groupOf(key: string): string {
 
 import { MARKER_PRINCIPALS } from './agent-token-transport';
 
-/**
- * Rate-limit key in the form `caller:scope`.
- * The caller is the agent grant, else the real user, else the client IP address.
- * The IP address is unreliable behind proxies. The caller part never contains ':'.
- */
+/** Rate-limit key `caller:scope`. The caller is the agent grant, else the real user, else the client IP address.
+ *  The IP address is unreliable behind proxies. The caller part never contains ':'. */
 export function principalRateKey(req: any, scope: string): string {
     const grant = req?.agentGrant?.ID;
     const rawUser = req?.user?.id;

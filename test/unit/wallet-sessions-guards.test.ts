@@ -270,7 +270,7 @@ describe('wallet session guard branches', () => {
         it('rejects an invalid ttlIso with 400', async () => {
             const req = makeReq({ ...base, ttlIso: 'not-a-date' });
             await handlers[op](req);
-            expect(req.reject).toHaveBeenCalledWith(400, 'ttlIso must be a valid ISO-8601 timestamp');
+            expect(req.reject).toHaveBeenCalledWith(400, 'ttlIso must be an ISO-8601 timestamp');
         });
 
         it('rejects a past ttlIso with 400', async () => {

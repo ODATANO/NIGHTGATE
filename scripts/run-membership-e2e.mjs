@@ -1,27 +1,6 @@
-// Bytes equality + set membership end-to-end (proveFieldEquality /
-// proveFieldMembership).
-//
-// Walks: connectWallet → connectWalletForSigning (await prewarm sync) →
-// deployContract(attestation-vault) → prepareDocumentProof over a MIXED
-// document (two bytes fields + one numeric field) → anchorDocument →
-// issueFieldEqualityAttestation (anchors the content root, proves
-// chemistry == digest('NMC811')) → prepareMembershipSet (canonical set root
-// + inclusion path, verifier lane cross-checked) → then:
-//
-//   POSITIVE  ONE mixed batch: numeric claim + membership claim (allowedValues
-//             lane) + an exact duplicate of the equality claim (dropped
-//             server-side). Expect: job SUCCEEDS, ONE txHash,
-//             droppedDuplicates=1, and every claim kind independently
-//             verified via crawler-free verifyPredicateState.
-//   NEGATIVE  a) membership issue with a value NOT in the allow-list → 400
-//             before any job. b) batch of one fresh TRUE numeric claim + a
-//             membership claim whose set path belongs to a DIFFERENT list →
-//             local proving failure ("value not in set"-class), atomic abort,
-//             the true claim did NOT land on-chain.
-//
-// Inputs (env): NIGHTGATE_URL (default http://localhost:4004),
-// LACE_VIEWING_KEY, LACE_MNEMONIC.
-// Run:  node --env-file=.env scripts/run-membership-e2e.mjs
+// Checks field equality and set membership attestations live, including values outside the set that must fail.
+// Run: node --env-file=.env scripts/run-membership-e2e.mjs
+// Env: NIGHTGATE_URL, LACE_VIEWING_KEY, LACE_MNEMONIC.
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';

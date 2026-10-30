@@ -1,26 +1,6 @@
-// Crawler-free state-verification end-to-end.
-//
-// Proves every crawler-free surface confirms the on-chain EFFECT of a
-// wallet-style direct submit, WITHOUT relying on the block crawler:
-//   connectWallet → connectWalletForSigning (await prewarm) →
-//   deployContract(attestation-vault) →
-//   registerGranteeIdentity →
-//   anchorDocument (attest payload) →
-//   verifyAttestationState        (#2: poll until verified=true from live state) →
-//   verifyDocument (+contractAddress)  (#3: state fallback, verified=true) →
-//   issueFieldPredicateAttestation → verifyPredicateAttestation (#3: state fallback) →
-//   grantDisclosure → reindexDisclosures (#1) → GET DisclosureGrants active=true →
-//   revokeDisclosure → reindexDisclosures (#1) → GET DisclosureGrants active=false
-//
-// To truly prove crawler-independence, run the server with the crawler disabled
-// (cds.requires.nightgate.crawler.enabled: false); then the ONLY thing that can
-// promote these reads to verified/active is queryContractState against live
-// contract state. The script still passes with the crawler on (the state path is
-// independent), but the point is that it needs no crawler and no local txHash.
-//
-// Inputs (env): NIGHTGATE_URL (default http://localhost:4004), LACE_VIEWING_KEY,
-// LACE_MNEMONIC. Optional: STATE_CONTRACT_ADDRESS (reuse a deployed vault). Run:
-//   node --env-file=.env scripts/run-state-verification-e2e.mjs
+// Checks that attestation, document, predicate and disclosure reads verify from live contract state without the crawler.
+// Run: node --env-file=.env scripts/run-state-verification-e2e.mjs, ideally with the server crawler disabled
+// Env: NIGHTGATE_URL, LACE_VIEWING_KEY, LACE_MNEMONIC, optional STATE_CONTRACT_ADDRESS to reuse a vault.
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';

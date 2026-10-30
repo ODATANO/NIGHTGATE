@@ -10,6 +10,7 @@ From `npm ci` to a wallet-signed transaction, in three steps:
 
 - Node.js >= 22, npm
 - Docker, only for a local proof server or indexer
+- A Midnight node and indexer for the network: on preview the public ones are built in; on preprod and mainnet set `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL` to your own or to Blockfrost ([self-hosted.md](self-hosted.md))
 - For wallet operations: a 24-word BIP39 mnemonic and viewing key, e.g. from [Lace](https://www.lace.io/)
 
 ## Path 1: Read-side only
@@ -19,7 +20,7 @@ npm ci
 npm run dev
 ```
 
-`npm run dev` runs `cds watch` with a 12 GB heap against the public Preprod RPC; no `.env` needed. The crawler catches up from genesis on the first run and resumes afterwards. Wait for `[Crawler] Live subscription active`, then:
+`npm run dev` runs `cds watch` with a 12 GB heap against the node in `.env` (`NIGHTGATE_NODE_URL`; on preview no `.env` is needed). The crawler catches up from genesis on the first run and resumes afterwards. Wait for `[Crawler] Live subscription active`, then:
 ```bash
 curl "http://localhost:4004/odata/v4/midnight-indexer/getHealth()"
 curl "http://localhost:4004/odata/v4/midnight-indexer/getSyncStatus()"
@@ -32,7 +33,7 @@ Expect a non-zero `chainHeight` and five blocks.
 
 Proving options:
 
-- **Default, wasm:** wallet and contract circuits prove in-process; prover keys are fetched on first use. Costs seconds of worker CPU per proof.
+- **Default, wasm:** wallet and contract circuits prove in-process; prover keys are fetched on first use. Costs tens of seconds to minutes of worker CPU per proof.
 - **Production, proof server:** `docker compose -f docker/docker-compose.yml up -d proof-server`, then set `NIGHTGATE_PROOF_SERVER_URL` (or `proofServerUrl`), which selects server proving. `NIGHTGATE_PROVING_MODE` overrides. ZK parameters persist in the `proof-server-data` volume.
 
 ### Configure wallet credentials
@@ -41,7 +42,9 @@ Proving options:
 
 ```env
 NIGHTGATE_NETWORK=preprod
-NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
+# your node and indexer, or Blockfrost with the project id (self-hosted.md)
+NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=<token>
+NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=<token>
 
 # Optional: frees CPU and memory for the wallet worker
 NIGHTGATE_CRAWLER_ENABLED=false
@@ -175,29 +178,11 @@ npm run deploy:e2e
 
 ## Use NIGHTGATE in another CAP app
 
-```bash
-cd my-cap-app
-npm install @odatano/nightgate @cap-js/sqlite
-```
-
-The package ships contract modules, verifier keys and zkir, but no prover keys. The first proving job fetches them from the release tag (override: `NIGHTGATE_ZK_ASSET_URL`, a `/zk-config` base) and checks them against `keys/manifest.json`. Without outbound access, run `npx nightgate-fetch-keys <contract>` once after install.
-
-`package.json`:
-
-```json
-{
-  "cds": {
-    "requires": {
-      "db": { "kind": "sqlite" },
-      "nightgate": { "network": "preprod" }
-    }
-  }
-}
-```
-
-Then `cds watch`. `network` is required (without it the plugin stays idle); everything else defaults to public endpoints. Configuration: [reference.md#configuration](reference.md#configuration). A `"kind": "nightgate"` entry is ignored.
-
-The services register under `/odata/v4/midnight`, `/odata/v4/midnight-indexer`, `/odata/v4/midnight-analytics`, `/odata/v4/midnight-admin` and `/odata/v4/midnight-verify`.
+`npm install @odatano/nightgate @cap-js/sqlite` and the `cds.requires.nightgate`
+block from the [README](../README.md#use-as-a-cap-plugin-in-another-app). The
+package ships verifier keys and zkir, not the prover keys: the first proving job
+fetches them (`NIGHTGATE_ZK_ASSET_URL` overrides the source), or run
+`npx nightgate-fetch-keys <contract>` once where there is no outbound access.
 
 ## Next
 

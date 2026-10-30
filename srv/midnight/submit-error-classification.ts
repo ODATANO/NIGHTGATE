@@ -1,12 +1,8 @@
-/**
- * Sorts a failed submit into one of the codes in `wallet-worker-protocol.ts`.
- * The worker sends the code along with its error reply.
- * Later decisions use only the code, never the message text.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Sorts a failed submit into a code from `wallet-worker-protocol.ts`. Later decisions use only the code.
+// SPDX-License-Identifier: Apache-2.0
 
-import { classificationHaystack, formatErr } from '../utils/format-error';
-import { findNightgateError, NightgateError } from '../utils/errors';
+import { classificationHaystack, ledgerErrorCode } from '../utils/format-error';
+import { findNightgateError, NightgateError, errorMessage } from '../utils/errors';
 import { dustRaceLedgerCode } from '../submission/dust-race';
 import {
     carriedSubmitFailure, type BatchCallStageInfo, type SubmitFailureInfo
@@ -36,18 +32,14 @@ export function errorChain(err: unknown): unknown[] {
 
 /** Messages of the cause chain below the top error, outermost first. */
 export function causeMessages(err: unknown): string[] {
-    return errorChain(err).slice(1).map(formatErr).filter((m) => m.length > 0);
+    return errorChain(err).slice(1).map(errorMessage).filter((m) => m.length > 0);
 }
 
 function nameOf(e: unknown): string {
     return typeof (e as any)?.name === 'string' ? String((e as any).name) : '';
 }
 
-/**
- * Reads the call list back out of a batch order error message.
- * Needed because the SDK sometimes passes on only the message text.
- * Example: `Stages in apply order: callA=1158[f] callB=1159[g]`.
- */
+/** Reads the call list back out of a batch order error, e.g. `Stages in apply order: callA=1158[f]`. */
 export function parseBatchCallStages(text: string): BatchCallStageInfo[] {
     const at = text.indexOf('Stages in apply order:');
     if (at < 0) return [];
@@ -80,17 +72,14 @@ function codedSubmitFailure(err: NightgateError | undefined): SubmitFailureInfo 
     }
 }
 
-/**
- * The checks run in a fixed order and the first match wins.
- * The "no reply" check comes last because other errors also contain "timed out".
- */
+/** First match wins. The "no reply" check is last because other errors also say "timed out". */
 export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     const carried = carriedSubmitFailure(err);
     if (carried) return carried;
 
     const chain = errorChain(err);
     const names = chain.map(nameOf);
-    const message = formatErr(err);
+    const message = errorMessage(err);
     const haystack = `${message} ${classificationHaystack(err)}`;
 
     // The SDK may pass on only the message, so the message text is also checked.
@@ -146,8 +135,8 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
         return { code: 'pre-mempool-reject', ledgerCode: '1016', retryable: true };
     }
     if (/\b1010\s*:|invalid transaction/i.test(haystack)) {
-        const custom = /custom error:?\s*(\d+)/i.exec(haystack);
-        return { code: 'pre-mempool-reject', ledgerCode: custom ? `1010/${custom[1]}` : '1010', retryable: false };
+        const custom = ledgerErrorCode(haystack);
+        return { code: 'pre-mempool-reject', ledgerCode: custom ? `1010/${custom}` : '1010', retryable: false };
     }
     if (TRANSPORT_RE.test(haystack)) return { code: 'transport', retryable: true };
     if (NO_REPLY_RE.test(haystack)) return { code: 'ambiguous', ledgerCode: 'no-reply', retryable: false };

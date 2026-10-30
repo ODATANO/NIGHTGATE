@@ -1,8 +1,5 @@
-/**
- * Agent grants: a token that lets an agent use one wallet session with limited rights.
- * A valid token makes the request run as the user who issued the grant,
- * so all existing per-user checks still apply.
- */
+// Agent grants: a token that lets an agent use one wallet session with limited rights.
+// A valid token runs the request as the user who issued the grant, so all per-user checks still apply.
 
 import { parseJsonStringList } from '../utils/json-list';
 import cds from '@sap/cds';
@@ -29,6 +26,9 @@ import { HEX64_RE } from '../utils/hex-patterns';
 import { createAgentGrant, createAgentGrants, getGrantUsage, revokeAgentGrant, rotateAgentGrantToken, updateAgentGrant } from '#cds-models/NightgateService';
 import type { getSponsorPolicy } from '#cds-models/NightgateAdminService';
 import type { Request } from '@sap/cds';
+import { futureTimeProblem } from '../utils/validation';
+import { requireUserId, narrowRead } from '../utils/request-types';
+import { deployRefund } from './deploy-refund';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -85,10 +85,7 @@ export const SPONSOR_TRANSFER_ACTION = 'sponsorTransfer';
 /** Actions where a sponsor pays for a caller's transaction. Their jobs run under the sponsor session, which may be the platform pool. */
 export const SPONSOR_PHASE2_ACTIONS: ReadonlySet<string> = new Set([...SPONSOR_TRANSACTION_ACTIONS, SPONSOR_SWAP_ACTION, SPONSOR_TRANSFER_ACTION]);
 
-/**
- * Entities a token may read. Session-specific ones are filtered to the grant's session in enforceAgentGrant.
- * Other per-user lists are excluded, because they would show the issuer's other sessions.
- */
+/** Entities a token may read. enforceAgentGrant filters session ones to the grant's session. Other per-user lists would leak the issuer's sessions. */
 export const AGENT_READABLE_ENTITIES: ReadonlySet<string> = new Set([
     'Blocks', 'Transactions', 'TransactionResults', 'TransactionSegments', 'TransactionFees',
     'ContractActions', 'ContractBalances', 'ContractStates', 'UnshieldedUtxos', 'ZswapLedgerEvents',
@@ -125,10 +122,7 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
 
 
 
-/**
- * Records contracts deployed under a grant. The sponsor policy allows calls to them
- * in addition to the contracts both the platform and the grant allow.
- */
+/** Records contracts deployed under a grant. The sponsor policy also allows calls to them. */
 export async function recordDeployedContracts(db: DbRunner, grantId: string, addresses: string[]): Promise<void> {
     const fresh = addresses.map(a => String(a).trim()).filter(Boolean);
     if (!grantId || fresh.length === 0) return;
@@ -138,7 +132,7 @@ export async function recordDeployedContracts(db: DbRunner, grantId: string, add
                 SELECT.one.from(AgentGrants).where({ ID: grantId })
             )) as AgentGrant | null;
             if (!grant) return;
-            const current = parseGrantList(grant.deployedContracts);
+            const current = parseJsonStringList(grant.deployedContracts);
             const merged = [...current];
             for (const a of fresh) if (!merged.includes(a)) merged.push(a);
             if (merged.length === current.length) return;
@@ -163,7 +157,7 @@ export async function recordMintedTokenTypes(db: DbRunner, grantId: string, type
                 SELECT.one.from(AgentGrants).where({ ID: grantId })
             )) as AgentGrant | null;
             if (!grant) return;
-            const current = parseGrantList(grant.mintedTokenTypes);
+            const current = parseJsonStringList(grant.mintedTokenTypes);
             const added = fresh.filter(t => !current.includes(t));
             if (added.length === 0) return;
             if (current.length + added.length > MAX_POLICY_ENTRIES) {
@@ -181,10 +175,7 @@ export async function recordMintedTokenTypes(db: DbRunner, grantId: string, type
     });
 }
 
-/**
- * Reserves deploys from the grant's total deploy budget before sending. All or nothing.
- * Run it in the same database transaction that inserts the submission attempt row.
- */
+/** Reserves deploys from the grant's deploy budget before sending, all or nothing. Run it in the transaction that inserts the attempt row. */
 export async function reserveDeployBudget(runner: DbRunner, grantId: string, count: number): Promise<boolean> {
     if (!grantId || !Number.isInteger(count) || count < 1) return false;
     const grant = await runner.run(SELECT.one.from(AgentGrants).where({ ID: grantId })) as AgentGrant | null;
@@ -202,21 +193,14 @@ export async function reserveDeployBudget(runner: DbRunner, grantId: string, cou
 export async function releaseDeployBudget(db: DbRunner, grantId: string, count: number): Promise<void> {
     if (!grantId || !Number.isInteger(count) || count < 1) return;
     try {
-        await runWithoutAmbientTx(() => db.run(
-            UPDATE.entity(AgentGrants)
-                .set({ deploysUsed: { '-=': count } })
-                .where({ ID: grantId, deploysUsed: { '>=': count } })
-        ));
+        await runWithoutAmbientTx(() => db.run(deployRefund(grantId, count)));
     } catch (err) {
         log.error(`could not release ${count} reserved deploy(s) on grant ${grantId.slice(0, 8)}…; deploysUsed is now one too high, correct it by hand: ${errorMessage(err)}`);
         throw err;
     }
 }
 
-/**
- * Reads the grant's current policy for each job, so a revoke or a narrower grant also hits queued jobs.
- * Returns null if the grant is revoked, expired or deleted.
- */
+/** Reads the grant's policy now, so a revoke or narrowing also hits queued jobs. Null if revoked, expired or deleted. */
 export async function currentGrantPolicy(runner: DbRunner, grantId: string): Promise<GrantPolicyInput | null> {
     const grant = await currentGrantRow(runner, grantId);
     return grant ? grantRowPolicy(grant) : null;
@@ -227,18 +211,18 @@ export type GrantRowPolicy = Omit<RequestAgentGrant, 'ID' | 'sessionId' | 'userI
 
 /** The one mapping of a grant row to its policy, shared by the request check, the job executor and the admin view. */
 export function grantRowPolicy(row: AgentGrant): GrantRowPolicy {
-    const actions = parseGrantList(row.allowedActions);
+    const actions = parseJsonStringList(row.allowedActions);
     return {
-        allowedContracts: parseGrantList(row.allowedContracts),
-        allowedCircuits: parseGrantList(row.allowedCircuits),
-        deployedContracts: parseGrantList(row.deployedContracts),
-        allowedTokenTypes: parseGrantList(row.allowedTokenTypes),
-        mintedTokenTypes: parseGrantList(row.mintedTokenTypes),
+        allowedContracts: parseJsonStringList(row.allowedContracts),
+        allowedCircuits: parseJsonStringList(row.allowedCircuits),
+        deployedContracts: parseJsonStringList(row.deployedContracts),
+        allowedTokenTypes: parseJsonStringList(row.allowedTokenTypes),
+        mintedTokenTypes: parseJsonStringList(row.mintedTokenTypes),
         allowDeploy: row.allowDeploy === true,
         allowSwaps: actions.includes(SPONSOR_SWAP_ACTION),
         allowTransfers: actions.includes(SPONSOR_TRANSFER_ACTION),
         allowUnshieldedOffers: row.allowUnshieldedOffers === true,
-        allowedUnshieldedTokenTypes: parseGrantList(row.allowedUnshieldedTokenTypes)
+        allowedUnshieldedTokenTypes: parseJsonStringList(row.allowedUnshieldedTokenTypes)
     };
 }
 
@@ -269,10 +253,7 @@ const OP_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
     retract: ['retract']
 };
 
-/**
- * Checks a queued job against the grant as it is now. A child job is checked by its parent's kind.
- * Returns null if the job is still allowed, else the reason.
- */
+/** Checks a queued job against the grant as it is now. A child job is checked by its parent's kind. Null if allowed, else the reason. */
 export function grantJobScopeViolation(
     grant: Pick<AgentGrant, 'allowedActions' | 'allowedContracts' | 'allowedCircuits'>,
     job: { kind: string; parentJobId?: string | null; parentKind?: string | null },
@@ -293,8 +274,6 @@ export function grantJobScopeViolation(
     return grantScopeViolation(grant, data, op);
 }
 
-/** Parses a grant's JSON list column. A missing or broken value gives an empty list, which means no limit. */
-const parseGrantList = parseJsonStringList;
 
 function grantExpired(grant: Pick<AgentGrant, 'validUntil'>, now: Date = new Date()): boolean {
     return !!grant.validUntil && new Date(grant.validUntil) < now;
@@ -306,12 +285,12 @@ export function grantScopeViolation(
     event?: string
 ): string | null {
     const d = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
-    const contracts = parseGrantList(grant.allowedContracts).map(c => c.toLowerCase());
+    const contracts = parseJsonStringList(grant.allowedContracts).map(c => c.toLowerCase());
     if (contracts.length > 0 && typeof d.contractAddress === 'string' && d.contractAddress.length > 0
         && !contracts.includes(d.contractAddress.toLowerCase())) {
         return `contract '${d.contractAddress.slice(0, 16)}' is not in this agent grant's allowedContracts`;
     }
-    const circuits = parseGrantList(grant.allowedCircuits);
+    const circuits = parseJsonStringList(grant.allowedCircuits);
     if (circuits.length === 0) return null;
     const required = circuitsOfRequest(event ?? '', d);
     if (required === null) {
@@ -325,10 +304,7 @@ export function grantScopeViolation(
     return null;
 }
 
-/**
- * Circuits each action may run on the server. A grant with a circuit list must allow all of them.
- * If the circuits of a request cannot be determined, a grant with a circuit list refuses it.
- */
+/** Circuits each action may run. A grant with a circuit list must allow all of them, and refuses a request whose circuits are unknown. */
 const ACTION_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
     issueFieldPredicateAttestation: ['anchorContentRoot', 'proveFieldPredicate'],
     issueFieldEqualityAttestation: ['anchorContentRoot', 'proveFieldEquality'],
@@ -375,12 +351,6 @@ export function circuitsOfRequest(event: string, d: Record<string, unknown>): st
 
 export function hashAgentToken(token: string): string {
     return crypto.createHash('sha256').update(token).digest('hex');
-}
-
-function requireUserId(req: Request): string | undefined {
-    const uid = req.user?.id;
-    if (!uid) { req.reject?.(401, 'authentication required'); return undefined; }
-    return uid as string;
 }
 
 function utcDay(now: Date = new Date()): string {
@@ -439,21 +409,8 @@ interface ValueBudgetInput { tokenType?: string | null; amount?: string | null }
 export type ValueBudgetMap = Record<string, string>;
 const MAX_VALUE_BUDGET_ENTRIES = 64;
 
-interface GrantShapeInput {
-    allowedActions?: string[] | null;
-    maxJobsPerDay?: number | null;
-    maxJobsPerHour?: number | null;
-    validUntil?: string | null;
-    agentLabel?: string | null;
-    allowedContracts?: string[] | null;
-    allowedCircuits?: string[] | null;
-    allowDeploy?: boolean | null;
-    maxDeploys?: number | null;
-    allowedTokenTypes?: string[] | null;
-    allowUnshieldedOffers?: boolean | null;
-    allowedUnshieldedTokenTypes?: string[] | null;
-    maxValuePerDay?: ValueBudgetInput[] | null;
-}
+/** The grant settings both create and update take, as the generated action parameters type them. */
+type GrantShapeInput = Omit<typeof updateAgentGrant.__parameters, 'grantId'>;
 
 /** Validated values, ready to store. An empty list means no limit. */
 interface GrantShapeValues {
@@ -511,10 +468,7 @@ export function valueBudgetList(map: ValueBudgetMap): Array<{ tokenType: string;
     return Object.entries(map).map(([tokenType, amount]) => ({ tokenType, amount }));
 }
 
-/**
- * Validates the editable fields for create and update. On update, a missing field
- * keeps its value from `existing`, and an explicit null clears it.
- */
+/** Validates the editable fields. On update a missing field keeps its value from `existing`, and an explicit null clears it. */
 export function validateGrantShape(
     input: GrantShapeInput,
     existing?: AgentGrant
@@ -532,7 +486,7 @@ export function validateGrantShape(
                 `Grantable: ${AGENT_ALLOWLISTABLE_ACTIONS.join(', ')}`);
         }
     }
-    const effectiveActions: string[] = actions ?? parseGrantList(existing?.allowedActions);
+    const effectiveActions: string[] = actions ?? parseJsonStringList(existing?.allowedActions);
 
     // Deploying is a separate right with its own budget, not implied by the action list.
     // Only a grant with a sponsoring action can have it.
@@ -554,7 +508,7 @@ export function validateGrantShape(
         return fail('maxDeploys needs allowDeploy: true');
     }
 
-    // Moving the agent's own unshielded tokens into a contract is a separate right as well, bound to a sponsoring action.
+    // Moving unshielded tokens in or out of a contract is a separate right as well, bound to a sponsoring action.
     const allowUnshieldedOffers = has('allowUnshieldedOffers') || !existing ? input.allowUnshieldedOffers === true : existing.allowUnshieldedOffers === true;
     if (allowUnshieldedOffers && !effectiveActions.some(a => SPONSOR_TRANSACTION_ACTIONS.has(a))) {
         return fail("allowUnshieldedOffers needs 'sponsorFinalizedTransaction' or 'sponsorUnboundTransaction' in allowedActions: the offer rides in a sponsored call");
@@ -569,16 +523,16 @@ export function validateGrantShape(
     try {
         allowedContracts = has('allowedContracts') || !existing
             ? validatePolicyList('allowedContracts', input.allowedContracts)
-            : parseGrantList(existing.allowedContracts);
+            : parseJsonStringList(existing.allowedContracts);
         allowedCircuits = has('allowedCircuits') || !existing
             ? validatePolicyList('allowedCircuits', input.allowedCircuits)
-            : parseGrantList(existing.allowedCircuits);
+            : parseJsonStringList(existing.allowedCircuits);
         allowedTokenTypes = has('allowedTokenTypes') || !existing
             ? validateTokenTypeList('allowedTokenTypes', input.allowedTokenTypes)
-            : parseGrantList(existing.allowedTokenTypes);
+            : parseJsonStringList(existing.allowedTokenTypes);
         allowedUnshieldedTokenTypes = has('allowedUnshieldedTokenTypes') || !existing
             ? validateTokenTypeList('allowedUnshieldedTokenTypes', input.allowedUnshieldedTokenTypes)
-            : parseGrantList(existing.allowedUnshieldedTokenTypes);
+            : parseJsonStringList(existing.allowedUnshieldedTokenTypes);
         maxValuePerDay = has('maxValuePerDay') || !existing
             ? validateValueBudget(input.maxValuePerDay)
             : parseValueBudgetMap(existing.maxValuePerDay);
@@ -601,11 +555,8 @@ export function validateGrantShape(
         values[field] = budget ?? null;
     }
     if (has('validUntil') || !existing) {
-        if (input.validUntil) {
-            const t = new Date(input.validUntil);
-            if (Number.isNaN(t.getTime())) return fail('validUntil must be a valid ISO-8601 timestamp');
-            if (t.getTime() <= Date.now()) return fail('validUntil must be in the future');
-        }
+        const untilProblem = futureTimeProblem(input.validUntil, 'validUntil');
+        if (untilProblem) return fail(untilProblem);
         values.validUntil = input.validUntil ?? null;
     }
     if (has('agentLabel') || !existing) {
@@ -625,10 +576,12 @@ function parseTimestamp(raw: unknown): string | null | undefined {
     return Number.isNaN(t.getTime()) ? null : t.toISOString();
 }
 
-/**
- * Returns a reject if the platform policy allows nothing from the grant's lists, else null.
- * A grant without own lists uses the platform's, so it is not checked here.
- */
+/** A refusal with a code keeps it; one without answers status and message. */
+function rejectRefusal(req: Request, refused: { status: number; code?: string; message: string }): never {
+    return refused.code ? req.reject({ status: refused.status, code: refused.code, message: refused.message }) : req.reject(refused.status, refused.message);
+}
+
+/** Rejects when the platform policy allows nothing from the grant's lists. A grant without own lists uses the platform's and is not checked. */
 function policyReject(values: GrantShapeValues, deployedContracts: string[] = []): { status: number; code?: string; message: string } | null {
     if (!values.allowedContracts.length && !values.allowedCircuits.length && !values.allowedTokenTypes.length && !values.allowedUnshieldedTokenTypes.length) return null;
     try {
@@ -718,28 +671,9 @@ const USAGE_WINDOW_MAX_MS = 366 * 24 * 60 * 60 * 1000;
 const USAGE_WINDOW_DEFAULT_MS = 30 * 24 * 60 * 60 * 1000;
 
 export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRunner): void {
-    interface GrantCreationInput {
-        sessionId?: string | null;
-        allowedActions?: string[] | null;
-        maxJobsPerDay?: number | null;
-        maxJobsPerHour?: number | null;
-        sponsorSessionId?: string | null;
-        validUntil?: string | null;
-        agentLabel?: string | null;
-        allowedContracts?: string[] | null;
-        allowedCircuits?: string[] | null;
-        allowDeploy?: boolean | null;
-        maxDeploys?: number | null;
-        allowedTokenTypes?: string[] | null;
-        allowUnshieldedOffers?: boolean | null;
-        allowedUnshieldedTokenTypes?: string[] | null;
-        maxValuePerDay?: ValueBudgetInput[] | null;
-    }
+    type GrantCreationInput = typeof createAgentGrant.__parameters;
 
-    /**
-     * Runs all checks before a grant is created.
-     * On failure it rejects the request and returns undefined.
-     */
+    /** Runs all checks before a grant is created. On failure it rejects the request and returns undefined. */
     async function prepareGrantCreation(req: Request, data: GrantCreationInput, userId: string): Promise<{ values: GrantShapeValues; actions: string[]; sessionId: string } | undefined> {
         if (!data.sessionId) { req.reject(400, 'sessionId is required'); return undefined; }
         applyBudgetDefaults(data);
@@ -747,7 +681,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         if (!shape.ok) { req.reject(400, shape.message); return undefined; }
         const actions = shape.values.allowedActions as string[];
         const refused = policyReject(shape.values);
-        if (refused) { if (refused.code) req.reject(refused as any); else req.reject(refused.status, refused.message); return undefined; }
+        if (refused) { rejectRefusal(req, refused); return undefined; }
 
         const session: WalletSession | undefined = await runWithoutAmbientTx(() => db.run(
             SELECT.one.from(WalletSessions).where({ sessionId: data.sessionId, isActive: true, userId })
@@ -935,13 +869,13 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
 
         const existing = await loadOwnGrant(db, data.grantId, userId);
         if (!existing) return req.reject(404, 'Grant not found');
-        if (!existing.isActive) return req.reject({ status: 409, code: 'GRANT_REVOKED', message: 'Grant is revoked' } as any);
+        if (!existing.isActive) return req.reject({ status: 409, code: 'GRANT_REVOKED', message: 'Grant is revoked' });
 
         const shape = validateGrantShape(data, existing);
         if (!shape.ok) return req.reject(400, shape.message);
         const v = shape.values;
-        const refused = policyReject(v, parseGrantList(existing.deployedContracts));
-        if (refused) return refused.code ? req.reject(refused as any) : req.reject(refused.status, refused.message);
+        const refused = policyReject(v, parseJsonStringList(existing.deployedContracts));
+        if (refused) return rejectRefusal(req, refused);
         const patch: Record<string, unknown> = {
             allowedContracts: v.allowedContracts.length ? JSON.stringify(v.allowedContracts) : null,
             allowedCircuits: v.allowedCircuits.length ? JSON.stringify(v.allowedCircuits) : null,
@@ -963,7 +897,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         const affected = await db.run(
             UPDATE.entity(AgentGrants).set(patch).where({ ID: data.grantId, userId, isActive: true })
         );
-        if (!Number(affected)) return req.reject({ status: 409, code: 'GRANT_REVOKED', message: 'Grant is revoked' } as any);
+        if (!Number(affected)) return req.reject({ status: 409, code: 'GRANT_REVOKED', message: 'Grant is revoked' });
         log.info(`agent grant ${data.grantId} updated (${updated.join(', ')})`);
         return { grantId: data.grantId, updated };
     });
@@ -1003,9 +937,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         const toIso = new Date(toMs).toISOString();
 
         // Revoked grants still show their history, so this only checks the owner.
-        const grant: AgentGrant | null = await runWithoutAmbientTx(() => db.run(
-            SELECT.one.from(AgentGrants).where({ ID: data.grantId, userId })
-        )) as AgentGrant | null;
+        const grant = await loadOwnGrant(db, data.grantId, userId);
         if (!grant) return req.reject(404, 'Grant not found');
 
         const rows = (await runWithoutAmbientTx(() => db.run(
@@ -1035,7 +967,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         const jobs = [...counts.values()].sort((a, b) => a.kind.localeCompare(b.kind) || a.status.localeCompare(b.status));
 
         // Fees are only known for transactions the crawler has indexed.
-        const crawlerOn = (resolveNightgateRuntimeConfig(getNightgatePluginConfig()).crawlerConfig as any)?.enabled !== false;
+        const crawlerOn = resolveNightgateRuntimeConfig(getNightgatePluginConfig()).crawlerConfig.enabled !== false;
         const dustPaid = crawlerOn ? await sumIndexedFees(db, landedHashes) : null;
 
         return {
@@ -1096,25 +1028,19 @@ async function sumIndexedFees(db: DbRunner, hashes: string[]): Promise<string> {
 }
 
 /** Registers the hook that checks agent tokens. Register it first in the service init. */
-export function attachAgentGrantEnforcement(srv: any, db: DbRunner): void {
+export function attachAgentGrantEnforcement(srv: cds.Service, db: DbRunner): void {
     srv.before('*', (req: Request) => {
         // CAP runs before-handlers in parallel. Other hooks that check the user
         // must wait for this one to set it, so the promise is stored on the request.
         const resolution = enforceAgentGrant(req, db);
-        (req as any)[AGENT_PRINCIPAL_READY] = resolution.then(() => undefined, () => undefined);
+        req.agentPrincipalReady = resolution.then(() => undefined, () => undefined);
         return resolution;
     });
 }
 
-const AGENT_PRINCIPAL_READY = Symbol.for('nightgate.agentPrincipalReady');
-
-/**
- * Waits until the agent token check has set the request user.
- * Every before-hook that reads `req.user` must call this first.
- */
+/** Waits until the agent token check has set the request user. Every before-hook that reads `req.user` must call this first. */
 export async function awaitAgentPrincipal(req: Request): Promise<void> {
-    const ready = (req as any)[AGENT_PRINCIPAL_READY];
-    if (ready) await ready;
+    if (req.agentPrincipalReady) await req.agentPrincipalReady;
 }
 
 /** CAP's per-request HTTP context. In a $batch it holds the headers of the single part. */
@@ -1171,13 +1097,10 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
         if (!AGENT_READABLE_ENTITIES.has(entity)) {
             return req.reject(403, `entity '${entity}' is not readable with an agent token`);
         }
-        const query: any = req.query;
-        if (query?.where) {
-            if (entity === 'WalletSessions' || entity === 'PendingSubmissions' || entity === 'Documents') {
-                query.where({ sessionId: grant.sessionId });
-            } else if (entity === 'AgentGrants') {
-                query.where({ ID: grant.ID });
-            }
+        if (entity === 'WalletSessions' || entity === 'PendingSubmissions' || entity === 'Documents') {
+            narrowRead(req, { sessionId: grant.sessionId });
+        } else if (entity === 'AgentGrants') {
+            narrowRead(req, { ID: grant.ID });
         }
     }
 
@@ -1235,20 +1158,11 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
             });
         }
         for (const budget of taken) noteRateLimitHeaders(req, budgetHeaderState(grant, budget));
-        if (taken.length) {
-            // A 4xx started no job (429 = a rate class refused after the take), so give the units back. 5xx keep them.
-            (req as any).on?.('failed', (err: any) => {
-                const status = Number(err?.status ?? err?.statusCode ?? err?.code);
-                if (!Number.isInteger(status) || status < 400 || status >= 500) return;
-                for (const budget of taken) {
-                    void refundBudget(db, grant, budget).catch((e: unknown) => log.warn(`${budget.limitName} refund for grant ${grant.ID} failed: ${errorMessage(e)}`));
-                }
-            });
-        }
+        // A 429 here means a rate class refused after the take.
+        for (const budget of taken) refundOnClientError(req, () => refundBudget(db, grant, budget), `${budget.limitName} refund for grant ${grant.ID}`);
     }
 
-    const UserCtor = (cds as any).User;
-    (req as any).user = UserCtor ? new UserCtor({ id: grant.userId }) : { id: grant.userId };
+    req.user = new cds.User(grant.userId);
     req.agentGrant = {
         ID: grant.ID, sessionId: grant.sessionId, userId: grant.userId,
         sponsorSessionId: grant.sponsorSessionId ?? null,
@@ -1295,20 +1209,22 @@ export async function consumeValueBudget(db: DbRunner, req: Request, grantId: st
         });
         return false;
     }
-    if ('taken' in outcome) {
-        // A 4xx started no job, so the amount goes back. 5xx keep it.
-        (req as unknown as FailureEvents).on?.('failed', (err) => {
-            const status = Number(err?.status ?? err?.statusCode ?? err?.code);
-            if (!Number.isInteger(status) || status < 400 || status >= 500) return;
-            void refundValueBudget(db, grantId, type, amount).catch((e: unknown) => log.warn(`value budget refund for grant ${grantId} failed: ${errorMessage(e)}`));
-        });
-    }
+    if ('taken' in outcome) refundOnClientError(req, () => refundValueBudget(db, grantId, type, amount), `value budget refund for grant ${grantId}`);
     return true;
 }
 
 /** The request's `failed` event, which CAP's Request emits and its types leave out. */
 interface FailureEvents {
     on?(event: 'failed', fn: (err: { status?: unknown; statusCode?: unknown; code?: unknown } | undefined) => void): void;
+}
+
+/** Gives a taken budget back when the request ends with a 4xx, which started no job. A 5xx keeps it. */
+function refundOnClientError(req: Request, refund: () => Promise<void>, what: string): void {
+    (req as unknown as FailureEvents).on?.('failed', (err) => {
+        const status = Number(err?.status ?? err?.statusCode ?? err?.code);
+        if (!Number.isInteger(status) || status < 400 || status >= 500) return;
+        void refund().catch((e: unknown) => log.warn(`${what} failed: ${errorMessage(e)}`));
+    });
 }
 
 async function refundValueBudget(db: DbRunner, grantId: string, type: string, amount: bigint): Promise<void> {
@@ -1330,10 +1246,7 @@ async function refundBudget(db: DbRunner, grant: AgentGrant, budget: GrantBudget
     ));
 }
 
-/**
- * Uses one unit of the budget. Safe under parallel requests.
- * A new window resets the counter only if no other request reset it first.
- */
+/** Uses one unit of the budget, safe under parallel requests. A new window resets the counter only if no other request reset it first. */
 async function consumeBudget(db: DbRunner, grant: AgentGrant, budget: GrantBudget): Promise<boolean> {
     const window = budget.current();
     const max = grant[budget.maxField] as number;

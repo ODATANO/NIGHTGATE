@@ -1,8 +1,5 @@
-/**
- * A minted token's type is rawTokenType(domainSeparator, address of the minting contract).
- * `sendNight` needs it to send a minted token.
- * SPDX-License-Identifier: Apache-2.0
- */
+// A minted token's type is rawTokenType(domainSeparator, address of the minting contract). `sendNight` needs it to send a minted token.
+// SPDX-License-Identifier: Apache-2.0
 import { NightgateError, errorMessage } from '../utils/errors';
 import { HEX64_ANY_CASE_RE, HEX64_RE } from '../utils/hex-patterns';
 
@@ -21,8 +18,7 @@ export class TokenTypeError extends NightgateError {
 }
 
 /**
- * 64 hex characters are read as hex. Anything else is UTF-8, padded with zeros to 32 bytes.
- * A 64-character string would not fit into 32 bytes as text anyway.
+ * 64 hex characters are read as hex, because they would not fit 32 bytes as text. Anything else is UTF-8, padded with zeros to 32 bytes.
  */
 export function padDomainSeparator(input?: string | null): Uint8Array {
     const value = input ?? SHIELDED_TEST_TOKEN_DOMAIN_SEP;

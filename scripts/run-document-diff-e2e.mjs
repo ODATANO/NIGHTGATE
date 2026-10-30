@@ -1,29 +1,6 @@
-// Cross-root document proofs end-to-end (proveDocumentComparison,
-// mode 0 integrity / mode 1 diff).
-//
-// Walks: connectWallet → connectWalletForSigning (await prewarm sync) →
-// deployContract(attestation-vault) → prepareDocumentProof for document v1
-// AND a changed v2 (one value change + one dropped field) → anchorDocument
-// for both → then:
-//
-//   POSITIVE  a) issueDocumentIntegrityAttestation with a mask covering
-//             exactly the changed slots (anchors BOTH content roots in-flow),
-//             verified crawler-free via verifyPredicateState.
-//             b) issueDocumentDiffAttestation with k = actual difference
-//             count, verified crawler-free.
-//             c) ONE batch tx carrying a numeric claim on v1 + a documentDiff
-//             claim (k=1) against v2: the proof-cart lane for the new kinds.
-//   NEGATIVE  a) integrity with a mask that MISSES the dropped field → local
-//             proving failure, nothing submitted, claim not on-chain.
-//             b) diff with k = count+1 → local proving failure, claim not
-//             on-chain.
-//
-// NOTE: proveDocumentComparison is the largest prover of the vault; it proves
-// in wasm mode.
-//
-// Inputs (env): NIGHTGATE_URL (default http://localhost:4004),
-// LACE_VIEWING_KEY, LACE_MNEMONIC.
-// Run:  node --env-file=.env scripts/run-document-diff-e2e.mjs
+// Checks document integrity and diff attestations live, including failing masks and wrong counts that must not land.
+// Run: node --env-file=.env scripts/run-document-diff-e2e.mjs
+// Env: NIGHTGATE_URL, LACE_VIEWING_KEY, LACE_MNEMONIC.
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';

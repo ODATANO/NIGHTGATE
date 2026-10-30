@@ -669,6 +669,7 @@ describe('evict', () => {
 describe('waitForSyncedState (genuine sync gate)', () => {
     it('latches once appliedIndex reaches the dust stream tip and the indexer is fresh', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         try {
@@ -684,6 +685,7 @@ describe('waitForSyncedState (genuine sync gate)', () => {
 
     it('rejects with a diagnostic when the deadline passes before catch-up', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         try {
@@ -699,6 +701,7 @@ describe('waitForSyncedState (genuine sync gate)', () => {
     // An index that does not move for stallMs fails as stalled while the absolute ceiling is far away; the last snapshot stays readable.
     it('fails as STALLED when appliedIndex does not advance within stallMs, before the ceiling', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         try {
@@ -722,6 +725,7 @@ describe('waitForSyncedState (genuine sync gate)', () => {
     // A state observable that cannot be read (peek timeout or error on every poll) counts as no progress.
     it('fails as STALLED when the wallet state is not readable for stallMs', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         const saved = facadeState.current;
@@ -741,6 +745,7 @@ describe('waitForSyncedState (genuine sync gate)', () => {
 
     it('stallMs <= 0 disables the stall bound (ceiling only)', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         try {
@@ -983,6 +988,7 @@ describe('buildWorkerWalletProvider', () => {
 
     function withSyncedIndexer() {
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
@@ -1326,6 +1332,7 @@ describe('buildWorkerWalletProvider', () => {
 
     function withIndexer(landed: boolean) {
         vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => ({
+            ok: true, status: 200,
             json: async () => String(init?.body ?? '').includes('transactions(')
                 ? { data: { transactions: landed ? [{ block: { height: '7' }, transactionResult: { status: 'SUCCESS', segments: [] } }] : [] } }
                 : { data: { block: { height: '500', timestamp: Date.now() } } }
@@ -1566,6 +1573,7 @@ describe('buildWorkerWalletProvider', () => {
         process.env.NIGHTGATE_SPONSOR_WAIT = 'finalized';
         process.env.NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS = '5000';
         vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => ({
+            ok: true, status: 200,
             json: async () => String(init?.body ?? '').includes('transactions(')
                 ? { data: { transactions: [{ block: { height: '13' }, transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ id: 2, success: false }] } }] } }
                 : { data: { block: { height: '500', timestamp: Date.now() } } }
@@ -1627,6 +1635,7 @@ describe('buildWorkerWalletProvider', () => {
     it('a landed transaction whose call did NOT apply is a TxFailed with the block height, never a success', async () => {
         const restore = withFastResend();
         vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => ({
+            ok: true, status: 200,
             json: async () => String(init?.body ?? '').includes('transactions(')
                 ? { data: { transactions: [{ block: { height: '11' }, transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ id: 1, success: false }] } }] } }
                 : { data: { block: { height: '500', timestamp: Date.now() } } }
@@ -1684,6 +1693,7 @@ describe('buildWorkerWalletProvider', () => {
             (finalized as any).identifiers = () => ['0xtxid'];
             let lookups = 0;
             (globalThis.fetch as any).mockImplementation(async (_url: any, init: any) => ({
+                ok: true, status: 200,
                 json: async () => String(init?.body ?? '').includes('transactions(')
                     ? { data: { transactions: ++lookups >= 2 ? [{ block: { height: '12' }, transactionResult: { status: 'SUCCESS', segments: [] } }] : [] } }
                     : { data: { block: { height: '500', timestamp: Date.now() } } }
@@ -1703,6 +1713,7 @@ describe('buildWorkerWalletProvider', () => {
         const restore = withFastResend();
         let lookups = 0;
         vi.stubGlobal('fetch', vi.fn(async (_url: any, init: any) => ({
+            ok: true, status: 200,
             json: async () => String(init?.body ?? '').includes('transactions(')
                 ? { data: { transactions: ++lookups >= 2 ? [{ block: { height: '9' }, transactionResult: { status: 'SUCCESS', segments: [] } }] : [] } }
                 : { data: { block: { height: '500', timestamp: Date.now() } } }
@@ -1925,7 +1936,7 @@ describe('progress watch tick', () => {
     afterEach(() => { vi.unstubAllGlobals(); });
 
     function stubIndexerTip(timestampMs: number) {
-        vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height: '500', timestamp: timestampMs } } }) })));
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: { block: { height: '500', timestamp: timestampMs } } }) })));
     }
 
     it('pushes the sync gate verdict for an idle facade', async () => {
@@ -2068,18 +2079,18 @@ describe('progress watch tick', () => {
 
             // the one-shot subscription fails: the tip from a moment ago still counts
             wsTip.maxId = null;
-            workerExports.streamTipCache.set('dust', { tip: 100n, at: Date.now() - 20_000 });
+            workerExports.streamTipCache.set(workerExports.streamTipKey(entry.indexerHttpUrl, 'dust'), { tip: 100n, at: Date.now() - 20_000 });
             await workerExports.progressWatchTick(SESSION, entry, Date.now() + 240_000);
             expect(lastPushed()).toMatchObject({ caughtUp: true, streamTip: '100', behindEvents: '0' });
 
             // past the grace window the tip is unknown again and the gate closes
-            workerExports.streamTipCache.set('dust', { tip: 100n, at: Date.now() - 400_000 });
+            workerExports.streamTipCache.set(workerExports.streamTipKey(entry.indexerHttpUrl, 'dust'), { tip: 100n, at: Date.now() - 400_000 });
             await workerExports.progressWatchTick(SESSION, entry, Date.now() + 360_000);
             expect(lastPushed()).toMatchObject({ caughtUp: false, streamTip: '-1', behindEvents: null });
 
             // grace off: a failed read is unknown at once
             process.env.NIGHTGATE_STREAM_TIP_GRACE_MS = '0';
-            workerExports.streamTipCache.set('dust', { tip: 100n, at: Date.now() - 20_000 });
+            workerExports.streamTipCache.set(workerExports.streamTipKey(entry.indexerHttpUrl, 'dust'), { tip: 100n, at: Date.now() - 20_000 });
             await workerExports.progressWatchTick(SESSION, entry, Date.now() + 480_000);
             expect(lastPushed()).toMatchObject({ caughtUp: false, streamTip: '-1' });
         } finally {
@@ -2452,6 +2463,7 @@ describe('buildSponsoredWalletProvider', () => {
 
     function withSyncedIndexer() {
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         facadeState.current = { dust: { progress: { appliedIndex: '100', isConnected: true } } };
@@ -3186,6 +3198,7 @@ describe('sponsorUnboundTx concurrency contract', () => {
     it('two concurrent sponsorings overlap in proving, land on distinct backings and never arm the dust snapshot', async () => {
         const facade = await initSession(SESSION);
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         try {
@@ -3267,6 +3280,7 @@ describe('sponsorUnboundTx concurrency contract', () => {
     it('a pre-mempool reject on the unbound path is rethrown WITHOUT a dust restore (nothing was booked)', async () => {
         const facade = await initSession('session-sponsor-unbound-bbbbbb');
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         try {
@@ -3326,6 +3340,7 @@ describe('dedicated submit clients: settle window + closing-socket retry', () =>
         const SESSION = 'session-sponsor-unbound-cccccc';
         const facade = await initSession(SESSION);
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         try {
@@ -3398,6 +3413,7 @@ describe('dust backing stays reserved until the wallet lists the spend', () => {
         const SESSION = 'session-sponsor-unbound-hold01';
         const facade = await initSession(SESSION);
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         const { held } = workerExports.__noteLeaseForTests;
@@ -3434,6 +3450,7 @@ describe('dust backing stays reserved until the wallet lists the spend', () => {
         const SESSION = 'session-sponsor-unbound-hold02';
         const facade = await initSession(SESSION);
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         const { held } = workerExports.__noteLeaseForTests;
@@ -3538,6 +3555,7 @@ describe('dedicated submit client pool cap', () => {
         const SESSION = 'session-sponsor-poolcap-aaaaaa';
         const facade = await initSession(SESSION);
         vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
             json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
         })));
         const relay = new URL(INIT_ARGS.relayUrl);
@@ -3592,10 +3610,10 @@ describe('sponsor submit watchdog (a watch that never sees Finalized)', () => {
         // fetch: tip queries (sync gate) AND the watchdog's indexer lookup by identifier
         vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
             const body = String(init?.body ?? '');
-            if (body.includes('transactions(offset:{identifier:')) {
-                return { json: async () => ({ data: { transactions: [{ block: { height: '4242' } }] } }) };
+            if (body.includes('"identifier"')) {
+                return { ok: true, status: 200, json: async () => ({ data: { transactions: [{ block: { height: '4242' } }] } }) };
             }
-            return { json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) };
+            return { ok: true, status: 200, json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) };
         }));
         workerExports.__submitClientPoolForTests.reset();
         try {
@@ -3647,7 +3665,7 @@ describe('sponsor dust spend proving', () => {
     it("uses the facade's own proving service (the proof server in server mode) and not the in-process wasm prover", async () => {
         const SESSION = 'session-sponsor-prover-aaaaaa';
         const facade = await initSession(SESSION);
-        vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
         try {
             facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
             wsTip.maxId = '100';
@@ -3693,10 +3711,10 @@ describe('sponsored call apply check', () => {
         // indexer: the tx is in block 4242 but the call segment failed
         vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
             const body = String(init?.body ?? '');
-            if (body.includes('transactions(offset:{identifier:')) {
-                return { json: async () => ({ data: { transactions: [{ block: { height: '4242' }, transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ id: 0, success: true }, { id: 42593, success: false }] } }] } }) };
+            if (body.includes('"identifier"')) {
+                return { ok: true, status: 200, json: async () => ({ data: { transactions: [{ block: { height: '4242' }, transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ id: 0, success: true }, { id: 42593, success: false }] } }] } }) };
             }
-            return { json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) };
+            return { ok: true, status: 200, json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) };
         }));
         const prevVisible = process.env.NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS;
         try {
@@ -3743,7 +3761,7 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
     it('when the main thread cannot persist the boundary (nack), the worker does NOT broadcast and the job fails before any external effect', async () => {
         const SESSION = 'session-sponsor-intent-aaaaaa';
         const facade = await initSession(SESSION);
-        vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
         try {
             facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
             wsTip.maxId = '100';
@@ -3786,7 +3804,7 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
 
     it('when the main thread does not acknowledge in time, the worker does NOT broadcast and names the configured wait', async () => {
         const facade = await initSession('session-sponsor-intent-bbbbbb');
-        vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
         try {
             facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
             wsTip.maxId = '100';
@@ -3830,7 +3848,7 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
 
     it('the dust intent takes the lowest segment the caller transaction leaves free', async () => {
         const facade = await initSession('session-sponsor-segment-aaaaa');
-        vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
         try {
             facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
             wsTip.maxId = '100';

@@ -109,6 +109,7 @@ import {
     acquireSponsor, releaseSponsor, PLATFORM_POOL_SENTINEL, sponsorCandidatesNonExclusive } from '../../srv/submission/sponsor-pool';
 import { resolveFeeSponsor } from '../../srv/submission/fee-sponsor';
 import { reportBroadcastOn, reportSubmissionRejectedOn } from '../../srv/submission/job-execution-context';
+import { runFinalizer } from '../fixtures/run-finalizer';
 
 function makeFakeService() {
     const handlers: Record<string, (req: any) => Promise<unknown>> = {};
@@ -783,14 +784,14 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
             ID: 'sub-1', txHash: '00late'.padEnd(64, '0'), contractAddress: NEW_ADDR,
             submitIntentData: JSON.stringify({ feeSponsor: 'sponsor-1', circuits: ['<deploy>'], contractAddress: NEW_ADDR, deployed: [NEW_ADDR], deployReservation: { grantId: 'grant-1', count: 1 } })
         };
-        const out: any = await finalize({ op: 'sponsorUnbound', grantId: 'grant-1', sponsorSessionId: 'sponsor-1' }, { ID: 'j', sessionId: 'sponsor-1' } as any,
-            { submissionId: 'sub-1', txHash: '00late'.padEnd(64, '0'), contractAddress: NEW_ADDR, finalizedAt: null });
+        const out: any = await runFinalizer(finalize, { op: 'sponsorUnbound', grantId: 'grant-1', sponsorSessionId: 'sponsor-1' }, { ID: 'j', sessionId: 'sponsor-1' } as any,
+            { submissionId: 'sub-1', txHash: '00late'.padEnd(64, '0'), contractAddress: NEW_ADDR, finalizedAt: null }, fakeDb);
         expect(grantBudget.record).toHaveBeenCalledWith(expect.anything(), 'grant-1', [NEW_ADDR]);
         expect(out).toMatchObject({ reconciled: true, status: 'finalized', deployed: [NEW_ADDR], contractAddress: NEW_ADDR, feeSponsor: 'sponsor-1', circuits: ['<deploy>'] });
         // a plain call reconciles without touching any grant
         grantBudget.record.mockClear();
         fakeDbRows.next = { ID: 'sub-2', submitIntentData: JSON.stringify({ circuits: ['attest'], contractAddress: 'dd'.repeat(32) }) };
-        const plain: any = await finalize({ op: 'sponsorUnbound', grantId: 'grant-1' }, { ID: 'j2', sessionId: 'sponsor-1' } as any, { submissionId: 'sub-2', txHash: '00plain'.padEnd(64, '0'), contractAddress: null, finalizedAt: null });
+        const plain: any = await runFinalizer(finalize, { op: 'sponsorUnbound', grantId: 'grant-1' }, { ID: 'j2', sessionId: 'sponsor-1' } as any, { submissionId: 'sub-2', txHash: '00plain'.padEnd(64, '0'), contractAddress: null, finalizedAt: null }, fakeDb);
         expect(grantBudget.record).not.toHaveBeenCalled();
         expect(plain.deployed).toBeUndefined();
     });
@@ -1146,7 +1147,7 @@ describe('minted token types are recorded on the grant', () => {
         const finalize = finalizers.get('sponsorSwap')!;
         expect(finalize).toBe(finalizers.get('sponsorUnboundTransaction'));
         fakeDbRows.next = { ID: 'sub-1', submitIntentData: JSON.stringify({ circuits: ['mint'], contractAddress: 'c', minted: [M] }) };
-        await finalize({ op: 'sponsorUnbound', grantId: 'grant-1' }, { ID: 'j', sessionId: 'sponsor-1' } as any, { submissionId: 'sub-1', txHash: '00ff'.padEnd(64, '0'), contractAddress: null, finalizedAt: null });
+        await runFinalizer(finalize, { op: 'sponsorUnbound', grantId: 'grant-1' }, { ID: 'j', sessionId: 'sponsor-1' } as any, { submissionId: 'sub-1', txHash: '00ff'.padEnd(64, '0'), contractAddress: null, finalizedAt: null }, fakeDb);
         expect(grantBudget.minted).toHaveBeenCalledWith(expect.anything(), 'grant-1', [M]);
     });
 });

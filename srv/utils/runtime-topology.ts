@@ -3,6 +3,7 @@ import { NightgateError } from './errors';
 import cds from '@sap/cds';
 import type { NightgatePluginConfig } from './nightgate-config';
 import { configString, configInt, configFlag } from './config';
+import { isProduction } from './production';
 
 export const NIGHTGATE_RUNTIME_MODE = 'single-instance' as const;
 
@@ -46,11 +47,8 @@ function configuredReplicaCount(config: NightgatePluginConfig): number {
         ?? 1;
 }
 
-/**
- * Cloud Foundry sets CF_INSTANCE_INDEX for every running instance, starting at 0.
- * An index above 0 means there is more than one instance, even if nobody configured a replica count.
- * Returns undefined when not on Cloud Foundry or when the value is invalid.
- */
+/** CF_INSTANCE_INDEX from Cloud Foundry, or undefined when absent or invalid.
+ *  An index above 0 means more than one instance runs, even if nobody configured a replica count. */
 function cfInstanceIndex(): number | undefined {
     const raw = process.env.CF_INSTANCE_INDEX;
     if (raw == null || !String(raw).trim()) return undefined;
@@ -66,12 +64,6 @@ function multitenancyEnabled(): boolean {
     return process.env.CDS_MULTITENANCY === 'true';
 }
 
-function productionMode(): boolean {
-    const profiles = (cds.env as any).profiles;
-    return process.env.NODE_ENV === 'production'
-        || (Array.isArray(profiles) && profiles.includes('production'))
-        || (profiles instanceof Set && profiles.has('production'));
-}
 
 function databaseKind(): string {
     const db = (cds.env as any).requires?.db ?? {};
@@ -113,7 +105,7 @@ export function getRuntimeTopology(config: NightgatePluginConfig = {}): RuntimeT
     if (multitenancy) {
         errors.push('CAP multitenancy is enabled, but Nightgate background work does not yet persist and restore tenant context.');
     }
-    if (productionMode() && dbKind === 'sqlite') {
+    if (isProduction() && dbKind === 'sqlite') {
         const message = 'SQLite is unsupported in production; configure PostgreSQL or SAP HANA.';
         if (allowProductionSqlite(config)) {
             warnings.push(`${message} NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true is active as an emergency compatibility override.`);
@@ -123,7 +115,7 @@ export function getRuntimeTopology(config: NightgatePluginConfig = {}): RuntimeT
     }
 
     // With `dummy` auth every request is a privileged user and could even export signing keys.
-    if (productionMode() && authKind() === 'dummy') {
+    if (isProduction() && authKind() === 'dummy') {
         const message = "Authentication kind 'dummy' serves every request unauthenticated and privileged.";
         if (configFlag('NIGHTGATE_ALLOW_UNAUTHENTICATED')) {
             warnings.push(`${message} NIGHTGATE_ALLOW_UNAUTHENTICATED=true is active; keep the port off any network.`);

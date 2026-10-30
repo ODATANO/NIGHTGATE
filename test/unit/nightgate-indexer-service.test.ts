@@ -494,8 +494,7 @@ describe('resumeCrawler', () => {
         // Crawler stays mocked: assert it was invoked with a resolved runtime config.
         expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
             enabled: true,
-            nodeUrl: expect.any(String),
-            requestTimeout: 30000
+            nodeUrl: expect.any(String)
         }));
     });
 

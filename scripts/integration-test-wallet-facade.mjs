@@ -1,13 +1,5 @@
-// Probe script: attempts to construct a WalletFacade against the real SDK.
-// Surfaces every config/typing peculiarity early so we can write the
-// production wiring with concrete knowledge instead of guesses.
-//
+// Checks that a WalletFacade can be built against the real SDK. It skips start(), so no running services are needed.
 // Run: node scripts/integration-test-wallet-facade.mjs
-//
-// NOTE: This DOES attempt to connect to indexer/proof-server URLs. If those
-// are not running on localhost, the construction may still succeed (facade
-// init is lazy) but `facade.start()` will hang or fail. We skip start() here
-// and only verify the static wiring.
 
 import { randomBytes } from 'node:crypto';
 import { WalletFacade } from '@midnightntwrk/wallet-sdk-facade';
@@ -28,10 +20,10 @@ console.log('     coinPublicKey:', zswapKeys.coinPublicKey.slice(0, 24) + '...')
 const configuration = {
     networkId: NetworkId.PreProd,
     provingServerUrl: new URL('http://localhost:6300'),
-    relayURL: new URL('wss://rpc.preprod.midnight.network/'),
+    relayURL: new URL(process.env.NIGHTGATE_NODE_URL || 'ws://127.0.0.1:9944'),
     indexerClientConnection: {
-        indexerHttpUrl: 'https://indexer.preprod.midnight.network/api/v4/graphql',
-        indexerWsUrl:   'wss://indexer.preprod.midnight.network/api/v4/graphql/ws'
+        indexerHttpUrl: process.env.NIGHTGATE_INDEXER_HTTP_URL || 'http://127.0.0.1:8088/api/v4/graphql',
+        indexerWsUrl:   process.env.NIGHTGATE_INDEXER_WS_URL || 'ws://127.0.0.1:8088/api/v4/graphql/ws'
     },
     txHistoryStorage: new InMemoryTransactionHistoryStorage()
 };

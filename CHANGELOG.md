@@ -1,5 +1,136 @@
 # Changelog
 
+## 0.40.0 - 2026-10-30
+
+### Changes
+
+- `@odatano/nightgate-tx` 0.20.0: a wallet syncs through the ODATANO
+  gateway. `createTxBuilder({ api })` and `createSwapWallet({ api })` with
+  `connect()` options that hold a gateway key (`token: 'oda_…'`) take the
+  gateway's indexer lane (`/indexer/api/v4/graphql` and its `/ws`, the key in
+  the query string) when no `indexerHttpUrl` and `indexerWsUrl` are given, so
+  a sponsored swap, transfer or coin call needs no indexer of its own.
+  `gatewayIndexerUrls(options)` exported for callers that build the URLs
+  themselves. An `api` connection without a gateway key still needs the
+  indexer URLs for a sync. `docs/txbuilder.md`: the option rows.
+- No built-in node or indexer for preprod and mainnet. Midnight retired its
+  hosted endpoints there (preprod 2026-10-09, mainnet 2026-09-30; the indexer
+  hosts answer HTTP 410), so `network: "preprod"` alone used to start and fail
+  at the first indexer call. Startup now refuses with a message that names
+  `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL` and both ways to fill
+  them: an own node and indexer, or Blockfrost with the project id in the URL.
+  Preview keeps its public defaults. `DEFAULT_NODE_URL` is gone from the
+  package exports; `DEFAULT_NODE_URLS` and `DEFAULT_INDEXER_URLS` list the
+  networks that have one.
+- `deriveIndexerWsUrl` keeps a query string: `…/api/v0?project_id=x` becomes
+  `…/api/v0/ws?project_id=x`, where it used to append `/ws` after the query.
+- `getBoardStatus` answers `version`, the running NIGHTGATE version, so a
+  client reads it instead of guessing from docs.
+- `@odatano/nightgate-tx`: `resolveBuilderPackage` fails before proving when
+  the lineage package's `contract.json` names another `compactRuntime`
+  major.minor than the builder runs (`runtimeVersionProblem`), instead of the
+  runtime's late `Version mismatch`.
+- Docs: `docs/self-hosted.md` (what each part needs, Blockfrost or own node
+  and indexer, which to pick); README, quickstart, operations, reference,
+  docker, txbuilder and `.env.example` name no retired host any more and
+  split hosted from self-hosted use. Reference: an empty
+  `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS` allows every call but names no payee
+  for an unshielded offer; a payout from a contract is never sponsored
+  (actions.md, reference.md).
+- `retireSwapOffer` on an offer that is already closed answers 200 with its
+  status (`expired`, `retired`, `filled`) instead of `409 SWAP_OFFER_NOT_OPEN`,
+  so a client tells "nothing to retire" from a board it could not reach. An
+  open row past its expiry is saved as expired on the way. 404 and 403 stay.
+- `@odatano/nightgate-tx` swap wallet: `revert(offer)` releases the coins of a
+  half or transfer whose build-time `revert()` is gone with its process, from
+  the offer file (the board keeps it past expiry), base64 or bytes; `pending()`
+  lists the reserved coins with the SDK's ttl for each. A half that was never
+  handed over used to keep its coins reserved in the saved state until a sync
+  from genesis.
+- The standalone image refuses to start on preprod and mainnet without
+  `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL` (entrypoint), instead
+  of staying offline behind a failing health check. `.env.example` leaves the
+  two lines commented, so a copied file gets the startup message rather than a
+  placeholder URL. Local defaults (`testnet`, `undeployed`) use `127.0.0.1`.
+- The server's `{ package }` registration checks the lineage package's
+  `compactRuntime` against the loaded runtime like the builder does
+  (`srv/utils/runtime-version.ts`, shared by both), so a package built for
+  another runtime is refused at registration, not in the worker.
+- `SWAP_OFFER_NOT_OPEN` is gone from the error codes; nothing raises it.
+- Breaking: `Transactions/byHash` returns `array of Transactions`. A hash can
+  occur in more than one block; the timestamp transaction repeats its hash in
+  every block. `Blocks/byHeight`, `Transactions/byHash` and
+  `ContractActions/history` are bound to the collection.
+- Breaking: every chain list function takes `limit` and `skip` and returns one
+  page in a fixed order: `range`, `byHash`, `byType`, `byAddress`, `history`,
+  `byOwner`, `unspent`, `getTopHolders`. The default page is 100, 1000 for
+  `byOwner` and `unspent`, 10 for `getTopHolders`; `limit` is 1 to 5000.
+  `byAddress` reads oldest first, `range` by height, the others newest first.
+  A value outside these ranges, or an unknown `txType` or a negative height,
+  is a 400. `byAddress`, `byOwner`,
+  `unspent` and `byHash` used to return every row. Indexes on hash, address,
+  owner and spent state with `createdAt` replace the single-column ones; the
+  first boot builds them. actions.md lists every chain read function.
+- A sponsored call may pay out what the called contract requires. With
+  `allowUnshieldedOffers`, an unshielded output to any address is accepted
+  when the call's proven result claims it (`claimedUnshieldedSpends`: same
+  token type, same recipient, at most that amount) and the segment balances
+  on the ledger. A claim, a refund or a prize from a contract no longer needs
+  a self-funded call. The other offer rules stay.
+- Rate classes: `grantDisclosureToHolders` and `revokeHolderDisclosure`
+  count as `compute`; `verifyDocument` and `verifyPredicateAttestation`
+  count as `read`.
+- `NIGHTGATE_RECEIPT_SIGNING_KEY` is read from the environment only, like the
+  `ENCRYPTION_*` keys, never from `cds.requires.nightgate`.
+- `getHealth`: an enabled crawler that stopped or failed makes the server
+  `unhealthy`; one without progress for 5 minutes makes it `degraded`.
+- Crawler: a transient or transport error schedules a new run instead of
+  stopping the crawler. A hard failure stops it with status `error`. The live
+  subscription halts after more than 10 consecutive non-transient errors. A
+  new head below the tip whose parent matches is checked against the node's
+  block hash at that height and handled as a fork when they differ.
+- Job finalizers write in the same database transaction that closes the job.
+  The offer board update and the disclosure reindex run after the commit.
+- `anchorDocument` and the `issue*` actions remove their rows again when the
+  job does not start or the request is a repeat of an earlier one.
+- A failed child step fails its workflow with `CHILD_FAILED`; the message
+  names the step, the steps already on chain and the need for a new
+  `idempotencyKey`.
+- `exportSigningKeys` reads keys stored under the previous password.
+- A sponsored transaction whose fee estimate fails uses a fixed fallback fee
+  and logs the failure.
+- Indexer GraphQL calls share one client with a per-call timeout and report
+  HTTP and GraphQL errors. Block timestamps are read in seconds or
+  milliseconds.
+- The wallet worker rejects calls when it exits before it is ready, forgets
+  progress and dust figures of a closed session, and waits for running calls
+  before it shuts down.
+- `slotWidth` accepts 16 or 32 at every registration path.
+- `deriveIndexerWsUrl` adds `/ws` only when the path does not end in it.
+- A grant that mints from a pool wallet skips the session owner check.
+- `registerPassport.passportId` is `Hex64`.
+- `issueFieldPredicateAttestationBatch` lists every claim field; fields the
+  predicate does not use are `null`.
+- `rxjs` is a declared dependency.
+- `@odatano/nightgate-tx` types: `ZkAssetResult.refreshed` and `verified`,
+  `BuiltSwapHalf.tx`, `BuiltTransfer.tx`, `JobStatus.transactionHash`.
+- Docs: the job code table lists `CHILD_FAILED`, `getHealth` lists all fields
+  and status rules, `getReceiptKey` is documented, `getBoardStatus` lists
+  `factoryContract` and `version`, the `issue*` signatures show `validUntil`.
+- `verifyDocument` and `verifyPredicateAttestation` report `included: true`
+  for a landed transaction. They found the indexed row by the extrinsic hash
+  only, while a job records the ledger hash, so `included` stayed false.
+- A request with more than one invalid parameter answers 400 with every
+  problem in `details`, instead of a 500 without a message. The status comes
+  from the parts, as in CAP.
+- The wallet worker waits at most 40 s for running submits at shutdown and
+  then saves every wallet, instead of waiting until the main thread's 60 s
+  limit ended it without a final save.
+- `.dockerignore` keeps local notes, agent files and wallet files out of an
+  image built from a working tree.
+- Schema: the `getBoardStatus` return type gains `version`; the image tag
+  moves to 0.40.0.
+
 ## 0.39.4 - 2026-10-29
 
 ### Changes

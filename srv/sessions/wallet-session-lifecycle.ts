@@ -123,19 +123,17 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db:
     throw new Error(`Unsupported wallet command operation: ${(command as any).op}`);
 }
 
-/**
- * Returns the accountId of an active signing session owned by the user. Another user's session reads as 404.
- * Reads outside the request transaction, so no database connection is held while callers wait for the worker.
- * As a result it does not see writes the request has not committed yet.
- */
-export async function loadSigningSessionAccountId(
+type SessionRefusal = { ok: false; status: number; msg: string };
+
+/** Checks the user's active signing session without decrypting it; others read as 404. Reads outside the request tx, so no connection is held. */
+export async function checkSigningSession(
     db: DbRunner,
     sessionId: string,
     /** `undefined` skips the owner check. Use it only for a configured platform fee sponsor. */
     userId: string | undefined,
     /** Use only for a configured platform fee sponsor, which does not expire. */
     ignoreExpiry = false
-): Promise<{ ok: true; accountId: string } | { ok: false; status: number; msg: string }> {
+): Promise<{ ok: true; session: Row<WalletSession, 'sessionId'>; encryptedViewingKey: string } | SessionRefusal> {
     const where: Record<string, unknown> = { sessionId, isActive: true };
     if (userId !== undefined) where.userId = userId;
     const session: Row<WalletSession, 'sessionId'> | undefined = await runWithoutAmbientTx(() => db.run(
@@ -147,20 +145,25 @@ export async function loadSigningSessionAccountId(
     if (!ignoreExpiry && isSessionExpired(sessionId, session.expiresAt)) {
         return { ok: false, status: 410, msg: 'Session expired' };
     }
+    return { ok: true, session, encryptedViewingKey: session.encryptedViewingKey };
+}
+
+/** `checkSigningSession`, then the session's accountId. It does not see writes the request has not committed yet. */
+export async function loadSigningSessionAccountId(
+    db: DbRunner, sessionId: string, userId: string | undefined, ignoreExpiry = false
+): Promise<{ ok: true; accountId: string } | SessionRefusal> {
+    const checked = await checkSigningSession(db, sessionId, userId, ignoreExpiry);
+    if (!checked.ok) return checked;
     let viewingKey: string;
     try {
-        viewingKey = decrypt(session.encryptedViewingKey, getEncryptionKey(), walletSessionViewingKeyBinding(session.sessionId));
+        viewingKey = decrypt(checked.encryptedViewingKey, getEncryptionKey(), walletSessionViewingKeyBinding(checked.session.sessionId));
     } catch {
         return { ok: false, status: 500, msg: 'Failed to decrypt session keys (ENCRYPTION_KEY mismatch?)' };
     }
     return { ok: true, accountId: deriveAccountId(viewingKey) };
 }
 
-/**
- * True if another live session still needs this wallet in memory. That is any session
- * of the same user, or another user's session with a signing key. Another user's
- * view-only session does not count. Callers must deactivate their own rows first.
- */
+/** True if another live session needs this wallet: the same user's, or another user's with a signing key. Deactivate your own rows first. */
 async function hasLiveSessionForWallet(
     db: DbRunner,
     viewingKeyHash: string | null | undefined,
@@ -174,13 +177,10 @@ async function hasLiveSessionForWallet(
             .where({ viewingKeyHash, isActive: true })
     ));
     if (!Array.isArray(rows)) return false;
-    return rows.some((r: any) => (r.userId === userId || !!r.encryptedSeedKey) && !isSessionExpired(r.sessionId, r.expiresAt));
+    return rows.some((r: Pick<WalletSession, 'sessionId' | 'expiresAt' | 'userId' | 'encryptedSeedKey'>) => (r.userId === userId || !!r.encryptedSeedKey) && !isSessionExpired(r.sessionId, r.expiresAt));
 }
 
-/**
- * Drops the wallet from memory unless another session still uses it. Never throws.
- * Call it after deactivating your own rows, otherwise two parallel disconnects both keep it.
- */
+/** Drops the wallet from memory unless another session uses it. Never throws. Call after deactivating your own rows, or two parallel disconnects both keep it. */
 export async function evictFacadeUnlessShared(
     db: DbRunner,
     session: { sessionId: string; encryptedViewingKey?: string | null; viewingKeyHash?: string | null; userId?: string | null },
@@ -198,5 +198,8 @@ export async function evictFacadeUnlessShared(
             log.info(`${context}: evicting facade ${accountId.slice(0, 16)}`);
             await evictWalletFacade(accountId);
         });
-    } catch { /* best-effort eviction */ }
+    } catch (err) {
+        // Best effort: a facade left loaded only costs memory until the worker restarts.
+        log.warn(`${context}: facade eviction failed: ${errorMessage(err)}`);
+    }
 }

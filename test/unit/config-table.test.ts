@@ -123,6 +123,7 @@ describe('config table: CAP mapping', () => {
         process.env.NIGHTGATE_WORKER_RPC_TIMEOUT_MS = '7000';
         expect(configMs('NIGHTGATE_WORKER_RPC_TIMEOUT_MS')).toBe(7000);
         expect(resolveConfigTable({}, { encryptionKey: 'nope' }).values.ENCRYPTION_KEY).toBeUndefined();
+        expect(resolveConfigTable({}, { receiptSigningKey: 'a'.repeat(64) }).values.NIGHTGATE_RECEIPT_SIGNING_KEY).toBeUndefined();
     });
 });
 

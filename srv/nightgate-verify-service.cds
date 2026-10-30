@@ -1,19 +1,15 @@
 using { Hex64 } from '../db/types';
 
-/**
- * The two verify functions of the Nightgate service, without login.
+/** The two verify functions of the Nightgate service, without login.
  * Off by default. Set `NIGHTGATE_PUBLIC_VERIFY=true` to enable it.
- * Requests per client address are limited by `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` per minute.
- */
+ * Requests per client address are limited by `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` per minute. */
 @path    : '/odata/v4/midnight-verify'
 @requires: 'any'
 service NightgateVerifyService {
 
-    /**
-     * Checks on chain whether an attester has attested a payload hash.
+    /** Checks on chain whether an attester has attested a payload hash.
      * Only the attester vouches for its attestation, so check `attesterId` against attesters you trust.
-     * If nothing is found, the result is `verified: false`, not an error.
-     */
+     * If nothing is found, the result is `verified: false`, not an error. */
     function verifyAttestationState(contractAddress: String,
                                     attesterId: Hex64,
                                     payloadHash: Hex64,
@@ -34,11 +30,9 @@ service NightgateVerifyService {
         documentId    : String;
     };
 
-    /**
-     * Checks on chain whether a proof about a document field was recorded as true.
+    /** Checks on chain whether a proof about a document field was recorded as true.
      * The inputs must be exactly those of the proof, otherwise the result is `verified: false`.
-     * For a comparison of two documents, A and B must be in the same order as when proving.
-     */
+     * For a comparison of two documents, A and B must be in the same order as when proving. */
     function verifyPredicateState(contractAddress: String,
                                   attesterId: Hex64,
                                   payloadHash: Hex64, // document A when comparing two documents

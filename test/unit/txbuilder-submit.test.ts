@@ -344,15 +344,17 @@ describe('txbuilder submit: probeLanded confirms by identifier', () => {
         expect(found).toMatchObject({ height: '7', applied: true });
     });
 
-    it('sends the identifier-offset query', async () => {
+    it('sends the identifier as a query variable', async () => {
         const { probeLanded } = await importSubmit();
         let body = '';
         const capture = (async (_url: string, init: { body: string }) => {
             body = init.body;
-            return { json: async () => ({ data: { transactions: [] } }) };
+            return { ok: true, status: 200, json: async () => ({ data: { transactions: [] } }) };
         }) as unknown as typeof fetch;
         await probeLanded('abc123', { indexerHttpUrl: 'http://i', fetchFn: capture });
-        expect(JSON.parse(body).query).toContain('transactions(offset:{identifier:"abc123"})');
+        // The identifier travels as a variable, never inside the query text.
+        expect(JSON.parse(body).query).toContain('transactions(offset: $offset)');
+        expect(JSON.parse(body).variables).toEqual({ offset: { identifier: 'abc123' } });
     });
 });
 

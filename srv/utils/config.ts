@@ -1,12 +1,9 @@
-/**
- * Typed getters for the settings listed in `config-table.ts`.
- * A value comes from the environment first, then from the CAP config, then from the default.
- * In the wallet worker thread the values come from a copy made by the main thread.
- * This module does not import `@sap/cds`, because the worker loads it too.
- */
+// Typed getters for the settings listed in `config-table.ts`.
+// In the wallet worker thread the values come from a copy made by the main thread.
+// This module does not import `@sap/cds`, because the worker loads it too.
 
 import {
-    CONFIG_TABLE, configSpec, resolveOne, resolveConfigTable,
+    CONFIG_TABLE, configSpec, resolveOne, resolveConfigTable, camelConfigKey, isEnvOnlyKey,
     type ConfigValue, type ConfigSpec
 } from './config-table';
 
@@ -20,10 +17,8 @@ const warned = new Set<string>();
 
 let workerDataChecked = false;
 
-/**
- * In the worker thread, takes the main thread's copy of the settings from `workerData` on first use.
- * `node:worker_threads` is required lazily because some tests mock it.
- */
+/** In the worker thread, takes the main thread's copy of the settings from `workerData` on first use.
+ *  `node:worker_threads` is required lazily because some tests mock it. */
 function pinFromWorkerDataOnce(): void {
     if (workerDataChecked) return;
     workerDataChecked = true;
@@ -96,10 +91,8 @@ export function configIsSet(key: string): boolean {
     const fromEnv = process.env[key];
     if (fromEnv !== undefined && fromEnv.trim() !== '') return true;
     const cap = overrideSource?.();
-    if (!cap) return false;
-    const camel = key.replace(/^NIGHTGATE_/, '').toLowerCase().split('_');
-    const camelKey = camel[0] + camel.slice(1).map(p => p.charAt(0).toUpperCase() + p.slice(1)).join('');
-    const v = cap[camelKey];
+    if (!cap || isEnvOnlyKey(key)) return false;
+    const v = cap[camelConfigKey(key)];
     return v !== undefined && v !== null && v !== '';
 }
 
@@ -117,7 +110,9 @@ export function configNumber(key: string): number {
     return v;
 }
 
+/** Like `configNumber`, and the key must be a duration in ms. */
 export function configMs(key: string): number {
+    if (configSpec(key).kind !== 'ms') throw new Error(`config: '${key}' is not a duration in ms`);
     return configNumber(key);
 }
 

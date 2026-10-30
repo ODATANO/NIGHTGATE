@@ -1,25 +1,24 @@
-/**
- * Shared helpers, command types and rate limits for the submission handlers.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Shared helpers, command types and rate limits for the submission handlers.
+// SPDX-License-Identifier: Apache-2.0
+import cds from '@sap/cds';
+import { Documents, PredicateAttestations, Transactions, TransactionResults, type Transaction, type TransactionResult } from '#cds-models/midnight';
 import { getArtifactGenerationDigest } from '../contract-registry';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../../utils/nightgate-config';
-import { checkRateClass, type RateClass } from '../../utils/rate-classes';
-import { WorkflowReconciliationRequiredError } from '../background-jobs';
+import { WorkflowReconciliationRequiredError, type StartJobResult } from '../background-jobs';
 import { UINT64_MAX } from '../verify-state';
 import { effectiveSponsorPolicy, getGlobalSponsorPolicy, type SponsorPolicy } from '../sponsor-policy';
-import { currentGrantPolicy } from '../../sessions/agent-grants';
-import { formatErr } from '../../utils/format-error';
+import { currentGrantPolicy, consumeValueBudget } from '../../sessions/agent-grants';
+
 import { configInt } from '../../utils/config';
 import type { DbRunner, TxCapableDb } from '../../utils/db-types';
-import type { ActionRequest } from '@sap/cds';
+import type { ActionRequest, Request } from '@sap/cds';
 import { isNightgateError, NightgateError, errorMessage } from '../../utils/errors';
-import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
+import { HEX64_ANY_CASE_RE, bareHex } from '../../utils/hex-patterns';
 import { withLockContentionRetry } from '../db-write-retry';
+const { DELETE, SELECT } = cds.ql;
 
 /**
- * Records a workflow step whose transaction is already on chain.
- * If the write keeps failing, the parent job is parked. Its re-run reuses the landed transaction and repeats only this write.
+ * Records a workflow step whose transaction is already on chain. If the write keeps failing, the parent job is parked and its re-run repeats only this write.
  */
 export async function recordProven(parentJobId: string, txHash: string, write: () => Promise<unknown>): Promise<void> {
     try {
@@ -31,10 +30,7 @@ export async function recordProven(parentJobId: string, txHash: string, write: (
     }
 }
 
-/**
- * Reads the sponsor policy when the job runs, not when it was queued.
- * So a revoked grant or a tightened policy also applies to jobs already waiting.
- */
+/** Reads the sponsor policy when the job runs, so a revoked grant or a tightened policy also applies to queued jobs. */
 export async function liveSponsorPolicyForJob(db: DbRunner, command: { grantId?: string | null }): Promise<SponsorPolicy> {
     const grant = command.grantId ? await currentGrantPolicy(db, command.grantId) : null;
     if (command.grantId && !grant) {
@@ -42,7 +38,6 @@ export async function liveSponsorPolicyForJob(db: DbRunner, command: { grantId?:
     }
     return effectiveSponsorPolicy(getGlobalSponsorPolicy(), grant);
 }
-
 
 /** The vault contract only accepts a `valid_until` after the block time and at most 5 years ahead. */
 export const CLAIM_MAX_LIFETIME_S = 5 * 365 * 24 * 60 * 60;
@@ -64,10 +59,7 @@ export function parseValidUntil(raw: unknown): { validUntil?: number; error?: st
     return { validUntil: v };
 }
 
-/**
- * Private proof inputs for one circuit call. Proofs that compare two documents
- * use `docPair` and need no Merkle path, so `siblings` and `dirs` may be missing.
- */
+/** Private proof inputs for one circuit call. Proofs that compare two documents use `docPair` and omit `siblings` and `dirs`. */
 export type MerkleProofBundle = {
     fieldValue?: string;
     /** Salt of the field, 64 hex chars. Every single-field proof needs it. */
@@ -126,38 +118,73 @@ export type ContractCommandV1 =
     | { op: 'retract'; mode: number; key: string; attesterId?: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string };
 
 /**
- * A command plus the digest of the exact contract build it was created for.
- * The registered name can later point to a different build, so the digest is checked before running.
+ * A command plus the digest of the contract build it was made for. The name can later point to another build, so the digest is checked before running.
  */
 export type ContractCommandV1WithProvenance = ContractCommandV1 & { artifactDigest?: string };
 
-/** Checks a Merkle path of fixed depth. On bad input it rejects with 400 and returns null. */
-// CAP checks the element types of the arrays, not the hex format of a plain `array of Hex64`.
-export function parseInclusionPath(
-    req: ActionRequest<unknown, unknown>,
-    siblings: readonly unknown[] | null | undefined,
-    dirs: readonly unknown[] | null | undefined,
-    depth: number,
-    names: { siblings: string; dirs: string }
-): { siblings: string[]; dirs: boolean[] } | null {
+/** The command a sponsor job stores. The executor reads the policy again when it runs. */
+export type SponsorJobCommand = Partial<Pick<SponsorPolicy, 'allowedContracts' | 'allowedCircuits' | 'allowDeploy' | 'ownContracts' | 'allowedTokenTypes' | 'allowUnshieldedOffers' | 'allowedUnshieldedTokenTypes'>> & {
+    sponsorSessionId: string;
+    grantId?: string;
+} & (
+    | { op: 'sponsorFinalized'; finalizedTxB64: string; unboundTxB64?: never; swap?: never; transfer?: never }
+    | { op: 'sponsorUnbound'; unboundTxB64?: string; swap?: { makerHalfB64: string; takerHalfB64: string; offerId?: string }; transfer?: { txB64: string; tokenType: string; amount: string } }
+);
+
+/** A non-negative integer argument up to `max`: the value, or what is wrong with it. */
+export function readUnsignedArg(raw: unknown, name: string, max: bigint, exceeds: string): bigint | string {
+    if (raw === undefined || raw === null || raw === '') return `${name} is required`;
+    let n: bigint;
+    try { n = BigInt(raw as string | number | bigint); } catch { return `${name} must be an integer (decimal string)`; }
+    if (n < 0n) return `${name} must be a non-negative integer`;
+    if (n > max) return `${name} ${exceeds}`;
+    return n;
+}
+
+/** The `args` JSON of a contract call: the array, or what is wrong with it. An absent value is no arguments. */
+export function readArgsJson(args: string | null | undefined): unknown[] | string {
+    if (!args) return [];
+    try {
+        const v = JSON.parse(args);
+        return Array.isArray(v) ? v : 'args must be a JSON array';
+    } catch {
+        return 'args must be valid JSON';
+    }
+}
+
+export const VALUE_EXCEEDS = 'exceeds Uint<64>';
+export const THRESHOLD_EXCEEDS = 'exceeds the recorded range (at most 9223372036854775807)';
+
+export interface InclusionPath { siblings: string[]; dirs: boolean[] }
+
+/**
+ * Checks a fixed-depth Merkle path and returns it with lowercase hashes, or what is wrong. CAP does not check the hex format of `array of Hex64`.
+ */
+export function readInclusionPath(siblings: unknown, dirs: unknown, depth: number, names: { siblings: string; dirs: string }): InclusionPath | string {
     const sibs = siblings ?? [];
     const ds = dirs ?? [];
-    if (!Array.isArray(sibs) || sibs.length !== depth) {
-        req.reject(400, `${names.siblings} must be an array of ${depth} hashes`); return null;
-    }
-    if (!Array.isArray(ds) || ds.length !== depth) {
-        req.reject(400, `${names.dirs} must be an array of ${depth} booleans`); return null;
-    }
-    for (const s of sibs) {
-        if (typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s)) {
-            req.reject(400, `each ${names.siblings} entry must be 64 hex chars (32 bytes)`); return null;
-        }
-    }
-    for (const d of ds) {
-        // Strict: Boolean("false") is true and would corrupt the path.
-        if (typeof d !== 'boolean') { req.reject(400, `${names.dirs} entries must be booleans`); return null; }
-    }
+    if (!Array.isArray(sibs) || sibs.length !== depth) return `${names.siblings} must be an array of ${depth} hashes`;
+    if (!Array.isArray(ds) || ds.length !== depth) return `${names.dirs} must be an array of ${depth} booleans`;
+    if (sibs.some(s => typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s))) return `${names.siblings} entries must be 64 hex chars (32 bytes)`;
+    // Only real booleans. Boolean("false") is true and would give a wrong path.
+    if (ds.some(d => typeof d !== 'boolean')) return `${names.dirs} entries must be booleans`;
     return { siblings: (sibs as string[]).map(s => s.toLowerCase()), dirs: ds as boolean[] };
+}
+
+/** `readInclusionPath` for a request: on bad input it rejects with 400 and returns null. */
+export function parseInclusionPath(
+    req: ActionRequest<unknown, unknown>, siblings: unknown, dirs: unknown, depth: number, names: { siblings: string; dirs: string }
+): InclusionPath | null {
+    const path = readInclusionPath(siblings, dirs, depth, names);
+    if (typeof path === 'string') { req.reject(400, path); return null; }
+    return path;
+}
+
+/** `readInclusionPath` that throws the problem, for checks inside a parse loop. */
+export function inclusionPathOrThrow(siblings: unknown, dirs: unknown, depth: number, names: { siblings: string; dirs: string }): InclusionPath {
+    const path = readInclusionPath(siblings, dirs, depth, names);
+    if (typeof path === 'string') throw new Error(path);
+    return path;
 }
 
 export function validateSchemaSlots(schema: unknown, name: string, width = 16): SchemaSlotWire[] {
@@ -212,10 +239,7 @@ export function validateOpening(opening: unknown, name: string, width = 16): Ope
     return { saltSeed: o.saltSeed.toLowerCase(), slots };
 }
 
-/**
- * True when the mask allows every real field to change, which makes the claim empty.
- * The circuit rejects such a claim, so this answers with a 400 before proving.
- */
+/** True when the mask lets every real field change, so the claim is empty. The circuit rejects that, so callers answer 400 before proving. */
 export function isVacuousMask(allowedMask: number, schema: SchemaSlotWire[]): boolean {
     return schema.every((s, i) => s.kind === 2 || (allowedMask & (1 << i)) !== 0);
 }
@@ -238,14 +262,13 @@ export function parseDocPairInputs(
             openingB: validateOpening(openingB, 'openingB', width)
         };
     } catch (e: unknown) {
-        req.reject(400, formatErr(e));
+        req.reject(400, errorMessage(e));
         return null;
     }
 }
 
 /**
- * WalletFacade config. Throws on an invalid network name.
- * The server keeps running after a failed init, so this must not fall back to a default network.
+ * WalletFacade config. Throws on an invalid network name, because the server keeps running after a failed init and must not fall back to a default network.
  */
 export function facadeConfigFromEnv() {
     const nightgateConfig = getNightgatePluginConfig();
@@ -282,15 +305,34 @@ export function rejectIfMainnetBlocked(req: ActionRequest<unknown, unknown>): bo
     return false;
 }
 
-/** Counts the call against the class for the caller and the scope; rejects with 429 and returns false when over. */
-export function checkRate(cls: RateClass, scope: string, req: ActionRequest<unknown, unknown>, count = 1): boolean {
-    return checkRateClass(cls, scope, req, count);
+/**
+ * Runs `insertRows`, then starts the job. The rows are removed again when no job starts or a repeated request reuses an earlier job.
+ */
+export async function startJobWithRows<R extends StartJobResult>(
+    db: DbRunner, entity: typeof Documents | typeof PredicateAttestations, ids: string[],
+    insertRows: unknown, start: () => Promise<R>
+): Promise<R> {
+    await db.run(insertRows);
+    const drop = () => db.run(DELETE.from(entity).where({ ID: { in: ids } }));
+    let job: R;
+    try {
+        job = await start();
+    } catch (err) {
+        await drop();
+        throw err;
+    }
+    if (job.deduplicated) await drop();
+    return job;
 }
 
-/**
- * Run `fn` in one transaction of `db` (commit on return, rollback on throw).
- * A test double without `tx` runs it directly, without atomicity.
- */
+/** A grant's value budget takes the amount a call moves out. Calls without a grant have no budget. Returns false after rejecting. */
+export async function takeValueBudget(req: Request, db: DbRunner, tokenType: string, amount: bigint): Promise<boolean> {
+    const grantId = req.agentGrant?.ID;
+    if (!grantId) return true;
+    return consumeValueBudget(db, req, String(grantId), tokenType, amount);
+}
+
+/** Runs `fn` in one transaction of `db`, commit on return and rollback on throw. A test double without `tx` runs it directly. */
 export async function runInOneTransaction<T>(db: TxCapableDb, fn: (tx: DbRunner) => Promise<T>): Promise<T> {
     if (typeof db?.tx === 'function') return db.tx(fn);
     return fn(db);
@@ -308,7 +350,21 @@ export async function runSubmission<T>(req: ActionRequest<unknown, unknown>, op:
             if (err.code === 'JOB_ADMISSION_BUSY') setRetryAfter(req, (err as { retryAfterSeconds?: number }).retryAfterSeconds ?? 2);
             return req.reject(err);
         }
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errorMessage(err);
         return req.reject(500, msg);
     }
+}
+
+/** True when the indexed transaction of a job's txHash landed with a success outcome. Matches the ledger hash, or the extrinsic hash older rows hold. */
+export async function landedOnChain(db: DbRunner, txHash: string | null | undefined): Promise<boolean> {
+    const bare = bareHex(txHash);
+    if (!bare) return false;
+    const tx: Pick<Transaction, 'ID'> | undefined = await db.run(
+        SELECT.one.from(Transactions).columns('ID').where`ledgerTxHash = ${bare} or hash = ${'0x' + bare}`
+    );
+    if (!tx?.ID) return false;
+    const result: Pick<TransactionResult, 'status' | 'outcomeSource'> | undefined = await db.run(
+        SELECT.one.from(TransactionResults).columns('status', 'outcomeSource').where({ transaction_ID: tx.ID })
+    );
+    return result?.status === 'SUCCESS' && result?.outcomeSource === 'substrate-system-events';
 }

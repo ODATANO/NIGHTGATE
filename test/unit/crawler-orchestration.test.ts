@@ -1182,7 +1182,7 @@ describe('MidnightCrawler orchestration', () => {
             expect((crawler as any).pendingHeights).toContain(3);
         });
 
-        it('records transient live-processing failures and pauses when the live breaker trips', async () => {
+        it('records transient live-processing failures and keeps retrying them past the breaker', async () => {
             let liveCallback: ((header: any) => Promise<void>) | undefined;
             const provider = {
                 subscribeFinalizedHeads: vi.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => {
@@ -1208,8 +1208,14 @@ describe('MidnightCrawler orchestration', () => {
 
                 expect(recordErrorSpy).toHaveBeenCalledWith('Request timeout');
                 expect(errorSpy).toHaveBeenCalledWith('Live: failed to process block 2 (transient): Request timeout');
-                expect(errorSpy).toHaveBeenCalledWith('Too many consecutive errors in live mode, pausing...');
+                expect((crawler as any).poisonBlock).toBeNull();
                 expect((crawler as any).processing).toBe(false);
+
+                // A block that keeps failing for another reason halts indexing at that block.
+                vi.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('decode failed: bad payload'));
+                await liveCallback!({ number: '0x2', parentHash: '0x1', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
+                expect((crawler as any).poisonBlock).toEqual({ height: 2, message: 'decode failed: bad payload' });
+                expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Block 2 does not index; halting'));
             } finally {
                 errorSpy.mockRestore();
             }
@@ -1370,6 +1376,22 @@ describe('MidnightCrawler orchestration', () => {
                 number: '0xa', parentHash: '0x9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
             })).resolves.toBeNull();
             expect(findForkPointSpy).not.toHaveBeenCalled();
+        });
+
+        it('detects a fork below the tip whose parent matches but whose own block differs', async () => {
+            const getBlockHash = vi.fn().mockResolvedValue('0xa-node');
+            const crawler = new MidnightCrawler({ getBlockHash } as any, { enabled: true });
+            (crawler as any).db = db;
+            await seedBlock(9, '0x9');
+            await seedBlock(10, '0xa-ours');
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x12', lastIndexedHeight: 12 });
+            const head = { number: '0xa', parentHash: '0x9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } };
+
+            await expect((crawler as any).checkForReorg(head)).resolves.toEqual({ forkHeight: 10, oldTipHash: '0x12', newTipHash: '0xa-node' });
+            expect(getBlockHash).toHaveBeenCalledWith(10);
+
+            getBlockHash.mockResolvedValue('0xa-ours');
+            await expect((crawler as any).checkForReorg(head)).resolves.toBeNull();
         });
 
         it('still detects a real fork below the tip (replayed height, diverging parent)', async () => {
@@ -1559,9 +1581,8 @@ describe('MidnightCrawler orchestration', () => {
             expect(Number(log.forkHeight)).toBe(10);
         });
 
-        it('returns a reorg-log id but writes no log when there are no indexed blocks to roll back', async () => {
-            // No blocks at/above the fork height → the tx returns early before
-            // inserting a ReorgLog row, but handleReorg still returns its id.
+        it('returns null and writes no log when there are no indexed blocks to roll back', async () => {
+            // No blocks at or above the fork height, so no ReorgLog row exists to update later.
             const crawler = new MidnightCrawler({} as any, { enabled: true });
             (crawler as any).db = db;
 
@@ -1570,7 +1591,7 @@ describe('MidnightCrawler orchestration', () => {
                 oldTipHash: '0xold',
                 newTipHash: '0xnew'
             });
-            expect(typeof reorgLogId).toBe('string');
+            expect(reorgLogId).toBeNull();
 
             // No ReorgLog row was written (early return), no blocks/sync touched.
             expect((await db.run(cds.ql.SELECT.from(REORG_LOG))).length).toBe(0);

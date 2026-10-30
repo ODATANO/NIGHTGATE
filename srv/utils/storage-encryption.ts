@@ -1,8 +1,6 @@
-/**
- * The same encryption format the Midnight SDK uses for its LevelDB private state, so data can move between both.
- * Layout, base64 encoded: version byte, 32-byte salt, 12-byte IV, 16-byte tag, then AES-256-GCM ciphertext.
- * The key is PBKDF2-SHA256 over the password and salt with 600,000 rounds.
- */
+// The encryption format of the Midnight SDK's LevelDB private state, so data can move between both.
+// Base64 of version byte, 32-byte salt, 12-byte IV, 16-byte tag, then the AES-256-GCM ciphertext.
+// The key is PBKDF2-SHA256 over the password and salt with 600,000 rounds.
 
 import crypto from 'crypto';
 

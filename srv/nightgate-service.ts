@@ -16,14 +16,22 @@ import { getNightgatePluginConfig, resolveNightgateRuntimeConfig } from './utils
 import { RateLimiter } from './utils/rate-limiter';
 import { configNumber } from './utils/config';
 import { rejectRateLimited } from './utils/rate-classes';
+import { Blocks, Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions, type WalletSession, type TransactionResult, type TransactionSegment, type Transaction as IndexedTransaction, type BackgroundJob } from '#cds-models/midnight';
+import { normalizeHttpError } from './utils/http-errors';
+import { getJobStatus, Block, ContractAction, ContractState, NightBalance, Transaction, UnshieldedUtxo } from '#cds-models/NightgateService';
+import { narrowRead } from './utils/request-types';
 
-// One limit for all callers of this server: the public indexer blocks the host's IP when it gets too many requests.
+// One limit for all callers of this server, because an indexer may block the host's IP after too many requests.
 let stateAtLimiter: RateLimiter | null = null;
 const stateAtIndexerLimiter = (): RateLimiter =>
     (stateAtLimiter ??= new RateLimiter({ windowMs: 1000, maxRequests: configNumber('NIGHTGATE_STATE_AT_INDEXER_RATE') }));
 
 // Equal requests share one indexer read. A state at a fixed height is kept briefly; the newest state never is.
 const STATE_AT_CACHE_MS = 5_000;
+/** Limit and skip of a list function. The model checks their ranges, at most 5000 rows per call. */
+function listPage(data: { limit?: number | null; skip?: number | null }, defaultLimit: number): { limit: number; skip: number } {
+    return { limit: data.limit ?? defaultLimit, skip: data.skip ?? 0 };
+}
 const stateAtInFlight = new Map<string, Promise<FetchedContractState | null>>();
 const stateAtCache = new Map<string, { at: number; value: FetchedContractState }>();
 
@@ -102,10 +110,6 @@ function fetchContractStateFromIndexers(): ContractStateFetcher {
     };
 }
 
-import { Blocks, Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions, type WalletSession, type TransactionResult, type TransactionSegment, type Transaction as IndexedTransaction, type BackgroundJob } from '#cds-models/midnight';
-import { normalizeHttpError } from './utils/http-errors';
-import { getJobStatus } from '#cds-models/NightgateService';
-import { Block, ContractAction, ContractState, NightBalance, Transaction, UnshieldedUtxo } from '#cds-models/NightgateService';
 
 
 export default class NightgateService extends cds.ApplicationService {
@@ -141,7 +145,7 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         this.on(Block.actions.range, 'Blocks', async (req) => {
-            const { startHeight, endHeight, limit } = req.data;
+            const { startHeight, endHeight } = req.data;
 
             if (startHeight == null || endHeight == null) {
                 return req.reject(400, 'startHeight and endHeight are required');
@@ -155,13 +159,13 @@ export default class NightgateService extends cds.ApplicationService {
                 return req.reject(400, 'endHeight must be greater than or equal to startHeight');
             }
 
-            const effectiveLimit = Math.min(Math.max(limit || 100, 1), 5000);
+            const page = listPage(req.data, 100);
             // A tagged template, because '>=' and '<=' on one column in an object silently lose a condition.
             return this.db.run(
                 cds.ql.SELECT.from(Blocks)
                     .where`height >= ${startHeight} and height <= ${endHeight}`
                     .orderBy('height asc')
-                    .limit(effectiveLimit)
+                    .limit(page.limit, page.skip)
             );
         });
 
@@ -172,7 +176,8 @@ export default class NightgateService extends cds.ApplicationService {
         this.on(Transaction.actions.byHash, 'Transactions', async (req) => {
             const { hash } = req.data;
             if (!hash) return req.reject(400, 'hash is required');
-            return this.db.run(cds.ql.SELECT.from(Transactions).where({ hash }));
+            const page = listPage(req.data, 100);
+            return this.db.run(cds.ql.SELECT.from(Transactions).where({ hash }).orderBy('createdAt desc', 'ID').limit(page.limit, page.skip));
         });
 
         this.on(Transaction.actions.byIdentifier, 'Transactions', async (req) => {
@@ -199,15 +204,14 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         this.on(Transaction.actions.byType, 'Transactions', async (req) => {
-            const { txType, limit } = req.data;
+            const { txType } = req.data;
             if (!txType) return req.reject(400, 'txType is required');
-
-            const effectiveLimit = Math.min(Math.max(limit || 100, 1), 2000);
+            const page = listPage(req.data, 100);
             return this.db.run(
                 cds.ql.SELECT.from(Transactions)
                     .where({ txType })
-                    .orderBy('createdAt desc')
-                    .limit(effectiveLimit)
+                    .orderBy('createdAt desc', 'ID')
+                    .limit(page.limit, page.skip)
             );
         });
 
@@ -218,19 +222,21 @@ export default class NightgateService extends cds.ApplicationService {
         this.on(ContractAction.actions.byAddress, 'ContractActions', async (req) => {
             const { address } = req.data;
             if (!address) return req.reject(400, 'address is required');
+            const page = listPage(req.data, 100);
             return this.db.run(
-                cds.ql.SELECT.from(ContractActions).where({ address })
+                cds.ql.SELECT.from(ContractActions).where({ address }).orderBy('createdAt asc', 'ID').limit(page.limit, page.skip)
             );
         });
 
         this.on(ContractAction.actions.history, 'ContractActions', async (req) => {
             const { address } = req.data;
             if (!address) return req.reject(400, 'address is required');
+            const page = listPage(req.data, 100);
             return this.db.run(
                 cds.ql.SELECT.from(ContractActions)
                     .where({ address })
-                    .orderBy('createdAt desc')
-                    .limit(100)
+                    .orderBy('createdAt desc', 'ID')
+                    .limit(page.limit, page.skip)
             );
         });
 
@@ -274,12 +280,14 @@ export default class NightgateService extends cds.ApplicationService {
         this.on(UnshieldedUtxo.actions.byOwner, 'UnshieldedUtxos', async (req) => {
             const { owner } = req.data;
             if (!owner) return req.reject(400, 'owner is required');
-            return this.db.run(cds.ql.SELECT.from(UnshieldedUtxos).where({ owner }));
+            const page = listPage(req.data, 1000);
+            return this.db.run(cds.ql.SELECT.from(UnshieldedUtxos).where({ owner }).orderBy('createdAt desc', 'ID').limit(page.limit, page.skip));
         });
 
-        this.on('unspent', 'UnshieldedUtxos', async () => {
+        this.on(UnshieldedUtxo.actions.unspent, 'UnshieldedUtxos', async (req) => {
+            const page = listPage(req.data, 1000);
             return this.db.run(
-                cds.ql.SELECT.from(UnshieldedUtxos).where({ spentAtTransaction_ID: null })
+                cds.ql.SELECT.from(UnshieldedUtxos).where({ spentAtTransaction_ID: null }).orderBy('createdAt desc', 'ID').limit(page.limit, page.skip)
             );
         });
 
@@ -292,47 +300,28 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         this.on(NightBalance.actions.getTopHolders, 'NightBalances', async (req) => {
-            const { limit } = req.data;
-            const effectiveLimit = Math.min(Math.max(limit || 10, 1), 1000);
+            const page = listPage(req.data, 10);
             return this.db.run(
                 cds.ql.SELECT.from(NightBalances)
-                    .orderBy('balance desc')
-                    .limit(effectiveLimit)
+                    .orderBy('balance desc', 'address')
+                    .limit(page.limit, page.skip)
             );
         });
 
+        // A caller reads only its own rows. An admin reads all of them.
+        const ownRowsOnly = async (req: cds.Request) => {
+            await awaitAgentPrincipal(req);
+            if (req.user?.is?.('admin')) return;
+            const userId = req.user?.id;
+            if (!userId) return req.reject(401, 'authentication required');
+            narrowRead(req, { userId });
+        };
+
         registerWalletSessionHandlers(this, this.db);
-
-        this.before('READ', 'WalletSessions', async (req) => {
-            await awaitAgentPrincipal(req);
-            const user = req.user;
-            if (user?.is?.('admin')) return;
-            const userId = user?.id;
-            if (!userId) return req.reject(401, 'authentication required');
-            (req.query as any).where({ userId });
-        });
-
+        this.before('READ', 'WalletSessions', ownRowsOnly);
         registerAgentGrantHandlers(this, this.db);
-
-        this.before('READ', 'AgentGrants', async (req) => {
-            await awaitAgentPrincipal(req);
-            const user = req.user;
-            if (user?.is?.('admin')) return;
-            const userId = user?.id;
-            if (!userId) return req.reject(401, 'authentication required');
-            (req.query as any).where({ userId });
-        });
-
-        for (const entity of ['Documents', 'GranteeIdentities'] as const) {
-            this.before('READ', entity, async (req) => {
-                await awaitAgentPrincipal(req);
-                const user = req.user;
-                if (user?.is?.('admin')) return;
-                const userId = user?.id;
-                if (!userId) return req.reject(401, 'authentication required');
-                (req.query as any).where({ userId });
-            });
-        }
+        this.before('READ', 'AgentGrants', ownRowsOnly);
+        for (const entity of ['Documents', 'GranteeIdentities'] as const) this.before('READ', entity, ownRowsOnly);
 
         this.on('READ', 'PendingSubmissions', async (req) => {
             const user = req.user;
@@ -344,7 +333,7 @@ export default class NightgateService extends cds.ApplicationService {
                 ) || [];
                 const sessionIds = sessions.map(s => s.sessionId).filter(Boolean);
                 if (sessionIds.length === 0) return [];
-                (req.query as any).where({ sessionId: { in: sessionIds } });
+                narrowRead(req, { sessionId: { in: sessionIds } });
             }
             return await this.db.run(req.query) || [];
         });

@@ -1,20 +1,7 @@
 #!/usr/bin/env node
-// Syncs wallets one after another against an indexer and writes each wallet's
-// sync state to a file. `scripts/import-wallet-state.mjs` loads such a file
-// into a server's WalletSyncStates, so the server restores instead of syncing.
-//
-//   node scripts/presync-wallets.mjs <wallets.json> [--out presync] [--max-minutes N] [--save-every-seconds 120] [--only <label>]
-//
-// wallets.json (keep it out of git, it carries seeds):
-//   { "network": "preprod",
-//     "indexerHttpUrl": "https://indexer.preprod.midnight.network/api/v4/graphql",   // optional, default = the network's public indexer
-//     "nodeUrl": "wss://rpc.preprod.midnight.network/",                               // optional
-//     "wallets": [ { "label": "sponsor-a", "sessionId": "<uuid>", "mnemonic": "..." | "seedHex": "<128 hex>", "accountIndex": 0 } ] }
-//
-// Output: <out>/<label>.json with the three serialized sub-wallet states, the
-// seed fingerprint, the SDK version and the index the wallet reached. A run
-// resumes from an existing file, so a stopped run loses at most one save.
-// Exit 0 when every wallet reached the tip, 1 otherwise.
+// Syncs wallets against an indexer and writes each sync state to <out>/<label>.json for import-wallet-state.mjs.
+// Run: node scripts/presync-wallets.mjs <wallets.json> [--out presync] [--max-minutes N] [--save-every-seconds 120] [--only <label>]
+// wallets.json holds network, indexerHttpUrl, nodeUrl and the wallet seeds; keep it out of git.
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -27,7 +14,7 @@ const { seedFingerprintOf } = require(path.join(packageRoot, 'srv/submission/wal
 const { getWalletSdkVersion } = require(path.join(packageRoot, 'srv/submission/wallet-sync-state-store.js'));
 const { appliedIndexOf, describeSyncState } = require(path.join(packageRoot, 'srv/midnight/worker/sync-replay.js'));
 const { deriveIndexerWsUrl } = require(path.join(packageRoot, 'srv/utils/indexer-url.js'));
-const { DEFAULT_INDEXER_URLS, DEFAULT_NODE_URLS, DEFAULT_NODE_URL } = require(path.join(packageRoot, 'srv/utils/nightgate-config.js'));
+const { DEFAULT_INDEXER_URLS, DEFAULT_NODE_URLS } = require(path.join(packageRoot, 'srv/utils/nightgate-config.js'));
 
 const EXPORT_VERSION = 1;
 const POLL_MS = 3000;
@@ -54,7 +41,8 @@ const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 const network = cfg.network ?? 'preprod';
 const indexerHttpUrl = cfg.indexerHttpUrl ?? DEFAULT_INDEXER_URLS[network]?.http;
 const indexerWsUrl = cfg.indexerWsUrl ?? (cfg.indexerHttpUrl ? deriveIndexerWsUrl(cfg.indexerHttpUrl) : DEFAULT_INDEXER_URLS[network]?.ws);
-const nodeUrl = cfg.nodeUrl ?? DEFAULT_NODE_URLS[network] ?? DEFAULT_NODE_URL;
+const nodeUrl = cfg.nodeUrl ?? DEFAULT_NODE_URLS[network];
+if (!nodeUrl) { console.error(`no node URL for network '${network}': set nodeUrl in the config`); process.exit(2); }
 if (!indexerHttpUrl || !indexerWsUrl) { console.error(`no indexer URL for network '${network}'`); process.exit(2); }
 if (!Array.isArray(cfg.wallets) || cfg.wallets.length === 0) { console.error('wallets.json: "wallets" must be a non-empty list'); process.exit(2); }
 

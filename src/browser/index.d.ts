@@ -50,20 +50,15 @@ export class InMemoryPrivateStateProvider {
     importSigningKeys(): Promise<unknown>;
 }
 
-/**
- * Where proofs are made.
- *   'server' - on the proof server the wallet reports. This is the default.
- *   'wallet' - in the wallet. Throws if the wallet cannot prove.
- *   'auto'   - in the wallet if it can prove, else on the server.
- */
-export type ProvingModality = 'server' | 'wallet' | 'auto';
+import type { ProvingModality, AssembledProvingModality } from './providers.mjs';
+export type { ProvingModality, AssembledProvingModality };
 
 export interface ConnectorProvidersResult {
     publicDataProvider: unknown;
     zkConfigProvider: FetchZkConfigProvider;
     proofProvider: unknown | undefined;
     /** Where proofs are actually made. Log it, because it says where the private inputs go. */
-    provingModality: 'server' | 'wallet' | 'none';
+    provingModality: AssembledProvingModality;
     privateStateProvider: InMemoryPrivateStateProvider;
     connector: unknown;
     config: { indexerUri: string; indexerWsUri: string; substrateNodeUri: string; networkId: string; proverServerUri?: string };
@@ -90,7 +85,7 @@ export function buildProofProvider(input: {
     zkConfigProvider: FetchZkConfigProvider;
     proverServerUri?: string;
     proofMod: any;
-}): Promise<{ proofProvider: unknown | undefined; provingModality: 'server' | 'wallet' | 'none' }>;
+}): Promise<{ proofProvider: unknown | undefined; provingModality: AssembledProvingModality }>;
 
 export {
     type PreparedCall,

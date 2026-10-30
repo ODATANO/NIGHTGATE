@@ -410,26 +410,6 @@ describe('parsing helpers', () => {
             expect((p as any).parseTimestampHex(bad)).toBeNull();
         }
     });
-
-    it('toInt coerces numbers and numeric strings, everything else to 0', async () => {
-        const p: any = await makeProcessor(fakeProvider());
-        expect(p.toInt(7.9)).toBe(7);
-        expect(p.toInt('42')).toBe(42);
-        expect(p.toInt('  ')).toBe(0);
-        expect(p.toInt('abc')).toBe(0);
-        expect(p.toInt(undefined)).toBe(0);
-        expect(p.toInt(Infinity)).toBe(0);
-    });
-
-    it('toBigInt coerces bigints, numbers and decimal strings, everything else to 0n', async () => {
-        const p: any = await makeProcessor(fakeProvider());
-        expect(p.toBigInt(5n)).toBe(5n);
-        expect(p.toBigInt(7.9)).toBe(7n);
-        expect(p.toBigInt('12')).toBe(12n);
-        expect(p.toBigInt('nope')).toBe(0n);
-        expect(p.toBigInt('')).toBe(0n);
-        expect(p.toBigInt(undefined)).toBe(0n);
-    });
 });
 
 // ---- The pallet map travels with the block -------------------------------

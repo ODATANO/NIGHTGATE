@@ -1,4 +1,5 @@
 import cds from '@sap/cds';
+import { futureTimeProblem } from './utils/validation';
 const { SELECT, UPDATE, INSERT } = cds.ql;
 
 import { ensureNightgateModelLoaded } from './utils/cds-model';
@@ -23,16 +24,14 @@ import { getConfiguredNightgateNetwork } from './utils/nightgate-config';
 import { reconcileNightBalances } from './crawler/night-balance-reconcile';
 import { redecodeFromHeight, RedecodeError } from './crawler/redecode';
 import { describeSponsorPolicy } from './sessions/agent-grants';
-import { formatErr } from './utils/format-error';
-import { NightgateError } from './utils/errors';
+
+import { NightgateError, errorMessage } from './utils/errors';
 import type { Row } from './utils/db-types';
 import { normalizeHttpError } from './utils/http-errors';
 import { exportContractSigningKey, getJobStats, getSponsorPolicy, grantRole, invalidateSession, profileWorker, registerContract, revokeRole, unregisterContract, reconcileNightBalances as reconcileNightBalancesAction, redecodeFromHeight as redecodeFromHeightAction } from '#cds-models/NightgateAdminService';
 
-/**
- * Drops the cached in-memory wallet of a session, so its secret keys leave RAM too.
- * Errors are ignored, they never block the invalidation.
- */
+/** Drops the cached in-memory wallet of a session, so its secret keys leave RAM too.
+ * Errors are ignored and never block the invalidation. */
 async function evictSessionFacade(session: { sessionId: string; encryptedViewingKey?: string | null }): Promise<void> {
     try {
         if (session.encryptedViewingKey) {
@@ -148,7 +147,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
                 }
                 return await walletCpuProfile(seconds, dir);
             } catch (e: unknown) {
-                return req.reject(new NightgateError('UNAVAILABLE', `${thread} profile failed: ${formatErr(e)}`, { exposeMessage: true }));
+                return req.reject(new NightgateError('UNAVAILABLE', `${thread} profile failed: ${errorMessage(e)}`, { exposeMessage: true }));
             }
         });
 
@@ -255,11 +254,8 @@ export default class NightgateAdminService extends cds.ApplicationService {
             }
 
             const now = new Date().toISOString();
-            if (validUntil) {
-                const until = Date.parse(validUntil);
-                if (Number.isNaN(until)) return req.reject(400, 'validUntil must be an ISO timestamp');
-                if (until <= Date.parse(now)) return req.reject(400, 'validUntil must be in the future');
-            }
+            const untilProblem = futureTimeProblem(validUntil, 'validUntil');
+            if (untilProblem) return req.reject(400, untilProblem);
 
             const callerRole = await attachDisclosureRole(req, this.db);
             if (!isAuthority(callerRole)) {

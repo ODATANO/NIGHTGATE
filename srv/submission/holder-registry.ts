@@ -1,9 +1,6 @@
-/**
- * Reads the holder-registry contract. A token holder registers a claim key there.
- * Whoever shows the secret behind that key proves to this server that they hold the token.
- * Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Reads the holder-registry contract, where a token holder registers a claim key. Showing the secret behind that key proves holding the token.
+// Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
+// SPDX-License-Identifier: Apache-2.0
 import { holderClaimKey, holderEntry as kitHolderEntry, hexToBytes32 } from '@odatano/contract-kit';
 import { importArtifact } from './artifact-import';
 import { buildPublicDataProvider } from '../midnight/public-data-provider';

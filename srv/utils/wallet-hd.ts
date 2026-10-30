@@ -1,9 +1,6 @@
-/**
- * HD key derivation that matches the Lace wallet.
- * Each key type is derived from its own BIP32 role, never from the raw seed.
- * Using the raw seed would give a different, empty account.
- */
-// Named imports: bip39's CJS build has no default export.
+// HD key derivation that matches the Lace wallet. Each key type comes from its own BIP32 role, never from the raw seed.
+// The raw seed would give a different, empty account.
+// Named imports, because bip39's CJS build has no default export.
 import { validateMnemonic, mnemonicToSeedSync } from 'bip39';
 
 const ACCOUNT = 0;

@@ -1,14 +1,12 @@
-/**
- * Two extra login routes ("lanes") for `@odatano/cap-auth`.
- * One accepts an agent token on the Nightgate service. The other opens the optional public verify service.
- * Both let the request through as a placeholder user that owns nothing. The agent grant check verifies the token later.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Two extra login routes for `@odatano/cap-auth`. One accepts agent tokens, the other opens the optional public verify service.
+// Both pass the request on as a placeholder user that owns nothing. The agent grant check verifies the token later.
+// SPDX-License-Identifier: Apache-2.0
 
 import cds from '@sap/cds';
 import { registerTransportLane, inLaneOf, markerUser, requestPath, setHeader, type TransportLane } from '@odatano/cap-auth';
 import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER, PUBLIC_VERIFY_TRANSPORT_USER, PUBLIC_VERIFY_LANE_PREFIX } from './agent-token-transport';
 import { configFlag } from './config';
+import { errorMessage } from './errors';
 
 export const AGENT_LANE_PREFIX = '/odata/v4/midnight';
 
@@ -45,6 +43,6 @@ export function registerNightgateTransportLanes(): void {
         registerTransportLane(agentTokenLane);
         registerTransportLane(publicVerifyLane);
     } catch (err) {
-        cds.log('nightgate').error(`transport lanes not registered: ${err instanceof Error ? err.message : String(err)}`);
+        cds.log('nightgate').error(`transport lanes not registered: ${errorMessage(err)}`);
     }
 }

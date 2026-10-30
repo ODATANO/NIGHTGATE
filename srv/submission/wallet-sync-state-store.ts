@@ -1,8 +1,5 @@
-/**
- * Stores encrypted snapshots of the three sub-wallets so a wallet can resume its sync.
- * Snapshots must stay strings: the SDK cannot restore from a Uint8Array.
- * All database writes run one after another in a single queue.
- */
+// Stores encrypted snapshots of the three sub-wallets so a wallet can resume its sync.
+// Snapshots must stay strings, because the SDK cannot restore from a Uint8Array. All database writes run in one queue.
 
 import crypto from 'crypto';
 import cds from '@sap/cds';
@@ -12,7 +9,7 @@ import { StorageEncryption, decryptWithPasswordAsync, extractEncryptedComponents
 import { getEncryptionKey, deriveBoundSecret, type KeyRing } from '../utils/crypto';
 import { resolveAccountDek, syncStatePassphraseFromDek, clearAllAccountDeks, DEK_SCHEME } from './account-keys';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
-import { isLockContention } from './db-write-retry';
+import { withLockContentionRetry } from './db-write-retry';
 import { configFlag } from '../utils/config';
 import { errorMessage } from '../utils/errors';
 const log = cds.log('nightgate:sync');
@@ -65,11 +62,8 @@ async function getDb(): Promise<cds.DatabaseService> {
 
 // ---- Per-account encryption keys -------------------------------------------
 
-/**
- * The encryption key is derived once per account and passphrase, then cached.
- * A fixed salt is safe here because the passphrase is a strong per-account secret.
- * Keys are wiped on disconnect and shutdown.
- */
+// The encryption key is derived once per account and passphrase, then cached until disconnect or shutdown.
+// A fixed salt is safe here because the passphrase is a strong per-account secret.
 interface EncryptionCacheEntry {
     /** Hash of account id and passphrase. A changed passphrase derives a new key. */
     passHash: string;
@@ -78,10 +72,8 @@ interface EncryptionCacheEntry {
 
 const encryptionCache = new Map<string, EncryptionCacheEntry>();
 
-/**
- * New snapshots are encrypted with a passphrase from the account's data key (account-keys.ts).
- * Snapshots in the two older formats stay readable and are re-encrypted at the next save.
- */
+// New snapshots are encrypted with a passphrase from the account's data key (account-keys.ts).
+// Snapshots in the two older formats stay readable and are re-encrypted at the next save.
 const SYNC_STATE_INFO = 'nightgate/sync-state/v2';
 const SALT_LABEL_V1 = 'nightgate-wallet-sync-salt-v1';
 const SALT_LABEL_V2 = 'nightgate-wallet-sync-salt-v2';
@@ -171,11 +163,7 @@ export async function clearAllEncryptionKeys(): Promise<void> {
 
 let saveChain: Promise<void> = Promise.resolve();
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// Writing the same row twice is harmless, so a write blocked by a lock is simply retried.
-const SAVE_ATTEMPTS = 3;
-const SAVE_BACKOFF_MS = [0, 1500, 4000];
 
 export function saveSyncState(args: SaveSyncStateArgs): Promise<void> {
     const p = saveSyncStateInner(args);
@@ -256,22 +244,10 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
         }
     };
 
+    // Writing the same row twice is harmless, so a write blocked by a lock is simply retried.
     const work = async (): Promise<void> => {
-        let lastErr: unknown;
-        for (let attempt = 0; attempt < SAVE_ATTEMPTS; attempt++) {
-            if (SAVE_BACKOFF_MS[attempt]) await sleep(SAVE_BACKOFF_MS[attempt]);
-            try {
-                await persistOnce();
-                dbgSync(`${callId} chain complete (attempt ${attempt + 1})`);
-                return;
-            } catch (e) {
-                lastErr = e;
-                const msg = errorMessage(e);
-                if (!isLockContention(e)) throw e;
-                dbgSync(`${callId} write contention (attempt ${attempt + 1}): ${msg.slice(0, 60)}`);
-            }
-        }
-        throw lastErr;
+        await withLockContentionRetry(`${callId} sync-state save`, persistOnce, msg => dbgSync(msg));
+        dbgSync(`${callId} chain complete`);
     };
 
     dbgSync(`${callId} queued (accountId=${accountId.slice(0, 16)})`);
@@ -295,6 +271,10 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
     if (!row) return null;
 
     if (row.sdkVersion !== expectedSdkVersion) {
+        log.warn(
+            `refusing restore for ${accountId.slice(0, 16)}: ` +
+            `stored sdkVersion '${row.sdkVersion}' != expected '${expectedSdkVersion}' (cold start)`
+        );
         return null;
     }
 
@@ -349,11 +329,8 @@ function saltOf(blob: string): Buffer | null {
     }
 }
 
-/**
- * Decrypts one snapshot. The salt in its header picks the key. Returns null when it cannot be read.
- * `underDek` means the snapshot already uses the current format and can be kept as is.
- * Key derivation never runs on the event loop: snapshots are megabytes and saved every minute.
- */
+// Decrypts one snapshot with the key the salt in its header picks. Null when unreadable. `underDek` means it already has the current format.
+// Key derivation never runs on the event loop, because snapshots are megabytes and saved every minute.
 async function decryptSyncBlob(accountId: string, blob: string, passphrase: string, ring: KeyRing, dekPassphrase?: string): Promise<{ text: string; underDek: boolean } | null> {
     const salt = saltOf(blob);
     if (!salt) return null;

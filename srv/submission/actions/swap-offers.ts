@@ -1,8 +1,6 @@
-/**
- * Actions of the swap offer board: post an offer, read offers, withdraw an offer.
- * An offer is the maker's half of a shielded swap. A taker adds the other half.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Actions of the swap offer board: post, read and withdraw offers.
+// An offer is the maker's half of a shielded swap. A taker adds the other half.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { SwapOffers, type SwapOffer } from '#cds-models/midnight';
 import { NightgateError, isNightgateError } from '../../utils/errors';
@@ -12,11 +10,13 @@ import { isSwapOfferOpen, loadSwapOffer, closeSwapOffer, effectiveSwapOfferStatu
 import { parseJsonStringList } from '../../utils/json-list';
 import { LONG_POLL_MAX_MS, holdUntil, waiterPool } from '../../utils/long-poll';
 import { runWithoutAmbientTx } from '../background-jobs';
-import { checkRate, runSubmission } from './common';
+import { runSubmission } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_RE } from '../../utils/hex';
 import { getSwapOffer, listSwapOffers, postSwapOffer, retireSwapOffer } from '#cds-models/NightgateService';
 import type { Request } from '@sap/cds';
+import { futureTimeProblem } from '../../utils/validation';
+import { checkRateClass } from '../../utils/rate-classes';
 
 const { SELECT, INSERT } = cds.ql;
 
@@ -81,11 +81,9 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         catch (e) { return req.reject(400, `offer: ${(e as Error).message}`); }
         let expiry: string | null = null;
         if (expiresAt !== undefined && expiresAt !== null && expiresAt !== '') {
-            const ms = Date.parse(String(expiresAt));
-            if (!Number.isFinite(ms)) return req.reject(400, 'expiresAt must be an ISO timestamp');
-            if (ms <= Date.now()) return req.reject(400, 'expiresAt must lie in the future');
-            if (ms - Date.now() > MAX_EXPIRY_MS) return req.reject(400, 'expiresAt: at most 90 days ahead');
-            expiry = new Date(ms).toISOString();
+            const problem = futureTimeProblem(expiresAt, 'expiresAt', MAX_EXPIRY_MS, '90 days');
+            if (problem) return req.reject(400, problem);
+            expiry = new Date(String(expiresAt)).toISOString();
         }
         const parsedTags = parseTags(tags);
         if (typeof parsedTags === 'string') return req.reject(400, parsedTags);
@@ -94,7 +92,7 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             takerSecretHash = String(req.data.takerSecretHash).trim().toLowerCase();
             if (!HEX64_RE.test(takerSecretHash)) return req.reject(400, 'takerSecretHash must be 64 hex characters (sha256 of the taker secret)');
         }
-        if (!checkRate('compute', 'compute', req)) return;
+        if (!checkRateClass('compute', 'compute', req)) return;
 
         return runSubmission(req, async () => {
             let half: Awaited<ReturnType<typeof walletDescribeSwapHalf>>;
@@ -125,7 +123,7 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
     });
 
     srv.on(listSwapOffers, async (req) => {
-        if (!checkRate('read', 'read', req)) return;
+        if (!checkRateClass('read', 'read', req)) return;
         const { givesType, wantsType, tag, limit, status, since, mine, waitMs } = req.data;
         const where: Record<string, unknown> = {};
         for (const [name, value] of [['givesType', givesType], ['wantsType', wantsType]] as const) {
@@ -198,7 +196,7 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
     srv.on(getSwapOffer, async (req) => {
         const { offerId } = req.data;
         if (!offerId) return req.reject(400, 'offerId is required');
-        if (!checkRate('read', 'read', req)) return;
+        if (!checkRateClass('read', 'read', req)) return;
         const row = await loadSwapOffer(db, String(offerId));
         if (!row) return req.reject(404, 'swap offer not found');
         return publicView(row, new Date());
@@ -207,18 +205,16 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
     srv.on(retireSwapOffer, async (req) => {
         const { offerId } = req.data;
         if (!offerId) return req.reject(400, 'offerId is required');
-        if (!checkRate('compute', 'compute', req)) return;
+        if (!checkRateClass('compute', 'compute', req)) return;
         return runSubmission(req, async () => {
             const row = await loadSwapOffer(db, String(offerId));
             if (!row) throw new NightgateError('NOT_FOUND', 'swap offer not found');
             if (!isPoster(row, req)) throw new NightgateError('FORBIDDEN', 'only the poster retires an offer');
-            if (!isSwapOfferOpen(row)) {
-                // Listing does not save the expired status. Write paths like this one do.
-                if (row.status === 'open') await closeSwapOffer(db, row.ID, 'expired');
-                throw new NightgateError('SWAP_OFFER_NOT_OPEN', `swap offer is ${row.status === 'open' ? 'expired' : row.status}`);
-            }
-            await closeSwapOffer(db, row.ID, 'retired');
-            return { offerId: row.ID, status: 'retired' };
+            // Listing does not save the expired status; this write path does. A close that finds the row no
+            // longer open lost a race with a fill or another close: the answer is what the row says now.
+            const closed = await closeSwapOffer(db, row.ID, isSwapOfferOpen(row) ? 'retired' : 'expired');
+            const now = closed ? row : (await loadSwapOffer(db, row.ID)) ?? row;
+            return { offerId: row.ID, status: closed ? (isSwapOfferOpen(row) ? 'retired' : 'expired') : effectiveSwapOfferStatus(now) };
         });
     });
 }

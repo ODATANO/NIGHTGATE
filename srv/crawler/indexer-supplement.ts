@@ -1,10 +1,5 @@
-/**
- * Fetches one block from the Midnight indexer and maps the data that the node's block does not contain.
- *
- * Examples are contract state after a call, the indexer's ledger event lists,
- * the result of each transaction segment, and the DUST registration flag of a UTXO.
- * The indexer is therefore a second data source, with its own cursor, separate from the node.
- */
+// Fetches one block from the Midnight indexer and maps the data the node's block does not contain.
+// Examples are contract state, ledger event lists, segment results and the DUST registration flag of a UTXO.
 
 const BLOCK_QUERY = `query($height: Int!) {
   block(offset: { height: $height }) {
@@ -28,6 +23,10 @@ const BLOCK_QUERY = `query($height: Int!) {
 }`;
 
 import type { FetchedContractState } from './contract-state';
+import { indexerQuery } from '../utils/indexer-graphql';
+import { bareHex } from '../utils/hex-patterns';
+import { toInt } from '../utils/numbers';
+import { hexToBase64 } from './cap-binary';
 
 export interface SupplementSegment {
     segmentId: number;
@@ -79,19 +78,6 @@ export interface SupplementBlock {
     transactions: SupplementTransaction[];
 }
 
-const hex = (value: unknown): string => String(value ?? '').replace(/^0x/i, '').toLowerCase();
-
-function toInt(value: unknown): number {
-    const n = Number(String(value ?? '').replace(/[,_\s]/g, ''));
-    return Number.isFinite(n) ? Math.trunc(n) : 0;
-}
-
-function toBinary(value: unknown): string | null {
-    const clean = hex(value);
-    if (!clean || clean.length % 2 !== 0) return null;
-    return Buffer.from(clean, 'hex').toString('base64');
-}
-
 const ACTION_TYPE: Record<string, SupplementContractAction['actionType']> = {
     ContractDeploy: 'DEPLOY',
     ContractCall: 'CALL',
@@ -103,7 +89,7 @@ function readEvents(list: unknown): SupplementLedgerEvent[] {
     return list.map((e: any) => ({
         eventId: toInt(e?.id),
         maxId: toInt(e?.maxId),
-        raw: toBinary(e?.raw)
+        raw: hexToBase64(e?.raw)
     }));
 }
 
@@ -124,9 +110,9 @@ function readDustEvents(list: unknown): SupplementDustEvent[] {
         out.push({
             eventId: toInt(e?.id),
             maxId: toInt(e?.maxId),
-            raw: toBinary(e?.raw),
+            raw: hexToBase64(e?.raw),
             eventType,
-            dustOutputNonce: eventType === 'INITIAL_UTXO' ? (hex(e?.output?.nonce) || null) : null
+            dustOutputNonce: eventType === 'INITIAL_UTXO' ? (bareHex(e?.output?.nonce) || null) : null
         });
     }
     return out;
@@ -138,21 +124,21 @@ export function readSupplementBlock(payload: any): SupplementBlock | null {
 
     const transactions: SupplementTransaction[] = [];
     for (const tx of block.transactions ?? []) {
-        const ledgerTxHash = hex(tx?.hash);
+        const ledgerTxHash = bareHex(tx?.hash);
         if (!ledgerTxHash) continue;
 
         const contractActions: SupplementContractAction[] = [];
         for (const action of tx.contractActions ?? []) {
             const actionType = ACTION_TYPE[String(action?.__typename)];
-            const address = hex(action?.address);
+            const address = bareHex(action?.address);
             if (!actionType || !address) continue;
             contractActions.push({
                 actionType,
                 address,
-                state: toBinary(action?.state),
-                zswapState: toBinary(action?.zswapState),
+                state: hexToBase64(action?.state),
+                zswapState: hexToBase64(action?.zswapState),
                 balances: (action?.unshieldedBalances ?? [])
-                    .map((b: any) => ({ tokenType: hex(b?.tokenType), amount: String(b?.amount ?? '0') }))
+                    .map((b: any) => ({ tokenType: bareHex(b?.tokenType), amount: String(b?.amount ?? '0') }))
                     .filter((b: SupplementBalance) => b.tokenType)
             });
         }
@@ -168,13 +154,13 @@ export function readSupplementBlock(payload: any): SupplementBlock | null {
             dustEvents: readDustEvents(tx?.dustLedgerEvents),
             dustRegisteredOutputs: (tx?.unshieldedCreatedOutputs ?? [])
                 .filter((u: any) => u?.registeredForDustGeneration)
-                .map((u: any) => ({ intentHash: hex(u?.intentHash), outputIndex: toInt(u?.outputIndex) }))
+                .map((u: any) => ({ intentHash: bareHex(u?.intentHash), outputIndex: toInt(u?.outputIndex) }))
         });
     }
 
     return {
         height: toInt(block.height),
-        ledgerParameters: toBinary(block.ledgerParameters),
+        ledgerParameters: hexToBase64(block.ledgerParameters),
         transactions
     };
 }
@@ -183,48 +169,10 @@ export interface IndexerClient {
     fetchBlock(height: number): Promise<SupplementBlock | null>;
 }
 
-/** A non-2xx response from the indexer. The caller uses the status to decide how long to back off. */
-export class IndexerHttpError extends Error {
-    constructor(readonly status: number) {
-        super(`indexer answered ${status}`);
-        this.name = 'IndexerHttpError';
-    }
-}
-
-/**
- * True for 403 and 429, which mean the indexer refuses this client.
- * The public indexer blocks the host's whole IP when it gets too many requests.
- * That block also cuts off the sponsor wallets on the same host.
- */
-export function isIndexerRateLimit(err: unknown): boolean {
-    return err instanceof IndexerHttpError && (err.status === 403 || err.status === 429);
-}
-
-async function postQuery(url: string, query: string, variables: Record<string, unknown>, timeoutMs: number, what: string): Promise<any> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ query, variables }),
-            signal: controller.signal
-        });
-        if (!res.ok) throw new IndexerHttpError(res.status);
-        const body: any = await res.json();
-        if (body?.errors?.length) {
-            throw new Error(`indexer rejected the ${what} query: ${JSON.stringify(body.errors).slice(0, 200)}`);
-        }
-        return body?.data;
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
 export function createIndexerClient(url: string, timeoutMs = 20000): IndexerClient {
     return {
         async fetchBlock(height: number): Promise<SupplementBlock | null> {
-            return readSupplementBlock(await postQuery(url, BLOCK_QUERY, { height }, timeoutMs, 'block'));
+            return readSupplementBlock(await indexerQuery(url, BLOCK_QUERY, { variables: { height }, timeoutMs }));
         }
     };
 }
@@ -236,11 +184,8 @@ const CONTRACT_STATE_QUERY = `query($address: HexEncoded!, $offset: ContractActi
   }
 }`;
 
-/**
- * A contract's state at `height`, or its latest state when no height is given, with the hash and
- * ledger parameters of the action's block. Binary values are base64.
- * Returns null when the indexer has no action of the contract up to that height.
- */
+// A contract's state at `height`, or its latest state without a height, with the hash and ledger parameters of the block.
+// Binary values are base64. Null when the indexer has no action of the contract up to that height.
 export async function fetchContractState(
     url: string,
     address: string,
@@ -248,14 +193,15 @@ export async function fetchContractState(
     timeoutMs = 20000
 ): Promise<FetchedContractState | null> {
     const offset = height == null ? null : { blockOffset: { height } };
-    const data = await postQuery(url, CONTRACT_STATE_QUERY, { address, offset }, timeoutMs, 'contract state');
+    type Answer = { contractAction?: { state?: unknown; zswapState?: unknown; transaction?: { block?: { hash?: unknown; ledgerParameters?: unknown } } } | null };
+    const data = await indexerQuery<Answer>(url, CONTRACT_STATE_QUERY, { variables: { address, offset }, timeoutMs });
     const action = data?.contractAction;
     if (!action) return null;
-    const blockHash = hex(action.transaction?.block?.hash);
+    const blockHash = bareHex(action.transaction?.block?.hash);
     return {
-        state: toBinary(action.state),
-        zswapState: toBinary(action.zswapState),
+        state: hexToBase64(action.state),
+        zswapState: hexToBase64(action.zswapState),
         blockHash: blockHash ? `0x${blockHash}` : null,
-        ledgerParameters: toBinary(action.transaction?.block?.ledgerParameters)
+        ledgerParameters: hexToBase64(action.transaction?.block?.ledgerParameters)
     };
 }

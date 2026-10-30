@@ -58,11 +58,11 @@ is the agent grant, else the user, else the client address.
 
 | Class | Window | Default | Counted per | Calls |
 |---|---|---|---|---|
-| `prove` | hour | 60 | caller and session | `submitContractCall`, `submitContractCallBatch`, `mintShieldedTestToken`, `burnFactoryToken`, the `issue*` attestations (a batch counts its claims), `anchorDocument`, `registerPassport`, `retractAttestation`, `purgeExpired`, `grantDisclosure`, `revokeDisclosure`, `grantDisclosureToHolders`, `revokeHolderDisclosure`, `buildSponsorable` |
+| `prove` | hour | 60 | caller and session | `submitContractCall`, `submitContractCallBatch`, `mintShieldedTestToken`, `burnFactoryToken`, the `issue*` attestations (a batch counts its claims), `anchorDocument`, `registerPassport`, `retractAttestation`, `purgeExpired`, `grantDisclosure`, `revokeDisclosure`, `buildSponsorable` |
 | `deploy` | hour | 5 | caller and session | `deployContract` |
 | `sponsor` | hour | 120 | caller | `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorSwap`, `sponsorTransfer`, `mintFactoryToken` |
-| `compute` | hour | 120 | caller | `prepareDocumentProof`, `prepareMembershipSet`, `claimDisclosure`, `postSwapOffer`, `retireSwapOffer`, `reindexDisclosures` (per contract) |
-| `read` | minute | 60 | caller | `listSwapOffers`, `getSwapOffer`, `getBoardStatus`, `getRuntimeInfo`, `getWalletBalance`, `getWalletSyncProgress`, `getSponsorPoolStatus`, `estimateSendNightFee` |
+| `compute` | hour | 120 | caller | `prepareDocumentProof`, `prepareMembershipSet`, `claimDisclosure`, `grantDisclosureToHolders`, `revokeHolderDisclosure`, `postSwapOffer`, `retireSwapOffer`, `reindexDisclosures` (per contract) |
+| `read` | minute | 60 | caller | `listSwapOffers`, `getSwapOffer`, `getBoardStatus`, `verifyDocument`, `verifyPredicateAttestation`, `getRuntimeInfo`, `getWalletBalance`, `getWalletSyncProgress`, `getSponsorPoolStatus`, `estimateSendNightFee` |
 | `wallet` | minute | 10 | caller | `connectWallet`, `sendNight`, `registerForDustGeneration`, `deregisterFromDustGeneration` |
 | `signing` | hour | 10 | caller | `connectWalletForSigning`, `deriveWalletInfo` (`NIGHTGATE_SIGNING_KEY_RATE_LIMIT`) |
 | `admin` | hour | 10 | caller | `createAgentGrant`, `createAgentGrants`, `updateAgentGrant`, `rotateAgentGrantToken`, `revokeAgentGrant` |
@@ -173,9 +173,9 @@ curl -X POST http://localhost:4004/odata/v4/midnight/sendNight \
   }'
 ```
 
-### `registerForDustGeneration(sessionId, dustReceiverAddress?) → { txId, changed, reason, registeredCount, totalNightUtxos, dustReceiverAddress, requestedReceiver, registeredUtxosBefore, registeredUtxosAfter, settled, consolidated, message }`
+### `registerForDustGeneration(sessionId, dustReceiverAddress?, idempotencyKey?) → { jobId, status }`
 
-Register the wallet's unregistered unshielded NIGHT UTXOs for dust generation. The result reports what happened:
+Register the wallet's unregistered unshielded NIGHT UTXOs for dust generation. The job result `{ txId, changed, reason, registeredCount, totalNightUtxos, dustReceiverAddress, requestedReceiver, registeredUtxosBefore, registeredUtxosAfter, settled, consolidated, message }` reports what happened:
 
 - Registration binds the **address**: later NIGHT arriving there generates dust for the same receiver. On an already-registered wallet the call changes nothing and still succeeds: `changed: false`, `reason: "already-registered"`, `dustReceiverAddress: null`, `requestedReceiver`, and a `message` to deregister first and register again with the new receiver. `reason: "no-night-utxos"`: nothing to register.
 - One registration consolidates its inputs (`registeredCount` = inputs, `consolidated: true`). One registered UTXO yields one dust note, the unit of parallel sponsoring, so read `registeredUtxosAfter` (observed after local apply, `settled: true`; waits up to `NIGHTGATE_DUST_REGISTER_SETTLE_MS`, default 90 s, else `settled: false` and `null`).
@@ -189,9 +189,9 @@ Register the wallet's unregistered unshielded NIGHT UTXOs for dust generation. T
 
 DUST accrues ~1-2 min after the tx finalizes; refill ~5 tDUST per 100 h (preprod parameters).
 
-### `deregisterFromDustGeneration(sessionId) → { txId, deregisteredCount, totalNightUtxos }`
+### `deregisterFromDustGeneration(sessionId, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
 
-Deregister all of the wallet's registered NIGHT UTXOs (no per-UTXO selection).
+Deregister all of the wallet's registered NIGHT UTXOs (no per-UTXO selection). Job result: `{ txId, deregisteredCount, totalNightUtxos }`. `sponsorSessionId` lets another wallet pay the fee.
 
 ## Contract operations
 
@@ -506,8 +506,9 @@ reach this endpoint can make you pay fees.
 - **Rights beyond the action list.** `allowDeploy` (with `maxDeploys`) lets
   the sponsor pay for deploys the agent built; `allowUnshieldedOffers` (with
   `allowedUnshieldedTokenTypes`, NIGHT always included) lets a sponsored call
-  move the agent's own unshielded tokens into the contract it calls. Both need
-  a sponsoring action in `allowedActions` and the matching platform switch
+  move the agent's own unshielded tokens into the contract it calls and pay
+  out what that contract requires. Both need a sponsoring action in
+  `allowedActions` and the matching platform switch
   (`NIGHTGATE_SPONSOR_ALLOW_DEPLOY`, `NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS`);
   a grant only narrows the platform's unshielded type list. Swaps and
   transfers are rights of the action list: `sponsorSwap`, `sponsorTransfer`.
@@ -599,6 +600,12 @@ backing of the sponsor, proves a dust-only spend, merges, binds and submits.
 Job result `{ txHash, circuits, contractAddress, note }` (`note` = backing
 used). **Rate class:** `sponsor`.
 
+What a sponsored call may move: with `allowUnshieldedOffers` the caller's own
+NIGHT or an allowed token type into the contract it calls (a deposit, a pot
+entry), and the payouts the called contract itself requires (a claim, a
+refund, a prize), balanced per type on the ledger. The contract decides who
+is paid; the sponsor adds dust only, never value.
+
 Parallelism: only the dust build is serialized per wallet; one wallet sponsors
 as many transactions at once as it has distinct registered dust backings.
 Same-backing requests wait up to `NIGHTGATE_BACKING_WAIT_MS` (default 5 min).
@@ -655,17 +662,18 @@ output type is NIGHT or in `allowedUnshieldedTokenTypes` (floor
 `NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES`, a grant only narrows);
 the segment balances on the ledger in every offered type, so inputs equal
 outputs plus what the called circuit takes in (`receiveUnshielded`), which the
-offer alone does not show; the offer creates no more than it spends; every
-output goes to the contract called, a contract on the allow-list, a contract
-deployed under the grant, or back to the address of an input owner (change);
-no input belongs to the sponsor's own wallet. An unshielded offer is public,
+offer alone does not show; every output goes to the contract called, a
+contract on the allow-list, a contract deployed under the grant, back to the
+address of an input owner (change), or to an address a called contract pays
+out to; the offer creates no more than it spends, apart from those payouts;
+no input belongs to the sponsor's own wallet. A payout counts when the call's
+proven result requires it (`claimedUnshieldedSpends`): same token type, same
+recipient, at most that amount. An unshielded offer is public,
 so every rule is checked on the bytes; the sponsor adds dust only, never
 value. Caller dust actions stay refused. The job result carries `unshielded:
 [{ type, amount, to }]`: one entry per contract-owned output, and one for what
 the circuit takes in without an output of its own, with `to` the called
-contract (one called contract per intent in that case). A payout from the
-contract to the caller is not covered: without an input of the caller its
-address cannot be derived from the offer.
+contract (one called contract per intent in that case). Payouts get no entry.
 
 ### `sponsorSwap(makerHalfB64 | offerId, takerHalfB64, idempotencyKey?, takerSecret?) → { jobId, status, sessionId }`
 
@@ -809,8 +817,11 @@ token may read it (rate class `read`).
 
 ### `retireSwapOffer(offerId) → { offerId, status }`
 
-Only the poster: the same user, or for a token the same grant. A filled,
-retired or expired offer is `409 SWAP_OFFER_NOT_OPEN`.
+Only the poster: the same user, or for a token the same grant. An offer that
+is already closed answers 200 with its status (`expired`, `retired`, `filled`),
+so a client can tell "nothing to retire" from a board it could not reach. The
+coins behind the half stay reserved in the poster's wallet until it reverts
+the half.
 
 ### `anchorDocument(sha256, storageRef, sessionId, contractAddress, contentType?, size?, metadata?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, documentId, attesterId }`
 
@@ -868,11 +879,11 @@ npx nightgate-fetch-keys attestation-vault-32 --from https://host/zk-config/atte
 
 The generation digest pins the manifest, not the key bytes: a fetch changes no recorded evidence and needs no restart. Container images already contain the keys.
 
-### `issueFieldPredicateAttestation(payloadHash, attesterId?, fieldKey, value, fieldSalt, predicate, threshold, sessionId, contractAddress, contentRoot?, schemaId?, siblings?, dirs?, unit?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueFieldPredicateAttestation(payloadHash, attesterId?, fieldKey, value, fieldSalt, predicate, threshold, sessionId, contractAddress, contentRoot?, schemaId?, siblings?, dirs?, unit?, compiledArtifactRef?, validUntil?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
 Prove the scaled integer `value` at `fieldKey` against `threshold` (`proveFieldPredicate`, Merkle inclusion in the anchored content root). A given `contentRoot` is anchored first (`anchorContentRoot`, requires `schemaId`). `value` stays witness, never persisted; `value` must fit Uint<64>, `threshold` is recorded and stays at most 9223372036854775807 (2^63 - 1). `siblings`/`dirs`: inclusion path of depth log2(width) (4 × 64-hex siblings and 4 booleans at width 16, 5 at 32). Job result `{ predicateAttestationId, payloadHash, claim, proof }`. **Rate class:** `prove`.
 
-### `issueFieldPredicateAttestationBatch(payloadHash, attesterId?, claims, sessionId, contractAddress, contentRoot?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, claims, droppedDuplicates }`
+### `issueFieldPredicateAttestationBatch(payloadHash, attesterId?, claims, sessionId, contractAddress, contentRoot?, schemaId?, compiledArtifactRef?, validUntil?, idempotencyKey?, sponsorSessionId?) → { jobId, status, claims, droppedDuplicates }`
 
 Prove up to 8 claims on ONE payload in ONE transaction (one balancing, submit, confirmation and fee; with `sponsorSessionId` one dust spend). `claims` entries mix kinds by `predicate`, each validated like its single action:
 
@@ -884,19 +895,19 @@ Prove up to 8 claims on ONE payload in ONE transaction (one balancing, submit, c
 
 Cross-root: document A is the batch `payloadHash`; an in-batch `contentRoot` is A's root, B's must already be anchored. A given `contentRoot` (with `schemaId`) is anchored as the first call and takes one of the 8 slots. Exact duplicate claims are dropped (`droppedDuplicates`). One `PredicateAttestations` row per claim, one shared `provenTxHash`; the response `claims` lists `{ predicateAttestationId, fieldKey, predicate, ... }` per claim. Proofs run sequentially, one per claim. A false claim fails at local proving (nothing submitted); after submission `PARTIAL_SUCCESS` fails the job with `OnChainStatus:...`, so verify per claim with `verifyPredicateAttestation`. **Rate class:** `prove`, one count per claim.
 
-### `issueFieldEqualityAttestation(payloadHash, attesterId?, fieldKey, expectedValue|expectedDigest, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblings?, dirs?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueFieldEqualityAttestation(payloadHash, attesterId?, fieldKey, expectedValue|expectedDigest, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblings?, dirs?, compiledArtifactRef?, validUntil?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
 Prove the bytes field at `fieldKey` holds the value whose blake2b-256 digest is `expectedDigest` (`proveFieldEquality`). Pass one of `expectedValue` (exact string, no trimming) or `expectedDigest` (64 hex). The digest is public: authenticity, not confidentiality (a low-entropy value is guessable). The field must be `kind: 'bytes'` in `prepareDocumentProof`; path as on the numeric action; a given `contentRoot` is anchored first (requires `schemaId`). **Rate class:** `prove`.
 
-### `issueFieldMembershipAttestation(payloadHash, attesterId?, fieldKey, value|valueDigest, allowedValues | setRoot+setSiblings+setDirs, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblings?, dirs?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueFieldMembershipAttestation(payloadHash, attesterId?, fieldKey, value|valueDigest, allowedValues | setRoot+setSiblings+setDirs, fieldSalt, sessionId, contractAddress, contentRoot?, schemaId?, siblings?, dirs?, compiledArtifactRef?, validUntil?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
 Prove the hidden bytes value at `fieldKey` is one of a public allow-list of up to 64 values, without revealing which (`proveFieldMembership`; set rule: `prepareMembershipSet`). Pass one of `value` or `valueDigest` (64 hex; witness, never persisted), and either `allowedValues` (400 before proving if the value is absent) or `setRoot` + `setSiblings`/`setDirs` (6 × 64-hex siblings, 6 booleans). **Rate class:** `prove`.
 
-### `issueDocumentIntegrityAttestation(payloadHashA, payloadHashB, attesterIdA?, attesterIdB?, allowedMask, schema, openingA, openingB, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueDocumentIntegrityAttestation(payloadHashA, payloadHashB, attesterIdA?, attesterIdB?, allowedMask, schema, openingA, openingB, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, validUntil?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
 Prove document B differs from A only in slots set in `allowedMask` (`proveDocumentComparison` mode 0; width bits, bit i = slot i may differ, 0 = identical; a mask constraining no real slot is rejected), values hidden. `schema` is the shared descriptor list, `openingA`/`openingB` the openings (`schema`/`opening` from `prepareDocumentProof`); the circuit recomputes the schema root and both content roots, so a forged schema id fails the proof. Both documents must be anchored under the same `schemaId`. A change outside the mask fails at local proving. `payloadHashA != payloadHashB` (asserted in-circuit); (A, B) order is part of the claim key. `contentRootA`/`contentRootB` anchor first, one transaction each (the batch `documentIntegrity` kind does it in one). **Rate class:** `prove`.
 
-### `issueDocumentDiffAttestation(payloadHashA, payloadHashB, attesterIdA?, attesterIdB?, k, schema, openingA, openingB, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
+### `issueDocumentDiffAttestation(payloadHashA, payloadHashB, attesterIdA?, attesterIdB?, k, schema, openingA, openingB, sessionId, contractAddress, contentRootA?, contentRootB?, schemaId?, compiledArtifactRef?, validUntil?, idempotencyKey?, sponsorSessionId?) → { jobId, status, predicateAttestationId }`
 
 Prove at least `k` (1..width) aligned slots differ between two anchored documents, hiding which (`proveDocumentComparison` mode 1; k=1: provably not the same document). Witnesses as in the integrity mode, never persisted. A value or presence change counts; both-empty and padding slots do not. One descriptor list must fold to both anchored schema ids. Fewer than k differences fail at local proving. **Rate class:** `prove`.
 
@@ -906,11 +917,11 @@ Prove at least `k` (1..width) aligned slots differ between two anchored document
 
 ## Crawler-free state verification
 
-Read live contract state (`queryContractState`): no crawler, txHash or server row needed, e.g. for wallet-submitted transactions. Absent state or no live provider: `verified: false`, not a 5xx. `network` (e.g. `preview` | `preprod`) reads another network's public indexer (unknown: 400; endpoints via `cds.requires.nightgate.networks.<network>.*`).
+Read live contract state (`queryContractState`): no crawler, txHash or server row needed, e.g. for wallet-submitted transactions. Absent state or no live provider: `verified: false`, not a 5xx. `network` (e.g. `preview` | `preprod`) reads another network's configured indexer (unknown: 400; endpoints via `cds.requires.nightgate.networks.<network>.*`).
 
 **Public lane.** `NIGHTGATE_PUBLIC_VERIFY=true` serves both functions without credentials at `/odata/v4/midnight-verify` (`NightgateVerifyService`, same signatures and results): the image admits the path unauthenticated with CORS `*`; a CAP host serves it under `@requires: 'any'`. Off (default): `404 PUBLIC_VERIFY_DISABLED`. Rate class `public-verify` (`NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT`, per client address). Nothing enumerable: every call needs contract, payload and claim coordinates. `verifyDocument` and `verifyPredicateAttestation` stay private (owner-scoped rows).
 
-**Independent verification:** everything these functions check is recomputable from public data: read the vault state from the public indexer, recompute the claim key (`persistentHash` over the tagged claim struct, e.g. bytes equality `{ tag 17, recordKey, contentRoot, schemaId, fieldKey, expectedDigest }` with `recordKey = persistentHash({ tag 21, attesterId, payloadHash })` and root and schema id from `content_anchors`), and look it up in `claims` (value: `valid_until` block time). The Compact source ships in `@odatano/contract-attestation-vault` under `src/`.
+**Independent verification:** everything these functions check is recomputable from public data: read the vault state from an indexer, recompute the claim key (`persistentHash` over the tagged claim struct, e.g. bytes equality `{ tag 17, recordKey, contentRoot, schemaId, fieldKey, expectedDigest }` with `recordKey = persistentHash({ tag 21, attesterId, payloadHash })` and root and schema id from `content_anchors`), and look it up in `claims` (value: `valid_until` block time). The Compact source ships in `@odatano/contract-attestation-vault` under `src/`.
 
 ### `verifyAttestationState(contractAddress, attesterId?, payloadHash?, documentId?, contentRoot?, schemaId?, compiledArtifactRef?, network?) → { verified, attested, contentRootOk, schemaOk, bindingRegistered, attesterId, payloadHash, recordKey, documentId }` (function)
 
@@ -983,11 +994,11 @@ The issuer binds `payloadHash` to `tokenType` on the registry at
 encrypted under the server key; without it the grant is an entitlement the
 issuer serves elsewhere. `expiresAt` at most a year ahead. The same grantor,
 payload, type and registry again updates the grant (`status: "updated"`).
-Grantable. **Rate class:** `prove`.
+Grantable. **Rate class:** `compute`.
 
 ### `revokeHolderDisclosure(holderGrantId) → { holderGrantId, status }`
 
-Only the grantor. A revoked grant answers no entitlement from the next claim.
+Only the grantor. A revoked grant answers no entitlement from the next claim. **Rate class:** `compute`.
 
 ### `claimDisclosure(payloadHash, tokenType, claimSecret) → { entitled, reason?, registryAddress?, holderGrantId?, contentType?, contentHashKind?, content?, expiresAt? }`
 
@@ -1109,18 +1120,22 @@ DUST fee (atoms, decimal string) for a `sendNight`: builds the recipe in the wor
 
 ## Indexer / health / metrics
 
-### `getHealth() → { status, chainHeight, indexedHeight, finalizedHeight, lag, finalizedLag, blocksPerSecond, syncStatus }`
+### `getHealth() → { status, chainHeight, indexedHeight, finalizedHeight, lag, finalizedLag, blocksPerSecond, syncStatus, instanceId, runtimeMode, replicaCount, databaseKind, topologyValid, runtimeWarnings }`
 
-The crawler's view, not the wallet's; with `NIGHTGATE_CRAWLER_ENABLED=false` it returns the last persisted `SyncState`.
+The crawler's view, not the wallet's; with `NIGHTGATE_CRAWLER_ENABLED=false` it returns the last persisted `SyncState`. `status` is `unhealthy` while an enabled crawler stopped or errored, or lags more than 100 blocks; `degraded` above 10 blocks or after five minutes without a new block; else `healthy`.
+
+### `getReceiptKey() → { publicKey, algorithm }`
+
+The Ed25519 public key (hex) this instance signs job receipts with. Public, so a third party can check a receipt.
 
 ### `getSyncStatus() → SyncState`
 ### `getMetrics() → String`
 
 `getMetrics` returns Prometheus text, prefix `odatano_nightgate_*`: chain and indexed height, sync lag, block throughput, error counts, uptime, sync status (stopped=0, syncing=1, synced=2, error=3), runtime topology (`_runtime_topology_valid`, `_runtime_replicas`, `_runtime_database_info`), jobs (`_jobs_queued`, `_jobs_running`, `_jobs_reconciliation_required`, `_jobs_oldest_queued_seconds`) and wallet worker (`_wallet_worker_running`, `_wallet_worker_inflight_rpcs`, `_wallet_worker_exits`).
 
-Over OData the text arrives wrapped in JSON (`{"value":"..."}`); unwrap it before feeding a Prometheus parser. The five read-only probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`, `getHealth`) are anonymous at the model level, so a scraper or a K8s probe needs no credentials; `getReadiness()` answers 503 when a check fails. (Up to 0.24.3 the image also served plain `/nightgate/metrics|health|ready` routes behind their own bearer token; they are gone, the OData functions are the one surface.)
+Over OData the text arrives wrapped in JSON (`{"value":"..."}`); unwrap it before feeding a Prometheus parser. The five read-only probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`, `getHealth`) are anonymous at the model level, so a scraper or a K8s probe needs no credentials; `getReadiness()` answers 503 when a check fails.
 
-### `getBoardStatus() → { openOffers, offersFilledToday, swapsToday, sponsorsConfigured, sponsorsReady, asOf }` (function)
+### `getBoardStatus() → { openOffers, offersFilledToday, swapsToday, sponsorsConfigured, sponsorsReady, factoryContract, version, asOf }` (function)
 
 Counts only, anonymous like the probes: open offers, offers filled and
 sponsored swaps succeeded since UTC midnight (none a chain failure; the
@@ -1169,7 +1184,7 @@ Last `limit` (default 10, max 100) reorg events with depth, detected-at timestam
 
 `invalidateSession(sessionId)` / `invalidateAllSessions()`: force-close any session (unlike `disconnectWallet`, not only the caller's own).
 
-`exportContractSigningKey(sessionId, contractAddress, password) → { format, encryptedPayload, salt, contractAddress, accountId }`: export a contract's maintenance signing key from the session that deployed it, sealed under `password` (at least 16 characters); `importSigningKeys` restores it. Whoever holds it can replace the contract's verifier keys; store it offline.
+`exportContractSigningKey(sessionId, contractAddress, password) → { format, encryptedPayload, salt, contractAddress, accountId }`: export a contract's maintenance signing key from the session that deployed it, sealed under `password` (at least 16 characters). No action restores it; in code, `CapDbPrivateStateProvider.importSigningKeys` reads it back into a session's store. Whoever holds it can replace the contract's verifier keys; store it offline.
 
 `SwapOffers` (read-only entity): the offer board with `posterUserId`, `posterGrantId`, `sessionId` and the halves' `nullifiers`, which the public reads never show.
 
@@ -1220,6 +1235,28 @@ curl "http://localhost:4004/odata/v4/midnight/PendingSubmissions?\$filter=sessio
 # Top 5 NIGHT holders
 curl "http://localhost:4004/odata/v4/midnight/NightBalances/NightgateService.getTopHolders(limit=5)"
 ```
+
+### Chain read functions
+
+Bound to the entity collection, for example `Transactions/byHash(hash='0x…')`.
+A list function takes `limit` (1 to 5000, default per function) and `skip` (default 0).
+A full page means more rows exist; read the next page with `skip`. A value outside these ranges is a 400.
+
+| Function | Order | Default `limit` |
+|---|---|---|
+| `Blocks/latest()`, `Blocks/byHeight(height)` | one block | - |
+| `Blocks/range(startHeight, endHeight, limit, skip)` | height ascending | 100 |
+| `Transactions/byHash(hash, limit, skip)` | newest first | 100 |
+| `Transactions/byType(txType, limit, skip)` | newest first | 100 |
+| `Transactions/byIdentifier(identifier)` | one transaction, 404 until indexed | - |
+| `ContractActions/byAddress(address, limit, skip)` | oldest first | 100 |
+| `ContractActions/history(address, limit, skip)` | newest first | 100 |
+| `UnshieldedUtxos/byOwner(owner, limit, skip)` | newest first | 1000 |
+| `UnshieldedUtxos/unspent(limit, skip)` | newest first | 1000 |
+| `NightBalances/getBalance(address)` | one balance | - |
+| `NightBalances/getTopHolders(limit, skip)` | highest balance first | 10 |
+
+A hash can occur in more than one block: the timestamp transaction repeats its hash in every block.
 
 ## Error model
 
@@ -1275,6 +1312,7 @@ Job codes (`classifySubmissionError`, `srv/submission/TransactionSubmitter.ts`):
 | `BatchCausalityViolation` | no | `causality`; `calls` (name, segId, stages in apply order) on the classification and in the message |
 | `ContractTypeError` / `IncompleteCallTxPrivateStateConfig` / `IncompleteFindContractPrivateStateConfig` | no | SDK contract configuration errors (by error `name`) |
 | `WalletSigningNotAvailable` | no | session has no encrypted seed |
+| `CHILD_FAILED` | no | a workflow step failed; the message names the step, the steps already on chain and that a new attempt needs a new `idempotencyKey` |
 | `<error name>` (default) | no | any other error, by its `name` |
 
 Raw node or SDK errors instead of a job code:
@@ -1284,4 +1322,4 @@ Raw node or SDK errors instead of a job code:
 - **`Wallet.InsufficientFunds`:** not enough dust for the fee or NIGHT for the outputs.
 - **`MalformedResult`:** the SDK returned without the expected fields; thrown by `TransactionSubmitter`, not a job code.
 
-For diagnostic 503s caused by the hosted Midnight indexer, see [docs/operations.md#troubleshooting](operations.md#troubleshooting).
+For diagnostic 503s caused by the indexer, see [docs/operations.md#troubleshooting](operations.md#troubleshooting).

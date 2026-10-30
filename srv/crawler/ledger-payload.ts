@@ -1,15 +1,12 @@
-/**
- * Reads the serialized ledger transaction inside a `Midnight.send_mn_transaction` extrinsic.
- *
- * The block's events say what happened. The transaction itself is the only place that names
- * the called circuit, the zswap offers and the DUST actions.
- * Decoding is slow, so it runs in a separate pass and not in the main crawl loop.
- */
+// Reads the serialized ledger transaction inside a `Midnight.send_mn_transaction` extrinsic.
+// Only the transaction names the called circuit, the zswap offers and the DUST actions.
+// Decoding is slow, so it runs in a separate pass and not in the main crawl loop.
 
 import { decodeCompact } from '../utils/scale';
 import { loadLedgerV8 } from '../midnight/sdk-loader';
 import { stripContractAddressPrefix } from './block-events';
 import { errorMessage } from '../utils/errors';
+import { bareHex } from '../utils/hex-patterns';
 
 /** One contract action as the transaction declared it, in intent order. */
 export interface DeclaredContractAction {
@@ -26,10 +23,7 @@ export interface LedgerPayloadFacts {
     zswapTransientCount: number;
     dustSpendCount: number;
     dustRegistrationCount: number;
-    /**
-     * Sum of `vFee` over the transaction's DUST spends.
-     * This is not the fee the Midnight indexer reports, which is a different number.
-     */
+    /** Sum of `vFee` over the DUST spends. Not the fee the Midnight indexer reports. */
     dustSpendValue: bigint;
 }
 
@@ -43,10 +37,8 @@ export function extractLedgerPayload(buf: Buffer, argsOffset: number): Uint8Arra
     return new Uint8Array(buf.subarray(start, start + length));
 }
 
-/**
- * Serialization variants to try, in order. On-chain transactions use the first one.
- * The others cover transactions that are not yet bound or have erased signatures.
- */
+// Serialization variants to try, in order. On-chain transactions use the first one.
+// The others cover transactions that are not yet bound or have erased signatures.
 const MARKERS: ReadonlyArray<readonly [string, string, string]> = [
     ['signature', 'proof', 'binding'],
     ['signature', 'proof', 'pre-binding'],
@@ -67,10 +59,8 @@ function deserialize(ledger: any, bytes: Uint8Array): any {
 }
 
 function hex(value: unknown): string {
-    if (value == null) return '';
-    if (typeof value === 'string') return value.replace(/^0x/i, '').toLowerCase();
     if (value instanceof Uint8Array) return Buffer.from(value).toString('hex');
-    return String(value).replace(/^0x/i, '').toLowerCase();
+    return bareHex(value);
 }
 
 function entryPointOf(action: any): string | null {
@@ -150,11 +140,8 @@ export function carriesProof(facts: LedgerPayloadFacts): boolean {
     return carriesShieldedCoins(facts) || facts.contractActions.some(a => a.entryPoint !== null);
 }
 
-/**
- * The type of a transaction without contract actions, or null.
- * Block events only report contract actions and unshielded transfers.
- * Other transactions get their real type only from the decoded payload.
- */
+// The type of a transaction without contract actions, or null.
+// Block events do not report shielded transfers or DUST registrations, so only the payload gives that type.
 export function callFreeTxType(facts: LedgerPayloadFacts): 'shielded_transfer' | 'dust_registration' | null {
     if (facts.contractActions.length > 0) return null;
     if (carriesShieldedCoins(facts)) return 'shielded_transfer';

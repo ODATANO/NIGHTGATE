@@ -14,3 +14,13 @@ export async function parseMidnightAddress(af: AddressFormatModule, text: string
     if (prefix !== af.MidnightBech32m.prefix) throw new Error(`Expected prefix ${af.MidnightBech32m.prefix}`);
     return new af.MidnightBech32m(type, network, Buffer.from(bech32m.fromWords(decoded.words)));
 }
+
+/** What a receiver address pays to, by its prefix. Null for any other text. */
+export function receiverKind(addr: string): 'shielded' | 'unshielded' | null {
+    if (addr.startsWith('mn_shield-addr_')) return 'shielded';
+    if (addr.startsWith('mn_addr_')) return 'unshielded';
+    return null;
+}
+
+/** The accepted receiver prefixes, for error messages. */
+export const RECEIVER_PREFIXES = "'mn_shield-addr_' (shielded) or 'mn_addr_' (unshielded)";

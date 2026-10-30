@@ -1,8 +1,5 @@
-/**
- * Digest of a compiled contract build and checks of its prover key list.
- * The code lives in `@odatano/contract-kit/node`. It has no dependencies,
- * so the worker thread and the contracts repository compute the same digest.
- */
+// Digest of a compiled contract build and checks of its prover key list.
+// Re-exported from `@odatano/contract-kit/node`, which has no dependencies, so the worker thread and the contracts repository compute the same digest.
 export {
     computeArtifactGenerationDigest,
     artifactGenerationMatch,

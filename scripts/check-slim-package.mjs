@@ -1,19 +1,5 @@
-// Verifies the generated `@odatano/nightgate-tx` the way a CONSUMER meets it:
-// resolve every declared export through Node's exports map, in a directory that
-// only sees the package by name. A green build is not proof; a package whose
-// exports map is wrong installs fine and fails on the consumer's first import.
-//
-// Checks:
-//   1. every `exports` subpath resolves and loads
-//   2. the documented API is actually there
-//   3. nothing pulls @sap/cds or @odatano/nightgate back in
-//   4. every file the `files` list promises exists
-//   5. the tarball stays small (the 78 MB of prover keys must NOT be in it)
-//   (3 also walks every relative require of a shipped runtime file: it must
-//   resolve inside the package, not in the server tree it was built from)
-//
-// Run via `npm run check:slim` (which builds first).
-//
+// Checks @odatano/nightgate-tx as a consumer meets it: exports resolve, API present, no server imports, small tarball.
+// Run: npm run check:slim (builds first)
 // SPDX-License-Identifier: Apache-2.0
 
 import { readFile, mkdir, writeFile, rm, access, readdir, stat } from 'node:fs/promises';
@@ -107,11 +93,7 @@ async function main() {
         if (/(from|require\()\s*['"]@sap\/cds/.test(text)) dirty.push(`${relative(PKG_DIR, f)} imports @sap/cds`);
         if (/(from|require\()\s*['"]@odatano\/nightgate(?!-tx)/.test(text)) dirty.push(`${relative(PKG_DIR, f)} imports @odatano/nightgate`);
         if (/@odatano\/nightgate(?!-tx)/.test(text)) dirty.push(`${relative(PKG_DIR, f)} still names @odatano/nightgate`);
-        // A shipped runtime file may only reach files that ship with it. The
-        // built srv/ twins are copied out of a tree that has everything, so a
-        // relative require of a server-only module (e.g. wasm-proof-provider
-        // -> ../utils/config) passes the import probes and fails on the
-        // consumer's first build.
+        // A shipped runtime file may only require files that ship with it.
         if (/\.m?js$/.test(f)) {
             for (const [line, spec] of text.matchAll(/^.*?(?:from|require\()\s*['"](\.{1,2}\/[^'"]+)['"].*$/gm)) {
                 // the one sanctioned exception: a require marked slim-optional
@@ -146,11 +128,8 @@ async function main() {
     if (mb > MAX_TARBALL_MB) bad(`tarball is ${mb.toFixed(1)} MB, over the ${MAX_TARBALL_MB} MB budget`);
     else ok(`tarball ${mb.toFixed(2)} MB, ${packed.entryCount} files (budget ${MAX_TARBALL_MB} MB)`);
 
-    // 6: REAL-INSTALL probe. The in-repo import probe resolves transitive
-    // dependencies by walking up into the MAIN tree's node_modules, so a
-    // phantom dependency passes there and fails with ERR_MODULE_NOT_FOUND on
-    // every clean install. Pack the tarball, npm-install it into an isolated
-    // prefix and import the entry points THERE.
+    // 6: Install the packed tarball into an isolated prefix and import there.
+    // The in-repo probe would find missing dependencies in the main node_modules.
     console.log('  ...   real-install probe (npm pack + install, takes a minute)');
     const probeRoot = join(PKG_DIR, '.install-probe');
     await rm(probeRoot, { recursive: true, force: true });
@@ -168,10 +147,7 @@ async function main() {
             "import '@odatano/nightgate-tx/attestation-vault';",
             "import '@odatano/nightgate-tx/attestation-vault-32';",
             "import '@odatano/nightgate-tx/set-root';",
-            // The entry points load the proof provider lazily, so a server-only
-            // require inside it passes the imports above and dies on
-            // the consumer's first wasm build. Load it here, in the clean
-            // install, and check the environment fallback answers.
+            // The proof provider loads lazily, so require it here to catch a server-only require inside it.
             "import { createRequire } from 'node:module';",
             "const wpp = createRequire(import.meta.url)('./node_modules/@odatano/nightgate-tx/srv/midnight/wasm-proof-provider.js');",
             "process.env.NIGHTGATE_PROVING_MODE = 'wasm';",

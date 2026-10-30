@@ -67,6 +67,6 @@ describe('db-indexes', () => {
         await ensureIndexes({ run }, 'postgres');
         const ddl = run.mock.calls.map((c: any[]) => String(c[0]));
         expect(ddl).toContain('CREATE INDEX IF NOT EXISTS ng_transactions_createdat_desc ON midnight_Transactions (createdAt DESC NULLS LAST)');
-        expect(ddl.some((s: string) => s.includes('NULLS') && !s.includes('createdAt'))).toBe(false);
+        expect(ddl.some((s: string) => s.includes('NULLS') && !s.includes('DESC'))).toBe(false);
     });
 });

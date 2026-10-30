@@ -1,16 +1,5 @@
-// Live lane for the sponsored deploy: a caller builds, proves and signs a
-// contract deploy with its own key (txbuilder `buildDeploySponsorable`), a grant
-// with `allowDeploy` lets the sponsor pay the dust, the landed address joins the
-// grant's `deployedContracts`, a follow-up call on it is sponsored under the same
-// token, and a second deploy under the grant is refused before broadcast.
-//
-// Server: `npm run serve` with NIGHTGATE_SPONSOR_ALLOW_DEPLOY=true.
-// Env: LACE_* (the sponsor wallet), NIGHTGATE_INDEXER_HTTP_URL, NIGHTGATE_NODE_URL,
-//      NIGHTGATE_URL (default http://localhost:4004), NIGHTGATE_HTTP_USER/_PASSWORD,
-//      DEPLOY_E2E_ARTIFACT (default 'counter').
-// Prints GRANT_TOKEN=... at the end; the burst lane can reuse it via
-// NIGHTGATE_AGENT_TOKEN=<token> NIGHTGATE_SPONSOR_SESSION_ID=<sponsor>.
-//
+// Checks a caller-built sponsored deploy under an allowDeploy grant, a follow-up call, and refusal of a second deploy.
+// Run: node --env-file=.env scripts/run-sponsored-deploy-e2e.mjs against `npm run serve` with NIGHTGATE_SPONSOR_ALLOW_DEPLOY=true
 // SPDX-License-Identifier: Apache-2.0
 import { randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';

@@ -1,8 +1,5 @@
-/**
- * Decides which calls a fee sponsor pays for. The platform policy comes from env
- * or from `NIGHTGATE_SPONSOR_POLICY_FILE`. An agent grant can only narrow it further.
- * An empty platform list allows everything. An empty grant list takes the platform list.
- */
+// Decides which calls a fee sponsor pays for. The platform policy comes from env or `NIGHTGATE_SPONSOR_POLICY_FILE`, and an agent grant can only narrow it.
+// An empty platform list allows everything. An empty grant list takes the platform list.
 import fs from 'node:fs';
 import cds from '@sap/cds';
 import { configList, configFlag, configString, configIsSet } from '../utils/config';
@@ -25,10 +22,7 @@ export interface SponsorPolicy {
     contractCircuits?: ContractCircuitRules;
     /** Sponsor deploys built by the caller. The platform and, for an agent, the grant must both allow it. */
     allowDeploy?: boolean;
-    /**
-     * Contracts deployed under the grant. `allowedCircuits` does not apply to them,
-     * because it names circuits of the shared contracts. The size limit still applies.
-     */
+    /** Contracts deployed under the grant. `allowedCircuits` names circuits of the shared contracts, so it does not apply here. The size limit still applies. */
     ownContracts?: string[];
     /** Raw token types (64 hex) whose zswap offers are sponsored. Empty means none. */
     allowedTokenTypes?: string[];
@@ -44,7 +38,7 @@ export interface SponsorPolicy {
     sharedTokenTypes?: string[];
     /** Sponsor plain shielded transfers of a listed token type. The platform and, for an agent, the grant must both allow it. */
     allowTransfers?: boolean;
-    /** Sponsor a call whose intent moves the caller's own unshielded tokens into the contract. Platform and grant must both allow it. */
+    /** Sponsor a call whose intent moves unshielded tokens: the caller's own in, the contract's payouts out. Platform and grant must both allow it. */
     allowUnshieldedOffers?: boolean;
     /** Raw token types an unshielded offer may move besides NIGHT. Empty means NIGHT only. */
     allowedUnshieldedTokenTypes?: string[];
@@ -71,10 +65,7 @@ export interface GrantPolicyInput {
 export const MAX_POLICY_ENTRIES = 256;
 const MAX_ENTRY_LENGTH = 130;
 
-/**
- * Validates an allow-list, trimmed and without duplicates.
- * A malformed entry throws, so it cannot sit in the list and silently never match.
- */
+/** Validates an allow-list, trimmed and without duplicates. A malformed entry throws, so it cannot sit in the list and silently never match. */
 export function validatePolicyList(name: string, raw: unknown): string[] {
     if (raw === undefined || raw === null) return [];
     if (!Array.isArray(raw)) throw new Error(`${name} must be an array of strings`);
@@ -358,11 +349,8 @@ function narrowCircuits(
     return { allowedContracts: usable, allowedCircuits: grantList, contractCircuits: Object.fromEntries(usable.map(a => [a, narrowed[a]])) };
 }
 
-/**
- * The platform policy narrowed by the grant. If nothing is left, it throws before a job is created.
- * `shared` holds token types minted anywhere on the platform. They are added to the platform's
- * token list while the platform shares minted types.
- */
+// The platform policy narrowed by the grant. Throws before a job is created when nothing is left.
+// `shared` holds token types minted anywhere on the platform. They join the platform's token list while minted types are shared.
 export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicyInput | null, shared: string[] = sharedLearnedTokenTypes()): SponsorPolicy {
     const circuits = narrowCircuits(floor, grant?.allowedCircuits, intersect(floor.allowedContracts, grant?.allowedContracts, 'allowedContracts'));
     const contracts = circuits.allowedContracts;
@@ -412,8 +400,7 @@ function floorTokenTypes(floor: SponsorPolicy, sharedTypes: string[]): string[] 
 }
 
 /**
- * Why a grant's lists cannot work under the platform policy, or null. Used when a grant is written.
- * Sponsoring checks again later, because the platform policy can shrink.
+ * Why a grant's lists cannot work under the platform policy, or null. Used when a grant is written. Sponsoring checks again later, because the platform policy can shrink.
  */
 export function grantPolicyConflict(floor: SponsorPolicy, grant: GrantPolicyInput, shared: string[] = sharedLearnedTokenTypes()): string | null {
     let effective: SponsorPolicy;

@@ -25,8 +25,7 @@ actions submit the job AND wait for the result, so one call returns the
 ```js
 const ng = connect({
     baseUrl: 'https://api.preprod.odatano.dev',
-    token: 'oda_...'                  // or agentToken: 'ngat_...' / username: + password:
-    // servicePath: '/api/v1/nightgate', indexerServicePath: '/api/v1/indexer'  // a server below 0.35.0
+    token: 'oda_...'                  // or agentToken: 'ngat_...', or username and password
 });
 
 const proof = await ng.prepareDocumentProof({
@@ -116,11 +115,14 @@ identity and TTL.
 
 Two wallets exchange shielded tokens without a contract; a sponsor pays the
 fee. `createSwapWallet({ seedHex, indexerHttpUrl, indexerWsUrl })` syncs the
-shielded coins only. `buildHalf({ give, want })` returns one half of a swap and
+shielded coins only; with a gateway key, `createSwapWallet({ seedHex, api })`
+syncs them through the gateway and needs no indexer. `buildHalf({ give, want })` returns one half of a swap and
 its offer file (`swapoffer1...`); `takeOffer({ offer, expect })` reads the
 offer's terms from the transaction, builds the mirror half and returns both for
 `ng.sponsorSwap({ makerHalfB64, takerHalfB64 })`.
-`serializeState()` / `walletState` resume a wallet without a sync from genesis.
+`serializeState()` / `walletState` resume a wallet without a sync from genesis;
+`revert(offer)` frees the coins of a half that never landed, also after a
+restart, and `pending()` lists what is still reserved.
 A process that swaps and calls contracts on one seed runs one shielded wallet:
 `createTxBuilder({ shieldedWallet: swap.shieldedWallet, walletSync: false })`
 balances from the swap wallet's coins and neither starts nor stops it (one
@@ -215,7 +217,7 @@ The verification reads need none.
   host's `/zk-config`, cached under `~/.cache/nightgate-txbuilder/<contract>`.
   `circuits: ['attest']` fetches only what you call. `connect()` downloads
   nothing.
-- **Local proving blocks the thread** for tens of seconds.
+- **Local proving blocks the thread** for tens of seconds to minutes per proof.
 - **Built transactions expire** (`ttlMinutes`, default 30).
 - **Fetch prover keys from the host you submit to**: it pins the artifact
   generation to the deployed contract.

@@ -1,23 +1,22 @@
-/**
- * Actions that store document hashes on-chain, verify them, register documents and remove them.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Actions that store document hashes on-chain, verify them, register documents and remove them.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 import { type NightgateNetwork, VALID_NIGHTGATE_NETWORKS } from '../../utils/nightgate-config';
 import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
-import { DEFAULT_ATTESTATION_VAULT_REF, liveProviderConfigured } from '../verify-state';
+import { vaultRef, liveProviderConfigured } from '../verify-state';
 import { agentOutputProducedAt } from '../document-proof';
-import { Documents, Transactions, TransactionResults, type Document, type Transaction } from '#cds-models/midnight';
+import { Documents, type Document } from '#cds-models/midnight';
 import type { Row } from '../../utils/db-types';
 import type { ActionRequest } from '@sap/cds';
-import { facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, checkRate, runSubmission } from './common';
+import { facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, runSubmission, startJobWithRows, landedOnChain } from './common';
 import type { SubmissionContext } from './context';
 import { anchorDocument, purgeExpired, registerPassport, retractAttestation, verifyDocument } from '#cds-models/NightgateService';
+import { checkRateClass } from '../../utils/rate-classes';
 
-const { INSERT, UPDATE, SELECT, DELETE } = cds.ql;
+const { INSERT, SELECT } = cds.ql;
 
 export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'attesterIdResolver' | 'contractResolver' | 'verifyDocumentViaState' | 'resolveSponsorForRequest'>): void {
     const { srv, db, walletFactory, attesterIdResolver, contractResolver, verifyDocumentViaState, resolveSponsorForRequest } = ctx;
@@ -31,48 +30,46 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
         const metadataStr = data.metadata ?? '';
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', data.sessionId, req)) return;
+        if (!checkRateClass('prove', data.sessionId, req)) return;
 
         const metadataHashBytes = sha256(new TextEncoder().encode(metadataStr));
         const producedAt = agentOutputProducedAt(data.contentType, metadataStr);
 
         const documentId = cds.utils.uuid();
-        const insertedAt = new Date().toISOString();
-        // verifyDocument later trusts only what is stored here, never values from its caller.
-        const networkId = recordedNetworkId();
-        await db.run(INSERT.into(Documents).entries({
-            ID: documentId,
-            sha256: data.sha256.toLowerCase(),
-            contentType: data.contentType ?? null,
-            size: data.size ?? null,
-            storageRef: data.storageRef,
-            anchoredTxHash: null,
-            anchoredAt: null,
-            userId: req.user?.id ?? null,
-            contractAddress: data.contractAddress ?? null,
-            network: networkId,
-            compiledArtifactRef: compiledRef,
-            artifactDigest: artifactDigestOrNull(compiledRef),
-            sessionId: data.sessionId ?? null,
-            createdAt: insertedAt,
-            modifiedAt: insertedAt
-        }));
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
             await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
+            // Ownership first, so nothing is written for a caller who does not own the session.
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
-
             const attesterId = await attesterIdResolver({ sessionId: data.sessionId!, db, expectedUserId: req.user?.id });
-            await db.run(UPDATE.entity(Documents).set({ attesterId }).where({ ID: documentId }));
-            const job = await startJob({
+
+            const insertedAt = new Date().toISOString();
+            // verifyDocument later trusts only what is stored here, never values from its caller.
+            const insertRows = INSERT.into(Documents).entries({
+                ID: documentId,
+                sha256: data.sha256!.toLowerCase(),
+                contentType: data.contentType ?? null,
+                size: data.size ?? null,
+                storageRef: data.storageRef,
+                anchoredTxHash: null,
+                anchoredAt: null,
+                userId: req.user?.id ?? null,
+                contractAddress: data.contractAddress,
+                network: recordedNetworkId(),
+                compiledArtifactRef: compiledRef,
+                artifactDigest: artifactDigestOrNull(compiledRef),
+                sessionId: data.sessionId,
+                attesterId,
+                createdAt: insertedAt,
+                modifiedAt: insertedAt
+            });
+            const job = await startJobWithRows(db, Documents, [documentId], insertRows, () => startJob({
                 kind: 'anchorDocument',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
@@ -98,10 +95,8 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                     metadataHash: bytesToHex(metadataHashBytes), attesterId, contractAddress: data.contractAddress!,
                     compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
                 }
-            });
-
-            if (job.deduplicated) await db.run(DELETE.from(Documents).where({ ID: documentId }));
-            const stableDocumentId = (job.originalRequest as any)?.documentId ?? documentId;
+            }));
+            const stableDocumentId = job.originalRequest?.documentId ?? documentId;
             return { jobId: job.jobId, status: job.status, documentId: stableDocumentId, attesterId };
         });
     });
@@ -111,6 +106,7 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         if (!documentId) return req.reject(400, 'documentId is required');
         if (!providedSha256) return req.reject(400, 'providedSha256 is required');
+        if (!checkRateClass('read', 'read', req)) return;
 
         const doc: Row<Document, 'ID' | 'sha256'> | undefined = await db.run(
             SELECT.one.from(Documents).where({ ID: documentId })
@@ -143,20 +139,7 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         let stateChecked = false;
         let current = false;
         if (anchoredOk && hashMatches) {
-            const txRow: Row<Transaction, 'ID'> | undefined = await db.run(
-                SELECT.one.from(Transactions)
-                    .columns('ID', 'hash')
-                    .where({ hash: doc.anchoredTxHash })
-            );
-            if (txRow?.ID) {
-                const result: any = await db.run(
-                    SELECT.one.from(TransactionResults)
-                        .columns('status', 'outcomeSource')
-                        .where({ transaction_ID: txRow.ID })
-                );
-                included = result?.status === 'SUCCESS'
-                    && result?.outcomeSource === 'substrate-system-events';
-            }
+            included = await landedOnChain(db, doc.anchoredTxHash);
             if (effectiveContract && doc.attesterId && liveProviderConfigured(recordedNetwork)) {
                 stateChecked = true;
                 current = await verifyDocumentViaState(
@@ -191,12 +174,10 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', data.sessionId, req)) return;
+        if (!checkRateClass('prove', data.sessionId, req)) return;
 
         const passportIdLc = data.passportId.toLowerCase();
         const ownerIdLc = data.ownerId.toLowerCase();
@@ -240,11 +221,9 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
     async function submitRetract(req: ActionRequest<unknown, unknown>, mode: number, key: string, data: { sessionId?: string | null; contractAddress?: string | null; compiledArtifactRef?: string | null; idempotencyKey?: string | null; sponsorSessionId?: string | null }) {
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
         if (rejectIfMainnetBlocked(req)) return;
-        if (!checkRate('prove', data.sessionId, req)) return;
+        if (!checkRateClass('prove', data.sessionId, req)) return;
         const keyLc = key.toLowerCase();
         const contractAddressLc = data.contractAddress.toLowerCase();
         return runSubmission(req, async () => {

@@ -147,6 +147,18 @@ import { walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../
 import { RateLimiter } from '../../srv/utils/rate-limiter';
 import { registerWalletSessionHandlers, startSessionCleanup, closeSessionsFromPreviousProcess } from '../../srv/sessions/wallet-sessions';
 import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
+import type { WalletBalanceSnapshot } from '../../srv/submission/token-ops';
+
+/** A full worker balance. Free dust notes follow the worker's rule when a test leaves them out. */
+function balanceOf(partial: Partial<WalletBalanceSnapshot>): WalletBalanceSnapshot {
+    const total = partial.dustUtxoCount ?? 0;
+    const pending = partial.dustPendingCount ?? 0;
+    return {
+        shieldedNight: '0', unshieldedNight: '0', shieldedTokens: [], dustBalance: '0',
+        registeredNightUtxoCount: 0, totalNightUtxoCount: 0, dustUtxoCount: total, dustPendingCount: pending,
+        dustPendingValue: '0', dustRestoreCount: 0, dustAvailableCount: Math.max(0, total - pending), ...partial
+    };
+}
 
 async function runPersistedCommand(args: any): Promise<unknown> {
     const processor = registeredProcessors.get(args.kind);
@@ -714,7 +726,7 @@ describe('wallet session handlers', () => {
 
             const badHex = createMockRequest({ sessionId: 's1', seedHex: 'not-hex' });
             await registeredHandlers['connectWalletForSigning'](badHex);
-            expect(badHex.reject).toHaveBeenCalledWith(400, expect.stringContaining('128 hex characters'));
+            expect(badHex.reject).toHaveBeenCalledWith(400, expect.stringContaining('128 hex chars'));
         });
 
         it('rejects 404 when the session row is missing', async () => {
@@ -1023,7 +1035,7 @@ describe('wallet session handlers', () => {
                 [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: 'NaN' }, /decimal integer/],
                 [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '0' }, 'amount must be > 0'],
                 [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1000000000000000000000' }, /sanity bound/],
-                [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1', ttlIso: 'not-a-date' }, /valid ISO-8601/],
+                [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1', ttlIso: 'not-a-date' }, /must be an ISO-8601 timestamp/],
                 [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1', ttlIso: new Date(Date.now() - 10_000).toISOString() }, /must be in the future/]
             ];
 
@@ -1496,12 +1508,12 @@ describe('wallet session handlers', () => {
             const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row);   // visibility lookup
             mockDbRun.mockResolvedValueOnce(row);   // loadSigningSessionAccountId
-            mockGetWalletBalance.mockResolvedValueOnce({
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
                 dustBalance: '5000',
                 registeredNightUtxoCount: 4, dustUtxoCount: 4,
                 dustPendingCount: 0,
                 dustRestoreCount: 1
-            });
+            }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result).toHaveLength(1);
@@ -1519,7 +1531,7 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
-            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '0', registeredNightUtxoCount: 2 });
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '0', registeredNightUtxoCount: 2 }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result[0].usable).toBe(false);
@@ -1535,13 +1547,13 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
-            mockGetWalletBalance.mockResolvedValueOnce({
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
                 dustBalance: '6510232317207628087',
                 registeredNightUtxoCount: 0,   // owns nothing registered
                 dustUtxoCount: 14,             // fourteen notes, all delegated
                 dustPendingCount: 0,
                 dustRestoreCount: 0
-            });
+            }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result[0]).toMatchObject({ usable: true, registeredNightUtxos: 0, dustNotes: 14 });
@@ -1554,10 +1566,10 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
-            mockGetWalletBalance.mockResolvedValueOnce({
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
                 dustBalance: '5000', registeredNightUtxoCount: 4,
                 dustUtxoCount: 4, dustPendingCount: 2, dustRestoreCount: 0
-            });
+            }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result[0]).toMatchObject({ dustNotes: 2, pendingDustNotes: 2 });
@@ -1569,10 +1581,10 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
-            mockGetWalletBalance.mockResolvedValueOnce({
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
                 dustBalance: '5000', registeredNightUtxoCount: 4,
                 dustUtxoCount: 9, dustAvailableCount: 3, dustPendingCount: 2, dustRestoreCount: 0
-            });
+            }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result[0]).toMatchObject({ dustNotes: 3 });
@@ -1582,10 +1594,10 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
-            mockGetWalletBalance.mockResolvedValueOnce({
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
                 dustBalance: '5000', registeredNightUtxoCount: 4,
                 dustUtxoCount: 2, dustPendingCount: 2, dustRestoreCount: 0
-            });
+            }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result[0]).toMatchObject({ usable: false, dustNotes: 0 });
@@ -1595,11 +1607,11 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
-            mockGetWalletBalance.mockResolvedValueOnce({
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
                 dustBalance: '5000',
                 registeredNightUtxoCount: 4, dustUtxoCount: 4,
                 dustPendingCount: 2
-            });
+            }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](createMockRequest({}));
             expect(result[0].dustBalance).toBeNull();
@@ -1611,7 +1623,7 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: TEST_USER_ID };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
-            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '5000', registeredNightUtxoCount: 1 });
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '5000', registeredNightUtxoCount: 1 }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](createMockRequest({}));
             expect(result[0].dustBalance).toBe('5000');
@@ -1624,7 +1636,7 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const expired = activeSessionRow({ expiresInMs: -60_000, sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(expired).mockResolvedValueOnce(expired);
-            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 });
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result[0].lastError).toBeNull();
@@ -1659,7 +1671,7 @@ describe('wallet session handlers', () => {
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue(null);
             mockHasWalletFacade.mockReturnValue(true);
-            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '700', registeredNightUtxoCount: 2, dustUtxoCount: 2 });
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '700', registeredNightUtxoCount: 2, dustUtxoCount: 2 }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result[0]).toMatchObject({ usable: false, caughtUp: false, registeredNightUtxos: 2, dustNotes: 2 });
@@ -1677,7 +1689,7 @@ describe('wallet session handlers', () => {
                 caughtUp: false, appliedIndex: '1520690', streamTip: '1520712', behindEvents: '22',
                 isConnected: true, indexerFresh: true, updatedAt: new Date().toISOString()
             });
-            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '9000', registeredNightUtxoCount: 4, dustUtxoCount: 13 });
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '9000', registeredNightUtxoCount: 4, dustUtxoCount: 13 }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result[0]).toMatchObject({ usable: false, caughtUp: false, dustNotes: 13 });
@@ -1734,7 +1746,7 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
-            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 });
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 }));
 
             const before = Date.now();
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
@@ -1747,7 +1759,7 @@ describe('wallet session handlers', () => {
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue({ caughtUp: true, updatedAt: new Date(Date.now() - 3_600_000).toISOString() });
-            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 });
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result[0]).toMatchObject({ usable: false, caughtUp: false });
@@ -1799,7 +1811,7 @@ describe('wallet session handlers', () => {
                 .mockResolvedValueOnce(second).mockResolvedValueOnce(second);
             mockGetWalletBalance
                 .mockRejectedValueOnce(new Error('wallet not genuinely synced'))
-                .mockResolvedValueOnce({ dustBalance: '900', registeredNightUtxoCount: 2, dustUtxoCount: 2 });
+                .mockResolvedValueOnce(balanceOf({ dustBalance: '900', registeredNightUtxoCount: 2, dustUtxoCount: 2 }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
             expect(result).toHaveLength(2);
@@ -1811,7 +1823,7 @@ describe('wallet session handlers', () => {
             process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
             const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
-            mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '1', registeredNightUtxoCount: 1 });
+            mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '1', registeredNightUtxoCount: 1 }));
 
             await registeredHandlers['getSponsorPoolStatus'](createMockRequest({}));
             // Same rule resolveFeeSponsor() applies: a configured sponsor is

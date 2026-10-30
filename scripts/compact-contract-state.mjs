@@ -1,18 +1,7 @@
 #!/usr/bin/env node
-// Move stored per-action contract states to the hash-per-action layout.
-//
-//   npx nightgate-compact-contract-state [--dry-run] [--batch 100] [sqlite-file]
-//
-// Writes the newest state per contract into ContractStates, a sha256 and the
-// size onto every contract action, and clears the full per-action state unless
-// NIGHTGATE_CRAWLER_CONTRACT_STATE_HISTORY (watched / all, with
-// NIGHTGATE_CRAWLER_CONTRACT_STATE_WATCH) keeps it. Idempotent.
-//
-// Database like the server: NIGHTGATE_DB_URL (postgres://...) or the SQLite
-// file (first argument, NIGHTGATE_DB_PATH, default db/midnight.db). Stop the
-// server first, or at least its supplement pass. The space returns to the file
-// system only after `VACUUM FULL midnight_contractactions` (PostgreSQL, takes
-// an exclusive lock) or `VACUUM` (SQLite).
+// Moves stored per-action contract states to one state per contract plus a hash per action. Stop the server first.
+// Run: npx nightgate-compact-contract-state [--dry-run] [--batch 100] [sqlite-file]
+// Env: NIGHTGATE_DB_URL or NIGHTGATE_DB_PATH; NIGHTGATE_CRAWLER_CONTRACT_STATE_HISTORY keeps full states.
 
 import { createRequire } from 'node:module';
 import fs from 'node:fs';

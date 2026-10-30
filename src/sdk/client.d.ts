@@ -46,7 +46,10 @@ export interface JobStatus {
     result?: string;
     errorCode?: string;
     errorMessage?: string;
+    /** The ledger identifier of the job's transaction. */
     txHash?: string;
+    /** The hash explorers show; null until the transaction is indexed. */
+    transactionHash?: string | null;
 }
 
 export type Params = Record<string, string | number | bigint | boolean | Int64Literal | undefined>;

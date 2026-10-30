@@ -1,7 +1,5 @@
-/**
- * Reads the vault contract's on-chain disclosure grants.
- * Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
- */
+// Reads the vault contract's on-chain disclosure grants.
+// Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
 import { importArtifact } from './artifact-import';
 import { buildPublicDataProvider, type IndexerEndpoints } from '../midnight/public-data-provider';
 import type { ContractArtifact } from './predicate-state';

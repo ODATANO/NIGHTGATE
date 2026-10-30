@@ -1,24 +1,37 @@
-/**
- * Shared constants and types for messages between the main thread and the wallet worker.
- * Keep this file free of imports, because the main thread must never load the worker's SDK.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Constants and types for messages between the main thread and the wallet worker.
+// Type imports only, so the main thread never loads the worker's SDK.
+// SPDX-License-Identifier: Apache-2.0
 import type { NightgateErrorPayload } from '../utils/errors';
+import type { ContractCircuitRules } from '../submission/sponsor-policy';
 
-/**
- * Methods that hold the session's submit lock, so a session is never removed while they run.
- * Each one reports its tx id to the main thread before it sends the tx.
- */
+/** The sponsor rules a sponsor call carries into the worker. */
+export interface SponsorPolicyArgs {
+    allowedContracts?: string[];
+    allowedCircuits?: string[];
+    /** Replaces `allowedCircuits` for calls on the listed contracts. */
+    contractCircuits?: ContractCircuitRules;
+    /** Both the server rules and the grant allow a contract deploy in this tx. */
+    allowDeploy?: boolean;
+    /** Contracts deployed under this grant. Calls on them skip `allowedCircuits`. */
+    ownContracts?: string[];
+    /** Shielded token types whose zswap offers the sponsor pays for. Unset means none. */
+    allowedTokenTypes?: string[];
+    /** Also pay for the offer of a token that a call in this tx mints. */
+    allowContractMints?: boolean;
+    /** Both the server rules and the grant let the calls move unshielded tokens: the caller's own in, the contract's payouts out. */
+    allowUnshieldedOffers?: boolean;
+    /** Unshielded token types besides NIGHT such an offer may move. */
+    allowedUnshieldedTokenTypes?: string[];
+}
+
+/** Methods that hold the session's submit lock. Each reports its tx id to the main thread before sending. */
 export const SUBMIT_METHODS: ReadonlySet<string> = new Set([
     'deployContract', 'submitContractCall', 'submitContractCallBatch',
     'registerDustGeneration', 'deregisterDustGeneration',
     'transferNight', 'buildSponsorableTx', 'sponsorFinalizedTx'
 ]);
 
-/**
- * Methods that may send a transaction. `sponsorUnboundTx` is one of them but takes no submit lock.
- * A worker restart waits for these calls and never repeats them.
- */
+/** Methods that may send a tx. A worker restart waits for these calls and never repeats them. */
 export function isSubmittingMethod(method: string): boolean {
     return SUBMIT_METHODS.has(method) || method === 'sponsorUnboundTx';
 }
@@ -28,20 +41,16 @@ export const WORKER_ROTATING = 'WORKER_ROTATING';
 /** The worker was restarted while this call was still running. */
 export const WORKER_ROTATED = 'WORKER_ROTATED';
 
-/**
- * Why a submit failed. The main thread decides on this code, never on message text.
- *  pre-mempool-reject  the node refused the tx and no fee was spent. `ledgerCode` holds the node's code.
- *  dust-race           another tx spent the same dust first. Build again and retry.
- *  transport           the connection broke before an answer. The tx may be sent again.
- *  ambiguous           the tx may have landed. Never rebuild. Look it up by its id instead.
- *  landed-not-applied  the tx is in a block, but the contract call did not apply.
- *  policy              the fee sponsor refused the tx.
- *  causality           the batch calls are in an order the ledger rejects. Found before proving.
- *  internal            anything else.
- */
+/** Why a submit failed. The main thread decides on this code, never on message text. */
 export const SUBMIT_FAILURE_CODES = [
-    'pre-mempool-reject', 'dust-race', 'transport', 'ambiguous',
-    'landed-not-applied', 'policy', 'causality', 'internal'
+    'pre-mempool-reject', // the node refused the tx and no fee was spent; `ledgerCode` holds the node's code
+    'dust-race',          // another tx spent the same dust first; build again and retry
+    'transport',          // the connection broke before an answer; the tx may be sent again
+    'ambiguous',          // the tx may have landed; never rebuild, look it up by its id
+    'landed-not-applied', // the tx is in a block, but the contract call did not apply
+    'policy',             // the fee sponsor refused the tx
+    'causality',          // the batch calls are in an order the ledger rejects, found before proving
+    'internal'            // anything else
 ] as const;
 export type SubmitFailureCode = typeof SUBMIT_FAILURE_CODES[number];
 

@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
-# Run the release gates the way CI sees them: in a throwaway clone that has
-# NO generated artifacts (@cds-models, the .js/.d.ts twins next to the .ts
-# sources, node_modules). A working tree that has been built and tested for
-# weeks hides every "this file only exists locally" defect; this does not.
-#
-#   bash scripts/check-fresh-tree.sh            # HEAD + uncommitted changes
-#   bash scripts/check-fresh-tree.sh --committed # HEAD only, as a tag would build
-#
-# Slow on purpose (fresh npm ci + the full gate set). Run it before tagging.
+# Runs the release gates in a throwaway clone without generated files, as CI sees them.
+# Run: bash scripts/check-fresh-tree.sh [--committed]  (--committed builds HEAD only, as a tag would)
 set -uo pipefail
 
 SRC=$(cd "$(dirname "$0")/.." && pwd)

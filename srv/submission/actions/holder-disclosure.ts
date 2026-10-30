@@ -1,8 +1,6 @@
-/**
- * Disclosure to token holders. The issuer links a document's text to a token type.
- * A holder registered a claim key on chain and gets the text by showing the secret behind that key.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Disclosure to token holders. The issuer links a document's text to a token type.
+// A holder who registered a claim key on chain gets the text by showing the secret behind that key.
+// SPDX-License-Identifier: Apache-2.0
 import { holderDisclosureContentBinding } from '../../utils/envelope-bindings';
 import cds from '@sap/cds';
 import { sha256 } from '@noble/hashes/sha256';
@@ -14,10 +12,12 @@ import { blake2b256Hex } from '../hashing';
 import { HOLDER_REGISTRY_REF, holderClaimKey } from '../holder-registry';
 import { readHolderRegistrationInWorker } from '../../midnight/decode-worker-client';
 import { liveProviderConfigured, contractProvidersConfigFromEnv } from '../verify-state';
-import { checkRate, runSubmission } from './common';
+import { runSubmission } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
 import { claimDisclosure, grantDisclosureToHolders, revokeHolderDisclosure } from '#cds-models/NightgateService';
+import { futureTimeProblem } from '../../utils/validation';
+import { checkRateClass } from '../../utils/rate-classes';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -70,12 +70,11 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
         if (content && !hashKind) return req.reject(400, 'content does not hash to payloadHash (blake2b-256 or sha256 of the UTF-8 text)');
         let expiry: string | null = null;
         if (data.expiresAt) {
-            const ms = Date.parse(String(data.expiresAt));
-            if (!Number.isFinite(ms) || ms <= Date.now()) return req.reject(400, 'expiresAt must be an ISO timestamp in the future');
-            if (ms - Date.now() > MAX_EXPIRY_MS) return req.reject(400, 'expiresAt: at most one year ahead');
-            expiry = new Date(ms).toISOString();
+            const problem = futureTimeProblem(data.expiresAt, 'expiresAt', MAX_EXPIRY_MS, 'one year');
+            if (problem) return req.reject(400, problem);
+            expiry = new Date(String(data.expiresAt)).toISOString();
         }
-        if (!checkRate('prove', req.agentGrant?.sessionId ?? 'prove', req)) return;
+        if (!checkRateClass('compute', 'compute', req)) return;
 
         return runSubmission(req, async () => {
             const grantorUserId = String(req.user?.id ?? 'anonymous');
@@ -101,6 +100,7 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
     srv.on(revokeHolderDisclosure, async (req) => {
         const { holderGrantId } = req.data;
         if (!holderGrantId) return req.reject(400, 'holderGrantId is required');
+        if (!checkRateClass('compute', 'compute', req)) return;
         return runSubmission(req, async () => {
             const row: HolderDisclosureGrant | null = await db.run(SELECT.one.from(HolderDisclosureGrants).where({ ID: String(holderGrantId) }));
             if (!row) throw new NightgateError('NOT_FOUND', 'holder disclosure grant not found');
@@ -120,7 +120,7 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
         const claimSecret = hex64(data.claimSecret);
         if (!claimSecret) return req.reject(400, 'claimSecret is required');
         if (!liveProviderConfigured()) return req.reject(503, 'no live indexer configured to read the holder registry');
-        if (!checkRate('compute', 'compute', req)) return;
+        if (!checkRateClass('compute', 'compute', req)) return;
 
         return runSubmission(req, async () => {
             const grants: HolderDisclosureGrant[] = await db.run(SELECT.from(HolderDisclosureGrants).where({ payloadHash, tokenType, active: true })) ?? [];

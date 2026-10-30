@@ -2,14 +2,25 @@
  * NIGHT and token transfers, balances, fee estimates and dust generation registration.
  */
 import { configMs } from '../../utils/config';
-import { formatErr } from '../../utils/format-error';
+import { errorMessage } from '../../utils/errors';
+
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 import { type MessagePort } from 'node:worker_threads';
 import { encodeAddressString, ensureNetworkId, facades, loadAddressFormat, loadSdk, log, parseReceiverAddress } from './context';
 import { parseMidnightAddress } from '../../utils/midnight-address';
-import { BALANCE_SYNC_TIMEOUT_MS, SYNC_POLL_MS, countAllNightUtxos, countRegisteredNightUtxos, peekFacadeState, waitForGenuineSync, waitForSyncedStateBounded, wsleep } from './facades';
+import { BALANCE_SYNC_TIMEOUT_MS, SYNC_POLL_MS, countAllNightUtxos, countRegisteredNightUtxos, peekFacadeState, waitForGenuineSync, waitForSyncedStateBounded } from './facades';
 import { captureDustSnapshot, feeOfDiscardedRecipe, submitWithDustGuard } from './submit';
 import { resolveSponsorEntry } from './sponsor';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+/** The SDK outputs of one payment, to a shielded or an unshielded address. The ttl defaults to ten minutes. */
+async function transferOutputs(sdk: any, networkId: string, a: { receiverAddress: string; amount: string; tokenTypeHex?: string; ttlIso?: string }) {
+    const receiver = await parseReceiverAddress(a.receiverAddress, networkId);
+    const output = { type: a.tokenTypeHex || sdk.ledger.nativeToken().raw, receiverAddress: receiver.addr, amount: BigInt(a.amount) };
+    const outputs: any[] = [{ type: receiver.kind, outputs: [output] }];
+    const ttl = a.ttlIso ? new Date(a.ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
+    return { receiver, outputs, ttl };
+}
 
 /** Registers the wallet's NIGHT UTXOs for dust generation. */
 export async function registerDustGeneration({ sessionId, dustReceiverAddress, syncTimeoutMs, __replyPort }: {
@@ -97,7 +108,7 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
         const state = await peekFacadeState(entry.facade, 10_000);
         const n = state ? countRegisteredNightUtxos(state) : null;
         if (n != null && n > registeredUtxosBefore) { registeredUtxosAfter = n; break; }
-        await wsleep(SYNC_POLL_MS);
+        await sleep(SYNC_POLL_MS);
     }
     const settled = registeredUtxosAfter != null;
     const consolidated = settled ? (registeredUtxosAfter! - registeredUtxosBefore) < unregistered.length : null;
@@ -208,14 +219,7 @@ export async function transferNight({ sessionId, receiverAddress, amount, ttlIso
     await waitForSyncedStateBounded(entry, 'transfer', syncTimeoutMs);
     log('info', `transfer: synced.`);
 
-    const receiver = await parseReceiverAddress(receiverAddress, entry.networkId);
-    const amountBig = BigInt(amount);
-    const rawType = tokenTypeHex || sdk.ledger.nativeToken().raw;
-    const ttl = ttlIso ? new Date(ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
-
-    const outputs: any[] = receiver.kind === 'shielded'
-        ? [{ type: 'shielded', outputs: [{ type: rawType, receiverAddress: receiver.addr, amount: amountBig }] }]
-        : [{ type: 'unshielded', outputs: [{ type: rawType, receiverAddress: receiver.addr, amount: amountBig }] }];
+    const { receiver, outputs, ttl } = await transferOutputs(sdk, entry.networkId, { receiverAddress, amount, tokenTypeHex, ttlIso });
 
     log('info', `transfer: ${amount} ${tokenTypeHex ? `token ${tokenTypeHex.slice(0, 12)}...` : 'NIGHT'} to ${receiver.kind} addr ${receiverAddress.slice(0, 24)}...`);
 
@@ -265,7 +269,7 @@ export async function getBalance({ sessionId, syncTimeoutMs }: {
     try {
         const p: any = (synced as any)?.dust?.progress;
         log('debug', `SYNC-PROGRESS isSynced=${(synced as any)?.isSynced} isConnected=${p?.isConnected} appliedIndex=${p?.appliedIndex} highestIndex=${p?.highestIndex} highestRelevantIndex=${p?.highestRelevantIndex}`);
-    } catch (e: unknown) { log('debug', `SYNC-PROGRESS read failed: ${formatErr(e)}`); }
+    } catch (e: unknown) { log('debug', `SYNC-PROGRESS read failed: ${errorMessage(e)}`); }
     const registeredCount = totalNightCoins.filter(
         (c: any) => c?.meta?.registeredForDustGeneration === true
     ).length;
@@ -297,10 +301,7 @@ export async function getBalance({ sessionId, syncTimeoutMs }: {
     };
 }
 
-/**
- * Estimates the fee of a transfer without sending it.
- * The built tx is discarded so the coins it reserved become spendable again.
- */
+/** Estimates a transfer's fee without sending. The built tx is discarded, so its reserved coins become spendable again. */
 export async function estimateTransferFee({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs, tokenTypeHex }: {
     sessionId: string;
     receiverAddress: string;
@@ -316,14 +317,7 @@ export async function estimateTransferFee({ sessionId, receiverAddress, amount, 
 
     await waitForSyncedStateBounded(entry, 'estimateTransferFee', syncTimeoutMs);
 
-    const receiver = await parseReceiverAddress(receiverAddress, entry.networkId);
-    const amountBig = BigInt(amount);
-    const rawType: string = tokenTypeHex || sdk.ledger.nativeToken().raw;
-    const ttl = ttlIso ? new Date(ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
-
-    const outputs: any[] = receiver.kind === 'shielded'
-        ? [{ type: 'shielded', outputs: [{ type: rawType, receiverAddress: receiver.addr, amount: amountBig }] }]
-        : [{ type: 'unshielded', outputs: [{ type: rawType, receiverAddress: receiver.addr, amount: amountBig }] }];
+    const { receiver, outputs, ttl } = await transferOutputs(sdk, entry.networkId, { receiverAddress, amount, tokenTypeHex, ttlIso });
 
     const recipe = await entry.facade.transferTransaction(
         outputs,

@@ -109,6 +109,43 @@ describe('rotation drain', () => {
         expect(facades.size).toBe(0);
         expect(fakeParentPort.posted.some(m => m.kind === 'state-save' && m.sessionId === 's-shutdown')).toBe(true);
     });
+
+    it('shutdown waits for a running submit before it unloads any wallet', async () => {
+        facades.set('s-busy', entryFor('s-busy'));
+        const base = fakeParentPort.postMessage.getMockImplementation()!;
+        fakeParentPort.postMessage.mockImplementation((m: any) => {
+            base(m);
+            if (m?.kind === 'state-save') void handleMessage({ kind: 'state-save-ack', sessionId: m.sessionId, seq: m.seq });
+        });
+        rotationState.inflight = 1;
+        const done = shutdown();
+        await new Promise(resolve => setTimeout(resolve, 250));
+        expect(facades.has('s-busy')).toBe(true);
+        rotationState.inflight = 0;
+        expect(await done).toEqual({ evicted: 1, failed: 0 });
+        expect(facades.size).toBe(0);
+    });
+
+    it('shutdown saves the wallets once a stuck submit outlasts the drain limit', async () => {
+        vi.useFakeTimers();
+        try {
+            facades.set('s-stuck', entryFor('s-stuck'));
+            const base = fakeParentPort.postMessage.getMockImplementation()!;
+            fakeParentPort.postMessage.mockImplementation((m: any) => {
+                base(m);
+                if (m?.kind === 'state-save') void handleMessage({ kind: 'state-save-ack', sessionId: m.sessionId, seq: m.seq });
+            });
+            rotationState.inflight = 1;
+            const done = shutdown();
+            await vi.advanceTimersByTimeAsync(39_000);
+            expect(facades.has('s-stuck')).toBe(true);
+            await vi.advanceTimersByTimeAsync(2_000);
+            expect(await done).toEqual({ evicted: 1, failed: 0 });
+        } finally {
+            rotationState.inflight = 0;
+            vi.useRealTimers();
+        }
+    });
 });
 
 describe('evict during an in-flight submit', () => {

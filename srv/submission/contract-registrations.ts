@@ -1,8 +1,5 @@
-/**
- * Contracts registered while the server runs. They are saved and loaded again at boot.
- * Contracts named in the config cannot be changed or removed this way.
- * Loading a contract runs its code, so paths must stay inside `NIGHTGATE_CONTRACTS_DIR`.
- */
+// Contracts registered while the server runs, saved and loaded again at boot. Contracts named in the config cannot be changed or removed this way.
+// Loading a contract runs its code, so paths must stay inside `NIGHTGATE_CONTRACTS_DIR`.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +14,7 @@ import {
     isConfigRegisteredContract,
     getArtifactGenerationDigest,
     slotWidthOf,
+    isSlotWidth,
     type ContractRegistration
 } from './contract-registry';
 import { effectiveModuleFormat, runtimeNodeModulesDir } from './artifact-digest';
@@ -24,6 +22,9 @@ import { hasAllProverKeys } from './prover-keys';
 import { configString } from '../utils/config';
 import type { DbRunner } from '../utils/db-types';
 import { NightgateError, errorMessage } from '../utils/errors';
+import { ContractRegistrations, type ContractRegistration as ContractRegistrationRow } from '#cds-models/midnight';
+
+const { UPSERT, DELETE, SELECT } = cds.ql;
 
 const log = cds.log('nightgate:contracts');
 
@@ -95,8 +96,7 @@ function resolveInsideRoots(what: string, p: string, roots: string[]): string {
 }
 
 /**
- * Load a copy of the compiled contract in a short-lived worker, so the main process never loads it.
- * A node_modules link next to the copy lets its runtime import resolve.
+ * Loads a copy of the compiled contract in a short-lived worker, so the main process never loads it. A node_modules link next to the copy lets its runtime import resolve.
  */
 export function probeArtifactModule(artifactPath: string, timeoutMs = 60_000): Promise<{ ok: boolean; hasContract: boolean; error?: string }> {
     let probeDir: string | null = null;
@@ -156,7 +156,7 @@ export async function validateRuntimeRegistration(input: RuntimeRegistrationInpu
     let slotWidth: number | undefined;
     if (input.slotWidth !== undefined && input.slotWidth !== null) {
         slotWidth = Number(input.slotWidth);
-        if (![8, 16, 32].includes(slotWidth)) throw new ContractRegistrationError(400, 'slotWidth must be 8, 16 or 32');
+        if (!isSlotWidth(slotWidth)) throw new ContractRegistrationError(400, 'slotWidth must be 16 or 32');
     }
     const roots = allowedContractRoots();
     const artifactPath = resolveInsideRoots('artifactPath', input.artifactPath, roots);
@@ -228,7 +228,6 @@ async function registerContractAtRuntimeLocked(
         throw new ContractRegistrationError(400, `artifact generation digest failed: ${errorMessage(e)}`);
     }
 
-    const { UPSERT } = cds.ql as any;
     const row = {
         name,
         artifactPath: registration.artifactPath,
@@ -239,7 +238,7 @@ async function registerContractAtRuntimeLocked(
         registeredBy: ctx.registeredBy ?? null
     };
     try {
-        await db.run(UPSERT.into('midnight.ContractRegistrations').entries(row));
+        await db.run(UPSERT.into(ContractRegistrations).entries(row));
     } catch (e) {
         if (previous) registerContract(name, { ...previous }); else unregisterContract(name);
         throw e;
@@ -259,8 +258,7 @@ export async function unregisterContractAtRuntime(
         throw new ContractRegistrationError(409, `'${name}' is registered from the config and cannot be removed at runtime`);
     }
     return withKeyedLock(registrationLockKey(name), async () => {
-        const { DELETE } = cds.ql as any;
-        const deleted = Number(await db.run(DELETE.from('midnight.ContractRegistrations').where({ name }))) || 0;
+        const deleted = Number(await db.run(DELETE.from(ContractRegistrations).where({ name }))) || 0;
         const removed = unregisterContract(name) || deleted > 0;
         if (removed) log.info(`contract '${name}' unregistered at runtime`);
         return { removed };
@@ -269,10 +267,9 @@ export async function unregisterContractAtRuntime(
 
 /** Runs at boot, after the config. Skips invalid rows and rows that clash with the config, but keeps them. Never throws. */
 export async function loadPersistedRegistrations(db: DbRunner): Promise<string[]> {
-    const { SELECT } = cds.ql as any;
-    let rows: any[] = [];
+    let rows: ContractRegistrationRow[] = [];
     try {
-        rows = (await db.run(SELECT.from('midnight.ContractRegistrations'))) as any[] ?? [];
+        rows = (await db.run(SELECT.from(ContractRegistrations))) ?? [];
     } catch (e) {
         // The table does not exist until the schema update has run.
         log.warn(`runtime contract registrations not loaded: ${errorMessage(e)}`);

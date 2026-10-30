@@ -1,27 +1,28 @@
-import { errorName, formatErr, formatErrWithCauses } from '../../srv/utils/format-error';
+import { errorName, formatErrWithCauses } from '../../srv/utils/format-error';
+import { errorMessage } from '../../srv/utils/errors';
 
-describe('formatErr', () => {
+describe('errorMessage', () => {
     it('returns the message for Error instances', () => {
-        expect(formatErr(new Error('boom'))).toBe('boom');
+        expect(errorMessage(new Error('boom'))).toBe('boom');
     });
 
     it('returns the string for string values', () => {
-        expect(formatErr('plain string')).toBe('plain string');
+        expect(errorMessage('plain string')).toBe('plain string');
     });
 
     it('returns "null" / "undefined" for nullish values', () => {
-        expect(formatErr(null)).toBe('null');
-        expect(formatErr(undefined)).toBe('undefined');
+        expect(errorMessage(null)).toBe('null');
+        expect(errorMessage(undefined)).toBe('undefined');
     });
 
     it('JSON-stringifies plain objects so they do not become [object Object]', () => {
-        expect(formatErr({ code: 'E_FOO', detail: 'bar' })).toBe('{"code":"E_FOO","detail":"bar"}');
+        expect(errorMessage({ code: 'E_FOO', detail: 'bar' })).toBe('{"code":"E_FOO","detail":"bar"}');
     });
 
     it('falls back to String() when JSON.stringify throws (e.g. circular refs)', () => {
         const circular: any = { name: 'cycle' };
         circular.self = circular;
-        expect(formatErr(circular)).toBe('[object Object]');
+        expect(errorMessage(circular)).toBe('[object Object]');
     });
 });
 
@@ -36,7 +37,7 @@ describe('formatErrWithCauses (worker RPC boundary)', () => {
         );
     });
 
-    it('is plain formatErr when there is no cause', () => {
+    it('is plain errorMessage when there is no cause', () => {
         expect(formatErrWithCauses(new Error('boom'))).toBe('boom');
         expect(formatErrWithCauses('str')).toBe('str');
     });

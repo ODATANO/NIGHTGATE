@@ -1,16 +1,5 @@
 // HTTP client for a hosted NIGHTGATE server. Each server action is a function here.
-//
-//   import { connect } from '@odatano/nightgate/client';
-//
-//   const ng = connect({ baseUrl: 'https://nightgate.example' });
-//   const state = await ng.verifyAttestation({ contractAddress, attesterId, payloadHash });
-//
-// To log in, pass `agentToken`, `token` for Bearer, or `username` and `password` for Basic.
-// An agent token can be sent together with Basic credentials.
-//
-// Actions that write run as background jobs and return `{ jobId, status }`.
-// `waitForJob` polls until the job ends and returns its parsed result.
-//
+// Write actions run as background jobs and return `{ jobId, status }`. `waitForJob` polls until the job ends.
 // SPDX-License-Identifier: Apache-2.0
 
 /** Error of a failed server call, with the server's status and error code. `retryAfterSeconds` comes from `Retry-After` when the server sent it. */
@@ -31,10 +20,7 @@ export const RETRYABLE_ERROR_CODES = new Set([
     'WALLET_NOT_SYNCED', 'WALLET_SYNCING', 'WORKER_ROTATING'
 ]);
 
-/**
- * Whether a failed call may be retried unchanged.
- * Uses the server's error code if there is one, else the HTTP status. Network errors are retryable.
- */
+/** Whether a failed call may be retried unchanged. Uses the server's error code, else the HTTP status. Network errors are retryable. */
 export function isRetryable(err) {
     if (err instanceof NightgateApiError) {
         if (typeof err.code === 'string' && !/^\d+$/.test(err.code)) return RETRYABLE_ERROR_CODES.has(err.code);
@@ -53,10 +39,7 @@ export class NightgateJobError extends Error {
     }
 }
 
-/**
- * Marks a value as a 64-bit integer for a function URL.
- * It is written without quotes and keeps full precision above Number.MAX_SAFE_INTEGER.
- */
+/** Marks a value as a 64-bit integer for a function URL. It is written unquoted and stays exact above Number.MAX_SAFE_INTEGER. */
 export function int64(value) {
     const digits = String(value);
     if (!/^-?\d+$/.test(digits)) throw new Error(`int64: not an integer: ${value}`);
@@ -111,24 +94,7 @@ function isStaleSocketError(err) {
     return /fetch failed/i.test(String(err?.message ?? '')) && /^(ECONNRESET|EPIPE|UND_ERR_SOCKET)$/.test(code);
 }
 
-/**
- * Connect to a hosted NIGHTGATE.
- *
- * @param {object} opts
- * @param {string} opts.baseUrl            For example https://nightgate.example
- * @param {string} [opts.servicePath]      Defaults to '/odata/v4/midnight'.
- * @param {string} [opts.indexerServicePath] Defaults to '/odata/v4/midnight-indexer'; getHealth() reads it.
- * @param {string} [opts.agentToken]       Agent token (ngat_...). Sent in the x-agent-token header.
- * @param {string} [opts.token]            Bearer token
- * @param {string} [opts.username]         Basic auth user. Can be combined with agentToken.
- * @param {string} [opts.password]
- * @param {number} [opts.timeoutMs]        Timeout per request in ms. Defaults to 120000.
- * @param {number} [opts.pollMs]           How often waitForJob polls, in ms. Defaults to 2000.
- * @param {number} [opts.longPollMs]       How long one getJobStatus call of waitForJob may wait on the server, in ms.
- *                                         Defaults to 20000; 0 polls instead. At most 25000 and 5000 below timeoutMs.
- *                                         A server without waitMs is polled.
- * @param {Function} [opts.fetchFn]        Replaces fetch, for tests.
- */
+/** Connects to a hosted NIGHTGATE. `longPollMs` is capped at 25000 and at 5000 below `timeoutMs`, and 0 turns long polling off. */
 export function connect(opts) {
     const {
         baseUrl, servicePath = '/odata/v4/midnight', indexerServicePath = '/odata/v4/midnight-indexer',
@@ -203,19 +169,12 @@ export function connect(opts) {
         return request('POST', `${service}/${name}`, body);
     }
 
-    /**
-     * A poll that failed for a temporary reason, not because the job failed.
-     * The job keeps running on the server, so the poll is retried.
-     */
+    /** The job keeps running on the server after a temporary poll error, so the poll is retried. */
     function isTransientPollError(err) {
         return isRetryable(err);
     }
 
-    /**
-     * Polls getJobStatus until the job ends and returns the parsed result.
-     * Temporary poll errors in a row are retried for up to `pollGraceMs`, default 5 minutes.
-     * A failed job throws at once.
-     */
+    /** Polls getJobStatus until the job ends. Temporary poll errors are retried for up to `pollGraceMs`. A failed job throws at once. */
     async function waitForJob({ jobId, sessionId, pollMs: overridePollMs, timeoutMs: waitTimeoutMs = 60 * 60 * 1000, pollGraceMs = 5 * 60 * 1000 }) {
         if (!jobId) throw new Error('waitForJob: jobId is required');
         const interval = overridePollMs ?? pollMs;
@@ -366,11 +325,7 @@ export function connect(opts) {
         burnFactoryToken: (p) => act('burnFactoryToken', p),
         sendNight: (p) => act('sendNight', p),
 
-        // ---- the server pays the fee for a transaction built elsewhere ----
-        /**
-         * Sends a transaction you built without a fee (txbuilder's finalizedTxB64).
-         * The server adds the fee, submits it and returns the txHash.
-         */
+        /** Sends a transaction built without a fee, txbuilder's finalizedTxB64. The server adds the fee, submits it and returns the txHash. */
         sponsorFinalized: (p) => act('sponsorFinalizedTransaction', p),
         /** Like sponsorFinalized, for a transaction built with `bind: false`. The server can pay for several of these at once. */
         sponsorUnbound: (p) => act('sponsorUnboundTransaction', p),

@@ -111,7 +111,7 @@ describe('createHttpTxConfirmer', () => {
             indexerHttpUrl: 'http://indexer/graphql',
             fetchFn: async () => jsonResponse({}, { ok: false, status: 502 })
         });
-        await expect(confirm('0xabc')).rejects.toThrow(/HTTP 502/);
+        await expect(confirm('0xabc')).rejects.toMatchObject({ status: 502 });
     });
 
     test('throws on a GraphQL error', async () => {

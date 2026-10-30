@@ -18,6 +18,8 @@ From the repo root:
 ```bash
 ENCRYPTION_KEY=$(openssl rand -hex 32) \
 NIGHTGATE_HTTP_PASSWORD=change-me \
+NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=$TOKEN \
+NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=$TOKEN \
 docker compose -f docker/docker-compose.yml up -d nightgate
 ```
 
@@ -28,9 +30,15 @@ docker build -t odatano/nightgate:local .
 docker run -d --name nightgate -p 4004:4004 \
   -e ENCRYPTION_KEY=$(openssl rand -hex 32) \
   -e NIGHTGATE_HTTP_PASSWORD=change-me \
+  -e NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=$TOKEN \
+  -e NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=$TOKEN \
   -v nightgate-data:/data \
   odatano/nightgate:local
 ```
+
+On preprod and mainnet the entrypoint refuses to start without `NIGHTGATE_NODE_URL`
+and `NIGHTGATE_INDEXER_HTTP_URL` ([self-hosted.md](self-hosted.md)). On preview the public
+endpoints are built in.
 
 The JSON request log masks `authorization`, `cookie` and `x-agent-token`
 (`log.mask_headers`); the plugin sets the same mask in a host app.
@@ -39,7 +47,8 @@ Runs as user `node` (uid 1000); a bind-mounted `/data` must be writable by
 uid 1000 (`chown 1000:1000 <dir>`).
 
 Listens on `http://localhost:4004`: `/odata/v4/midnight`, `/odata/v4/midnight-indexer`,
-`/odata/v4/midnight-analytics`, `/odata/v4/midnight-admin`. HTTP basic auth (`nightgate` / your
+`/odata/v4/midnight-analytics`, `/odata/v4/midnight-admin`, and the credential-free
+`/odata/v4/midnight-verify`. HTTP basic auth (`nightgate` / your
 password) via `@odatano/cap-auth` (`kind: basic`, realm `nightgate`; 20
 failed attempts per 15 min per client address and user, then 429 with
 `Retry-After`); agent requests use `x-agent-token`. A request without
@@ -60,21 +69,15 @@ probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`,
 | `NIGHTGATE_BIND_ADDRESS` | `127.0.0.1` | Compose only: host address port 4004 is published on. Basic auth is plain text without TLS: put a TLS reverse proxy in front before `0.0.0.0` |
 | `NIGHTGATE_NETWORK` | `preprod` | Target network |
 | `NIGHTGATE_CRAWLER_ENABLED` | `false` | Block crawler (verification works without it) |
-| `NIGHTGATE_CRAWLER_START_HEIGHT` | unset | First height to index while the index is empty; unset walks from genesis |
-| `NIGHTGATE_CRAWLER_MAX_BPS` | unset | Catch-up rate cap, so the crawler can share the host with the submission side |
-| `NIGHTGATE_NODE_URL` / `NIGHTGATE_INDEXER_HTTP_URL` / `NIGHTGATE_INDEXER_WS_URL` | per-network defaults | Endpoint overrides |
+| `NIGHTGATE_NODE_URL` / `NIGHTGATE_INDEXER_HTTP_URL` | required on preprod and mainnet; built in on preview | Node RPC and indexer GraphQL of the network: your own, or Blockfrost with the project id in the URL ([self-hosted.md](self-hosted.md)) |
 | `NIGHTGATE_PROOF_SERVER_URL` | unset | Set = proof-server proving instead of wasm |
 | `NIGHTGATE_DB_PATH` | `/data/nightgate.db` | SQLite file (persist `/data`) |
-| `NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS` | `30000` | SQLite lock wait for writers (large wallet-state saves hold the lock for seconds) |
 | `NODE_OPTIONS` | `--max-old-space-size=8192` | Heap; container memory limit must be higher |
 | `NIGHTGATE_NODE_FLAGS` | `--no-concurrent-recompilation` | V8 flags on the node command line (not allowed in `NODE_OPTIONS`). The default avoids a compile-thread/GC-safepoint deadlock; empty = no flag |
-| `NIGHTGATE_PUBLIC_VERIFY` | `false` | `verifyAttestationState` / `verifyPredicateState` without credentials under `/odata/v4/midnight-verify` (CORS preflight `*`) |
-| `NIGHTGATE_<CLASS>_RATE_LIMIT` | per class | Count of a rate class (`PROVE` 60/h, `DEPLOY` 5/h, `SPONSOR` 120/h, `COMPUTE` 120/h, `READ` 60/min, `WALLET` 10/min, `SIGNING_KEY` 10/h, `ADMIN` 10/h, `PUBLIC_VERIFY` 60/min); `rateLimits` in the policy file replaces a key without a restart |
-| `NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR` / `_PER_DAY` |  | Budgets of a grant whose creation names none |
 
-Default proving is in-process wasm: no extra container, but proofs take
-minutes and block the thread. For throughput start the compose `proof-server`
-service and set `NIGHTGATE_PROOF_SERVER_URL=http://proof-server:6300`.
+Every other variable is listed in [reference.md](reference.md). Default proving is in-process wasm,
+which blocks a thread for each proof. For throughput start the compose `proof-server` service
+and set `NIGHTGATE_PROOF_SERVER_URL=http://proof-server:6300`.
 
 ## Watchdog on the healthcheck
 
@@ -88,25 +91,12 @@ cp docker/watchdog.sh /root/nightgate-api/watchdog.sh
 crontab -l | { cat; echo '* * * * * /root/nightgate-api/watchdog.sh'; } | crontab -
 ```
 
-Three unhealthy checks a minute apart, then two stages. When readiness
-reports only the crawler down (database, runtime, initialization fine), the
-script cycles the crawler in place (`pauseCrawler` + `resumeCrawler` through
-the operator API, run inside the container so it needs no published port
-and no copy of the password); the sponsor facades in the same process keep
-running. If the container is still unhealthy three checks later, or if any
-other check fails, `docker restart -t 5` (a hung main thread ignores
-SIGTERM). Restart recovery closes the old sessions and fails or replays
-interrupted jobs. `starting` does not count, and no restart happens within
-`NIGHTGATE_WATCHDOG_START_GRACE` seconds (900) of the container's start: the
-sponsor wallets warm for minutes at full CPU, readiness reports `warming`, and a
-restart in that window only begins the warm-up again. Skipped restarts are
-logged. The container defaults to the
-compose file's `odatano-nightgate`; a container under another name takes
-`NIGHTGATE_CONTAINER=<name>` in the cron line, and a name that `docker
-inspect` cannot find is logged, never watched. Log path
-(`NIGHTGATE_WATCHDOG_LOG`) and the optional host guard (`NIGHTGATE_HOST_GUARD`,
-`exit 1` while the host is stalled skips the restart) are variables at the
-top of the script.
+What it does after three unhealthy checks a minute apart:
+
+- Only the crawler down: `pauseCrawler` + `resumeCrawler` inside the container; the sponsor facades keep running.
+- Still unhealthy three checks later, or any other check failing: `docker restart -t 5`. Restart recovery closes old sessions and fails or replays interrupted jobs.
+- No restart while `starting`, and none within `NIGHTGATE_WATCHDOG_START_GRACE` seconds (900) of the start, when the sponsor wallets warm at full CPU (`phase: warming`). Skipped restarts are logged.
+- Variables at the top of the script: `NIGHTGATE_CONTAINER` (default `odatano-nightgate`; an unknown name is logged, never watched), `NIGHTGATE_WATCHDOG_LOG`, `NIGHTGATE_HOST_GUARD` (a command whose `exit 1` skips the restart while the host is stalled).
 
 ## Schema upgrades
 
@@ -120,12 +110,7 @@ image upgrade that adds entities or columns, run the additive migration
 docker exec odatano-nightgate node scripts/apply-schema-delta.mjs
 ```
 
-Crawler storage format (`Transactions.raw` binary, `ContractActions.state`
-empty): the script re-encodes existing SQLite rows and creates the secondary
-indexes (the server also creates them at startup). On PostgreSQL, indexed data
-from releases before 0.23.0 needs `reindexFromHeight(0)` on the indexer service.
-
-Wipe options: recreate the volume, or `npx cds deploy --to "sqlite:/data/nightgate.db"`.
+The script also re-encodes rows of an older storage format and creates the secondary indexes. Wipe: recreate the volume, or `npx cds deploy --to "sqlite:/data/nightgate.db"`. Hand-made steps for older databases: [operations.md#schema-upgrades](operations.md#schema-upgrades).
 
 ## PostgreSQL
 
@@ -159,21 +144,14 @@ NIGHTGATE_DB_URL=postgres://nightgate:$NIGHTGATE_PG_PASSWORD@nightgate-postgres:
   migrate --from /data/nightgate.db
 ```
 
-`migrate` mode serves nothing and reads only `NIGHTGATE_DB_URL`. It waits for
-the PostgreSQL listener (`NIGHTGATE_DB_WAIT_SECONDS`, default 60) before
-`cds deploy`. A plain `docker run` needs the compose-prefixed volume and
-network names (`docker volume ls` / `docker network ls`).
-
-It deploys the schema and copies every persisted entity, incl. `.texts` and
-`cds_outbox_Messages`, in batches: integers as BigInt (`Integer64` exact),
-SQLite 0/1 as booleans, JSON as text, views skipped. Unknown source tables
-with rows stop the run unless `--ignore-unknown`. `Decimal` values are copied
-as stored; a REAL beyond 2^53 aborts. Row counts are compared per table
-(mismatch = non-zero exit). `--dry-run` prints the plan; `--force` appends to
-a non-empty target (the `SyncState` row is replaced). Plugin hosts:
-`npx nightgate-db-migrate --from <file> --to <url>` (needs `@cap-js/postgres`
-and `better-sqlite3`). Keep the SQLite file until a PostgreSQL backup and a
-smoke test succeed.
+`migrate` mode serves nothing: it waits for PostgreSQL
+(`NIGHTGATE_DB_WAIT_SECONDS`, default 60), deploys the schema and copies every
+persisted entity in batches, with exact `Integer64`, SQLite 0/1 as booleans and
+row counts compared per table. Unknown source tables with rows stop the run
+unless `--ignore-unknown`; `--dry-run` prints the plan; `--force` appends to a
+non-empty target. Plugin hosts run `npx nightgate-db-migrate --from <file> --to
+<url>` (needs `@cap-js/postgres` and `better-sqlite3`). Keep the SQLite file
+until a PostgreSQL backup and a smoke test succeed.
 
 ## Operational notes
 
@@ -192,7 +170,8 @@ smoke test succeed.
   90 s start period covers schema deploy and plugin init. Readiness is 200
   while the sponsor pool warms (`phase: warming`).
 - Compiled artifacts are in the image: `attestation-vault`,
-  `attestation-vault-32`, `counter`, `shielded-token`.
+  `attestation-vault-32`, `counter`, `shielded-token`, `token-factory`,
+  `holder-registry`.
 - Own artifacts: bind-mount a directory as `NIGHTGATE_CONTRACTS_DIR` (e.g.
   `/data/contracts`) and call the admin action `registerContract`; persisted,
   reloaded at boot, no restart. The sponsor allow-list can live in

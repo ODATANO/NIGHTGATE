@@ -1,9 +1,5 @@
-// CPU profile of the main thread and every worker thread of a running NIGHTGATE process.
-// Prints the self time per function and, for a busy thread, the inclusive time of the JS
-// frames above the wasm, which names the caller of a hot ledger call.
-//
-// Open the inspector on the server process first (SIGUSR1 to the node pid, or --inspect),
-// then: node scripts/profile-workers.mjs [seconds] [host:port]
+// CPU profile of the main thread and every worker thread of a running NIGHTGATE process, with the callers of hot wasm calls.
+// Run: node scripts/profile-workers.mjs [seconds] [host:port] after opening the inspector with SIGUSR1 or --inspect.
 // In the container: docker exec -e NODE_PATH=/app/node_modules <container> node /app/scripts/profile-workers.mjs 15
 
 import WebSocket from 'ws';

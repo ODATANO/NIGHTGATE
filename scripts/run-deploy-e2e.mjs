@@ -1,28 +1,6 @@
-// End-to-end deploy runner.
-//
-// Walks through: connectWallet → connectWalletForSigning → (await prewarm)
-// → registerForDustGeneration (poll) → wait → deployContract (poll) against
-// a running NIGHTGATE instance.
-//
-// Async-job model: registerForDustGeneration and deployContract
-// return `{ jobId, status }` immediately. The actual result (txHash,
-// registeredCount, contractAddress, ...) is fetched via getJobStatus polling.
-// `pollJob` below handles that.
-//
-// Inputs (env vars):
-//   NIGHTGATE_URL                  default http://localhost:4004
-//   DEPLOY_E2E_ARTIFACT            default 'counter'; e.g. 'attestation-vault'
-//                                  to exercise the constructor argument (registrar)
-//   LACE_VIEWING_KEY               required, Midnight Preprod viewing key from Lace
-//   LACE_MNEMONIC                  required, BIP39 recovery phrase (12/24 words);
-//                                  the server HD-derives per-role keys from it
-//   DEPLOY_E2E_DUST_WAIT_SECONDS   default 90, how long to wait after registration
-//   DEPLOY_E2E_SKIP_DUST_REG       set to 1 if DUST already registered in a prior run
-//   E2E_PREWARM_TIMEOUT_MIN        default 240 (4h), cold sync upper bound
-//   E2E_JOB_POLL_INTERVAL_MS       default 5000, getJobStatus poll cadence
-//
-// Run:
-//   LACE_VIEWING_KEY="..." LACE_MNEMONIC="word1 word2 ..." node scripts/run-deploy-e2e.mjs
+// Runs connectWallet, connectWalletForSigning, DUST registration and deployContract against a running NIGHTGATE.
+// Run: LACE_VIEWING_KEY="..." LACE_MNEMONIC="word1 word2 ..." node scripts/run-deploy-e2e.mjs
+// Env: NIGHTGATE_URL, DEPLOY_E2E_ARTIFACT (default counter), DEPLOY_E2E_SKIP_DUST_REG=1 after a prior registration.
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -75,14 +53,7 @@ async function post(path, body, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
-/**
- * Poll `getJobStatus(jobId, sessionId)` until the job reaches `succeeded` or
- * `failed`. Returns the parsed `result` JSON on success; `fail()`s on failure
- * with the classified errorCode + errorMessage.
- *
- * `label` is shown in the progress line so the operator knows which job
- * (prewarm / dust-reg / deploy) the runner is currently waiting on.
- */
+/** Polls getJobStatus until the job succeeds or fails and returns the parsed result. */
 async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS, intervalMs = JOB_POLL_MS } = {}) {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = null;
@@ -145,10 +116,7 @@ async function waitForServer() {
     if (r.status !== 200 && r.status !== 201) fail(`connectWalletForSigning → HTTP ${r.status}: ${pretty(r.body)}`);
     console.log(`OK   signing enabled: ${pretty(r.body)}`);
 
-    // The session UPDATE is sync (signingEnabled=true above). The facade
-    // pre-warm runs as a background job; wait for it before proceeding so
-    // downstream actions don't pay the cold-sync cost on top of their own
-    // (and so we can fail fast here if the prewarm itself errors).
+    // Wait for the background prewarm job, so later actions skip the cold sync and a prewarm error fails here.
     const prewarmJobId = r.body?.prewarmJobId;
     if (prewarmJobId) {
         step(`2b. Waiting for prewarm job ${prewarmJobId.slice(0, 8)} (cold sync can take hours on a fresh seed)`);

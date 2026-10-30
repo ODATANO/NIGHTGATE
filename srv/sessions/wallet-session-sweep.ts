@@ -7,17 +7,14 @@ import { getNightgatePluginConfig, type NightgatePluginConfig } from '../utils/n
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import type { DbRunner, Row } from '../utils/db-types';
 import { evictFacadeUnlessShared } from './wallet-session-lifecycle';
+import { errorMessage } from '../utils/errors';
 
 const { SELECT, UPDATE } = cds.ql;
 
 /** Rows per UPDATE, small enough for the database driver's parameter limit. */
 const SESSION_CLOSE_CHUNK = 200;
 
-/**
- * At startup, closes the view-only sessions left by the previous process.
- * Returns their ids so their queued jobs can be dropped. Assumes a single server instance.
- * Platform fee sponsors and sessions with a signing key stay open, because closing deletes the key.
- */
+/** At startup closes the previous process's view-only sessions and returns their ids. Assumes one server instance. Fee sponsors and key-holding sessions stay open. */
 export async function closeSessionsFromPreviousProcess(db: DbRunner, config?: NightgatePluginConfig): Promise<string[]> {
     const exempt = new Set(getConfiguredFeeSponsorSessions(config));
     const active: Row<WalletSession, 'sessionId'>[] = (await db.run(
@@ -77,7 +74,10 @@ export function startSessionCleanup(db: DbRunner): ReturnType<typeof setInterval
                     db, s, `session cleanup (expired session ${String(s.sessionId).slice(0, 8)})`
                 );
             }
-        } catch { /* ignore cleanup errors */ }
+        } catch (err) {
+            // The next run retries.
+            cds.log('nightgate').warn(`Session cleanup failed: ${errorMessage(err)}`);
+        }
     }, SESSION_CLEANUP_INTERVAL);
 
     // Tests replace setInterval with a plain object that has no unref().

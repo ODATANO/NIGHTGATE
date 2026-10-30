@@ -1,8 +1,4 @@
-// Guards the `@odatano/nightgate/browser` surface.
-//
-// 1. Static check: no Node-only / server imports in src/browser/*.mjs.
-// 2. Smoke import: the ESM entry loads in Node and its exports work.
-//
+// Checks that src/browser has no Node-only or server imports and that its ESM entry loads.
 // Run: node scripts/check-browser-bundle.mjs
 
 import { readFileSync, readdirSync } from 'node:fs';

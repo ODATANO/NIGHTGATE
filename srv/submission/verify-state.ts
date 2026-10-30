@@ -1,8 +1,6 @@
-/**
- * Verify functions that read the live contract state from the public indexer.
- * They never look at the caller, because they are also served anonymously.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Verify functions that read the live contract state from the public indexer.
+// They never look at the caller, because they are also served anonymously.
+// SPDX-License-Identifier: Apache-2.0
 
 import cds, { type ActionRequest } from '@sap/cds';
 import { verifyAttestationState, verifyPredicateState } from '#cds-models/NightgateService';
@@ -19,16 +17,19 @@ import {
     resolveOverrideIndexerEndpoints,
     getNightgatePluginConfig
 } from '../utils/nightgate-config';
+import { errorMessage } from '../utils/errors';
 
 
 export const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
 
-/**
- * Field count, Merkle path depth and largest field mask of a vault contract.
- * JS bit operations work up to 32 bits, so a width of 32 still fits a number.
- */
+/** The registered contract name a vault call uses: the given one, else the default vault. */
+export function vaultRef(compiledRef: string | null | undefined): string {
+    return compiledRef?.length ? compiledRef : DEFAULT_ATTESTATION_VAULT_REF;
+}
+
+/** Field count, Merkle path depth and largest field mask of a vault contract. JS bit operations work up to 32 bits, so a width of 32 still fits. */
 export function vaultDims(compiledRef: string | null | undefined): { width: number; depth: number; maxMask: number } {
-    const width = slotWidthOf(getContractRegistration(compiledRef?.length ? compiledRef : DEFAULT_ATTESTATION_VAULT_REF));
+    const width = slotWidthOf(getContractRegistration(vaultRef(compiledRef)));
     return { width, depth: Math.log2(width), maxMask: width === 32 ? 0xffffffff : (1 << width) - 1 };
 }
 
@@ -37,10 +38,7 @@ export const UINT64_MAX = (1n << 64n) - 1n;
 
 export type PredicateKind = 'numeric' | 'equality' | 'membership' | 'integrity' | 'diff';
 
-/**
- * The single parser for predicate names, so an unknown name never yields a wrong claim.
- * `opCode` is set for numeric predicates only.
- */
+/** The single parser for predicate names, so an unknown name never yields a wrong claim. `opCode` is set for numeric predicates only. */
 export function parsePredicate(literal: unknown): { predicate: string; kind: PredicateKind; opCode: number | null } | null {
     if (literal === 'lessOrEqual') return { predicate: literal, kind: 'numeric', opCode: 0 };
     if (literal === 'greaterOrEqual') return { predicate: literal, kind: 'numeric', opCode: 1 };
@@ -52,18 +50,14 @@ export function parsePredicate(literal: unknown): { predicate: string; kind: Pre
 }
 
 /**
- * CAP returns Integer64 values as strings. The mask needs Integer64 because bit 31 does not fit Int32.
- * Returns a number, or null when the value is not an integer.
+ * Reads the mask as a number. CAP returns Integer64 values as strings, and the mask needs Integer64 because bit 31 does not fit Int32. Null when not an integer.
  */
 export function coerceMask(raw: unknown): number | null {
     const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
     return typeof n === 'number' && Number.isInteger(n) ? n : null;
 }
 
-/**
- * True when an indexer is configured for the requested network.
- * When false, the verify functions answer "not verified" instead of an error.
- */
+/** True when an indexer is configured for the requested network. When false, the verify functions answer "not verified" instead of an error. */
 export function liveProviderConfigured(networkOverride?: NightgateNetwork): boolean {
     const { network, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
     if (networkOverride && networkOverride !== network) {
@@ -84,8 +78,7 @@ export function contractProvidersConfigFromEnv(zkConfigPath: string): ContractPr
 }
 
 /**
- * Provider config for a call that names another network.
- * Only the indexer endpoints change. Reading never proves, and contracts are the same on every network.
+ * Provider config for a call that names another network. Only the indexer endpoints change, because reading never proves and contracts are the same on every network.
  */
 export function contractProvidersConfigForNetwork(
     zkConfigPath: string,
@@ -126,7 +119,7 @@ async function runVerify<T>(req: ActionRequest<unknown, unknown>, op: () => Prom
     } catch (err) {
         if (err instanceof CoercionError) return req.reject(400, err.message);
         if (err instanceof ContractNotRegisteredError) return req.reject(404, err.message);
-        return req.reject(500, err instanceof Error ? err.message : String(err));
+        return req.reject(500, errorMessage(err));
     }
 }
 
@@ -149,9 +142,7 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
         const netParsed = parseVerifyNetworkOverride(data.network, req);
         if (!netParsed.ok) return;
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         const NEGATIVE = { verified: false, attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false, attesterId: '', payloadHash: '', recordKey: '', documentId: '' };
 
@@ -254,9 +245,7 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
         const netParsed = parseVerifyNetworkOverride(data.network, req);
         if (!netParsed.ok) return;
 
-        const compiledRef = data.compiledArtifactRef && data.compiledArtifactRef.length > 0
-            ? data.compiledArtifactRef
-            : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
 
         const NEGATIVE = { verified: false, proven: false };
 

@@ -1,9 +1,5 @@
-/**
- * Wallet-worker side of the dust verify worker (`../dust-verify-worker.ts`).
- * One helper thread per wallet worker, started on the first collapse. The budget counts from
- * the moment the helper begins a check; a check past it ends the helper, and checks still
- * waiting move to the restarted one.
- */
+// Wallet-worker side of the dust verify worker. One helper thread per wallet worker, started on the first collapse.
+// A check past its budget ends the helper. Waiting checks move to the restarted one.
 
 import path from 'node:path';
 import { configMs } from '../../utils/config';

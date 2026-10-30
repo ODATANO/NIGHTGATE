@@ -1,14 +1,4 @@
-// Native-ESM integration check for srv/crawler/utxo-identity.ts.
-//
-// `Midnight.UnshieldedTokens` reports a UTXO's raw 32-byte owner and its
-// (intentHash, outputNo); the stored row needs the Bech32m address and the
-// DUST initial nonce, which the crawler derives. This check pins those
-// derivations against values READ FROM THE MIDNIGHT INDEXER for the same
-// UTXOs on preprod, so the crawler's rows are the indexer's rows.
-//
-// Reference data: preprod blocks 2647473, 2647521 and 2647181, taken from the
-// indexer's unshieldedCreatedOutputs. Nothing here talks to the network.
-//
+// Checks the crawler's UTXO address and DUST nonce derivation against preprod indexer values. No network calls.
 // Run: node scripts/integration-test-utxo-identity.mjs
 
 import { createRequire } from 'node:module';

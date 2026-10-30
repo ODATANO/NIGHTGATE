@@ -8,6 +8,7 @@ import { mountZkConfigRoute, mountContractManifestRoute } from './connector-rout
 import { applyPoolDefault } from './cap-pool-default';
 import { registerNightgateTransportLanes } from '../srv/utils/transport-lanes';
 import { legacyServicePathMiddleware } from '../srv/utils/legacy-service-paths';
+import { errorMessage } from '../srv/utils/errors';
 
 const log = cds.log('nightgate');
 
@@ -59,7 +60,7 @@ function registerLifecycle(): void {
                 );
                 return;
             }
-            const msg = err instanceof Error ? err.message : String(err);
+            const msg = errorMessage(err);
             log.error(`initialize() failed: ${msg}`);
         }
     });
@@ -90,19 +91,16 @@ const plugin = {
                         default: 'preprod'
                     },
                     nodeUrl: {
-                        description: 'Midnight Node Substrate RPC endpoint. Override via NIGHTGATE_NODE_URL env var.',
-                        type: 'string',
-                        default: 'wss://rpc.preprod.midnight.network/'
+                        description: 'Midnight node Substrate RPC endpoint (ws/wss). Built in for preview, testnet and undeployed; preprod and mainnet need your own node or Blockfrost (token in the URL). Override via NIGHTGATE_NODE_URL env var.',
+                        type: 'string'
                     },
                     indexerHttpUrl: {
-                        description: 'Midnight Indexer GraphQL HTTP endpoint (used by the submission path for publicDataProvider). Override via NIGHTGATE_INDEXER_HTTP_URL env var.',
-                        type: 'string',
-                        default: 'https://indexer.preprod.midnight.network/api/v4/graphql'
+                        description: 'Midnight indexer GraphQL HTTP endpoint for the wallet SDK. Built in for preview, testnet and undeployed; preprod and mainnet need your own indexer or Blockfrost (token in the URL). Override via NIGHTGATE_INDEXER_HTTP_URL env var.',
+                        type: 'string'
                     },
                     indexerWsUrl: {
-                        description: 'Midnight Indexer GraphQL WebSocket endpoint (used by the submission path for subscriptions). Override via NIGHTGATE_INDEXER_WS_URL env var.',
-                        type: 'string',
-                        default: 'wss://indexer.preprod.midnight.network/api/v4/graphql/ws'
+                        description: 'Midnight indexer GraphQL WebSocket endpoint; derived from indexerHttpUrl (ws scheme, /ws after the path) unless set. Override via NIGHTGATE_INDEXER_WS_URL env var.',
+                        type: 'string'
                     },
                     proofServerUrl: {
                         description: 'Proof server URL. Required only for contract deploy/call submission. Override via NIGHTGATE_PROOF_SERVER_URL env var.',
@@ -175,7 +173,7 @@ const plugin = {
                             rpcBatchSize: { type: 'number', description: 'Batched JSON-RPC calls per round during catch-up. Override via NIGHTGATE_RPC_BATCH_SIZE env var.' },
                             startHeight: { type: 'number', description: 'First height to index while the index is EMPTY; the block below it is indexed as the parentless anchor. Ignored once the index holds blocks. Override via NIGHTGATE_CRAWLER_START_HEIGHT env var.' },
                             maxBlocksPerSecond: { type: 'number', description: 'Catch-up rate cap; unset = unlimited. Override via NIGHTGATE_CRAWLER_MAX_BPS env var.' },
-                            decodePayloads: { type: 'boolean', description: 'Decode stored ledger payloads in a pass behind the indexed tip: circuit names, zswap and DUST counts (default: false; the decode runs in wasm on the main thread). Override via NIGHTGATE_CRAWLER_DECODE_PAYLOADS env var.' },
+                            decodePayloads: { type: 'boolean', description: 'Decode stored ledger payloads in a pass behind the indexed tip: circuit names, zswap and DUST counts (default: false; the decode runs in a worker thread). Override via NIGHTGATE_CRAWLER_DECODE_PAYLOADS env var.' },
                             indexerSupplement: { type: 'boolean', description: 'Fill what a block does not carry (segments, contract state and balances, ledger-event streams, the DUST registration flag) from the Midnight indexer, in a pass behind the indexed tip (default: false). Override via NIGHTGATE_CRAWLER_INDEXER_SUPPLEMENT env var.' },
                             indexerUrl: { type: 'string', description: 'GraphQL endpoint for the supplement pass (default: the configured indexerHttpUrl).' },
                             supplementBlocksPerSecond: { type: 'number', description: 'Indexer requests per second of the supplement pass, one per block (default: 2). Override via NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS env var.' },

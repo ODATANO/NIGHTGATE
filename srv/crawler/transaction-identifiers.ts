@@ -4,12 +4,13 @@ import cds from '@sap/cds';
 import { Transactions, TransactionIdentifiers, SyncState } from '#cds-models/midnight';
 import { parseJsonStringList } from '../utils/json-list';
 import type { DbRunner } from '../utils/db-types';
+import { bareHex } from '../utils/hex-patterns';
 
 const { SELECT, INSERT, DELETE, UPDATE } = cds.ql;
 const log = cds.log('nightgate:crawler');
 
 export function normalizeIdentifier(raw: string): string {
-    return raw.trim().toLowerCase().replace(/^0x/, '');
+    return bareHex(raw);
 }
 
 /** Replaces the identifier rows of one transaction. Running it again with the same list changes nothing. */

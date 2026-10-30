@@ -1,14 +1,5 @@
-// Drives the browser DApp-connector HTTP surface against the REAL route
-// handlers (src/connector-routes.js) mounted on a bare Express app: no cds
-// lifecycle, no node, no chain. Exercises:
-//   GET /contract-manifest                  -> self-configuration manifest
-//   GET /zk-config/<contract>/<dir>/<file>  -> proving-artifact serving + ETag/304
-// plus the security boundary (unknown contract / bad dir / bad filename -> 404)
-// and the pinned-address + network passthrough (network reflects config).
-//
-// Run: npm run build   (compiles src/*.ts -> *.js in place)
-//      node scripts/integration-test-connector-routes.mjs
-//   or: npm run integration:connector-routes
+// Checks the /contract-manifest and /zk-config routes on a bare Express app, including 404s and ETag handling.
+// Run: npm run build, then npm run integration:connector-routes
 
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -25,20 +16,14 @@ function ok(name, value, detail) {
 
 const PINNED_ADDRESS = '0200deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefcafe';
 
-// --- Configure cds.env BEFORE importing the route module ------------------
-// getNightgatePluginConfig() reads cds.env.requires.nightgate; the manifest
-// route reads network + per-contract pinned address from it. Set it up so the
-// manifest reflects an `undeployed` network and a pinned attestation-vault
-// address, proving both passthroughs end-to-end.
+// Configure cds.env before importing the route module.
+// The manifest then shows an `undeployed` network and a pinned attestation-vault address.
 const cds = (await import('@sap/cds')).default;
 cds.env.requires ??= {};
 cds.env.requires.nightgate = {
     contracts: { 'attestation-vault': { address: PINNED_ADDRESS } }
 };
-// cds lazily (re)loads .env into process.env on first cds.env access, which sets
-// NIGHTGATE_NETWORK from the repo .env. Pin the network deterministically AFTER
-// that load has happened (getConfiguredNightgateNetwork reads env first), so the
-// manifest reflects `undeployed` regardless of the local .env.
+// cds loads .env on first cds.env access, so pin the network after that load.
 process.env.NIGHTGATE_NETWORK = 'undeployed';
 
 // --- Load the REAL compiled route handlers + registry ----------------------

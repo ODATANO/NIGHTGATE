@@ -1,23 +1,6 @@
-// Live acceptance lane for in-process wasm proving:
-// with the SERVER started under NIGHTGATE_PROVING_MODE=wasm (and ideally a
-// dead NIGHTGATE_PROOF_SERVER_URL so any accidental server-proving fails
-// loudly), build → sign → prove → submit a NIGHT self-transfer and get a
-// node-accepted tx hash. Proving runs in-process; no proof server involved.
-//
-// Server (separate terminal):
-//   NIGHTGATE_PROVING_MODE=wasm NIGHTGATE_PROOF_SERVER_URL=http://127.0.0.1:9999 npm run dev
-//
-// Then:
-//   node --env-file=.env scripts/run-wasm-proving-e2e.mjs
-//   (or: npm run wasm-proving:e2e)
-//
-// Inputs (env vars):
-//   NIGHTGATE_URL            default http://localhost:4004
-//   LACE_VIEWING_KEY         required (64 hex)
-//   LACE_MNEMONIC            required (BIP39 phrase; server HD-derives keys)
-//   WASM_E2E_AMOUNT          default '1000000' NIGHT atoms, sent to own address
-//   E2E_PREWARM_TIMEOUT_MIN  default 240
-//   E2E_JOB_POLL_INTERVAL_MS default 5000
+// Submits a NIGHT self-transfer proven in-process with the server in wasm proving mode and a dead proof server URL.
+// Run: npm run wasm-proving:e2e against `NIGHTGATE_PROVING_MODE=wasm NIGHTGATE_PROOF_SERVER_URL=http://127.0.0.1:9999 npm run dev`
+// Env: NIGHTGATE_URL, LACE_VIEWING_KEY, LACE_MNEMONIC, WASM_E2E_AMOUNT (default 1000000).
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -151,5 +134,5 @@ async function waitForServer() {
     console.log(`      job wall-clock ${sendSecs}s (includes sync gate + build + prove + submit)`);
     console.log('\nCross-check the server log for:');
     console.log('  "proving mode: wasm (in-process prover; proof server not used for wallet proving)"');
-    console.log('and record the proving duration in the FR (AC-6).');
+    console.log('and note the proving duration.');
 })();

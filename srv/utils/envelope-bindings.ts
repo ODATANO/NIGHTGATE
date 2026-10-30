@@ -1,8 +1,5 @@
-/**
- * The context each encrypted database value is bound to: a purpose per column and the row id.
- * An encrypted value copied into another row or column will not decrypt.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Binds each encrypted value to its column and row id. A value copied into another row or column will not decrypt.
+// SPDX-License-Identifier: Apache-2.0
 
 import type { EnvelopeBinding } from './crypto';
 

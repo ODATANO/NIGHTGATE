@@ -1,11 +1,13 @@
 import cds from '@sap/cds';
-import { NightgateError } from '../srv/utils/errors';
+import { NightgateError, errorMessage } from '../srv/utils/errors';
 
 import { startCrawler, stopCrawler } from '../srv/crawler/index';
 import { ensureNightgateModelLoaded } from '../srv/utils/cds-model';
 import {
     isNightgatePluginConfigured,
     resolveNightgateRuntimeConfig,
+    crawlerStartConfig,
+    missingEndpointsMessage,
     warnIfCrawlerlessChainConfirmSet,
     resolveEffectiveProvingMode,
     resolveProofTimeoutMs,
@@ -22,6 +24,8 @@ import { publishRuntimeState } from '../srv/utils/runtime-state';
 import { ensureSyncStateSingleton } from '../srv/utils/sync-state';
 import { closeSessionsFromPreviousProcess } from '../srv/sessions/wallet-sessions';
 import { getConfiguredFeeSponsorSessions, prewarmFeeSponsorPool } from '../srv/submission/fee-sponsor';
+import { affectedRows } from '../srv/utils/db-types';
+import { isNodeTransportError } from '../srv/utils/retry';
 const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
 import { stopDecodeWorker } from '../srv/midnight/decode-worker-client';
@@ -34,7 +38,6 @@ import { recoverInterruptedJobs, dropPendingJobsForClosedSessions, startBackgrou
 import { createHttpTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
 import { TransactionResults } from '#cds-models/midnight';
 import { backfillTransactionIdentifiers } from '../srv/crawler/transaction-identifiers';
-import { errorMessage } from '../srv/utils/errors';
 import {
     assertSupportedRuntimeTopology,
     UnsupportedRuntimeTopologyError
@@ -53,7 +56,7 @@ import { startEventLoopWatch, stopEventLoopWatch } from '../srv/monitoring/event
 import { dbPoolGauges } from '../srv/monitoring/status';
 
 export type { NightgateConfig } from '../srv/types';
-export { DEFAULT_NETWORK, DEFAULT_NODE_URL } from '../srv/utils/nightgate-config';
+export { DEFAULT_NETWORK, DEFAULT_NODE_URLS, DEFAULT_INDEXER_URLS } from '../srv/utils/nightgate-config';
 
 export interface NightgateIndexerStatus {
     initialized: boolean;
@@ -84,9 +87,6 @@ function setLastStatus(next: NightgateIndexerStatus): void {
     publishRuntimeState({ initialized: next.initialized, mode: next.mode, lastError: next.lastError });
 }
 
-function isLikelyNodeConnectionError(message: string): boolean {
-    return /ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|socket hang up|WebSocket|Not connected to Midnight Node/i.test(message);
-}
 
 function logStartupState(state: 'stopped' | 'syncing' | 'offline', detail?: string): void {
     const suffix = detail ? ` (${detail})` : '';
@@ -100,7 +100,7 @@ export class SchemaNotDeployedError extends NightgateError {
         public readonly dbPath: string,
         cause: unknown
     ) {
-        const causeMsg = cause instanceof Error ? cause.message : String(cause);
+        const causeMsg = errorMessage(cause);
         super('SCHEMA_NOT_DEPLOYED',
             `Nightgate schema is not deployed (or out of date): ` +
             `missing table or column for '${missingTable}' in ${dbPath}. ` +
@@ -114,7 +114,7 @@ export class SchemaNotDeployedError extends NightgateError {
 }
 
 function resolveDbPath(): string {
-    const dbCfg = (cds.env as any).requires?.db?.credentials || (cds.env as any).requires?.db || {};
+    const dbCfg = cds.env.requires?.db?.credentials || cds.env.requires?.db || {};
     return dbCfg.database || dbCfg.url || 'db.sqlite';
 }
 
@@ -155,29 +155,26 @@ async function ensureSchemaDeployed(): Promise<void> {
         }
     }
 
-    const dbKind = String((cds.env as any).requires?.db?.kind ?? '');
+    const dbKind = String(cds.env.requires?.db?.kind ?? '');
     // Lets PostgreSQL use the indexes below for sorted queries. See srv/utils/pg-order-nulls.ts.
     if (/postgres/i.test(dbKind)) installPostgresOrderNulls();
-    const created = await ensureIndexes(db as any, dbKind, msg => log.warn(msg));
+    const created = await ensureIndexes(db, dbKind, msg => log.warn(msg));
     log.debug(`ensured ${created} secondary index(es)`);
 
     // Stop if a stored seed was encrypted with an unknown key, instead of treating it as missing.
-    await assertStoredKeyIdsKnown(db as any);
+    await assertStoredKeyIdsKnown(db);
 
     const removed = await db.run(
         cds.ql.DELETE.from(TransactionResults).where({ outcomeSource: null })
     );
-    const removedCount = typeof removed === 'number' ? removed : Number((removed as any)?.changes ?? 0);
+    const removedCount = affectedRows(removed);
     if (removedCount > 0) log.warn(`Removed ${removedCount} legacy unverified TransactionResults row(s); re-crawl historical blocks to backfill canonical outcomes`);
 
     // Rows decoded before the lookup table existed. Runs in the background, the start does not wait for it.
     void backfillTransactionIdentifiers(db).catch(err => log.warn(`transaction identifier backfill failed: ${errorMessage(err)}`));
 }
 
-/**
- * Starts NIGHTGATE. Calling it again does nothing.
- * The status is "offline" if a startup step failed and "idle" if block indexing is turned off.
- */
+/** Starts NIGHTGATE once. Status is "offline" after a failed startup step and "idle" with block indexing off. */
 export async function initialize(): Promise<NightgateIndexerStatus> {
     await ensureNightgateModelLoaded();
 
@@ -197,7 +194,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     }
 
     const { network, nodeUrl, crawlerConfig, crawlerNodeUrl, submissionEndpoints, invalidNetwork } = resolveNightgateRuntimeConfig(nightgateConfig);
-    const crawlerEnabled = (crawlerConfig as any).enabled !== false;
+    const crawlerEnabled = crawlerConfig.enabled !== false;
 
     if (invalidNetwork) {
         const message = `Invalid network "${invalidNetwork}". Must be one of: ${VALID_NIGHTGATE_NETWORKS.join(', ')}. ` +
@@ -215,11 +212,19 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         throw new Error(message);
     }
 
+    const missingEndpoints = missingEndpointsMessage(network, nodeUrl, submissionEndpoints.indexerHttpUrl);
+    if (missingEndpoints) {
+        initialized = false;
+        setLastStatus({ initialized: false, crawlerEnabled, network, nodeUrl, mode: 'offline', lastError: missingEndpoints });
+        logStartupState('offline', 'node or indexer not configured');
+        throw new Error(missingEndpoints);
+    }
+
     let runtimeTopology;
     try {
         runtimeTopology = assertSupportedRuntimeTopology(nightgateConfig);
     } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = errorMessage(err);
         const rejected = err instanceof UnsupportedRuntimeTopologyError ? err.topology : undefined;
         initialized = false;
         setLastStatus({
@@ -243,11 +248,18 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         `mode=${runtimeTopology.runtimeMode}, replicas=${runtimeTopology.replicaCount}, database=${runtimeTopology.databaseKind}`
     );
     for (const warning of runtimeTopology.warnings) log.warn(warning);
+    const topologyStatus = {
+        instanceId: runtimeTopology.instanceId,
+        runtimeMode: runtimeTopology.runtimeMode,
+        replicaCount: runtimeTopology.replicaCount,
+        databaseKind: runtimeTopology.databaseKind,
+        runtimeWarnings: runtimeTopology.warnings
+    };
 
     try {
         await ensureSchemaDeployed();
     } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = errorMessage(err);
         initialized = false;
         setLastStatus({
             initialized: false,
@@ -256,11 +268,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             nodeUrl,
             mode: 'offline',
             lastError: message,
-            instanceId: runtimeTopology.instanceId,
-            runtimeMode: runtimeTopology.runtimeMode,
-            replicaCount: runtimeTopology.replicaCount,
-            databaseKind: runtimeTopology.databaseKind,
-            runtimeWarnings: runtimeTopology.warnings
+            ...topologyStatus
         });
         logStartupState('offline', 'schema unavailable');
         throw err;
@@ -271,7 +279,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         const db = await cds.connect.to('db');
         await ensureSyncStateSingleton(db);
     } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = errorMessage(err);
         initialized = false;
         setLastStatus({
             initialized: false,
@@ -279,7 +287,8 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             network,
             nodeUrl,
             mode: 'offline',
-            lastError: message
+            lastError: message,
+            ...topologyStatus
         });
         logStartupState('offline', 'network/database binding rejected');
         throw err;
@@ -297,9 +306,9 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         setActiveLease(BACKGROUND_LEASE_ROLE, holder);
         stopLeaseHeartbeat = startInstanceLeaseHeartbeat(db, BACKGROUND_LEASE_ROLE, holder, Math.floor(ttlMs / 3), () => {
             onInstanceLeaseLost(holder);
-        }, err => log.warn(`Instance lease heartbeat failed: ${err instanceof Error ? err.message : String(err)}`));
+        }, err => log.warn(`Instance lease heartbeat failed: ${errorMessage(err)}`));
     } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = errorMessage(err);
         initialized = false;
         setLastStatus({
             initialized: false,
@@ -307,7 +316,8 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             network,
             nodeUrl,
             mode: 'offline',
-            lastError: message
+            lastError: message,
+            ...topologyStatus
         });
         logStartupState('offline', 'instance lease held by another process');
         throw err;
@@ -320,7 +330,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             log.info(`Classified ${recovered} interrupted background job(s) for safe restart recovery/reconciliation`);
         }
     } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errorMessage(err);
         log.warn(`Background-job recovery skipped: ${msg}`);
     }
 
@@ -338,7 +348,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
                 }
             }
         } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
+            const msg = errorMessage(err);
             log.warn(`Wallet-session restart cleanup skipped: ${msg}`);
         }
     }
@@ -355,7 +365,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         const learned = await refreshLearnedTokenTypes(cds.db || await cds.connect.to('db'));
         if (learned.length) log.info(`Learned token types: ${learned.length}`);
     } catch (regErr) {
-        const msg = regErr instanceof Error ? regErr.message : String(regErr);
+        const msg = errorMessage(regErr);
         log.warn(`Contract registry load warning: ${msg}`);
     }
 
@@ -384,17 +394,17 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
                 db: cds.db,
                 config: nightgateConfig,
                 facadeConfig: {
-                    networkId: network as any,
+                    networkId: network,
                     indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
                     indexerWsUrl: submissionEndpoints.indexerWsUrl,
                     proofServerUrl: submissionEndpoints.proofServerUrl,
                     relayUrl: nodeUrl
                 },
                 log
-            }).catch(err => log.warn(`Sponsor pool prewarm aborted: ${err instanceof Error ? err.message : String(err)}`));
+            }).catch(err => log.warn(`Sponsor pool prewarm aborted: ${errorMessage(err)}`));
         }
     } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errorMessage(err);
         log.warn(`Wallet worker startup failed: ${msg}`);
         log.warn('Signing-related operations will fail until restart');
         submissionStartupError = `submission pipeline did not start: ${msg}`;
@@ -410,17 +420,12 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     if (crawlerEnabled) {
         try {
             log.info('Initializing crawler and starting catch-up...');
-            await startCrawler({
-                ...(crawlerConfig as Record<string, unknown>),
-                enabled: true,
-                nodeUrl: crawlerNodeUrl,
-                requestTimeout: (crawlerConfig as any).requestTimeout || 30000
-            });
+            await startCrawler(crawlerStartConfig({ crawlerConfig, crawlerNodeUrl }));
             logStartupState('syncing', 'crawler started');
         } catch (err) {
-            lastError = err instanceof Error ? err.message : String(err);
+            lastError = errorMessage(err);
             mode = 'offline';
-            if (isLikelyNodeConnectionError(lastError)) {
+            if (isNodeTransportError(err)) {
                 log.warn(`Node not reachable at ${redactUrlCredentials(crawlerNodeUrl)}: ${lastError}`);
                 logStartupState('offline', 'node unreachable');
                 log.info('Running in offline mode. Start a Midnight node: docker compose -f docker/docker-compose.yml up -d');
@@ -444,25 +449,18 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         nodeUrl,
         mode,
         lastError,
-        instanceId: runtimeTopology.instanceId,
-        runtimeMode: runtimeTopology.runtimeMode,
-        replicaCount: runtimeTopology.replicaCount,
-        databaseKind: runtimeTopology.databaseKind,
-        runtimeWarnings: runtimeTopology.warnings
+        ...topologyStatus
     });
 
     return getStatus();
 }
 
-/**
- * Called when another process took over the lease.
- * This process then stops all jobs and writes but keeps running, in offline mode.
- */
+/** Called when another process took over the lease. Stops all jobs and writes, and keeps running offline. */
 function onInstanceLeaseLost(holder: string): void {
     fenceBackgroundWork();
     log.error(`Instance lease of ${holder} was taken over by another instance; job dispatch, write actions and broadcasts are refused, job loops and crawler stop`);
     stopBackgroundJobProcessor();
-    void stopCrawler().catch(err => log.warn(`Crawler stop error: ${err instanceof Error ? err.message : String(err)}`));
+    void stopCrawler().catch(err => log.warn(`Crawler stop error: ${errorMessage(err)}`));
     setLastStatus({ ...lastStatus, mode: 'offline', lastError: 'instance lease taken over by another process' });
 }
 
@@ -476,7 +474,7 @@ export async function shutdown(): Promise<void> {
     try {
         await stopCrawler();
     } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = errorMessage(err);
         log.warn(`Crawler stop error: ${message}`);
         setLastStatus({
             ...lastStatus,
@@ -486,19 +484,19 @@ export async function shutdown(): Promise<void> {
     try {
         await stopWalletWorker();
     } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = errorMessage(err);
         log.warn(`Wallet worker stop error: ${message}`);
     }
     try {
         await stopDecodeWorker();
     } catch (err) {
-        log.warn(`Decode worker stop error: ${err instanceof Error ? err.message : String(err)}`);
+        log.warn(`Decode worker stop error: ${errorMessage(err)}`);
     }
     if (leaseHolder) {
         try {
             await releaseInstanceLease(await cds.connect.to('db'), BACKGROUND_LEASE_ROLE, leaseHolder);
         } catch (err) {
-            log.warn(`Instance lease release error: ${err instanceof Error ? err.message : String(err)}`);
+            log.warn(`Instance lease release error: ${errorMessage(err)}`);
         }
         leaseHolder = undefined;
         clearActiveLease();
@@ -507,7 +505,7 @@ export async function shutdown(): Promise<void> {
         // Only after the worker stopped, because the worker may still save encrypted state.
         await clearAllEncryptionKeys();
     } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = errorMessage(err);
         log.warn(`Encryption key cleanup error: ${message}`);
     }
     initialized = false;

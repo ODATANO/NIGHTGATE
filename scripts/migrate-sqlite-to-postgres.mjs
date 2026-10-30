@@ -1,32 +1,6 @@
 #!/usr/bin/env node
-// nightgate-db-migrate: copy a NIGHTGATE SQLite database into PostgreSQL.
-//
-//   nightgate-db-migrate --from /data/nightgate.db --to postgres://user:pw@host:5432/db [--dry-run] [--force] [--ignore-unknown] [--batch 500]
-//
-// Reads every persisted entity of the loaded CDS model (this package's own
-// model plus a consuming app's, when run from its root; `.texts` and CAP's
-// own tables such as cds.outbox.Messages included) from the SQLite file with
-// better-sqlite3 and inserts the rows through CAP into PostgreSQL, so types
-// are converted the way the runtime expects (SQLite 0/1 -> boolean, ISO
-// strings stay timestamps, JSON columns stay text). Rows are STREAMED
-// (statement iterator, integers read as BigInt so Integer64 keeps every
-// digit; a Decimal that SQLite already holds as a rounded REAL beyond 2^53
-// aborts the run, see migrate-values.mjs) and written in batches; memory
-// stays flat on large indexer databases. Views are skipped (the deploy
-// creates them). A source table the model does not define is reported; with
-// rows it stops the run unless --ignore-unknown. The target must have been
-// deployed (`cds deploy`, the image entrypoint does it) and must be EMPTY
-// unless --force (rows are then appended; duplicate keys fail the run).
-//
-// Stop every writer first: this is a data migration, not a live sync. After
-// the copy the script compares row counts per table and prints them; a
-// mismatch exits 1. Defaults: --from NIGHTGATE_DB_PATH or /data/nightgate.db,
-// --to NIGHTGATE_DB_URL.
-//
-// Needs `@cap-js/postgres` and `better-sqlite3` resolvable from this package
-// or from the working directory (a plugin host running on PostgreSQL has the
-// first; `@cap-js/sqlite` brings the second). The image has both.
-//
+// Copies a NIGHTGATE SQLite database into a deployed, empty PostgreSQL. Stop every writer first; a row-count mismatch exits 1.
+// Run: nightgate-db-migrate --from /data/nightgate.db --to postgres://user:pw@host:5432/db [--dry-run] [--force] [--ignore-unknown] [--batch 500]
 // SPDX-License-Identifier: Apache-2.0
 import { createRequire } from 'node:module';
 import fs from 'node:fs';

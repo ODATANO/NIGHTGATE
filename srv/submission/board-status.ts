@@ -1,8 +1,6 @@
-/**
- * Public counts for the offer board and the sponsor pool. Shows no ids and no amounts.
- * Sponsor readiness comes from the reports the worker sends anyway, so no worker call is needed.
- * SPDX-License-Identifier: Apache-2.0
- */
+// Public counts for the offer board and the sponsor pool, without ids or amounts.
+// Sponsor readiness comes from reports the worker already sends, so no worker call is needed.
+// SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { SwapOffers, BackgroundJobs } from '#cds-models/midnight';
 import type { DbRunner } from '../utils/db-types';
@@ -13,6 +11,7 @@ import { walletGetSyncProgress } from '../midnight/wallet-worker-client';
 import { syncGateReading } from './sponsor-sync-gate';
 import { runWithoutAmbientTx } from './background-jobs';
 import { configString } from '../utils/config';
+import { packageVersion } from '../utils/package-version';
 
 const { SELECT } = cds.ql;
 
@@ -24,6 +23,7 @@ export interface BoardStatus {
     sponsorsReady: number;
     /** The token factory a mint without `contractAddress` uses; null when the instance sets none. */
     factoryContract: string | null;
+    version: string;
     asOf: string;
 }
 
@@ -77,5 +77,5 @@ async function computeBoardStatus(db: DbRunner, now: Date): Promise<BoardStatus>
     const sponsorIds = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
     const sponsorsReady = sponsorIds.length ? await countReadySponsors(db, sponsorIds) : 0;
     const factoryContract = String(configString('NIGHTGATE_TOKEN_FACTORY_CONTRACT') ?? '').trim().toLowerCase() || null;
-    return { openOffers, offersFilledToday, swapsToday, sponsorsConfigured: sponsorIds.length, sponsorsReady, factoryContract, asOf: nowIso };
+    return { openOffers, offersFilledToday, swapsToday, sponsorsConfigured: sponsorIds.length, sponsorsReady, factoryContract, version: packageVersion(), asOf: nowIso };
 }

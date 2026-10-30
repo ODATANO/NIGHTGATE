@@ -6,11 +6,8 @@ const roots = ['src', 'srv', 'test'];
 const generatedDirs = ['@cds-models'];
 const generatedSuffixes = ['.js', '.js.map', '.d.ts', '.d.ts.map'];
 
-// A file is BUILD OUTPUT only when its TypeScript source sits next to it:
-// tsc emits foo.js / foo.js.map / foo.d.ts / foo.d.ts.map from foo.ts. Files
-// without that source are hand-written and must survive (src/browser ships
-// hand-written declarations like index.d.ts and witnesses.d.ts next to .mjs
-// modules; a pack from a tree without them ships an untyped package).
+// A file is build output only when its .ts source sits next to it.
+// Hand-written declarations next to .mjs modules must survive.
 function shouldDelete(filePath) {
     const suffix = generatedSuffixes.find((s) => filePath.endsWith(s));
     if (!suffix) return false;

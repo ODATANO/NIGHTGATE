@@ -1,8 +1,5 @@
-/**
- * Loads and checks the wallet session that pays fees for other users.
- * Only sessions listed in the platform config may pay for other users.
- * Otherwise a guessed or leaked session id could spend someone else's dust.
- */
+// Loads and checks the wallet session that pays fees for other users.
+// Only sessions listed in the platform config may do that, so a guessed or leaked session id cannot spend someone else's dust.
 
 import type { NightgatePluginConfig } from '../utils/nightgate-config';
 import cds from '@sap/cds';
@@ -13,12 +10,11 @@ import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../uti
 import { deriveAccountId, deriveStoragePassword } from './wallet-material-factory';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
 import { assignDedicatedWorker, walletWaitForSyncedState, walletWorkerPoolConfig } from '../midnight/wallet-worker-client';
-import { NightgateError } from '../utils/errors';
+import { NightgateError, errorMessage } from '../utils/errors';
 import { publishPrewarmState } from '../utils/runtime-state';
 
 /**
- * How long startup waits for each sponsor wallet to sync to the chain tip. 0 means build only.
- * Sponsors sync one after another, because all wallets share one worker thread.
+ * How long startup waits for each sponsor wallet to sync to the chain tip; 0 means build only. Sponsors sync one at a time, because all wallets share one worker thread.
  */
 export function prewarmSyncBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
     return configNumberFrom('NIGHTGATE_SPONSOR_PREWARM_SYNC_MS', env);
@@ -129,11 +125,8 @@ export async function ensureFeeSponsorFacade(
     });
 }
 
-/**
- * Starts the platform sponsor wallets after boot: one at a time in a shared worker (they would
- * starve each other), side by side when every sponsor has a worker of its own.
- * A failing sponsor is logged and skipped. The pool then uses the other sponsors.
- */
+// Starts the platform sponsor wallets after boot. In a shared worker they start one at a time, because they would starve each other.
+// With a worker per sponsor they start side by side. A failing sponsor is logged and skipped, and the pool uses the others.
 export async function prewarmFeeSponsorPool(opts: {
     db: DbRunner;
     config?: NightgatePluginConfig;
@@ -165,12 +158,12 @@ export async function prewarmFeeSponsorPool(opts: {
                     await walletWaitForSyncedState(sponsor.accountId, syncBudget);
                     opts.log?.info(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} at tip after ${Math.round((Date.now() - started) / 1000)}s; next sponsor`);
                 } catch (err) {
-                    opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} not at tip within ${Math.round(syncBudget / 1000)}s (${err instanceof Error ? err.message : String(err)}); it keeps catching up, the pool fails over to a synced member`);
+                    opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} not at tip within ${Math.round(syncBudget / 1000)}s (${errorMessage(err)}); it keeps catching up, the pool fails over to a synced member`);
                 }
             }
         } catch (err) {
             failed.push(sponsorSessionId);
-            opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} failed (${err instanceof Error ? err.message : String(err)}); the pool fails over at use time`);
+            opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} failed (${errorMessage(err)}); the pool fails over at use time`);
         }
         publish(true);
     };

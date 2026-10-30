@@ -1,11 +1,10 @@
-/**
- * Derives the Bech32m address and the DUST initial nonce of an unshielded UTXO, which the chain event does not carry.
- * Both match the Midnight indexer's values exactly.
- */
+// Derives the Bech32m address and DUST initial nonce of an unshielded UTXO, which the chain event lacks.
+// Both match the Midnight indexer's values exactly.
 
 import { loadLedgerV8 } from '../midnight/sdk-loader';
+import { bareHex } from '../utils/hex-patterns';
 
-type AddressFormatModule = any;
+type AddressFormatModule = typeof import('@midnightntwrk/wallet-sdk-address-format');
 
 let cachedAddressFormat: AddressFormatModule | undefined;
 let inflightAddressFormat: Promise<AddressFormatModule> | undefined;
@@ -35,7 +34,7 @@ export async function encodeUnshieldedOwner(rawHex: string, network: string): Pr
     if (hit) return hit;
 
     const af = await loadAddressFormat();
-    const bytes = new Uint8Array(Buffer.from(rawHex, 'hex'));
+    const bytes = Buffer.from(rawHex, 'hex');
     const encoded = af.MidnightBech32m.encode(network, new af.UnshieldedAddress(bytes)).toString();
 
     if (addressCache.size >= MAX_CACHED_ADDRESSES) addressCache.clear();
@@ -48,7 +47,7 @@ export async function computeInitialNonce(outputNo: number, intentHash: string):
     const ledger = await loadLedgerV8();
     const nonce = ledger.dustInitialNonce(BigInt(outputNo), intentHash);
     return typeof nonce === 'string'
-        ? nonce.replace(/^0x/i, '').toLowerCase()
+        ? bareHex(nonce)
         : Buffer.from(nonce).toString('hex');
 }
 

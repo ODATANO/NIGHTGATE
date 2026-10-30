@@ -1,14 +1,4 @@
-// SPIKE: prove we can read the on-chain
-// `disclosures` ledger Map back out via the compiled artifact's `ledger()`
-// decoder, AND that the enumeration strategy works given the central
-// constraint: the OUTER `disclosures` map is NOT iterable (member/lookup only),
-// while sibling maps (attestations) and the INNER per-payload map ARE.
-//
-// It drives the REAL Compact-emitted circuits locally (no chain / no proof
-// server): attest -> grantDisclosure -> decode+enumerate -> revokeDisclosure
-// -> decode again. If this passes, the production indexer (disclosure-indexer.ts)
-// can mirror the exact decode/enumerate logic against publicDataProvider state.
-//
+// Checks locally that the vault's disclosures map decodes and enumerates, although its outer map is not iterable.
 // Run: node scripts/spike-disclosure-indexer.mjs
 
 import path from 'node:path';

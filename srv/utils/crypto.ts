@@ -1,15 +1,12 @@
-/**
- * Encryption of secrets stored in the database.
- * Each value gets its own random data key, which is itself encrypted with a master key from the key ring.
- * Several master keys can exist at once, so they can be rotated. `ENCRYPTION_KEY` is the key with id `1`.
- * New values use format v3, which also binds the value to its column and row.
- * Older v1 and v2 values can still be read and are converted by `nightgate-rewrap-keys`.
- */
+// Encryption of database secrets. Each value gets its own data key, which a master key from the key ring encrypts.
+// Several master keys can exist at once for rotation. `ENCRYPTION_KEY` is the key with id `1`.
+// New values use format v3, which binds them to column and row. `nightgate-rewrap-keys` converts older v1 and v2 values.
 
 import crypto from 'crypto';
 import { NightgateError } from './errors';
 import cds from '@sap/cds';
 import { configFlag } from './config';
+import { isProduction } from './production';
 
 const log = cds.log('nightgate:crypto');
 
@@ -136,10 +133,6 @@ export function parseKeyRingSpec(env: NodeJS.ProcessEnv = process.env): KeyRingS
     return { activeId: active || keys[0].id, keys };
 }
 
-function isProduction(): boolean {
-    if (process.env.NODE_ENV === 'production') return true;
-    try { return (cds as any)?.env?.production === true; } catch { return false; }
-}
 
 let pinnedRing: KeyRing | undefined;
 let cachedRing: { snapshot: string; ring: KeyRing } | undefined;
@@ -150,10 +143,8 @@ export function setKeyRing(spec: KeyRingSpec | undefined): void {
     pinnedRing = spec ? new KeyRing(spec) : undefined;
 }
 
-/**
- * Returns the key ring: the one set by `setKeyRing`, else the one from the environment.
- * Outside production, without any key, a random key is used. Its data is unreadable after a restart.
- */
+/** Returns the key ring: the one set by `setKeyRing`, else the one from the environment.
+ *  Outside production, without any key, a random key is used. Its data is unreadable after a restart. */
 export function getEncryptionKey(): KeyRing {
     if (pinnedRing) return pinnedRing;
     // Must run first: reading cds.env loads the project's .env file into process.env.
@@ -265,10 +256,8 @@ export class UnboundEnvelopeError extends Error {
     }
 }
 
-/**
- * Decrypts any format. When a binding is given, old unbound values are refused,
- * unless `allowUnbound` or NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES allows them.
- */
+/** Decrypts any format. When a binding is given, old unbound values are refused,
+ *  unless `allowUnbound` or NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES allows them. */
 export function decrypt(combined: string, key: EncryptionKey, binding?: EnvelopeBinding, opts: { allowUnbound?: boolean } = {}): string {
     const ring = asRing(key);
     const { version, keyId } = inspectCiphertext(combined);

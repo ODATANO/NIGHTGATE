@@ -38,7 +38,7 @@ import { getDustStreamTip, getIndexerTip, indexerTipCache, streamTipCache } from
 const URL = 'https://indexer.example/api/v4/graphql';
 
 function stubHttpTip(timestampMs: number, height = '500') {
-    vi.stubGlobal('fetch', vi.fn(async () => ({ json: async () => ({ data: { block: { height, timestamp: timestampMs } } }) })));
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: { block: { height, timestamp: timestampMs } } }) })));
 }
 function stubHttpRefused(status = 403) {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status, json: async () => { throw new SyntaxError('Unexpected token <'); } })));

@@ -1,15 +1,4 @@
-// Legacy-migration integration test for scripts/apply-schema-delta.mjs.
-//
-// Builds a synthetic legacy database shape (PredicateAttestations with
-// NOT NULL op/threshold, which the target schema relaxed, and job tables
-// with NULL rows in columns it tightened -> both rebuild paths) plus an operator-added index, trigger and a data row, runs
-// the real migration CLI against it, and asserts:
-//   1. the later columns exist (payloadHashB, allowedMask, network,
-//      compiledArtifactRef),
-//   2. the NOT NULL constraints were relaxed,
-//   3. the data row survived,
-//   4. the operator index AND trigger survived the rebuild.
-//
+// Checks apply-schema-delta.mjs on an old database: new columns, relaxed NOT NULL, kept rows, indexes and triggers.
 // Run: node scripts/integration-test-schema-delta.mjs
 
 import { execFileSync } from 'node:child_process';
@@ -345,7 +334,7 @@ ok('delta 0.23: the Transactions row itself survives', after.prepare("SELECT has
 const stateRow = after.prepare("SELECT state FROM midnight_ContractActions WHERE ID = 'ca-1'").get();
 ok('delta 0.23: the ContractActions.state copy is cleared', stateRow?.state === null, JSON.stringify(stateRow));
 const ngIdx = after.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'ng_%'").all().map(r => r.name);
-ok('delta 0.23: secondary indexes exist after the migration', ngIdx.includes('ng_transactions_hash') && ngIdx.includes('ng_blocks_height_unique'), ngIdx.join(','));
+ok('delta 0.23: secondary indexes exist after the migration', ngIdx.includes('ng_transactions_hash_createdat') && ngIdx.includes('ng_blocks_height_unique'), ngIdx.join(','));
 ok('delta: the unique height index replaced the plain one', !ngIdx.includes('ng_blocks_height'), ngIdx.join(','));
 
 const regs = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_ContractRegistrations'").get();

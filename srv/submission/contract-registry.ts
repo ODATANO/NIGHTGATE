@@ -1,8 +1,5 @@
-/**
- * In-memory map from a contract name (`compiledArtifactRef`) to its compiled module,
- * `privateStateId` and `zkConfigPath`. Filled from `cds.requires.nightgate.contracts`.
- * A "generation digest" identifies the exact build behind a name: module, keys and settings.
- */
+// In-memory map from a contract name (`compiledArtifactRef`) to its compiled module, `privateStateId` and `zkConfigPath`.
+// Filled from `cds.requires.nightgate.contracts`. A generation digest identifies the exact build behind a name: module, keys and settings.
 
 import type { NightgatePluginConfig } from '../utils/nightgate-config';
 import cds from '@sap/cds';
@@ -12,12 +9,14 @@ import crypto from 'crypto';
 import { pathToFileURL } from 'url';
 import { computeArtifactGenerationDigest, artifactGenerationMatch } from './artifact-digest';
 import { resolveContractPackage, contractPackageDigestProblem, type ZkAssetLayout } from '@odatano/contract-kit/node';
+import { versionString as compactRuntimeVersion } from '@midnight-ntwrk/compact-runtime';
+import { runtimeVersionProblem } from '../utils/runtime-version';
 import { ensureProverKeys, missingProverKeys, ZK_ASSET_URL_ENV } from './prover-keys';
 import { configMs } from '../utils/config';
 import { artifactImportSpec, importArtifactGeneration } from './artifact-import';
 
 export { artifactImportSpec, importArtifactGeneration };
-import { NightgateError } from '../utils/errors';
+import { NightgateError, errorMessage } from '../utils/errors';
 
 function resolveContractPath(p: string, baseDir: string): string {
     return path.isAbsolute(p) ? p : path.join(baseDir, p);
@@ -29,10 +28,7 @@ export interface ContractRegistration {
     privateStateId: string;
     /** Directory containing `keys/` and `zkir/`. */
     zkConfigPath: string;
-    /**
-     * Number of provable fields per document in a vault contract, 16 by default.
-     * Must match the compiled contract. A non-default value is part of the digest.
-     */
+    /** Provable fields per document in a vault contract, default 16. Must match the compiled contract; a non-default value is part of the digest. */
     slotWidth?: number;
     package?: ContractPackageRef;
 }
@@ -42,6 +38,11 @@ export interface ContractPackageRef {
     version: string;
     zkAssetUrl?: string;
     zkAssetLayout?: ZkAssetLayout;
+}
+
+/** 64 is not allowed: field masks use 32-bit bit operations and a signed Integer64 column. */
+export function isSlotWidth(width: number): boolean {
+    return width === 16 || width === 32;
 }
 
 export function slotWidthOf(reg: Pick<ContractRegistration, 'slotWidth'> | undefined): number {
@@ -66,9 +67,7 @@ export function registerContract(name: string, reg: ContractRegistration): void 
     if (!name || !reg.artifactPath || !reg.privateStateId || !reg.zkConfigPath) {
         throw new Error('registerContract: all fields are required');
     }
-    // 64 is not allowed. Field masks use 32-bit JS bit operations and a signed Integer64 column.
-    if (reg.slotWidth !== undefined
-        && (![16, 32].includes(reg.slotWidth))) {
+    if (reg.slotWidth !== undefined && !isSlotWidth(reg.slotWidth)) {
         throw new Error(`registerContract: slotWidth must be 16 or 32 (got ${String(reg.slotWidth)})`);
     }
     // Store a frozen copy, so a later change to the caller's object cannot
@@ -78,10 +77,7 @@ export function registerContract(name: string, reg: ContractRegistration): void 
     currentDigestCache.delete(name);
 }
 
-/**
- * Cached digest of the build a name points to. Stored jobs and proof results record it,
- * and loading a contract refuses to run when it no longer matches.
- */
+/** Cached digest of the build a name points to. Stored jobs and proofs record it, and loading refuses to run when it no longer matches. */
 export function getArtifactGenerationDigest(name: string): string {
     const cached = generationDigests.get(name);
     if (cached) return cached;
@@ -95,10 +91,7 @@ export function getArtifactGenerationDigest(name: string): string {
 /** Re-hash after this age even when the stat fingerprint is unchanged. */
 const CURRENT_DIGEST_MAX_AGE_MS = configMs('NIGHTGATE_ARTIFACT_DIGEST_MAX_AGE_MS');
 
-/**
- * Cheap change check from file stats only. Inode and ctime are included because
- * replacing or restoring a file can keep its mtime and size.
- */
+/** Cheap change check from file stats. Includes inode and ctime, because replacing or restoring a file can keep its mtime and size. */
 function statFingerprint(reg: ContractRegistration): string {
     const parts: string[] = [];
     const add = (file: string) => {
@@ -125,10 +118,7 @@ function statFingerprint(reg: ContractRegistration): string {
 
 const currentDigestCache = new Map<string, { fingerprint: string; digest: string; computedAt: number }>();
 
-/**
- * Digest of the files as they are on disk right now, unlike the cached digest of what was loaded.
- * Reused while the file stats are unchanged and the value is not too old.
- */
+/** Digest of the files on disk now, not of what was loaded. Reused while the file stats are unchanged and the value is not too old. */
 export function getCurrentArtifactDigest(name: string): string {
     const reg = registry.get(name);
     if (!reg) throw new ContractNotRegisteredError(name, listRegisteredContracts());
@@ -189,10 +179,7 @@ export function clearRegistry(): void {
     configNames.clear();
 }
 
-/**
- * Names from `cds.requires.nightgate.contracts`. They are fixed: registrations at
- * runtime may add names but never change or remove one of these.
- */
+/** Names from `cds.requires.nightgate.contracts`. Runtime registrations may add names but never change or remove these. */
 const configNames = new Set<string>();
 
 export function isConfigRegisteredContract(name: string): boolean {
@@ -219,6 +206,8 @@ export function registrationFromPackage(packageName: string, baseDir = process.c
     }
     const problem = contractPackageDigestProblem(pkg);
     if (problem) throw new Error(`contract package ${packageName} is not the generation its contract.json describes: ${problem}`);
+    const runtimeProblem = runtimeVersionProblem(pkg.manifest, compactRuntimeVersion);
+    if (runtimeProblem) throw new Error(`contract package ${packageName} ${runtimeProblem}`);
     return {
         artifactPath: pkg.artifactPath,
         privateStateId: pkg.manifest.privateStateId,
@@ -244,7 +233,7 @@ export function loadRegistryFromConfig(config?: NightgatePluginConfig, baseDir =
             try {
                 resolved = registrationFromPackage(r.package, baseDir);
             } catch (err) {
-                cds.log('nightgate').error(`contract '${name}' not registered: ${err instanceof Error ? err.message : String(err)}`);
+                cds.log('nightgate').error(`contract '${name}' not registered: ${errorMessage(err)}`);
                 continue;
             }
         } else {
@@ -276,8 +265,7 @@ function warnOnMissingProverKeys(name: string, zkConfigPath: string): void {
 }
 
 /**
- * Resolves a contract, optionally only if it matches `expectedDigest`. The registration is read
- * once and checked before any import, so a parallel re-registration cannot swap it.
+ * Resolves a contract, optionally only if it matches `expectedDigest`. The registration is read once and checked before any import, so a parallel re-registration cannot swap it.
  */
 export async function resolveContract(name: string, expectedDigest?: string, opts: { compile?: boolean } = {}): Promise<ResolvedContract> {
     const reg = registry.get(name);

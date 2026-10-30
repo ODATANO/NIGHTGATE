@@ -25,10 +25,7 @@ export interface BatchScopeResult {
     circuits: string[];
 }
 
-/**
- * Run several circuit calls on one contract as a single transaction.
- * The ledger applies them in call order unless `orderOpts.independentCalls` is set.
- */
+/** Runs several circuit calls on one contract as one transaction, in call order unless `orderOpts.independentCalls` is set. */
 export async function runBatchInScope(
     contracts: any,
     providers: unknown,

@@ -47,6 +47,12 @@
 
 The wallet SDK runs in a worker thread because its sync saturates the microtask queue; the CAP request pipeline stays responsive.
 
+## Three ways to use it
+
+- **Hosted**: an agent or app talks to the gateway at `api.preprod.odatano.dev` with a key. No node, no indexer, no server to run. Start at the [hosted quickstart](https://api.preprod.odatano.dev/quickstart).
+- **Self-hosted**: you run NIGHTGATE as a CAP plugin or container, with a Midnight node and indexer behind it: your own, or Blockfrost with a project id. Start at [docs/self-hosted.md](docs/self-hosted.md).
+- **Library**: `@odatano/nightgate-tx` builds, proves and signs on your machine and hands the transaction to a sponsor, through the hosted gateway or your own instance. Start at [docs/txbuilder.md](docs/txbuilder.md).
+
 ## Quick start
 
 ```bash
@@ -61,17 +67,23 @@ docker pull ghcr.io/odatano/nightgate:latest
 docker run -d -p 4004:4004 \
   -e ENCRYPTION_KEY=$(openssl rand -hex 32) \
   -e NIGHTGATE_HTTP_PASSWORD=change-me \
+  -e NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=$TOKEN \
+  -e NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=$TOKEN \
   -v nightgate-data:/data \
   ghcr.io/odatano/nightgate:latest
 ```
+
+The node and indexer are required on preprod and mainnet (the container refuses to start without them); `-e NIGHTGATE_NETWORK=preview` runs with the public ones.
 
 `.env` (see `.env.example`):
 
 ```bash
 NIGHTGATE_NETWORK=preprod
-NIGHTGATE_NODE_URL=wss://rpc.preprod.midnight.network/
+# Node and indexer of the network: your own, or Blockfrost with the project id in the URL
+# (docs/self-hosted.md). Preprod and mainnet have no built-in endpoints; preview has.
+NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=<token>
 # GraphQL indexer, HTTP; the WS URL is derived
-NIGHTGATE_INDEXER_HTTP_URL=https://indexer.preprod.midnight.network/api/v4/graphql
+NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=<token>
 # Unset = in-process wasm proving. Setting it selects server proving (production).
 # NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300
 NIGHTGATE_CRAWLER_ENABLED=false
@@ -107,7 +119,7 @@ Submit actions are async: they return `{ jobId, status }`; poll `getJobStatus(jo
 | Agent markets | `sponsorSwap` settles a shielded swap from two proven halves; the offer board (`postSwapOffer` / `listSwapOffers` / `getSwapOffer` / `retireSwapOffer`, anonymous `getBoardStatus`) carries maker halves as offer files; `mintFactoryToken` mints a session's own named tokens on the `token-factory` lineage |
 | Field proofs | `issueFieldPredicateAttestation` (`value <= / >= threshold`), `issueFieldEqualityAttestation` (value behind a public digest), `issueFieldMembershipAttestation` (one of up to 64 allowed values); `issueFieldPredicateAttestationBatch`: up to 8 mixed claims in one tx. Values stay hidden |
 | Cross-document proofs | `issueDocumentIntegrityAttestation` (B differs from A only in a slot mask), `issueDocumentDiffAttestation` (at least k slots differ); same width only |
-| Crawler-free verification | `verifyAttestationState`, `verifyPredicateState`, `reindexDisclosures`: live contract state from the public indexer, optional `network` override |
+| Crawler-free verification | `verifyAttestationState`, `verifyPredicateState`, `reindexDisclosures`: live contract state from the configured indexer, optional `network` override |
 | Tiered disclosure | `grantDisclosure` / `revokeDisclosure` / `registerGranteeIdentity`, `DisclosureGrants` index, `AttestationService` with three tiers |
 | Local tx building | `@odatano/nightgate/txbuilder` or [`@odatano/nightgate-tx`](packages/nightgate-tx/README.md): build, prove and sign with your own key, then `sponsorFinalizedTransaction` / `sponsorUnboundTransaction` pays and submits. The sponsor sees no key, witness or preimage |
 | Browser | `@odatano/nightgate/browser` + `GET /zk-config/<contract>/…` + `GET /contract-manifest`: wallet-driven dApps without Compact toolchain or `managed/` artifacts |
@@ -117,9 +129,10 @@ Submit actions are async: they return `{ jobId, status }`; poll `getJobStatus(jo
 
 - [Quickstart](docs/quickstart.md): first wallet-signed transaction
 - [First anchor on the hosted API](https://api.preprod.odatano.dev/quickstart): key, seed and a shared sandbox vault, no indexer; [AGENT_MS](https://github.com/maxalexweber1/AGENT_MS) is a working agent built that way
+- [Self-hosted](docs/self-hosted.md): run your own instance with your own node and indexer, or with Blockfrost
 - [Actions](docs/actions.md): every action and function with examples
 - [Architecture](docs/architecture.md): worker thread, submission flow, persistence
-- [Operations](docs/operations.md): scripts, local indexer, troubleshooting
+- [Operations](docs/operations.md): scripts, wallet sync, troubleshooting
 - [Docker](docs/docker.md): standalone container, configuration, schema upgrades
 - [Transaction builder](docs/txbuilder.md): build sponsorable transactions without a server
 - [Reference](docs/reference.md): configuration and project structure
@@ -137,34 +150,21 @@ npm install @odatano/nightgate @cap-js/sqlite
   "cds": {
     "requires": {
       "db": { "kind": "sqlite" },
-      "nightgate": { "network": "preprod" }
+      "nightgate": {
+        "network": "preprod",
+        "nodeUrl": "wss://rpc.midnight-preprod.blockfrost.io?project_id=<token>",
+        "indexerHttpUrl": "https://midnight-preprod.blockfrost.io/api/v0?project_id=<token>"
+      }
     }
   }
 }
 ```
 
-Then `cds watch`. `network` is the only required key; the defaults are the public RPC and indexer and wasm proving. Configuration: [docs/reference.md#configuration](docs/reference.md#configuration).
+Then `cds watch`. On preprod and mainnet `nodeUrl` and `indexerHttpUrl` are required (your own or Blockfrost, [docs/self-hosted.md](docs/self-hosted.md)); preview has built-in public endpoints, so `network` alone is enough there. Proving defaults to wasm. Configuration: [docs/reference.md#configuration](docs/reference.md#configuration).
 
 ## Development
 
-```bash
-npm run dev                # cds watch, 12 GB heap
-npm run serve:sync         # cds-serve, 12 GB heap; for long syncs and e2e runs
-npm run sync:start         # create a wallet session on the running server
-
-npm run typecheck
-npm run lint
-npm test                   # Vitest with coverage
-npm run build              # CDS types + TypeScript
-
-# Real SDK, no chain access
-npm run smoke:sdk
-npm run integration:providers   # also: wallet-keys, wallet-facade, contract-registry,
-                                #   connector-routes, attestation-vault, derive-wallet-info
-
-# Live e2e on preprod (funded wallet)
-npm run deploy:e2e         # more lanes: docs/operations.md
-```
+`npm run dev` (cds watch, 12 GB heap), `npm run typecheck`, `npm run lint`, `npm test`; `npm run check:release` before a tag. Every script and e2e lane: [docs/operations.md#scripts-at-a-glance](docs/operations.md#scripts-at-a-glance).
 
 ## License
 

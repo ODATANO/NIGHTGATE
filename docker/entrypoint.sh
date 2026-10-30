@@ -44,6 +44,16 @@ if [ -z "${ENCRYPTION_KEY:-}" ] && [ -z "${ENCRYPTION_KEYS:-}" ]; then
     exit 1
 fi
 
+# preprod and mainnet have no built-in node or indexer; without them the plugin stays offline and the
+# health check would restart the container for nothing.
+case "${NIGHTGATE_NETWORK:-preprod}" in
+    preprod|mainnet)
+        if [ -z "${NIGHTGATE_NODE_URL:-}" ] || [ -z "${NIGHTGATE_INDEXER_HTTP_URL:-}" ]; then
+            echo "FATAL: network ${NIGHTGATE_NETWORK:-preprod} has no built-in node or indexer: set NIGHTGATE_NODE_URL and NIGHTGATE_INDEXER_HTTP_URL (your own, or Blockfrost with the project id in the URL; docs/self-hosted.md)." >&2
+            exit 1
+        fi ;;
+esac
+
 if [ -z "$DB_URL" ]; then
     mkdir -p "$(dirname "$DB_PATH")"
 fi

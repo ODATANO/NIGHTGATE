@@ -1,20 +1,6 @@
-// Contract-path companion to run-wasm-proving-e2e.mjs: with the server under
-// NIGHTGATE_PROVING_MODE=wasm, deploy the counter contract and call
-// increment(). In wasm mode BOTH sides prove in-process: the contract
-// circuit through srv/midnight/wasm-proof-provider.ts (zkir over the
-// contract's local key material) and the wallet-side finalize through the
-// facade's WASM prover; no proof server is contacted. Run the server with a
-// dead NIGHTGATE_PROOF_SERVER_URL for the strongest form of the check.
-//
-// Server (separate terminal):
-//   NIGHTGATE_PROVING_MODE=wasm NIGHTGATE_PROOF_SERVER_URL=http://127.0.0.1:9999 npm run dev
-// Then:
-//   node --env-file=.env scripts/run-wasm-contract-e2e.mjs
-//   (or: npm run wasm-contract:e2e)
-//
-// Inputs (env vars): same as run-wasm-proving-e2e.mjs, plus
-//   WASM_E2E_ARTIFACT        default 'counter'
-//   WASM_E2E_CIRCUIT         default 'increment'
+// Deploys the counter and calls increment with the server in wasm proving mode, so no proof server is used.
+// Run: npm run wasm-contract:e2e against `NIGHTGATE_PROVING_MODE=wasm NIGHTGATE_PROOF_SERVER_URL=http://127.0.0.1:9999 npm run dev`
+// Env: as run-wasm-proving-e2e.mjs, plus WASM_E2E_ARTIFACT (default counter) and WASM_E2E_CIRCUIT (default increment).
 
 import bip39 from 'bip39';
 import { Agent, setGlobalDispatcher } from 'undici';

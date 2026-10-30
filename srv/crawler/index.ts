@@ -30,10 +30,7 @@ export async function startCrawler(config: CrawlerConfig & { nodeUrl: string; re
     // that may answer slowly or not at all.
     if (configBool('NIGHTGATE_CRAWLER_FAULT_GUARD') !== false) installCrawlerFaultGuard();
 
-    const nodeProvider = new MidnightNodeProvider({
-        nodeUrl: config.nodeUrl,
-        requestTimeout: config.requestTimeout || 30000
-    });
+    const nodeProvider = new MidnightNodeProvider({ nodeUrl: config.nodeUrl, requestTimeout: config.requestTimeout });
 
     const crawler = new MidnightCrawler(nodeProvider, config);
     try {

@@ -1,7 +1,5 @@
-/**
- * How an allow-list of values is turned into one set root, public under
- * `@odatano/nightgate/set-root`. The code lives in `@odatano/contract-kit`.
- */
+// How an allow-list of values is turned into one set root, public under `@odatano/nightgate/set-root`.
+// The code lives in `@odatano/contract-kit`.
 export {
     SET_DEPTH,
     MAX_SET_VALUES,

@@ -1,8 +1,9 @@
 import cds from '@sap/cds';
+import { errorMessage } from './utils/errors';
 const { SELECT, UPDATE } = cds.ql;
 
 import { ensureNightgateModelLoaded } from './utils/cds-model';
-import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, crawlerStartConfig } from './utils/nightgate-config';
 import { ensureSyncStateSingleton } from './utils/sync-state';
 import { isCrawlerRunning, startCrawler, stopCrawler } from './crawler';
 import { rollbackIndexedDataFromHeight, RollbackResult } from './crawler/rollback';
@@ -28,14 +29,8 @@ const log = cds.log('nightgate:indexer');
 export default class NightgateIndexerService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
 
-    private resolveCrawlerStartConfig(): { enabled: boolean; nodeUrl: string; requestTimeout?: number } {
-        const { crawlerConfig, crawlerNodeUrl } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
-        return {
-            ...(crawlerConfig as Record<string, unknown>),
-            enabled: true,
-            nodeUrl: crawlerNodeUrl,
-            requestTimeout: (crawlerConfig as any).requestTimeout || 30000
-        };
+    private resolveCrawlerStartConfig(): ReturnType<typeof crawlerStartConfig> {
+        return crawlerStartConfig(resolveNightgateRuntimeConfig(getNightgatePluginConfig()));
     }
 
     private async rollbackFromHeight(fromHeight: number): Promise<{
@@ -167,7 +162,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                     message: 'Crawler resumed'
                 };
             } catch (err) {
-                const message = err instanceof Error ? err.message : String(err);
+                const message = errorMessage(err);
                 return req.reject(500, `Failed to resume crawler: ${message}`);
             }
         });
@@ -194,7 +189,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                     await startCrawler(this.resolveCrawlerStartConfig());
                     crawlerResumed = true;
                 } catch (err) {
-                    resumeError = err instanceof Error ? err.message : String(err);
+                    resumeError = errorMessage(err);
                     log.error('Failed to resume crawler after reindex:', resumeError);
                 }
             }

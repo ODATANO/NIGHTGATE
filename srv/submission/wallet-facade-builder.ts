@@ -1,8 +1,5 @@
-/**
- * Main-thread side of the wallets that run in the wallet worker thread.
- * The worker exists because a syncing SDK wallet would block the main thread.
- * This module hands saved wallet state to the worker and stores the state it sends back.
- */
+// Main-thread side of the wallets in the wallet worker thread. The worker exists because a syncing SDK wallet would block the main thread.
+// This module hands saved wallet state to the worker and stores the state it sends back.
 
 import {
     walletInit,
@@ -11,6 +8,7 @@ import {
     onWorkerGone,
     type WalletInitArgs
 } from '../midnight/wallet-worker-client';
+import { errorMessage } from '../utils/errors';
 import {
     saveSyncState,
     loadSyncState,
@@ -18,7 +16,7 @@ import {
     evictEncryptionKey
 } from './wallet-sync-state-store';
 import { evictAccountDek } from './account-keys';
-import { formatErr } from '../utils/format-error';
+
 import { withKeyedLock } from '../utils/keyed-lock';
 import cds from '@sap/cds';
 const log = cds.log('nightgate:facade');
@@ -60,10 +58,8 @@ export function seedFingerprintOf(seedHex: string): string {
         .digest('hex');
 }
 
-/**
- * `sessionRegistry` holds what a save needs. `residentAccounts` lists the wallets loaded in the worker.
- * A worker crash clears only the second: saves it already sent may still be queued and need the passphrase.
- */
+// `sessionRegistry` holds what a save needs. `residentAccounts` lists the wallets loaded in the worker.
+// A worker crash clears only `residentAccounts`, because saves it already sent may still be queued and need the passphrase.
 const sessionRegistry = new Map<string, SessionRecord>();
 const residentAccounts = new Set<string>();
 
@@ -108,10 +104,7 @@ onWorkerGone(async (reason, info) => {
     }
 });
 
-/**
- * Loads the wallet for `cacheKey` into the worker. Safe to call repeatedly.
- * Holds the account lock, so a disconnect cannot remove a wallet while it is being built.
- */
+/** Loads the wallet for `cacheKey` into the worker; safe to repeat. Holds the account lock, so a disconnect cannot remove a wallet while it is built. */
 export function getOrBuildWalletFacade(
     cacheKey: string,
     args: WalletFacadeBuildArgs
@@ -222,7 +215,7 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
     try {
         await walletEvict(cacheKey);
     } catch (err) {
-        log.warn(`evict failed for ${cacheKey.slice(0, 16)}:`, formatErr(err));
+        log.warn(`evict failed for ${cacheKey.slice(0, 16)}:`, errorMessage(err));
     } finally {
         residentAccounts.delete(cacheKey);
         facadeOrigins.delete(cacheKey);
@@ -232,14 +225,13 @@ export async function evictWalletFacade(cacheKey: string): Promise<void> {
             await evictEncryptionKey(cacheKey);
             evictAccountDek(cacheKey);
         } catch (err) {
-            log.warn(`key evict failed for ${cacheKey.slice(0, 16)}:`, formatErr(err));
+            log.warn(`key evict failed for ${cacheKey.slice(0, 16)}:`, errorMessage(err));
         }
     }
 }
 
 /**
- * Whether this account's wallet is loaded in the worker. Builds nothing.
- * More reliable than the sync-progress cache, which fills only after the first progress check.
+ * Whether this account's wallet is loaded in the worker. Builds nothing. More reliable than the sync-progress cache, which fills only after the first progress check.
  */
 export function hasWalletFacade(cacheKey: string): boolean {
     return residentAccounts.has(cacheKey);
@@ -303,7 +295,7 @@ async function handleStateSave(event: Parameters<Parameters<typeof setStateSaveS
             ].join(' ');
             log.debug(`saved ${event.sessionId.slice(0, 16)} ${sizes}`);
         } catch (err) {
-            log.warn(`save failed for ${event.sessionId.slice(0, 16)}:`, formatErr(err));
+            log.warn(`save failed for ${event.sessionId.slice(0, 16)}:`, errorMessage(err));
             // Throwing makes the worker send the state again later.
             throw err;
         }

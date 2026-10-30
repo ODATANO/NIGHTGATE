@@ -1,13 +1,29 @@
 // A midnight-js PublicDataProvider that reads the chain through the NIGHTGATE API, for a builder that never submits itself.
 // SPDX-License-Identifier: Apache-2.0
 
+import { createRequire } from 'node:module';
 import { connect } from '../sdk/client.mjs';
+
+const require = createRequire(import.meta.url);
+const { deriveIndexerWsUrl } = require('../../srv/utils/indexer-url.js');
 
 /** The client behind `api`: a connected `connect()` client, or the options to create one. */
 export function apiClientFor(api) {
     if (api && typeof api.contractStateAt === 'function' && typeof api.transactionByIdentifier === 'function') return api;
     if (api && typeof api === 'object' && api.baseUrl) return connect(api);
     throw new Error('api must be the options for connect() ({ baseUrl, agentToken, ... }) or a connected client');
+}
+
+const GATEWAY_KEY = /^oda_[0-9a-f]{40}$/i;
+
+/** The gateway's indexer lane for `connect()` options with a gateway key (`oda_…`), the key in the query string; null otherwise. */
+export function gatewayIndexerUrls(api) {
+    const baseUrl = api?.baseUrl;
+    const token = api?.token;
+    if (typeof baseUrl !== 'string' || typeof token !== 'string' || !GATEWAY_KEY.test(token)) return null;
+    const http = new URL(`${baseUrl.replace(/\/+$/, '')}/indexer/api/v4/graphql`);
+    http.searchParams.set('key', token);
+    return { indexerHttpUrl: http.toString(), indexerWsUrl: deriveIndexerWsUrl(http.toString()) };
 }
 
 /** The wallet facade's submission service for a builder that never submits. Nothing is dialed. */

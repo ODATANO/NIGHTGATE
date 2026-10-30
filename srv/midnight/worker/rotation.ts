@@ -1,17 +1,16 @@
-/**
- * Planned worker restart and shutdown.
- * Node never frees an imported module, so after loading many contract versions the worker
- * stops taking calls, saves and unloads its wallets, and the main thread starts a new one.
- */
+// Planned worker restart and shutdown. Node never frees an imported module, so after many contract versions
+// the worker stops taking calls, saves and unloads its wallets, and the main thread starts a new one.
 
 // Must stay the first import. The worker modules import each other in a cycle,
 // and config is read at load time.
 import { configNumber } from '../../utils/config';
+import { errorMessage } from '../../utils/errors';
 import { WORKER_ROTATING } from '../wallet-worker-protocol';
-import { formatErr } from '../../utils/format-error';
+
 import { parentPort } from 'node:worker_threads';
 import { facades, log } from './context';
 import { evict } from './facades';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 export const importedGenerations = new Set<string>();
 /** One shared object, so the dispatcher in another module can update it. */
@@ -69,7 +68,7 @@ export async function evictAllFacades(site: string): Promise<{ evicted: number; 
     results.forEach((r, i) => {
         if (r.status === 'rejected') {
             failed++;
-            log('error', `${site}: eviction of ${ids[i].slice(0, 16)} failed: ${formatErr(r.reason)}`);
+            log('error', `${site}: eviction of ${ids[i].slice(0, 16)} failed: ${errorMessage(r.reason)}`);
         } else if ((r.value as { saved?: boolean })?.saved === false) {
             failed++;
             log('error', `${site}: final state save of ${ids[i].slice(0, 16)} was NOT confirmed; up to one save interval of sync progress is redone on the next restore`);
@@ -81,13 +80,15 @@ export async function evictAllFacades(site: string): Promise<{ evicted: number; 
 /** Test seam: the dispatcher's admission decision. */
 export function __admitRpcForTests(): boolean { return !rotationState.draining; }
 
+/** Longest wait for running submits at shutdown. It stays under the main thread's 60 s limit, so the final saves still run. */
+const SHUTDOWN_DRAIN_MS = 40_000;
 
-/**
- * Saves and unloads every wallet so a shutdown loses no sync progress.
- * Each unload waits for its session lock, so a running submit completes first.
- */
+/** Saves and unloads every wallet so a shutdown loses no sync progress. Sending calls get up to SHUTDOWN_DRAIN_MS to finish first. */
 export async function shutdown() {
     rotationState.draining = true;
+    const deadline = Date.now() + SHUTDOWN_DRAIN_MS;
+    while (rotationState.inflight > 0 && Date.now() < deadline) await sleep(100);
+    if (rotationState.inflight > 0) log('warn', `shutdown: ${rotationState.inflight} submitting call(s) still running after ${SHUTDOWN_DRAIN_MS} ms; saving the wallets anyway`);
     const { evicted, failed } = await evictAllFacades('shutdown');
     log(failed > 0 ? 'error' : 'info', `shutdown: ${evicted} facade(s) evicted, ${failed} without a confirmed final save`);
     return { evicted, failed };

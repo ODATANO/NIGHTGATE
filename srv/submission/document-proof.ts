@@ -1,11 +1,10 @@
-/**
- * Actions that prepare document proofs and record AI agent outputs on-chain.
- * The hashing rules live in `@odatano/contract-kit` and are re-exported here.
- */
+// Actions that prepare document proofs and record AI agent outputs on-chain.
+// The hashing rules live in `@odatano/contract-kit` and are re-exported here.
 import cds from '@sap/cds';
 import { randomBytes } from 'node:crypto';
 import { checkRateClass } from '../utils/rate-classes';
-import { getContractRegistration, slotWidthOf, importRegisteredArtifact } from './contract-registry';
+import { getContractRegistration, importRegisteredArtifact } from './contract-registry';
+import { vaultDims, vaultRef } from './verify-state';
 import {
     blake2b256Hex,
     fromHex32,
@@ -33,8 +32,8 @@ import {
     type BuiltContentRoot
 } from '@odatano/contract-kit';
 import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
-import { formatErr } from '../utils/format-error';
-import { NightgateError } from '../utils/errors';
+
+import { NightgateError, errorMessage } from '../utils/errors';
 import { attestAgentOutput, prepareDocumentProof, prepareMembershipSet } from '#cds-models/NightgateService';
 
 export {
@@ -55,11 +54,6 @@ export type { PureCircuits, ProofFieldSpec, PreparedField, SchemaDescriptorWire,
 
 const log = cds.log('nightgate:document-proof');
 
-const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
-
-export function slotWidthForRef(compiledRef: string): number {
-    return slotWidthOf(getContractRegistration(compiledRef));
-}
 
 // ---- Pure-circuit loading -------------------------------------------------
 
@@ -132,8 +126,7 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
             ...(f.kind != null ? { kind: f.kind } : {}),
             ...(f.scale != null ? { scale: f.scale } : {})
         }));
-        const widthRef = data.compiledArtifactRef?.length ? data.compiledArtifactRef : DEFAULT_ATTESTATION_VAULT_REF;
-        const slotWidth = slotWidthForRef(widthRef);
+        const slotWidth = vaultDims(data.compiledArtifactRef).width;
         if (specs.length > slotWidth) {
             return req.reject(400, `at most ${slotWidth} proof fields (depth-${Math.log2(slotWidth)} tree)`);
         }
@@ -156,7 +149,7 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
             }
         }
 
-        const compiledRef = widthRef;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
         let pure: PureCircuits;
         try {
             pure = await loadPure(compiledRef);
@@ -216,7 +209,7 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
             return req.reject(400, 'pass at most one of value / valueDigest');
         }
 
-        const compiledRef = data.compiledArtifactRef?.length ? data.compiledArtifactRef : DEFAULT_ATTESTATION_VAULT_REF;
+        const compiledRef = vaultRef(data.compiledArtifactRef);
         let pure: PureCircuits;
         try {
             pure = await loadPure(compiledRef);
@@ -314,7 +307,7 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
             const e = err as { code?: unknown; status?: unknown } | null | undefined;
             const status = Number(e?.status ?? e?.code);
             return req.reject(Number.isInteger(status) && status >= 400 && status < 600 ? status : 500,
-                formatErr(err));
+                errorMessage(err));
         }
     });
 }

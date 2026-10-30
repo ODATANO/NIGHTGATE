@@ -1,23 +1,37 @@
-/**
- * Sends transactions from the worker. Every tx is announced to the main thread before it is sent,
- * and every send uses its own node connection.
- */
+// Sends transactions from the worker. Every tx is announced to the main thread before it is sent,
+// and every send uses its own node connection.
 
 import { configNumber, configMs, configEnum } from '../../utils/config';
 import { markIntentAnnounced } from './cancellation';
 import { callSegments } from '../batch-segment-order';
 import { classifySubmitFailure, isPreMempoolFailure } from '../submit-error-classification';
-import { classificationHaystack, formatErr, formatErrWithCauses, safeDeepInspect } from '../../utils/format-error';
+import { classificationHaystack, formatErrWithCauses, safeDeepInspect } from '../../utils/format-error';
 import { NightgateError, errorMessage } from '../../utils/errors';
 import { type MessagePort } from 'node:worker_threads';
 import { FacadeEntry, loadSdk, loadNodeClientSdk, log, loadLedger } from './context';
 import { createPhasedSubmitService, createSdkNodeAdapter, submitPhaseOf, type PhasedSubmitService } from './phased-submit';
 import { BALANCE_SYNC_TIMEOUT_MS, pushStateSaveAcked, restoreSaveAckTimeoutMs, waitForGenuineSync } from './facades';
+import { indexerQuery } from '../../utils/indexer-graphql';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { withTimeout } from '../../utils/timeout';
 
-/**
- * Describes the dust parts of a tx for logging. Never throws.
- * An empty dust part makes the node reject the tx with 1010/117 (NotNormalized).
- */
+/** Refuses a balanced tx with an empty DustActions section, which the node rejects as 1010/117. `revert` frees its coins first. */
+async function refuseEmptyDustActions(finalized: any, what: string, revert: () => Promise<void>): Promise<void> {
+    const dust = describeTxDust(finalized);
+    log('info', `${what} dust sections: ${dust.summary}`);
+    if (!dust.emptyDustActions) return;
+    await revert();
+    throw new Error(`${what} carries an EMPTY DustActions section (node would reject it as 1010 Custom error: 117 NotNormalized). The dust balancer produced an empty recipe, i.e. the computed fee was 0. Dust sections: ${dust.summary}`);
+}
+
+/** Logs the dust sections of a transaction about to be sent, and warns on an empty DustActions section. */
+function noteDustBeforeSubmit(tx: any, what: string): void {
+    const dust = describeTxDust(tx);
+    log('info', `pre-submit ${what} dust sections: ${dust.summary}`);
+    if (dust.emptyDustActions) log('warn', `pre-submit ${what} has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
+}
+
+/** Describes the dust parts of a tx for logging. Never throws. */
 export function describeTxDust(tx: any): { summary: string; emptyDustActions: boolean } {
     try {
         const parts: string[] = [];
@@ -50,7 +64,7 @@ export async function revertRecipeBestEffort(facade: any, txOrRecipe: any, site:
     try {
         await facade.revert(txOrRecipe);
     } catch (e) {
-        log('warn', `${site}: recipe revert failed (coins may stay pending until a fresh resync): ${formatErr(e)}`);
+        log('warn', `${site}: recipe revert failed (coins may stay pending until a fresh resync): ${errorMessage(e)}`);
     }
 }
 
@@ -71,14 +85,11 @@ export function isPreMempoolReject(err: unknown): boolean {
     return isPreMempoolFailure(classifySubmitFailure(err));
 }
 
-/**
- * An earlier send may still land, so a later failure means the outcome is unknown.
- * The main thread keeps the tx id and never rebuilds, which could pay the fee twice.
- */
+/** An earlier send may still land, so the outcome is unknown. The main thread keeps the tx id and never rebuilds, which could pay the fee twice. */
 export class SubmitOutcomeUnknownError extends Error {
     readonly identifier: string;
     constructor(identifier: string, cause: unknown) {
-        super(`submit outcome unknown: an earlier send of ${identifier.slice(0, 16)} may have reached the node and the indexer does not show it yet; the later attempt failed: ${formatErr(cause).slice(0, 300)}`, { cause });
+        super(`submit outcome unknown: an earlier send of ${identifier.slice(0, 16)} may have reached the node and the indexer does not show it yet; the later attempt failed: ${errorMessage(cause).slice(0, 300)}`, { cause });
         this.name = 'SubmitOutcomeUnknownError';
         this.identifier = identifier;
     }
@@ -103,15 +114,11 @@ export async function captureDustSnapshot(entry: FacadeEntry, site: string): Pro
         entry.preSubmitDustSnapshot = await entry.facade.dust.serializeState();
     } catch (e) {
         entry.preSubmitDustSnapshot = undefined;
-        log('warn', `${site}: dust pre-build snapshot failed (wedge protection disarmed for this tx): ${formatErr(e)}`);
+        log('warn', `${site}: dust pre-build snapshot failed (wedge protection disarmed for this tx): ${errorMessage(e)}`);
     }
 }
 
-/**
- * Replaces the running dust wallet with one restored from the saved state.
- * Safe while the wallet is in use, because all code reaches it through `facade.dust`
- * and submits of one wallet run one at a time.
- */
+/** Swaps in a dust wallet restored from the saved state. Safe in use, because code reaches it via `facade.dust` and submits run one at a time. */
 export async function restoreDustFromSnapshot(entry: FacadeEntry, site: string): Promise<void> {
     const snapshot = entry.preSubmitDustSnapshot;
     entry.preSubmitDustSnapshot = undefined;
@@ -132,10 +139,10 @@ export async function restoreDustFromSnapshot(entry: FacadeEntry, site: string):
             entry.dustRestoresPersisted = (entry.dustRestoresPersisted ?? 0) + 1;
             log('info', `${site}: restored dust snapshot persist CONFIRMED (state-save ack)`);
         } catch (e) {
-            log('warn', `${site}: restored dust snapshot persist NOT confirmed (${formatErr(e)}); the DB may hold the pre-restore state until the next periodic save lands`);
+            log('warn', `${site}: restored dust snapshot persist NOT confirmed (${errorMessage(e)}); the DB may hold the pre-restore state until the next periodic save lands`);
         }
     } catch (e) {
-        log('warn', `${site}: dust snapshot restore failed; wallet may be dust-wedged until a cold re-sync: ${formatErr(e)}`);
+        log('warn', `${site}: dust snapshot restore failed; wallet may be dust-wedged until a cold re-sync: ${errorMessage(e)}`);
     }
 }
 
@@ -184,14 +191,11 @@ export async function waitLandedOnIndexer(entry: FacadeEntry, identifier: string
         const found = await indexerBlockOfIdentifier(entry.indexerHttpUrl, identifier);
         if (found) return found;
         if (Date.now() >= deadline) return null;
-        await new Promise((r) => setTimeout(r, Math.min(5_000, Math.max(0, deadline - Date.now()))));
+        await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
     }
 }
 
-/**
- * Before sending, the main thread stores the tx id on the job and confirms.
- * Without that confirmation nothing is sent, so every landed tx belongs to a known job.
- */
+/** The main thread stores the tx id on the job and confirms before sending. Without it nothing is sent, so every landed tx has a known job. */
 export interface BoundSubmitIntent {
     replyPort?: MessagePort;
     contractAddress?: string;
@@ -201,10 +205,7 @@ export interface BoundSubmitIntent {
     ttl?: string;
 }
 
-/**
- * Restores the saved dust state only when the tx surely never reached the mempool.
- * A tx that may have reached it has spent its dust fee.
- */
+/** Restores the saved dust state only when the tx surely never reached the mempool, because a tx that may have reached it spent its fee. */
 export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: string, intent?: BoundSubmitIntent): Promise<any> {
     if (intent?.replyPort) {
         try {
@@ -237,11 +238,9 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
     }
 }
 
-// The SDK's node client closes its connection after every submit, so parallel submits on one
-// client break each other. Each submit therefore gets a client of its own from a pool.
-// The SDK's disconnect returns before the socket is closed, so a client is reused only after a
-// short wait. A send that fails on such a closing socket may have left the socket first, so it is
-// resent once and a refusal of the resend is looked up on the indexer.
+// Each submit gets its own pooled client, because the SDK client closes its connection after every submit.
+// A client is reused only after a short wait, because the SDK's disconnect returns before the socket closes.
+// A send that fails on a closing socket is resent once, and a refusal of the resend is looked up on the indexer.
 export let SUBMIT_CLIENT_POOL_MAX = 8;
 let submitClientSettleMs = 2500;
 /** Limit for closing a stuck client. The SDK's close waits for the client's start, which may be what hangs. */
@@ -266,7 +265,7 @@ export const __submitClientPoolForTests = {
 };
 
 export class SubmitWatchTimeoutError extends NightgateError {
-    constructor(ms: number) { super('SUBMIT_WATCH_TIMEOUT', `submit watch timed out after ${ms}ms without a Finalized status`); }
+    constructor(ms: number) { super('SUBMIT_WATCH_TIMEOUT', `submit watch timed out after ${ms}ms without a final answer from the node`); }
 }
 
 export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any) => Promise<T>, opts: { abandonAfterMs?: number; label?: string } = {}): Promise<T> {
@@ -299,9 +298,9 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
             const settling = free.filter((s) => Number.isFinite(s.readyAt));
             if (settling.length > 0) {
                 const wait = Math.max(0, Math.min(...settling.map((s) => s.readyAt)) - Date.now());
-                await new Promise((r) => setTimeout(r, wait));
+                await sleep(wait);
             } else if (free.length > 0) {
-                await new Promise((r) => setTimeout(r, 100)); // another caller is creating a client
+                await sleep(100); // another caller is creating a client
             } else {
                 await Promise.race(pool.map((s) => s.busy!.catch(() => undefined)));
             }
@@ -318,7 +317,7 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
         if (idx >= 0) pool!.splice(idx, 1);
         await Promise.race([
             Promise.resolve().then(() => slot!.svc?.close?.()).catch(() => undefined),
-            new Promise<void>((r) => setTimeout(r, SUBMIT_CLOSE_TIMEOUT_MS))
+            sleep(SUBMIT_CLOSE_TIMEOUT_MS)
         ]);
         slot!.busy = null;
     };
@@ -334,14 +333,12 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
         }
     }
     // Last resort only, since each step has its own timeout. On timeout, drop the client and let the caller ask the indexer.
-    let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new SubmitWatchTimeoutError(opts.abandonAfterMs!)), opts.abandonAfterMs); });
     try {
-        return await Promise.race([run, timeout]);
+        return await withTimeout(run, opts.abandonAfterMs, () => new SubmitWatchTimeoutError(opts.abandonAfterMs!));
     } catch (e) {
         if (e instanceof SubmitWatchTimeoutError) {
             void run.then(
-                () => log('warn', `${label}: submit resolved ${'after'} the ${opts.abandonAfterMs}ms backstop had abandoned it (the transaction reached the node; the confirmer resolves the job)`),
+                () => log('warn', `${label}: submit resolved after the ${opts.abandonAfterMs}ms backstop had abandoned it (the transaction reached the node; the confirmer resolves the job)`),
                 (err) => log('warn', `${label}: submit failed after the ${opts.abandonAfterMs}ms backstop had abandoned it: ${formatErrWithCauses(err).slice(0, 400)}`)
             );
             await evict();
@@ -350,24 +347,17 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
         }
         throw e;
     } finally {
-        if (timer) clearTimeout(timer);
         if (pool.includes(slot)) { slot.busy = null; slot.readyAt = Date.now() + submitClientSettleMs; }
     }
 }
 
-/**
- * Looks up a tx on the indexer, with the ledger result. A tx in a block whose call failed is not a success.
- * Null when the tx is unknown or the indexer is unreachable.
- */
+/** Finds a tx on the indexer with its ledger result. A block whose call failed is no success. Null when unknown or unreachable. */
+const TX_BLOCK_QUERY = 'query($offset: TransactionOffset!) { transactions(offset: $offset) { block { height } ... on RegularTransaction { transactionResult { status segments { id success } } } } }';
+
 export async function indexerBlockOfIdentifier(indexerHttpUrl: string, identifier: string): Promise<{ height: string; status: string | null; failedSegments: number[] } | null> {
     try {
-        const r = await fetch(indexerHttpUrl, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query: `{ transactions(offset:{identifier:"${identifier}"}) { block { height } ... on RegularTransaction { transactionResult { status segments { id success } } } } }` }),
-            signal: AbortSignal.timeout(15_000)
-        });
-        const j: any = await r.json();
-        const t = j?.data?.transactions?.[0];
+        const data: any = await indexerQuery(indexerHttpUrl, TX_BLOCK_QUERY, { variables: { offset: { identifier } } });
+        const t = data?.transactions?.[0];
         const h = t?.block?.height;
         if (h == null) return null;
         const res = t?.transactionResult;
@@ -376,10 +366,7 @@ export async function indexerBlockOfIdentifier(indexerHttpUrl: string, identifie
     } catch { return null; }
 }
 
-/**
- * The tx is in a block but its call did not apply, and the fee is spent.
- * Named like the SDK's error so the main thread handles both the same way.
- */
+/** The tx is in a block but its call did not apply, and the fee is spent. Named like the SDK's error, so both are handled the same way. */
 export class TxNotAppliedError extends NightgateError {
     readonly blockHeight: number | null;
     constructor(identifier: string, height: string, status: string, failedSegments: number[]) {
@@ -418,7 +405,7 @@ export async function waitIndexerVisible(indexerHttpUrl: string, identifier: str
             assertApplied(found, identifier);
             return;
         }
-        await new Promise((r) => setTimeout(r, 1500));
+        await sleep(1500);
     }
     log('warn', `${site}: transaction in block but not visible on the indexer after ${windowMs}ms; reporting landed anyway`);
 }
@@ -486,12 +473,7 @@ async function bookPending(entry: FacadeEntry, tx: any, site: string): Promise<v
     await svc.addPendingTransaction(tx);
 }
 
-/**
- * Every tx is sent through here, on a node connection of its own.
- * With `book`, its coins are marked as spent before sending and freed again on failure.
- * A connection failure leads to a resend of the same tx. A timeout leads to an indexer lookup.
- * A tx the node rejected is never sent again.
- */
+/** Sends a tx on its own node connection. A connection failure resends, a timeout looks it up on the indexer, a node rejection is never resent. */
 export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site: string, opts: { book?: boolean } = {}): Promise<any> {
     await logTxCost(tx, site);
     const relayURL: URL = entry.walletConfiguration.relayURL;
@@ -511,7 +493,7 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
     };
     const resend = async (reason: string): Promise<void> => {
         log('warn', `${site}: ${identifier.slice(0, 16)}: ${reason}; resending the SAME transaction (no rebuild, no re-proving)`);
-        await new Promise((r) => setTimeout(r, submitTransportBackoffMs()));
+        await sleep(submitTransportBackoffMs());
     };
     if (opts.book) await bookPending(entry, tx, site);
     try {
@@ -540,7 +522,7 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
                         throw e;
                     }
                     resends++;
-                    await resend(`submit connect phase failed, nothing sent (send ${resends}/${retries + 1}): ${formatErr(e).slice(0, 200)}`);
+                    await resend(`submit connect phase failed, nothing sent (send ${resends}/${retries + 1}): ${errorMessage(e).slice(0, 200)}`);
                     continue;
                 }
                 if (e instanceof SubmitWatchTimeoutError || phase === 'watch' || phase === 'request') {
@@ -594,34 +576,17 @@ export function buildWorkerWalletProvider(entry: FacadeEntry, intent?: BoundSubm
                 await revertRecipeBestEffort(entry.facade, recipe, 'balance');
                 throw e;
             }
-            const dust = describeTxDust(finalized);
-            log('info', `balanced tx dust sections: ${dust.summary}`);
-            if (dust.emptyDustActions) {
-                await revertRecipeBestEffort(entry.facade, finalized, 'balance');
-                throw new Error(
-                    'balanced transaction carries an EMPTY DustActions section ' +
-                    '(node would reject it as 1010 Custom error: 117 NotNormalized). ' +
-                    'The dust balancer produced an empty recipe, i.e. the computed ' +
-                    `fee was 0. Dust sections: ${dust.summary}`
-                );
-            }
+            await refuseEmptyDustActions(finalized, 'balanced transaction', () => revertRecipeBestEffort(entry.facade, finalized, 'balance'));
             return finalized;
         },
         async submitTx(tx: any): Promise<any> {
-            const dust = describeTxDust(tx);
-            log('info', `pre-submit tx dust sections: ${dust.summary}`);
-            if (dust.emptyDustActions) {
-                log('warn', `pre-submit tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
-            }
+            noteDustBeforeSubmit(tx, 'tx');
             return submitWithDustGuard(entry, tx, 'submit', intent);
         }
     };
 }
 
-/**
- * Wallet provider for a sponsored tx. The caller pays everything except the fee, signs and finalizes.
- * The sponsor then adds the dust fee and sends.
- */
+/** Wallet provider for a sponsored tx. The caller pays all but the fee, signs and finalizes. The sponsor adds the dust fee and sends. */
 export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: FacadeEntry, intent?: BoundSubmitIntent): any {
     // The caller's finalized tx from the last successful balanceTx, freed if the submit fails.
     let lastCallerFinalized: any;
@@ -671,17 +636,7 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
                     throw e;
                 }
 
-                const dust = describeTxDust(finalized);
-                log('info', `sponsored balanced tx dust sections: ${dust.summary}`);
-                if (dust.emptyDustActions) {
-                    await revertRecipeBestEffort(sponsor.facade, finalized, 'sponsored-balance sponsor');
-                    throw new Error(
-                        'sponsored balanced transaction carries an EMPTY DustActions section ' +
-                        '(node would reject it as 1010 Custom error: 117 NotNormalized). ' +
-                        `The sponsor's dust balancer produced an empty recipe, i.e. the computed ` +
-                        `fee was 0. Dust sections: ${dust.summary}`
-                    );
-                }
+                await refuseEmptyDustActions(finalized, 'sponsored balanced transaction', () => revertRecipeBestEffort(sponsor.facade, finalized, 'sponsored-balance sponsor'));
                 lastCallerFinalized = callerFinalized;
                 return finalized;
             } catch (e) {
@@ -691,11 +646,7 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
             }
         },
         async submitTx(tx: any): Promise<any> {
-            const dust = describeTxDust(tx);
-            log('info', `pre-submit (sponsored) tx dust sections: ${dust.summary}`);
-            if (dust.emptyDustActions) {
-                log('warn', `pre-submit sponsored tx has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
-            }
+            noteDustBeforeSubmit(tx, 'sponsored tx');
             try {
                 const result = await submitWithDustGuard(sponsor, tx, 'sponsored-submit sponsor', intent);
                 lastCallerFinalized = undefined;

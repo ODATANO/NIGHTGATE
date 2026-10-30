@@ -25,7 +25,8 @@ import {
     resolveEffectiveProvingMode,
     resolveProofTimeoutMs,
     deriveIndexerWsUrl,
-    DEFAULT_INDEXER_URLS
+    DEFAULT_INDEXER_URLS,
+    missingEndpointsMessage
 } from '../../srv/utils/nightgate-config';
 
 const ENV_KEYS = [
@@ -297,11 +298,14 @@ describe('resolveNightgateRuntimeConfig', () => {
         expect(resolved.submissionEndpoints.indexerWsUrl).toContain('127.0.0.1:8088');
     });
 
-    it('resolves mainnet to the public mainnet relay and indexer, never the preprod relay', () => {
+    it('resolves mainnet to nothing built in, never to another network\'s endpoints', () => {
         const resolved = resolveNightgateRuntimeConfig({ network: 'mainnet' });
-        expect(resolved.nodeUrl).toBe('wss://rpc.mainnet.midnight.network/');
-        expect(resolved.submissionEndpoints.indexerHttpUrl).toBe('https://indexer.mainnet.midnight.network/api/v4/graphql');
-        expect(resolved.submissionEndpoints.indexerWsUrl).toBe('wss://indexer.mainnet.midnight.network/api/v4/graphql/ws');
+        expect(resolved.nodeUrl).toBe('');
+        expect(resolved.submissionEndpoints.indexerHttpUrl).toBe('');
+        expect(resolved.submissionEndpoints.indexerWsUrl).toBe('');
+        const own = resolveNightgateRuntimeConfig({ network: 'mainnet', nodeUrl: 'ws://node:9944', indexerHttpUrl: 'http://idx:8088/api/v4/graphql' });
+        expect(own.nodeUrl).toBe('ws://node:9944');
+        expect(own.submissionEndpoints.indexerWsUrl).toBe('ws://idx:8088/api/v4/graphql/ws');
     });
 
     it('honours an explicit nodeUrl override even on undeployed', () => {
@@ -320,6 +324,11 @@ describe('deriveIndexerWsUrl', () => {
 
     it('tolerates trailing slashes', () => {
         expect(deriveIndexerWsUrl('http://my-idx/graphql///')).toBe('ws://my-idx/graphql/ws');
+    });
+
+    it('keeps a single /ws on a WebSocket input and the query after it', () => {
+        expect(deriveIndexerWsUrl('wss://h/api/v4/graphql/ws')).toBe('wss://h/api/v4/graphql/ws');
+        expect(deriveIndexerWsUrl('https://h/api/v0?project_id=x')).toBe('wss://h/api/v0/ws?project_id=x');
     });
 
     it('reproduces every built-in default pairing', () => {
@@ -352,17 +361,50 @@ describe('resolveSubmissionEndpoints indexer ws derivation', () => {
     });
 
     it('keeps the per-network default pair when nothing is overridden', () => {
-        const eps = resolveSubmissionEndpoints('preprod', {});
-        expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.preprod.http);
-        expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.preprod.ws);
+        const eps = resolveSubmissionEndpoints('preview', {});
+        expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.preview!.http);
+        expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.preview!.ws);
+    });
+
+    it('keeps the query of a hosted indexer URL in front of nothing: /ws goes after the path', () => {
+        expect(deriveIndexerWsUrl('https://midnight-preprod.blockfrost.io/api/v0?project_id=abc')).toBe('wss://midnight-preprod.blockfrost.io/api/v0/ws?project_id=abc');
+        const eps = resolveSubmissionEndpoints('preprod', { indexerHttpUrl: 'https://midnight-preprod.blockfrost.io/api/v0?project_id=abc' });
+        expect(eps.indexerWsUrl).toBe('wss://midnight-preprod.blockfrost.io/api/v0/ws?project_id=abc');
+    });
+
+    it('has no built-in endpoints for preprod and mainnet: empty, and a message that names both settings', () => {
+        for (const network of ['preprod', 'mainnet'] as const) {
+            const eps = resolveSubmissionEndpoints(network, {});
+            expect(eps.indexerHttpUrl).toBe('');
+            expect(eps.indexerWsUrl).toBe('');
+            expect(resolveNightgateRuntimeConfig({ network }).nodeUrl).toBe('');
+            const message = missingEndpointsMessage(network, '', '');
+            expect(message).toMatch(/NIGHTGATE_NODE_URL/);
+            expect(message).toMatch(/NIGHTGATE_INDEXER_HTTP_URL/);
+            expect(message).toMatch(new RegExp(`midnight-${network}.blockfrost.io`));
+        }
+        expect(missingEndpointsMessage('preprod', 'wss://node', '')).toMatch(/^network "preprod".*NIGHTGATE_INDEXER_HTTP_URL/);
+        expect(missingEndpointsMessage('preprod', 'wss://node', '')).not.toMatch(/NIGHTGATE_NODE_URL/);
+        expect(missingEndpointsMessage('preprod', 'wss://node', 'https://idx/graphql')).toBeNull();
+        for (const network of ['preview', 'testnet', 'undeployed'] as const) {
+            expect(missingEndpointsMessage(network, resolveNightgateRuntimeConfig({ network }).nodeUrl, resolveSubmissionEndpoints(network, {}).indexerHttpUrl)).toBeNull();
+        }
+        // a local network names no hosted service
+        expect(missingEndpointsMessage('testnet', '', 'http://localhost:8088/api/v4/graphql')).toMatch(/^network "testnet" has no built-in node: set NIGHTGATE_NODE_URL.*See docs\/self-hosted\.md\.$/);
+        expect(missingEndpointsMessage('testnet', '', '')).not.toMatch(/blockfrost/);
+    });
+
+    it('keeps a wss:// indexer URL encrypted when deriving the WebSocket URL', () => {
+        expect(deriveIndexerWsUrl('wss://idx.example/api/v0?project_id=t')).toBe('wss://idx.example/api/v0/ws?project_id=t');
+        expect(deriveIndexerWsUrl('ws://idx.local:8088/api/v4/graphql')).toBe('ws://idx.local:8088/api/v4/graphql/ws');
     });
 });
 
 describe('resolveOverrideIndexerEndpoints (cross-network verify indexer endpoints)', () => {
     it('falls back to the built-in public defaults for the override network', () => {
         const eps = resolveOverrideIndexerEndpoints('preview', {});
-        expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.preview.http);
-        expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.preview.ws);
+        expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.preview!.http);
+        expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.preview!.ws);
     });
 
     it('prefers cds.requires.nightgate.networks[<network>] over defaults', () => {
@@ -390,8 +432,9 @@ describe('resolveOverrideIndexerEndpoints (cross-network verify indexer endpoint
         });
         delete process.env.NIGHTGATE_INDEXER_HTTP_URL;
         delete process.env.NIGHTGATE_INDEXER_WS_URL;
-        expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.mainnet.http);
-        expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.mainnet.ws);
+        // mainnet has no built-in indexer: nothing configured for it means no indexer, not the configured network's
+        expect(eps.indexerHttpUrl).toBe('');
+        expect(eps.indexerWsUrl).toBe('');
     });
 });
 

@@ -1,12 +1,9 @@
-/**
- * The calling side of a helper worker thread: lazy start, one message channel per call,
- * a timeout per call, restart on the next call after a crash.
- * This module does not import `@sap/cds`, because the wallet worker uses it too.
- */
+// Calling side of a helper worker thread. Starts lazily, times out each call, restarts after a crash.
+// Does not import `@sap/cds`, because the wallet worker uses it too.
 
 import { Worker, MessageChannel, type MessagePort } from 'node:worker_threads';
-import { nightgateErrorFromPayload } from '../../utils/errors';
-import { formatErr } from '../../utils/format-error';
+import { nightgateErrorFromPayload, errorMessage } from '../../utils/errors';
+
 import type { WorkerRpcReply, WorkerRpcStarted } from './dispatch';
 
 export type WorkerRpcLogLevel = 'info' | 'warn' | 'error' | 'debug';
@@ -21,16 +18,9 @@ export interface WorkerRpcClientOptions {
     log: (level: WorkerRpcLogLevel, message: string) => void;
     /** Read per call. */
     timeoutMs: () => number;
-    /**
-     * Counts the timeout from the moment the worker begins the call, not from the send.
-     * A call waiting behind others is then not charged for the queue.
-     */
+    /** Counts the timeout from when the worker begins the call, so time spent queued is not charged. */
     budgetFromStart?: boolean;
-    /**
-     * Ends the worker when a call runs past its timeout, so a stuck call does not hold the
-     * thread for the calls behind it. Calls the worker had not begun are sent again to the
-     * restarted worker once. Off, a timed-out call keeps running in the worker.
-     */
+    /** Ends a worker whose call times out, so it does not block the calls behind it. Calls not yet begun go once to the restarted worker. Off, a timed-out call keeps running. */
     terminateOnTimeout?: boolean;
     /** For a worker that must never keep its owning thread alive. */
     unref?: boolean;
@@ -122,7 +112,7 @@ export class WorkerRpcClient {
             log(level, `[${name}] ${msg.message}`);
         });
         worker.on('error', (err) => {
-            log('error', `${name} error: ${formatErr(err)}`);
+            log('error', `${name} error: ${errorMessage(err)}`);
         });
         worker.on('exit', (code) => {
             if (this.client === state) this.client = null;

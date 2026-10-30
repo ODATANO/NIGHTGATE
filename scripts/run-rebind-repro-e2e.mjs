@@ -1,35 +1,6 @@
-// Live lane for the canonical anchor batch on a POPULATED vault:
-// [attest, anchorContentRoot, bindPassport] in ONE transaction, both as a
-// fresh bind and as a same-owner rebind (where bindPassport OVERWRITES an
-// existing ledger cell).
-//
-// Two ledger behaviours meet here, and both need a populated vault to show up
-// at all, which is why this runner prefills:
-//   - expensive calls go LAST, since nothing behind them can be starved;
-//   - the ledger's causality constraint: a call carrying a FALLIBLE
-//     transcript must not be followed by one carrying a GUARANTEED
-//     transcript, and which stage a call lands in is decided by its gas
-//     cost, which grows with contract state. `attest` crosses over from
-//     roughly the third attestation, which is why this runner prefills and
-//     why the batch dies mid-series rather than immediately.
-//
-// The runner reports every job outcome verbatim; the DECISIVE evidence is the
-// server's own stdout: the `[nightgate:batch-segments]` line carries each
-// call's stage and gas budget (`attest=1158[f:6.04G]`), and the RPC-CORE line
-// carries the node's real reject code. Run it against a server whose log you
-// can read.
-//
-// Server (separate terminal): npm run dev
-// Then:  npm run anchor-batch:e2e   (or REPRO_PREFILL=4 npm run anchor-batch:e2e)
-//
-// Inputs (env vars):
-//   NIGHTGATE_URL       default http://localhost:4004
-//   LACE_VIEWING_KEY    required (64 hex)
-//   LACE_MNEMONIC       required (BIP39 phrase)
-//   REPRO_VAULT         existing vault address; unset -> deploy a throwaway
-//   REPRO_PREFILL       N anchor batches to populate a scratch vault first (default 0)
-//   REPRO_VARIANT       bind-middle -> the known-failing order (see below)
-//   E2E_PREWARM_TIMEOUT_MIN / E2E_JOB_POLL_INTERVAL_MS as in the other lanes
+// Runs the [attest, anchorContentRoot, bindPassport] batch as bind and rebind on a populated vault, where gas grows with state.
+// Run: npm run anchor-batch:e2e against `npm run dev`; the server log shows each call's stage and the node's reject code.
+// Env: NIGHTGATE_URL, LACE_VIEWING_KEY, LACE_MNEMONIC, REPRO_VAULT, REPRO_PREFILL (default 0), REPRO_VARIANT.
 
 import { randomBytes } from 'node:crypto';
 import bip39 from 'bip39';
@@ -124,12 +95,8 @@ async function submitSingle(sessionId, vault, label, circuit, args) {
     return res;
 }
 
-// The batch defaults to [attest, anchorContentRoot, bindPassport]:
-// dependency-valid (both bind and anchor only need attest) and it puts the
-// costliest call of a rebind (the UPDATING bindPassport) last, where nothing
-// behind it can be starved. REPRO_VARIANT=bind-middle uses the order
-// [attest, bindPassport, anchorContentRoot], which fails earlier because the
-// update then has a call behind it.
+// Default order puts the costly rebind of bindPassport last, so no call behind it can be starved.
+// REPRO_VARIANT=bind-middle moves it to the middle, which fails earlier.
 const BIND_MIDDLE = process.env.REPRO_VARIANT === 'bind-middle';
 const freshBindCalls = (pid) => {
     const h = hex32();

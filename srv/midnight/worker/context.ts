@@ -1,14 +1,11 @@
-/**
- * Shared state of the worker thread.
- * A facade is the SDK wallet object that combines the shielded, unshielded and dust parts.
- * This module can be imported outside a worker. `log` then does nothing.
- */
+// Shared state of the worker thread. A facade is the SDK wallet that combines the shielded, unshielded and dust parts.
+// This module can be imported outside a worker. `log` then does nothing.
 
 // Must stay the first import. The worker modules import each other in a cycle,
 // and config is read at load time.
 import { configEnum, setConfigWarnSink } from '../../utils/config';
 import { RpcErrorPayload } from '../wallet-worker-protocol';
-import { parseMidnightAddress } from '../../utils/midnight-address';
+import { parseMidnightAddress, receiverKind, RECEIVER_PREFIXES } from '../../utils/midnight-address';
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 import { parentPort, type MessagePort } from 'node:worker_threads';
 import type { ReplayKind, ReplayTrack } from './sync-replay';
@@ -71,10 +68,7 @@ export interface FacadeEntry {
     indexerHttpUrl: string;
     /** Kept to rebuild the dust wallet when its state is restored. */
     walletConfiguration: any;
-    /**
-     * Dust state saved before building a tx, because the build marks the dust as spent.
-     * Restored when the node rejects the tx before the mempool.
-     */
+    /** Dust state saved before a build, because the build marks dust as spent. Restored when the node rejects the tx before the mempool. */
     preSubmitDustSnapshot?: string;
     /** Raised whenever the dust wallet is replaced. Saves of the old wallet are then ignored. */
     dustEpoch?: number;
@@ -269,15 +263,9 @@ export type ReceiverParsed =
 
 export async function parseReceiverAddress(addr: string, networkId: string): Promise<ReceiverParsed> {
     const af = await loadAddressFormat();
-    if (addr.startsWith('mn_shield-addr_')) {
-        return { kind: 'shielded', addr: (await parseMidnightAddress(af, addr)).decode(af.ShieldedAddress, networkId) };
-    }
-    if (addr.startsWith('mn_addr_')) {
-        return { kind: 'unshielded', addr: (await parseMidnightAddress(af, addr)).decode(af.UnshieldedAddress, networkId) };
-    }
-    throw new Error(
-        `Unsupported receiver address prefix in '${addr.slice(0, 16)}...' ` +
-        `(expected 'mn_shield-addr_' for shielded or 'mn_addr_' for unshielded)`
-    );
+    const kind = receiverKind(addr);
+    if (kind === 'shielded') return { kind, addr: (await parseMidnightAddress(af, addr)).decode(af.ShieldedAddress, networkId) };
+    if (kind === 'unshielded') return { kind, addr: (await parseMidnightAddress(af, addr)).decode(af.UnshieldedAddress, networkId) };
+    throw new Error(`Unsupported receiver address prefix in '${addr.slice(0, 16)}...' (expected ${RECEIVER_PREFIXES})`);
 }
 

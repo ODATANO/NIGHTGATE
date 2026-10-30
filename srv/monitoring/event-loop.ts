@@ -1,7 +1,5 @@
-/**
- * Watches the main thread's event-loop delay. A saturated thread shows up here before the healthcheck fails.
- * The gauges hold the last completed window, so one scrape never sees a half-filled histogram.
- */
+// Watches the main thread's event-loop delay. A saturated thread shows up here before the healthcheck fails.
+// The gauges hold the last completed window, so one scrape never sees a half-filled histogram.
 
 import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
 import { configMs } from '../utils/config';

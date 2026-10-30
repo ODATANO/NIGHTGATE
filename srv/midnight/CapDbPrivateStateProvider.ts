@@ -1,8 +1,5 @@
-/**
- * Stores a contract's private state in the CAP database instead of the SDK's LevelDB store.
- * Exports use the same format as the LevelDB provider.
- * Each instance serves one account and the contract chosen with `setContractAddress()`.
- */
+// Stores a contract's private state in the CAP database instead of the SDK's LevelDB store.
+// Exports use the LevelDB format. One instance serves one account and one contract.
 
 import crypto from 'crypto';
 import { NightgateError } from '../utils/errors';
@@ -103,10 +100,7 @@ export interface CapDbPrivateStateProviderConfig {
 
 const PRIVATE_STATE_SALT_LABEL = 'nightgate-private-state-salt-v1';
 
-/**
- * The same account and password always give the same salt.
- * So a stored row's salt shows which password wrote it, and no trial decryption is needed.
- */
+/** Same account and password give the same salt, so a row's salt shows which password wrote it. */
 export function privateStateStableSalt(accountId: string, password: string): Buffer {
     return crypto
         .createHash('sha256')
@@ -229,22 +223,8 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             states[r.privateStateId] = JSON.parse(json);
         }
 
-        const payload = {
-            version: CURRENT_EXPORT_VERSION,
-            stateCount: rows.length,
-            states
-        };
-
-        const password = options?.password ?? await this.getStoragePassword();
-        validateExportPassword(password);
-        const exporter = new StorageEncryption(password);
-        const encryptedPayload = exporter.encrypt(JSON.stringify(payload));
-
-        return {
-            format: PRIVATE_STATE_EXPORT_FORMAT,
-            encryptedPayload,
-            salt: exporter.salt.toString('hex')
-        };
+        const payload = { version: CURRENT_EXPORT_VERSION, stateCount: rows.length, states };
+        return sealExport(PRIVATE_STATE_EXPORT_FORMAT, payload, options?.password ?? await this.getStoragePassword());
     }
 
     async importPrivateStates(exportData: PrivateStateExport, options?: ImportPrivateStatesOptions): Promise<ImportPrivateStatesResult> {
@@ -323,8 +303,9 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         }
 
         const keys: Record<string, string> = {};
-        const inst = await this.getEncryption();
-        for (const r of rows) keys[r.contractAddress] = inst.decrypt(r.ciphertext);
+        for (const r of rows) {
+            keys[r.contractAddress] = await this.decryptStored(r.ciphertext, fresh => this.upsertSigningKey(r.contractAddress, fresh));
+        }
         return buildSigningKeyExport(keys, options?.password ?? await this.getStoragePassword());
     }
 
@@ -408,11 +389,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         return pw;
     }
 
-    /**
-     * Uses a fixed salt because each submission creates its own provider.
-     * With a random salt, one provider could not read what another wrote.
-     * The password is a strong secret per account. Exports still get a random salt.
-     */
+    /** Fixed salt, because each submission has its own provider and must read what another wrote. Exports get a random salt. */
     private getEncryption(): Promise<StorageEncryption> {
         if (!this.encryptionPromise) {
             this.encryptionPromise = this.getStoragePassword().then(pw =>
@@ -495,21 +472,20 @@ function validateExportPassword(password: string): void {
     }
 }
 
-/** Packs already decrypted signing keys into an export encrypted with `password`. */
-export function buildSigningKeyExport(keys: Record<string, string>, password: string): SigningKeyExport {
+/** Encrypts an export payload with `password` and wipes the derived key afterwards. */
+function sealExport<F extends string>(format: F, payload: object, password: string): { format: F; encryptedPayload: string; salt: string } {
     validateExportPassword(password);
-    const addresses = Object.keys(keys);
-    const payload = { version: CURRENT_EXPORT_VERSION, keyCount: addresses.length, keys };
     const exporter = new StorageEncryption(password);
     try {
-        return {
-            format: SIGNING_KEY_EXPORT_FORMAT,
-            encryptedPayload: exporter.encrypt(JSON.stringify(payload)),
-            salt: exporter.salt.toString('hex')
-        };
+        return { format, encryptedPayload: exporter.encrypt(JSON.stringify(payload)), salt: exporter.salt.toString('hex') };
     } finally {
         exporter.clear();
     }
+}
+
+/** Packs already decrypted signing keys into an export encrypted with `password`. */
+export function buildSigningKeyExport(keys: Record<string, string>, password: string): SigningKeyExport {
+    return sealExport(SIGNING_KEY_EXPORT_FORMAT, { version: CURRENT_EXPORT_VERSION, keyCount: Object.keys(keys).length, keys }, password);
 }
 
 function validateSaltHex(saltHex: string): void {

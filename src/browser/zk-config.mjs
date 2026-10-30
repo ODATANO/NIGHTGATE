@@ -1,9 +1,5 @@
-// Loads the proving files of a contract over HTTP from the server's `/zk-config/<contract>` route.
-// The file layout is the same as on the server:
-//   keys/<circuitId>.prover, keys/<circuitId>.verifier, zkir/<circuitId>.bzkir
-//
-// One instance serves both proving modes: proving in the page and proving in the wallet.
-// The wallet uses the asKeyMaterialProvider() view inherited from the SDK base class.
+// Loads a contract's proving files over HTTP from the server's `/zk-config/<contract>` route.
+// One instance serves proving in the page and, through asKeyMaterialProvider(), proving in the wallet.
 
 import {
     ZKConfigProvider,
@@ -13,11 +9,7 @@ import {
 } from '@midnight-ntwrk/midnight-js-types';
 
 export class FetchZkConfigProvider extends ZKConfigProvider {
-    /**
-     * @param {string} baseUrl  The contract's `zkConfigBaseUrl` from /contract-manifest,
-     *                          for example `https://host/zk-config/attestation-vault`.
-     * @param {typeof fetch} [fetchFn]  Defaults to the global fetch.
-     */
+    /** @param {string} baseUrl  The contract's `zkConfigBaseUrl` from /contract-manifest. */
     constructor(baseUrl, fetchFn) {
         super();
         if (!baseUrl) throw new Error('FetchZkConfigProvider: baseUrl is required');
