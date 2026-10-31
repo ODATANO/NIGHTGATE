@@ -73,7 +73,7 @@ export const DEFAULT_NETWORK: NightgateNetwork = 'preprod';
 
 // Built-in node and indexer endpoints. Only networks with a public, keyless endpoint have one:
 // preprod and mainnet need `nodeUrl` and `indexerHttpUrl` configured (an own node and indexer, or
-// Blockfrost with the project id in the URL), see docs/self-hosted.md.
+// hosted ones with the token in the URL), see docs/self-hosted.md.
 export const DEFAULT_NODE_URLS: Partial<Record<NightgateNetwork, string>> = {
     preview: 'wss://rpc.preview.midnight.network/',
     testnet: 'ws://127.0.0.1:9944',
@@ -103,7 +103,7 @@ export function missingEndpointsMessage(network: NightgateNetwork, nodeUrl: stri
     if (!missing.length) return null;
     const what = !nodeUrl && !indexerHttpUrl ? 'node or indexer' : !nodeUrl ? 'node' : 'indexer';
     const hosted = network === 'preprod' || network === 'mainnet'
-        ? ` Use your own, or Blockfrost with the project id in the URL (https://midnight-${network}.blockfrost.io/api/v0?project_id=<token>, wss://rpc.midnight-${network}.blockfrost.io?project_id=<token>).`
+        ? ` Use your own node and indexer, no token needed (ws://<node-host>:9944, http://<indexer-host>:8088/api/v4/graphql), or hosted ones for ${network} with the access token in the URL.`
         : '';
     return `network "${network}" has no built-in ${what}: set ${missing.join(' and ')}.${hosted} See docs/self-hosted.md.`;
 }

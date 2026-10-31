@@ -50,7 +50,7 @@ The wallet SDK runs in a worker thread because its sync saturates the microtask 
 ## Three ways to use it
 
 - **Hosted**: an agent or app talks to the gateway at `api.preprod.odatano.dev` with a key. No node, no indexer, no server to run. Start at the [hosted quickstart](https://api.preprod.odatano.dev/quickstart).
-- **Self-hosted**: you run NIGHTGATE as a CAP plugin or container, with a Midnight node and indexer behind it: your own, or Blockfrost with a project id. Start at [docs/self-hosted.md](docs/self-hosted.md).
+- **Self-hosted**: you run NIGHTGATE as a CAP plugin or container, with a Midnight node and indexer behind it: your own, or hosted ones with an access token. Start at [docs/self-hosted.md](docs/self-hosted.md).
 - **Library**: `@odatano/nightgate-tx` builds, proves and signs on your machine and hands the transaction to a sponsor, through the hosted gateway or your own instance. Start at [docs/txbuilder.md](docs/txbuilder.md).
 
 ## Quick start
@@ -63,12 +63,15 @@ npm run dev
 Or standalone with Docker ([docs/docker.md](docs/docker.md)):
 
 ```bash
+# your own node and indexer; hosted ones: their URLs with the access token in the query
+NODE_URL='ws://<node-host>:9944'
+INDEXER_URL='http://<indexer-host>:8088/api/v4/graphql'
 docker pull ghcr.io/odatano/nightgate:latest
 docker run -d -p 4004:4004 \
   -e ENCRYPTION_KEY=$(openssl rand -hex 32) \
   -e NIGHTGATE_HTTP_PASSWORD=change-me \
-  -e NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=$TOKEN \
-  -e NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=$TOKEN \
+  -e NIGHTGATE_NODE_URL="$NODE_URL" \
+  -e NIGHTGATE_INDEXER_HTTP_URL="$INDEXER_URL" \
   -v nightgate-data:/data \
   ghcr.io/odatano/nightgate:latest
 ```
@@ -79,11 +82,11 @@ The node and indexer are required on preprod and mainnet (the container refuses 
 
 ```bash
 NIGHTGATE_NETWORK=preprod
-# Node and indexer of the network: your own, or Blockfrost with the project id in the URL
+# Node and indexer of the network: your own, or hosted ones with the access token in the URL
 # (docs/self-hosted.md). Preprod and mainnet have no built-in endpoints; preview has.
-NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=<token>
+NIGHTGATE_NODE_URL=ws://<node-host>:9944
 # GraphQL indexer, HTTP; the WS URL is derived
-NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=<token>
+NIGHTGATE_INDEXER_HTTP_URL=http://<indexer-host>:8088/api/v4/graphql
 # Unset = in-process wasm proving. Setting it selects server proving (production).
 # NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300
 NIGHTGATE_CRAWLER_ENABLED=false
@@ -129,7 +132,7 @@ Submit actions are async: they return `{ jobId, status }`; poll `getJobStatus(jo
 
 - [Quickstart](docs/quickstart.md): first wallet-signed transaction
 - [First anchor on the hosted API](https://api.preprod.odatano.dev/quickstart): key, seed and a shared sandbox vault, no indexer; [AGENT_MS](https://github.com/maxalexweber1/AGENT_MS) is a working agent built that way
-- [Self-hosted](docs/self-hosted.md): run your own instance with your own node and indexer, or with Blockfrost
+- [Self-hosted](docs/self-hosted.md): run your own instance with your own node and indexer, or with hosted ones
 - [Actions](docs/actions.md): every action and function with examples
 - [Architecture](docs/architecture.md): worker thread, submission flow, persistence
 - [Operations](docs/operations.md): scripts, wallet sync, troubleshooting
@@ -152,15 +155,15 @@ npm install @odatano/nightgate @cap-js/sqlite
       "db": { "kind": "sqlite" },
       "nightgate": {
         "network": "preprod",
-        "nodeUrl": "wss://rpc.midnight-preprod.blockfrost.io?project_id=<token>",
-        "indexerHttpUrl": "https://midnight-preprod.blockfrost.io/api/v0?project_id=<token>"
+        "nodeUrl": "ws://<node-host>:9944",
+        "indexerHttpUrl": "http://<indexer-host>:8088/api/v4/graphql"
       }
     }
   }
 }
 ```
 
-Then `cds watch`. On preprod and mainnet `nodeUrl` and `indexerHttpUrl` are required (your own or Blockfrost, [docs/self-hosted.md](docs/self-hosted.md)); preview has built-in public endpoints, so `network` alone is enough there. Proving defaults to wasm. Configuration: [docs/reference.md#configuration](docs/reference.md#configuration).
+Then `cds watch`. On preprod and mainnet `nodeUrl` and `indexerHttpUrl` are required (your own or hosted ones, [docs/self-hosted.md](docs/self-hosted.md)); preview has built-in public endpoints, so `network` alone is enough there. Proving defaults to wasm. Configuration: [docs/reference.md#configuration](docs/reference.md#configuration).
 
 ## Development
 

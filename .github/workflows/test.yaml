@@ -1,7 +1,9 @@
 name: NIGHTGATE Tests
 
 on:
+  # Branches only: a tag runs the same gates in release.yml.
   push:
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 

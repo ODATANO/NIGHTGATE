@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.40.2 - 2026-10-31
+
+### Changes
+
+- Tooling and docs; no API change, `@odatano/nightgate-tx` unchanged.
+- Docs, `.env.example`, compose comments and the startup message for a
+  missing node or indexer name no hosting provider. Examples use your own
+  node and indexer, which need no token; hosted ones take the access token in
+  the URL.
+- vitest runs at most 6 test files in parallel, fewer on machines with fewer cores.
+- `check:release` records the source tree it passed. `npm publish` skips a
+  second run when the tree is unchanged since then.
+- CI test workflow runs on branch pushes; a tag runs the release workflow only.
+
 ## 0.40.1 - 2026-10-31
 
 ### Changes
@@ -31,7 +45,7 @@
   hosts answer HTTP 410), so `network: "preprod"` alone used to start and fail
   at the first indexer call. Startup now refuses with a message that names
   `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL` and both ways to fill
-  them: an own node and indexer, or Blockfrost with the project id in the URL.
+  them: an own node and indexer, or hosted ones with the access token in the URL.
   Preview keeps its public defaults. `DEFAULT_NODE_URL` is gone from the
   package exports; `DEFAULT_NODE_URLS` and `DEFAULT_INDEXER_URLS` list the
   networks that have one.
@@ -43,7 +57,7 @@
   the lineage package's `contract.json` names another `compactRuntime`
   major.minor than the builder runs (`runtimeVersionProblem`), instead of the
   runtime's late `Version mismatch`.
-- Docs: `docs/self-hosted.md` (what each part needs, Blockfrost or own node
+- Docs: `docs/self-hosted.md` (what each part needs, hosted or own node
   and indexer, which to pick); README, quickstart, operations, reference,
   docker, txbuilder and `.env.example` name no retired host any more and
   split hosted from self-hosted use. Reference: an empty

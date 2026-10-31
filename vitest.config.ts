@@ -1,3 +1,4 @@
+import os from 'node:os';
 import path from 'node:path';
 import { defineConfig } from 'vitest/config';
 
@@ -26,6 +27,8 @@ export default defineConfig({
         // CAP-bootstrap suites (cds.test()) need headroom.
         testTimeout: 60000,
         hookTimeout: 60000,
+        // At most 6 forks, fewer on small machines. More forks land on slow cores and starve the timing tests.
+        maxWorkers: Math.min(6, Math.max(os.availableParallelism() - 1, 1)),
         // Test files run in parallel fork processes (vitest default): each fork
         // gets its own env, in-memory DB and random ports, so the cds.test()
         // suites don't collide. Forks are killed after the run, which also ends

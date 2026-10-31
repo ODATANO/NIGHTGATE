@@ -49,7 +49,7 @@ fi
 case "${NIGHTGATE_NETWORK:-preprod}" in
     preprod|mainnet)
         if [ -z "${NIGHTGATE_NODE_URL:-}" ] || [ -z "${NIGHTGATE_INDEXER_HTTP_URL:-}" ]; then
-            echo "FATAL: network ${NIGHTGATE_NETWORK:-preprod} has no built-in node or indexer: set NIGHTGATE_NODE_URL and NIGHTGATE_INDEXER_HTTP_URL (your own, or Blockfrost with the project id in the URL; docs/self-hosted.md)." >&2
+            echo "FATAL: network ${NIGHTGATE_NETWORK:-preprod} has no built-in node or indexer: set NIGHTGATE_NODE_URL and NIGHTGATE_INDEXER_HTTP_URL (your own, or hosted ones with the access token in the URL; docs/self-hosted.md)." >&2
             exit 1
         fi ;;
 esac

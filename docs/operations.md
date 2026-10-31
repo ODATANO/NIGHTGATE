@@ -40,9 +40,9 @@ Two layers: `.env` (read by both CDS and our scripts) and CDS config under `cds.
 # Network selection
 NIGHTGATE_NETWORK=preprod                                 # preview | testnet | preprod | mainnet | undeployed
 # Node and indexer of the network (self-hosted.md): required on preprod and mainnet,
-# built in on preview. Own instances, or Blockfrost with the project id in the URL.
-NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=<token>
-NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=<token>
+# built in on preview. Own instances, or hosted ones with the access token in the URL.
+NIGHTGATE_NODE_URL=ws://<node-host>:9944
+NIGHTGATE_INDEXER_HTTP_URL=http://<indexer-host>:8088/api/v4/graphql
 # NIGHTGATE_INDEXER_WS_URL=                               # derived from the HTTP URL unless set
 
 # Crawler control
@@ -76,7 +76,7 @@ The alternative to a hosted indexer with a token ([self-hosted.md](self-hosted.m
 docker compose -f docker/docker-compose.yml up -d indexer
 ```
 
-It reads the node in `INDEXER_UPSTREAM_NODE_URL` (your own, or Blockfrost with the project id) and stores SQLite in a named volume.
+It reads the node in `INDEXER_UPSTREAM_NODE_URL` (your own, or a hosted one with the access token) and stores SQLite in a named volume.
 
 ### Verify it's up
 

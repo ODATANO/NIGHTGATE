@@ -13,13 +13,16 @@ docker pull ghcr.io/odatano/nightgate:latest
 
 ## Quickstart
 
-From the repo root:
+From the repo root, with the node and indexer URLs of the network:
 
 ```bash
+# your own node and indexer; hosted ones: their URLs with the access token in the query
+NODE_URL='ws://<node-host>:9944'
+INDEXER_URL='http://<indexer-host>:8088/api/v4/graphql'
 ENCRYPTION_KEY=$(openssl rand -hex 32) \
 NIGHTGATE_HTTP_PASSWORD=change-me \
-NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=$TOKEN \
-NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=$TOKEN \
+NIGHTGATE_NODE_URL="$NODE_URL" \
+NIGHTGATE_INDEXER_HTTP_URL="$INDEXER_URL" \
 docker compose -f docker/docker-compose.yml up -d nightgate
 ```
 
@@ -30,8 +33,8 @@ docker build -t odatano/nightgate:local .
 docker run -d --name nightgate -p 4004:4004 \
   -e ENCRYPTION_KEY=$(openssl rand -hex 32) \
   -e NIGHTGATE_HTTP_PASSWORD=change-me \
-  -e NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=$TOKEN \
-  -e NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=$TOKEN \
+  -e NIGHTGATE_NODE_URL="$NODE_URL" \
+  -e NIGHTGATE_INDEXER_HTTP_URL="$INDEXER_URL" \
   -v nightgate-data:/data \
   odatano/nightgate:local
 ```
@@ -69,7 +72,7 @@ probes (`getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus`,
 | `NIGHTGATE_BIND_ADDRESS` | `127.0.0.1` | Compose only: host address port 4004 is published on. Basic auth is plain text without TLS: put a TLS reverse proxy in front before `0.0.0.0` |
 | `NIGHTGATE_NETWORK` | `preprod` | Target network |
 | `NIGHTGATE_CRAWLER_ENABLED` | `false` | Block crawler (verification works without it) |
-| `NIGHTGATE_NODE_URL` / `NIGHTGATE_INDEXER_HTTP_URL` | required on preprod and mainnet; built in on preview | Node RPC and indexer GraphQL of the network: your own, or Blockfrost with the project id in the URL ([self-hosted.md](self-hosted.md)) |
+| `NIGHTGATE_NODE_URL` / `NIGHTGATE_INDEXER_HTTP_URL` | required on preprod and mainnet; built in on preview | Node RPC and indexer GraphQL of the network: your own, or hosted ones with the access token in the URL ([self-hosted.md](self-hosted.md)) |
 | `NIGHTGATE_PROOF_SERVER_URL` | unset | Set = proof-server proving instead of wasm |
 | `NIGHTGATE_DB_PATH` | `/data/nightgate.db` | SQLite file (persist `/data`) |
 | `NODE_OPTIONS` | `--max-old-space-size=8192` | Heap; container memory limit must be higher |

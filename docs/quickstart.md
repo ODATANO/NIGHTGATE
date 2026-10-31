@@ -10,7 +10,7 @@ From `npm ci` to a wallet-signed transaction, in three steps:
 
 - Node.js >= 22, npm
 - Docker, only for a local proof server or indexer
-- A Midnight node and indexer for the network: on preview the public ones are built in; on preprod and mainnet set `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL` to your own or to Blockfrost ([self-hosted.md](self-hosted.md))
+- A Midnight node and indexer for the network: on preview the public ones are built in; on preprod and mainnet set `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL` to your own or to hosted ones ([self-hosted.md](self-hosted.md))
 - For wallet operations: a 24-word BIP39 mnemonic and viewing key, e.g. from [Lace](https://www.lace.io/)
 
 ## Path 1: Read-side only
@@ -42,9 +42,9 @@ Proving options:
 
 ```env
 NIGHTGATE_NETWORK=preprod
-# your node and indexer, or Blockfrost with the project id (self-hosted.md)
-NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=<token>
-NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=<token>
+# your node and indexer, or hosted ones with the access token (self-hosted.md)
+NIGHTGATE_NODE_URL=ws://<node-host>:9944
+NIGHTGATE_INDEXER_HTTP_URL=http://<indexer-host>:8088/api/v4/graphql
 
 # Optional: frees CPU and memory for the wallet worker
 NIGHTGATE_CRAWLER_ENABLED=false

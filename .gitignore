@@ -16,6 +16,8 @@ db/backup-*
 
 # Packaging (npm pack / publish output)
 *.tgz
+# check-slim install probe; an interrupted run leaves it behind
+packages/nightgate-tx/.install-probe/
 
 # In-place TypeScript build output
 src/**/*.js

@@ -4,7 +4,7 @@ Configuration, runtime behavior, schema and development setup. Signatures: [acti
 
 ## Configuration
 
-Configure the plugin under `cds.requires.nightgate`. Environment variables override CDS config. The network defaults to preprod. Node and indexer are built in for preview, testnet and undeployed; preprod and mainnet need your own or Blockfrost, see [self-hosted.md](self-hosted.md).
+Configure the plugin under `cds.requires.nightgate`. Environment variables override CDS config. The network defaults to preprod. Node and indexer are built in for preview, testnet and undeployed; preprod and mainnet need your own or hosted ones, see [self-hosted.md](self-hosted.md).
 
 ### Minimal
 
@@ -14,8 +14,8 @@ Configure the plugin under `cds.requires.nightgate`. Environment variables overr
     "requires": {
       "nightgate": {
         "network": "preprod",
-        "nodeUrl": "wss://rpc.midnight-preprod.blockfrost.io?project_id=<token>",
-        "indexerHttpUrl": "https://midnight-preprod.blockfrost.io/api/v0?project_id=<token>"
+        "nodeUrl": "ws://<node-host>:9944",
+        "indexerHttpUrl": "http://<indexer-host>:8088/api/v4/graphql"
       }
     }
   }
@@ -77,8 +77,8 @@ Without `network` the plugin serves OData but stays idle (no crawler, no submiss
 | Key | Default | Notes |
 |---|---|---|
 | `network` | `preprod` | `testnet` / `preprod` / `preview` / `mainnet` / `undeployed` (local stack: node `ws://127.0.0.1:9944`, indexer `127.0.0.1:8088`); an invalid value refuses to start |
-| `nodeUrl` | built in on preview, testnet and undeployed; required on preprod and mainnet | Substrate RPC WebSocket: your own node, or Blockfrost with the project id in the URL ([self-hosted.md](self-hosted.md)) |
-| `indexerHttpUrl` | built in on preview, testnet and undeployed; required on preprod and mainnet | Indexer GraphQL for the wallet SDK and the verify service; not used by the crawler. Your own indexer, or Blockfrost with the project id in the URL |
+| `nodeUrl` | built in on preview, testnet and undeployed; required on preprod and mainnet | Substrate RPC WebSocket: your own node, or a hosted one with the access token in the URL ([self-hosted.md](self-hosted.md)) |
+| `indexerHttpUrl` | built in on preview, testnet and undeployed; required on preprod and mainnet | Indexer GraphQL for the wallet SDK and the verify service; not used by the crawler. Your own indexer, or a hosted one with the access token in the URL |
 | `indexerWsUrl` | derived from `indexerHttpUrl` (`http -> ws` + `/ws`) | Subscription endpoint, only for a non-standard indexer |
 | `proofServerUrl` | `http://localhost:6300` (server mode only) | Proof server for all submissions; setting it selects server proving, unset = wasm |
 | `proofTimeoutMs` | `300000` | Timeout of one proof request in server mode; midnight-js re-requests up to three times, so set it above the slowest proof. Ignored in wasm mode |

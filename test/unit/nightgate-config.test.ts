@@ -367,9 +367,9 @@ describe('resolveSubmissionEndpoints indexer ws derivation', () => {
     });
 
     it('keeps the query of a hosted indexer URL in front of nothing: /ws goes after the path', () => {
-        expect(deriveIndexerWsUrl('https://midnight-preprod.blockfrost.io/api/v0?project_id=abc')).toBe('wss://midnight-preprod.blockfrost.io/api/v0/ws?project_id=abc');
-        const eps = resolveSubmissionEndpoints('preprod', { indexerHttpUrl: 'https://midnight-preprod.blockfrost.io/api/v0?project_id=abc' });
-        expect(eps.indexerWsUrl).toBe('wss://midnight-preprod.blockfrost.io/api/v0/ws?project_id=abc');
+        expect(deriveIndexerWsUrl('https://indexer.example.com/api/v0?project_id=abc')).toBe('wss://indexer.example.com/api/v0/ws?project_id=abc');
+        const eps = resolveSubmissionEndpoints('preprod', { indexerHttpUrl: 'https://indexer.example.com/api/v4/graphql?token=abc' });
+        expect(eps.indexerWsUrl).toBe('wss://indexer.example.com/api/v4/graphql/ws?token=abc');
     });
 
     it('has no built-in endpoints for preprod and mainnet: empty, and a message that names both settings', () => {
@@ -381,7 +381,8 @@ describe('resolveSubmissionEndpoints indexer ws derivation', () => {
             const message = missingEndpointsMessage(network, '', '');
             expect(message).toMatch(/NIGHTGATE_NODE_URL/);
             expect(message).toMatch(/NIGHTGATE_INDEXER_HTTP_URL/);
-            expect(message).toMatch(new RegExp(`midnight-${network}.blockfrost.io`));
+            expect(message).toMatch(/your own node and indexer, no token needed/);
+            expect(message).toMatch(new RegExp(`hosted ones for ${network} with the access token in the URL`));
         }
         expect(missingEndpointsMessage('preprod', 'wss://node', '')).toMatch(/^network "preprod".*NIGHTGATE_INDEXER_HTTP_URL/);
         expect(missingEndpointsMessage('preprod', 'wss://node', '')).not.toMatch(/NIGHTGATE_NODE_URL/);
@@ -391,7 +392,7 @@ describe('resolveSubmissionEndpoints indexer ws derivation', () => {
         }
         // a local network names no hosted service
         expect(missingEndpointsMessage('testnet', '', 'http://localhost:8088/api/v4/graphql')).toMatch(/^network "testnet" has no built-in node: set NIGHTGATE_NODE_URL.*See docs\/self-hosted\.md\.$/);
-        expect(missingEndpointsMessage('testnet', '', '')).not.toMatch(/blockfrost/);
+        expect(missingEndpointsMessage('testnet', '', '')).not.toMatch(/hosted ones/);
     });
 
     it('keeps a wss:// indexer URL encrypted when deriving the WebSocket URL', () => {

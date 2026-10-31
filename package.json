@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.40.1",
+  "version": "0.40.2",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -172,10 +172,10 @@
     "wasm-zswap:e2e": "node --env-file=.env scripts/run-wasm-zswap-e2e.mjs",
     "test:pg-idempotency": "node scripts/test-postgres-idempotency.mjs",
     "lint": "eslint . && node scripts/check-any-baseline.mjs",
-    "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:schema-delta && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports",
+    "check:release": "node scripts/release-stamp.mjs start && npm run build && npm run lint && npm run typecheck && npm test && npm run integration:schema-delta && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports && node scripts/release-stamp.mjs pass",
     "check:release:full": "npm run check:release && npm run integration:postgres",
     "prepack": "npm run build:plugin",
-    "prepublishOnly": "npm run check:release && npm run build:plugin",
+    "prepublishOnly": "(node scripts/release-stamp.mjs verified || npm run check:release) && npm run build:plugin",
     "integration:derive-wallet-info": "node --env-file=.env scripts/integration-test-derive-wallet-info.mjs",
     "integration:utxo-identity": "node scripts/integration-test-utxo-identity.mjs",
     "check:fresh-tree": "bash scripts/check-fresh-tree.sh",

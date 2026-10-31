@@ -5,7 +5,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.40.1}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.40.2}
     container_name: odatano-nightgate
     # Loopback only by default: basic auth is plain text without TLS, so put a
     # TLS reverse proxy in front. NIGHTGATE_BIND_ADDRESS=0.0.0.0 publishes it.
@@ -117,15 +117,15 @@ services:
       # configured network (cds.requires.nightgate.network).
       APP__APPLICATION__NETWORK_ID: "${NIGHTGATE_NETWORK:-preprod}"
       # Upstream Substrate node of the same network, set in .env: your own preprod node, or a
-      # hosted one with its token in the URL (wss://rpc.midnight-preprod.blockfrost.io?project_id=...).
+      # hosted one with its token in the URL (wss://<node-host>?token=...).
       # The `node` service above is a local dev chain, not preprod. Empty = the indexer refuses to start.
       APP__INFRA__NODE__URL: "${INDEXER_UPSTREAM_NODE_URL:-}"
       APP__INFRA__SPO_NODE__URL: "${INDEXER_UPSTREAM_NODE_URL:-}"
       # Hex-encoded 32-byte secret that encrypts stored data. Set INDEXER_SECRET for production and never commit it.
       # It needs at least one a-f character, or the indexer reads it as a number and crash-loops.
       APP__INFRA__SECRET: "${INDEXER_SECRET:-deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe}"
-      # SPO/Blockfrost integration off for vanilla wallet-SDK usage. Required
-      # placeholder per the indexer's config schema.
+      # SPO lookups off for vanilla wallet-SDK usage. The key name is the indexer's; a
+      # placeholder is required by its config schema.
       APP__INFRA__SPO_NODE__BLOCKFROST_ID: "dummy-not-using-spo"
       RUST_LOG: "indexer_standalone=info,chain_indexer=info,indexer_api=info,wallet_indexer=info,indexer_common=info,info"
       # The default concurrency of 1 indexes serially and takes weeks to catch up. These values speed up the historical sync.

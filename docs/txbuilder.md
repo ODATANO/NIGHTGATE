@@ -572,7 +572,7 @@ const landed = await withDustGuard(facade, { configuration, dustKey }, async () 
     );
     const finalized = await facade.finalizeRecipe(recipe);
     const identifier = txIdentifiers(finalized).at(-1);
-    const nodeUrl = process.env.NIGHTGATE_NODE_URL;               // your node, or Blockfrost with ?project_id=
+    const nodeUrl = process.env.NIGHTGATE_NODE_URL;               // your node, or a hosted one with the token in the URL
     const indexerHttpUrl = process.env.NIGHTGATE_INDEXER_HTTP_URL;
 
     // Transport failure: the tx MAY be in the mempool. Probe, then resend the SAME bytes.

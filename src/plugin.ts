@@ -91,11 +91,11 @@ const plugin = {
                         default: 'preprod'
                     },
                     nodeUrl: {
-                        description: 'Midnight node Substrate RPC endpoint (ws/wss). Built in for preview, testnet and undeployed; preprod and mainnet need your own node or Blockfrost (token in the URL). Override via NIGHTGATE_NODE_URL env var.',
+                        description: 'Midnight node Substrate RPC endpoint (ws/wss). Built in for preview, testnet and undeployed; preprod and mainnet need your own node or a hosted one (token in the URL). Override via NIGHTGATE_NODE_URL env var.',
                         type: 'string'
                     },
                     indexerHttpUrl: {
-                        description: 'Midnight indexer GraphQL HTTP endpoint for the wallet SDK. Built in for preview, testnet and undeployed; preprod and mainnet need your own indexer or Blockfrost (token in the URL). Override via NIGHTGATE_INDEXER_HTTP_URL env var.',
+                        description: 'Midnight indexer GraphQL HTTP endpoint for the wallet SDK. Built in for preview, testnet and undeployed; preprod and mainnet need your own indexer or a hosted one (token in the URL). Override via NIGHTGATE_INDEXER_HTTP_URL env var.',
                         type: 'string'
                     },
                     indexerWsUrl: {

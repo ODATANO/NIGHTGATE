@@ -18,38 +18,38 @@ and mainnet have none since Midnight retired its hosted endpoints (preprod on
 2026-10-09, mainnet on 2026-09-30; the old indexer hosts answer HTTP 410), so
 NIGHTGATE refuses to start there until `nodeUrl` and `indexerHttpUrl` are set.
 
-## Option A: Blockfrost
+## Option A: hosted node and indexer
 
-A project id per network from [blockfrost.io](https://blockfrost.io), product
-"Midnight Preprod" or "Midnight Mainnet". The token goes into the URL; a preprod
-token does not work on mainnet and the other way round.
+Any provider that serves a Midnight node RPC and the standard indexer GraphQL
+for the network. Put the URLs in as the provider gives them. An access token in
+the query string is fine. A token is usually bound to one network.
 
 ```env
 NIGHTGATE_NETWORK=preprod
-NIGHTGATE_NODE_URL=wss://rpc.midnight-preprod.blockfrost.io?project_id=<token>
-NIGHTGATE_INDEXER_HTTP_URL=https://midnight-preprod.blockfrost.io/api/v0?project_id=<token>
+NIGHTGATE_NODE_URL=wss://<node-host>?token=<token>
+NIGHTGATE_INDEXER_HTTP_URL=https://<indexer-host>/api/v4/graphql?token=<token>
 ```
 
-Mainnet: `midnight-mainnet` in both hosts. The WebSocket URL is derived
-(`wss://…/api/v0/ws?project_id=<token>`); set `NIGHTGATE_INDEXER_WS_URL` only for
-a non-standard path. Check:
+The WebSocket URL is derived (`http -> ws` plus `/ws`, the query kept); set
+`NIGHTGATE_INDEXER_WS_URL` only for a non-standard path. Check:
 
 ```bash
 curl -s -X POST -H 'Content-Type: application/json' -d '{"query":"{ block { height } }"}' \
-  "https://midnight-preprod.blockfrost.io/api/v0?project_id=$TOKEN"
+  "https://<indexer-host>/api/v4/graphql?token=$TOKEN"
 ```
 
-`403` means a missing or mismatched token. A wallet state saved against another
-indexer does not carry over: the first sync against Blockfrost starts from
-genesis.
+`401` or `403` means a missing or mismatched token. A wallet state saved against
+another indexer does not carry over: the first sync against a new indexer
+starts from genesis.
 
-Cost: Blockfrost meters requests; a wallet sync from genesis is minutes of
-streaming per wallet, a sponsor pool with several wallets more. Logs and error
-texts strip the query, so the token does not land in them.
+Cost: hosted indexers usually meter requests. A wallet sync from genesis is
+minutes of streaming per wallet, a sponsor pool with several wallets more. Logs
+and error texts strip the query, so the token does not land in them.
 
 ## Option B: your own node and indexer
 
-The same images Midnight publishes, on your own box.
+The same images Midnight publishes, on your own box. Your own node and indexer
+need no access token: their URLs are plain.
 
 - **Node**: a Midnight node on preprod or mainnet follows a Cardano node of the
   same network through db-sync, so it is three containers and a day or more of
@@ -59,7 +59,7 @@ The same images Midnight publishes, on your own box.
   issue, and operators are asked to upgrade.
 - **Indexer**: `midnightntwrk/indexer-standalone`, the `indexer` service in
   `docker/docker-compose.yml`. It reads the node in `INDEXER_UPSTREAM_NODE_URL`
-  (your node, or Blockfrost's `wss://rpc.midnight-preprod.blockfrost.io?project_id=…`)
+  (your node, or a hosted node RPC with its token in the URL)
   and indexes from genesis: days on preprod. Wait for `"caught_up":true` in its
   log, or `GET /ready` answering 200.
 
@@ -76,13 +76,13 @@ NIGHTGATE_NODE_URL=ws://<your-node>:9944
 NIGHTGATE_INDEXER_HTTP_URL=http://127.0.0.1:8088/api/v4/graphql
 ```
 
-An indexer on Blockfrost's node and NIGHTGATE on your own indexer is a valid
-middle way: one token, no chain on disk, the sync path under your control.
+Your own indexer on a hosted node RPC is a valid middle way: one token, no
+chain on disk, the sync path under your control.
 Sizing and the memory watchdog for the indexer: [operations.md](operations.md).
 
 ## Which to pick
 
-- Blockfrost: nothing to run, a token to keep secret, per-request cost, a
+- Hosted: nothing to run, a token to keep secret, usually per-request cost, a
   cold wallet sync on the first start.
 - Own: the node stack and the indexer to run, disk for the chain, no third party in the
   wallet's sync path, the indexer can be shared by every NIGHTGATE and every
