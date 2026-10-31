@@ -105,6 +105,32 @@ describe('offer files in the builder', () => {
     });
 });
 
+describe('revertBuilt', () => {
+    it("decodes an offer file, base64 or bytes, bound or not, and hands the transaction to the facade's revert", async () => {
+        const { revertBuilt, encodeOffer } = await importTxBuilder();
+        const bound = half([[A, 10n], [B, -3n]]);
+        const unbound = half([[A, 10n], [B, -3n]]);
+        const boundBytes = registered(bound, 4, 'binding');
+        const unboundBytes = registered(unbound, 5, 'pre-binding');
+        const facade = { revertTransaction: vi.fn(async () => {}) };
+        for (const input of [await encodeOffer(boundBytes), Buffer.from(boundBytes).toString('base64'), boundBytes]) {
+            await revertBuilt(facade, input);
+        }
+        await revertBuilt(facade, Buffer.from(unboundBytes).toString('base64'));
+        const reverted = facade.revertTransaction.mock.calls.map(([tx]: any[]) => tx);
+        expect(reverted).toHaveLength(4);
+        [bound, bound, bound, unbound].forEach((tx, i) => expect(reverted[i]).toBe(tx));
+    });
+
+    it('refuses input that is no transaction before touching the wallets', async () => {
+        const { revertBuilt } = await importTxBuilder();
+        const facade = { revertTransaction: vi.fn(async () => {}) };
+        await expect(revertBuilt(facade, 'not base64!')).rejects.toThrow(/neither an offer file nor base64/);
+        await expect(revertBuilt(facade, Buffer.from('junk').toString('base64'))).rejects.toThrow(/not a proven transaction/);
+        expect(facade.revertTransaction).not.toHaveBeenCalled();
+    });
+});
+
 describe('createSwapWallet', () => {
     const SEED = 'ab'.repeat(64);
     const URLS = { indexerHttpUrl: 'https://indexer.example/api/v3/graphql', indexerWsUrl: 'wss://indexer.example/api/v3/graphql/ws' };

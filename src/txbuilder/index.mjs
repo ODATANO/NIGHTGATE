@@ -39,6 +39,7 @@ export { holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from './holder.mjs';
 // Reading the chain through the NIGHTGATE API instead of an indexer.
 export { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
 import { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
+import { decodeOffer } from './swap.mjs';
 
 // With `api` and no wallet sync the facade dials neither a node nor an indexer, so these are never used.
 const UNUSED_INDEXER = { indexerHttpUrl: 'http://unused.invalid/', indexerWsUrl: 'ws://unused.invalid/' };
@@ -306,6 +307,13 @@ function sha256Hex(body) {
     return createHash('sha256').update(body).digest('hex');
 }
 
+/** Releases what a built transaction reserved, in all sub-wallets whatever they sync, and drops it from the pending list. */
+// Exported for the unit tests only.
+export async function revertBuilt(facade, input) {
+    const { tx } = await decodeOffer(input);
+    await facade.revertTransaction(tx);
+}
+
 /** Runs a single call. Its `before` hook runs first, just as in a batch. */
 // Exported for the unit tests only.
 export async function runSingleCall(single, fn) {
@@ -333,6 +341,7 @@ export function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, ho
                 // If the wallet had to add its own coins, there is a second transaction.
                 // The sponsor would only seal the first one, so this case needs bind: true.
                 if (signed?.balancingTransaction) {
+                    await facade.revert(signed).catch(() => { /* the refusal is the error to report */ });
                     throw new Error('buildSponsorable({ bind: false }): this call needs a balancing transaction (it moves value); use the bound handover (bind: true / sponsorFinalizedTransaction) for it');
                 }
                 holder.unbound = true;
@@ -829,6 +838,11 @@ export async function createTxBuilder(opts) {
             return bind === false
                 ? { unboundTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: false, contractAddress }
                 : { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length, bound: true, contractAddress };
+        },
+
+        /** Releases what a built transaction reserved in the builder's wallets, a shared shielded wallet included. */
+        async revert(input) {
+            await revertBuilt(facade, input);
         },
 
         /** Stops the wallet sync and closes the indexer connections. */

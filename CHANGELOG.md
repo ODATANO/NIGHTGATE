@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.40.1 - 2026-10-31
+
+### Changes
+
+- `@odatano/nightgate-tx` 0.20.1: `builder.revert(tx)` releases the coins a
+  built transaction reserved, for example the NIGHT of a pay-in the sponsor
+  refused. Before, only closing the builder released them, and the next
+  builder synced again. It reverts in all sub-wallets, a shared shielded
+  wallet included, and drops the transaction from the wallet's pending list.
+  Takes an offer file, base64 or bytes. `docs/txbuilder.md`: the return value.
+- `buildSponsorable({ bind: false })`: a call that needs a balancing
+  transaction now releases the coins balancing reserved before it throws.
+
 ## 0.40.0 - 2026-10-30
 
 ### Changes

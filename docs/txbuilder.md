@@ -118,11 +118,14 @@ and `code`; a 429 and a retryable 503 also carry `retryAfterSeconds` from
 | `shieldedWallet` | no | a started shielded wallet of the same seed, such as a swap wallet's `shieldedWallet`: the builder balances from it and neither starts nor stops it, so the swap wallet and every builder of the process share one sync and one view of the coins. Excludes `walletState.shielded`; with `walletSync: false` the builder syncs nothing more |
 | `onProgress` | no | callback for asset download, wallet start and build phases; while a wallet syncs, `{ phase: 'sync', wallet, appliedIndex, highestIndex, isConnected }` at most once a second per wallet and once more at the tip |
 
-Returns `{ attestationSecret, attesterId, zkAssets, addresses, shieldedKeys, provingMode, walletSync, waitForSync, serializeWalletState, buildSponsorable, buildDeploySponsorable, close }`.
+Returns `{ attestationSecret, attesterId, zkAssets, addresses, shieldedKeys, provingMode, walletSync, waitForSync, serializeWalletState, buildSponsorable, buildDeploySponsorable, revert, close }`.
 `close()` stops the wallet sync and the indexer sockets; otherwise both run
 until the process exits. `serializeWalletState()` returns the state of the
 syncing sub-wallets (`{ shielded, unshielded?, dust? }`); it holds the wallet's
-coins, store it like a key.
+coins, store it like a key. `revert(tx)` releases the coins a built
+transaction reserved, for a transaction that will not land (refused or
+failed); offer file, base64 or bytes, bound or not. It covers all
+sub-wallets, a shared `shieldedWallet` included.
 
 Which sync a call needs:
 

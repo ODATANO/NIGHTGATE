@@ -272,6 +272,11 @@ export interface TxBuilder {
     buildDeploySponsorable(input: BuildDeploySponsorableUnboundInput): Promise<BuiltUnboundDeploy>;
     buildDeploySponsorable(input?: BuildDeploySponsorableBoundInput): Promise<BuiltBoundDeploy>;
     buildDeploySponsorable(input: BuildDeploySponsorableInput): Promise<BuiltDeploy>;
+    /**
+     * Releases the coins a built transaction reserved in this builder's wallets, a shared shielded wallet included,
+     * when it will not land: offer file, base64 or bytes, bound or not.
+     */
+    revert(tx: string | Uint8Array): Promise<void>;
     /** Stops the wallet sync and closes connections. Without it the sync runs until the process exits. */
     close(): Promise<void>;
 }

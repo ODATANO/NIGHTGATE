@@ -427,18 +427,20 @@ describe('txbuilder: createTxBuilder input validation', () => {
 });
 
 describe('txbuilder: unbound handover refuses a recipe that carries a balancing transaction', () => {
-    it('bind:false throws when signRecipe returns a balancingTransaction; bind:true finalizes it', async () => {
+    it('bind:false releases the reserved coins and throws when signRecipe returns a balancingTransaction; bind:true finalizes it', async () => {
         const { buildOnlyWalletProvider } = await importTxBuilder();
         const recipe: any = { type: 'UNBOUND_TRANSACTION', baseTransaction: { base: true }, balancingTransaction: { balancing: true } };
         const facade = {
             balanceUnboundTransaction: vi.fn(async (): Promise<any> => recipe),
             signRecipe: vi.fn(async (r: any) => r),
-            finalizeRecipe: vi.fn(async () => ({ finalized: true }))
+            finalizeRecipe: vi.fn(async () => ({ finalized: true })),
+            revert: vi.fn(async () => { throw new Error('revert failed'); })
         };
         const keystore = { signData: vi.fn(() => new Uint8Array(64)) };
         const holder: any = {};
         const unbound = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, { dust: true }, keystore, holder, 30, false);
         await expect(unbound.balanceTx({ tx: true })).rejects.toThrow(/needs a balancing transaction.*bound handover/);
+        expect(facade.revert).toHaveBeenCalledWith(recipe);
         expect(holder.unbound).toBeUndefined();
         const bound = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, { dust: true }, keystore, {}, 30, true);
         await expect(bound.balanceTx({ tx: true })).resolves.toEqual({ finalized: true });
