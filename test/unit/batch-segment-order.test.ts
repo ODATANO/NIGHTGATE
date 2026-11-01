@@ -86,6 +86,34 @@ describe('orderBatchSegments', () => {
         expect(new Set(tx.intents.values())).toEqual(new Set([first, second]));
     });
 
+    test('same-name calls keep their build order when the build-time segment ids are known', () => {
+        const init1 = intentFor('initialiseField');
+        const init2 = intentFor('initialiseField');
+        const init3 = intentFor('initialiseField');
+        const reg = intentFor('register');
+        // Merged map order is neither build order nor ascending.
+        const tx = txWithIntents([[40, init3], [12, reg], [90, init1], [7, init2]]);
+
+        const ok = orderBatchSegments(tx, ['register', 'initialiseField', 'initialiseField', 'initialiseField'],
+            { segmentIds: [12, 90, 7, 40] });
+
+        expect(ok).toBe(true);
+        expect(tx.intents.get(7)).toBe(reg);
+        expect(tx.intents.get(12)).toBe(init1);
+        expect(tx.intents.get(40)).toBe(init2);
+        expect(tx.intents.get(90)).toBe(init3);
+    });
+
+    test('segment ids that do not fit the calls fall back to matching by name', () => {
+        const attest = intentFor('attest');
+        const bind = intentFor('bindPassport');
+        const tx = txWithIntents([[9, bind], [4, attest]]);
+
+        expect(orderBatchSegments(tx, ['attest', 'bindPassport'], { segmentIds: [9, NaN] })).toBe(true);
+        expect(tx.intents.get(4)).toBe(attest);
+        expect(tx.intents.get(9)).toBe(bind);
+    });
+
     test('mismatch (missing intent for a listed circuit) leaves the map unchanged', () => {
         const attest = intentFor('attest');
         const tx = txWithIntents([[5, attest]]);
@@ -185,6 +213,23 @@ describe('withOrderedBatchSegments', () => {
         expect(seen).toEqual([[tx, { zk: 'config' }]]);
         expect(tx.intents.get(4)).toBe(attest); // reordered before the delegate saw it
         expect(tx.intents.get(9)).toBe(bind);
+    });
+
+    test('the preflight sees the ordered transaction and its error stops the proof', async () => {
+        const attest = intentFor('attest');
+        const bind = intentFor('bindPassport');
+        const tx = txWithIntents([[9, bind], [4, attest]]);
+        const provider = { proveTx: vi.fn(async () => 'proven') };
+        const preflight = vi.fn(async (t: any) => {
+            expect(t.intents.get(4)).toBe(attest);
+            throw new Error('runs out of gas on the ledger');
+        });
+
+        const wrapped = withOrderedBatchSegments(provider, ['attest', 'bindPassport'], {}, preflight);
+
+        await expect(wrapped.proveTx(tx)).rejects.toThrow(/runs out of gas/);
+        expect(preflight).toHaveBeenCalledTimes(1);
+        expect(provider.proveTx).not.toHaveBeenCalled();
     });
 
     test('a throwing intents surface aborts BEFORE proving (fail-closed)', async () => {

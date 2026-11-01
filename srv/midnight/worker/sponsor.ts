@@ -628,22 +628,84 @@ export function tryLockBacking(sessionId: string, notes: any[], needSpecks: bigi
 export function sufficientNoteOnBacking(sessionId: string, notes: any[], key: string, needSpecks: bigint): any | null {
     return notes.find((n) => backingKey(sessionId, n) === key && noteSpecks(n) >= needSpecks) ?? null;
 }
-/** Reserves a free backing, waiting up to `waitMs`. */
+/** Reserved backings for one sponsored spend. Most spends hold one, a fee no single note covers holds several. */
+export interface DustLease {
+    parts: Array<{ key: string; token: number }>;
+    backing: string;
+}
+
+/** The note with the most dust on each free backing, largest first, until they cover `needSpecks`. Null when they do not add up. */
+export function pickNotesAcrossBackings(
+    sessionId: string, notes: any[], needSpecks: bigint, maxNotes: number, skipBackings: ReadonlySet<string> = new Set()
+): any[] | null {
+    const now = Date.now();
+    const best = new Map<string, any>();
+    for (const n of notes) {
+        const key = backingKey(sessionId, n);
+        if (skipBackings.has(key)) continue;
+        const held = noteLocks.get(key);
+        if (held && held.exp > now) continue;
+        const current = best.get(key);
+        if (!current || noteSpecks(n) > noteSpecks(current)) best.set(key, n);
+    }
+    const sorted = [...best.values()].filter((n) => noteSpecks(n) > 0n)
+        .sort((a, b) => (noteSpecks(a) < noteSpecks(b) ? 1 : noteSpecks(a) > noteSpecks(b) ? -1 : 0));
+    const picked: any[] = [];
+    let sum = 0n;
+    for (const n of sorted) {
+        if (sum >= needSpecks || picked.length >= maxNotes) break;
+        picked.push(n);
+        sum += noteSpecks(n);
+    }
+    return sum >= needSpecks ? picked : null;
+}
+
+/** Reserves one backing that covers the fee. When no note covers it alone, reserves up to `maxNotes` backings that cover it together. */
+export function tryLockDust(
+    sessionId: string, notes: any[], needSpecks: bigint, ttlMs: number, skipBackings: ReadonlySet<string> = new Set(), maxNotes = 1
+): DustLease | null {
+    const single = tryLockBacking(sessionId, notes, needSpecks, ttlMs, skipBackings);
+    if (single) return { parts: [{ key: single.key, token: single.token }], backing: single.backing };
+    // A note that covers the fee alone is only busy, so waiting for it keeps the other backings free.
+    const coversAlone = notes.some((n) => noteSpecks(n) >= needSpecks && !skipBackings.has(backingKey(sessionId, n)));
+    if (maxNotes < 2 || coversAlone) return null;
+    const picked = pickNotesAcrossBackings(sessionId, notes, needSpecks, maxNotes, skipBackings);
+    if (!picked) return null;
+    const exp = Date.now() + ttlMs;
+    const parts = picked.map((n) => {
+        const key = backingKey(sessionId, n);
+        const token = ++noteLeaseSeq;
+        noteLocks.set(key, { exp, token });
+        return { key, token };
+    });
+    return { parts, backing: picked.map((n) => String(n?.token?.backingNight ?? '?').slice(0, 16)).join('+') };
+}
+
+/** Reserves backings for a spend, waiting up to `waitMs`. */
 export async function acquireBacking(
     sessionId: string, refresh: () => Promise<any[]>, needSpecks: bigint, ttlMs: number, waitMs: number,
-    skipBackings: ReadonlySet<string> = new Set()
-): Promise<any> {
+    skipBackings: ReadonlySet<string> = new Set(), maxNotes = 1
+): Promise<DustLease> {
     const deadline = Date.now() + waitMs;
     for (; ;) {
         throwIfRpcCancelled('dust backing wait');
         const notes = await refresh();
-        const leased = tryLockBacking(sessionId, notes, needSpecks, ttlMs, skipBackings);
+        const leased = tryLockDust(sessionId, notes, needSpecks, ttlMs, skipBackings, maxNotes);
         if (leased) return leased;
         if (Date.now() >= deadline) {
-            throw new Error(`no free dust backing with >= ${needSpecks} specks within ${waitMs}ms (all backings busy)`);
+            throw new Error(`no free dust backing with >= ${needSpecks} specks, alone or up to ${maxNotes} together, within ${waitMs}ms (all backings busy)`);
         }
         await sleep(1000);
     }
+}
+/** Releases every backing of a lease. */
+export function releaseLease(lease: DustLease): void {
+    for (const p of lease.parts) releaseNote(p.key, p.token);
+}
+/** Renews every backing of a lease. Returns a stop function. */
+export function keepDustLeaseAlive(lease: DustLease, ttlMs: number): () => void {
+    const stops = lease.parts.map((p) => keepLeaseAlive(p.key, p.token, ttlMs));
+    return () => stops.forEach((stop) => stop());
 }
 /** Does nothing when someone else took over the reservation. */
 export function releaseNote(key: string, token: number): void {
@@ -664,29 +726,29 @@ export function noteLeaseTtlMs(): number {
     return configMs('NIGHTGATE_NOTE_LEASE_MS');
 }
 /**
- * Keeps a backing reserved after the send until the dust wallet drops the spent note, else the next spend on it would reuse that note (1010/196).
+ * Keeps the backings reserved after the send until the dust wallet drops the spent notes, else the next spend on one would reuse its note (1010/196).
  */
-export async function releaseBackingWhenSpent(sponsor: FacadeEntry, leased: any, spentNonce: string | undefined, stopRenewal: () => void): Promise<void> {
+export async function releaseBackingWhenSpent(sponsor: FacadeEntry, leased: DustLease, spentNonces: string[], stopRenewal: () => void): Promise<void> {
     const waitMs = configMs('NIGHTGATE_NOTE_SPENT_WAIT_MS');
     const t0 = Date.now();
     try {
-        let listed = spentNonce !== undefined && waitMs > 0;
+        let listed = spentNonces.length > 0 && waitMs > 0;
         while (listed && Date.now() - t0 < waitMs && facades.get(sponsor.sessionId) === sponsor) {
             const dws: any = await firstDustState(sponsor.facade.dust);
             const coins: any[] = Array.from(dws.capabilities.coinsAndBalances.getAvailableCoins(dws.state, new Date()));
-            listed = coins.some((n) => String(n?.token?.nonce) === spentNonce);
+            listed = coins.some((n) => spentNonces.includes(String(n?.token?.nonce)));
             if (listed) await sleep(1000, undefined, { ref: false });
         }
-        if (listed) log('warn', `backing ${leased.backing} released after ${Date.now() - t0}ms although the dust wallet still lists the spent note`);
-        else if (spentNonce !== undefined) log('debug', `backing ${leased.backing} released: spent note gone after ${Date.now() - t0}ms`);
+        if (listed) log('warn', `backing ${leased.backing} released after ${Date.now() - t0}ms although the dust wallet still lists a spent note`);
+        else if (spentNonces.length > 0) log('debug', `backing ${leased.backing} released: spent notes gone after ${Date.now() - t0}ms`);
     } catch (e) {
         log('warn', `backing ${leased.backing} released without the spent-note check: ${errorMessage(e)}`);
     } finally {
         stopRenewal();
-        releaseNote(leased.key, leased.token);
+        releaseLease(leased);
     }
 }
-export const __noteLeaseForTests = { tryLockBacking, sufficientNoteOnBacking, releaseNote, keepLeaseAlive, noteLeaseTtlMs, releaseBackingWhenSpent, held: (key: string) => noteLocks.get(key), reset: () => noteLocks.clear() };
+export const __noteLeaseForTests = { tryLockBacking, tryLockDust, pickNotesAcrossBackings, dustSpendInputs, sufficientNoteOnBacking, releaseNote, releaseLease, keepLeaseAlive, noteLeaseTtlMs, releaseBackingWhenSpent, held: (key: string) => noteLocks.get(key), reset: () => noteLocks.clear() };
 
 /** The sponsor adds the dust fee to a tx the caller finalized and sends it. */
 export async function sponsorAndSubmitFinalized(
@@ -811,11 +873,18 @@ export async function sponsorFinalizedTx(args: SponsorPolicyArgs & {
     };
 }
 
+/** Fee margin of an unbound sponsoring, in blocks of possible price rise. */
+const UNBOUND_FEE_MARGIN_BLOCKS = 2;
+
 /** How often to pick another backing when the chosen one turns out to hold too little dust. */
 export const MAX_BACKING_RESELECTS = 3;
 
+/** How often the fee of a spend from several notes is priced again before it is paid. */
+const MAX_FEE_ROUNDS = 4;
+
 export class DustBackingShortError extends Error {
-    constructor(readonly backing: string, readonly held: bigint, readonly needed: bigint) {
+    // `shortKeys`: the backings whose note was gone at build time. Empty when the notes together held too little.
+    constructor(readonly backing: string, readonly held: bigint, readonly needed: bigint, readonly shortKeys: string[] = []) {
         super(`dust backing ${backing} holds ${held} specks at the spend's block time, the fee needs ${needed}`);
         this.name = 'DustBackingShortError';
     }
@@ -834,10 +903,24 @@ export function freeSegmentId(tx: any): number {
     throw new SponsorRefusalError('refusing to sponsor: the transaction uses every segment id, none is left for the dust spend');
 }
 
-/** Builds the dust spend on the reserved backing. Runs under the wallet's session lock. */
+/** Spend inputs that take `target` specks from the notes in order. */
+export function dustSpendInputs(notes: any[], target: bigint): Array<{ token: any; value: bigint }> {
+    const inputs: Array<{ token: any; value: bigint }> = [];
+    let left = target;
+    for (const n of notes) {
+        if (left <= 0n) break;
+        const value = noteSpecks(n) < left ? noteSpecks(n) : left;
+        inputs.push({ token: n.token, value });
+        left -= value;
+    }
+    return inputs;
+}
+
+/** Builds the dust spend on the reserved backings. Runs under the wallet's session lock. */
 async function buildDustSpend(
-    sponsor: FacadeEntry, networkId: string, sdk: any, leased: any, needSpecks: bigint, ctime: Date, ttl: Date, segment: number
-): Promise<{ dustUnproven: any; spentNonce: string | undefined }> {
+    sponsor: FacadeEntry, networkId: string, sdk: any, leased: DustLease, needSpecks: bigint, ctime: Date, ttl: Date, segment: number,
+    callerTx: any, params: any
+): Promise<{ dustUnproven: any; spentNonces: string[] }> {
     const CoreWalletApi = await loadDustCoreWallet();
     return withSessionLocks([sponsor.sessionId], async () => {
         if (facades.get(sponsor.sessionId) !== sponsor) {
@@ -846,18 +929,41 @@ async function buildDustSpend(
         const dws: any = await firstDustState(sponsor.facade.dust);
         const cab = dws.capabilities.coinsAndBalances;
         const fresh: any[] = Array.from(cab.getAvailableCoins(dws.state, ctime));
-        const note = sufficientNoteOnBacking(sponsor.sessionId, fresh, leased.key, needSpecks);
-        if (!note) {
-            const onBacking = fresh.filter((n) => backingKey(sponsor.sessionId, n) === leased.key);
-            const held = onBacking.reduce((m, n) => (noteSpecks(n) > m ? noteSpecks(n) : m), 0n);
-            throw new DustBackingShortError(leased.backing, held, needSpecks);
+        const bestOn = (key: string) => fresh.filter((n) => backingKey(sponsor.sessionId, n) === key)
+            .reduce<any>((m, n) => (!m || noteSpecks(n) > noteSpecks(m) ? n : m), undefined);
+        let notes: any[];
+        if (leased.parts.length === 1) {
+            const note = sufficientNoteOnBacking(sponsor.sessionId, fresh, leased.parts[0].key, needSpecks);
+            if (!note) throw new DustBackingShortError(leased.backing, noteSpecks(bestOn(leased.parts[0].key)), needSpecks);
+            notes = [note];
+        } else {
+            const missing = leased.parts.filter((p) => !bestOn(p.key)).map((p) => p.key);
+            if (missing.length) throw new DustBackingShortError(leased.backing, 0n, needSpecks, missing);
+            notes = leased.parts.map((p) => bestOn(p.key));
         }
-        const [spends] = CoreWalletApi.spendCoins(dws.state, sponsor.dustKey, [{ token: note.token, value: needSpecks }], ctime);
-        const intent = sdk.ledger.Intent.new(ttl);
-        intent.dustActions = new sdk.ledger.DustActions('signature', 'pre-proof', ctime, [spends[0]]);
-        const dustUnproven = sdk.ledger.Transaction.fromParts(networkId).addIntent({ tag: 'specific', value: segment }, intent);
-        const nonce = note?.token?.nonce;
-        return { dustUnproven, spentNonce: nonce === undefined || nonce === null ? undefined : String(nonce) };
+        const held = notes.reduce((sum, n) => sum + noteSpecks(n), 0n);
+        const build = (target: bigint) => {
+            const [spends] = CoreWalletApi.spendCoins(dws.state, sponsor.dustKey, dustSpendInputs(notes, target), ctime);
+            const intent = sdk.ledger.Intent.new(ttl);
+            intent.dustActions = new sdk.ledger.DustActions('signature', 'pre-proof', ctime, [...spends]);
+            return sdk.ledger.Transaction.fromParts(networkId).addIntent({ tag: 'specific', value: segment }, intent);
+        };
+        let target = needSpecks;
+        let dustUnproven: any;
+        // Every extra dust spend raises the fee, so the whole transaction is priced until the fee holds, as the SDK balancer does.
+        for (let round = 0; ; round++) {
+            if (held < target) throw new DustBackingShortError(leased.backing, held, target);
+            dustUnproven = build(target);
+            if (notes.length < 2 || round >= MAX_FEE_ROUNDS) break;
+            let fee = target;
+            try { fee = callerTx.eraseProofs().merge(dustUnproven.eraseProofs()).feesWithMargin(params, UNBOUND_FEE_MARGIN_BLOCKS); }
+            catch (err) { log('warn', `fee estimate with ${notes.length} dust spends failed, paying ${target} specks: ${errorMessage(err).slice(0, 200)}`); }
+            if (fee <= target) break;
+            target = fee;
+        }
+        const spentNonces = notes.slice(0, dustSpendInputs(notes, target).length)
+            .map((n) => n?.token?.nonce).filter((x) => x !== undefined && x !== null).map(String);
+        return { dustUnproven, spentNonces };
     });
 }
 
@@ -927,7 +1033,7 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
 
     const params = sdk.ledger.LedgerParameters.initialParameters();
     let needSpecks = FALLBACK_FEE_SPECKS;
-    try { needSpecks = callerTx.feesWithMargin(params, 2); }
+    try { needSpecks = callerTx.feesWithMargin(params, UNBOUND_FEE_MARGIN_BLOCKS); }
     catch (err) { log('warn', `fee estimate failed, reserving ${FALLBACK_FEE_SPECKS} specks instead: ${errorMessage(err).slice(0, 200)}`); }
     if (needSpecks <= 0n) needSpecks = FALLBACK_FEE_SPECKS;
 
@@ -944,21 +1050,25 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
         const cab = dws.capabilities.coinsAndBalances;
         return Array.from(cab.getAvailableCoins(dws.state, at));
     };
+    const maxNotes = configNumber('NIGHTGATE_SPONSOR_MAX_DUST_NOTES');
     const shortBackings = new Set<string>();
-    let leased: any;
-    let built: { dustUnproven: any; spentNonce: string | undefined } | undefined;
+    let leased!: DustLease;
+    let built: { dustUnproven: any; spentNonces: string[] } | undefined;
     let stopRenewal: () => void = () => undefined;
     for (let attempt = 0; ; attempt++) {
-        leased = await acquireBacking(sponsor.sessionId, () => snapshotNotes(ctime), needSpecks, leaseTtlMs, backingWaitMs, shortBackings);
-        stopRenewal = keepLeaseAlive(leased.key, leased.token, leaseTtlMs);
+        leased = await acquireBacking(sponsor.sessionId, () => snapshotNotes(ctime), needSpecks, leaseTtlMs, backingWaitMs, shortBackings, maxNotes);
+        stopRenewal = keepDustLeaseAlive(leased, leaseTtlMs);
         try {
-            built = await buildDustSpend(sponsor, args.networkId, sdk, leased, needSpecks, ctime, ttl, dustSegment);
+            built = await buildDustSpend(sponsor, args.networkId, sdk, leased, needSpecks, ctime, ttl, dustSegment, callerTx, params);
             break;
         } catch (e) {
-            stopRenewal(); releaseNote(leased.key, leased.token);
+            stopRenewal(); releaseLease(leased);
             if (e instanceof DustBackingShortError && attempt < MAX_BACKING_RESELECTS) {
                 log('warn', `sponsorUnboundTx: ${(e as Error).message}; selecting another backing`);
-                shortBackings.add(leased.key);
+                // Several notes fell short of the fee priced with all their spends: ask for more next time.
+                if (e.shortKeys.length) for (const key of e.shortKeys) shortBackings.add(key);
+                else if (leased.parts.length > 1 && e.needed > needSpecks) needSpecks = e.needed;
+                else for (const p of leased.parts) shortBackings.add(p.key);
                 continue;
             }
             throw e;
@@ -1006,8 +1116,8 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
         if (isPreMempoolReject(e) || isNothingSent(e)) sent = false;
         throw e;
     } finally {
-        if (sent) void releaseBackingWhenSpent(sponsor, leased, built!.spentNonce, stopRenewal);
-        else { stopRenewal(); releaseNote(leased.key, leased.token); }
+        if (sent) void releaseBackingWhenSpent(sponsor, leased, built!.spentNonces, stopRenewal);
+        else { stopRenewal(); releaseLease(leased); }
     }
 }
 

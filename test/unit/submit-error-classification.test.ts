@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { classifySubmitFailure, isPreMempoolFailure, parseBatchCallStages, causeMessages, SponsorRefusalError } from '../../srv/midnight/submit-error-classification';
 import { WorkerSubmitError, carriedSubmitFailure, SUBMIT_FAILURE_CODES } from '../../srv/midnight/wallet-worker-protocol';
 import { BatchCausalityError } from '../../srv/midnight/batch-segment-order';
+import { BatchGasBudgetError } from '../../srv/midnight/batch-gas-preflight';
 import { NightgateError } from '../../srv/utils/errors';
 
 /** The SDK shape: generic wrappers on top, the node's line in the innermost cause. */
@@ -47,6 +48,12 @@ describe('classifySubmitFailure', () => {
         const textOnly = new Error("Unexpected error submitting scoped transaction 'batch': " + own.message);
         expect(classifySubmitFailure(textOnly)).toEqual({ code: 'causality', retryable: false, calls });
         expect(parseBatchCallStages('nothing here')).toEqual([]);
+    });
+
+    it('gas-budget: our own error and its SDK-wrapped text', () => {
+        const own = new BatchGasBudgetError('batch [attest+attest] runs out of gas on the ledger: ran out of gas budget. Aborted before proving; nothing was submitted.');
+        expect(classifySubmitFailure(new Error('scoped', { cause: own }))).toEqual({ code: 'gas-budget', retryable: false });
+        expect(classifySubmitFailure(new Error("Unexpected error submitting scoped transaction 'batch': " + own.message))).toEqual({ code: 'gas-budget', retryable: false });
     });
 
     it('ambiguous: the watch timeout, by name and by text', () => {
@@ -118,7 +125,7 @@ describe('classifySubmitFailure', () => {
     it('internal for anything else; the closed set is what the protocol lists', () => {
         expect(classifySubmitFailure(new Error('finalized-tx round-trip FAILED at deserialize'))).toEqual({ code: 'internal', retryable: false });
         expect(classifySubmitFailure(undefined)).toEqual({ code: 'internal', retryable: false });
-        expect(SUBMIT_FAILURE_CODES).toHaveLength(8);
+        expect(SUBMIT_FAILURE_CODES).toHaveLength(9);
     });
 
     it('isPreMempoolFailure: the dust guard restores on node rejects and coded races only', () => {

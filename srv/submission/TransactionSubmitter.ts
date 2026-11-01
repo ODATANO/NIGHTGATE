@@ -574,6 +574,9 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
     if (/violates the ledger's causality constraint/.test(message)) {
         return { code: 'BatchCausalityViolation', retryable: false, message };
     }
+    if (/runs out of gas on the ledger/.test(message)) {
+        return { code: 'BatchGasBudgetExceeded', retryable: false, message };
+    }
 
     // Node rejects are wrapped by the SDK, so search the whole inspected error. 1010 means an invalid
     // transaction and its `Custom error: N` becomes `1010/N`. 1014 is a pool reject.
@@ -673,6 +676,8 @@ function classificationFromSubmitFailure(
             return { code: 'SponsorPolicyRefused', retryable: false, message };
         case 'causality':
             return { code: 'BatchCausalityViolation', retryable: false, message, ...(info.calls?.length ? { calls: info.calls } : {}) };
+        case 'gas-budget':
+            return { code: 'BatchGasBudgetExceeded', retryable: false, message };
         default:
             return { code: 'UnknownError', retryable: false, message };
     }

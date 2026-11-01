@@ -88,6 +88,9 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
         const own = Array.isArray((causality as any)?.calls) ? (causality as any).calls as BatchCallStageInfo[] : undefined;
         return { code: 'causality', retryable: false, calls: own?.length ? own : parseBatchCallStages(haystack) };
     }
+    if (chain.some((e: any) => e?.code === 'BatchGasBudgetExceeded') || /runs out of gas on the ledger/.test(haystack)) {
+        return { code: 'gas-budget', retryable: false };
+    }
     // An earlier send of the same transaction has no known outcome, so it may still land.
     // This wins over the checks below, which would match its nested causes.
     if (names.includes('SubmitOutcomeUnknownError')) return { code: 'ambiguous', ledgerCode: 'unresolved-send', retryable: false };

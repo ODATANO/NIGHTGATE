@@ -613,6 +613,12 @@ describe('classifySubmissionError', () => {
         expect(c.message).toMatch(/attest=1158\[f\] anchorContentRoot=1159\[g\]/);
     });
 
+    test('a gas refusal before proving gets its own code, carried or by text', () => {
+        expect(classifySubmissionError(coded('gas-budget'), 'preprod')).toMatchObject({ code: 'BatchGasBudgetExceeded', retryable: false });
+        const wrapped = new Error("Unexpected error submitting scoped transaction 'batch:a+a': batch [a+a] runs out of gas on the ledger: ran out of gas budget. Aborted before proving; nothing was submitted.");
+        expect(classifySubmissionError(wrapped, 'preprod')).toMatchObject({ code: 'BatchGasBudgetExceeded', retryable: false });
+    });
+
     test('"invalid transaction" is a 1010 validity reject (permanent), even when 1014 appears in the text', () => {
         const c = classifySubmissionError(new Error('Substrate error 1014: invalid transaction'), 'preprod');
         expect(c).toMatchObject({ code: '1010', retryable: false });

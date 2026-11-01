@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.40.3 - 2026-11-01
+
+### Fixes
+
+- `@odatano/nightgate-tx` 0.20.2. A batch with several calls of the same
+  circuit applies them in array order. Before, they ran in the order the
+  merged transaction listed them. A call budgeted against an earlier state
+  could then run out of gas, and the node refused the batch with `1010/104`.
+- Before proving, a batch runs on a local ledger with the contract's current
+  state and the chain's ledger parameters, in the default segment mode. A call that runs out of gas stops the build with
+  `BatchGasBudgetExceeded`. Nothing is proven or sent. The code is the same in
+  the builder and in server jobs, and `classifyNodeReject` returns
+  `sequencing` for it.
+
+### Changes
+
+- Unbound sponsoring pays a fee that no single dust note covers from several
+  notes together. It takes up to `NIGHTGATE_SPONSOR_MAX_DUST_NOTES` free
+  backings, default 4, largest first. The fee is priced with all their spends.
+  A fee that one note covers still uses one backing. While such a note is
+  busy, the request waits for it.
+
 ## 0.40.2 - 2026-10-31
 
 ### Changes

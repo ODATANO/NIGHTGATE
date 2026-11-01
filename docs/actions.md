@@ -266,6 +266,10 @@ vault, `attest` and `anchorContentRoot` stay guaranteed as the vault grows, and
   `errorCode: "BatchCausalityViolation"` (never retryable, nothing submitted),
   its message ending `Stages in apply order: <call>=<segment>[<stages>] ...`.
   Every multi-call batch logs stages and gas (`[nightgate:batch-segments]`).
+- The gas is checked before proving too: the batch runs on a local ledger with
+  the contract's current state and the chain's ledger parameters. Not with
+  `NIGHTGATE_BATCH_SEGMENT_MODE=observe`. A call that runs out of gas fails the job with
+  `errorCode: "BatchGasBudgetExceeded"` (never retryable, nothing submitted).
 - Independent calls (distinct claim keys, no shared cell): `independentCalls:
   true` groups calls by stage before proving (guaranteed-only first, call order
   within a group). `issueFieldPredicateAttestationBatch` sets it; its in-batch
@@ -611,6 +615,10 @@ as many transactions at once as it has distinct registered dust backings.
 Same-backing requests wait up to `NIGHTGATE_BACKING_WAIT_MS` (default 5 min).
 A backing stays reserved after its spend went out until the sponsor wallet no
 longer lists the spent note (`NIGHTGATE_NOTE_SPENT_WAIT_MS`, default 30 s).
+A fee no single note covers is paid from up to `NIGHTGATE_SPONSOR_MAX_DUST_NOTES`
+free backings together (default 4), largest first, priced with all their
+spends. While a note that covers the fee alone is only busy, the request waits
+for it instead.
 A lost dust race (`1010/170`, `1010/171`, `1010/196`) is rebuilt on the same sponsor
 (`NIGHTGATE_SPONSOR_DUST_RETRIES`, default 4; `NIGHTGATE_SPONSOR_DUST_BACKOFF_MS`,
 default 5000). Job concurrency: `cds.requires.nightgate.jobs.concurrency.heavy`
@@ -1310,6 +1318,7 @@ Job codes (`classifySubmissionError`, `srv/submission/TransactionSubmitter.ts`):
 | `SubmitIntentTimeout` | no | `pre-mempool-reject`, `intent-timeout`: identifier not recorded within `NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS`; nothing broadcast, retry with a new `idempotencyKey` |
 | `SponsorPolicyRefused` | no | `policy` |
 | `BatchCausalityViolation` | no | `causality`; `calls` (name, segId, stages in apply order) on the classification and in the message |
+| `BatchGasBudgetExceeded` | no | `gas-budget`: a batch call runs out of gas on a local ledger before proving; nothing submitted, split the batch |
 | `ContractTypeError` / `IncompleteCallTxPrivateStateConfig` / `IncompleteFindContractPrivateStateConfig` | no | SDK contract configuration errors (by error `name`) |
 | `WalletSigningNotAvailable` | no | session has no encrypted seed |
 | `CHILD_FAILED` | no | a workflow step failed; the message names the step, the steps already on chain and that a new attempt needs a new `idempotencyKey` |

@@ -3,6 +3,7 @@ import {
     withObservedBatchSegments,
     withOrderedBatchSegments
 } from './batch-segment-order';
+import { checkBatchGas } from './batch-gas-preflight';
 import { runtimeConfigEnum } from './runtime-config';
 
 export interface BatchCall {
@@ -23,6 +24,17 @@ export interface BatchScopeResult {
     /** Indexer block height of the inclusion, when the SDK reported one. */
     blockHeight: number | null;
     circuits: string[];
+}
+
+/** The segment id of the call the scope built last, or NaN when it has not exactly one. */
+export function lastCallSegmentId(txCtx: any): number {
+    try {
+        const intents = txCtx?.getLastUnsubmittedCallTxDataToTransact?.()?.[0]?.private?.unprovenTx?.intents;
+        const ids = intents && typeof intents.keys === 'function' ? Array.from(intents.keys()) : [];
+        return ids.length === 1 ? Number(ids[0]) : NaN;
+    } catch {
+        return NaN;
+    }
 }
 
 /** Runs several circuit calls on one contract as one transaction, in call order unless `orderOpts.independentCalls` is set. */
@@ -58,8 +70,13 @@ export async function runBatchInScope(
     const providersAny = providers as any;
     const mode = runtimeConfigEnum<'observe' | 'rewrite'>('NIGHTGATE_BATCH_SEGMENT_MODE') ?? 'rewrite';
     const wrapSegments = mode === 'observe' ? withObservedBatchSegments : withOrderedBatchSegments;
+    // Filled while the calls are built. The wrapper reads it at proving time.
+    const segmentIds: number[] = [];
+    const preflight = typeof providersAny?.publicDataProvider?.queryZSwapAndContractState === 'function'
+        ? (tx: any) => checkBatchGas(tx, providersAny.publicDataProvider, contractAddress, circuits)
+        : undefined;
     const scopedProviders = typeof providersAny?.proofProvider?.proveTx === 'function'
-        ? { ...providersAny, proofProvider: wrapSegments(providersAny.proofProvider, circuits, orderOpts) }
+        ? { ...providersAny, proofProvider: wrapSegments(providersAny.proofProvider, circuits, { ...orderOpts, segmentIds }, preflight) }
         : providers;
 
     const finalized = await contracts.withContractScopedTransaction(
@@ -68,6 +85,7 @@ export async function runBatchInScope(
             for (const c of calls) {
                 c.before?.();
                 await found.callTx[c.circuit](txCtx, ...(c.args ?? []));
+                segmentIds.push(lastCallSegmentId(txCtx));
             }
         },
         { scopeName: `batch:${circuits.join('+')}`, ...scopeOpts }

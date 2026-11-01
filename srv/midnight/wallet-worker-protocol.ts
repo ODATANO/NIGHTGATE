@@ -50,6 +50,7 @@ export const SUBMIT_FAILURE_CODES = [
     'landed-not-applied', // the tx is in a block, but the contract call did not apply
     'policy',             // the fee sponsor refused the tx
     'causality',          // the batch calls are in an order the ledger rejects, found before proving
+    'gas-budget',         // a batch call runs out of gas on the ledger, found before proving
     'internal'            // anything else
 ] as const;
 export type SubmitFailureCode = typeof SUBMIT_FAILURE_CODES[number];

@@ -76,6 +76,8 @@ const FILES = [
     { path: 'srv/midnight/batch-call-scope.d.ts', buildOutput: true },
     { path: 'srv/midnight/batch-segment-order.js', buildOutput: true },
     { path: 'srv/midnight/batch-segment-order.d.ts', buildOutput: true },
+    { path: 'srv/midnight/batch-gas-preflight.js', buildOutput: true },
+    { path: 'srv/midnight/batch-gas-preflight.d.ts', buildOutput: true },
     // the canonical membership-set rule (a public subpath of the main
     // package); a re-export of @odatano/contract-kit.
     { path: 'srv/submission/set-root.js', buildOutput: true },

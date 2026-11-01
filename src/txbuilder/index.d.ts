@@ -199,6 +199,7 @@ export interface BuildSponsorableInput {
      * Up to 8 calls in one transaction, run in array order.
      * If the ledger would reject the order, it fails before proving with `code: 'BatchCausalityViolation'`.
      * Putting the most expensive call last usually helps.
+     * A call that would run out of gas fails before proving with `code: 'BatchGasBudgetExceeded'`.
      * Every circuit must be allowed by the sponsor.
      */
     calls?: PreparedCall[];

@@ -189,8 +189,7 @@ single transactions, which can refuse each other with `1010/104` (see below).
   attestation secret (override `attestationSecret`); it swaps each entry's
   `merkleProof`, so prepare every batched call with the SAME secret. Per-call
   `witnesses` are ignored.
-- Same-named calls have no guaranteed relative order: batch them only when
-  order-independent, grouped (both attests before both anchors).
+- Same-named calls keep their array order too.
 - `bind: false` refuses a batch that moves value. The sponsor's allow-list
   applies per circuit, its size cap (default 64 KiB) to the whole transaction
   (~5.4 KB per call).
@@ -226,11 +225,11 @@ Dependent batches leave the flag unset. A remaining violation carries
 `calls: [{ name, segId, stages }]` in apply order (also in the message), so a
 consumer can split deterministically.
 
-**Map size.** Every call of a batch is budgeted against the state at build time.
-A batch that grows a map past 1, 16 or 256 entries needs more gas for its
-later calls than they were given; the node refuses it before the mempool
-(`1010/104`, no fee). Cross those sizes with single calls and batch the rest.
-From about 4096 entries on the ledger's 20 % margin covers one more level.
+**Gas check.** Every call of a batch is budgeted against the state the calls
+before it leave. Before proving, the builder applies the batch to a local
+ledger with the contract's current state. A call that runs out of gas aborts
+the build with `code: 'BatchGasBudgetExceeded'`. Nothing is proven or sent;
+split the batch. The node would refuse such a batch with `1010/104`.
 
 `bind` picks the handover. `true` (default) returns `finalizedTxB64` for
 `sponsorFinalizedTransaction`. `false` returns `unboundTxB64`, the signed

@@ -772,6 +772,10 @@ export async function createTxBuilder(opts) {
                         } catch { /* frozen error */ }
                         throw e;
                     }
+                    if (/runs out of gas on the ledger/.test(String(e?.message ?? e))) {
+                        try { e.code = 'BatchGasBudgetExceeded'; } catch { /* frozen error */ }
+                        throw e;
+                    }
                     if (!holder.captured) throw e;
                 }
             } else {

@@ -63,6 +63,7 @@ describe('txbuilder submit: classifyNodeReject', () => {
     it('the balancer\'s own funds message counts as funds without a sub-code', async () => {
         expect(await classify(new Error('Insufficient Funds: could not balance dust'))).toEqual({ kind: 'funds', subCode: null });
         expect(await classify(new Error('BatchCausalityViolation: causality constraint'))).toEqual({ kind: 'sequencing', subCode: null });
+        expect(await classify(new Error('batch [a+a] runs out of gas on the ledger: ran out of gas budget'))).toEqual({ kind: 'sequencing', subCode: null });
     });
 
     it('anything else is unknown', async () => {

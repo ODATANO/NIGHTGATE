@@ -126,6 +126,22 @@ export interface BatchOrderOptions {
     independentCalls?: boolean;
     // Number of leading calls that keep their position even with `independentCalls`.
     orderedPrefix?: number;
+    // The segment id each call got when it was built, in call order.
+    // Calls of the same circuit are matched by it, because the merged intents come back in no fixed order.
+    segmentIds?: number[];
+}
+
+/** The intents in call order, matched by build-time segment id. Null when the ids do not fit the calls. */
+function pickBySegmentIds(intents: Map<number, any>, circuitsInOrder: string[], segmentIds: number[] | undefined): Array<[number, any]> | null {
+    if (!segmentIds || segmentIds.length !== circuitsInOrder.length) return null;
+    if (new Set(segmentIds).size !== segmentIds.length) return null;
+    const picked: Array<[number, any]> = [];
+    for (let i = 0; i < segmentIds.length; i++) {
+        const intent = intents.get(segmentIds[i]);
+        if (entryPointName(intent?.actions?.[0]?.entryPoint) !== circuitsInOrder[i]) return null;
+        picked.push([segmentIds[i], intent]);
+    }
+    return picked;
 }
 
 /** Gives the calls the existing segment ids in call order. Returns false and leaves `tx` unchanged on a mismatch. */
@@ -135,19 +151,21 @@ export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: Bat
     if (circuitsInOrder.length < 2 || intents.size < 2) return false;
 
     const entries = Array.from(intents.entries());
-    const pools = new Map<string, Array<[number, any]>>();
-    for (const [segId, intent] of entries) {
-        const name = entryPointName(intent?.actions?.[0]?.entryPoint);
-        const pool = pools.get(name);
-        if (pool) pool.push([segId, intent]);
-        else pools.set(name, [[segId, intent]]);
-    }
-
-    let picked: Array<[number, any]> = [];
-    for (const circuit of circuitsInOrder) {
-        const pool = pools.get(circuit);
-        if (!pool || pool.length === 0) return false;
-        picked.push(pool.shift()!);
+    const byIds = pickBySegmentIds(intents, circuitsInOrder, opts.segmentIds);
+    let picked: Array<[number, any]> = byIds ?? [];
+    if (!byIds) {
+        const pools = new Map<string, Array<[number, any]>>();
+        for (const [segId, intent] of entries) {
+            const name = entryPointName(intent?.actions?.[0]?.entryPoint);
+            const pool = pools.get(name);
+            if (pool) pool.push([segId, intent]);
+            else pools.set(name, [[segId, intent]]);
+        }
+        for (const circuit of circuitsInOrder) {
+            const pool = pools.get(circuit);
+            if (!pool || pool.length === 0) return false;
+            picked.push(pool.shift()!);
+        }
     }
 
     if (opts.independentCalls) {
@@ -180,7 +198,9 @@ export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: Bat
 export function withOrderedBatchSegments(
     proofProvider: any,
     circuitsInOrder: string[],
-    opts: BatchOrderOptions = {}
+    opts: BatchOrderOptions = {},
+    // Runs on the ordered transaction before proving and throws to stop the build.
+    preflight?: (tx: any) => Promise<void>
 ): any {
     const wrapped = Object.create(proofProvider);
     wrapped.proveTx = async (tx: any, ...rest: unknown[]) => {
@@ -213,6 +233,7 @@ export function withOrderedBatchSegments(
                     calls
                 );
             }
+            await preflight?.(tx);
         }
         return proofProvider.proveTx(tx, ...rest);
     };

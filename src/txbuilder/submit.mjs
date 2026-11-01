@@ -77,7 +77,7 @@ export function isTransportFailure(err) {
 }
 
 /** Maps a node rejection to a kind by its ledger error code. Only 'stale-dust-proof' and 'stale-transcript' are worth a rebuild.
- *  'sequencing' means the batch's call order is not allowed, so send the calls as separate transactions.
+ *  'sequencing' means the batch's call order or gas is not allowed, so send the calls as separate transactions.
  *  After a rejection always build new bytes. Resend the same bytes only after a connection failure. */
 export function classifyNodeReject(err) {
     const haystack = rejectHaystack(err);
@@ -91,7 +91,7 @@ export function classifyNodeReject(err) {
         if (subCode === 117) return { kind: 'malformed', subCode };
     }
     if (/insufficient funds|could not balance dust/i.test(haystack)) return { kind: 'funds', subCode };
-    if (/causality|sequencing/i.test(haystack)) return { kind: 'sequencing', subCode };
+    if (/causality|sequencing|runs out of gas on the ledger/i.test(haystack)) return { kind: 'sequencing', subCode };
     return { kind: 'unknown', subCode };
 }
 

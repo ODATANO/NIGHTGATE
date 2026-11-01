@@ -3446,6 +3446,54 @@ describe('dust backing stays reserved until the wallet lists the spend', () => {
         }
     }, 15_000);
 
+    it('a fee no single note covers is paid from two backings, priced with both spends', async () => {
+        const SESSION = 'session-sponsor-unbound-multi1';
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        const { held } = workerExports.__noteLeaseForTests;
+        const fromParts = ledgerTx.fromParts.getMockImplementation();
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            let notes = [
+                { token: { backingNight: 'backing-M1', nonce: 'm1' }, generatedNow: 600n },
+                { token: { backingNight: 'backing-M2', nonce: 'm2' }, generatedNow: 600n }
+            ];
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => notes } } });
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            // The caller pays 1000 alone; with two dust spends the whole tx costs 1100.
+            ledgerTx.deserialize.mockImplementation(() => ({ ...callerTx(), eraseProofs: () => ({ merge: () => ({ feesWithMargin: () => 1_100n }) }) }));
+            ledgerTx.fromParts.mockImplementation(() => ({ addIntent: (segment: any, intent: any) => ({ dustUnproven: true, segment, intent, eraseProofs: () => ({}) }) }));
+            makeWasmProvingService.mockImplementation(() => ({
+                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-multi'] }) }) })
+            }));
+            spendCoins.mockClear();
+            const reply = await rpc('sponsorUnboundTx', sponsorArgs(SESSION));
+            expect(reply.ok).toBe(true);
+            expect(reply.result.note).toBe('backing-M1+backing-M2');
+            const lastInputs = spendCoins.mock.calls.at(-1)![2].map((c: any) => [c.token.nonce, c.value]);
+            expect(lastInputs).toEqual([['m1', 600n], ['m2', 500n]]);
+            // Both backings stay reserved until both spent notes are gone.
+            await new Promise((r) => setTimeout(r, 200));
+            expect(held(`${SESSION}|backing-M1`)).toBeDefined();
+            expect(held(`${SESSION}|backing-M2`)).toBeDefined();
+            notes = [];
+            expect(await until(() => held(`${SESSION}|backing-M1`) === undefined && held(`${SESSION}|backing-M2`) === undefined, 3_000)).toBe(true);
+        } finally {
+            vi.unstubAllGlobals();
+            ledgerTx.fromParts.mockImplementation(fromParts!);
+            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            await rpc('evict', { sessionId: SESSION });
+        }
+    }, 15_000);
+
     it('a pre-mempool reject frees the backing at once', async () => {
         const SESSION = 'session-sponsor-unbound-hold02';
         const facade = await initSession(SESSION);
@@ -3547,6 +3595,39 @@ describe('dust backing lease ownership', () => {
         expect(sufficientNoteOnBacking('sess', fresh, 'sess|A', 412n)).toBeNull();     // 407 < 412: refused before proving
         expect(sufficientNoteOnBacking('sess', fresh, 'sess|B', 412n)?.token.backingNight).toBe('B');
         expect(sufficientNoteOnBacking('sess', fresh, 'sess|A', 400n)?.token.backingNight).toBe('A');
+    });
+
+    it('combines free backings, largest first, only when no single note covers the fee', () => {
+        const { tryLockDust, releaseLease, held } = workerExports.__noteLeaseForTests;
+        const pool = [
+            { token: { backingNight: 'a' }, generatedNow: 4n },
+            { token: { backingNight: 'b' }, generatedNow: 6n },
+            { token: { backingNight: 'c' }, generatedNow: 3n }
+        ];
+        expect(tryLockDust('sess', pool, 9n, 60_000, new Set(), 1)).toBeNull();
+        const lease = tryLockDust('sess', pool, 9n, 60_000, new Set(), 4);
+        expect(lease.backing).toBe('b+a');
+        expect(lease.parts.map((p: any) => p.key)).toEqual(['sess|b', 'sess|a']);
+        expect(held('sess|c')).toBeUndefined();
+        // c alone is too small for the rest: nothing is locked.
+        expect(tryLockDust('sess', pool, 9n, 60_000, new Set(), 4)).toBeNull();
+        expect(held('sess|c')).toBeUndefined();
+        releaseLease(lease);
+        expect(held('sess|a')).toBeUndefined();
+        // A fee one note covers stays on one backing.
+        const single = tryLockDust('sess', pool, 5n, 60_000, new Set(), 4);
+        expect(single.parts).toHaveLength(1);
+        // That note is busy: wait for it rather than tie up the small ones.
+        expect(tryLockDust('sess', pool, 5n, 60_000, new Set(), 4)).toBeNull();
+        releaseLease(single);
+        // More notes than allowed would be needed.
+        expect(tryLockDust('sess', pool, 13n, 60_000, new Set(), 2)).toBeNull();
+    });
+
+    it('dustSpendInputs takes the fee from the notes in order, the last one partly', () => {
+        const { dustSpendInputs } = workerExports.__noteLeaseForTests;
+        const notes = [{ token: 'x', generatedNow: 6n }, { token: 'y', generatedNow: 4n }, { token: 'z', generatedNow: 3n }];
+        expect(dustSpendInputs(notes, 9n)).toEqual([{ token: 'x', value: 6n }, { token: 'y', value: 3n }]);
     });
 });
 

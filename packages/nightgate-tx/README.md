@@ -99,7 +99,8 @@ receives the witnesses); `proofTimeoutMs` raises the 5 min per-request timeout.
 
 `buildSponsorable({ contractAddress, calls: [...] })` puts up to 8 calls into
 ONE transaction (one fee). A causality pre-check aborts before proving
-(`BatchCausalityViolation`, no fee, names the calls). For independent calls
+(`BatchCausalityViolation`, no fee, names the calls). A gas check on a local
+ledger aborts the same way (`BatchGasBudgetExceeded`). For independent calls
 (a proof cart: distinct claim keys) `independentCalls: true` orders them by
 execution stage; `orderedPrefix: 1` keeps a leading in-batch anchor first.
 Details: `docs/txbuilder.md` in the main repo.

@@ -5,7 +5,7 @@
  * the findDeployedContract result.
  */
 
-import { runBatchInScope } from '../../srv/midnight/batch-call-scope';
+import { lastCallSegmentId, runBatchInScope } from '../../srv/midnight/batch-call-scope';
 
 const PROVIDERS = { fake: 'providers' };
 const ADDR = '0xCONTRACT';
@@ -190,6 +190,43 @@ describe('runBatchInScope', () => {
         expect(proveTx).toHaveBeenCalledWith(tx);
         expect(tx.intents.get(4)).toBe(attest);
         expect(tx.intents.get(9)).toBe(bind);
+    });
+
+    test('same-name calls prove in build order, read from the segment id each call got', async () => {
+        const built: number[] = [17, 3, 55];
+        let last: number | undefined;
+        const txCtx = {
+            getLastUnsubmittedCallTxDataToTransact: () =>
+                [{ private: { unprovenTx: { intents: new Map([[last, { actions: [{ entryPoint: 'attest' }] }]]) } } }]
+        };
+        const byId = new Map(built.map(id => [id, { actions: [{ entryPoint: 'attest' }], id }]));
+        // The merged map comes back in no fixed order.
+        const tx: any = { intents: new Map([55, 17, 3].map(id => [id, byId.get(id)])) };
+        const contracts = {
+            withContractScopedTransaction: vi.fn(async (p: any, fn: (ctx: unknown) => Promise<void>) => {
+                await fn(txCtx);
+                await p.proofProvider.proveTx(tx);
+                return { public: { txHash: '0x1', status: 'SucceedEntirely' } };
+            })
+        };
+        let n = 0;
+        const found = { callTx: { attest: vi.fn(async () => { last = built[n++]; }) } };
+        const providers = { proofProvider: { proveTx: vi.fn(async () => 'proven') } };
+
+        await runBatchInScope(contracts, providers, found, [
+            { circuit: 'attest', args: [] }, { circuit: 'attest', args: [] }, { circuit: 'attest', args: [] }
+        ], ADDR);
+
+        // The first built call gets the smallest id, the last built the largest.
+        expect(tx.intents.get(3).id).toBe(17);
+        expect(tx.intents.get(17).id).toBe(3);
+        expect(tx.intents.get(55).id).toBe(55);
+    });
+
+    test('lastCallSegmentId is NaN without exactly one intent', () => {
+        expect(lastCallSegmentId({})).toBeNaN();
+        const two = { getLastUnsubmittedCallTxDataToTransact: () => [{ private: { unprovenTx: { intents: new Map([[1, {}], [2, {}]]) } } }] };
+        expect(lastCallSegmentId(two)).toBeNaN();
     });
 
     // ---- segment mode selection (NIGHTGATE_BATCH_SEGMENT_MODE) -------------
