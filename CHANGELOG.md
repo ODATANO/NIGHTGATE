@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.41.0 - 2026-11-06
+
+### Fixes
+
+- `Blocks.author` holds the validator that produced the block: its AURA
+  public key as `0x` hex. Before, it held the engine id and the slot bytes,
+  a value that differs for every block. The validator is the authority of the
+  block's slot, taken from the authority list in the parent block's state.
+  The crawler stores it only when the header seal verifies against that key.
+  A block without an AURA slot, or with a seal that does not match, has
+  `author` null.
+
+### Changes
+
+- `Blocks.slot`: the AURA slot of the block.
+- The crawler reads the authority list from the node once per run. After
+  that it follows the list changes that block headers announce.
+- Blocks indexed by an earlier version are rewritten in the background while
+  the crawler runs. Each header is read again, a few hundred blocks per
+  second. `SyncState.authorBackfillHeight` is the height up to which blocks
+  carry the validator. `SyncState.authorsBackfilledAt` is set once all do.
+- Schema delta: three nullable columns, `Blocks.slot`,
+  `SyncState.authorBackfillHeight` and `SyncState.authorsBackfilledAt`.
+- New dependency `@polkadot/wasm-crypto`, which checks the seal.
+- `@odatano/nightgate-tx` unchanged.
+
 ## 0.40.3 - 2026-11-01
 
 ### Fixes

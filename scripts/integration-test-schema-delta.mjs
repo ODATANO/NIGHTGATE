@@ -377,6 +377,7 @@ ok('delta 0.23: the legacy submission row survived with null coordinates',
     const blockSql = after.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='midnight_Blocks'").get()?.sql ?? '';
     ok('delta 0.25: ledgerParameters is no longer NOT NULL',
         !/ledgerParameters[^,]*NOT NULL/i.test(blockSql), blockSql);
+    ok('delta 0.41: Blocks gained slot', blockCols.has('slot'), [...blockCols].join(','));
 }
 
 {
@@ -393,6 +394,8 @@ ok('delta 0.23: the legacy submission row survived with null coordinates',
     ok('delta 0.25: the two trailing-pass cursors were added to SyncState',
         syncCols.has('lastDecodedHeight') && syncCols.has('lastSupplementedHeight'), [...syncCols].join(','));
     ok('delta 0.33: the identifier backfill marker was added to SyncState', syncCols.has('identifiersBackfilledAt'), [...syncCols].join(','));
+    ok('delta 0.41: the author backfill cursor and marker were added to SyncState',
+        syncCols.has('authorBackfillHeight') && syncCols.has('authorsBackfilledAt'), [...syncCols].join(','));
 }
 
 {

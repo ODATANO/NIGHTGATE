@@ -201,8 +201,8 @@ describe('runtime initialize', () => {
             expect(mockEnsureNightgateModelLoaded).toHaveBeenCalledTimes(1);
             expect(mockEnsureNightgateModelLoaded.mock.invocationCallOrder[0]).toBeLessThan(mockConnectTo.mock.invocationCallOrder[0]);
             expect(mockConnectTo).toHaveBeenCalledWith('db');
-            expect(selectFromSpy).toHaveBeenCalledWith('midnight.Blocks');
-            expect(selectFromSpy).toHaveBeenCalledWith('midnight.SyncState');
+            expect(selectFromSpy).toHaveBeenCalledWith('midnight.Blocks', ['slot']);
+            expect(selectFromSpy).toHaveBeenCalledWith('midnight.SyncState', ['authorBackfillHeight', 'authorsBackfilledAt']);
             expect(mockDbRun).toHaveBeenNthCalledWith(1, expect.objectContaining({
                 __kind: 'one',
                 __table: 'midnight.Blocks'
@@ -300,7 +300,7 @@ describe('runtime initialize', () => {
 
         const err = await initialize().catch(e => e);
         expect(err).toBeInstanceOf(SchemaNotDeployedError);
-        expect(err.missingTable).toBe('midnight.SyncState');
+        expect(err.missingTable).toBe('midnight.SyncState (needs columns: authorBackfillHeight, authorsBackfilledAt)');
         expect(err.message).toMatch(/npm run deploy/);
         expect(getStatus()).toEqual(expect.objectContaining({
             initialized: false,

@@ -121,8 +121,8 @@ function resolveDbPath(): string {
 // Only checks that tables and columns exist. It never changes the schema.
 async function ensureSchemaDeployed(): Promise<void> {
     const requiredTables: Array<{ table: string; columns?: string[] }> = [
-        { table: 'midnight.Blocks' },
-        { table: 'midnight.SyncState' },
+        { table: 'midnight.Blocks', columns: ['slot'] },
+        { table: 'midnight.SyncState', columns: ['authorBackfillHeight', 'authorsBackfilledAt'] },
         { table: 'midnight.PendingSubmissions', columns: ['submitIntentData'] },
         { table: 'midnight.TransactionResults' },
         { table: 'midnight.PrivateStates' },

@@ -16,6 +16,7 @@ import {
     readBlockEvents, txTypeFromEvents, projectTransfer, NIGHT_RAW_TOKEN_TYPE, type ExtrinsicEvents
 } from './block-events';
 import { encodeUnshieldedOwner, computeInitialNonce } from './utxo-identity';
+import { BlockAuthorResolver } from './block-author';
 import type { DbRunner } from '../utils/db-types';
 import {
     Blocks, Transactions, TransactionResults, TransactionFees, ContractActions,
@@ -218,11 +219,13 @@ export class BlockProcessor {
         '0x26aa394eea5630e07c48ae0c9558cef7f9cce9c888469bb1a0dceaa129672ef8';
     /** Runtime version per raw LastRuntimeUpgrade value, so the node is asked once per value and not per block. */
     private readonly specVersionByUpgrade = new Map<string, SpecVersionLookup>();
+    private readonly authors: BlockAuthorResolver;
 
     constructor(
         private nodeProvider: MidnightNodeProvider
     ) {
         this.defaultPalletMap = buildPalletMap();
+        this.authors = new BlockAuthorResolver(nodeProvider);
     }
 
     private palletMapFor(specVersion: number): Map<number, PalletMapping> {
@@ -447,6 +450,7 @@ export class BlockProcessor {
         // These SDK calls run before the database transaction opens,
         // so the transaction is not held open while waiting for them.
         const projections = await this.projectEvents(extrinsicEvents, timestamp, `block ${blockHash}`);
+        const producer = await this.authors.resolve(blockHash, header);
 
         const written = await this.db.tx(async (tx) => {
             const blockId = cds.utils.uuid();
@@ -467,7 +471,8 @@ export class BlockProcessor {
                 height: height,
                 protocolVersion,
                 timestamp,
-                author: this.extractAuthor(header.digest?.logs),
+                author: producer.author,
+                slot: producer.slot,
                 stateRoot: header.stateRoot,
                 parent_ID: parentBlock?.ID || null
             }));
@@ -1020,25 +1025,5 @@ export class BlockProcessor {
             throw new Error(`No runtime version for ${where}: ${(err as Error).message}`);
         }
         return this.specVersionFromBatch(rv, where);
-    }
-
-    /** Returns `engineId:data` of the PreRuntime digest log, which has type 6. Otherwise the first log. */
-    private extractAuthor(digestLogs: string[] | undefined): string | null {
-        if (!digestLogs || digestLogs.length === 0) return null;
-
-        for (const logHex of digestLogs) {
-            const clean = bareHex(logHex);
-            if (clean.length < 10) continue;
-
-            const logType = parseInt(clean.slice(0, 2), 16);
-
-            if (logType === 6) {
-                const engineId = Buffer.from(clean.slice(2, 10), 'hex').toString('ascii');
-                const data = '0x' + clean.slice(10);
-                return `${engineId}:${data}`;
-            }
-        }
-
-        return digestLogs[0] || null;
     }
 }

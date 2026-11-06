@@ -3,7 +3,6 @@
  * - blake2b-256 extrinsic hashing
  * - On-chain timestamp from Timestamp pallet
  * - protocolVersion from RuntimeVersion
- * - Structured author extraction from digest logs
  */
 
 const selectColumnsWhereSpy = vi.hoisted(() => (vi.fn()));
@@ -338,53 +337,6 @@ describe('getProtocolVersion: RuntimeVersion per-block query', () => {
         expect(failed?.message).toMatch(/No runtime version for block 0xdef: runtime unavailable/);
         expect(isTransientError(failed!)).toBe(true);
         await expect((processor as any).getProtocolVersion('0xnull')).rejects.toThrow(/No runtime version for block 0xnull/);
-    });
-});
-
-// ============================================================================
-// Structured Author from Digest Logs
-// ============================================================================
-
-describe('extractAuthor: digest log parsing', () => {
-    const processor = new BlockProcessor({} as any);
-
-    it('extracts PreRuntime log with BABE engine', () => {
-        // Type 0x06 + "BABE" in hex (42414245) + some slot data
-        const preRuntimeLog = '0x0642414245aabbccdd';
-        const result = (processor as any).extractAuthor([preRuntimeLog]);
-        expect(result).toBe('BABE:0xaabbccdd');
-    });
-
-    it('extracts PreRuntime log with aura engine', () => {
-        // Type 0x06 + "aura" in hex (61757261) + authority data
-        const preRuntimeLog = '0x0661757261112233';
-        const result = (processor as any).extractAuthor([preRuntimeLog]);
-        expect(result).toBe('aura:0x112233');
-    });
-
-    it('returns null for empty digest logs', () => {
-        expect((processor as any).extractAuthor([])).toBeNull();
-        expect((processor as any).extractAuthor(undefined)).toBeNull();
-    });
-
-    it('falls back to first log if no PreRuntime entry', () => {
-        // Type 0x04 = Consensus (not PreRuntime)
-        const consensusLog = '0x044241424511223344';
-        const result = (processor as any).extractAuthor([consensusLog]);
-        expect(result).toBe(consensusLog);
-    });
-
-    it('skips short log entries', () => {
-        const result = (processor as any).extractAuthor(['0x06', '0x064241424511223344']);
-        // First entry too short (< 10 chars after 0x), second is valid PreRuntime
-        expect(result).toBe('BABE:0x11223344');
-    });
-
-    it('picks first PreRuntime log when multiple exist', () => {
-        const log1 = '0x0642414245aabbccdd';  // BABE
-        const log2 = '0x0661757261eeff0011';  // aura
-        const result = (processor as any).extractAuthor([log1, log2]);
-        expect(result).toBe('BABE:0xaabbccdd');
     });
 });
 

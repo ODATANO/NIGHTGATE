@@ -14,6 +14,7 @@ import { rollbackIndexedDataFromHeight } from './rollback';
 import { LedgerPayloadDecoder } from './LedgerPayloadDecoder';
 import { decodeLedgerPayloadInWorker } from '../midnight/decode-worker-client';
 import { IndexerSupplement } from './IndexerSupplement';
+import { BlockAuthorBackfill } from './BlockAuthorBackfill';
 import { contractStatePolicy } from './contract-state';
 import { SyncState, ReorgLog, Blocks, type Block } from '#cds-models/midnight';
 
@@ -75,6 +76,8 @@ export class MidnightCrawler {
     /** Background passes that run behind the indexed tip. Both are off unless configured. */
     private decoder: LedgerPayloadDecoder | null = null;
     private supplement: IndexerSupplement | null = null;
+    /** Rewrites blocks stored with the slot in `author`. Ends itself once none is left. */
+    private authorBackfill: BlockAuthorBackfill | null = null;
 
     private config: Required<CrawlerConfig>;
 
@@ -154,8 +157,11 @@ export class MidnightCrawler {
         }
     }
 
-    /** Neither pass blocks indexing, and a failure in either leaves the indexed blocks untouched. */
+    /** No pass blocks indexing, and a failure in one leaves the indexed blocks untouched. */
     private async startTrailingPasses(): Promise<void> {
+        this.authorBackfill = new BlockAuthorBackfill(this.nodeProvider, { batchSize: 200, intervalMs: 250, retryMs: 30_000 });
+        await this.authorBackfill.init(this.db);
+        this.authorBackfill.start();
         if (this.config.decodePayloads) {
             // The crawler stores only finalized blocks, so the pass can decode up to the indexed tip.
             this.decoder = new LedgerPayloadDecoder({ batchSize: 25, intervalMs: 1000, lagBlocks: 0, decode: decodeLedgerPayloadInWorker });
@@ -253,9 +259,10 @@ export class MidnightCrawler {
         this.isRunning = false;
         if (this.redriveTimer) { clearTimeout(this.redriveTimer); this.redriveTimer = null; }
 
-        await Promise.allSettled([this.decoder?.stop(), this.supplement?.stop()]);
+        await Promise.allSettled([this.decoder?.stop(), this.supplement?.stop(), this.authorBackfill?.stop()]);
         this.decoder = null;
         this.supplement = null;
+        this.authorBackfill = null;
 
         const inflight = [this.ingestPromise, this.liveProcessing].filter((p): p is Promise<void> => !!p);
         if (inflight.length > 0) {

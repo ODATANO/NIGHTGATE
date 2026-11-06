@@ -31,7 +31,8 @@ entity Blocks : cuid, managed {
     height           : Integer64 not null;
     protocolVersion  : Integer not null;
     timestamp        : Integer not null;
-    author           : HexEncoded;
+    author           : HexEncoded; // null = not known; AURA public key of the validator that produced the block
+    slot             : Integer64; // null = the header names none; AURA slot of the block
     stateRoot        : HexEncoded;
     ledgerParameters : LargeBinary;
     parent           : Association to Blocks;
@@ -317,6 +318,8 @@ entity SyncState {
         lastErrorAt             : Timestamp;
         consecutiveErrors       : Integer default 0;
         identifiersBackfilledAt : Timestamp; // null = rows decoded before TransactionIdentifiers existed are not filled in yet
+        authorBackfillHeight    : Integer64; // null = not started; blocks up to this height carry the validator in author
+        authorsBackfilledAt     : Timestamp; // null = blocks stored with the slot in author are not all rewritten yet
 }
 
 entity ReorgLog : cuid, managed {

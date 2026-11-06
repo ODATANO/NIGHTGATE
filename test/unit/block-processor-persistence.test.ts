@@ -14,6 +14,9 @@
 
 import cds from '@sap/cds';
 import { BlockProcessor } from '../../srv/crawler/BlockProcessor';
+import { AURA_AUTHORITIES_STORAGE_KEY } from '../../srv/crawler/block-author';
+import { TypeRegistry } from '@polkadot/types/create';
+import auraHeaders from '../fixtures/aura-headers.json';
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
 // (would shadow Vitest's global test()).
@@ -214,6 +217,27 @@ describe('BlockProcessor persistence paths', () => {
         }
     });
 
+    it('stores the validator and the slot of a block, read from a mainnet header', async () => {
+        const [block] = auraHeaders.blocks;
+        const authorities = new TypeRegistry().createType('Vec<H256>', block.parentAuthorities).toHex();
+        const provider = {
+            getBlock: vi.fn().mockResolvedValue({ block: { header: block.header, extrinsics: [] }, justifications: null }),
+            getRuntimeVersion: vi.fn().mockResolvedValue({ specVersion: 77 }),
+            getStorage: vi.fn(async (key: string) =>
+                key === AURA_AUTHORITIES_STORAGE_KEY ? authorities : buildTimestampHex(1_700_000_000))
+        };
+        const processor = makeProcessor(provider);
+        vi.spyOn(processor as any, 'decodeBlockEvents').mockReturnValue(new Map());
+
+        await processor.processBlockByHash(block.hash);
+
+        const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).columns('author', 'slot', 'height').where({ hash: block.hash }));
+        expect(row.author).toBe(block.author);
+        expect(Number(row.slot)).toBe(block.slot);
+        expect(Number(row.height)).toBe(block.height);
+        expect(provider.getStorage).toHaveBeenCalledWith(AURA_AUTHORITIES_STORAGE_KEY, block.header.parentHash);
+    });
+
     // ------------------------------------------------------------------------
     // Full persist: block + 5 transactions + results/fees + 3 contract actions
     // + SyncState advance, all written to the real DB.
@@ -282,7 +306,9 @@ describe('BlockProcessor persistence paths', () => {
             hash: '0xnew',
             protocolVersion: 77,
             timestamp: 1_700_000_000,
-            author: 'BABE:0xdeadbeef',
+            // The digest names no AURA slot, so no validator is stored.
+            author: null,
+            slot: null,
             stateRoot: '0xstate',
             parent_ID: parentId
         }));
