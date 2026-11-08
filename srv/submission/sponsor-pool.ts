@@ -86,13 +86,14 @@ export function benchSponsor(id: string, cooldownMs: number): void {
 export function isRetryableSponsorFailure(err: unknown): boolean {
     const coded = findNightgateError(err)?.code;
     if (coded === 'WALLET_NOT_SYNCED' || coded === 'FEE_SPONSOR_UNUSABLE') return true;
-    if ((err as any)?.name === 'FeeSponsorError') return true;
+    const e = err as { name?: unknown; message?: unknown } | null | undefined;
+    if (e?.name === 'FeeSponsorError') return true;
     const info = classifySubmitFailure(err);
     if (info.code === 'dust-race') return info.ledgerCode !== 'pool-invalid';
     if (info.code !== 'internal') return false;
     // These failures arrive from the worker without an error code, so match the message text.
-    const msg = String((err as any)?.message ?? err ?? '');
-    return /genuine(ly)? sync|not caught up|sync.*(timeout|timed out|stalled)|not synced to tip|No facade for sponsorSessionId|dust.*(stale|validity)|WALLET_SYNCING|Sponsor session/i.test(msg);
+    const msg = String(e?.message ?? err ?? '');
+    return /genuine(ly)? sync|not caught up|sync.*(timeout|timed out|stalled)|not synced to tip|No facade for sponsorSessionId|dust.*(stale|validity)|WALLET_SYNCING|Sponsor session|no free dust backing/i.test(msg);
 }
 
 /** A short-lived dust conflict. Rebuild with the same sponsor. */

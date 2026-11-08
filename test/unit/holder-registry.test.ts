@@ -4,7 +4,8 @@
  * provider holding real ledger state of the contract.
  */
 const providerState = vi.hoisted(() => ({ state: null as any, queried: [] as string[] }));
-vi.mock('../../srv/midnight/public-data-provider', () => ({
+vi.mock('../../srv/midnight/public-data-provider', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../../srv/midnight/public-data-provider')>()),
     buildPublicDataProvider: vi.fn(async () => ({
         queryContractState: async (addr: string) => { providerState.queried.push(addr); return providerState.state; }
     }))
@@ -43,11 +44,17 @@ describe('readHolderRegistration', () => {
         // Real ledger state of a fresh deployment (no holders), read back through `ledger()`.
         const rt: any = await import('@midnight-ntwrk/compact-runtime');
         const contract = new artifact.Contract({});
-        const initial = contract.initialState(rt.createConstructorContext({}, '00'.repeat(32)));
-        providerState.state = { data: initial.currentContractState.data };
+        const initial = await contract.initialState(rt.createConstructorContext({}, '00'.repeat(32)));
+        providerState.state = { contractState: { era: 'v9', deserialize: () => ({ data: initial.currentContractState.data }) } };
         const miss = await readHolderRegistration({ contractAddress: 'cc'.repeat(32), tokenType: T, claimKey, artifactPath: ARTIFACT, contractProvidersConfig: {} as any });
         expect(miss).toEqual({ registered: false, entry });
         expect(providerState.queried).toEqual(['cc'.repeat(32)]);
+    });
+
+    it('refuses a state written by ledger 8', async () => {
+        providerState.state = { contractState: { era: 'v8' } };
+        await expect(readHolderRegistration({ contractAddress: 'cc'.repeat(32), tokenType: T, claimKey: holderClaimKey(SECRET), artifactPath: ARTIFACT, contractProvidersConfig: {} as any }))
+            .rejects.toThrow(/written by ledger v8/);
     });
 
     it('answers null for a contract without state', async () => {

@@ -1,7 +1,7 @@
 // Derives the Bech32m address and DUST initial nonce of an unshielded UTXO, which the chain event lacks.
 // Both match the Midnight indexer's values exactly.
 
-import { loadLedgerV8 } from '../midnight/sdk-loader';
+import { loadLedger } from '../midnight/sdk-loader';
 import { bareHex } from '../utils/hex-patterns';
 
 type AddressFormatModule = typeof import('@midnightntwrk/wallet-sdk-address-format');
@@ -44,7 +44,7 @@ export async function encodeUnshieldedOwner(rawHex: string, network: string): Pr
 
 /** `intentHash` must be hex without `0x`, because the ledger rejects the prefix. */
 export async function computeInitialNonce(outputNo: number, intentHash: string): Promise<string> {
-    const ledger = await loadLedgerV8();
+    const ledger = await loadLedger();
     const nonce = ledger.dustInitialNonce(BigInt(outputNo), intentHash);
     return typeof nonce === 'string'
         ? bareHex(nonce)

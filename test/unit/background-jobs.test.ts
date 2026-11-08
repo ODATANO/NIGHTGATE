@@ -42,7 +42,7 @@ type Row = {
     heartbeatAt?: string | null;
     submissionId?: string | null;
     txHash?: string | null;
-    chainStatus?: 'pending' | 'success' | 'failure' | null;
+    chainStatus?: 'pending' | 'success' | 'failure' | 'dropped' | null;
     chainFinalizedAt?: string | null;
     createdAt: string;
     modifiedAt: string;
@@ -949,6 +949,10 @@ describe('bounded background scans remain fair beyond one page', () => {
         return row;
     };
 
+    // The next pass a minute later, when the shared lookup budget has refilled.
+    const laterPass = (): void => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(Date.now() + 60_000); };
+    afterEach(() => { vi.useRealTimers(); });
+
     test('advances past 100 unresolved reconciliation rows', async () => {
         for (let i = 0; i < 101; i++) {
             putRow(`recon-${String(i).padStart(3, '0')}`, {
@@ -961,6 +965,7 @@ describe('bounded background scans remain fair beyond one page', () => {
         registerChainOutcomeConfirmer(async (txHash) => txHash === '00late' ? { status: 'success', blockHeight: 5 } : null);
         try {
             expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+            laterPass();
             expect(await confirmChainOutcomesViaIndexer()).toBe(1);
         } finally {
             registerChainOutcomeConfirmer(null);
@@ -979,6 +984,7 @@ describe('bounded background scans remain fair beyond one page', () => {
         registerChainOutcomeConfirmer(async (txHash) => txHash === '00late' ? { status: 'success', blockHeight: 6 } : null);
         try {
             expect(await confirmChainOutcomesViaIndexer()).toBe(0);
+            laterPass();
             expect(await confirmChainOutcomesViaIndexer()).toBe(1);
         } finally {
             registerChainOutcomeConfirmer(null);
@@ -999,6 +1005,14 @@ describe('bounded background scans remain fair beyond one page', () => {
         expect(await refreshSucceededChainOutcomes()).toBe(0);
         expect(await refreshSucceededChainOutcomes()).toBe(1);
         expect(rows.get('parent-100')).toMatchObject({ chainStatus: 'success' });
+    });
+
+    test('a workflow parent whose children all ended and one was dropped is dropped, not pending forever', async () => {
+        putRow('parent-drop', { kind: 'issueFieldPredicateAttestation', chainStatus: 'pending', txHash: null });
+        putRow('child-ok', { kind: 'fieldPredicateProof', parentJobId: 'parent-drop', chainStatus: 'success', txHash: '0xok' });
+        putRow('child-gone', { kind: 'fieldPredicateProof', parentJobId: 'parent-drop', chainStatus: 'dropped', txHash: '0xgone' });
+        expect(await refreshSucceededChainOutcomes()).toBe(1);
+        expect(rows.get('parent-drop')).toMatchObject({ chainStatus: 'dropped' });
     });
 });
 
@@ -1061,6 +1075,82 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         putSucceeded('job-pending', { txHash: '0xnotyet' });
         expect(await confirmChainOutcomesViaIndexer()).toBe(0);
         expect(rows.get('job-pending')?.chainStatus).toBe('pending');
+    });
+
+    test('asks again about a job without an outcome only after a pause that doubles per lookup', async () => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        try {
+            const start = Date.now();
+            const confirmer = vi.fn(async () => null);
+            registerChainOutcomeConfirmer(confirmer);
+            putSucceeded('job-wait', { txHash: '0xwait' });
+            const passAt = async (ms: number) => { vi.setSystemTime(start + ms); await confirmChainOutcomesViaIndexer(); };
+            await passAt(0);
+            await passAt(2_000);
+            expect(confirmer).toHaveBeenCalledTimes(1);
+            await passAt(5_000);
+            expect(confirmer).toHaveBeenCalledTimes(2);
+            await passAt(14_000);
+            expect(confirmer).toHaveBeenCalledTimes(2);
+            await passAt(15_000);
+            expect(confirmer).toHaveBeenCalledTimes(3);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    test('a lookup that throws pauses the job the same way', async () => {
+        const confirmer = vi.fn(async () => { throw new Error('403 Forbidden'); });
+        registerChainOutcomeConfirmer(confirmer);
+        putSucceeded('job-403', { txHash: '0x403' });
+        await confirmChainOutcomesViaIndexer();
+        await confirmChainOutcomesViaIndexer();
+        expect(confirmer).toHaveBeenCalledTimes(1);
+    });
+
+    test('failed lookups pause a job at most a minute, and a later answer starts the normal backoff from the start', async () => {
+        const start = Date.now();
+        vi.useFakeTimers({ toFake: ['Date'], now: start });
+        try {
+        let failing = true;
+        const confirmer = vi.fn(async () => { if (failing) throw new Error('403 Forbidden'); return null; });
+        registerChainOutcomeConfirmer(confirmer);
+        putSucceeded('job-outage', { txHash: '0xfeed' });
+        // An hour of outage, far longer than the doubling needs to reach its cap.
+        for (let elapsed = 0; elapsed < 3_600_000; elapsed += 30_000) {
+            vi.setSystemTime(start + elapsed);
+            await confirmChainOutcomesViaIndexer();
+        }
+        const during = confirmer.mock.calls.length;
+        expect(during).toBeGreaterThanOrEqual(55);
+        failing = false;
+        vi.setSystemTime(start + 3_600_000 + 60_000);
+        await confirmChainOutcomesViaIndexer();
+        expect(confirmer).toHaveBeenCalledTimes(during + 1);
+        vi.setSystemTime(start + 3_600_000 + 60_000 + 4_000);
+        await confirmChainOutcomesViaIndexer();
+        expect(confirmer).toHaveBeenCalledTimes(during + 1);
+        vi.setSystemTime(start + 3_600_000 + 60_000 + 5_000);
+        await confirmChainOutcomesViaIndexer();
+        expect(confirmer).toHaveBeenCalledTimes(during + 2);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    test('spends at most the shared lookup budget per pass over all jobs', async () => {
+        process.env.NIGHTGATE_CHAIN_CONFIRM_LOOKUPS_PER_MINUTE = '60';
+        try {
+            const confirmer = vi.fn(async () => null);
+            registerChainOutcomeConfirmer(confirmer);
+            for (let i = 0; i < 50; i++) putSucceeded(`job-budget-${String(i).padStart(2, '0')}`, { txHash: `0xb${i}` });
+            await confirmChainOutcomesViaIndexer();
+            expect(confirmer).toHaveBeenCalledTimes(10);
+            await confirmChainOutcomesViaIndexer();
+            expect(confirmer).toHaveBeenCalledTimes(10);
+        } finally {
+            delete process.env.NIGHTGATE_CHAIN_CONFIRM_LOOKUPS_PER_MINUTE;
+        }
     });
 
     test('resolves a BOUND kind parked in reconciliation_required with a hash (crawler off: no other evidence exists)', async () => {
@@ -1288,13 +1378,14 @@ describe('startJob: idempotency', () => {
         });
     });
 
-    test('a failed job remains bound to its idempotency key', async () => {
+    test('a failed job releases its idempotency key: the retry is a new job, with the same or another payload', async () => {
+        // Idempotency stops a double submit. A retry after an error must not be stopped, even when it is rebuilt differently.
         const work1 = vi.fn(async () => { throw new Error('boom'); });
         const first = await startJob({
             kind:           'sendNight',
             sessionId:      'sess-1',
             idempotencyKey: 'idem-3',
-            request:        {},
+            request:        { amount: '1' },
             work:           work1
         });
         await flushSpawn();
@@ -1305,15 +1396,61 @@ describe('startJob: idempotency', () => {
             kind:           'sendNight',
             sessionId:      'sess-1',
             idempotencyKey: 'idem-3',
-            request:        {},
+            request:        { amount: '2' },
             work:           work2
         });
         await flushSpawn();
 
-        expect(second.jobId).toBe(first.jobId);
-        expect(second.status).toBe('failed');
-        expect(work2).not.toHaveBeenCalled();
-        expect(rows.get(second.jobId)?.status).toBe('failed');
+        expect(second.jobId).not.toBe(first.jobId);
+        expect(work2).toHaveBeenCalledTimes(1);
+        expect(rows.get(second.jobId)).toMatchObject({ status: 'succeeded', idempotencyKey: 'idem-3' });
+        expect(rows.get(first.jobId)).toMatchObject({ status: 'failed', idempotencyKey: null });
+
+        // The key now belongs to the succeeded job again: a repeat returns it, a different payload conflicts.
+        const third = await startJob({ kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-3', request: { amount: '2' }, work: async () => ({ ok: true }) });
+        expect(third.jobId).toBe(second.jobId);
+        await expect(startJob({ kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-3', request: { amount: '3' }, work: async () => ({ ok: true }) }))
+            .rejects.toMatchObject({ code: 'IDEMPOTENCY_KEY_CONFLICT' });
+    });
+
+    test('a parked job keeps its idempotency key: a transaction may be on chain', async () => {
+        const first = await startJob({
+            kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-parked',
+            request: { amount: '1' }, work: async () => ({ ok: true })
+        });
+        await flushSpawn();
+        Object.assign(rows.get(first.jobId)!, { status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED' });
+
+        const again = await startJob({
+            kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-parked',
+            request: { amount: '1' }, work: async () => ({ ok: true })
+        });
+        expect(again).toMatchObject({ jobId: first.jobId, status: 'reconciliation_required' });
+        await expect(startJob({
+            kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-parked',
+            request: { amount: '2' }, work: async () => ({ ok: true })
+        })).rejects.toMatchObject({ code: 'IDEMPOTENCY_KEY_CONFLICT' });
+        expect(rows.get(first.jobId)?.idempotencyKey).toBe('idem-parked');
+    });
+
+    test('a failed workflow step keeps its key: a replayed parent finds the failure instead of paying again', async () => {
+        const failing = vi.fn(async () => { throw new Error('chain execution failed'); });
+        const first = await startJob({
+            kind: 'callContract', sessionId: 'sess-1', idempotencyKey: 'workflow:parent-1:call',
+            request: { step: 'call' }, work: failing, parentJobId: 'parent-1', workflowStep: 'call'
+        });
+        await flushSpawn();
+        expect(rows.get(first.jobId)?.status).toBe('failed');
+
+        const rerun = vi.fn(async () => ({ ok: true }));
+        const again = await startJob({
+            kind: 'callContract', sessionId: 'sess-1', idempotencyKey: 'workflow:parent-1:call',
+            request: { step: 'call' }, work: rerun, parentJobId: 'parent-1', workflowStep: 'call'
+        });
+        await flushSpawn();
+        expect(again).toMatchObject({ jobId: first.jobId, status: 'failed', deduplicated: true });
+        expect(rerun).not.toHaveBeenCalled();
+        expect(rows.get(first.jobId)?.idempotencyKey).toBe('workflow:parent-1:call');
     });
 
     test('different sessionIds with the same key do not collide', async () => {

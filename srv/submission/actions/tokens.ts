@@ -1,7 +1,6 @@
 // Shielded test-token mint, token-factory mint and token-type derivation.
 // SPDX-License-Identifier: Apache-2.0
 import crypto from 'node:crypto';
-import { ensureNetworkId } from '../../midnight/providers';
 import { deriveRawTokenType, TokenTypeError, SHIELDED_TEST_TOKEN_REF, SHIELDED_TEST_TOKEN_CIRCUIT } from '../token-type';
 import { TOKEN_FACTORY_REF, TOKEN_FACTORY_MINT_CIRCUIT, TOKEN_FACTORY_BURN_CIRCUIT, parseFactoryTokenName, parseFactoryMintAmount } from '../token-factory';
 import { startJob } from '../background-jobs';
@@ -61,7 +60,6 @@ export function registerTokenActions(ctx: Pick<SubmissionContext, 'srv' | 'db' |
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(TOKEN_FACTORY_REF);
             await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: ownerUserId });
             const issuerKey = await tokenFactory.issuerKeyForSession({ sessionId, db, expectedUserId: ownerUserId });
@@ -109,7 +107,6 @@ export function registerTokenActions(ctx: Pick<SubmissionContext, 'srv' | 'db' |
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(TOKEN_FACTORY_REF);
             await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             if (!issuerKey) issuerKey = await tokenFactory.issuerKeyForSession({ sessionId, db, expectedUserId: req.user?.id });
@@ -160,7 +157,6 @@ export function registerTokenActions(ctx: Pick<SubmissionContext, 'srv' | 'db' |
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(artifactRef);
             await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);

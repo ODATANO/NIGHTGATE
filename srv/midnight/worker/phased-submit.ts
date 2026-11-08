@@ -4,6 +4,9 @@ import { log as workerLog } from './context';
 import { NightgateError } from '../../utils/errors';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { withTimeout } from '../../utils/timeout';
+import type * as NodeClientEffect from '@midnightntwrk/wallet-sdk-node-client/effect';
+import type * as Abstractions from '@midnightntwrk/wallet-sdk-abstractions';
+import type * as EffectLib from 'effect';
 
 export type SubmitPhase = 'connect' | 'request' | 'watch';
 
@@ -63,10 +66,11 @@ export class SubmitPhaseError extends NightgateError {
 
 /** The step a submit failed in, searched through the nested causes. Null when none is found. */
 export function submitPhaseOf(err: unknown): SubmitPhase | null {
-    let cur: any = err;
+    let cur: unknown = err;
     for (let depth = 0; cur && depth < 8; depth++) {
-        if (cur?.name === 'SubmitPhaseError' && typeof cur.phase === 'string') return cur.phase as SubmitPhase;
-        cur = cur.cause;
+        const e = cur as { name?: unknown; phase?: unknown; cause?: unknown };
+        if (e.name === 'SubmitPhaseError' && typeof e.phase === 'string') return e.phase as SubmitPhase;
+        cur = e.cause;
     }
     return null;
 }
@@ -77,10 +81,11 @@ function formatTimeline(entries: readonly SubmitTimelineEntry[], t0: number): st
 
 function describe(err: unknown): string {
     const parts: string[] = [];
-    let cur: any = err;
+    let cur: unknown = err;
     for (let depth = 0; cur && depth < 6; depth++) {
-        parts.push(String(cur?.message ?? cur));
-        cur = cur.cause;
+        const e = cur as { message?: unknown; cause?: unknown };
+        parts.push(String(e.message ?? cur));
+        cur = e.cause;
     }
     return parts.join(' <- ').slice(0, 400);
 }
@@ -226,24 +231,31 @@ function timelineDur(timeline: readonly SubmitTimelineEntry[], t0: number, event
 }
 
 export interface NodeClientSdk {
-    PolkadotNodeClient: any;
-    SerializedTransaction: any;
-    Effect: any; Scope: any; Exit: any; Stream: any; Duration: any;
+    PolkadotNodeClient: typeof NodeClientEffect.PolkadotNodeClient;
+    SerializedTransaction: typeof Abstractions.SerializedTransaction;
+    Effect: typeof EffectLib.Effect; Scope: typeof EffectLib.Scope; Exit: typeof EffectLib.Exit;
+    Stream: typeof EffectLib.Stream; Duration: typeof EffectLib.Duration;
+}
+
+/** The `message` of an error the socket reports, else the value itself. */
+function socketErrorText(arg: unknown): string {
+    const message = typeof arg === 'object' && arg !== null && 'message' in arg ? arg.message : undefined;
+    return String(message ?? arg).slice(0, 200);
 }
 
 export async function createSdkNodeAdapter(relayURL: URL, opts: { connectTimeoutMs: number; sdk: () => Promise<NodeClientSdk> }): Promise<SubmitNodeAdapter> {
     const { PolkadotNodeClient, SerializedTransaction, Effect, Scope, Exit, Stream, Duration } = await opts.sdk();
     const scope = Effect.runSync(Scope.make());
     // By default the SDK reconnects forever. This is the only place to set a limit.
-    const client: any = await Effect.runPromise(
+    const client = await Effect.runPromise(
         PolkadotNodeClient.make({ nodeURL: relayURL, reconnectionTimeout: Duration.millis(opts.connectTimeoutMs) })
             .pipe(Effect.provideService(Scope.Scope, scope))
     );
     const listeners: Array<(ev: SocketEvent) => void> = [];
-    const api: any = client.api;
+    const api = client.api;
     for (const kind of ['connected', 'disconnected', 'error'] as const) {
         api?.on?.(kind, (arg: unknown) => {
-            const ev: SocketEvent = { kind, detail: kind === 'error' ? String((arg as any)?.message ?? arg).slice(0, 200) : undefined };
+            const ev: SocketEvent = { kind, detail: kind === 'error' ? socketErrorText(arg) : undefined };
             for (const l of listeners) l(ev);
         });
     }
@@ -252,7 +264,7 @@ export async function createSdkNodeAdapter(relayURL: URL, opts: { connectTimeout
         send: (bytes, onEvent, signal) => Effect.runPromise(
             Stream.runForEach(
                 client.sendMidnightTransaction(SerializedTransaction.of(bytes)),
-                (ev: any) => Effect.sync(() => onEvent({ tag: ev?._tag, txHash: ev?.txHash, blockHash: ev?.blockHash, blockHeight: ev?.blockHeight }))
+                (ev) => Effect.sync(() => onEvent({ tag: ev._tag, txHash: ev.txHash, blockHash: ev._tag === 'Submitted' ? undefined : ev.blockHash, blockHeight: ev._tag === 'Submitted' ? undefined : ev.blockHeight }))
             ),
             { signal }
         ),

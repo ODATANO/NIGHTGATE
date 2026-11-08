@@ -1,7 +1,7 @@
 // Reads the vault contract's on-chain disclosure grants.
 // Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
 import { importArtifact } from './artifact-import';
-import { buildPublicDataProvider, type IndexerEndpoints } from '../midnight/public-data-provider';
+import { buildPublicDataProvider, queryLedger9ContractState, type IndexerEndpoints } from '../midnight/public-data-provider';
 import type { ContractArtifact } from './predicate-state';
 
 function hex(b: Uint8Array): string {
@@ -55,8 +55,7 @@ export async function readDisclosureGrants(args: ReadDisclosureGrantsArgs): Prom
     const publicData = await buildPublicDataProvider(args);
     const artifact = await importArtifact(args.artifactPath, args.artifactDigest) as ContractArtifact<DisclosureLedger>;
     const at = args.atHeight === undefined || args.atHeight === null ? undefined : { type: 'blockHeight' as const, blockHeight: args.atHeight };
-    const state = await publicData.queryContractState(args.contractAddress.toLowerCase(), at);
+    const state = await queryLedger9ContractState(publicData, args.contractAddress.toLowerCase(), at);
     if (!state) return null;
-    // The state may come wrapped with the ledger in `.data`, or bare.
-    return enumerateGrants(artifact.ledger(state.data ?? state));
+    return enumerateGrants(artifact.ledger(state.data));
 }

@@ -4,12 +4,11 @@ import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 import { resolveFeeSponsor } from '../fee-sponsor';
 import { getNightgatePluginConfig } from '../../utils/nightgate-config';
-import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
 import { PLATFORM_POOL_SENTINEL } from '../sponsor-pool';
 import { resolveSponsorPolicyForRequest } from '../sponsor-policy';
 import { getConfiguredFeeSponsorSessions } from '../fee-sponsor';
-import { facadeConfigFromEnv, rejectIfMainnetBlocked, runSubmission, takeValueBudget, type SponsorJobCommand } from './common';
+import { rejectIfMainnetBlocked, runSubmission, takeValueBudget, type SponsorJobCommand } from './common';
 import { NightgateError, isNightgateError } from '../../utils/errors';
 import { walletDescribeSwapHalf, walletDescribeTransaction, walletDescribeTransfer } from '../../midnight/wallet-worker-client';
 import { transactionBytesOf } from '../../utils/offer-file';
@@ -68,8 +67,6 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
 
     /** What every sponsor job starts from: a checked pinned sponsor, the grant, the caller and its scoped idempotency key. */
     async function sponsorJobBase(req: Request, effectiveSponsor: string, idempotencyKey: string | null | undefined) {
-        const facadeCfg = facadeConfigFromEnv();
-        await ensureNetworkId(facadeCfg.networkId);
         // A pinned sponsor is checked here only against its database row. Loading its wallet is slow
         // and happens when the job runs. Pool jobs skip this, so one broken pool wallet cannot block requests.
         if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {

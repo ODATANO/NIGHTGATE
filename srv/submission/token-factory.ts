@@ -29,8 +29,8 @@ export async function loadTokenFactoryPureCircuits(ref: string = TOKEN_FACTORY_R
     if (!getContractRegistration(ref)) {
         throw new TokenFactoryUnavailableError(`contract '${ref}' is not registered; add the token-factory lineage to cds.requires.nightgate.contracts`);
     }
-    const mod: any = await importRegisteredArtifact(ref);
-    const pure = mod.pureCircuits ?? mod.default?.pureCircuits;
+    const mod = await importRegisteredArtifact(ref);
+    const pure = (mod.pureCircuits ?? mod.default?.pureCircuits) as Partial<TokenFactoryPureCircuits> | null | undefined;
     if (typeof pure?.issuerKey !== 'function' || typeof pure?.domainOf !== 'function') {
         throw new TokenFactoryUnavailableError(`artifact '${ref}' exports no issuerKey/domainOf pure circuits; it is not a token factory`);
     }

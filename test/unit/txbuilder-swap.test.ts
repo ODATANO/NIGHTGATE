@@ -8,7 +8,7 @@ const A = 'a1'.repeat(32);
 const B = 'b2'.repeat(32);
 
 const ledgerFake = vi.hoisted(() => ({ byBytes: new Map<string, { binding: string; tx: any }>() }));
-vi.mock('@midnight-ntwrk/ledger-v8', () => ({
+vi.mock('@midnightntwrk/ledger-v9', () => ({
     Transaction: {
         deserialize: (_s: string, _p: string, binding: string, bytes: Uint8Array) => {
             const found = ledgerFake.byBytes.get(Buffer.from(bytes).toString('hex'));
@@ -17,6 +17,13 @@ vi.mock('@midnight-ntwrk/ledger-v8', () => ({
         }
     },
     ZswapSecretKeys: { fromSeed: () => ({ coinPublicKey: 'c1'.repeat(32), encryptionPublicKey: 'e1'.repeat(32) }) }
+}));
+
+// The wallet's sealed handles are plain records here: `{ sealed, tx }` going in, `{ stage, tx }` coming out.
+vi.mock('../../src/txbuilder/wallet-tx.mjs', () => ({
+    sealTx: async (stage: string, tx: unknown) => ({ sealed: stage, tx }),
+    openTx: async (handle: { tx: unknown }) => handle.tx,
+    shieldedKeysByEpoch: async () => ({ v8: 'keys-v8', v9: 'keys-v9' })
 }));
 
 const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
@@ -117,9 +124,10 @@ describe('revertBuilt', () => {
             await revertBuilt(facade, input);
         }
         await revertBuilt(facade, Buffer.from(unboundBytes).toString('base64'));
-        const reverted = facade.revertTransaction.mock.calls.map(([tx]: any[]) => tx);
-        expect(reverted).toHaveLength(4);
-        [bound, bound, bound, unbound].forEach((tx, i) => expect(reverted[i]).toBe(tx));
+        // The wallet gets each transaction sealed, a sealed one as finalized.
+        const reverted = facade.revertTransaction.mock.calls.map(([handle]: any[]) => handle);
+        expect(reverted.map((handle: any) => handle.sealed)).toEqual(['Finalized', 'Finalized', 'Finalized', 'Unbound']);
+        [bound, bound, bound, unbound].forEach((tx, i) => expect(reverted[i].tx).toBe(tx));
     });
 
     it('refuses input that is no transaction before touching the wallets', async () => {
@@ -133,7 +141,7 @@ describe('revertBuilt', () => {
 
 describe('createSwapWallet', () => {
     const SEED = 'ab'.repeat(64);
-    const URLS = { indexerHttpUrl: 'https://indexer.example/api/v3/graphql', indexerWsUrl: 'wss://indexer.example/api/v3/graphql/ws' };
+    const URLS = { networkId: 'preprod', indexerHttpUrl: 'https://indexer.example/api/v3/graphql', indexerWsUrl: 'wss://indexer.example/api/v3/graphql/ws' };
 
     function fakeSdk(over: { balances?: Record<string, bigint>; built?: (inputs: any, outputs: any) => any; coins?: Array<{ type: string; value: bigint }>; pendingCoins?: Array<{ type: string; value: bigint }>; unprovenInputs?: number } = {}) {
         const calls: any = { initSwap: [], reverted: [], restored: [], started: 0, stopped: 0, proven: [], picked: [], order: [] };
@@ -158,11 +166,11 @@ describe('createSwapWallet', () => {
             getAddress: vi.fn(async () => ownAddress),
             waitForSyncedState: vi.fn(async () => ({})),
             serializeState: vi.fn(async () => '{"saved":true}'),
-            balanceTransaction: vi.fn(async (_keys: any, tx: any) => {
+            balanceTransaction: vi.fn(async (tx: any) => {
                 calls.order.push('balance');
                 return { balanced: tx, picked: selection([...coins], A, 0n, {})?.value };
             }),
-            initSwap: vi.fn(async (_keys: any, inputs: any, outputs: any) => {
+            initSwap: vi.fn(async (inputs: any, outputs: any) => {
                 calls.order.push('initSwap');
                 calls.initSwap.push({ inputs, outputs });
                 await new Promise(resolve => setTimeout(resolve, 5));
@@ -179,27 +187,31 @@ describe('createSwapWallet', () => {
                     pool = pool.filter(c => c !== coin);
                 }
                 calls.picked.push(picked);
-                return { unproven: true, inputs, outputs, guaranteedOffer: { inputs: Array.from({ length: over.unprovenInputs ?? picked.length }) } };
+                return { stage: 'Unproven', tx: { unproven: true, inputs, outputs, guaranteedOffer: { inputs: Array.from({ length: over.unprovenInputs ?? picked.length }) } } };
             }),
             revertTransaction: vi.fn(async (tx: any) => { calls.reverted.push(tx); })
         };
         const factory = {
-            startWithSecretKeys: vi.fn(() => wallet),
+            startWithSeed: vi.fn(async () => wallet),
             restore: vi.fn((state: string) => { calls.restored.push(state); return wallet; })
         };
         const sdk = {
             ledger: { ZswapSecretKeys: { fromSeed: () => ({ coinPublicKey: 'c1'.repeat(32), encryptionPublicKey: 'e1'.repeat(32) }) } },
-            shielded: { CustomShieldedWallet: vi.fn((_config: unknown, _builder: unknown) => factory) },
-            shieldedV1: {
-                V1Builder: class {
+            shielded: { CustomForkingShieldedWallet: vi.fn((_config: unknown, _v1: unknown, _v2: unknown) => factory) },
+            shieldedV1: { V1Builder: class { withDefaults() { return this; } } },
+            shieldedV2: {
+                V2Builder: class {
                     withDefaults() { return this; }
                     withCoinSelection(make: () => unknown) { selection = make(); return this; }
-                }
+                    withMigration() { return this; }
+                },
+                Migration: { makeCrossLedgerMigration: () => ({}) }
             },
+            chainVersion: { makeIndexerChainVersionProbe: () => ({}) },
+            shieldedKeysByEpoch: async () => ({ v8: 'keys-v8', v9: 'keys-v9' }),
             abstractions: { InMemoryTransactionHistoryStorage: class { /* storage stand-in */ } },
-            facade: { WalletEntrySchema: {}, mergeWalletEntries: () => ({}) },
+            facade: { WalletEntrySchema: {}, mergeWalletEntries: () => ({}), DefaultForkSchedule: { v9: 2_000_000n } },
             addressFormat: { MidnightBech32m: { encode: (network: string) => ({ toString: () => `mn_shield-addr_${network}1own` }) } },
-            networkId: { setNetworkId: vi.fn() },
             deriveRoleSeeds: async () => ({ zswap: new Uint8Array(32), dust: new Uint8Array(32), night: new Uint8Array(32) }),
             provingService: {
                 prove: vi.fn(async (unproven: any) => {
@@ -266,8 +278,10 @@ describe('createSwapWallet', () => {
         const { createSwapWallet } = await importTxBuilder();
         const fresh = fakeSdk();
         const wallet = await createSwapWallet({ ...URLS, seedHex: SEED, sdk: fresh.sdk });
-        expect(fresh.factory.startWithSecretKeys).toHaveBeenCalledTimes(1);
+        expect(fresh.factory.startWithSeed).toHaveBeenCalledTimes(1);
         expect(fresh.calls.started).toBe(1);
+        // The wallet starts with the keys of both ledger generations.
+        expect(fresh.wallet.start).toHaveBeenCalledWith({ v8: 'keys-v8', v9: 'keys-v9' });
         expect(wallet).toMatchObject({ address: 'mn_shield-addr_preprod1own', coinPublicKey: 'c1'.repeat(32), encryptionPublicKey: 'e1'.repeat(32), provingMode: 'wasm' });
         expect(await wallet.balances()).toEqual({ [A]: 5000n });
         expect(await wallet.pendingBalances()).toEqual({});
@@ -278,7 +292,7 @@ describe('createSwapWallet', () => {
         const resumed = fakeSdk();
         await createSwapWallet({ ...URLS, seedHex: SEED, walletState: '{"saved":true}', sdk: resumed.sdk });
         expect(resumed.calls.restored).toEqual(['{"saved":true}']);
-        expect(resumed.factory.startWithSecretKeys).not.toHaveBeenCalled();
+        expect(resumed.factory.startWithSeed).not.toHaveBeenCalled();
     });
 
     it('shieldedWallet is the wallet behind the swap wallet; its coin picks wait for a half in flight and use no plan', async () => {
@@ -289,7 +303,7 @@ describe('createSwapWallet', () => {
         expect(shared.state).toBe(inner.state);
         expect(await shared.serializeState()).toBe('{"saved":true}');
         const half = wallet.buildHalf({ give: { tokenType: A, amount: 5000 }, want: { tokenType: B, amount: 1 } });
-        const balanced = await shared.balanceTransaction({ keys: true }, { tx: 1 });
+        const balanced = await shared.balanceTransaction({ tx: 1 });
         await half;
         expect(calls.order).toEqual(['initSwap', 'balance']);
         expect(balanced).toEqual({ balanced: { tx: 1 }, picked: 100n });   // the smallest coin, no plan
@@ -314,11 +328,11 @@ describe('createSwapWallet', () => {
         const bound = tx.bind();
         const offer = await encodeOffer(bound.serialize());
         await wallet.revert(offer);
-        expect(calls.reverted).toEqual([bound]);
+        expect(calls.reverted).toEqual([{ sealed: 'Finalized', tx: bound }]);
         expect(inner.revertTransaction).toHaveBeenCalledTimes(1);
         // base64 of an unbound half works the same
         await wallet.revert(Buffer.from(tx.serialize()).toString('base64'));
-        expect(calls.reverted).toEqual([bound, tx]);
+        expect(calls.reverted).toEqual([{ sealed: 'Finalized', tx: bound }, { sealed: 'Unbound', tx }]);
         await expect(wallet.revert('swapoffer1garbage')).rejects.toThrow();
     });
 
@@ -349,7 +363,7 @@ describe('createSwapWallet', () => {
         const failing = fakeSdk({ built: () => { throw new Error('prover unavailable'); } });
         const a = await createSwapWallet({ ...URLS, seedHex: SEED, sdk: failing.sdk });
         await expect(a.buildHalf({ give: { tokenType: A, amount: 10n }, want: { tokenType: B, amount: 3n } })).rejects.toThrow('prover unavailable');
-        expect(failing.calls.reverted).toEqual([expect.objectContaining({ unproven: true })]);
+        expect(failing.calls.reverted).toEqual([{ stage: 'Unproven', tx: expect.objectContaining({ unproven: true }) }]);
 
         const other = fakeSdk();
         other.sdk.provingService.prove = vi.fn(async () => other.proven([[A, 9n], [B, -3n]]));

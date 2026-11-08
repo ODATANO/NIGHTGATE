@@ -7,6 +7,8 @@ export {
     sealAttestationSecret,
     openAttestationSecret,
     buildAttestationVaultWitnesses,
+    InMemoryPrivateStateProvider,
+    type InMemoryContractPrivateStates,
     type SealedAttestationSecret,
     type MerkleProof,
     type SchemaDescriptor,
@@ -33,23 +35,7 @@ export class FetchZkConfigProvider {
     };
 }
 
-/** Keeps contract private state in memory. The vault contract has no private state. */
-export class InMemoryPrivateStateProvider {
-    setContractAddress(address: unknown): void;
-    set(id: unknown, state: unknown): Promise<void>;
-    get(id: unknown): Promise<unknown | null>;
-    remove(id: unknown): Promise<void>;
-    clear(): Promise<void>;
-    setSigningKey(address: unknown, key: unknown): Promise<void>;
-    getSigningKey(address: unknown): Promise<unknown | null>;
-    removeSigningKey(address: unknown): Promise<void>;
-    clearSigningKeys(): Promise<void>;
-    exportPrivateStates(): Promise<unknown>;
-    importPrivateStates(): Promise<unknown>;
-    exportSigningKeys(): Promise<unknown>;
-    importSigningKeys(): Promise<unknown>;
-}
-
+import type { InMemoryPrivateStateProvider } from '@odatano/contract-kit';
 import type { ProvingModality, AssembledProvingModality } from './providers.mjs';
 export type { ProvingModality, AssembledProvingModality };
 

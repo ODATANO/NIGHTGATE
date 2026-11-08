@@ -13,7 +13,8 @@ export const SWAP_OFFER_PREFIX = 'swapoffer';
 
 const offerFile = () => require('../../srv/utils/offer-file.js');
 const midnightAddress = () => require('../../srv/utils/midnight-address.js');
-const loadLedger = () => import('@midnight-ntwrk/ledger-v8');
+const loadLedger = () => import('@midnightntwrk/ledger-v9');
+import { sealTx, openTx, shieldedKeysByEpoch } from './wallet-tx.mjs';
 
 function rawTokenTypeOf(value, name) {
     const type = bareHex(value);
@@ -143,18 +144,21 @@ const latest = (observable, what, timeoutMs = 10_000) => new Promise((resolve, r
 });
 
 /** Returns the proving service. In `server` mode the proof server sees the coins you spend. */
-export async function swapProvingService({ provingMode = 'wasm', proofServerUrl } = {}) {
+export async function swapProvingService({ provingMode = 'wasm', proofServerUrl, proverMaterialDir, onProgress } = {}) {
     if (provingMode !== 'wasm' && provingMode !== 'server') throw new Error(`provingMode must be 'wasm' or 'server' (got ${String(provingMode)})`);
     const proving = await import('@midnightntwrk/wallet-sdk-capabilities/proving');
-    if (provingMode === 'wasm') return proving.makeWasmProvingService({});
+    if (provingMode === 'wasm') {
+        const { createProverMaterialProvider } = await import('./prover-material.mjs');
+        return proving.makeV9WasmProvingService({ keyMaterialProvider: createProverMaterialProvider({ dir: proverMaterialDir, onProgress }) });
+    }
     if (!proofServerUrl) throw new Error("provingMode 'server' requires proofServerUrl (a proof server YOU run; it sees the coins you spend)");
-    return proving.makeServerProvingService({ provingServerUrl: new URL(proofServerUrl) });
+    return proving.makeV9ServerProvingService({ provingServerUrl: new URL(proofServerUrl) });
 }
 
 /** Creates a wallet for swapping that syncs only the seed's shielded coins. The seed never leaves this process.
  *  It needs `indexerHttpUrl`, or an `api` with a gateway key to sync through the gateway's indexer. */
 export async function createSwapWallet(opts) {
-    const { seedHex, networkId = 'preprod', accountIndex = 0, nodeUrl, walletState } = opts ?? {};
+    const { seedHex, networkId = 'mainnet', accountIndex = 0, nodeUrl, walletState } = opts ?? {};
     assertSeedHex(seedHex, 'createSwapWallet');
     let { indexerHttpUrl, indexerWsUrl } = opts ?? {};
     if (!indexerHttpUrl || !indexerWsUrl) {
@@ -172,21 +176,23 @@ export async function createSwapWallet(opts) {
         ledger: await loadLedger(),
         shielded: await import('@midnightntwrk/wallet-sdk-shielded'),
         shieldedV1: await import('@midnightntwrk/wallet-sdk-shielded/v1'),
+        shieldedV2: await import('@midnightntwrk/wallet-sdk-shielded/v2'),
+        chainVersion: await import('@midnightntwrk/wallet-sdk-capabilities/chainVersion'),
+        shieldedKeysByEpoch,
         abstractions: await import('@midnightntwrk/wallet-sdk-abstractions'),
         facade: await import('@midnightntwrk/wallet-sdk-facade'),
         addressFormat: await import('@midnightntwrk/wallet-sdk-address-format'),
-        networkId: await import('@midnight-ntwrk/midnight-js-network-id'),
-        provingService: await swapProvingService({ provingMode, proofServerUrl: opts.proofServerUrl }),
+        provingService: await swapProvingService({ provingMode, proofServerUrl: opts.proofServerUrl, proverMaterialDir: opts.proverMaterialDir, onProgress: opts.onProgress }),
         deriveRoleSeeds: require('../../srv/utils/wallet-hd.js').deriveRoleSeeds
     };
-    sdk.networkId?.setNetworkId?.(networkId);
     const roleSeeds = await sdk.deriveRoleSeeds(new Uint8Array(Buffer.from(seedHex, 'hex')), accountIndex);
     const keys = sdk.ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
 
     const configuration = {
         networkId,
+        // Where ledger 9 starts on the chain. The SDK's default fits chains that began on it.
+        forks: opts.forks ?? sdk.facade.DefaultForkSchedule,
         ...(nodeUrl ? { relayURL: new URL(nodeUrl) } : {}),
-        provingServerUrl: new URL(opts.proofServerUrl ?? 'http://127.0.0.1:6300'),
         indexerClientConnection: { indexerHttpUrl, indexerWsUrl },
         txHistoryStorage: new sdk.abstractions.InMemoryTransactionHistoryStorage(sdk.facade.WalletEntrySchema, sdk.facade.mergeWalletEntries),
         costParameters: { additionalFeeOverhead: 1n, feeBlocksMargin: 5 }
@@ -194,9 +200,16 @@ export async function createSwapWallet(opts) {
     // The wallet asks for coins one at a time, so only one half may be built at a time.
     let plan = null;
     const selection = (coins, tokenType) => (plan ? chooseSwapCoin(coins, tokenType, plan) : coins.filter((c) => c.type === tokenType).sort(byValue).at(0));
-    const factory = sdk.shielded.CustomShieldedWallet(configuration, new sdk.shieldedV1.V1Builder().withDefaults().withCoinSelection(() => selection));
-    const wallet = walletState ? factory.restore(walletState) : factory.startWithSecretKeys(keys);
-    await wallet.start(keys);
+    // The SDK's shielded wallet spans the change to ledger 9: one variant and one key set per side. Only the ledger 9 side picks coins here.
+    const Wallet = sdk.shielded.CustomForkingShieldedWallet(
+        { ...configuration, chainVersionProbe: sdk.chainVersion.makeIndexerChainVersionProbe(configuration) },
+        { builder: new sdk.shieldedV1.V1Builder().withDefaults(), configuration },
+        { builder: new sdk.shieldedV2.V2Builder().withDefaults().withCoinSelection(() => selection).withMigration(() => sdk.shieldedV2.Migration.makeCrossLedgerMigration()), configuration }
+    );
+    const wallet = walletState ? Wallet.restore(walletState) : await Wallet.startWithSeed(roleSeeds.zswap);
+    await wallet.start(await sdk.shieldedKeysByEpoch(roleSeeds.zswap));
+    // The wallet hands out and takes back transactions as sealed handles.
+    const revertBuilt = async (tx, bound) => wallet.revertTransaction(await sealTx(bound ? 'Finalized' : 'Unbound', tx, configuration.forks));
     const freeCoins = async () => ((await latest(wallet.state, 'wallet state'))?.availableCoins ?? []).map((c) => c.coin);
     let queue = Promise.resolve();
     const oneAtATime = (fn) => {
@@ -244,13 +257,14 @@ export async function createSwapWallet(opts) {
             throw new Error(`buildTransfer: sending ${leg.amount} of ${leg.tokenType.slice(0, 16)} needs more than ${maxInputs} coins; the ${maxInputs} largest free coins hold ${spendable}`);
         }
         plan = { remaining: leg.amount, slots: maxInputs };
-        let unproven;
+        let handle;
         try {
-            unproven = await wallet.initSwap(keys, { [leg.tokenType]: leg.amount }, [{ type: leg.tokenType, receiverAddress: receiver, amount: leg.amount }]);
+            handle = await wallet.initSwap({ [leg.tokenType]: leg.amount }, [{ type: leg.tokenType, receiverAddress: receiver, amount: leg.amount }]);
         } finally {
             plan = null;
         }
         try {
+            const unproven = await openTx(handle);
             const inputs = unproven?.guaranteedOffer?.inputs?.length;
             if (Number.isInteger(inputs) && inputs > maxInputs) throw new Error(`buildTransfer: the transfer spends ${inputs} coins, more than the ${maxInputs} a sponsor accepts`);
             const proven = await sdk.provingService.prove(unproven);
@@ -261,10 +275,10 @@ export async function createSwapWallet(opts) {
                 tx, bound: bind !== false, serializedBytes: bytes.length, txB64: Buffer.from(bytes).toString('base64'),
                 terms: { tokenType: leg.tokenType, amount: leg.amount, to: to.trim() }, inputs: shape.inputs,
                 // The wallet keeps the transfer's coins reserved until it lands or `revert` is called.
-                revert: () => wallet.revertTransaction(tx)
+                revert: () => revertBuilt(tx, bind !== false)
             };
         } catch (e) {
-            await wallet.revertTransaction(unproven).catch(() => { /* the build error is the one to report */ });
+            await wallet.revertTransaction(handle).catch(() => { /* the build error is the one to report */ });
             throw e;
         }
     });
@@ -278,13 +292,14 @@ export async function createSwapWallet(opts) {
             throw new Error(`buildHalf: giving ${g.amount} of ${g.tokenType.slice(0, 16)} needs more than ${maxInputs} coins; the ${maxInputs} largest free coins hold ${spendable}`);
         }
         plan = { remaining: g.amount, slots: maxInputs };
-        let unproven;
+        let handle;
         try {
-            unproven = await wallet.initSwap(keys, { [g.tokenType]: g.amount }, [{ type: w.tokenType, receiverAddress: ownAddress, amount: w.amount }]);
+            handle = await wallet.initSwap({ [g.tokenType]: g.amount }, [{ type: w.tokenType, receiverAddress: ownAddress, amount: w.amount }]);
         } finally {
             plan = null;
         }
         try {
+            const unproven = await openTx(handle);
             const inputs = unproven?.guaranteedOffer?.inputs?.length;
             if (Number.isInteger(inputs) && inputs > maxInputs) throw new Error(`buildHalf: the half spends ${inputs} coins, more than the ${maxInputs} a sponsor accepts`);
             const proven = await sdk.provingService.prove(unproven);
@@ -294,9 +309,9 @@ export async function createSwapWallet(opts) {
             }
             const out = await handover(proven, bind !== false);
             // The wallet keeps the half's coins reserved until the swap lands or `revert` is called.
-            return { ...out, terms, revert: () => wallet.revertTransaction(out.tx) };
+            return { ...out, terms, revert: () => revertBuilt(out.tx, out.bound) };
         } catch (e) {
-            await wallet.revertTransaction(unproven).catch(() => { /* the build error is the one to report */ });
+            await wallet.revertTransaction(handle).catch(() => { /* the build error is the one to report */ });
             throw e;
         }
     });
@@ -339,8 +354,8 @@ export async function createSwapWallet(opts) {
 
         /** Releases the coins of a half or transfer whose build-time `revert` is gone: its offer file, base64 or bytes. */
         async revert(input) {
-            const { tx } = await decodeOffer(input);
-            await wallet.revertTransaction(tx);
+            const { tx, bound } = await decodeOffer(input);
+            await revertBuilt(tx, bound);
         },
 
         /** The unreserved coins, smallest first. */

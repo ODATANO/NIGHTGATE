@@ -2,7 +2,7 @@
 // Run: LACE_MNEMONIC="word1 word2 ..." node scripts/derive-keys.mjs
 
 import bip39 from 'bip39';
-import { ZswapSecretKeys } from '@midnight-ntwrk/ledger-v8';
+import { ZswapSecretKeys } from '@midnightntwrk/ledger-v9';
 
 const MNEMONIC = process.env.LACE_MNEMONIC;
 if (!MNEMONIC) {

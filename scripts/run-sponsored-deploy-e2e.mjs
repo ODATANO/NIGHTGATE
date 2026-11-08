@@ -67,7 +67,7 @@ step(`2. LOCAL builder for '${ARTIFACT}' (throwaway caller key; prover keys from
 const t0 = Date.now();
 const builder = await createTxBuilder({
     seedHex: randomBytes(64).toString('hex'),
-    networkId: process.env.NIGHTGATE_NETWORK || 'preprod',
+    networkId: process.env.NIGHTGATE_NETWORK || 'preview',
     indexerHttpUrl: IHTTP, indexerWsUrl: IWS, nodeUrl: NODE,
     zkConfigBaseUrl: `${BASE}/zk-config/${ARTIFACT}`,
     contractClass: Contract,

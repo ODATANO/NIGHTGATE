@@ -6,7 +6,7 @@
  * SQL, but the in-memory mock's `includes(null)` does. This boots a REAL CAP DB
  * via cds.test() and asserts a legacy NULL-chainStatus leaf is actually updated.
  */
-import { test, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import { test, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import cds from '@sap/cds';
 import {
     confirmChainOutcomesViaIndexer,
@@ -255,11 +255,45 @@ test('a broadcast the indexer never shows ends failed/BROADCAST_NOT_INCLUDED onc
     expect(subs['sub-live'].status).toBe('pending');
     expect(subs['sub-lag'].status).toBe('pending');
 
-    // the margin passes: the lagging one ends too
+    // the margin passes: the lagging one ends too, once its lookup pause is over
     registerChainOutcomeConfirmer(async () => chainAbsent(now + 6 * 60_000));
-    await confirmChainOutcomesViaIndexer(db);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+        vi.setSystemTime(now + 6 * 60_000);
+        await confirmChainOutcomesViaIndexer(db);
+    } finally {
+        vi.useRealTimers();
+    }
     const lag = await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-lag' }));
     expect(lag).toMatchObject({ status: 'failed', errorCode: 'BROADCAST_NOT_INCLUDED' });
+});
+
+test('a succeeded job whose transaction the indexer never shows gets chainStatus dropped past its ttl and keeps its status', async () => {
+    const PS = 'midnight.PendingSubmissions';
+    await db.run(cds.ql.DELETE.from(PS));
+    const H = 60 * 60 * 1000;
+    const now = Date.now();
+    const sub = (ID: string, txHash: string, ttl: number) => ({
+        ID, txHash, contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL',
+        submittedAt: new Date(now - 3 * H).toISOString(), status: 'pending', sessionId: 'sp-sess',
+        submitIntentData: JSON.stringify({ circuits: ['attest'], ttl: new Date(ttl).toISOString() })
+    });
+    await db.run(cds.ql.INSERT.into(PS).entries(sub('sub-gone', '00gone', now - 2 * H), sub('sub-fresh', '00fresh', now + 10 * 60_000)));
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        { ID: 'j-gone',  kind: 'sendNight', sessionId: 'sp-sess', status: 'succeeded', chainStatus: 'pending', txHash: '00gone',  submissionId: 'sub-gone' },
+        { ID: 'j-fresh', kind: 'sendNight', sessionId: 'sp-sess', status: 'succeeded', chainStatus: null,      txHash: '00fresh', submissionId: 'sub-fresh' }
+    ));
+    registerChainOutcomeConfirmer(async () => chainAbsent(now));
+
+    expect(await confirmChainOutcomesViaIndexer(db)).toBe(1);
+
+    const jobs = Object.fromEntries((await db.run(cds.ql.SELECT.from(BG).columns('ID', 'status', 'errorCode', 'chainStatus', 'chainFinalizedAt'))).map((r: any) => [r.ID, r]));
+    expect(jobs['j-gone']).toMatchObject({ status: 'succeeded', chainStatus: 'dropped', errorCode: 'BROADCAST_NOT_INCLUDED' });
+    expect(jobs['j-gone'].chainFinalizedAt).toBeTruthy();
+    expect(jobs['j-fresh']).toMatchObject({ status: 'succeeded', chainStatus: null });
+    const subs = Object.fromEntries((await db.run(cds.ql.SELECT.from(PS).columns('ID', 'status'))).map((r: any) => [r.ID, r]));
+    expect(subs['sub-gone'].status).toBe('failed');
+    expect(subs['sub-fresh'].status).toBe('pending');
 });
 
 test('an indexed but not yet confirmable transaction (null lookup: unknown status, no height) is NOT absence: the job stays parked past its ttl', async () => {

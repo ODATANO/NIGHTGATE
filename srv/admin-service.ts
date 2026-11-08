@@ -162,7 +162,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
                     privateStateId: data.privateStateId!, slotWidth: data.slotWidth ?? null
                 }, {
                     registeredBy: req.user?.id,
-                    networkId: getConfiguredNightgateNetwork((cds as any).env?.requires?.nightgate) ?? undefined
+                    networkId: getConfiguredNightgateNetwork(cds.env?.requires?.nightgate) ?? undefined
                 });
             } catch (err) {
                 if (err instanceof ContractRegistrationError) return req.reject(err.httpStatus, err.message);

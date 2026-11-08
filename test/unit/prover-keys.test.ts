@@ -119,11 +119,53 @@ describe('prover keys on demand', () => {
         const missing404 = await ensureProverKeys('vault', reg, { env: { [ZK_ASSET_URL_ENV]: 'https://h' }, fetchFn: fetchOf({}) }).catch(e => e);
         expect(missing404.message).toMatch(/HTTP 404/);
         expect(missing404.retryable).toBe(false);
-        const down = await ensureProverKeys('vault', reg, { env: { [ZK_ASSET_URL_ENV]: 'https://h' }, fetchFn: fetchOf({}, 503) }).catch(e => e);
+        const down = await ensureProverKeys('vault', reg, { env: { [ZK_ASSET_URL_ENV]: 'https://h' }, fetchFn: fetchOf({}, 503), retryDelaysMs: [] }).catch(e => e);
         expect(down.retryable).toBe(true);
-        const boom = await ensureProverKeys('vault', reg, { env: { [ZK_ASSET_URL_ENV]: 'https://h' }, fetchFn: (async () => { throw new Error('ECONNRESET'); }) as unknown as typeof fetch }).catch(e => e);
+        const boom = await ensureProverKeys('vault', reg, { env: { [ZK_ASSET_URL_ENV]: 'https://h' }, fetchFn: (async () => { throw new Error('ECONNRESET'); }) as unknown as typeof fetch, retryDelaysMs: [] }).catch(e => e);
         expect(boom.message).toMatch(/ECONNRESET/);
         expect(boom.retryable).toBe(true);
+    });
+
+    it('a lost connection, a torn body and a 503 get another try; a 404 and wrong bytes do not', async () => {
+        const reg = () => artifact({ manifest: true });
+        const env = { [ZK_ASSET_URL_ENV]: 'https://h' };
+        const good = fetchOf({ 'attest.prover': 'pk-attest', 'grant.prover': 'pk-grant' });
+        const notFound = fetchOf({});
+        const lost = vi.fn<(u: string) => Promise<unknown>>()
+            .mockRejectedValueOnce(Object.assign(new TypeError('fetch failed'), { cause: new Error('other side closed') }))
+            .mockResolvedValueOnce({ ok: true, status: 200, arrayBuffer: async () => { throw new TypeError('terminated'); } })
+            .mockResolvedValueOnce({ ok: false, status: 503 })
+            .mockImplementation(async (u) => (good as unknown as (u: string) => Promise<unknown>)(u));
+        const lines: string[] = [];
+        const done = await ensureProverKeys('vault', reg(), { env, fetchFn: lost as unknown as typeof fetch, retryDelaysMs: [0, 0, 0], log: (m) => lines.push(m) });
+        expect(done.fetched.sort()).toEqual(['attest', 'grant']);
+        expect(lost).toHaveBeenCalledTimes(5);
+        expect(lines.join()).toMatch(/other side closed/);
+
+        const gone = vi.fn(notFound);
+        await expect(ensureProverKeys('vault', reg(), { env, fetchFn: gone as unknown as typeof fetch, retryDelaysMs: [0, 0, 0] })).rejects.toThrow(/HTTP 404/);
+        expect(gone).toHaveBeenCalledTimes(1);
+
+        const wrong = vi.fn(fetchOf({ 'attest.prover': 'tampered', 'grant.prover': 'tampered' }));
+        await expect(ensureProverKeys('vault', reg(), { env, fetchFn: wrong as unknown as typeof fetch, retryDelaysMs: [0, 0, 0] })).rejects.toThrow(/does not match/);
+        expect(wrong).toHaveBeenCalledTimes(1);
+    });
+
+    it('an error that is no network failure is not tried again', async () => {
+        const reg = artifact({ provers: { attest: 'pk-attest' }, manifest: true });
+        const refused = vi.fn(async () => { throw new Error('refused by the caller'); });
+        const err = await ensureProverKeys('vault', reg, { env: { [ZK_ASSET_URL_ENV]: 'https://h' }, fetchFn: refused as unknown as typeof fetch, retryDelaysMs: [0, 0] }).catch(e => e);
+        expect(err.message).toMatch(/refused by the caller/);
+        expect(refused).toHaveBeenCalledTimes(1);
+    });
+
+    it('the last failure names its cause and the number of tries', async () => {
+        const reg = artifact({ provers: { attest: 'pk-attest' }, manifest: true });
+        const down = vi.fn(async () => { throw Object.assign(new TypeError('fetch failed'), { cause: new Error('other side closed') }); });
+        const err = await ensureProverKeys('vault', reg, { env: { [ZK_ASSET_URL_ENV]: 'https://h' }, fetchFn: down as unknown as typeof fetch, retryDelaysMs: [0] }).catch(e => e);
+        expect(err.message).toMatch(/fetch failed: other side closed \(2 tries\)/);
+        expect(err.retryable).toBe(true);
+        expect(down).toHaveBeenCalledTimes(2);
     });
 
     it('an artifact without a manifest cannot fetch at all', async () => {

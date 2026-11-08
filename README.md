@@ -13,138 +13,19 @@
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E10-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-yellow)](LICENSE)
 
-`@odatano/nightgate` connects SAP CAP to the [Midnight](https://midnight.network/) blockchain. A crawler indexes blocks from a Substrate RPC node into CAP entities; a wallet stack in a worker thread submits transactions (Compact deploys and calls, NIGHT and custom-token transfers, dust generation, fee sponsoring). Everything is exposed as OData V4.
+`@odatano/nightgate` is an indexer and transaction service for the [Midnight](https://midnight.network/) blockchain, built on SAP CAP. It runs as a plugin inside a CAP application or as a standalone container. A crawler indexes blocks from a Midnight node into CAP entities. A wallet stack in worker threads builds, proves and submits transactions: Compact deploys and calls, NIGHT and custom-token transfers, dust generation and fee sponsoring. Everything is exposed as OData V4.
 
-```text
-                            ┌──────────────────────────────────────┐
-                            │      Midnight Preview / Preprod      │
-                            │   Substrate Node    GraphQL Indexer  │
-                            └──────────────┬──────────────┬────────┘
-                                           │              │
-                            wss://         │ Substrate    │ GraphQL
-                            JSON-RPC       │ RPC          │ HTTP + WS
-                                           ▼              ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│  NIGHTGATE                                                                │
-│                                                                           │
-│  Main thread                              Worker thread                   │
-│  ┌──────────────────────┐                 ┌──────────────────────────┐    │
-│  │  Crawler             │                 │  Wallet SDK              │    │
-│  │  - BlockProcessor    │                 │                          │    │
-│  │  - reorg detection   │                 │  - facade.start (sync)   │    │
-│  └─────────┬────────────┘                 │  - transferTransaction   │    │
-│            │ atomic writes                │  - finalize (ZK prove)   │    │
-│            ▼                              │  - registerForDustGen    │    │
-│  ┌──────────────────────┐                 │  - deployContract        │    │
-│  │  CAP DB              │◄────state-save──┤  - submitContractCall    │    │
-│  │  (SQLite / HANA)     │   periodic save │                          │    │
-│  └─────────┬────────────┘                 │ - private-state-rpc      │    │
-│            │ OData V4                     └──────────┬───────────────┘    │
-│            ▼                                         │                    │
-│  5 services on /odata/v4/midnight{,-indexer,-analytics,-admin,-verify}    │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+It runs on Midnight ledger 9 networks.
 
-The wallet SDK runs in a worker thread because its sync saturates the microtask queue; the CAP request pipeline stays responsive.
+## Ways to use it
 
-## Three ways to use it
+- **Hosted**: call the gateway at `api.preview.odatano.dev` with a key. Start at the [hosted quickstart](https://api.preview.odatano.dev/quickstart).
+- **Self-hosted**: run NIGHTGATE as a CAP plugin or container with a Midnight node and indexer behind it. See [docs/self-hosted.md](docs/self-hosted.md).
+- **Library**: [`@odatano/nightgate-tx`](packages/nightgate-tx/README.md) builds, proves and signs on your machine and hands the transaction to a sponsor. See [docs/txbuilder.md](docs/txbuilder.md).
 
-- **Hosted**: an agent or app talks to the gateway at `api.preprod.odatano.dev` with a key. No node, no indexer, no server to run. Start at the [hosted quickstart](https://api.preprod.odatano.dev/quickstart).
-- **Self-hosted**: you run NIGHTGATE as a CAP plugin or container, with a Midnight node and indexer behind it: your own, or hosted ones with an access token. Start at [docs/self-hosted.md](docs/self-hosted.md).
-- **Library**: `@odatano/nightgate-tx` builds, proves and signs on your machine and hands the transaction to a sponsor, through the hosted gateway or your own instance. Start at [docs/txbuilder.md](docs/txbuilder.md).
-
-## Quick start
+## Install as a CAP plugin
 
 ```bash
-npm ci
-npm run dev           
-```
-
-Or standalone with Docker ([docs/docker.md](docs/docker.md)):
-
-```bash
-# your own node and indexer; hosted ones: their URLs with the access token in the query
-NODE_URL='ws://<node-host>:9944'
-INDEXER_URL='http://<indexer-host>:8088/api/v4/graphql'
-docker pull ghcr.io/odatano/nightgate:latest
-docker run -d -p 4004:4004 \
-  -e ENCRYPTION_KEY=$(openssl rand -hex 32) \
-  -e NIGHTGATE_HTTP_PASSWORD=change-me \
-  -e NIGHTGATE_NODE_URL="$NODE_URL" \
-  -e NIGHTGATE_INDEXER_HTTP_URL="$INDEXER_URL" \
-  -v nightgate-data:/data \
-  ghcr.io/odatano/nightgate:latest
-```
-
-The node and indexer are required on preprod and mainnet (the container refuses to start without them); `-e NIGHTGATE_NETWORK=preview` runs with the public ones.
-
-`.env` (see `.env.example`):
-
-```bash
-NIGHTGATE_NETWORK=preprod
-# Node and indexer of the network: your own, or hosted ones with the access token in the URL
-# (docs/self-hosted.md). Preprod and mainnet have no built-in endpoints; preview has.
-NIGHTGATE_NODE_URL=ws://<node-host>:9944
-# GraphQL indexer, HTTP; the WS URL is derived
-NIGHTGATE_INDEXER_HTTP_URL=http://<indexer-host>:8088/api/v4/graphql
-# Unset = in-process wasm proving. Setting it selects server proving (production).
-# NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300
-NIGHTGATE_CRAWLER_ENABLED=false
-ENCRYPTION_KEY=<random secret>
-```
-
-First sync walkthrough: [docs/quickstart.md](docs/quickstart.md).
-
-## Services & capabilities
-
-| Service | Path | Content |
-|---|---|---|
-| `NightgateService` | `/odata/v4/midnight` | chain data, wallet sessions, token / contract / attestation actions |
-| `NightgateIndexerService` | `/odata/v4/midnight-indexer` | sync state, health, metrics, crawler control |
-| `NightgateAnalyticsService` | `/odata/v4/midnight-analytics` | aggregate counts |
-| `NightgateAdminService` | `/odata/v4/midnight-admin` | sessions, contract registration, diagnostics |
-| `NightgateVerifyService` | `/odata/v4/midnight-verify` | unauthenticated state verification (`NIGHTGATE_PUBLIC_VERIFY=true`) |
-
-Submit actions are async: they return `{ jobId, status }`; poll `getJobStatus(jobId, sessionId)`. Signatures, error codes and examples: [docs/actions.md](docs/actions.md).
-
-| Capability | Surface |
-|---|---|
-| Block indexing | Crawler with reorg detection; OData queries on `Blocks`, `Transactions`, `ContractActions`, `UnshieldedUtxos`, `NightBalances` |
-| Wallet sessions | `connectWallet` (viewing key, read-only), `connectWalletForSigning` (BIP39 mnemonic, Lace-compatible HD derivation); AES-256-GCM at rest, bound to the requesting user |
-| Token ops | `sendNight` (ledger from the receiver address; `tokenTypeHex` for custom tokens), `registerForDustGeneration` / `deregisterFromDustGeneration` |
-| Fee sponsoring | Dust generation delegation (`dustReceiverAddress`) and per-tx `sponsorSessionId` on submit actions (platform sponsors: `NIGHTGATE_FEE_SPONSOR_SESSION`) |
-| Pre-flight | `getWalletBalance`, `estimateSendNightFee`, `deriveWalletInfo` |
-| Compact contracts | `deployContract`, `submitContractCall`, `submitContractCallBatch` on registered artifacts |
-| Proving | `wasm` in-process (default without a proof server) or `server` (selected by a proof-server URL; production). Override: `NIGHTGATE_PROVING_MODE` |
-| Document anchoring | `anchorDocument` / `verifyDocument`: hash on chain, storage stays with the caller |
-| Document ingestion | `prepareDocumentProof`: canonical JSON -> `payloadHash` + salted content root with per-field inclusion paths (16 slots, 32 on `attestation-vault-32`); `prepareMembershipSet`: canonical allow-list root. Compute-only |
-| Agent access | `createAgentGrant` / `createAgentGrants` / `updateAgentGrant` / `rotateAgentGrantToken` / `revokeAgentGrant`: scoped bearer tokens (`x-agent-token`) with action allow-list, budgets, pinned session and sponsor; `attestAgentOutput`: verifiable agent-output provenance. MCP server: [`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP) |
-| Agent markets | `sponsorSwap` settles a shielded swap from two proven halves; the offer board (`postSwapOffer` / `listSwapOffers` / `getSwapOffer` / `retireSwapOffer`, anonymous `getBoardStatus`) carries maker halves as offer files; `mintFactoryToken` mints a session's own named tokens on the `token-factory` lineage |
-| Field proofs | `issueFieldPredicateAttestation` (`value <= / >= threshold`), `issueFieldEqualityAttestation` (value behind a public digest), `issueFieldMembershipAttestation` (one of up to 64 allowed values); `issueFieldPredicateAttestationBatch`: up to 8 mixed claims in one tx. Values stay hidden |
-| Cross-document proofs | `issueDocumentIntegrityAttestation` (B differs from A only in a slot mask), `issueDocumentDiffAttestation` (at least k slots differ); same width only |
-| Crawler-free verification | `verifyAttestationState`, `verifyPredicateState`, `reindexDisclosures`: live contract state from the configured indexer, optional `network` override |
-| Tiered disclosure | `grantDisclosure` / `revokeDisclosure` / `registerGranteeIdentity`, `DisclosureGrants` index, `AttestationService` with three tiers |
-| Local tx building | `@odatano/nightgate/txbuilder` or [`@odatano/nightgate-tx`](packages/nightgate-tx/README.md): build, prove and sign with your own key, then `sponsorFinalizedTransaction` / `sponsorUnboundTransaction` pays and submits. The sponsor sees no key, witness or preimage |
-| Browser | `@odatano/nightgate/browser` + `GET /zk-config/<contract>/…` + `GET /contract-manifest`: wallet-driven dApps without Compact toolchain or `managed/` artifacts |
-| Operations | Health, liveness, readiness, Prometheus metrics, crawler pause / resume / reindex, offline start |
-
-## Documentation
-
-- [Quickstart](docs/quickstart.md): first wallet-signed transaction
-- [First anchor on the hosted API](https://api.preprod.odatano.dev/quickstart): key, seed and a shared sandbox vault, no indexer; [AGENT_MS](https://github.com/maxalexweber1/AGENT_MS) is a working agent built that way
-- [Self-hosted](docs/self-hosted.md): run your own instance with your own node and indexer, or with hosted ones
-- [Actions](docs/actions.md): every action and function with examples
-- [Architecture](docs/architecture.md): worker thread, submission flow, persistence
-- [Operations](docs/operations.md): scripts, wallet sync, troubleshooting
-- [Docker](docs/docker.md): standalone container, configuration, schema upgrades
-- [Transaction builder](docs/txbuilder.md): build sponsorable transactions without a server
-- [Reference](docs/reference.md): configuration and project structure
-- [Changelog](CHANGELOG.md)
-
-## Use as a CAP plugin in another app
-
-```bash
-cd my-cap-app
 npm install @odatano/nightgate @cap-js/sqlite
 ```
 
@@ -154,7 +35,7 @@ npm install @odatano/nightgate @cap-js/sqlite
     "requires": {
       "db": { "kind": "sqlite" },
       "nightgate": {
-        "network": "preprod",
+        "network": "mainnet",
         "nodeUrl": "ws://<node-host>:9944",
         "indexerHttpUrl": "http://<indexer-host>:8088/api/v4/graphql"
       }
@@ -163,11 +44,64 @@ npm install @odatano/nightgate @cap-js/sqlite
 }
 ```
 
-Then `cds watch`. On preprod and mainnet `nodeUrl` and `indexerHttpUrl` are required (your own or hosted ones, [docs/self-hosted.md](docs/self-hosted.md)); preview has built-in public endpoints, so `network` alone is enough there. Proving defaults to wasm. Configuration: [docs/reference.md#configuration](docs/reference.md#configuration).
+Then `cds watch`. Every network but preview, testnet and undeployed needs `nodeUrl` and `indexerHttpUrl`. Preview has built-in public endpoints, so `network` alone is enough there. Proving runs in-process by default. All options: [docs/reference.md#configuration](docs/reference.md#configuration).
+
+## Run the container
+
+```bash
+docker run -d -p 4004:4004 \
+  -e ENCRYPTION_KEY=$(openssl rand -hex 32) \
+  -e NIGHTGATE_HTTP_PASSWORD=change-me \
+  -e NIGHTGATE_NODE_URL='ws://<node-host>:9944' \
+  -e NIGHTGATE_INDEXER_HTTP_URL='http://<indexer-host>:8088/api/v4/graphql' \
+  -v nightgate-data:/data \
+  ghcr.io/odatano/nightgate:latest
+```
+
+Configuration, PostgreSQL and upgrades: [docs/docker.md](docs/docker.md).
+
+## Services
+
+| Service | Path | Content |
+|---|---|---|
+| `NightgateService` | `/odata/v4/midnight` | chain data, wallet sessions, token, contract, attestation and sponsoring actions |
+| `NightgateIndexerService` | `/odata/v4/midnight-indexer` | sync state, health, metrics, crawler control |
+| `NightgateAnalyticsService` | `/odata/v4/midnight-analytics` | aggregate counts |
+| `NightgateAdminService` | `/odata/v4/midnight-admin` | sessions, contract registration, diagnostics |
+| `NightgateVerifyService` | `/odata/v4/midnight-verify` | verification without credentials, with `NIGHTGATE_PUBLIC_VERIFY=true` |
+
+Actions that write to the chain return `{ jobId, status }`. Poll `getJobStatus`. Every action: [docs/actions.md](docs/actions.md).
+
+## Capabilities
+
+- Block indexing with reorg rollback: `Blocks`, `Transactions`, `ContractActions`, `UnshieldedUtxos`, `NightBalances`.
+- Wallet sessions: `connectWallet` with a viewing key, `connectWalletForSigning` with a BIP39 mnemonic. Keys are encrypted at rest.
+- Transfers and dust: `sendNight` with optional `tokenTypeHex`, `registerForDustGeneration`, `deregisterFromDustGeneration`.
+- Compact contracts: `deployContract`, `submitContractCall`, `submitContractCallBatch` on registered artifacts.
+- Fee sponsoring: `sponsorSessionId` on submit actions, `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorTransfer`, platform sponsors in `NIGHTGATE_FEE_SPONSOR_SESSION`.
+- Documents and proofs: `anchorDocument`, `prepareDocumentProof`, field predicate, equality and membership attestations, cross-document integrity and diff attestations.
+- Verification without the crawler: `verifyAttestationState`, `verifyPredicateState`.
+- Disclosure: `grantDisclosure`, `revokeDisclosure`, `grantDisclosureToHolders`, `claimDisclosure`.
+- Agents: `createAgentGrant` issues scoped tokens for the `x-agent-token` header. MCP server: [`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP).
+- Offer board: `postSwapOffer`, `listSwapOffers`, `sponsorSwap`, `mintFactoryToken`.
+- Browser dApps: `@odatano/nightgate/browser`, `GET /zk-config/<contract>/...`, `GET /contract-manifest`.
+- Operations: liveness, readiness, Prometheus metrics, crawler pause, resume and reindex.
+
+## Documentation
+
+- [Quickstart](docs/quickstart.md): first wallet-signed transaction
+- [Self-hosted](docs/self-hosted.md): node and indexer behind your own instance
+- [Docker](docs/docker.md): standalone container
+- [Actions](docs/actions.md): every action and function with examples
+- [Reference](docs/reference.md): configuration, services, entities
+- [Operations](docs/operations.md): scripts, wallet sync, troubleshooting
+- [Architecture](docs/architecture.md): threads, submission flow, persistence
+- [Transaction builder](docs/txbuilder.md): build sponsorable transactions without a server
+- [Changelog](CHANGELOG.md)
 
 ## Development
 
-`npm run dev` (cds watch, 12 GB heap), `npm run typecheck`, `npm run lint`, `npm test`; `npm run check:release` before a tag. Every script and e2e lane: [docs/operations.md#scripts-at-a-glance](docs/operations.md#scripts-at-a-glance).
+`npm run dev` runs `cds watch` with a 12 GB heap. Checks: `npm run typecheck`, `npm run lint`, `npm test`, `npm run check:release`. Scripts and e2e lanes: [docs/operations.md#scripts-at-a-glance](docs/operations.md#scripts-at-a-glance).
 
 ## License
 
@@ -177,5 +111,5 @@ Then `cds watch`. On preprod and mainnet `nodeUrl` and `indexerHttpUrl` are requ
 
 - [ODATANO GitHub org](https://github.com/ODATANO)
 - [Midnight Network](https://midnight.network/)
-- [Consumer App Implementation](https://github.com/ODATANO/NIGHTPASS)
-- [SAP CAP Documentation](https://cap.cloud.sap/docs/)
+- [Consumer app implementation](https://github.com/ODATANO/NIGHTPASS)
+- [SAP CAP documentation](https://cap.cloud.sap/docs/)

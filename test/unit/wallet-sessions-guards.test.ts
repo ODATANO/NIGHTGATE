@@ -73,9 +73,6 @@ vi.mock('../../srv/submission/token-ops', () => ({
     getWalletBalance: mockGetWalletBalance,
     estimateSendNightFee: mockEstimateSendNightFee
 }));
-vi.mock('../../srv/midnight/providers', () => ({
-    ensureNetworkId: vi.fn(async () => undefined)
-}));
 vi.mock('../../srv/submission/background-jobs', () => ({
     startJob: vi.fn(async (args: any) => ({ jobId: `job-${args.kind}`, status: 'pending' })),
     registerBackgroundJobProcessor: vi.fn(),
@@ -150,7 +147,7 @@ describe('wallet session guard branches', () => {
         __resetRateLimitersForTests();
         vi.clearAllMocks();
         for (const k of NIGHTGATE_ENV_KEYS) delete process.env[k];
-        (cds.env as any).requires = { nightgate: {} };
+        (cds.env as any).requires = { nightgate: { network: 'preprod' } };
         mockDeriveAccountId.mockReturnValue('acct-derived');
         mockDbRun.mockResolvedValue(null);
         Object.keys(handlers).forEach(k => delete handlers[k]);

@@ -71,11 +71,13 @@ export async function profileCurrentThread(seconds: number, opts: { dir?: string
     const inspector = await import('node:inspector');
     const session = new inspector.Session();
     session.connect();
-    const post = (m: string, p?: object) => new Promise<any>((res, rej) => (session as any).post(m, p ?? {}, (e: Error | null, r: unknown) => e ? rej(e) : res(r)));
+    const post = <R = object>(m: string, p?: object) => new Promise<R>((res, rej) => session.post(m, p ?? {}, (e, r) => e ? rej(e) : res(r as R)));
     const gc: GcFigures = { count: 0, totalMs: 0, byKind: {} };
     const observer = new PerformanceObserver(list => {
         for (const e of list.getEntries()) {
-            const kind = GC_KIND[(e as any).detail?.kind ?? (e as any).kind ?? 0] ?? 'other';
+            // Node reports the GC kind in `detail`, older versions on the entry itself.
+            const entry = e as PerformanceEntry & { kind?: number; detail?: { kind?: number } };
+            const kind = GC_KIND[entry.detail?.kind ?? entry.kind ?? 0] ?? 'other';
             gc.count++; gc.totalMs += e.duration;
             const k = (gc.byKind[kind] ??= { count: 0, ms: 0 });
             k.count++; k.ms += e.duration;
@@ -88,10 +90,10 @@ export async function profileCurrentThread(seconds: number, opts: { dir?: string
         await post('Profiler.setSamplingInterval', { interval: 1000 });
         await post('Profiler.start');
         await sleep(secs * 1000);
-        const { profile } = await post('Profiler.stop');
+        const { profile } = await post<import('node:inspector').Profiler.StopReturnType>('Profiler.stop');
         observer.disconnect();
         const heapAfter = heapFigures();
-        const summary = summarizeCpuProfile(profile, opts.top ?? 25);
+        const summary = summarizeCpuProfile({ ...profile, samples: profile.samples ?? [], timeDeltas: profile.timeDeltas ?? [] }, opts.top ?? 25);
         let file: string | null = null;
         try {
             const outDir = opts.dir || PROFILE_ROOT;

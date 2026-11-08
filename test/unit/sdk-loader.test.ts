@@ -11,11 +11,11 @@ vi.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({ __e
 vi.mock('@midnight-ntwrk/midnight-js-http-client-proof-provider', () => ({ __esModule: true, marker: 'proof' }));
 vi.mock('@midnight-ntwrk/midnight-js-node-zk-config-provider', () => ({ __esModule: true, marker: 'zk' }));
 vi.mock('@midnight-ntwrk/midnight-js-level-private-state-provider', () => ({ __esModule: true, marker: 'level' }));
-vi.mock('@midnight-ntwrk/ledger-v8', () => ({ __esModule: true, marker: 'ledger-v8' }));
+vi.mock('@midnightntwrk/ledger-v9', () => ({ __esModule: true, marker: 'ledger-v9' }));
 
 import {
     loadMidnightSdk,
-    loadLedgerV8,
+    loadLedger,
     resetMidnightSdkCache
 } from '../../srv/midnight/sdk-loader';
 
@@ -26,7 +26,7 @@ describe('sdk-loader', () => {
 
     describe('loadMidnightSdk', () => {
         it('loads the four provider packages and returns them as a bundle', async () => {
-            const bundle = await loadMidnightSdk();
+            const bundle: any = await loadMidnightSdk();
             expect(bundle.indexer.marker).toBe('indexer');
             expect(bundle.proof.marker).toBe('proof');
             expect(bundle.zk.marker).toBe('zk');
@@ -47,7 +47,7 @@ describe('sdk-loader', () => {
         it('re-loads the SDK after resetMidnightSdkCache()', async () => {
             const first = await loadMidnightSdk();
             resetMidnightSdkCache();
-            const second = await loadMidnightSdk();
+            const second: any = await loadMidnightSdk();
             // Different bundle object after reset: the module cache survives,
             // but the loader's in-memory pointer was nulled, so we get a fresh
             // bundle composition.
@@ -56,28 +56,28 @@ describe('sdk-loader', () => {
         });
     });
 
-    describe('loadLedgerV8', () => {
-        it('loads ledger-v8 and caches it', async () => {
-            const first = await loadLedgerV8();
-            expect(first.marker).toBe('ledger-v8');
-            const second = await loadLedgerV8();
+    describe('loadLedger', () => {
+        it('loads ledger-v9 and caches it', async () => {
+            const first: any = await loadLedger();
+            expect(first.marker).toBe('ledger-v9');
+            const second = await loadLedger();
             expect(second).toBe(first);
         });
 
         it('returns the in-flight ledger promise to concurrent callers', async () => {
-            const [a, b] = await Promise.all([loadLedgerV8(), loadLedgerV8()]);
+            const [a, b] = await Promise.all([loadLedger(), loadLedger()]);
             expect(b).toBe(a);
         });
 
         it('re-loads ledger after resetMidnightSdkCache() without throwing', async () => {
-            await loadLedgerV8();
+            await loadLedger();
             resetMidnightSdkCache();
             // Underlying module identity comes from the runner's module cache,
             // so we can't assert `!== first` like we do for the bundle
             // wrappers. The observable behaviour is "doesn't throw, returns
             // the module".
-            const second = await loadLedgerV8();
-            expect(second.marker).toBe('ledger-v8');
+            const second: any = await loadLedger();
+            expect(second.marker).toBe('ledger-v9');
         });
     });
 });

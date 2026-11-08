@@ -28,13 +28,16 @@ import { rotationState, noteGenerationImported, rotateIfDue, __resetRotationForT
 import { handleMessage } from '../../srv/midnight/worker/rpc';
 import { privateStateRpc, PRIVATE_STATE_RPC_TIMEOUT_MS } from '../../srv/midnight/worker/private-state';
 import { WORKER_ROTATING } from '../../srv/midnight/wallet-worker-protocol';
+import { revocableKeystore } from '../../srv/midnight/worker/revocable-keystore';
+import type { UnshieldedKeystore } from '@midnightntwrk/wallet-sdk-unshielded-wallet';
 
 function fakePort() {
     return { postMessage: vi.fn(), close: vi.fn() };
 }
 
-function entryFor(sessionId: string): FacadeEntry {
-    return {
+/** The fields an evict touches; the SDK objects are stubs. */
+function entryFor(sessionId: string) {
+    const entry = {
         sessionId,
         facade: {
             stop: vi.fn(async () => undefined),
@@ -45,13 +48,15 @@ function entryFor(sessionId: string): FacadeEntry {
         sdkVersion: 'test',
         zswapKeys: { clear: vi.fn() },
         dustKey: { clear: vi.fn() },
-        unshieldedKeystore: { clear: vi.fn() },
+        walletSeeds: { shielded: new Uint8Array(32).fill(1), unshielded: new Uint8Array(32).fill(3), dust: new Uint8Array(32).fill(2) },
+        unshieldedKeystore: revocableKeystore({ signData: vi.fn(() => 'sig') } as unknown as UnshieldedKeystore),
         networkId: 'preprod',
         indexerHttpUrl: 'http://indexer.test',
         walletConfiguration: {},
         attestationSecret: new Uint8Array(32).fill(7),
         tokenFactoryIssuerSecret: new Uint8Array(32).fill(8)
     };
+    return entry as typeof entry & FacadeEntry;
 }
 
 beforeEach(() => {
@@ -162,13 +167,16 @@ describe('evict during an in-flight submit', () => {
         expect(facades.has('s-evict')).toBe(false);
         expect(entry.zswapKeys.clear).not.toHaveBeenCalled();
         expect(entry.facade.stop).not.toHaveBeenCalled();
+        expect(entry.unshieldedKeystore.signData(new Uint8Array([1]))).toBe('sig');
 
         releaseSubmit();
         await submit;
         await expect(eviction).resolves.toEqual({ evicted: true, saved: true });
         expect(entry.zswapKeys.clear).toHaveBeenCalledTimes(1);
         expect(entry.dustKey.clear).toHaveBeenCalledTimes(1);
-        expect(entry.unshieldedKeystore.clear).toHaveBeenCalledTimes(1);
+        for (const seed of Object.values(entry.walletSeeds)) expect(seed.every(b => b === 0)).toBe(true);
+        expect(() => entry.unshieldedKeystore.signData(new Uint8Array([1]))).toThrow('signing key dropped');
+        await expect(entry.unshieldedKeystore.signDataAsync(new Uint8Array([1]))).rejects.toThrow('signing key dropped');
         expect(entry.attestationSecret.every(b => b === 0)).toBe(true);
         expect(entry.tokenFactoryIssuerSecret.every(b => b === 0)).toBe(true);
         expect(entry.facade.stop).toHaveBeenCalledTimes(1);

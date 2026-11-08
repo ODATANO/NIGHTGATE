@@ -9,9 +9,9 @@ const KEY = 'oda_' + 'ab'.repeat(20);
 describe('gatewayIndexerUrls', () => {
     it('builds the lane URLs for a gateway key, the key in the query string', async () => {
         const { gatewayIndexerUrls } = await importProvider();
-        expect(gatewayIndexerUrls({ baseUrl: 'https://api.preprod.odatano.dev/', token: KEY })).toEqual({
-            indexerHttpUrl: `https://api.preprod.odatano.dev/indexer/api/v4/graphql?key=${KEY}`,
-            indexerWsUrl: `wss://api.preprod.odatano.dev/indexer/api/v4/graphql/ws?key=${KEY}`
+        expect(gatewayIndexerUrls({ baseUrl: 'https://api.preview.odatano.dev/', token: KEY })).toEqual({
+            indexerHttpUrl: `https://api.preview.odatano.dev/indexer/api/v4/graphql?key=${KEY}`,
+            indexerWsUrl: `wss://api.preview.odatano.dev/indexer/api/v4/graphql/ws?key=${KEY}`
         });
         expect(gatewayIndexerUrls({ baseUrl: 'http://localhost:4030', token: KEY })?.indexerWsUrl).toBe(`ws://localhost:4030/indexer/api/v4/graphql/ws?key=${KEY}`);
     });

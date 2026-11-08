@@ -45,8 +45,9 @@ describe('unshielded offers next to a call', () => {
     const ADDR_A = 'a1'.repeat(32);
     const ADDR_B = 'b2'.repeat(32);
     const SPONSOR_KEY = '99'.repeat(32);
-    const addressFromKey = (k: string) => (k === KEY_A ? ADDR_A : 'ee'.repeat(32));
-    const input = (value: unknown, owner = KEY_A, type = NIGHT) => ({ value, owner, type, intentHash: '00'.repeat(32), outputNo: 0 });
+    // Ledger 9 names an input's owner by its verifying key, `{ tag, value }`.
+    const addressFromKey = (k: { value: string }) => (k.value === KEY_A ? ADDR_A : 'ee'.repeat(32));
+    const input = (value: unknown, owner = KEY_A, type = NIGHT) => ({ value, owner: { tag: 'schnorr', value: owner }, type, intentHash: '00'.repeat(32), outputNo: 0 });
     const output = (value: bigint, owner: string, type = NIGHT) => ({ value, owner, type });
     const payIn = (inputs: unknown[], outputs: unknown[]) => tx([{ actions: [CALL(C, 'deposit')], fallibleUnshieldedOffer: { inputs, outputs } }]);
     const canonical = payIn([input(50n)], [output(10n, C), output(40n, ADDR_A)]);

@@ -11,7 +11,7 @@ setConfigWarnSink((message) => cds.log('nightgate:config').warn(message));
 
 export { deriveIndexerWsUrl };
 
-export const VALID_NIGHTGATE_NETWORKS = ['preview', 'testnet', 'preprod', 'mainnet', 'undeployed'] as const;
+export const VALID_NIGHTGATE_NETWORKS = ['preview', 'testnet', 'preprod', 'mainnet', 'stagenet', 'undeployed'] as const;
 
 export type NightgateNetwork = (typeof VALID_NIGHTGATE_NETWORKS)[number];
 
@@ -65,11 +65,11 @@ export interface NightgatePluginConfig {
 
 export function getNightgatePluginConfig(): NightgatePluginConfig {
     // `cds.env` is missing when tests mock `cds`.
-    const env = (cds as any).env as { requires?: { nightgate?: NightgatePluginConfig } } | undefined;
-    return env?.requires?.nightgate ?? {};
+    const config: NightgatePluginConfig | undefined = cds.env?.requires?.nightgate;
+    return config ?? {};
 }
 
-export const DEFAULT_NETWORK: NightgateNetwork = 'preprod';
+export const DEFAULT_NETWORK: NightgateNetwork = 'mainnet';
 
 // Built-in node and indexer endpoints. Only networks with a public, keyless endpoint have one:
 // preprod and mainnet need `nodeUrl` and `indexerHttpUrl` configured (an own node and indexer, or

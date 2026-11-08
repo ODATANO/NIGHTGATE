@@ -97,11 +97,6 @@ vi.mock('../../srv/submission/sponsor-sync-gate', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
     sponsorAtSyncGate: (id: string) => syncGate.atGate(id)
 }));
-vi.mock('../../srv/midnight/providers', async (importOriginal) => ({
-    ...(await importOriginal<Record<string, unknown>>()),
-    ensureNetworkId: vi.fn(async () => undefined)
-}));
-
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';
 import { encodeOfferFile } from '../../srv/utils/offer-file';
 import {

@@ -8,9 +8,16 @@ import { bech32m } from '@scure/base';
 const A = 'a1'.repeat(32);
 const B = 'b2'.repeat(32);
 
-vi.mock('@midnight-ntwrk/ledger-v8', () => ({
+vi.mock('@midnightntwrk/ledger-v9', () => ({
     Transaction: { deserialize: () => { throw new Error('not used here'); } },
     ZswapSecretKeys: { fromSeed: () => ({ coinPublicKey: 'c1'.repeat(32), encryptionPublicKey: 'e1'.repeat(32) }) }
+}));
+
+// The wallet's sealed handles are plain records here: `{ sealed, tx }` going in, `{ stage, tx }` coming out.
+vi.mock('../../src/txbuilder/wallet-tx.mjs', () => ({
+    sealTx: async (stage: string, tx: unknown) => ({ sealed: stage, tx }),
+    openTx: async (handle: { tx: unknown }) => handle.tx,
+    shieldedKeysByEpoch: async () => ({ v8: 'keys-v8', v9: 'keys-v9' })
 }));
 
 const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
@@ -45,7 +52,7 @@ describe('readTransferShape', () => {
 
 describe('createSwapWallet().buildTransfer', () => {
     const SEED = 'ab'.repeat(64);
-    const URLS = { indexerHttpUrl: 'https://indexer.example/api/v3/graphql', indexerWsUrl: 'wss://indexer.example/api/v3/graphql/ws' };
+    const URLS = { networkId: 'preprod', indexerHttpUrl: 'https://indexer.example/api/v3/graphql', indexerWsUrl: 'wss://indexer.example/api/v3/graphql/ws' };
     // A real shielded address: 64 bytes, 132 characters, beyond the 90-character default of bech32.
     const TO = bech32m.encode('mn_shield-addr_preprod', bech32m.toWords(Uint8Array.from({ length: 64 }, (_, i) => i)), false);
 
@@ -59,7 +66,7 @@ describe('createSwapWallet().buildTransfer', () => {
             getAddress: vi.fn(async () => ({ own: 'address' })),
             waitForSyncedState: vi.fn(async () => ({})),
             serializeState: vi.fn(async () => '{}'),
-            initSwap: vi.fn(async (_keys: any, inputs: any, outputs: any) => {
+            initSwap: vi.fn(async (inputs: any, outputs: any) => {
                 calls.initSwap.push({ inputs, outputs });
                 const [[type, amount]] = Object.entries(inputs) as Array<[string, bigint]>;
                 let pool = [...coins];
@@ -71,21 +78,27 @@ describe('createSwapWallet().buildTransfer', () => {
                     got += coin.value; picked++;
                     pool = pool.filter(c => c !== coin);
                 }
-                return { unproven: true, guaranteedOffer: { inputs: Array.from({ length: picked }) } };
+                return { stage: 'Unproven', tx: { unproven: true, guaranteedOffer: { inputs: Array.from({ length: picked }) } } };
             }),
             revertTransaction: vi.fn(async (tx: any) => { calls.reverted.push(tx); })
         };
-        const factory = { startWithSecretKeys: vi.fn(() => wallet), restore: vi.fn(() => wallet) };
+        const factory = { startWithSeed: vi.fn(async () => wallet), restore: vi.fn(() => wallet) };
         const proven: any = transferTx(shape);
         const bytes = Uint8Array.from({ length: 40 }, (_, i) => i);
         proven.serialize = () => bytes;
         proven.bind = () => ({ ...proven, isBound: true, serialize: () => bytes });
         const sdk = {
             ledger: { ZswapSecretKeys: { fromSeed: () => ({ coinPublicKey: 'c1'.repeat(32), encryptionPublicKey: 'e1'.repeat(32) }) } },
-            shielded: { CustomShieldedWallet: vi.fn(() => factory) },
-            shieldedV1: { V1Builder: class { withDefaults() { return this; } withCoinSelection(make: () => unknown) { selection = make(); return this; } } },
+            shielded: { CustomForkingShieldedWallet: vi.fn(() => factory) },
+            shieldedV1: { V1Builder: class { withDefaults() { return this; } } },
+            shieldedV2: {
+                V2Builder: class { withDefaults() { return this; } withCoinSelection(make: () => unknown) { selection = make(); return this; } withMigration() { return this; } },
+                Migration: { makeCrossLedgerMigration: () => ({}) }
+            },
+            chainVersion: { makeIndexerChainVersionProbe: () => ({}) },
+            shieldedKeysByEpoch: async () => ({ v8: 'keys-v8', v9: 'keys-v9' }),
             abstractions: { InMemoryTransactionHistoryStorage: class { /* stand-in */ } },
-            facade: { WalletEntrySchema: {}, mergeWalletEntries: () => ({}) },
+            facade: { WalletEntrySchema: {}, mergeWalletEntries: () => ({}), DefaultForkSchedule: { v9: 2_000_000n } },
             addressFormat: {
                 mainnet: Symbol('Mainnet'),
                 MidnightBech32m: class {
@@ -95,7 +108,6 @@ describe('createSwapWallet().buildTransfer', () => {
                 },
                 ShieldedAddress: { codec: { decode: (network: string, repr: { type: string; network: string; data: Buffer }) => { calls.decoded.push([network, repr.type, repr.network, repr.data.length]); return { decoded: TO }; } } }
             },
-            networkId: { setNetworkId: vi.fn() },
             deriveRoleSeeds: async () => ({ zswap: new Uint8Array(32), dust: new Uint8Array(32), night: new Uint8Array(32) }),
             provingService: { prove: vi.fn(async (unproven: any) => { calls.proven.push(unproven); return proven; }) }
         };

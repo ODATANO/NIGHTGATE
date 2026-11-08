@@ -1,17 +1,20 @@
 // Loads the Midnight JS SDK once with a dynamic `import()`, because the SDK is ESM only.
 // Covers only the main thread. The wallet worker loads its own SDK packages.
 
-type MidnightSdkIndexerProvider = any;
-type MidnightSdkProofProvider = any;
-type MidnightSdkZkConfig = any;
-type MidnightSdkLevelState = any;
-type LedgerV8 = any;
+import type * as IndexerSdk from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
+import type * as ProofSdk from '@midnight-ntwrk/midnight-js-http-client-proof-provider';
+import type * as ZkConfigSdk from '@midnight-ntwrk/midnight-js-node-zk-config-provider';
+import type * as LevelStateSdk from '@midnight-ntwrk/midnight-js-level-private-state-provider';
+import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
+import type * as LedgerV8 from '@midnightntwrk/ledger-v8';
+
+type LedgerModule = typeof LedgerV9;
 
 export interface MidnightSdkBundle {
-    indexer: MidnightSdkIndexerProvider;
-    proof: MidnightSdkProofProvider;
-    zk: MidnightSdkZkConfig;
-    level: MidnightSdkLevelState;
+    indexer: typeof IndexerSdk;
+    proof: typeof ProofSdk;
+    zk: typeof ZkConfigSdk;
+    level: typeof LevelStateSdk;
 }
 
 let cachedBundle: MidnightSdkBundle | undefined;
@@ -43,21 +46,33 @@ export async function loadMidnightSdk(): Promise<MidnightSdkBundle> {
 export function resetMidnightSdkCache(): void {
     cachedBundle = undefined;
     inflight = undefined;
-    cachedLedgerV8 = undefined;
+    cachedLedgerModule = undefined;
     inflightLedger = undefined;
+    ledger8Module = undefined;
 }
 
 // The ledger package is loaded on its own because many callers need only the ledger.
 
-let cachedLedgerV8: LedgerV8 | undefined;
-let inflightLedger: Promise<LedgerV8> | undefined;
+/** First runtime `spec_version` whose blocks carry ledger 9 transactions. Older blocks carry ledger 8 ones. */
+export const LEDGER_9_FIRST_SPEC_VERSION = 2_000_000;
 
-export async function loadLedgerV8(): Promise<LedgerV8> {
-    if (cachedLedgerV8) return cachedLedgerV8;
+let ledger8Module: Promise<typeof LedgerV8> | undefined;
+
+/** The ledger of the generation before the fork, for transactions of blocks below `LEDGER_9_FIRST_SPEC_VERSION`. */
+export function loadLedger8(): Promise<typeof LedgerV8> {
+    ledger8Module ??= import('@midnightntwrk/ledger-v8');
+    return ledger8Module;
+}
+
+let cachedLedgerModule: LedgerModule | undefined;
+let inflightLedger: Promise<LedgerModule> | undefined;
+
+export async function loadLedger(): Promise<LedgerModule> {
+    if (cachedLedgerModule) return cachedLedgerModule;
     if (inflightLedger) return inflightLedger;
     inflightLedger = (async () => {
-        const mod = await import('@midnight-ntwrk/ledger-v8');
-        cachedLedgerV8 = mod;
+        const mod = await import('@midnightntwrk/ledger-v9');
+        cachedLedgerModule = mod;
         return mod;
     })();
     try {

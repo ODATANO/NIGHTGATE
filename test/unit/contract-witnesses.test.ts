@@ -3,7 +3,13 @@
  * kit's and tested with the circuits.
  */
 
+import type { WitnessContext } from '@midnight-ntwrk/compact-runtime';
 import { getContractWitnessFactory, deriveTokenFactoryIssuerSecret, deriveAttestationSecret } from '../../srv/submission/contract-witnesses';
+
+/** The context a circuit hands a witness. Only the private state matters to these witnesses. */
+function witnessContext(privateState: unknown): WitnessContext<unknown, unknown> {
+    return { privateState, ledger: undefined, contractAddress: '' };
+}
 
 describe('getContractWitnessFactory', () => {
     test('returns the factory for attestation-vault', () => {
@@ -16,9 +22,9 @@ describe('getContractWitnessFactory', () => {
         expect(typeof factory).toBe('function');
         const secret = new Uint8Array(32).fill(9);
         const witnesses = factory({ issuerSecret: secret });
-        expect(witnesses.issuerSecret({ privateState: 'ps' })).toEqual(['ps', secret]);
+        expect(witnesses.issuerSecret(witnessContext('ps'))).toEqual(['ps', secret]);
         const vacant = getContractWitnessFactory('token-factory')!({});
-        expect(() => vacant.issuerSecret({ privateState: null })).toThrow(/issuerSecret/);
+        expect(() => vacant.issuerSecret(witnessContext(null))).toThrow(/issuerSecret/);
     });
 
     test('the issuer secret is deterministic per seed and distinct from the vault secret', () => {

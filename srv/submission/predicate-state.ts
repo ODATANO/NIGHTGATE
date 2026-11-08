@@ -18,7 +18,7 @@ import {
     type ReadPredicateResultDeps
 } from '@odatano/contract-kit';
 import { importArtifact } from './artifact-import';
-import { buildPublicDataProvider } from '../midnight/public-data-provider';
+import { buildPublicDataProvider, queryLedger9ContractState } from '../midnight/public-data-provider';
 
 export {
     CLAIM_TAG,
@@ -80,9 +80,9 @@ export async function readPredicateStateForContract(
     const publicData = await buildPublicDataProvider(args.contractProvidersConfig);
     const artifact = await importArtifact(args.artifactPath, args.artifactDigest) as ContractArtifact<PredicateLedger>;
 
-    const state = await publicData.queryContractState(args.contractAddress.toLowerCase());
+    const state = await queryLedger9ContractState(publicData, args.contractAddress.toLowerCase());
     if (!state) return null;
-    const led = artifact.ledger(state.data ?? state);
+    const led = artifact.ledger(state.data);
 
     const recordKeyA = await computeRecordKey(args.attesterId, args.payloadHash);
     const anchorA = anchorOf(led, recordKeyA);

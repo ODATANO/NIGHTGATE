@@ -111,7 +111,7 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     // Read functions bound to indexer entities. They return rows that `READ` already allows,
     // but CAP reports each one as its own event.
     'latest', 'byHeight', 'range',          // Blocks
-    'byHash', 'byIdentifier', 'byType',     // Transactions
+    'byHash', 'byIdentifier', 'byType', 'ledgerTransaction', // Transactions
     'byAddress', 'history',                 // ContractActions
     'stateAt',                              // ContractStates
     'byOwner', 'unspent',                   // UnshieldedUtxos

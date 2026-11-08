@@ -15,6 +15,9 @@ import { log } from './context';
 import { zkProviderBundles } from './contracts';
 import { noteGenerationImported } from './rotation';
 import { errorMessage } from '../../utils/errors';
+import type { Contract } from '@midnight-ntwrk/compact-js';
+import type { Types } from 'effect';
+import { ZK_ARTIFACT_MANIFEST_DIR, ZK_ARTIFACT_MANIFEST_FILE, hasZkArtifactManifest, zkArtifactManifestPath } from '../../submission/zk-artifact-manifest';
 
 export interface ContractRegistration {
     artifactPath: string;
@@ -26,9 +29,25 @@ export interface ContractRegistration {
     slotWidth?: number;
 }
 
+/** A contract compiled from Compact. The artifact is imported at run time, so its private state and witnesses are not typed. */
+export type ArtifactContract = Contract<unknown>;
+export type ArtifactContractClass = Types.Ctor<ArtifactContract>;
+
 // Only the class is cached. Witnesses differ per session, so the contract object is built per call.
 export interface ContractScaffold {
-    contractClass: any;
+    contractClass: ArtifactContractClass;
+}
+
+function isContractClass(value: unknown): value is ArtifactContractClass {
+    return typeof value === 'function';
+}
+
+/** The class an artifact module exports: `Contract`, else the default export, else the module itself. */
+function exportedContractClass(mod: unknown): unknown {
+    if ((typeof mod !== 'object' && typeof mod !== 'function') || mod === null) return mod;
+    const named = 'Contract' in mod ? mod.Contract : undefined;
+    const fallback = 'default' in mod ? mod.default : undefined;
+    return named ?? fallback ?? mod;
 }
 
 /** How many contract generations stay loaded. */
@@ -48,7 +67,7 @@ export async function getContractScaffold(name: string, registration: ContractRe
     const key = `${name}\0${registration.artifactPath}\0${generation}`;
     const cached = contractScaffolds.get(key);
     if (cached) return cached;
-    let mod: any;
+    let mod: unknown;
     if (generation) {
         const snapshot = materializeArtifactSnapshot(name, registration);
         mod = await importArtifactGeneration(snapshot!.modulePath, generation);
@@ -56,7 +75,8 @@ export async function getContractScaffold(name: string, registration: ContractRe
     } else {
         mod = await importArtifactGeneration(registration.artifactPath, generation);
     }
-    const contractClass = mod.Contract ?? mod.default ?? mod;
+    const contractClass = exportedContractClass(mod);
+    if (!isContractClass(contractClass)) throw new Error(`contract '${name}': the artifact exports no contract class`);
     const scaffold: ContractScaffold = { contractClass };
     contractScaffolds.set(key, scaffold);
     return scaffold;
@@ -238,6 +258,13 @@ export function copySourceMapRebased(from: string, to: string, originalDir: stri
     fs.copyFileSync(from, to);
 }
 
+/** The manifest is not part of the digest, so a snapshot made without one is completed in place. */
+function ensureSnapshotManifest(dir: string, registration: ContractRegistration): void {
+    if (hasZkArtifactManifest(dir) || !hasZkArtifactManifest(registration.zkConfigPath)) return;
+    fs.mkdirSync(path.join(dir, ZK_ARTIFACT_MANIFEST_DIR), { recursive: true });
+    fs.copyFileSync(zkArtifactManifestPath(registration.zkConfigPath), zkArtifactManifestPath(dir));
+}
+
 export function touchSnapshot(dir: string): void {
     try { const now = new Date(); fs.utimesSync(dir, now, now); } catch { /* best effort */ }
 }
@@ -250,11 +277,11 @@ export function materializeArtifactSnapshot(name: string, registration: Contract
     const snapReg = snapshotRegistration(dir, registration);
     const result: ArtifactSnapshot = { digest, zkConfigPath: dir, modulePath: snapReg.artifactPath };
 
-    if (verifiedSnapshots.has(digest) && fs.existsSync(snapReg.artifactPath)) { touchSnapshot(dir); holdSnapshot(dir); return result; }
+    if (verifiedSnapshots.has(digest) && fs.existsSync(snapReg.artifactPath)) { ensureSnapshotManifest(dir, registration); touchSnapshot(dir); holdSnapshot(dir); return result; }
     if (fs.existsSync(dir)) {
         let onDisk: string | null = null;
         try { onDisk = computeArtifactGenerationDigest(snapReg); } catch { onDisk = null; }
-        if (onDisk === digest) { verifiedSnapshots.add(digest); touchSnapshot(dir); holdSnapshot(dir); return result; }
+        if (onDisk === digest) { verifiedSnapshots.add(digest); ensureSnapshotManifest(dir, registration); touchSnapshot(dir); holdSnapshot(dir); return result; }
         log('warn', `artifact snapshot ${digest.slice(0, 16)}… for '${name}' does not verify (${onDisk ? onDisk.slice(0, 16) + '…' : 'unreadable'}); rebuilding it from the registration`);
         fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -269,6 +296,7 @@ export function materializeArtifactSnapshot(name: string, registration: Contract
         if (fs.existsSync(mapPath)) copySourceMapRebased(mapPath, path.join(tmp, 'module', mapName), path.dirname(registration.artifactPath));
         copyDirFiltered(path.join(registration.zkConfigPath, 'keys'), path.join(tmp, 'keys'), (f) => f.endsWith('.verifier') || f.endsWith('.prover') || f === 'manifest.json');
         copyDirFiltered(path.join(registration.zkConfigPath, 'zkir'), path.join(tmp, 'zkir'), () => true);
+        copyDirFiltered(path.join(registration.zkConfigPath, ZK_ARTIFACT_MANIFEST_DIR), path.join(tmp, ZK_ARTIFACT_MANIFEST_DIR), (f) => f === ZK_ARTIFACT_MANIFEST_FILE);
         // The digest covers the key manifest but not the prover keys, so check them against it here.
         const manifestProblems = proverKeyManifestProblems(path.join(tmp, 'keys'));
         if (manifestProblems.length) throw new Error(`Contract '${name}': prover keys do not match keys/manifest.json, refusing to prove from them: ${manifestProblems.join('; ')}`);

@@ -63,6 +63,11 @@ export async function stopCrawler(): Promise<void> {
     log.info('Stopped');
 }
 
+/** The crawler's node connection, null while no crawler runs. */
+export function getActiveNodeProvider(): MidnightNodeProvider | null {
+    return activeNodeProvider;
+}
+
 /** True while the crawler is indexing. False after a stop or a permanent failure. */
 export function isCrawlerRunning(): boolean {
     return activeCrawler !== null && activeCrawler.isActive();

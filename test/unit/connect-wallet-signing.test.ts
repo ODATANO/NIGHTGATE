@@ -15,10 +15,6 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     evictWalletFacade: vi.fn(async () => undefined)
 }));
 
-vi.mock('../../srv/midnight/providers', () => ({
-    ensureNetworkId: vi.fn(async () => undefined)
-}));
-
 // startJob is exercised in its own suite; here it's collapsed to a stub that
 // returns a predictable jobId so connectWalletForSigning's return-shape
 // assertions can be deterministic. The stub also records the work fn so a

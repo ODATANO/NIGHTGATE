@@ -8,7 +8,7 @@ export async function readCapBinary(value: unknown): Promise<Buffer | null> {
     if (Buffer.isBuffer(value)) return value;
     if (value instanceof Uint8Array) return Buffer.from(value);
     if (typeof value === 'string') return Buffer.from(value, 'base64');
-    if (typeof (value as any)[Symbol.asyncIterator] === 'function') {
+    if (typeof value === 'object' && Symbol.asyncIterator in value && typeof value[Symbol.asyncIterator] === 'function') {
         const chunks: Buffer[] = [];
         for await (const chunk of value as AsyncIterable<Buffer | string>) {
             chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));

@@ -17,7 +17,7 @@ service NightgateVerifyService {
                                     contentRoot: Hex64, // optional; must match the stored content root
                                     schemaId: Hex64, // optional; must match the stored schema id
                                     compiledArtifactRef: String, // optional, default 'attestation-vault'
-                                    network: String // optional, default the server's network; e.g. 'preprod'
+                                    network: String // optional, default the server's network; e.g. 'preview'
     )                                                                 returns {
         verified      : Boolean;
         attested      : Boolean; // the payload hash is attested
@@ -46,7 +46,7 @@ service NightgateVerifyService {
                                   allowedMask: Integer64, // required for 'documentIntegrity'; bit i set = field i may differ
                                   k: Integer, // required for 'documentDiff'; minimum number of differing fields
                                   compiledArtifactRef: String, // optional, default 'attestation-vault'
-                                  network: String // optional, default the server's network; e.g. 'preprod'
+                                  network: String // optional, default the server's network; e.g. 'preview'
     )                                                                 returns {
         verified : Boolean;
         proven   : Boolean; // the proof is recorded on chain as true

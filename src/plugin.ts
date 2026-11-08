@@ -2,12 +2,12 @@
 import './cap-log-mask-boot';
 import cds from '@sap/cds';
 import path from 'path';
+import type { Application } from 'express';
 
 import { initialize, shutdown, SchemaNotDeployedError } from './index';
 import { mountZkConfigRoute, mountContractManifestRoute } from './connector-routes';
 import { applyPoolDefault } from './cap-pool-default';
 import { registerNightgateTransportLanes } from '../srv/utils/transport-lanes';
-import { legacyServicePathMiddleware } from '../srv/utils/legacy-service-paths';
 import { errorMessage } from '../srv/utils/errors';
 
 const log = cds.log('nightgate');
@@ -23,9 +23,7 @@ function registerModels(): void {
         log.info('features.use_generic_pool defaulted to true (the built-in @cap-js/db-service pool loses connections on acquire timeouts); set it explicitly in the host config to override');
     }
 
-    const requires = ((cds.env as unknown as {
-        requires?: Record<string, any>;
-    }).requires ??= {});
+    const requires = cds.env.requires;
 
     const modelPaths = [
         path.join(pluginRoot, 'db'),
@@ -37,9 +35,8 @@ function registerModels(): void {
 }
 
 function registerConnectorRoutes(): void {
-    cds.on('bootstrap', (app: any) => {
+    cds.on('bootstrap', (app: Application) => {
         // Only these routes are added. HTTP policy and global middleware are left to the host app.
-        app.use(legacyServicePathMiddleware);
         mountZkConfigRoute(app);
         mountContractManifestRoute(app);
     });
@@ -85,10 +82,10 @@ const plugin = {
                 description: 'Nightgate configuration for @odatano/nightgate',
                 properties: {
                     network: {
-                        description: 'Target Midnight network: testnet | preview | preprod | mainnet | undeployed. "undeployed" is a local standalone stack (midnight-local-dev). Override via NIGHTGATE_NETWORK env var.',
+                        description: 'Target Midnight network: testnet | preview | preprod | mainnet | stagenet | undeployed. "undeployed" is a local standalone stack (midnight-local-dev). Override via NIGHTGATE_NETWORK env var.',
                         type: 'string',
-                        enum: ['testnet', 'preview', 'preprod', 'mainnet', 'undeployed'],
-                        default: 'preprod'
+                        enum: ['testnet', 'preview', 'preprod', 'mainnet', 'stagenet', 'undeployed'],
+                        default: 'mainnet'
                     },
                     nodeUrl: {
                         description: 'Midnight node Substrate RPC endpoint (ws/wss). Built in for preview, testnet and undeployed; preprod and mainnet need your own node or a hosted one (token in the URL). Override via NIGHTGATE_NODE_URL env var.',

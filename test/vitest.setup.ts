@@ -14,6 +14,8 @@
  */
 process.env.NO_TELEMETRY = 'true';
 process.env.SKIP_AUTO_INIT = 'true';
+// The suites run on a test network. The default network is mainnet, where submission is gated off.
+process.env.NIGHTGATE_NETWORK ??= 'preprod';
 
 import { beforeAll } from 'vitest';
 import cds from '@sap/cds';

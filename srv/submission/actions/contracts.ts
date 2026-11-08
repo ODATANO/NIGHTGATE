@@ -1,7 +1,6 @@
 // Contract deploy, call, batch and build-only actions.
 // SPDX-License-Identifier: Apache-2.0
 import { coerceCircuitArgs } from '../arg-coercion';
-import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
 import { vaultDims } from '../verify-state';
 import { SET_DEPTH } from '../set-root';
@@ -10,6 +9,21 @@ import type { SubmissionContext } from './context';
 import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
 import { buildSponsorable, deployContract, submitContractCall, submitContractCallBatch } from '#cds-models/NightgateService';
 import { checkRateClass } from '../../utils/rate-classes';
+
+// One entry of the `calls` JSON before validation.
+type CallEntryInput = {
+    circuit?: unknown;
+    args?: unknown;
+    merkleProof?: {
+        docPair?: { schema?: unknown; openingA?: unknown; openingB?: unknown } | null;
+        fieldValue?: unknown;
+        fieldDigest?: unknown;
+        fieldSalt?: unknown;
+        siblings?: unknown;
+        dirs?: unknown;
+        setProof?: { siblings?: unknown; dirs?: unknown } | null;
+    } | null;
+} | null;
 
 export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'contractResolver' | 'argTypesLoader' | 'resolveSponsorForRequest'>): void {
     const { srv, db, walletFactory, contractResolver, argTypesLoader, resolveSponsorForRequest } = ctx;
@@ -29,7 +43,6 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledArtifactRef);
             await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
@@ -72,7 +85,6 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledArtifactRef);
 
             const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
@@ -115,7 +127,6 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledArtifactRef);
             const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
             coerceCircuitArgs(parsedArgs, argTypes); // validate now -> 400
@@ -149,7 +160,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
             const v = JSON.parse(calls);
             if (!Array.isArray(v) || v.length === 0) return req.reject(400, 'calls must be a non-empty JSON array');
             if (v.length > 8) return req.reject(400, 'calls supports at most 8 entries per batch');
-            parsedCalls = v.map((entry: any, i: number) => {
+            parsedCalls = v.map((entry: CallEntryInput, i: number) => {
                 if (!entry || typeof entry.circuit !== 'string' || !entry.circuit) {
                     throw new Error(`calls[${i}].circuit is required`);
                 }
@@ -175,7 +186,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                     let fieldValueStr: string | undefined;
                     if (mp.fieldValue !== undefined) {
                         let fieldValueBig: bigint;
-                        try { fieldValueBig = BigInt(mp.fieldValue); } catch { throw new Error(`calls[${i}].merkleProof.fieldValue must be an integer (decimal string)`); }
+                        try { fieldValueBig = BigInt(mp.fieldValue as string | number | bigint); } catch { throw new Error(`calls[${i}].merkleProof.fieldValue must be an integer (decimal string)`); }
                         if (fieldValueBig < 0n) throw new Error(`calls[${i}].merkleProof.fieldValue must be a non-negative integer`);
                         fieldValueStr = fieldValueBig.toString();
                     }
@@ -222,7 +233,6 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             const resolved = await contractResolver(compiledArtifactRef);
 
             // Check every call now, so a bad argument is a 400 and not a failed job.

@@ -3,8 +3,10 @@
 import { persistentHash, CompactTypeBytes } from '@midnight-ntwrk/compact-runtime';
 import { mnemonicToBip39SeedHex, deriveRoleSeeds, type RoleSeeds } from './wallet-hd';
 import { deriveAttestationSecret } from '../submission/contract-witnesses';
-import { loadLedgerV8 } from '../midnight/sdk-loader';
+import { loadLedger } from '../midnight/sdk-loader';
 import { assertSeedHex } from './hex-patterns';
+import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
+import type * as UnshieldedWallet from '@midnightntwrk/wallet-sdk-unshielded-wallet';
 
 export interface WalletInfo {
     viewingKey: string;      // shielded encryption public key, 64 hex chars, the input of connectWallet
@@ -20,17 +22,17 @@ export interface DeriveWalletInfoOptions {
     mnemonic?: string | null;
     seedHex?: string | null; // 64-byte BIP39 seed as 128 hex chars
     accountIndex?: number;   // default 0
-    network: string;         // network the addresses are encoded for, for example preprod
+    network: string;         // network the addresses are encoded for, for example preview
 }
 
-let cachedAddressFormat: any;
-async function loadAddressFormat(): Promise<any> {
+let cachedAddressFormat: typeof AddressFormat | undefined;
+async function loadAddressFormat(): Promise<typeof AddressFormat> {
     if (!cachedAddressFormat) cachedAddressFormat = await import('@midnightntwrk/wallet-sdk-address-format');
     return cachedAddressFormat;
 }
 
-let cachedUnshielded: any;
-async function loadUnshielded(): Promise<any> {
+let cachedUnshielded: typeof UnshieldedWallet | undefined;
+async function loadUnshielded(): Promise<typeof UnshieldedWallet> {
     if (!cachedUnshielded) cachedUnshielded = await import('@midnightntwrk/wallet-sdk-unshielded-wallet');
     return cachedUnshielded;
 }
@@ -53,7 +55,7 @@ export async function deriveViewingKeyForAccount(bip39SeedHex: string, accountIn
     let roleSeeds: RoleSeeds | undefined;
     try {
         roleSeeds = await deriveRoleSeeds(bip39Seed, accountIndex);
-        const ledger = await loadLedgerV8();
+        const ledger = await loadLedger();
         const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
         try {
             return zswapKeys.encryptionPublicKey;
@@ -94,7 +96,7 @@ export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<W
     let roleSeeds: RoleSeeds | undefined;
     try {
         roleSeeds = await deriveRoleSeeds(bip39Seed, accountIndex);
-        const ledger = await loadLedgerV8();
+        const ledger = await loadLedger();
         const af = await loadAddressFormat();
         const unshielded = await loadUnshielded();
 
@@ -112,7 +114,7 @@ export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<W
             zswapKeys.clear?.();
         }
 
-        const keystore = unshielded.createKeystore(roleSeeds.night, opts.network);
+        const keystore = unshielded.createKeystore({ kind: 'schnorr', secret: roleSeeds.night }, opts.network);
         const nightAddress: string = unshielded.PublicKey.fromKeyStore(keystore).address;
 
         // Another wallet that generates dust for this one sends it to this address.

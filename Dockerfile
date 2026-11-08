@@ -35,9 +35,9 @@ ENV NODE_ENV=production
 # default heap; override to match the container's memory limit.
 ENV NODE_OPTIONS=--max-old-space-size=8192
 ENV NIGHTGATE_DB_PATH=/data/nightgate.db
-# The plugin only initializes with an explicit network; preprod is the image's default. The entrypoint
+# The plugin only initializes with an explicit network; mainnet is the image's default. The entrypoint
 # refuses preprod and mainnet without NIGHTGATE_NODE_URL and NIGHTGATE_INDEXER_HTTP_URL (docs/self-hosted.md).
-ENV NIGHTGATE_NETWORK=preprod
+ENV NIGHTGATE_NETWORK=mainnet
 # Attestation-server default: the verify surface is crawler-free, and a
 # fresh container crawling the whole chain into SQLite is rarely what a
 # puller wants. Enable explicitly to run NIGHTGATE as a block indexer.

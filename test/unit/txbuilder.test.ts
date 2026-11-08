@@ -1,13 +1,21 @@
 // `@odatano/nightgate/txbuilder`: the parts that do NOT need the SDK.
 // The live path (build + prove + sponsor) is covered by scripts/run-txbuilder-e2e.mjs.
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
+// The wallet's sealed handles are replaced by plain records, so a test sees what went in and what came out.
+vi.mock('../../src/txbuilder/wallet-tx.mjs', () => ({
+    sealTx: async (stage: string, tx: unknown, forks: unknown) => ({ sealed: stage, tx, forks }),
+    openTx: async (handle: unknown) => ({ opened: handle })
+}));
+
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
+
+const COMPILER_MANIFEST = 'compiler/contract-manifest.json';
 
 describe('txbuilder: ensureZkAssets', () => {
     let dir: string;
@@ -26,16 +34,40 @@ describe('txbuilder: ensureZkAssets', () => {
             cacheDir: dir, circuits: ['attest'],
             fetchFn: (async (u: string) => { seen.push(u); return (await okFetch()(u)); }) as any
         });
-        expect(res.fetched).toBe(3);
+        expect(res.fetched).toBe(4);
         expect(res.cached).toBe(0);
-        // The served manifest is asked for once (best effort) before the files.
-        expect(seen.sort()).toEqual([
-            'https://sponsor.example/zk-config/attestation-vault/keys/attest.prover',
-            'https://sponsor.example/zk-config/attestation-vault/keys/attest.verifier',
+        // The compiler manifest comes first, then the served key manifest (best effort), then the files.
+        expect(seen).toEqual([
+            'https://sponsor.example/zk-config/attestation-vault/compiler/contract-manifest.json',
             'https://sponsor.example/zk-config/attestation-vault/keys/manifest.json',
-            'https://sponsor.example/zk-config/attestation-vault/zkir/attest.bzkir'
+            'https://sponsor.example/zk-config/attestation-vault/keys/attest.prover',
+            'https://sponsor.example/zk-config/attestation-vault/zkir/attest.bzkir',
+            'https://sponsor.example/zk-config/attestation-vault/keys/attest.verifier'
         ]);
         expect((await readFile(join(dir, 'keys', 'attest.prover'), 'utf8')).startsWith('x:')).toBe(true);
+        expect((await readFile(join(dir, COMPILER_MANIFEST), 'utf8')).startsWith('x:')).toBe(true);
+    });
+
+    it('refuses a server without the compiler manifest before any key is downloaded', async () => {
+        // midnight-js verifies every key and zkir against compiler/contract-manifest.json and proves nothing without it.
+        const { ensureZkAssets } = await importTxBuilder();
+        const seen: string[] = [];
+        await expect(ensureZkAssets({
+            zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'],
+            fetchFn: (async (u: string) => { seen.push(u); return u.endsWith(COMPILER_MANIFEST) ? { ok: false, status: 404 } : okFetch()(u); }) as any
+        })).rejects.toThrow(/serves no compiler\/contract-manifest\.json/);
+        expect(seen).toEqual(['https://s/x/' + COMPILER_MANIFEST]);
+    });
+
+    it('replaces a cached compiler manifest the server changed and keeps one it did not', async () => {
+        const { ensureZkAssets } = await importTxBuilder();
+        const serve = (manifest: string) => (async (u: string) => ({
+            ok: true, status: 200, arrayBuffer: async () => Buffer.from(u.endsWith(COMPILER_MANIFEST) ? manifest : 'k:' + u)
+        })) as any;
+        await ensureZkAssets({ zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'], fetchFn: serve('m1') });
+        expect(await ensureZkAssets({ zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'], fetchFn: serve('m1') })).toMatchObject({ fetched: 0, cached: 4, refreshed: 0 });
+        expect(await ensureZkAssets({ zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'], fetchFn: serve('m2') })).toMatchObject({ fetched: 1, cached: 3, refreshed: 1 });
+        expect(await readFile(join(dir, COMPILER_MANIFEST), 'utf8')).toBe('m2');
     });
 
     it('restricting circuits still fetches VERIFIER keys for the whole contract', async () => {
@@ -49,7 +81,7 @@ describe('txbuilder: ensureZkAssets', () => {
             circuits: ['attest'], verifierCircuits: ['attest', 'attestGuarded', 'bindPassport'],
             fetchFn: (async (u: string) => { seen.push(u); return (await okFetch()(u)); }) as any
         });
-        expect(res.fetched).toBe(5); // 1 prover + 1 zkir + 3 verifiers
+        expect(res.fetched).toBe(6); // compiler manifest + 1 prover + 1 zkir + 3 verifiers
         expect(seen.filter(u => u.endsWith('.prover'))).toHaveLength(1);
         expect(seen.filter(u => u.endsWith('.verifier')).sort()).toEqual([
             'https://s/x/keys/attest.verifier',
@@ -81,11 +113,12 @@ describe('txbuilder: ensureZkAssets', () => {
             fetchFn: (async (u: string) => {
                 seen.push(u);
                 if (u.endsWith('/keys/manifest.json')) return { ok: true, status: 200, arrayBuffer: async () => Buffer.from(JSON.stringify(manifest)) };
+                if (u.endsWith(COMPILER_MANIFEST)) return { ok: true, status: 200, arrayBuffer: async () => Buffer.from('m') };
                 const key = Object.keys(bodies).find(k => u.endsWith(k))!;
                 return { ok: true, status: 200, arrayBuffer: async () => Buffer.from(bodies[key]) };
             }) as any
         });
-        expect(res).toMatchObject({ fetched: 2, cached: 1, refreshed: 2, verified: true });
+        expect(res).toMatchObject({ fetched: 3, cached: 1, refreshed: 2, verified: true });
         expect(seen.filter(u => !u.endsWith('manifest.json')).sort()).toEqual(['https://s/x/keys/attest.prover', 'https://s/x/zkir/attest.bzkir']);
         expect(await readFile(join(dir, 'keys', 'attest.prover'), 'utf8')).toBe('prover-v2');
         expect(await readFile(join(dir, 'zkir', 'attest.bzkir'), 'utf8')).toBe('zkir-v2');
@@ -100,7 +133,7 @@ describe('txbuilder: ensureZkAssets', () => {
             zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'],
             fetchFn: (async (u: string) => u.endsWith('/keys/manifest.json')
                 ? { ok: true, status: 200, arrayBuffer: async () => Buffer.from(JSON.stringify(manifest)) }
-                : { ok: true, status: 200, arrayBuffer: async () => Buffer.from('a tampered key') }) as any
+                : { ok: true, status: 200, arrayBuffer: async () => Buffer.from(u.endsWith(COMPILER_MANIFEST) ? 'm' : 'a tampered key') }) as any
         })).rejects.toThrow(/does not match the sha256 in the served keys\/manifest\.json/);
         expect(await readFile(join(dir, 'keys', 'attest.prover'), 'utf8').catch(() => 'absent')).toBe('absent');
     });
@@ -112,16 +145,16 @@ describe('txbuilder: ensureZkAssets', () => {
             zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'],
             fetchFn: (async () => { throw new Error('must not fetch'); }) as any
         });
-        expect(res).toMatchObject({ fetched: 0, cached: 3 });
+        expect(res).toMatchObject({ fetched: 0, cached: 4 });
     });
 
     it('tolerates a 404 (a circuit this contract does not expose) but not a 500', async () => {
         const { ensureZkAssets } = await importTxBuilder();
         const res = await ensureZkAssets({
             zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['ghost'],
-            fetchFn: (async () => ({ ok: false, status: 404 })) as any
+            fetchFn: (async (u: string) => u.endsWith(COMPILER_MANIFEST) ? okFetch()(u) : { ok: false, status: 404 }) as any
         });
-        expect(res.fetched).toBe(0);
+        expect(res).toMatchObject({ fetched: 1, cached: 0 });
 
         await expect(ensureZkAssets({
             zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'],
@@ -151,7 +184,7 @@ describe('txbuilder: ensureZkAssets', () => {
         await mkdir(join(dir, 'keys'), { recursive: true });
         await writeFile(join(dir, 'keys', 'attest.prover.part'), 'half a key');
         const res = await ensureZkAssets({ zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'], fetchFn: okFetch() as any });
-        expect(res.fetched).toBe(3);
+        expect(res.fetched).toBe(4);
         expect((await readFile(join(dir, 'keys', 'attest.prover'), 'utf8')).startsWith('x:')).toBe(true);
     });
 
@@ -160,7 +193,7 @@ describe('txbuilder: ensureZkAssets', () => {
         await mkdir(join(dir, 'keys'), { recursive: true });
         await writeFile(join(dir, 'keys', 'attest.prover'), 'already-here');
         const res = await ensureZkAssets({ zkConfigBaseUrl: 'https://s/x', cacheDir: dir, circuits: ['attest'], fetchFn: okFetch() as any });
-        expect(res).toMatchObject({ fetched: 2, cached: 1 });
+        expect(res).toMatchObject({ fetched: 3, cached: 1 });
         expect(await readFile(join(dir, 'keys', 'attest.prover'), 'utf8')).toBe('already-here');
     });
 });
@@ -189,6 +222,8 @@ describe('txbuilder: zkConfigDir assets keep the public ZkAssetResult shape', ()
         const { createTxBuilder } = await importTxBuilder();
         await mkdir(join(dir, 'keys'), { recursive: true });
         await mkdir(join(dir, 'zkir'), { recursive: true });
+        await mkdir(join(dir, 'compiler'), { recursive: true });
+        await writeFile(join(dir, COMPILER_MANIFEST), '{}');
         class Throws { constructor() { throw new Error('not introspectable'); } }
         await expect(createTxBuilder({
             seedHex: 'ab'.repeat(64), indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i', nodeUrl: 'ws://n',
@@ -203,6 +238,8 @@ describe('txbuilder: zkConfigDir assets keep the public ZkAssetResult shape', ()
         await writeFile(join(dir, 'keys', 'attest.verifier'), 'v');
         await writeFile(join(dir, 'keys', 'attest.prover'), 'p');
         await writeFile(join(dir, 'zkir', 'attest.bzkir'), 'z');
+        await mkdir(join(dir, 'compiler'), { recursive: true });
+        await writeFile(join(dir, COMPILER_MANIFEST), '{}');
         const out = await describeLocalZkAssets(dir, ['attest']);
         expect(out).toEqual({ cacheDir: dir, fetched: 0, cached: 3, source: 'local' });
         expect((out as any).downloaded).toBeUndefined();
@@ -216,6 +253,9 @@ describe('txbuilder: zkConfigDir assets keep the public ZkAssetResult shape', ()
         await expect(describeLocalZkAssets(dir, [])).rejects.toThrow(/must hold keys\/ and zkir\/ directories/);
         await rm(join(dir, 'zkir'));
         await mkdir(join(dir, 'zkir'), { recursive: true });
+        await expect(describeLocalZkAssets(dir, [])).rejects.toThrow(/lacks compiler\/contract-manifest\.json/);
+        await mkdir(join(dir, 'compiler'), { recursive: true });
+        await writeFile(join(dir, COMPILER_MANIFEST), '{}');
         await writeFile(join(dir, 'keys', 'attest.verifier'), 'v');
         await expect(describeLocalZkAssets(dir, ['attest', 'anchorContentRoot'])).rejects.toThrow(/lacks verifier keys for anchorContentRoot/);
         // verifier present, but nothing to PROVE attest with
@@ -250,6 +290,8 @@ describe('txbuilder: a lineage package as the asset source', () => {
         await mkdir(join(zk, 'contract'), { recursive: true });
         await mkdir(join(zk, 'keys'), { recursive: true });
         await mkdir(join(zk, 'zkir'), { recursive: true });
+        await mkdir(join(zk, 'compiler'), { recursive: true });
+        await writeFile(join(zk, COMPILER_MANIFEST), '{"manifest-version":"1"}');
         await writeFile(join(pkgRoot, 'package.json'), JSON.stringify({ name: PKG, version: '0.0.1', type: 'module' }));
         await writeFile(join(zk, 'contract', 'index.js'), 'export class Contract { constructor(w) { this.witnesses = w; this.impureCircuits = { mint() {}, burn() {} }; } }\n');
         const sha = (b: Buffer) => ({ sha256: createHash('sha256').update(b).digest('hex'), bytes: b.length });
@@ -264,7 +306,7 @@ describe('txbuilder: a lineage package as the asset source', () => {
         const digest = opts.digest ?? computeArtifactGenerationDigest({ artifactPath: join(zk, 'contract', 'index.js'), privateStateId: 'fakePrivateState', zkConfigPath: zk });
         await writeFile(join(pkgRoot, 'contract.json'), JSON.stringify({
             name: 'fake', role: 'example', privateStateId: 'fakePrivateState', artifactPath: 'managed/fake/contract/index.js', zkConfigPath: 'managed/fake',
-            circuits: ['burn', 'mint'], compactCompiler: '0.31.0', compactRuntime: '0.16.0', digest, zkAssetUrl: ASSETS, zkAssetLayout: 'flat'
+            circuits: ['burn', 'mint'], compactCompiler: '0.36.0', compactRuntime: '0.21.0', digest, zkAssetUrl: ASSETS, zkAssetLayout: 'flat'
         }));
         return zk;
     }
@@ -290,6 +332,16 @@ describe('txbuilder: a lineage package as the asset source', () => {
         const second = await ensureZkAssets({ package: PKG, from: root, fetchFn: assetFetch(again) });
         expect(again).toEqual([]);
         expect(second).toMatchObject({ fetched: 0, cached: 6, source: 'package' });
+    });
+
+    it('a lost connection during a key download gets another try', async () => {
+        const { ensureZkAssets } = await importTxBuilder();
+        await writePackage();
+        const good = assetFetch([]);
+        const flaky = vi.fn(good).mockRejectedValueOnce(Object.assign(new TypeError('fetch failed'), { cause: new Error('other side closed') }));
+        const done = await ensureZkAssets({ package: PKG, from: root, fetchFn: flaky, retryDelaysMs: [0] });
+        expect(done).toMatchObject({ fetched: 2 });
+        expect(flaky).toHaveBeenCalledTimes(3);
     });
 
     it('a key that does not match the manifest is refused and leaves no file; circuits restricts the fetch, an unknown circuit is an error', async () => {
@@ -331,7 +383,7 @@ describe('txbuilder: a lineage package as the asset source', () => {
         } as any)).rejects.toBe(stop);
         expect(seen.every(u => u.startsWith('http://s/zk-config/fake/'))).toBe(true);
         expect(seen.some(u => u.includes('assets.example'))).toBe(false);
-        expect((await readdir(cacheDir)).sort()).toEqual(['keys', 'zkir']);
+        expect((await readdir(cacheDir)).sort()).toEqual(['compiler', 'keys', 'zkir']);
     });
 
     it('createTxBuilder({ package }) needs neither zkConfigBaseUrl nor contractClass and warms the package keys before anything else', async () => {
@@ -427,6 +479,7 @@ describe('txbuilder: createTxBuilder input validation', () => {
 });
 
 describe('txbuilder: unbound handover refuses a recipe that carries a balancing transaction', () => {
+    const FORKS = { v9: 2_000_000n };
     it('bind:false releases the reserved coins and throws when signRecipe returns a balancingTransaction; bind:true finalizes it', async () => {
         const { buildOnlyWalletProvider } = await importTxBuilder();
         const recipe: any = { type: 'UNBOUND_TRANSACTION', baseTransaction: { base: true }, balancingTransaction: { balancing: true } };
@@ -438,18 +491,19 @@ describe('txbuilder: unbound handover refuses a recipe that carries a balancing 
         };
         const keystore = { signData: vi.fn(() => new Uint8Array(64)) };
         const holder: any = {};
-        const unbound = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, { dust: true }, keystore, holder, 30, false);
+        const unbound = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, keystore, holder, 30, false, FORKS);
         await expect(unbound.balanceTx({ tx: true })).rejects.toThrow(/needs a balancing transaction.*bound handover/);
+        expect((facade.balanceUnboundTransaction.mock.calls[0] as any[])[0]).toEqual({ sealed: 'Unbound', tx: { tx: true }, forks: FORKS });
         expect(facade.revert).toHaveBeenCalledWith(recipe);
-        expect(holder.unbound).toBeUndefined();
-        const bound = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, { dust: true }, keystore, {}, 30, true);
-        await expect(bound.balanceTx({ tx: true })).resolves.toEqual({ finalized: true });
+        expect(holder.captured).toBeUndefined();
+        const bound = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, keystore, {}, 30, true, FORKS);
+        await expect(bound.balanceTx({ tx: true })).resolves.toEqual({ opened: { finalized: true } });
         // and a recipe WITHOUT balancing hands over the base unbound
         facade.balanceUnboundTransaction.mockResolvedValueOnce({ type: 'UNBOUND_TRANSACTION', baseTransaction: { base: true } });
         const holder2: any = {};
-        const unbound2 = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, { dust: true }, keystore, holder2, 30, false);
-        await expect(unbound2.balanceTx({ tx: true })).resolves.toEqual({ base: true });
-        expect(holder2.unbound).toBe(true);
+        const unbound2 = buildOnlyWalletProvider(facade, { coinPublicKey: 'c', encryptionPublicKey: 'e' }, keystore, holder2, 30, false, FORKS);
+        await expect(unbound2.balanceTx({ tx: true })).rejects.toThrow('BUILD_ONLY_STOP');
+        expect(holder2.captured).toEqual({ opened: { base: true } });
     });
 });
 
@@ -470,6 +524,92 @@ describe('txbuilder: readDeployAddress requires exactly one deploy action', () =
         expect(() => readDeployAddress(tx([{ actions: [DEPLOY('')] }]))).toThrow(/expected exactly one/);
         expect(() => readDeployAddress({})).toThrow(/not inspectable/);
         expect(() => readDeployAddress(tx([{ actions: [{ address: 'bb'.repeat(32), updates: [] }] }]))).toThrow(/maintenance update/);
+    });
+});
+
+// A call can declare more gas than measured so it still fits after a parallel caller grew a map.
+describe('txbuilder: gasHeadroom raises the declared gas of a single call before proving', () => {
+    const gas = { readTime: 1000n, computeTime: 10n, bytesWritten: 3n, bytesDeleted: 7n };
+
+    it('validates the factor and scales every field but bytesDeleted, rounding up', async () => {
+        const { gasHeadroomFactor, scaleTranscriptGas } = await importTxBuilder();
+        expect(gasHeadroomFactor(undefined)).toBeUndefined();
+        expect(gasHeadroomFactor(1.5)).toBe(1.5);
+        for (const bad of [0.9, 11, 'x', NaN]) expect(() => gasHeadroomFactor(bad)).toThrow(/gasHeadroom must be a number from 1 to 10/);
+        const effects = { tag: 'effects' };
+        const scaled = scaleTranscriptGas({ gas, effects, program: ['op'] }, 1.5);
+        expect(scaled.gas).toEqual({ readTime: 1500n, computeTime: 15n, bytesWritten: 5n, bytesDeleted: 7n });
+        expect(scaled.effects).toBe(effects);
+        expect(scaled.program).toEqual(['op']);
+        expect(scaleTranscriptGas({ gas }, 1).gas).toEqual(gas);
+    });
+
+    function fakes() {
+        const protos: any[] = [];
+        class ContractCallPrototype {
+            args: unknown[];
+            constructor(...args: unknown[]) { this.args = args; protos.push(this); }
+        }
+        // Like the ledger: addCall returns a new intent with the call appended to the actions it has at that moment.
+        const intent = (fields: Record<string, unknown>) => ({
+            actions: [] as unknown[], binding: 'pre-binding', ...fields,
+            addCall(prototype: unknown) { return intent({ ...this, actions: [...this.actions, { call: true, prototype }] }); }
+        });
+        const ledger = {
+            ContractState: { deserialize: (raw: Uint8Array) => ({ operation: (id: string) => (raw.length && id === 'approve' ? { verifierKey: new Uint8Array([9, 9]) } : undefined) }) },
+            ContractCallPrototype,
+            communicationCommitmentRandomness: () => 'fresh-rand'
+        };
+        const mjTypes = {
+            encodeContractKeyLocation: (x: any) => `loc:${x.contractAddress}/${x.circuitId}?vk=${x.verifierKeyHash}`,
+            hashVerifierKey: (vk: Uint8Array) => `h${vk.length}`,
+            LedgerTransaction: { seal: (era: string, stage: string, tx: any) => ({ era, stage, tx }) }
+        };
+        const data = (calls: unknown[], intents: Map<number, any>) => ({ calls, public: {}, private: { unprovenTx: { deserialize: () => ({ intents }) } } });
+        const contractState = { contractState: { serialize: () => new Uint8Array(1) } };
+        const call = (commitment: unknown = { _tag: 'None' }) => ({
+            public: { partitionedTranscript: [{ gas, program: ['g'] }, undefined] },
+            private: { privateTranscriptOutputs: ['pto'], input: 'in', output: 'out' },
+            communicationCommitment: commitment
+        });
+        return { protos, ledger, mjTypes, data, call, contractState, intent };
+    }
+
+    it('rebuilds the one call with scaled gas, the chain state\'s verifier key and the SDK key location, and writes the intent back', async () => {
+        const { applyGasHeadroom } = await importTxBuilder();
+        const { protos, ledger, mjTypes, data, call, contractState, intent } = fakes();
+        const d = data([call()], new Map([[7, intent({ actions: [{ old: true }], ttl: 't' })]]));
+        const { unprovenTx, declared } = applyGasHeadroom({ ledger, mjTypes }, d, 1.5, { contractAddress: 'ab'.repeat(32), circuitId: 'approve', contractState });
+        expect(declared).toEqual({ guaranteed: { readTime: '1000', computeTime: '10', bytesWritten: '3', bytesDeleted: '7' }, fallible: undefined });
+        expect(protos).toHaveLength(1);
+        const [address, entryPoint, op, g, f, pto, input, output, rand, keyLocation] = protos[0].args;
+        expect([address, entryPoint, op.verifierKey.length, f, pto, input, output, rand]).toEqual(['ab'.repeat(32), 'approve', 2, undefined, ['pto'], 'in', 'out', 'fresh-rand']);
+        expect(g.gas).toEqual({ readTime: 1500n, computeTime: 15n, bytesWritten: 5n, bytesDeleted: 7n });
+        expect(keyLocation).toBe(`loc:${'ab'.repeat(32)}/approve?vk=h2`);
+        expect([unprovenTx.era, unprovenTx.stage]).toEqual(['v9', 'Unproven']);
+        const rebuilt = unprovenTx.tx.intents;
+        expect([...rebuilt.keys()]).toEqual([7]);
+        // The old call is gone, the intent's other fields stay.
+        expect(rebuilt.get(7).actions).toEqual([{ call: true, prototype: protos[0] }]);
+        expect(rebuilt.get(7)).toMatchObject({ ttl: 't', binding: 'pre-binding' });
+    });
+
+    it('keeps the runtime\'s communication commitment randomness when the call has one', async () => {
+        const { applyGasHeadroom } = await importTxBuilder();
+        const { protos, ledger, mjTypes, data, call, contractState, intent } = fakes();
+        const d = data([call({ _tag: 'Some', value: { commCommRand: 'bound-rand' } })], new Map([[1, intent({})]]));
+        applyGasHeadroom({ ledger, mjTypes }, d, 2, { contractAddress: 'cd'.repeat(32), circuitId: 'approve', contractState });
+        expect(protos[0].args[8]).toBe('bound-rand');
+    });
+
+    it('refuses a call tree with several contracts, a missing or keyless chain state and a transaction without one intent', async () => {
+        const { applyGasHeadroom } = await importTxBuilder();
+        const { ledger, mjTypes, data, call, contractState, intent } = fakes();
+        const at = { contractAddress: 'ab'.repeat(32), circuitId: 'approve', contractState };
+        expect(() => applyGasHeadroom({ ledger, mjTypes }, data([call(), call()], new Map([[1, intent({})]])), 1.5, at)).toThrow(/one contract.*has 2 calls/);
+        expect(() => applyGasHeadroom({ ledger, mjTypes }, data([call()], new Map([[1, intent({})]])), 1.5, { ...at, contractState: null })).toThrow(/no contract state found/);
+        expect(() => applyGasHeadroom({ ledger, mjTypes }, data([call()], new Map([[1, intent({})]])), 1.5, { ...at, circuitId: 'other' })).toThrow(/no verifier key for 'other'/);
+        expect(() => applyGasHeadroom({ ledger, mjTypes }, data([call()], new Map()), 1.5, at)).toThrow(/expects one intent.*found 0/);
     });
 });
 
@@ -530,6 +670,22 @@ describe('txbuilder: deriveIdentity validates the seed before touching the SDK',
 });
 
 describe('txbuilder: wallet sync modes', () => {
+    it('only a wallet that does not sync gets a fixed start version, so a synced one can read the history before the fork', async () => {
+        const { walletConfiguration, syncedWallets } = await importTxBuilder();
+        const configuration = { networkId: 'preview' };
+        const of = (wallet: string, mode: string) => walletConfiguration(wallet, syncedWallets(mode), configuration, 9n);
+        for (const wallet of ['shielded', 'unshielded', 'dust']) {
+            expect(of(wallet, 'all')).toBe(configuration);
+            expect(await of(wallet, 'none').chainVersionProbe()).toBe(9n);
+        }
+        expect(of('shielded', 'coins')).toBe(configuration);
+        expect(of('unshielded', 'coins')).toBe(configuration);
+        expect(await of('dust', 'coins').chainVersionProbe()).toBe(9n);
+        expect(of('shielded', 'shielded')).toBe(configuration);
+        expect(await of('unshielded', 'shielded').chainVersionProbe()).toBe(9n);
+        expect(await of('dust', 'shielded').chainVersionProbe()).toBe(9n);
+    });
+
     it('walletSyncMode accepts true, false, shielded and coins; syncedWallets names the sub-wallets each starts', async () => {
         const { walletSyncMode, syncedWallets } = await importTxBuilder();
         expect(walletSyncMode(undefined)).toBe('all');

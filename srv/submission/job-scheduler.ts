@@ -5,7 +5,7 @@ import { isBackgroundFenced } from '../utils/instance-lease';
 import cds from '@sap/cds';
 import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
 import { classifySubmissionError } from './TransactionSubmitter';
-import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, DEFAULT_NETWORK, type NightgateNetwork } from '../utils/nightgate-config';
 import { runInJobExecutionContext } from './job-execution-context';
 import { isCallNotAppliedFailure } from './sponsor-pool';
 import { configMs } from '../utils/config';
@@ -63,22 +63,21 @@ function getSemaphore(kind: string): Semaphore {
     const { key, cap } = concurrencyClass(kind);
     const cached = semaphores.get(key);
     if (cached) return cached;
-    const userCaps = ((cds.env as any).requires?.nightgate?.jobs?.concurrency || {}) as { heavy?: number; light?: number; serial?: number };
+    const userCaps: { heavy?: number; light?: number; serial?: number } = cds.env.requires?.nightgate?.jobs?.concurrency || {};
     const max = typeof userCaps[cap] === 'number' ? userCaps[cap]! : DEFAULT_CONCURRENCY[cap];
     const sem = new Semaphore(max);
     semaphores.set(key, sem);
     return sem;
 }
 
-let cachedNetwork: 'preprod' | 'testnet' | 'mainnet' | undefined;
+let cachedNetwork: NightgateNetwork | undefined;
 
-function getNetwork(): 'preprod' | 'testnet' | 'mainnet' {
+function getNetwork(): NightgateNetwork {
     if (!cachedNetwork) {
         try {
-            cachedNetwork = resolveNightgateRuntimeConfig(getNightgatePluginConfig()).network as
-                'preprod' | 'testnet' | 'mainnet';
+            cachedNetwork = resolveNightgateRuntimeConfig(getNightgatePluginConfig()).network;
         } catch {
-            cachedNetwork = 'preprod';
+            cachedNetwork = DEFAULT_NETWORK;
         }
     }
     return cachedNetwork;

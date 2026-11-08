@@ -34,7 +34,7 @@ import {
 import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
 
 import { NightgateError, errorMessage } from '../utils/errors';
-import { attestAgentOutput, prepareDocumentProof, prepareMembershipSet } from '#cds-models/NightgateService';
+import { attestAgentOutput, prepareDocumentProof, prepareMembershipSet, type anchorDocument } from '#cds-models/NightgateService';
 
 export {
     blake2b256Hex,
@@ -60,7 +60,7 @@ const log = cds.log('nightgate:document-proof');
 export async function loadPureCircuitsFromRegistry(compiledRef: string): Promise<PureCircuits> {
     const reg = getContractRegistration(compiledRef);
     if (!reg) throw new PureCircuitsUnavailableError(`contract '${compiledRef}' is not registered`);
-    const mod: any = await importRegisteredArtifact(compiledRef);
+    const mod = await importRegisteredArtifact(compiledRef);
     const pure = mod.pureCircuits ?? mod.default?.pureCircuits;
     if (missingPureCircuits(pure).length > 0) {
         throw new PureCircuitsUnavailableError(
@@ -285,7 +285,8 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
 
         // The envelope is sent as metadata, so its hash is stored on-chain.
         try {
-            const anchored = await srv.send({
+            // The typings of `send` list only event, data and headers. CAP also hands `user` and `agentGrant` to the inner request.
+            const anchorRequest = {
                 event: 'anchorDocument',
                 data: {
                     sha256: payloadHash,
@@ -301,7 +302,8 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
                 user: req.user,
                 // Already checked for this request. The job is recorded under the same grant.
                 agentGrant: req.agentGrant
-            } as any);
+            };
+            const anchored = await srv.send<NonNullable<Awaited<typeof anchorDocument.__returns>>>(anchorRequest);
             return { ...anchored, payloadHash, envelopeJson };
         } catch (err: unknown) {
             const e = err as { code?: unknown; status?: unknown } | null | undefined;

@@ -320,6 +320,7 @@ entity SyncState {
         identifiersBackfilledAt : Timestamp; // null = rows decoded before TransactionIdentifiers existed are not filled in yet
         authorBackfillHeight    : Integer64; // null = not started; blocks up to this height carry the validator in author
         authorsBackfilledAt     : Timestamp; // null = blocks stored with the slot in author are not all rewritten yet
+        reindexTargetHeight     : Integer64; // null = no reindex open; a rollback must reach this height before the crawler runs
 }
 
 entity ReorgLog : cuid, managed {

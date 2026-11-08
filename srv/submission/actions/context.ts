@@ -3,7 +3,7 @@
 import cds from '@sap/cds';
 import { TransactionSubmitter, type TransactionSubmitterDeps } from '../TransactionSubmitter';
 import { resolveContract, type ResolvedContract } from '../contract-registry';
-import { buildWalletMaterialForSession, attesterIdForSession, SessionNotFoundError } from '../wallet-material-factory';
+import { attesterIdForSession, SessionNotFoundError, type WalletMaterialFactory } from '../wallet-material-factory';
 import { resolveFeeSponsor, type ResolvedFeeSponsor } from '../fee-sponsor';
 import { loadCircuitArgTypes } from '../arg-coercion';
 import { resolveNightgateRuntimeConfig, type NightgateNetwork, VALID_NIGHTGATE_NETWORKS, getConfiguredPrivateStateBackend, getNightgatePluginConfig } from '../../utils/nightgate-config';
@@ -27,7 +27,7 @@ const { UPDATE } = cds.ql;
 export interface SubmissionDeps {
     srv: cds.ApplicationService;
     db: DbRunner;
-    walletFactory: typeof buildWalletMaterialForSession;
+    walletFactory: WalletMaterialFactory;
     attesterIdResolver: typeof attesterIdForSession;
     contractResolver: typeof resolveContract;
     submitterFactory: (deps: TransactionSubmitterDeps) => TransactionSubmitter;

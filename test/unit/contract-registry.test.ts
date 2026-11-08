@@ -340,37 +340,24 @@ describe('resolveContract', () => {
     });
 });
 
-// A CommonJS digest carries a module-format section; the legacy form without it, recorded on
-// jobs/evidence, stays accepted for an unchanged artifact. ESM digests have no legacy form.
-describe('artifact digest: the legacy CommonJS digest form stays accepted', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-legacy-digest-'));
+describe('artifact digest: only the current form of a CommonJS digest is accepted', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-cjs-digest-'));
     const cjsDir = path.join(tmp, 'cjs');
     fs.mkdirSync(path.join(cjsDir, 'contract'), { recursive: true });
     fs.writeFileSync(path.join(cjsDir, 'package.json'), '{"type":"commonjs"}');
     fs.writeFileSync(path.join(cjsDir, 'contract', 'index.js'), 'exports.Contract = class Contract {};\n');
-    const CJS = { artifactPath: path.join(cjsDir, 'contract', 'index.js'), privateStateId: 'legacy', zkConfigPath: cjsDir };
+    const CJS = { artifactPath: path.join(cjsDir, 'contract', 'index.js'), privateStateId: 'cjs', zkConfigPath: cjsDir };
 
-    it('assertArtifactGeneration and resolveContract accept the legacy form of a CommonJS digest, not a foreign one', async () => {
-        const { computeArtifactGenerationDigest, artifactGenerationMatch } = await import('../../srv/submission/artifact-digest.js');
-        registerContract('legacy-cjs', CJS);
-        const current = getArtifactGenerationDigest('legacy-cjs');
-        const legacy = computeArtifactGenerationDigest(CJS, { legacyModuleFormat: true });
-        expect(legacy).not.toBe(current);
-        expect(artifactGenerationMatch(CJS, legacy)).toBe('legacy');
-        expect(artifactGenerationMatch(CJS, current)).toBe('current');
-        expect(artifactGenerationMatch(CJS, 'f'.repeat(64))).toBeNull();
-        expect(() => assertArtifactGeneration('legacy-cjs', legacy, 'a 0.20 job')).not.toThrow();
-        expect(() => assertArtifactGeneration('legacy-cjs', current, 'a 0.21 job')).not.toThrow();
-        expect(() => assertArtifactGeneration('legacy-cjs', 'f'.repeat(64), 'a foreign job')).toThrow(/different generation/);
-        const resolved = await resolveContract('legacy-cjs', legacy);
-        expect(resolved.artifactDigest).toBe(current); // the worker is pinned to the CURRENT form
-        await expect(resolveContract('legacy-cjs', 'f'.repeat(64))).rejects.toThrow(/Refusing to load a different generation/);
-    });
-
-    it('an ESM artifact has no legacy form', async () => {
-        const { computeArtifactGenerationDigest, artifactGenerationMatch } = await import('../../srv/submission/artifact-digest.js');
-        expect(computeArtifactGenerationDigest(VAULT_FIXTURE(), { legacyModuleFormat: true })).toBe(computeArtifactGenerationDigest(VAULT_FIXTURE()));
-        expect(artifactGenerationMatch(VAULT_FIXTURE(), computeArtifactGenerationDigest(VAULT_FIXTURE()))).toBe('current');
+    it('assertArtifactGeneration and resolveContract refuse the form without the module-format section', async () => {
+        const { computeArtifactGenerationDigest } = await import('../../srv/submission/artifact-digest.js');
+        registerContract('cjs-digest', CJS);
+        const current = getArtifactGenerationDigest('cjs-digest');
+        const older = computeArtifactGenerationDigest(CJS, { legacyModuleFormat: true });
+        expect(older).not.toBe(current);
+        expect(() => assertArtifactGeneration('cjs-digest', current, 'a job')).not.toThrow();
+        expect(() => assertArtifactGeneration('cjs-digest', older, 'an older job')).toThrow(/different generation/);
+        expect((await resolveContract('cjs-digest', current)).artifactDigest).toBe(current);
+        await expect(resolveContract('cjs-digest', older)).rejects.toThrow(/Refusing to load a different generation/);
     });
 });
 

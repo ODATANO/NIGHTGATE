@@ -9,36 +9,61 @@ import { throwIfRpcCancelled } from './cancellation';
 import { callSegments } from '../batch-segment-order';
 import { SponsorRefusalError } from '../submit-error-classification';
 
-import { getSharedKeyMaterialProvider } from '../wasm-proof-provider';
 import { type MerkleProofBundle } from '../../submission/contract-witnesses';
 import { type ContractCircuitRules } from '../../submission/sponsor-policy';
 import { type MessagePort } from 'node:worker_threads';
-import { FacadeEntry, ensureNetworkId, facades, loadContractsSdk, loadDustCoreWallet, loadProvingSdk, loadSdk, log, resolveProvingMode, loadLedger } from './context';
+import { FacadeEntry, facades, loadContractsSdk, loadDustV2Sdk, loadSdk, log, resolveProvingMode, loadLedger, type WalletSdk } from './context';
+import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
+import type { DustWalletState } from '@midnightntwrk/wallet-sdk-dust-wallet';
+import type { CoinsAndBalances, CoreWallet as DustCoreWallet, Dust, DustFullInfo } from '@midnightntwrk/wallet-sdk-dust-wallet/v2';
+import type { WalletFacade } from '@midnightntwrk/wallet-sdk-facade';
 import type { ContractRegistration } from './artifacts';
 import { contractCallProviders, findContractForWallet, getOrCompileContract } from './contracts';
-import { BALANCE_SYNC_TIMEOUT_MS, firstEmission, getIndexerTip, waitForGenuineSync, withSessionLocks } from './facades';
+import { BALANCE_SYNC_TIMEOUT_MS, FEE_BLOCKS_MARGIN, type IndexerTip, firstEmission, getIndexerTip, peekFacadeState, waitForGenuineSync, withSessionLocks } from './facades';
+import { openTx, sealTx, type FinalizedLedgerTx, type UnboundLedgerTx, type UnprovenLedgerTx } from './wallet-tx';
 import { announceSubmitIntent, buildBuildOnlyWalletProvider, captureDustSnapshot, isNothingSent, isPreMempoolReject, revertRecipeBestEffort, submitOnDedicatedClient, submitWithDustGuard } from './submit';
 import { HEX64_RE, bareHex } from '../../utils/hex-patterns';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { SponsorPolicyArgs } from '../wallet-worker-protocol';
 
+/** A signed, proven caller transaction, bound or not yet bound. */
+export type ProvenCallerTx = { tx: FinalizedLedgerTx; bound: true } | { tx: UnboundLedgerTx; bound: false };
+
+type ProvenIntent = LedgerV9.Intent<LedgerV9.SignatureEnabled, LedgerV9.Proof, LedgerV9.Bindingish>;
+/** The parts of a proven transaction the sponsor rules read. Bound and unbound transactions both have them. */
+export type InspectedTx = Pick<UnboundLedgerTx, 'guaranteedOffer' | 'fallibleOffer' | 'imbalances'> & { readonly intents: ReadonlyMap<number, ProvenIntent> | undefined };
+
+/** Reads a property of a caller-built structure whose shape is checked, not trusted. */
+function field(value: unknown, key: string): unknown {
+    return value == null ? undefined : (value as Record<string, unknown>)[key];
+}
+
+/** The hex of a verifying key. Ledger 9 names a key as `{ tag, value }`. */
+function verifyingKeyHex(key: LedgerV9.SignatureVerifyingKey | undefined): string {
+    return bareHex(key?.value);
+}
+
 /** A signed, proven transaction, bound or not. Otherwise the error of each binding tried, in order. */
-async function deserializeProven(bytes: Uint8Array): Promise<{ tx: any; bound: boolean } | { failures: Array<[binding: string, error: string]> }> {
-    const ledger: any = await loadLedger();
+async function deserializeProven(bytes: Uint8Array): Promise<ProvenCallerTx | { failures: Array<[binding: string, error: string]> }> {
+    const ledger = await loadLedger();
     const failures: Array<[string, string]> = [];
-    for (const binding of ['binding', 'pre-binding']) {
-        try {
-            const tx = ledger.Transaction.deserialize('signature', 'proof', binding, bytes);
-            if (tx) return { tx, bound: binding === 'binding' };
-        } catch (e) {
-            failures.push([binding, errorMessage(e)]);
-        }
+    try {
+        const tx = ledger.Transaction.deserialize<LedgerV9.SignatureEnabled, LedgerV9.Proof, LedgerV9.Binding>('signature', 'proof', 'binding', bytes);
+        if (tx) return { tx, bound: true };
+    } catch (e) {
+        failures.push(['binding', errorMessage(e)]);
+    }
+    try {
+        const tx = ledger.Transaction.deserialize<LedgerV9.SignatureEnabled, LedgerV9.Proof, LedgerV9.PreBinding>('signature', 'proof', 'pre-binding', bytes);
+        if (tx) return { tx, bound: false };
+    } catch (e) {
+        failures.push(['pre-binding', errorMessage(e)]);
     }
     return { failures };
 }
 
 /** Reads a caller tx from base64, bound or not yet bound. */
-export async function deserializeFinalizedTx(b64: string): Promise<{ tx: any; bytes: Uint8Array; bound: boolean }> {
+export async function deserializeFinalizedTx(b64: string): Promise<ProvenCallerTx & { bytes: Uint8Array }> {
     const bytes = new Uint8Array(Buffer.from(b64, 'base64'));
     const out = await deserializeProven(bytes);
     if ('tx' in out) return { ...out, bytes };
@@ -60,18 +85,16 @@ export async function describeTransaction(args: { txB64: string }): Promise<{ by
 }
 
 /** True when an offer or action list is not empty. */
-export function offerNonEmpty(offer: any): boolean {
+export function offerNonEmpty(offer: unknown): boolean {
     if (!offer) return false;
     let sawKnownKey = false;
     for (const key of ['inputs', 'outputs', 'transient', 'spends', 'registrations', 'deltas']) {
-        const v = offer[key];
+        const v = field(offer, key);
         if (v === undefined) continue;
         sawKnownKey = true;
         if (v === null) continue;
-        if (Array.isArray(v)) { if (v.length > 0) return true; continue; }
-        if (typeof v?.size === 'number') { if (v.size > 0) return true; continue; }
-        if (typeof v?.length === 'number') { if (v.length > 0) return true; continue; }
-        return true;
+        const n = sizeOf(v);
+        if (n === null || n > 0) return true;
     }
     // Treat an unreadable shape as not empty, so it gets refused.
     return !sawKnownKey;
@@ -82,21 +105,21 @@ export type MintBudget = Map<string, bigint>;
 
 /** What calls on sponsorable contracts mint, read from the call results, which the proof covers. */
 export function declaredMints(
-    tx: any,
+    tx: Pick<InspectedTx, 'intents'>,
     contractSponsorable: (address: string) => boolean,
     deriveTokenType: (domainSeparatorHex: string, contractAddress: string) => string
 ): MintBudget {
     const budget: MintBudget = new Map();
-    const intents: Map<number, any> | undefined = tx?.intents;
+    const intents = tx?.intents;
     if (!intents || typeof intents.values !== 'function') return budget;
     for (const intent of Array.from(intents.values())) {
         for (const action of (intent?.actions ?? [])) {
             const address = String(action?.address ?? '');
             if (!address || !contractSponsorable(address)) continue;
-            for (const transcript of [action?.guaranteedTranscript, action?.fallibleTranscript]) {
+            for (const transcript of transcriptsOf(action)) {
                 const mints = transcript?.effects?.shieldedMints;
                 if (!mints || typeof mints.entries !== 'function') continue;
-                for (const [domainSeparator, amount] of Array.from(mints.entries() as Iterable<[unknown, unknown]>)) {
+                for (const [domainSeparator, amount] of Array.from<[unknown, unknown]>(mints.entries())) {
                     if (typeof amount !== 'bigint' || amount <= 0n) continue;
                     const type = bareHex(deriveTokenType(bareHex(domainSeparator), address));
                     if (!HEX64_RE.test(type)) continue;
@@ -108,16 +131,27 @@ export function declaredMints(
     return budget;
 }
 
+/** The two transcripts of a call. Deploys and maintenance updates have none. */
+function transcriptsOf(action: LedgerV9.ContractAction<LedgerV9.Proof>): Array<LedgerV9.Transcript<LedgerV9.AlignedValue> | undefined> {
+    return action && 'entryPoint' in action ? [action.guaranteedTranscript, action.fallibleTranscript] : [];
+}
+
+/** The coins of one kind an offer lists, or null when it lists none of that kind. */
+function coinsOf(offer: unknown, coll: string): unknown[] | null {
+    const list = field(offer, coll);
+    return Array.isArray(list) ? list : null;
+}
+
 /** Throws unless the offer moves only allowed or same-tx minted tokens, no NIGHT, and only sponsorable contract coins. A zero-net offer needs a contract coin. */
-export function checkOfferTokens(offer: any, key: string, tokenTypes: string[], nightType: string | undefined, contractSponsorable: (address: string) => boolean, mints: MintBudget = new Map()): void {
-    const deltas = offer?.deltas;
-    const entries: Array<[unknown, unknown]> | null = typeof deltas?.entries === 'function'
-        ? Array.from(deltas.entries() as Iterable<[unknown, unknown]>)
+export function checkOfferTokens(offer: unknown, key: string, tokenTypes: string[], nightType: string | undefined, contractSponsorable: (address: string) => boolean, mints: MintBudget = new Map()): void {
+    const deltas = field(offer, 'deltas');
+    const entries: Array<[unknown, unknown]> | null = typeof field(deltas, 'entries') === 'function'
+        ? Array.from((deltas as ReadonlyMap<unknown, unknown>).entries())
         : (Array.isArray(deltas) ? deltas as Array<[unknown, unknown]> : null);
     if (!entries) throw new SponsorRefusalError(`refusing to sponsor: ${key} exposes no deltas (token types not inspectable)`);
     if (entries.length === 0) {
         const contractCoin = ['inputs', 'outputs', 'transients', 'transient'].some((coll) =>
-            Array.isArray(offer?.[coll]) && offer[coll].some((coin: any) => coin?.contractAddress !== undefined && coin?.contractAddress !== null));
+            coinsOf(offer, coll)?.some((coin) => field(coin, 'contractAddress') !== undefined && field(coin, 'contractAddress') !== null));
         if (!contractCoin) {
             throw new SponsorRefusalError(`refusing to sponsor: ${key} nets to zero and carries no contract-owned coin (a shielded transfer alongside the call, not value the call moves)`);
         }
@@ -139,10 +173,10 @@ export function checkOfferTokens(offer: any, key: string, tokenTypes: string[], 
         mints.set(type, minted - taken);
     }
     for (const coll of ['inputs', 'outputs', 'transients', 'transient']) {
-        const list = offer?.[coll];
-        if (!Array.isArray(list)) continue;
+        const list = coinsOf(offer, coll);
+        if (!list) continue;
         for (const coin of list) {
-            const owner = coin?.contractAddress;
+            const owner = field(coin, 'contractAddress');
             if (owner === undefined || owner === null) continue;
             const address = String(owner);
             if (!address || !contractSponsorable(address)) {
@@ -164,18 +198,23 @@ export interface SwapTerms {
     wants: { tokenType: string; amount: string };
 }
 
-const sizeOf = (v: any): number | null =>
-    Array.isArray(v) ? v.length : typeof v?.size === 'number' ? v.size : typeof v?.length === 'number' ? v.length : null;
+function sizeOf(v: unknown): number | null {
+    if (Array.isArray(v)) return v.length;
+    const size = field(v, 'size');
+    if (typeof size === 'number') return size;
+    const length = field(v, 'length');
+    return typeof length === 'number' ? length : null;
+}
 
 /** The guaranteed offer of a plain shielded tx. No intent, fallible offer, transient or contract coin, 1 to `maxInputs` inputs, 1 to 2 outputs. */
-function plainShieldedOffer(tx: any, maxInputs: number, refuse: (why: string) => never, outputsWhy: string): any {
+function plainShieldedOffer(tx: InspectedTx, maxInputs: number, refuse: (why: string) => never, outputsWhy: string): LedgerV9.ZswapOffer<LedgerV9.Proof> {
     if (tx?.intents !== undefined && tx?.intents !== null && sizeOf(tx.intents) !== 0) refuse('carries an intent (a contract call, unshielded value or dust actions)');
     const fallible = tx?.fallibleOffer;
     if (fallible !== undefined && fallible !== null && sizeOf(fallible) !== 0) refuse('carries a fallible offer');
     const offer = tx?.guaranteedOffer;
     if (!offer || !Array.isArray(offer.inputs) || !Array.isArray(offer.outputs)) return refuse('carries no readable guaranteed offer');
     if (sizeOf(offer.transients ?? []) !== 0) refuse('carries a transient coin');
-    if ([...offer.inputs, ...offer.outputs].some((coin: any) => coin?.contractAddress !== undefined && coin?.contractAddress !== null)) {
+    if ([...offer.inputs, ...offer.outputs].some((coin) => coin?.contractAddress !== undefined && coin?.contractAddress !== null)) {
         refuse('carries a contract-owned coin');
     }
     if (offer.inputs.length < 1 || offer.inputs.length > maxInputs) refuse(`carries ${offer.inputs.length} inputs; 1 to ${maxInputs} are sponsored (NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS)`);
@@ -184,11 +223,11 @@ function plainShieldedOffer(tx: any, maxInputs: number, refuse: (why: string) =>
 }
 
 /** A swap half gives one token type and wants another. Its terms come from the two deltas, because coins do not show their type. */
-function swapHalfTerms(half: any, label: string, tokenTypes: string[] | null, nightType: string | undefined, maxInputs: number, prefix = 'refusing to sponsor'): { give: [string, bigint]; want: [string, bigint] } {
+function swapHalfTerms(half: InspectedTx, label: string, tokenTypes: string[] | null, nightType: string | undefined, maxInputs: number, prefix = 'refusing to sponsor'): { give: [string, bigint]; want: [string, bigint] } {
     const refuse = (why: string): never => { throw new SponsorRefusalError(`${prefix}: the ${label} ${why}`); };
     const offer = plainShieldedOffer(half, maxInputs, refuse, 'a half has the coin it wants and at most its change');
     const deltas = offer.deltas;
-    const entries: Array<[unknown, unknown]> | null = typeof deltas?.entries === 'function' ? Array.from(deltas.entries() as Iterable<[unknown, unknown]>) : null;
+    const entries: Array<[unknown, unknown]> | null = typeof deltas?.entries === 'function' ? Array.from<[unknown, unknown]>(deltas.entries()) : null;
     if (!entries) return refuse('exposes no deltas (terms not readable)');
     const typed = entries.map(([t, v]) => [bareHex(t), v] as [string, unknown]);
     if (typed.some(([, v]) => typeof v !== 'bigint' || v === 0n)) refuse('exposes a delta that is not a non-zero amount');
@@ -206,9 +245,9 @@ function swapHalfTerms(half: any, label: string, tokenTypes: string[] | null, ni
 }
 
 /** Nullifiers of a half's inputs. Once they show as spent on chain, the half can no longer be used. */
-export function swapHalfNullifiers(half: any): string[] {
-    const inputs: any[] = Array.isArray(half?.guaranteedOffer?.inputs) ? half.guaranteedOffer.inputs : [];
-    return [...new Set(inputs.map((i: any) => bareHex(i?.nullifier)).filter((n: string) => HEX64_RE.test(n)))];
+export function swapHalfNullifiers(half: Pick<InspectedTx, 'guaranteedOffer'>): string[] {
+    const inputs = Array.isArray(half?.guaranteedOffer?.inputs) ? half.guaranteedOffer.inputs : [];
+    return [...new Set(inputs.map((i) => bareHex(i?.nullifier)).filter((n) => HEX64_RE.test(n)))];
 }
 
 export interface SwapHalfDescription extends SwapTerms {
@@ -220,21 +259,21 @@ export interface SwapHalfDescription extends SwapTerms {
 /** Reads one half's terms. Checks its shape like a sponsored half, but without the token allow list. */
 export async function describeSwapHalf(args: { halfB64: string }): Promise<SwapHalfDescription> {
     const half = await deserializeSwapHalf(args.halfB64, 'half');
-    const ledger: any = await loadLedger();
+    const ledger = await loadLedger();
     const nightType = bareHex(ledger.nativeToken().raw);
     const t = swapHalfTerms(half.tx, 'half', null, nightType, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'), 'not a swap half');
     return {
         gives: { tokenType: t.give[0], amount: t.give[1].toString() },
         wants: { tokenType: t.want[0], amount: t.want[1].toString() },
         bound: half.bound,
-        inputs: half.tx.guaranteedOffer.inputs.length,
+        inputs: half.tx.guaranteedOffer!.inputs.length,
         nullifiers: swapHalfNullifiers(half.tx)
     };
 }
 
 /** Throws unless the two halves are exact mirror images. Returns the terms. */
 export function checkSwapHalves(
-    maker: any, taker: any,
+    maker: InspectedTx, taker: InspectedTx,
     options: { allowedTokenTypes?: string[]; nightTokenType?: string; maxInputs?: number } = {}
 ): SwapTerms {
     const tokenTypes = (options.allowedTokenTypes ?? []).map(bareHex);
@@ -255,7 +294,7 @@ export function checkSwapHalves(
 }
 
 /** Throws unless the merged halves balance, so the sponsor adds only the fee, never value. */
-export function assertSwapBalanced(merged: any, byteLength: number): void {
+export function assertSwapBalanced(merged: InspectedTx, byteLength: number): void {
     const maxBytes = configNumber('NIGHTGATE_SPONSOR_MAX_TX_BYTES');
     if (byteLength > maxBytes) {
         throw new SponsorRefusalError(`refusing to sponsor: the merged swap is ${byteLength}B, over the ${maxBytes}B budget (NIGHTGATE_SPONSOR_MAX_TX_BYTES)`);
@@ -266,13 +305,13 @@ export function assertSwapBalanced(merged: any, byteLength: number): void {
     const deltas = merged?.guaranteedOffer?.deltas;
     if (sizeOf(deltas) !== 0) throw new SponsorRefusalError('refusing to sponsor: the merged swap does not net to zero');
     let imbalances: Array<[unknown, unknown]>;
-    try { imbalances = Array.from(merged.imbalances(0).entries() as Iterable<[unknown, unknown]>); }
+    try { imbalances = Array.from<[unknown, unknown]>(merged.imbalances(0).entries()); }
     catch (e) { throw new SponsorRefusalError(`refusing to sponsor: the merged swap's balance is not readable (${errorMessage(e).slice(0, 80)})`); }
     if (imbalances.some(([, v]) => v !== 0n)) throw new SponsorRefusalError('refusing to sponsor: the merged swap does not balance');
 }
 
 /** A swap half must be proven. It may be bound, as in an offer file, or not yet bound. */
-async function deserializeSwapHalf(b64: string, label: string): Promise<{ tx: any; bound: boolean }> {
+async function deserializeSwapHalf(b64: string, label: string): Promise<ProvenCallerTx> {
     const bytes = new Uint8Array(Buffer.from(String(b64 ?? ''), 'base64'));
     if (bytes.length === 0) throw new SponsorRefusalError(`refusing to sponsor: the ${label} is empty`);
     const out = await deserializeProven(bytes);
@@ -282,23 +321,25 @@ async function deserializeSwapHalf(b64: string, label: string): Promise<{ tx: an
 }
 
 /** Merges two checked halves into one tx. A bound and an unbound tx cannot be merged, so an unbound half is bound first. */
-export function mergeSwapHalves(maker: { tx: any; bound: boolean }, taker: { tx: any; bound: boolean }): { tx: any; bound: boolean } {
-    const bound = maker.bound || taker.bound;
+export function mergeSwapHalves(maker: ProvenCallerTx, taker: ProvenCallerTx): ProvenCallerTx {
     try {
-        const m = bound && !maker.bound ? maker.tx.bind() : maker.tx;
-        const t = bound && !taker.bound ? taker.tx.bind() : taker.tx;
-        return { tx: m.merge(t), bound };
+        if (maker.bound || taker.bound) {
+            const m = maker.bound ? maker.tx : maker.tx.bind();
+            const t = taker.bound ? taker.tx : taker.tx.bind();
+            return { tx: m.merge(t), bound: true };
+        }
+        return { tx: maker.tx.merge(taker.tx), bound: false };
     } catch (e) {
         throw new SponsorRefusalError(`refusing to sponsor: the halves do not merge: ${errorMessage(e).slice(0, 120)}`);
     }
 }
 
-function mintedTypesOf(tx: any, allowContractMints: boolean | undefined, ledger: any): string[] {
+function mintedTypesOf(tx: InspectedTx, allowContractMints: boolean | undefined, ledger: Pick<typeof LedgerV9, 'rawTokenType'>): string[] {
     if (allowContractMints !== true) return [];
     return Array.from(declaredMints(tx, () => true, tokenTypeDeriver(ledger)).keys());
 }
 
-export function tokenTypeDeriver(ledger: any): (domainSeparatorHex: string, contractAddress: string) => string {
+export function tokenTypeDeriver(ledger: Pick<typeof LedgerV9, 'rawTokenType'>): (domainSeparatorHex: string, contractAddress: string) => string {
     return (domainSeparatorHex, contractAddress) =>
         String(ledger.rawTokenType(new Uint8Array(Buffer.from(domainSeparatorHex, 'hex')), contractAddress));
 }
@@ -315,7 +356,7 @@ export interface UnshieldedOfferOptions {
     /** Raw token types besides NIGHT. */
     allowedUnshieldedTokenTypes?: string[];
     /** The ledger's `addressFromKey`; without it an output to a user address is refused. */
-    addressFromKey?: (key: string) => string;
+    addressFromKey?: (key: LedgerV9.SignatureVerifyingKey) => string;
     /** Signature verifying keys of the sponsor's own wallets. */
     sponsorInputKeys?: string[];
     /** Filled with the contract-owned outputs the offers create. */
@@ -330,9 +371,8 @@ const utxoValue = (v: unknown, what: string): bigint => {
 };
 
 /** The ledger's imbalance of one unshielded token type in a segment; undefined when the segment never touched it. */
-function ledgerImbalance(balance: Map<unknown, unknown>, type: string): bigint | undefined {
-    for (const [tokenType, value] of balance.entries()) {
-        const t = tokenType as { tag?: unknown; raw?: unknown } | null;
+function ledgerImbalance(balance: ReadonlyMap<LedgerV9.TokenType, bigint>, type: string): bigint | undefined {
+    for (const [t, value] of balance.entries()) {
         if (t?.tag === 'unshielded' && bareHex(t.raw) === type) return utxoValue(value, `the ledger balance of ${type.slice(0, 16)}…`);
     }
     return undefined;
@@ -342,14 +382,14 @@ function ledgerImbalance(balance: Map<unknown, unknown>, type: string): bigint |
 export type ClaimedPayouts = Map<string, bigint>;
 
 /** Reads `claimedUnshieldedSpends` of every call on the given contracts. The contract decides who gets paid, the proof covers it. */
-export function claimedPayouts(actions: unknown, contracts: Set<string>): ClaimedPayouts {
+export function claimedPayouts(actions: readonly LedgerV9.ContractAction<LedgerV9.Proof>[] | undefined, contracts: Set<string>): ClaimedPayouts {
     const budget: ClaimedPayouts = new Map();
     for (const action of (Array.isArray(actions) ? actions : [])) {
         if (!contracts.has(String(action?.address ?? ''))) continue;
-        for (const transcript of [action?.guaranteedTranscript, action?.fallibleTranscript]) {
+        for (const transcript of transcriptsOf(action)) {
             const spends = transcript?.effects?.claimedUnshieldedSpends;
             if (!spends || typeof spends.entries !== 'function') continue;
-            for (const [k, amount] of Array.from(spends.entries() as Iterable<[unknown, unknown]>)) {
+            for (const [k, amount] of Array.from(spends.entries())) {
                 const [tokenType, recipient] = Array.isArray(k) ? k : [];
                 if (tokenType?.tag !== 'unshielded' || typeof amount !== 'bigint' || amount <= 0n) continue;
                 const key = `${bareHex(tokenType.raw)}:${bareHex(recipient?.address)}`;
@@ -364,7 +404,7 @@ export function claimedPayouts(actions: unknown, contracts: Set<string>): Claime
  * Public offer, so every rule runs on the bytes. The ledger's segment balance decides the net, since it counts what the called circuit takes in.
  */
 export function checkUnshieldedOffer(
-    offer: any, key: string,
+    offer: Pick<LedgerV9.UnshieldedOffer<LedgerV9.SignatureEnabled>, 'inputs' | 'outputs'> | undefined, key: string,
     ctx: {
         nightType?: string; tokenTypes: string[];
         /** A contract named in the allow-list or deployed under the grant. An empty list allows every call but names no payee here. */
@@ -372,13 +412,13 @@ export function checkUnshieldedOffer(
         /** The contracts the same intent calls. */
         calledContracts: Set<string>;
         /** `tx.imbalances(segment)` of the offer's segment. */
-        ledgerBalance: Map<unknown, unknown>;
+        ledgerBalance: ReadonlyMap<LedgerV9.TokenType, bigint>;
         /** Payouts the intent's calls require. An output they cover may go to any address. */
         claimed?: ClaimedPayouts;
     } & UnshieldedOfferOptions
 ): UnshieldedMove[] {
-    const inputs: any[] | undefined = Array.isArray(offer?.inputs) ? offer.inputs : undefined;
-    const outputs: any[] | undefined = Array.isArray(offer?.outputs) ? offer.outputs : undefined;
+    const inputs = Array.isArray(offer?.inputs) ? offer.inputs : undefined;
+    const outputs = Array.isArray(offer?.outputs) ? offer.outputs : undefined;
     if (!inputs || !outputs) throw new SponsorRefusalError(`refusing to sponsor: ${key} is not inspectable (no inputs/outputs)`);
     const allowedType = (type: string): boolean => (ctx.nightType !== undefined && type === ctx.nightType) || ctx.tokenTypes.includes(type);
     const sums = new Map<string, bigint>();
@@ -386,10 +426,10 @@ export function checkUnshieldedOffer(
     for (const input of inputs) {
         const type = bareHex(input?.type);
         if (!allowedType(type)) throw new SponsorRefusalError(`refusing to sponsor: ${key} spends token type ${type.slice(0, 16)}…, which is neither NIGHT nor in allowedUnshieldedTokenTypes`);
-        const owner = bareHex(input?.owner);
+        const owner = verifyingKeyHex(input?.owner);
         if (!HEX64_RE.test(owner)) throw new SponsorRefusalError(`refusing to sponsor: ${key} has an input without a readable owner key`);
         if (ctx.sponsorInputKeys?.includes(owner)) throw new SponsorRefusalError(`refusing to sponsor: ${key} spends a UTXO of the sponsor itself`);
-        if (ctx.addressFromKey) ownerAddresses.add(bareHex(ctx.addressFromKey(owner)));
+        if (ctx.addressFromKey) ownerAddresses.add(bareHex(ctx.addressFromKey(input.owner)));
         sums.set(type, (sums.get(type) ?? 0n) + utxoValue(input?.value, `${key} input`));
     }
     const moves: UnshieldedMove[] = [];
@@ -434,7 +474,7 @@ export function checkUnshieldedOffer(
     return moves;
 }
 
-function ledgerBalance(tx: any, segment: number): Map<unknown, unknown> {
+function ledgerBalance(tx: InspectedTx, segment: number): ReadonlyMap<LedgerV9.TokenType, bigint> {
     if (typeof tx?.imbalances !== 'function') throw new SponsorRefusalError('refusing to sponsor: transaction structure is not inspectable (no imbalances)');
     try { return tx.imbalances(segment); }
     catch (e) { throw new SponsorRefusalError(`refusing to sponsor: the balance of segment ${segment} is not readable (${errorMessage(e).slice(0, 80)})`); }
@@ -442,7 +482,7 @@ function ledgerBalance(tx: any, segment: number): Map<unknown, unknown> {
 
 /** Checks what a tx contains before the sponsor pays. An allowed call could hide a deploy, transfers or dust actions. Unreadable parts are refused. */
 export function checkSponsorableShape(
-    tx: any,
+    tx: InspectedTx,
     byteLength: number,
     allowedContracts?: string[],
     allowedCircuits?: string[],
@@ -466,7 +506,7 @@ export function checkSponsorableShape(
         throw new SponsorRefusalError(`refusing to sponsor: transaction is ${byteLength}B, over the ${maxBytes}B budget (NIGHTGATE_SPONSOR_MAX_TX_BYTES)`);
     }
 
-    const intents: Map<number, any> | undefined = tx?.intents;
+    const intents = tx?.intents;
     if (!intents || typeof intents.entries !== 'function') {
         throw new SponsorRefusalError('refusing to sponsor: transaction structure is not inspectable (no intents)');
     }
@@ -474,10 +514,10 @@ export function checkSponsorableShape(
         ? declaredMints(tx, contractSponsorable, options.deriveTokenType)
         : new Map();
     for (const key of ['guaranteedOffer', 'fallibleOffer', 'guaranteedCoins', 'fallibleCoins']) {
-        const offer = (tx as any)[key];
+        const offer = field(tx, key);
         if (offer === undefined || offer === null) continue;
-        const parts: unknown[] = typeof offer?.entries === 'function' && !('inputs' in offer)
-            ? Array.from(offer.entries() as Iterable<[unknown, unknown]>).map(([, sub]) => sub)
+        const parts: unknown[] = typeof field(offer, 'entries') === 'function' && !(typeof offer === 'object' && 'inputs' in offer)
+            ? Array.from((offer as ReadonlyMap<unknown, unknown>).entries()).map(([, sub]) => sub)
             : [offer];
         for (const part of parts) {
             if (!offerNonEmpty(part)) continue;
@@ -495,23 +535,23 @@ export function checkSponsorableShape(
         if (offerNonEmpty(intent?.dustActions)) {
             throw new SponsorRefusalError('refusing to sponsor: transaction carries dustActions alongside its contract calls');
         }
-        const unshieldedKeys = ['guaranteedUnshieldedOffer', 'fallibleUnshieldedOffer'].filter(key => offerNonEmpty(intent?.[key]));
+        const unshieldedKeys = (['guaranteedUnshieldedOffer', 'fallibleUnshieldedOffer'] as const).filter(key => offerNonEmpty(intent?.[key]));
         if (unshieldedKeys.length && options.allowUnshieldedOffers !== true) {
             throw new SponsorRefusalError(`refusing to sponsor: transaction carries ${unshieldedKeys[0]} alongside its contract calls; moving unshielded tokens needs allowUnshieldedOffers on the grant and NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS on the server`);
         }
         const intentCalls = new Set<string>();
         for (const action of (intent?.actions ?? [])) {
-            const ep = action?.entryPoint;
+            const ep = field(action, 'entryPoint');
             const name = typeof ep === 'string' ? ep : (ep instanceof Uint8Array ? new TextDecoder().decode(ep) : '');
             if (!name) {
-                const kind = action?.constructor?.name || typeof action;
+                const kind = String(field(field(action, 'constructor'), 'name') || typeof action);
                 // Maintenance updates change who controls a contract, so they are never sponsored.
                 // Detected by shape too, not only by class name.
-                const isMaintenance = kind === 'MaintenanceUpdate' || action?.updates !== undefined;
+                const isMaintenance = kind === 'MaintenanceUpdate' || field(action, 'updates') !== undefined;
                 if (isMaintenance) {
                     throw new SponsorRefusalError('refusing to sponsor: transaction carries a contract maintenance update (never sponsorable)');
                 }
-                const isDeploy = kind === 'ContractDeploy' || (action?.initialState !== undefined && action?.address !== undefined);
+                const isDeploy = kind === 'ContractDeploy' || (field(action, 'initialState') !== undefined && action?.address !== undefined);
                 if (isDeploy && options.allowDeploy === true) {
                     const address = String(action?.address ?? '');
                     if (!address) throw new SponsorRefusalError('refusing to sponsor: deploy action carries no contract address');
@@ -568,13 +608,13 @@ export const TRANSFER_ENTRY_POINT = '<transfer>';
 /**
  * An offer and nothing else that nets to zero. Recipient and amount are commitments, so only the shape is checked; the caller's terms are recorded.
  */
-export function checkTransferShape(tx: any, maxInputs: number, prefix = 'refusing to sponsor'): { inputs: number; outputs: number; nullifiers: string[] } {
+export function checkTransferShape(tx: InspectedTx, maxInputs: number, prefix = 'refusing to sponsor'): { inputs: number; outputs: number; nullifiers: string[] } {
     const refuse = (why: string): never => { throw new SponsorRefusalError(`${prefix}: the transfer ${why}`); };
     const offer = plainShieldedOffer(tx, maxInputs, refuse, "a transfer has the recipient's coin and at most its change");
     // The ledger drops zero entries from the deltas, so a transfer shows none at all.
     if (sizeOf(offer.deltas) !== 0) refuse('does not net to zero (a net change in a type makes it a swap half, not a transfer)');
     let imbalances: Array<[unknown, unknown]>;
-    try { imbalances = Array.from(tx.imbalances(0).entries() as Iterable<[unknown, unknown]>); }
+    try { imbalances = Array.from<[unknown, unknown]>(tx.imbalances(0).entries()); }
     catch (e) { return refuse(`has a balance that is not readable (${errorMessage(e).slice(0, 80)})`); }
     if (imbalances.some(([, v]) => v !== 0n)) refuse('does not balance');
     return { inputs: offer.inputs.length, outputs: offer.outputs.length, nullifiers: swapHalfNullifiers(tx) };
@@ -588,9 +628,24 @@ export async function describeTransfer(args: { txB64: string }): Promise<{ bound
 }
 
 /** The current dust wallet state. */
-export async function firstDustState(dust: any): Promise<any> {
+export async function firstDustState(dust: Pick<WalletFacade['dust'], 'state'>): Promise<DustWalletState> {
     if (typeof dust?.state?.subscribe !== 'function') throw new Error('facade.dust.state not observable');
-    return firstEmission(dust.state, 10_000, 'dust emission');
+    return firstEmission<DustWalletState>(dust.state, 10_000, 'dust emission');
+}
+
+/** A dust note: one dust UTXO with what it holds at the time it was read. */
+export type DustNote = DustFullInfo;
+
+let dustCoins: CoinsAndBalances.CoinsAndBalancesCapability<DustCoreWallet> | undefined;
+
+/** The ledger 9 core state of the dust wallet and its free notes valued at `at`. The wallet state seals the core state, the ledger 9 variant reads it. */
+export async function readDustNotes(dust: Pick<WalletFacade['dust'], 'state'>, at: Date): Promise<{ core: DustCoreWallet; notes: readonly DustNote[] }> {
+    const dws = await firstDustState(dust);
+    const v2 = await loadDustV2Sdk();
+    const core = v2.coreStateOf(dws);
+    if (core._tag === 'None') throw new Error('the sponsor dust wallet is not on ledger 9, so its notes cannot be spent here');
+    dustCoins ??= v2.CoinsAndBalances.makeDefaultCoinsAndBalancesCapability(undefined, () => ({ keysCapability: v2.Keys.makeDefaultKeysCapability() }));
+    return { core: core.value, notes: dustCoins.getAvailableCoins(core.value, at) };
 }
 
 /** Backing reservations. They expire so a crashed call frees its own. The token stops a late caller from releasing a reservation someone else took over. */
@@ -598,16 +653,18 @@ export const noteLocks = new Map<string, { exp: number; token: number }>();
 export let noteLeaseSeq = 0;
 
 /** Reservations are per backing, because notes of one backing spent at once are rejected by the node with 1010/196. */
-export function backingKey(sessionId: string, note: any): string {
+export function backingKey(sessionId: string, note: DustNote | undefined): string {
     return `${sessionId}|${note?.token?.backingNight ?? '?'}`;
 }
 /** Dust a note holds. 0 when unreadable. */
-export function noteSpecks(note: any): bigint {
+export function noteSpecks(note: DustNote | undefined): bigint {
     try { return BigInt(note?.generatedNow ?? 0); } catch { return 0n; }
 }
 
 /** Reserves the free backing with the most dust. Value `notes` at the spend's block time, because dust grows and the current clock shows too much. */
-export function tryLockBacking(sessionId: string, notes: any[], needSpecks: bigint, ttlMs: number, skipBackings: ReadonlySet<string> = new Set()): any | null {
+export function tryLockBacking(
+    sessionId: string, notes: readonly DustNote[], needSpecks: bigint, ttlMs: number, skipBackings: ReadonlySet<string> = new Set()
+): { note: DustNote; key: string; token: number; backing: string } | null {
     const now = Date.now();
     const eligible = notes
         .filter((n) => noteSpecks(n) >= needSpecks)
@@ -625,7 +682,7 @@ export function tryLockBacking(sessionId: string, notes: any[], needSpecks: bigi
 }
 
 /** The note on the reserved backing that still covers the fee, or null. */
-export function sufficientNoteOnBacking(sessionId: string, notes: any[], key: string, needSpecks: bigint): any | null {
+export function sufficientNoteOnBacking(sessionId: string, notes: readonly DustNote[], key: string, needSpecks: bigint): DustNote | null {
     return notes.find((n) => backingKey(sessionId, n) === key && noteSpecks(n) >= needSpecks) ?? null;
 }
 /** Reserved backings for one sponsored spend. Most spends hold one, a fee no single note covers holds several. */
@@ -636,10 +693,10 @@ export interface DustLease {
 
 /** The note with the most dust on each free backing, largest first, until they cover `needSpecks`. Null when they do not add up. */
 export function pickNotesAcrossBackings(
-    sessionId: string, notes: any[], needSpecks: bigint, maxNotes: number, skipBackings: ReadonlySet<string> = new Set()
-): any[] | null {
+    sessionId: string, notes: readonly DustNote[], needSpecks: bigint, maxNotes: number, skipBackings: ReadonlySet<string> = new Set()
+): DustNote[] | null {
     const now = Date.now();
-    const best = new Map<string, any>();
+    const best = new Map<string, DustNote>();
     for (const n of notes) {
         const key = backingKey(sessionId, n);
         if (skipBackings.has(key)) continue;
@@ -650,7 +707,7 @@ export function pickNotesAcrossBackings(
     }
     const sorted = [...best.values()].filter((n) => noteSpecks(n) > 0n)
         .sort((a, b) => (noteSpecks(a) < noteSpecks(b) ? 1 : noteSpecks(a) > noteSpecks(b) ? -1 : 0));
-    const picked: any[] = [];
+    const picked: DustNote[] = [];
     let sum = 0n;
     for (const n of sorted) {
         if (sum >= needSpecks || picked.length >= maxNotes) break;
@@ -662,7 +719,7 @@ export function pickNotesAcrossBackings(
 
 /** Reserves one backing that covers the fee. When no note covers it alone, reserves up to `maxNotes` backings that cover it together. */
 export function tryLockDust(
-    sessionId: string, notes: any[], needSpecks: bigint, ttlMs: number, skipBackings: ReadonlySet<string> = new Set(), maxNotes = 1
+    sessionId: string, notes: readonly DustNote[], needSpecks: bigint, ttlMs: number, skipBackings: ReadonlySet<string> = new Set(), maxNotes = 1
 ): DustLease | null {
     const single = tryLockBacking(sessionId, notes, needSpecks, ttlMs, skipBackings);
     if (single) return { parts: [{ key: single.key, token: single.token }], backing: single.backing };
@@ -682,8 +739,14 @@ export function tryLockDust(
 }
 
 /** Reserves backings for a spend, waiting up to `waitMs`. */
+function holdsBacking(sessionId: string): boolean {
+    const now = Date.now();
+    for (const [key, held] of noteLocks) if (key.startsWith(`${sessionId}|`) && held.exp > now) return true;
+    return false;
+}
+
 export async function acquireBacking(
-    sessionId: string, refresh: () => Promise<any[]>, needSpecks: bigint, ttlMs: number, waitMs: number,
+    sessionId: string, refresh: () => Promise<readonly DustNote[]>, needSpecks: bigint, ttlMs: number, waitMs: number,
     skipBackings: ReadonlySet<string> = new Set(), maxNotes = 1
 ): Promise<DustLease> {
     const deadline = Date.now() + waitMs;
@@ -692,6 +755,10 @@ export async function acquireBacking(
         const notes = await refresh();
         const leased = tryLockDust(sessionId, notes, needSpecks, ttlMs, skipBackings, maxNotes);
         if (leased) return leased;
+        // Nothing reserved means nothing comes free, so waiting would only hold up the job. Another sponsor may have the dust.
+        if (!holdsBacking(sessionId)) {
+            throw new Error(`no free dust backing: this sponsor's notes do not cover ${needSpecks} specks, alone or up to ${maxNotes} together, and none is reserved`);
+        }
         if (Date.now() >= deadline) {
             throw new Error(`no free dust backing with >= ${needSpecks} specks, alone or up to ${maxNotes} together, within ${waitMs}ms (all backings busy)`);
         }
@@ -734,9 +801,8 @@ export async function releaseBackingWhenSpent(sponsor: FacadeEntry, leased: Dust
     try {
         let listed = spentNonces.length > 0 && waitMs > 0;
         while (listed && Date.now() - t0 < waitMs && facades.get(sponsor.sessionId) === sponsor) {
-            const dws: any = await firstDustState(sponsor.facade.dust);
-            const coins: any[] = Array.from(dws.capabilities.coinsAndBalances.getAvailableCoins(dws.state, new Date()));
-            listed = coins.some((n) => spentNonces.includes(String(n?.token?.nonce)));
+            const { notes } = await readDustNotes(sponsor.facade.dust, new Date());
+            listed = notes.some((n) => spentNonces.includes(String(n?.token?.nonce)));
             if (listed) await sleep(1000, undefined, { ref: false });
         }
         if (listed) log('warn', `backing ${leased.backing} released after ${Date.now() - t0}ms although the dust wallet still lists a spent note`);
@@ -752,18 +818,23 @@ export const __noteLeaseForTests = { tryLockBacking, tryLockDust, pickNotesAcros
 
 /** The sponsor adds the dust fee to a tx the caller finalized and sends it. */
 export async function sponsorAndSubmitFinalized(
-    sponsor: FacadeEntry, rehydrated: any, site: string, replyPort?: MessagePort,
+    sponsor: FacadeEntry, rehydrated: FinalizedLedgerTx, site: string, replyPort?: MessagePort,
     calls?: Array<{ address: string; entryPoint: string }>, minted: string[] = [], unshielded: UnshieldedMove[] = []
 ): Promise<string> {
     await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, `${site} sponsor`);
     await captureDustSnapshot(sponsor, `${site} sponsor`);
     const sponsorTtl = new Date(Date.now() + 30 * 60 * 1000);
     const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(
-        rehydrated,
-        { shieldedSecretKeys: sponsor.zswapKeys, dustSecretKey: sponsor.dustKey },
+        await sealTx('Finalized', rehydrated, sponsor.walletConfiguration),
         { ttl: sponsorTtl, tokenKindsToBalance: ['dust'] }
     );
-    const finalized = await sponsor.facade.finalizeRecipe(sponsorRecipe);
+    let finalized: FinalizedLedgerTx;
+    try {
+        finalized = await openTx(await sponsor.facade.finalizeRecipe(sponsorRecipe));
+    } catch (e) {
+        await revertRecipeBestEffort(sponsor, sponsorRecipe, `${site} sponsor-finalize`);
+        throw e;
+    }
     try {
         await announceSubmitIntent(replyPort, {
             txHash: String(finalized.identifiers().at(-1)),
@@ -775,7 +846,7 @@ export async function sponsorAndSubmitFinalized(
             ...(unshielded.length ? { unshielded } : {})
         });
     } catch (e) {
-        await revertRecipeBestEffort(sponsor.facade, finalized, `${site} sponsor-intent`);
+        await revertRecipeBestEffort(sponsor, finalized, `${site} sponsor-intent`);
         throw e;
     }
     return String(await submitWithDustGuard(sponsor, finalized, `${site} sponsor-submit`));
@@ -804,14 +875,12 @@ export async function buildSponsorableTx(args: {
 }) {
     const entry = facades.get(args.sessionId);
     if (!entry) throw new Error(`No facade for sessionId=${args.sessionId.slice(0, 16)}`);
-    const sdk = await loadSdk();
-    await ensureNetworkId(args.networkId, sdk);
     const compiledContract = await getOrCompileContract(args.contractName, args.registration, entry, args.merkleProof);
-    const holder: { captured?: any } = {};
+    const holder: { captured?: FinalizedLedgerTx } = {};
     const { providers, privateStateProvider } = await contractCallProviders({
         contractName: args.contractName, registration: args.registration, proxyId: args.proxyId,
         indexerHttpUrl: args.indexerHttpUrl, indexerWsUrl: args.indexerWsUrl, proofServerUrl: args.proofServerUrl,
-        walletProvider: buildBuildOnlyWalletProvider(entry, holder), cacheFindQueries: true
+        networkId: args.networkId, walletProvider: buildBuildOnlyWalletProvider(entry, holder), cacheFindQueries: true
     });
     const { contracts } = await loadContractsSdk();
     const found = await findContractForWallet(contracts, providers, privateStateProvider, {
@@ -822,9 +891,7 @@ export async function buildSponsorableTx(args: {
     if (typeof fn !== 'function') throw new Error(`Circuit '${args.circuit}' not found on contract at ${args.contractAddress}`);
     try { await fn(...(args.args ?? [])); } catch (e) { if (!holder.captured) throw e; }
     const callerFinalized = holder.captured;
-    if (!callerFinalized || typeof callerFinalized.serialize !== 'function') {
-        throw new Error('phase 1 did not produce a serializable finalized transaction');
-    }
+    if (!callerFinalized) throw new Error('phase 1 did not produce a finalized transaction');
     const bytes: Uint8Array = new Uint8Array(callerFinalized.serialize());
     log('info', `buildSponsorableTx: ${args.contractName}.${args.circuit} finalized (${bytes.length}B, fee-unpaid)`);
     return { finalizedTxB64: Buffer.from(bytes).toString('base64'), serializedBytes: bytes.length };
@@ -832,16 +899,16 @@ export async function buildSponsorableTx(args: {
 
 
 /** The shape-check options of one sponsor, with the unshielded rules bound to the ledger and the sponsor's keys. */
-function shapeOptions(sdk: any, sponsor: FacadeEntry, args: SponsorPolicyArgs, collectUnshielded: UnshieldedMove[]) {
+function shapeOptions(sdk: WalletSdk, sponsor: FacadeEntry, args: SponsorPolicyArgs, collectUnshielded: UnshieldedMove[]) {
     const sponsorKey = (() => {
-        try { return bareHex(sponsor.unshieldedKeystore?.getPublicKey?.()); } catch { return ''; }
+        try { return verifyingKeyHex(sponsor.unshieldedKeystore?.getPublicKey?.()); } catch { return ''; }
     })();
     return {
         allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, contractCircuits: args.contractCircuits,
         allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw,
         allowContractMints: args.allowContractMints === true, deriveTokenType: tokenTypeDeriver(sdk.ledger),
         allowUnshieldedOffers: args.allowUnshieldedOffers === true, allowedUnshieldedTokenTypes: args.allowedUnshieldedTokenTypes,
-        addressFromKey: (key: string) => String(sdk.ledger.addressFromKey(key)),
+        addressFromKey: (key: LedgerV9.SignatureVerifyingKey) => String(sdk.ledger.addressFromKey(key)),
         sponsorInputKeys: HEX64_RE.test(sponsorKey) ? [sponsorKey] : [],
         collectUnshielded
     };
@@ -856,14 +923,15 @@ export async function sponsorFinalizedTx(args: SponsorPolicyArgs & {
     const sponsor = resolveSponsorEntry(args.sponsorSessionId);
     if (!sponsor) throw new Error('sponsorFinalizedTx requires a sponsorSessionId');
     const sdk = await loadSdk();
-    await ensureNetworkId(args.networkId, sdk);
-    const { tx, bytes } = await deserializeFinalizedTx(args.finalizedTxB64);
+    const deserialized = await deserializeFinalizedTx(args.finalizedTxB64);
+    const { tx, bytes } = deserialized;
 
     const unshielded: UnshieldedMove[] = [];
     const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, shapeOptions(sdk, sponsor, args, unshielded));
     log('info', `sponsorFinalizedTx: paying dust for ${calls.map(c => c.entryPoint).join('+')} (${bytes.length}B)${unshielded.length ? `, ${unshielded.length} unshielded output(s) into the contract` : ''}`);
     const minted = mintedTypesOf(tx, args.allowContractMints, sdk.ledger);
-    const txId = await sponsorAndSubmitFinalized(sponsor, tx, 'sponsor-endpoint', args.__replyPort, calls, minted, unshielded);
+    if (!deserialized.bound) throw new SponsorRefusalError('refusing to sponsor: the transaction is not bound; an unbound transaction goes to sponsorUnboundTransaction');
+    const txId = await sponsorAndSubmitFinalized(sponsor, deserialized.tx, 'sponsor-endpoint', args.__replyPort, calls, minted, unshielded);
     log('info', `sponsorFinalizedTx: LANDED txHash=${txId.slice(0, 16)}`);
     return {
         txHash: txId, circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '',
@@ -873,13 +941,20 @@ export async function sponsorFinalizedTx(args: SponsorPolicyArgs & {
     };
 }
 
-/** Fee margin of an unbound sponsoring, in blocks of possible price rise. */
-const UNBOUND_FEE_MARGIN_BLOCKS = 2;
+/** The chain moves its fee prices every block, so a fee priced with the initial parameters can fall short of what the node charges. */
+function tipLedgerParameters(sdk: Pick<WalletSdk, 'ledger'>, tip: IndexerTip): LedgerV9.LedgerParameters {
+    if (tip.ledgerParameters) {
+        try { return sdk.ledger.LedgerParameters.deserialize(Buffer.from(tip.ledgerParameters, 'hex')); }
+        catch (err) { log('warn', `the tip block's ledger parameters are not readable: ${errorMessage(err).slice(0, 200)}`); }
+    }
+    log('warn', 'no ledger parameters of the tip block, pricing the fee with the initial ones');
+    return sdk.ledger.LedgerParameters.initialParameters();
+}
 
 /** How often to pick another backing when the chosen one turns out to hold too little dust. */
 export const MAX_BACKING_RESELECTS = 3;
 
-/** How often the fee of a spend from several notes is priced again before it is paid. */
+/** How often the fee is priced again with the dust spends before it is paid. */
 const MAX_FEE_ROUNDS = 4;
 
 export class DustBackingShortError extends Error {
@@ -891,7 +966,7 @@ export class DustBackingShortError extends Error {
 }
 
 /** The lowest unused segment id. The added dust spend needs a segment of its own. */
-export function freeSegmentId(tx: any): number {
+export function freeSegmentId(tx: Pick<InspectedTx, 'intents'>): number {
     const used = new Set<number>();
     const intents = tx?.intents;
     if (intents && typeof intents.keys === 'function') {
@@ -904,8 +979,8 @@ export function freeSegmentId(tx: any): number {
 }
 
 /** Spend inputs that take `target` specks from the notes in order. */
-export function dustSpendInputs(notes: any[], target: bigint): Array<{ token: any; value: bigint }> {
-    const inputs: Array<{ token: any; value: bigint }> = [];
+export function dustSpendInputs(notes: readonly DustNote[], target: bigint): Array<CoinsAndBalances.CoinWithValue<Dust>> {
+    const inputs: Array<CoinsAndBalances.CoinWithValue<Dust>> = [];
     let left = target;
     for (const n of notes) {
         if (left <= 0n) break;
@@ -918,20 +993,18 @@ export function dustSpendInputs(notes: any[], target: bigint): Array<{ token: an
 
 /** Builds the dust spend on the reserved backings. Runs under the wallet's session lock. */
 async function buildDustSpend(
-    sponsor: FacadeEntry, networkId: string, sdk: any, leased: DustLease, needSpecks: bigint, ctime: Date, ttl: Date, segment: number,
-    callerTx: any, params: any
-): Promise<{ dustUnproven: any; spentNonces: string[] }> {
-    const CoreWalletApi = await loadDustCoreWallet();
+    sponsor: FacadeEntry, networkId: string, sdk: WalletSdk, leased: DustLease, needSpecks: bigint, ctime: Date, ttl: Date, segment: number,
+    callerTx: ProvenCallerTx['tx'], params: LedgerV9.LedgerParameters
+): Promise<{ dustUnproven: UnprovenLedgerTx; spentNonces: string[] }> {
+    const v2 = await loadDustV2Sdk();
     return withSessionLocks([sponsor.sessionId], async () => {
         if (facades.get(sponsor.sessionId) !== sponsor) {
             throw new Error('sponsor facade was evicted while waiting for the dust build lock');
         }
-        const dws: any = await firstDustState(sponsor.facade.dust);
-        const cab = dws.capabilities.coinsAndBalances;
-        const fresh: any[] = Array.from(cab.getAvailableCoins(dws.state, ctime));
+        const { core, notes: fresh } = await readDustNotes(sponsor.facade.dust, ctime);
         const bestOn = (key: string) => fresh.filter((n) => backingKey(sponsor.sessionId, n) === key)
-            .reduce<any>((m, n) => (!m || noteSpecks(n) > noteSpecks(m) ? n : m), undefined);
-        let notes: any[];
+            .reduce<DustNote | undefined>((m, n) => (!m || noteSpecks(n) > noteSpecks(m) ? n : m), undefined);
+        let notes: DustNote[];
         if (leased.parts.length === 1) {
             const note = sufficientNoteOnBacking(sponsor.sessionId, fresh, leased.parts[0].key, needSpecks);
             if (!note) throw new DustBackingShortError(leased.backing, noteSpecks(bestOn(leased.parts[0].key)), needSpecks);
@@ -939,25 +1012,25 @@ async function buildDustSpend(
         } else {
             const missing = leased.parts.filter((p) => !bestOn(p.key)).map((p) => p.key);
             if (missing.length) throw new DustBackingShortError(leased.backing, 0n, needSpecks, missing);
-            notes = leased.parts.map((p) => bestOn(p.key));
+            notes = leased.parts.map((p) => bestOn(p.key)!);
         }
         const held = notes.reduce((sum, n) => sum + noteSpecks(n), 0n);
         const build = (target: bigint) => {
-            const [spends] = CoreWalletApi.spendCoins(dws.state, sponsor.dustKey, dustSpendInputs(notes, target), ctime);
+            const [spends] = v2.CoreWallet.spendCoins(core, sponsor.dustKey, dustSpendInputs(notes, target), ctime);
             const intent = sdk.ledger.Intent.new(ttl);
             intent.dustActions = new sdk.ledger.DustActions('signature', 'pre-proof', ctime, [...spends]);
             return sdk.ledger.Transaction.fromParts(networkId).addIntent({ tag: 'specific', value: segment }, intent);
         };
         let target = needSpecks;
-        let dustUnproven: any;
-        // Every extra dust spend raises the fee, so the whole transaction is priced until the fee holds, as the SDK balancer does.
+        let dustUnproven: UnprovenLedgerTx;
+        // The dust spends add to the fee, so the whole transaction is priced until the fee holds, as the SDK balancer does.
         for (let round = 0; ; round++) {
             if (held < target) throw new DustBackingShortError(leased.backing, held, target);
             dustUnproven = build(target);
-            if (notes.length < 2 || round >= MAX_FEE_ROUNDS) break;
+            if (round >= MAX_FEE_ROUNDS) break;
             let fee = target;
-            try { fee = callerTx.eraseProofs().merge(dustUnproven.eraseProofs()).feesWithMargin(params, UNBOUND_FEE_MARGIN_BLOCKS); }
-            catch (err) { log('warn', `fee estimate with ${notes.length} dust spends failed, paying ${target} specks: ${errorMessage(err).slice(0, 200)}`); }
+            try { fee = callerTx.eraseProofs().merge(dustUnproven.eraseProofs()).feesWithMargin(params, FEE_BLOCKS_MARGIN); }
+            catch (err) { log('warn', `fee estimate with ${notes.length} dust spend(s) failed, paying ${target} specks: ${errorMessage(err).slice(0, 200)}`); }
             if (fee <= target) break;
             target = fee;
         }
@@ -980,11 +1053,9 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
     const sponsor = resolveSponsorEntry(args.sponsorSessionId);
     if (!sponsor) throw new Error('sponsorUnboundTx requires a sponsorSessionId');
     const sdk = await loadSdk();
-    await ensureNetworkId(args.networkId, sdk);
 
-    let callerTx: any;
     // A caller tx is unbound. A swap is bound when one of its halves arrived bound.
-    let callerBound = false;
+    let caller: ProvenCallerTx;
     let calls: Array<{ address: string; entryPoint: string }>;
     let swap: SwapTerms | undefined;
     let transfer: { tokenType: string; amount: string } | undefined;
@@ -998,12 +1069,11 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
         if (tokenType === bareHex(sdk.ledger.nativeToken().raw)) throw new SponsorRefusalError('refusing to sponsor: the transfer declares NIGHT, which is never shielded');
         const deserialized = await deserializeSwapHalf(args.transfer.txB64, 'transfer');
         const shape = checkTransferShape(deserialized.tx, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'));
-        callerTx = deserialized.tx;
-        callerBound = deserialized.bound;
+        caller = deserialized;
         nullifiers = shape.nullifiers;
         transfer = { tokenType, amount: String(args.transfer.amount) };
         calls = [{ address: '', entryPoint: TRANSFER_ENTRY_POINT }];
-        log('info', `sponsorUnboundTx: transfer of ${transfer.amount} ${tokenType.slice(0, 12)} declared (${shape.inputs} input(s), ${callerBound ? 'bound' : 'unbound'})`);
+        log('info', `sponsorUnboundTx: transfer of ${transfer.amount} ${tokenType.slice(0, 12)} declared (${shape.inputs} input(s), ${caller.bound ? 'bound' : 'unbound'})`);
     } else if (args.swap) {
         if (args.allowSwaps !== true) throw new SponsorRefusalError('refusing to sponsor: swaps are not sponsored for this caller');
         const maker = await deserializeSwapHalf(args.swap.makerHalfB64, 'maker half');
@@ -1013,17 +1083,16 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
             maxInputs: configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS')
         });
         nullifiers = [...new Set([...swapHalfNullifiers(maker.tx), ...swapHalfNullifiers(taker.tx)])];
-        const merged = mergeSwapHalves(maker, taker);
-        callerTx = merged.tx;
-        callerBound = merged.bound;
-        assertSwapBalanced(callerTx, callerTx.serialize().length);
+        caller = mergeSwapHalves(maker, taker);
+        assertSwapBalanced(caller.tx, caller.tx.serialize().length);
         calls = [{ address: '', entryPoint: SWAP_ENTRY_POINT }];
-        log('info', `sponsorUnboundTx: swap of ${swap.gives.amount} ${swap.gives.tokenType.slice(0, 12)} for ${swap.wants.amount} ${swap.wants.tokenType.slice(0, 12)} (${callerBound ? 'bound' : 'unbound'} halves)`);
+        log('info', `sponsorUnboundTx: swap of ${swap.gives.amount} ${swap.gives.tokenType.slice(0, 12)} for ${swap.wants.amount} ${swap.wants.tokenType.slice(0, 12)} (${caller.bound ? 'bound' : 'unbound'} halves)`);
     } else {
         const deserialized = await deserializeFinalizedTx(String(args.unboundTxB64 ?? ''));
-        callerTx = deserialized.tx;
-        calls = checkSponsorableShape(callerTx, deserialized.bytes.length, args.allowedContracts, args.allowedCircuits, shapeOptions(sdk, sponsor, args, unshielded));
+        caller = deserialized;
+        calls = checkSponsorableShape(caller.tx, deserialized.bytes.length, args.allowedContracts, args.allowedCircuits, shapeOptions(sdk, sponsor, args, unshielded));
     }
+    const callerTx = caller.tx;
     const minted = swap || transfer ? [] : mintedTypesOf(callerTx, args.allowContractMints, sdk.ledger);
     const contractAddress = calls[0]?.address || undefined;
 
@@ -1031,9 +1100,10 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
 
     await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, 'sponsor-unbound');
 
-    const params = sdk.ledger.LedgerParameters.initialParameters();
+    const tip = await getIndexerTip(sponsor.indexerHttpUrl);
+    const params = tipLedgerParameters(sdk, tip);
     let needSpecks = FALLBACK_FEE_SPECKS;
-    try { needSpecks = callerTx.feesWithMargin(params, UNBOUND_FEE_MARGIN_BLOCKS); }
+    try { needSpecks = callerTx.feesWithMargin(params, FEE_BLOCKS_MARGIN); }
     catch (err) { log('warn', `fee estimate failed, reserving ${FALLBACK_FEE_SPECKS} specks instead: ${errorMessage(err).slice(0, 200)}`); }
     if (needSpecks <= 0n) needSpecks = FALLBACK_FEE_SPECKS;
 
@@ -1041,19 +1111,14 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
     const leaseTtlMs = noteLeaseTtlMs();
     const backingWaitMs = configMs('NIGHTGATE_BACKING_WAIT_MS');
 
-    const tip = await getIndexerTip(sponsor.indexerHttpUrl);
     const ctime = tip.timestampMs != null ? new Date(tip.timestampMs) : new Date();
     const ttl = new Date(ctime.getTime() + 30 * 60 * 1000);
 
-    const snapshotNotes = async (at: Date): Promise<any[]> => {
-        const dws: any = await firstDustState(sponsor.facade.dust);
-        const cab = dws.capabilities.coinsAndBalances;
-        return Array.from(cab.getAvailableCoins(dws.state, at));
-    };
+    const snapshotNotes = async (at: Date): Promise<readonly DustNote[]> => (await readDustNotes(sponsor.facade.dust, at)).notes;
     const maxNotes = configNumber('NIGHTGATE_SPONSOR_MAX_DUST_NOTES');
     const shortBackings = new Set<string>();
     let leased!: DustLease;
-    let built: { dustUnproven: any; spentNonces: string[] } | undefined;
+    let built: { dustUnproven: UnprovenLedgerTx; spentNonces: string[] } | undefined;
     let stopRenewal: () => void = () => undefined;
     for (let attempt = 0; ; attempt++) {
         leased = await acquireBacking(sponsor.sessionId, () => snapshotNotes(ctime), needSpecks, leaseTtlMs, backingWaitMs, shortBackings, maxNotes);
@@ -1080,15 +1145,14 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
     let sent = false;
     try {
         const tProve = Date.now();
-        let provingService: any = sponsor.facade?.provingService;
-        if (!provingService?.prove) {
-            const provingSdk = await loadProvingSdk();
-            const sharedKeys = await getSharedKeyMaterialProvider();
-            provingService = provingSdk.makeWasmProvingService({ keyMaterialProvider: sharedKeys });
-        }
-        const dustProven = await provingService.prove(built!.dustUnproven);
-        log('info', `sponsorUnboundTx: dust spend proven in ${Date.now() - tProve}ms (${sponsor.facade?.provingService?.prove ? resolveProvingMode() : 'wasm'})`);
-        const bound = callerBound ? dustProven.bind().merge(callerTx) : dustProven.merge(callerTx).bind();
+        // The facade's prover picks its backend by the protocol version the chain is on.
+        const version = (await peekFacadeState(sponsor.facade, 5_000))?.activeProtocolVersion;
+        if (version == null) throw new Error('sponsorUnboundTx: no protocol version from the sponsor wallet state');
+        const proven = await sponsor.facade.provingService.prove(built!.dustUnproven, version);
+        if (!(proven instanceof sdk.ledger.Transaction)) throw new Error('sponsorUnboundTx: the dust spend was proven for ledger 8; this sponsor pays on ledger 9 only');
+        const dustProven = proven;
+        log('info', `sponsorUnboundTx: dust spend proven in ${Date.now() - tProve}ms (${resolveProvingMode()})`);
+        const bound = caller.bound ? dustProven.bind().merge(caller.tx) : dustProven.merge(caller.tx).bind();
         await announceSubmitIntent(args.__replyPort, {
             txHash: String(bound.identifiers().at(-1)),
             contractAddress, circuits: calls.map(c => c.entryPoint), note: leased.backing, sponsorAccountId: sponsor.sessionId,

@@ -1,5 +1,5 @@
 // Stores a contract's private state in the CAP database instead of the SDK's LevelDB store.
-// Exports use the LevelDB format. One instance serves one account and one contract.
+// Exports use the LevelDB format. One instance serves one account, its contracts are reached through `forContract`.
 
 import crypto from 'crypto';
 import { NightgateError } from '../utils/errors';
@@ -15,6 +15,12 @@ import { DEK_SCHEME } from '../submission/account-keys';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { PrivateStates, ContractSigningKeys } from '#cds-models/midnight';
 import type { DbRunner } from '../utils/db-types';
+import type {
+    ContractPrivateStates, ExportPrivateStatesOptions, ExportSigningKeysOptions, ImportPrivateStatesOptions, ImportPrivateStatesResult,
+    ImportSigningKeysOptions, ImportSigningKeysResult, PrivateStateExport, PrivateStateId, PrivateStateProvider, SigningKeyExport
+} from '@midnight-ntwrk/midnight-js-types';
+
+export type { SigningKeyExport };
 
 const MAX_EXPORT_STATES = 10_000;
 const MAX_EXPORT_SIGNING_KEYS = 10_000;
@@ -23,56 +29,21 @@ const SIGNING_KEY_EXPORT_FORMAT = 'midnight-signing-key-export';
 const CURRENT_EXPORT_VERSION = 1;
 const SUPPORTED_EXPORT_VERSIONS = [1];
 
-// Copies of the SDK's types, because the SDK is ESM only and cannot be imported here.
-
 type ContractAddress = string;
-type PrivateStateId = string;
-type SigningKey = string;
+type SigningKey = Parameters<PrivateStateProvider['setSigningKey']>[1];
 
-interface PrivateStateExport {
-    readonly format: 'midnight-private-state-export';
-    readonly encryptedPayload: string;
-    readonly salt: string;          // hex 32 bytes
-}
+const LEGACY_SIGNING_KEY = /^[0-9a-fA-F]{64}$/;
 
-export interface SigningKeyExport {
-    readonly format: 'midnight-signing-key-export';
-    readonly encryptedPayload: string;
-    readonly salt: string;
-}
-
-interface ExportPrivateStatesOptions {
-    readonly password?: string;
-    readonly maxStates?: number;
-}
-
-interface ImportPrivateStatesOptions {
-    readonly password?: string;
-    readonly conflictStrategy?: 'skip' | 'overwrite' | 'error';
-    readonly maxStates?: number;
-}
-
-interface ImportPrivateStatesResult {
-    readonly imported: number;
-    readonly skipped: number;
-    readonly overwritten: number;
-}
-
-interface ExportSigningKeysOptions {
-    readonly password?: string;
-    readonly maxKeys?: number;
-}
-
-interface ImportSigningKeysOptions {
-    readonly password?: string;
-    readonly conflictStrategy?: 'skip' | 'overwrite' | 'error';
-    readonly maxKeys?: number;
-}
-
-interface ImportSigningKeysResult {
-    readonly imported: number;
-    readonly skipped: number;
-    readonly overwritten: number;
+/** A stored signing key is JSON text of `{ tag, value }`. An older row holds a bare hex Schnorr key. */
+function readStoredSigningKey(stored: string, contractAddress: string): SigningKey {
+    if (LEGACY_SIGNING_KEY.test(stored)) return { tag: 'schnorr', value: stored };
+    let parsed: unknown;
+    try { parsed = JSON.parse(stored); } catch { parsed = undefined; }
+    const key = parsed as Partial<SigningKey> | undefined;
+    if (key && (key.tag === 'schnorr' || key.tag === 'ecdsa') && typeof key.value === 'string' && LEGACY_SIGNING_KEY.test(key.value)) {
+        return { tag: key.tag, value: key.value };
+    }
+    throw new Error(`The signing key stored for contract '${contractAddress}' is not a valid signing key`);
 }
 
 // Errors (names match SDK convention)
@@ -108,8 +79,7 @@ export function privateStateStableSalt(accountId: string, password: string): Buf
         .digest();
 }
 
-export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateStateId, PS = any> {
-    private currentContractAddress: ContractAddress | null = null;
+export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateStateId, PS = unknown> implements PrivateStateProvider<PSI, PS> {
     private db: DbRunner | undefined;
     private encryptionPromise: Promise<StorageEncryption> | undefined;
 
@@ -119,20 +89,32 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         if (config.db) this.db = config.db;
     }
 
-    setContractAddress(address: ContractAddress): void {
-        if (!address) throw new Error('Contract address must not be empty');
-        this.currentContractAddress = address;
+    /** Rows are keyed by the address as given. The view reports it in lower case, as the SDK's providers do. */
+    forContract(contractAddress: ContractAddress): ContractPrivateStates<PSI, PS> {
+        if (!contractAddress) throw new Error('Contract address must not be empty');
+        return {
+            contractAddress: contractAddress.toLowerCase(),
+            set: (privateStateId, state) => this.set(contractAddress, privateStateId, state),
+            get: (privateStateId) => this.get(contractAddress, privateStateId),
+            remove: (privateStateId) => this.remove(contractAddress, privateStateId),
+            clear: () => this.clear(contractAddress),
+            exportPrivateStates: (options) => this.exportPrivateStates(contractAddress, options),
+            importPrivateStates: (exportData, options) => this.importPrivateStates(contractAddress, exportData, options)
+        };
     }
 
-    async set(privateStateId: PSI, state: PS): Promise<void> {
-        const contractAddress = this.requireContractAddress('set');
+    async clearAll(): Promise<void> {
+        const db = await this.getDb();
+        await db.run(DELETE.from(PrivateStates).where({ accountId: this.config.accountId }));
+    }
+
+    private async set(contractAddress: ContractAddress, privateStateId: PSI, state: PS): Promise<void> {
         const enc = await this.getEncryption();
         const ciphertext = enc.encrypt(JSON.stringify(state));
         await this.upsertPrivateState(contractAddress, privateStateId, ciphertext);
     }
 
-    async get(privateStateId: PSI): Promise<PS | null> {
-        const contractAddress = this.requireContractAddress('get');
+    private async get(contractAddress: ContractAddress, privateStateId: PSI): Promise<PS | null> {
         const db = await this.getDb();
         const row = await db.run(
             SELECT.one.from(PrivateStates).where({
@@ -146,8 +128,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         return JSON.parse(json) as PS;
     }
 
-    async remove(privateStateId: PSI): Promise<void> {
-        const contractAddress = this.requireContractAddress('remove');
+    private async remove(contractAddress: ContractAddress, privateStateId: PSI): Promise<void> {
         const db = await this.getDb();
         await db.run(
             DELETE.from(PrivateStates).where({
@@ -158,9 +139,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         );
     }
 
-    /** Clears only the current contract's state, like the SDK's provider does. */
-    async clear(): Promise<void> {
-        const contractAddress = this.requireContractAddress('clear');
+    private async clear(contractAddress: ContractAddress): Promise<void> {
         const db = await this.getDb();
         await db.run(
             DELETE.from(PrivateStates).where({ accountId: this.config.accountId, contractAddress })
@@ -169,7 +148,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
 
     async setSigningKey(address: ContractAddress, signingKey: SigningKey): Promise<void> {
         const enc = await this.getEncryption();
-        const ciphertext = enc.encrypt(signingKey);
+        const ciphertext = enc.encrypt(JSON.stringify(signingKey));
         await this.upsertSigningKey(address, ciphertext);
     }
 
@@ -182,7 +161,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             })
         );
         if (!row) return null;
-        return this.decryptStored(row.ciphertext, fresh => this.upsertSigningKey(address, fresh));
+        return readStoredSigningKey(await this.decryptStored(row.ciphertext, fresh => this.upsertSigningKey(address, fresh)), address);
     }
 
     async removeSigningKey(address: ContractAddress): Promise<void> {
@@ -202,8 +181,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         );
     }
 
-    async exportPrivateStates(options?: ExportPrivateStatesOptions): Promise<PrivateStateExport> {
-        const contractAddress = this.requireContractAddress('exportPrivateStates');
+    private async exportPrivateStates(contractAddress: ContractAddress, options?: ExportPrivateStatesOptions): Promise<PrivateStateExport> {
         const maxStates = options?.maxStates ?? MAX_EXPORT_STATES;
 
         const db = await this.getDb();
@@ -227,8 +205,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         return sealExport(PRIVATE_STATE_EXPORT_FORMAT, payload, options?.password ?? await this.getStoragePassword());
     }
 
-    async importPrivateStates(exportData: PrivateStateExport, options?: ImportPrivateStatesOptions): Promise<ImportPrivateStatesResult> {
-        const contractAddress = this.requireContractAddress('importPrivateStates');
+    private async importPrivateStates(contractAddress: ContractAddress, exportData: PrivateStateExport, options?: ImportPrivateStatesOptions): Promise<ImportPrivateStatesResult> {
         const conflictStrategy = options?.conflictStrategy ?? 'error';
         const maxStates = options?.maxStates ?? MAX_EXPORT_STATES;
 
@@ -271,7 +248,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         if (conflictStrategy === 'error') {
             let conflictCount = 0;
             for (const id of stateIds) {
-                const existing = await this.get(id as PSI);
+                const existing = await this.get(contractAddress, id as PSI);
                 if (existing !== null) conflictCount++;
             }
             if (conflictCount > 0) throw new ImportConflictError(conflictCount);
@@ -280,7 +257,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         let imported = 0, skipped = 0, overwritten = 0;
         const enc = await this.getEncryption();
         for (const id of stateIds) {
-            const existing = await this.get(id as PSI);
+            const existing = await this.get(contractAddress, id as PSI);
             const isConflict = existing !== null;
             if (isConflict && conflictStrategy === 'skip') { skipped++; continue; }
             const ciphertext = enc.encrypt(JSON.stringify(payload.states[id]));
@@ -365,13 +342,6 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             if (isConflict) overwritten++; else imported++;
         }
         return { imported, skipped, overwritten };
-    }
-
-    private requireContractAddress(op: string): ContractAddress {
-        if (this.currentContractAddress === null) {
-            throw new Error(`Contract address not set. Call setContractAddress() before ${op}().`);
-        }
-        return this.currentContractAddress;
     }
 
     private async getDb(): Promise<DbRunner> {

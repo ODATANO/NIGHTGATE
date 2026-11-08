@@ -767,3 +767,166 @@ describe('authorization', () => {
         }
     });
 });
+
+describe('reindexFromHeight: slices and the reindex lock', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const reindexNative = require('../../srv/crawler/reindex');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const rollbackNative = require('../../srv/crawler/rollback');
+
+    const seedBlocks = async (heights: number[]) => {
+        for (const h of heights) {
+            await db.run(cds.ql.INSERT.into(BLOCKS).entries({
+                ID: cds.utils.uuid(), hash: `0x${h}`, height: h, protocolVersion: 1, timestamp: 1700000000 + h, stateRoot: '0xabcd'
+            }));
+        }
+    };
+    const heights = async () => (await db.run(cds.ql.SELECT.from(BLOCKS).columns('height')))
+        .map((b: any) => Number(b.height)).sort((a: number, b: number) => a - b);
+    const finished = async () => { while (reindexNative.reindexInProgress()) await new Promise(r => setTimeout(r, 5)); };
+
+    // Only the rollback spy is undone: the crawler spies at the top of the file must stay.
+    let rollbackSpy: { mockRestore(): void } | undefined;
+    afterEach(() => { rollbackSpy?.mockRestore(); rollbackSpy = undefined; reindexNative.__resetReindexForTests(); });
+
+    const noCrawler = { stop: async () => false, start: async () => undefined };
+    const syncState = () => db.run(cds.ql.SELECT.one.from('midnight.SyncState').where({ ID: 'SINGLETON' }));
+    const setSyncState = (fields: Record<string, unknown>) => db.run(cds.ql.UPDATE.entity('midnight.SyncState').set(fields).where({ ID: 'SINGLETON' }));
+    afterEach(async () => { await setSyncState({ reindexTargetHeight: null, lastError: null, lastErrorAt: null, syncStatus: 'stopped' }); });
+
+    /** Fails the rollback from the given call on, so the slices before it stay committed. */
+    const failFromCall = (failingCall: number) => {
+        const real = rollbackNative.rollbackIndexedDataFromHeight;
+        let calls = 0;
+        rollbackSpy = vi.spyOn(rollbackNative, 'rollbackIndexedDataFromHeight').mockImplementation(async (...args: unknown[]) => {
+            if (++calls >= failingCall) throw new Error('disk full');
+            return real(...args);
+        });
+    };
+
+    it('removes the blocks from the tip down, one committed slice at a time, and clears the target with the last one', async () => {
+        await seedBlocks([1, 2, 3, 4, 5, 6, 7, 8]);
+        const rollback = vi.spyOn(rollbackNative, 'rollbackIndexedDataFromHeight');
+        rollbackSpy = rollback;
+        const result = await reindexNative.startReindex(db, 3, noCrawler, 2);
+        expect(rollback.mock.calls.map(call => call[1])).toEqual([7, 5, 3]);
+        expect(result.progress).toEqual({ requestedHeight: 3, blocksRolledBack: 6, transactionsRolledBack: 0, effectiveStartHeight: 3 });
+        expect(await heights()).toEqual([1, 2]);
+        expect(reindexNative.reindexInProgress()).toBeNull();
+        expect((await syncState()).reindexTargetHeight).toBeNull();
+    });
+
+    it('holds the claim while the crawler stops, so a second call and crawler control get a 409', async () => {
+        await seedBlocks([20, 21]);
+        let releaseStop!: () => void;
+        mockIsCrawlerRunning.mockReturnValue(true);
+        mockStopCrawler.mockImplementationOnce(() => new Promise<void>(resolve => { releaseStop = resolve; }));
+        mockStartCrawler.mockResolvedValue(undefined);
+
+        const first = srv.send({ event: 'reindexFromHeight', data: { height: 21 } });
+        await vi.waitFor(() => expect(mockStopCrawler).toHaveBeenCalledTimes(1));
+        await expect(srv.send({ event: 'reindexFromHeight', data: { height: 20 } })).rejects.toMatchObject({ status: 409 });
+        await expect(srv.send('resumeCrawler')).rejects.toMatchObject({ status: 409 });
+        expect(mockStartCrawler).not.toHaveBeenCalled();
+
+        releaseStop();
+        await expect(first).resolves.toMatchObject({ status: 'ok', crawlerResumed: true });
+        expect(await heights()).toContain(20);
+        expect(await heights()).not.toContain(21);
+    });
+
+    it('holds the claim until the crawler runs again', async () => {
+        await seedBlocks([30]);
+        let releaseStart!: () => void;
+        mockIsCrawlerRunning.mockReturnValue(true);
+        mockStopCrawler.mockResolvedValue(undefined);
+        mockStartCrawler.mockImplementationOnce(() => new Promise<void>(resolve => { releaseStart = resolve; }));
+
+        const first = srv.send({ event: 'reindexFromHeight', data: { height: 30 } });
+        await vi.waitFor(() => expect(mockStartCrawler).toHaveBeenCalledTimes(1));
+        await expect(srv.send('resumeCrawler')).rejects.toMatchObject({ status: 409 });
+        expect(mockStartCrawler).toHaveBeenCalledTimes(1);
+
+        releaseStart();
+        await expect(first).resolves.toMatchObject({ crawlerResumed: true });
+        expect(reindexNative.reindexInProgress()).toBeNull();
+    });
+
+    it('a failed slice leaves the crawler stopped and shows in SyncState, and resumeCrawler finishes the rollback first', async () => {
+        await seedBlocks([40, 41, 42, 43]);
+        mockIsCrawlerRunning.mockReturnValue(false);
+        mockStartCrawler.mockResolvedValue(undefined);
+        failFromCall(2);
+
+        await expect(reindexNative.startReindex(db, 41, { stop: async () => true, start: mockStartCrawler }, 1)).rejects.toThrow('disk full');
+        expect(mockStartCrawler).not.toHaveBeenCalled();
+        expect(await heights()).toEqual(expect.arrayContaining([40, 41, 42]));
+        expect(await heights()).not.toContain(43);
+        let state = await syncState();
+        expect(state).toMatchObject({ syncStatus: 'error', lastError: expect.stringContaining('disk full') });
+        expect(Number(state.reindexTargetHeight)).toBe(41);
+
+        rollbackSpy?.mockRestore();
+        rollbackSpy = undefined;
+        const reply = await srv.send('resumeCrawler');
+        expect(reply).toMatchObject({ status: 'ok', running: false, message: expect.stringContaining('from 41') });
+        await finished();
+        await vi.waitFor(() => expect(mockStartCrawler).toHaveBeenCalledTimes(1));
+        expect((await heights()).filter((h: number) => h >= 40)).toEqual([40]);
+        state = await syncState();
+        expect(state).toMatchObject({ reindexTargetHeight: null, lastError: null });
+    });
+
+    it('answers 500 when the rollback fails inside the reply wait', async () => {
+        await seedBlocks([44]);
+        mockIsCrawlerRunning.mockReturnValue(false);
+        failFromCall(1);
+        await expect(srv.send({ event: 'reindexFromHeight', data: { height: 44 } }))
+            .rejects.toMatchObject({ status: 500, message: expect.stringContaining('disk full') });
+        expect(Number((await syncState()).reindexTargetHeight)).toBe(44);
+    });
+
+    it('an open target stays when a new reindex asks for a higher height', async () => {
+        await seedBlocks([49, 50, 51, 52]);
+        await setSyncState({ reindexTargetHeight: 50 });
+        const result = await reindexNative.startReindex(db, 52, noCrawler);
+        expect(result.progress.effectiveStartHeight).toBe(50);
+        expect(await heights()).not.toContain(50);
+        expect((await syncState()).reindexTargetHeight).toBeNull();
+    });
+
+    it('answers running when the rollback outlasts the reply wait, refuses crawler control meanwhile and resumes the crawler at the end', async () => {
+        process.env.NIGHTGATE_REINDEX_REPLY_WAIT_MS = '0';
+        try {
+            await seedBlocks([9, 10, 11]);
+            let release!: () => void;
+            const gate = new Promise<void>(r => { release = r; });
+            const real = rollbackNative.rollbackIndexedDataFromHeight;
+            rollbackSpy = vi.spyOn(rollbackNative, 'rollbackIndexedDataFromHeight').mockImplementation(async (...args: unknown[]) => {
+                await gate;
+                return real(...args);
+            });
+            mockIsCrawlerRunning.mockReturnValue(true);
+            mockStopCrawler.mockResolvedValue(undefined);
+            mockStartCrawler.mockResolvedValue(undefined);
+
+            const reply = await srv.send({ event: 'reindexFromHeight', data: { height: 10 } });
+            expect(reply).toMatchObject({ status: 'running', requestedHeight: 10, effectiveStartHeight: null, crawlerResumed: false });
+            expect(reindexNative.reindexInProgress()).toMatchObject({ requestedHeight: 10 });
+
+            for (const event of ['resumeCrawler', 'pauseCrawler']) {
+                await expect(srv.send(event)).rejects.toMatchObject({ message: expect.stringContaining('a reindex is running') });
+            }
+            await expect(srv.send({ event: 'reindexFromHeight', data: { height: 9 } }))
+                .rejects.toMatchObject({ message: expect.stringContaining('a reindex is running') });
+            expect(mockStartCrawler).not.toHaveBeenCalled();
+
+            release();
+            await finished();
+            expect(await heights()).toEqual([9]);
+            await vi.waitFor(() => expect(mockStartCrawler).toHaveBeenCalledTimes(1));
+        } finally {
+            delete process.env.NIGHTGATE_REINDEX_REPLY_WAIT_MS;
+        }
+    });
+});

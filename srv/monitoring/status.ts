@@ -29,8 +29,9 @@ import { readRuntimeState, readPrewarmState } from '../utils/runtime-state';
 import { configMs } from '../utils/config';
 import { eventLoopLagGauges } from './event-loop';
 import { rateLimitedTotals } from '../utils/rate-classes';
-import { legacyPathRequestTotals } from '../utils/legacy-service-paths';
 import { absorbedCrawlerFaults } from '../crawler/crawler-fault-guard';
+import { getActiveNodeProvider } from '../crawler/index';
+import { readNodeInfo } from './node-info';
 import type { DbRunner } from '../utils/db-types';
 import type { getReadiness, getRuntimeInfo } from '#cds-models/NightgateIndexerService';
 
@@ -328,10 +329,6 @@ export async function buildMetricsText(db: DbRunner): Promise<string> {
     lines.push(`# TYPE ${metricPrefix}_rate_limited_total counter`);
     for (const [name, count] of rateLimitedTotals()) lines.push(`${metricPrefix}_rate_limited_total{limit="${name}"} ${count}`);
 
-    lines.push(`# HELP ${metricPrefix}_legacy_path_requests_total Requests on a deprecated /api/v1 service path since process start`);
-    lines.push(`# TYPE ${metricPrefix}_legacy_path_requests_total counter`);
-    for (const [path, count] of legacyPathRequestTotals()) lines.push(`${metricPrefix}_legacy_path_requests_total{path="${path}"} ${count}`);
-
     const decode = getDecodeWorkerStatus();
     lines.push(`# HELP ${metricPrefix}_decode_worker_running Decode worker thread alive (1=running, 0=not running)`);
     lines.push(`# TYPE ${metricPrefix}_decode_worker_running gauge`);
@@ -386,13 +383,14 @@ export async function buildMetricsText(db: DbRunner): Promise<string> {
     return lines.join('\n') + '\n';
 }
 
-/** Version, network, proving mode and a hash of each contract's compiled files.
+/** Version, network, proving mode, the crawler's node and a hash of each contract's compiled files.
  *  The hashes show why writes are refused after contract files changed on disk. */
-export function buildRuntimeInfo(): NonNullable<Awaited<ReturnType<typeof getRuntimeInfo>>> {
+export async function buildRuntimeInfo(): Promise<NonNullable<Awaited<ReturnType<typeof getRuntimeInfo>>>> {
     const config = getNightgatePluginConfig();
     const topology = getRuntimeTopology(config);
 
     const version = packageVersion();
+    const provider = getActiveNodeProvider();
 
     const contracts = listRegisteredContracts().map(name => {
         const registration = getContractRegistration(name);
@@ -428,6 +426,7 @@ export function buildRuntimeInfo(): NonNullable<Awaited<ReturnType<typeof getRun
         runtimeMode: topology.runtimeMode,
         databaseKind: topology.databaseKind,
         uptime: Math.floor((Date.now() - processStartTime) / 1000),
+        node: provider ? await readNodeInfo(provider) : null,
         contracts
     };
 }

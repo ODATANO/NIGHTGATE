@@ -191,8 +191,9 @@ export function validateSchemaSlots(schema: unknown, name: string, width = 16): 
     if (!Array.isArray(schema) || schema.length !== width) {
         throw new Error(`${name} must be an array of exactly ${width} slot descriptors`);
     }
-    return schema.map((d: any, i: number) => {
-        if (!d || typeof d !== 'object') throw new Error(`${name}[${i}] must be an object`);
+    return schema.map((entry: unknown, i: number) => {
+        if (!entry || typeof entry !== 'object') throw new Error(`${name}[${i}] must be an object`);
+        const d = entry as Record<string, unknown>;
         if (typeof d.fieldKey !== 'string' || !HEX64_ANY_CASE_RE.test(d.fieldKey)) {
             throw new Error(`${name}[${i}].fieldKey must be 64 hex chars (32 bytes)`);
         }
@@ -200,28 +201,29 @@ export function validateSchemaSlots(schema: unknown, name: string, width = 16): 
             throw new Error(`${name}[${i}].kind must be 0 (uint), 1 (bytes) or 2 (padding)`);
         }
         let scaleBig: bigint;
-        try { scaleBig = BigInt(d.scale ?? '0'); } catch { throw new Error(`${name}[${i}].scale must be an integer (decimal string)`); }
+        try { scaleBig = BigInt((d.scale ?? '0') as string | number | bigint); } catch { throw new Error(`${name}[${i}].scale must be an integer (decimal string)`); }
         if (scaleBig < 0n || scaleBig > UINT64_MAX) throw new Error(`${name}[${i}].scale must fit Uint<64>`);
         return { fieldKey: d.fieldKey.toLowerCase(), kind: d.kind, scale: scaleBig.toString() };
     });
 }
 
 export function validateOpening(opening: unknown, name: string, width = 16): OpeningWire {
-    const o = opening as any;
-    if (!o || typeof o !== 'object') throw new Error(`${name} must be an object`);
+    if (!opening || typeof opening !== 'object') throw new Error(`${name} must be an object`);
+    const o = opening as Record<string, unknown>;
     if (typeof o.saltSeed !== 'string' || !HEX64_ANY_CASE_RE.test(o.saltSeed)) {
         throw new Error(`${name}.saltSeed must be 64 hex chars (32 bytes)`);
     }
     if (!Array.isArray(o.slots) || o.slots.length !== width) {
         throw new Error(`${name}.slots must be an array of exactly ${width} slot openings`);
     }
-    const slots = o.slots.map((s: any, i: number) => {
-        if (!s || typeof s !== 'object') throw new Error(`${name}.slots[${i}] must be an object`);
+    const slots = o.slots.map((entry: unknown, i: number) => {
+        if (!entry || typeof entry !== 'object') throw new Error(`${name}.slots[${i}] must be an object`);
+        const s = entry as Record<string, unknown>;
         if (typeof s.present !== 'boolean') throw new Error(`${name}.slots[${i}].present must be a boolean`);
         const out: { present: boolean; value?: string; valueDigest?: string } = { present: s.present };
         if (s.value !== undefined) {
             let v: bigint;
-            try { v = BigInt(s.value); } catch { throw new Error(`${name}.slots[${i}].value must be an integer (decimal string)`); }
+            try { v = BigInt(s.value as string | number | bigint); } catch { throw new Error(`${name}.slots[${i}].value must be an integer (decimal string)`); }
             if (v < 0n || v > UINT64_MAX) throw new Error(`${name}.slots[${i}].value must fit Uint<64>`);
             out.value = v.toString();
         }
@@ -279,7 +281,7 @@ export function facadeConfigFromEnv() {
             `Fix NIGHTGATE_NETWORK / cds.requires.nightgate.network.`);
     }
     return {
-        networkId: network as 'preprod' | 'testnet' | 'mainnet' | 'undeployed',
+        networkId: network,
         indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
         indexerWsUrl: submissionEndpoints.indexerWsUrl,
         proofServerUrl: submissionEndpoints.proofServerUrl,

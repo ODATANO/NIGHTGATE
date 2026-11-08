@@ -4,7 +4,7 @@
 import cds from '@sap/cds';
 import { TransactionSubmitter, type TransactionSubmitterDeps } from './TransactionSubmitter';
 import { resolveContract } from './contract-registry';
-import { buildWalletMaterialForSession, attesterIdForSession } from './wallet-material-factory';
+import { buildWalletMaterialForSession, attesterIdForSession, type WalletMaterialFactory } from './wallet-material-factory';
 import { loadCircuitArgTypes } from './arg-coercion';
 import { deriveRawTokenType, SHIELDED_TEST_TOKEN_AMOUNT } from './token-type';
 import { registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer } from './background-jobs';
@@ -37,7 +37,7 @@ export { recordProven } from './actions/common';
 
 /** Dependency overrides for tests. */
 export interface SubmissionHandlersOptions {
-    walletMaterialFactory?: typeof buildWalletMaterialForSession;
+    walletMaterialFactory?: WalletMaterialFactory;
     attesterIdResolver?: typeof attesterIdForSession;
     resolveContractImpl?: typeof resolveContract;
     submitterFactory?: (deps: TransactionSubmitterDeps) => TransactionSubmitter;

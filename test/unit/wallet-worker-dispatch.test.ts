@@ -9,8 +9,7 @@
  * restore-vs-fresh selection, dust cold-start flag, facade start).
  *
  * The facade OPERATION bodies (transferNight, deploys, …) stay
- * deliberately uncovered here: they are exercised by the live e2e scripts
- * (docs/reference.md "Testing baseline").
+ * deliberately uncovered here: they are exercised by the live e2e scripts.
  */
 
 // In-memory private-state store answering the worker's private-state-rpc
@@ -28,11 +27,12 @@ const fakeParentPort = vi.hoisted(() => {
         postMessage: vi.fn((msg: any) => {
             if (msg?.kind !== 'private-state-rpc') return;
             privateState.calls.push({ method: msg.method, args: msg.args });
-            if (!msg.port) return; // fire-and-forget (setContractAddress)
+            if (!msg.port) return;
+            // Contract calls carry [contractAddress, privateStateId, state?]; the store is keyed by the id.
             if (msg.method === 'get') {
-                msg.port.postMessage({ ok: true, result: privateState.store[String(msg.args[0])] });
+                msg.port.postMessage({ ok: true, result: privateState.store[String(msg.args[1])] });
             } else if (msg.method === 'set') {
-                privateState.store[String(msg.args[0])] = msg.args[1];
+                privateState.store[String(msg.args[1])] = msg.args[2];
                 msg.port.postMessage({ ok: true, result: undefined });
             } else {
                 msg.port.postMessage({ ok: true, result: undefined });
@@ -92,16 +92,67 @@ const ledgerTx = vi.hoisted(() => ({
     deserialize: vi.fn(),
     fromParts: vi.fn((..._a: any[]) => ({ addIntent: (segment: any, intent: any) => ({ dustUnproven: true, segment, intent }) }))
 }));
-vi.mock('@midnight-ntwrk/ledger-v8', () => ({
+// The wallet SDK passes transactions as handles. A fake handle serializes to a token
+// that `Transaction.deserialize` maps back to the sealed object.
+const walletTx = vi.hoisted(() => {
+    const sealed = new WeakMap<Uint8Array, unknown>();
+    const handles = new WeakSet<object>();
+    const adopt = vi.fn((stage: string, tx: any, protocolVersion: unknown) => {
+        const bytes = new Uint8Array([0xfe]);
+        sealed.set(bytes, tx);
+        const handle = { stage, tx, protocolVersion, serialize: () => bytes };
+        handles.add(handle);
+        return handle;
+    });
+    return { sealed, adopt, is: (v: unknown) => typeof v === 'object' && v !== null && handles.has(v) };
+});
+// The ledger 9 Transaction class: the sponsor checks that a proven dust spend is an instance of it.
+const LedgerTxClass = vi.hoisted(() => class FakeLedgerTransaction {
+    static deserialize(...a: any[]) {
+        const bytes = a[3];
+        if (bytes instanceof Uint8Array && walletTx.sealed.has(bytes)) return walletTx.sealed.get(bytes);
+        return ledgerTx.deserialize(...a);
+    }
+    static fromParts(...a: any[]) { return ledgerTx.fromParts(...a); }
+});
+/** A fake ledger 9 transaction with the given members. */
+function v9Tx<T extends object>(members: T): T {
+    return Object.assign(Object.create(LedgerTxClass.prototype), members);
+}
+/** The caller bytes read only as an unbound transaction: the bound read fails, as for real pre-binding bytes. */
+function mockUnboundCaller(make: () => unknown) {
+    ledgerTx.deserialize.mockImplementation((...a: any[]) => {
+        if (a[2] === 'binding') throw new Error('not a bound transaction');
+        return make();
+    });
+}
+/** Seals a fake transaction like the facade returns it. */
+function handleOf(tx: any, stage = 'Finalized') {
+    return walletTx.adopt(stage, tx, 9_000_000n);
+}
+/** Matches the handle a bare transaction was sealed into. */
+function sealedHandle(tx: unknown, stage = 'Finalized') {
+    return expect.objectContaining({ stage, tx });
+}
+vi.mock('@midnightntwrk/ledger-v9', () => ({
     ZswapSecretKeys: {
         fromSeed: vi.fn(() => ({ coinPublicKey: 'cpk', encryptionPublicKey: 'epk', clear: zswapClear }))
     },
     DustSecretKey: { fromSeed: vi.fn(() => ({ dustKey: true })) },
-    LedgerParameters: { initialParameters: vi.fn(() => ({ dust: { dustParams: true } })) },
+    LedgerParameters: {
+        initialParameters: vi.fn(() => ({ dust: { dustParams: true } })),
+        deserialize: vi.fn((bytes: Uint8Array) => ({ ofTipBlock: Buffer.from(bytes).toString('hex') }))
+    },
     nativeToken: vi.fn(() => ({ raw: 'night-raw-type' })),
-    Transaction: ledgerTx,
+    Transaction: LedgerTxClass,
     Intent: { new: vi.fn(() => ({})) },
     DustActions: class { constructor(..._a: any[]) { /* stub */ } }
+}));
+/** The dust keys a fresh dust wallet starts with, one per ledger generation. */
+const DUST_KEYS_BY_EPOCH = { v8: { v8DustKey: true }, v9: { dustKey: true } };
+vi.mock('@midnightntwrk/ledger-v8', () => ({
+    ZswapSecretKeys: { fromSeed: vi.fn(() => ({ v8ZswapKeys: true })) },
+    DustSecretKey: { fromSeed: vi.fn(() => ({ v8DustKey: true })) }
 }));
 
 // Receiver-address parsing + address encoding go through the real
@@ -145,13 +196,15 @@ vi.mock('@midnight-ntwrk/compact-js', () => ({
         withVacantWitnesses: vi.fn(),
         withWitnesses: vi.fn(() => vi.fn()),
         withCompiledFileAssets: vi.fn(() => vi.fn())
-    }
+    },
+    parseContractKeyLocation: vi.fn(() => undefined),
+    hashVerifierKey: vi.fn(() => 'vk-hash')
 }));
 
 const shieldedStart = vi.hoisted(() => (vi.fn(() => 'sh-fresh')));
 const shieldedRestore = vi.hoisted(() => (vi.fn(() => 'sh-restored')));
 vi.mock('@midnightntwrk/wallet-sdk-shielded', () => ({
-    ShieldedWallet: vi.fn(() => ({ startWithSecretKeys: shieldedStart, restore: shieldedRestore }))
+    ShieldedWallet: vi.fn(() => ({ startWithSeed: shieldedStart, restore: shieldedRestore }))
 }));
 
 const unshieldedStart = vi.hoisted(() => (vi.fn(() => 'un-fresh')));
@@ -169,23 +222,35 @@ vi.mock('@midnightntwrk/wallet-sdk-unshielded-wallet', () => ({
 const dustStart = vi.hoisted(() => (vi.fn(() => 'du-fresh')));
 const dustRestore = vi.hoisted(() => (vi.fn(() => 'du-restored')));
 vi.mock('@midnightntwrk/wallet-sdk-dust-wallet', () => ({
-    DustWallet: vi.fn(() => ({ startWithSecretKey: dustStart, restore: dustRestore }))
+    DustWallet: vi.fn(() => ({ startWithSeed: dustStart, restore: dustRestore }))
 }));
 // CoreWallet.spendCoins (unbound sponsor build): functional, returns the spends
 // and an updated wallet the worker discards.
 const spendCoins = vi.hoisted(() => (vi.fn((_state: any, _sk: any, coins: any[]) =>
     [coins.map((c: any) => ({ oldNullifier: `nul-${c.token.backingNight}` })), { updated: true }])));
-vi.mock('@midnightntwrk/wallet-sdk-dust-wallet/v1', () => ({
-    CoreWallet: { spendCoins }
+// The fixtures carry the ledger 9 core state at `walletState.state`. A sponsor fixture's core
+// lists its free notes through `availableNotes`, which the coins capability reads.
+vi.mock('@midnightntwrk/wallet-sdk-dust-wallet/v2', () => ({
+    CoreWallet: { spendCoins },
+    coreStateOf: (ws: any) => (ws?.state && typeof ws.state === 'object' ? { _tag: 'Some', value: ws.state } : { _tag: 'None' }),
+    CoinsAndBalances: {
+        makeDefaultCoinsAndBalancesCapability: () => ({ getAvailableCoins: (core: any, at: Date) => core?.availableNotes?.(at) ?? [] })
+    },
+    Keys: { makeDefaultKeysCapability: () => ({}) }
 }));
+/** A dust wallet state whose core state lists `notes` as free. */
+function dustStateOf(notes: (at: Date) => unknown[]) {
+    return { state: { availableNotes: notes } };
+}
 
 vi.mock('@midnightntwrk/wallet-sdk-abstractions', () => ({
-    InMemoryTransactionHistoryStorage: class { constructor(..._a: any[]) { /* stub */ } }
+    InMemoryTransactionHistoryStorage: class { constructor(..._a: any[]) { /* stub */ } },
+    WalletTransaction: { adopt: walletTx.adopt, is: walletTx.is }
 }));
 
-const makeWasmProvingService = vi.hoisted(() => (vi.fn((..._args: any[]): any => ({ wasmProver: true }))));
+const makeV9WasmProvingService = vi.hoisted(() => (vi.fn((..._args: any[]): any => ({ wasmProver: true }))));
 vi.mock('@midnightntwrk/wallet-sdk-capabilities/proving', () => ({
-    makeWasmProvingService
+    makeV9WasmProvingService
 }));
 // Dedicated per-submit node clients of the unbound sponsor path: each
 // makeDefaultSubmissionService call is one client with its own socket.
@@ -201,11 +266,18 @@ vi.mock('@midnightntwrk/wallet-sdk-capabilities/submission', () => ({
 
 // wasm mode shares one key-material provider via wasm-proof-provider's
 // loadDeps; stub its ESM imports so no real SDK loads in unit tests.
-vi.mock('@midnight-ntwrk/zkir-v2', () => ({ provingProvider: vi.fn(() => ({})) }));
-vi.mock('@midnight-ntwrk/midnight-js-types', () => ({ zkConfigToProvingKeyMaterial: vi.fn() }));
+vi.mock('@midnightntwrk/zkir-v2', () => ({ provingProvider: vi.fn(() => ({})) }));
+vi.mock('@midnightntwrk/zkir-v3', () => ({ provingProvider: vi.fn(() => ({})) }));
+vi.mock('@midnight-ntwrk/midnight-js-types', () => ({
+    zkConfigToProvingKeyMaterial: vi.fn(),
+    createLedger9ProofProvider: vi.fn((pp: any) => ({ proveTx: vi.fn(), from: pp })),
+    // The real factories narrow `{ version: 'v9', tx }`; the fakes pass the call straight through.
+    createLedger9WalletProvider: (impl: any) => ({ supportedEras: ['v9'], ...impl }),
+    createLedger9MidnightProvider: (submitTx: any) => ({ supportedEras: ['v9'], submitTx })
+}));
 const sharedKeyProvider = vi.hoisted(() => ({ lookupKey: vi.fn(), getParams: vi.fn() }));
 vi.mock('@midnightntwrk/wallet-sdk-prover-client/effect', () => ({
-    WasmProver: { makeDefaultKeyMaterialProvider: () => sharedKeyProvider }
+    WasmProver: { makeV9KeyMaterialProvider: () => sharedKeyProvider }
 }));
 
 // The facade mock invokes the shielded/unshielded/dust factory closures like
@@ -216,13 +288,13 @@ const facadeState = vi.hoisted(() => ({
 }));
 const facadeInit = vi.hoisted(() => (vi.fn()));
 vi.mock('@midnightntwrk/wallet-sdk-facade', () => ({
-    WalletFacade: { init: facadeInit },
+    WalletFacade: { init: facadeInit, resolveConfiguration: (c: any) => ({ ...c, forks: { v9: 9_000_000n } }) },
+    // Same test as the real one: a recipe is an object with one of the three recipe types.
+    BalancingRecipe: {
+        isRecipe: (v: any) => typeof v === 'object' && v !== null && ['FINALIZED_TRANSACTION', 'UNBOUND_TRANSACTION', 'UNPROVEN_TRANSACTION'].includes(v.type)
+    },
     WalletEntrySchema: { schema: true },
     mergeWalletEntries: vi.fn()
-}));
-
-vi.mock('@midnight-ntwrk/midnight-js-network-id', () => ({
-    setNetworkId: vi.fn()
 }));
 
 // getDustStreamTip probes the indexer via a one-shot graphql-transport-ws
@@ -255,6 +327,10 @@ vi.mock('ws', () => {
 });
 
 import { MessageChannel } from 'node:worker_threads';
+import type { PublicDataProvider } from '@midnight-ntwrk/midnight-js-types';
+import type { InspectedTx } from '../../srv/midnight/worker/sponsor';
+
+type SegmentIntent = NonNullable<InspectedTx['intents']> extends ReadonlyMap<number, infer I> ? I : never;
 import { bech32m } from '@scure/base';
 import path from 'node:path';
 
@@ -271,22 +347,22 @@ function makeFakeFacade() {
         unshielded: { serializeState: vi.fn(async () => 'BLOB-UN') },
         dust: { serializeState: vi.fn(async () => 'BLOB-DU'), getAddress: vi.fn(async () => DUST_ADDRESS) },
         state: () => ({
-            subscribe(obs: any) { obs.next(facadeState.current); return { unsubscribe() { /* noop */ } }; }
+            subscribe(obs: any) { obs.next({ activeProtocolVersion: 9_000_000, ...facadeState.current }); return { unsubscribe() { /* noop */ } }; }
         }),
         waitForSyncedState: vi.fn(async () => undefined),
         revert: vi.fn(async () => undefined),
-        // The worker books a send with the facade's pending service and sends on its own client.
-        pendingTransactionsService: { addPendingTransaction: vi.fn(async () => undefined), clear: vi.fn(async () => undefined) },
-        transferTransaction: vi.fn(async () => ({ type: 'UNPROVEN_TRANSACTION', transaction: { unproven: true } })),
+        transferTransaction: vi.fn(async () => ({ type: 'UNPROVEN_TRANSACTION', transaction: handleOf({ unproven: true }, 'Unproven') })),
         signRecipe: vi.fn(async (r: any) => r),
         // identifiers(): every submit announces the last one before broadcasting; it is the txId
-        finalizeRecipe: vi.fn(async () => ({ finalized: true, identifiers: () => ['tx-hash-fixture'] })),
+        finalizeRecipe: vi.fn(async () => handleOf({ finalized: true, identifiers: () => ['tx-hash-fixture'] })),
         // Never used by the worker (the facade's submit hangs until its socket closes); asserted absent.
         submitTransaction: vi.fn(async () => 'never'),
         calculateTransactionFee: vi.fn(async () => 42n),
-        registerNightUtxosForDustGeneration: vi.fn(async () => ({ type: 'RECIPE', transaction: { reg: true } })),
-        deregisterFromDustGeneration: vi.fn(async () => ({ transaction: { dereg: true } })),
-        balanceUnprovenTransaction: vi.fn(async () => ({ balanced: true }))
+        registerNightUtxosForDustGeneration: vi.fn(async () => ({ type: 'UNPROVEN_TRANSACTION', transaction: handleOf({ reg: true }, 'Unproven') })),
+        deregisterFromDustGeneration: vi.fn(async () => ({ type: 'UNPROVEN_TRANSACTION', transaction: handleOf({ dereg: true }, 'Unproven') })),
+        balanceUnprovenTransaction: vi.fn(async () => ({ type: 'UNPROVEN_TRANSACTION', transaction: handleOf({ balanced: true }, 'Unproven') })),
+        // Proves the sponsor's dust spend. Tests that sponsor replace it.
+        provingService: { prove: vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-proven-default'] }) }) })) }
     };
     return facade;
 }
@@ -547,26 +623,23 @@ describe('init', () => {
         }
     });
 
-    it('passes no provingService by default (facade uses its server prover)', async () => {
+    it('configures no wasm prover by default (facade uses its server prover)', async () => {
         facadeInit.mockClear();
         const reply = await rpc('init', { ...INIT_ARGS, sessionId: 'session-provedefault-dddddd' });
         expect(reply.ok).toBe(true);
-        expect(facadeInit.mock.calls[0][0].provingService).toBeUndefined();
+        expect(facadeInit.mock.calls[0][0].configuration.provers).toBeUndefined();
     });
 
-    it('NIGHTGATE_PROVING_MODE=wasm passes a provingService that builds the WASM prover with the SHARED key provider', async () => {
+    it('NIGHTGATE_PROVING_MODE=wasm configures the ledger-9 wasm prover with the SHARED key provider', async () => {
         process.env.NIGHTGATE_PROVING_MODE = 'wasm';
         try {
             facadeInit.mockClear();
-            makeWasmProvingService.mockClear();
             const reply = await rpc('init', { ...INIT_ARGS, sessionId: 'session-provewasm-eeeeeeee' });
             expect(reply.ok).toBe(true);
-            const provingService = facadeInit.mock.calls[0][0].provingService;
-            expect(typeof provingService).toBe('function');
-            expect(provingService()).toEqual({ wasmProver: true });
             // The per-worker shared key provider must be passed, otherwise the
-            // SDK builds a fresh S3 cache per session.
-            expect(makeWasmProvingService).toHaveBeenCalledWith({ keyMaterialProvider: sharedKeyProvider });
+            // SDK builds a fresh key cache per session.
+            expect(facadeInit.mock.calls[0][0].configuration.provers)
+                .toEqual({ v9: { kind: 'wasm', keyMaterialProvider: sharedKeyProvider } });
         } finally {
             delete process.env.NIGHTGATE_PROVING_MODE;
         }
@@ -578,7 +651,7 @@ describe('init', () => {
             facadeInit.mockClear();
             const reply = await rpc('init', { ...INIT_ARGS, sessionId: 'session-provebogus-ffffff' });
             expect(reply.ok).toBe(true);
-            expect(facadeInit.mock.calls[0][0].provingService).toBeUndefined();
+            expect(facadeInit.mock.calls[0][0].configuration.provers).toBeUndefined();
             const warns = fakeParentPort.postMessage.mock.calls
                 .map(c => c[0])
                 .filter((m: any) => m.kind === 'log' && m.level === 'warn' && /NIGHTGATE_PROVING_MODE: 'gpu' is not one of/.test(m.message));
@@ -919,6 +992,7 @@ describe('revertRecipeBestEffort / feeOfDiscardedRecipe', () => {
             .filter((m: any) => m.kind === 'log' && m.level === 'warn')
             .map((m: any) => m.message);
     }
+    const entryOf = (facade: any) => ({ facade, walletConfiguration: { forks: { v9: 9_000_000n } } });
 
     it('feeOfDiscardedRecipe prices via calculateTransactionFee (NOT the hang-prone estimateTransactionFee) and ALWAYS reverts', async () => {
         const facade = makeFakeFacade();
@@ -926,7 +1000,7 @@ describe('revertRecipeBestEffort / feeOfDiscardedRecipe', () => {
         facade.estimateTransactionFee = vi.fn(async () => { throw new Error('must not be called: uncapped runSync loop'); });
         const recipe = { type: 'UNPROVEN_TRANSACTION', transaction: { tx: true } };
 
-        const fee = await workerExports.feeOfDiscardedRecipe(facade, recipe, 'test-site');
+        const fee = await workerExports.feeOfDiscardedRecipe(entryOf(facade), recipe, 'test-site');
         expect(fee).toBe(42n);
         expect(facade.calculateTransactionFee).toHaveBeenCalledWith(recipe.transaction);
         expect(facade.estimateTransactionFee).not.toHaveBeenCalled();
@@ -938,7 +1012,7 @@ describe('revertRecipeBestEffort / feeOfDiscardedRecipe', () => {
         facade.calculateTransactionFee = vi.fn(async () => { throw new Error('fee boom'); });
         const recipe = { type: 'UNPROVEN_TRANSACTION', transaction: {} };
 
-        await expect(workerExports.feeOfDiscardedRecipe(facade, recipe, 'test-site')).rejects.toThrow('fee boom');
+        await expect(workerExports.feeOfDiscardedRecipe(entryOf(facade), recipe, 'test-site')).rejects.toThrow('fee boom');
         expect(facade.revert).toHaveBeenCalledWith(recipe);
     });
 
@@ -946,13 +1020,24 @@ describe('revertRecipeBestEffort / feeOfDiscardedRecipe', () => {
         const facade = makeFakeFacade();
         facade.revert = vi.fn(async () => { throw new Error('revert boom'); });
 
-        await expect(workerExports.revertRecipeBestEffort(facade, { recipe: true }, 'test-site')).resolves.toBeUndefined();
+        await expect(workerExports.revertRecipeBestEffort(entryOf(facade), { type: 'UNPROVEN_TRANSACTION' }, 'test-site')).resolves.toBeUndefined();
         expect(warns().some(m => /test-site: recipe revert failed.*revert boom/.test(m))).toBe(true);
+    });
+
+    it('revertRecipeBestEffort seals a bare finalized transaction and passes recipes and handles through', async () => {
+        const facade = makeFakeFacade();
+        const bare = { finalized: true };
+        const handle = handleOf({ other: true });
+        const recipe = { type: 'FINALIZED_TRANSACTION' };
+        await workerExports.revertRecipeBestEffort(entryOf(facade), bare, 'test-site');
+        await workerExports.revertRecipeBestEffort(entryOf(facade), handle, 'test-site');
+        await workerExports.revertRecipeBestEffort(entryOf(facade), recipe, 'test-site');
+        expect(facade.revert.mock.calls.map((c: any[]) => c[0])).toEqual([sealedHandle(bare), handle, recipe]);
     });
 
     it('revertRecipeBestEffort no-ops on a missing recipe', async () => {
         const facade = makeFakeFacade();
-        await workerExports.revertRecipeBestEffort(facade, undefined, 'test-site');
+        await workerExports.revertRecipeBestEffort(entryOf(facade), undefined, 'test-site');
         expect(facade.revert).not.toHaveBeenCalled();
     });
 });
@@ -966,13 +1051,14 @@ describe('buildWorkerWalletProvider', () => {
     function makeEntry(finalizedDust: any) {
         const finalized = { intents: new Map<any, any>([[0, { dustActions: finalizedDust }]]), identifiers: () => ['0xsubmitted'] };
         const facade = makeFakeFacade();
-        facade.balanceUnboundTransaction = vi.fn(async () => ({ recipe: true }));
-        facade.finalizeRecipe = vi.fn(async () => finalized);
+        facade.balanceUnboundTransaction = vi.fn(async () => ({ type: 'UNBOUND_TRANSACTION', recipe: true }));
+        facade.finalizeRecipe = vi.fn(async () => handleOf(finalized));
         return {
             entry: {
                 sessionId: 'session-provider-test-aaaaaa',
                 facade,
-                walletConfiguration: { relayURL: new URL('ws://relay.test') },
+                walletConfiguration: { relayURL: new URL('ws://relay.test'), forks: { v9: 9_000_000n } },
+                walletSeeds: { shielded: new Uint8Array(32).fill(1), unshielded: new Uint8Array(32).fill(3), dust: new Uint8Array(32).fill(2) },
                 sdkVersion: 'test',
                 zswapKeys: { coinPublicKey: 'cpk', encryptionPublicKey: 'epk' },
                 dustKey: { dust: true },
@@ -1028,7 +1114,7 @@ describe('buildWorkerWalletProvider', () => {
         }
     });
 
-    it('submitTx announces the identifier on the reply port, books the spends, then sends on a dedicated client (bound channel)', async () => {
+    it('submitTx announces the identifier on the reply port, then sends on a dedicated client (bound channel)', async () => {
         const { entry, facade, finalized } = makeEntry(DUST_OK);
         (finalized as any).identifiers = () => ['tx-bound-1'];
         const { port1, port2 } = new MessageChannel();
@@ -1040,7 +1126,6 @@ describe('buildWorkerWalletProvider', () => {
                 port2.postMessage({ kind: 'submit-intent-ack', txHash: m.txHash, ok: true });
             }
         });
-        facade.pendingTransactionsService.addPendingTransaction = vi.fn(async () => { order.push('pend'); });
         const restoreSubmit = withSubmit(async (tx: any, status: string, ctx: any) => {
             order.push('send');
             expect(tx).toBe(finalized);
@@ -1052,7 +1137,7 @@ describe('buildWorkerWalletProvider', () => {
             await expect(provider.submitTx(finalized)).resolves.toBe('tx-bound-1');
             expect(seen).toHaveLength(1);
             expect(seen[0]).toMatchObject({ txHash: 'tx-bound-1', contractAddress: 'c'.repeat(64), circuits: ['increment'] });
-            expect(order).toEqual(['intent', 'pend', 'send']);
+            expect(order).toEqual(['intent', 'send']);
             // The facade's own submit is never used: it would hold the worker until the node socket closes.
             expect(facade.submitTransaction).not.toHaveBeenCalled();
             expect(facade.revert).not.toHaveBeenCalled();
@@ -1079,8 +1164,7 @@ describe('buildWorkerWalletProvider', () => {
             expect(err?.message).toMatch(/submit-intent rejected.*cannot record txHash/);
             expect(err?.code).toBe('SUBMIT_INTENT_REJECTED');
             expect(submitCount()).toBe(submitsBefore);
-            expect(facade.pendingTransactionsService.addPendingTransaction).not.toHaveBeenCalled();
-            expect(facade.revert).toHaveBeenCalledWith(finalized);
+            expect(facade.revert).toHaveBeenCalledWith(sealedHandle(finalized));
             expect(dustRestore).toHaveBeenCalledWith('du-blob');
         } finally {
             port1.close(); port2.close();
@@ -1104,13 +1188,9 @@ describe('buildWorkerWalletProvider', () => {
 
             const result = await provider.balanceTx(tx);
             expect(result).toBe(finalized);
-            expect(facade.balanceUnboundTransaction).toHaveBeenCalledWith(
-                tx,
-                { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
-                { ttl: expect.any(Date) }
-            );
+            expect(facade.balanceUnboundTransaction).toHaveBeenCalledWith(sealedHandle(tx, 'Unbound'), { ttl: expect.any(Date) });
             // Default ttl is ~1h out.
-            const ttl = (facade.balanceUnboundTransaction as any).mock.calls[0][2].ttl as Date;
+            const ttl = (facade.balanceUnboundTransaction as any).mock.calls[0][1].ttl as Date;
             expect(ttl.getTime()).toBeGreaterThan(Date.now() + 50 * 60 * 1000);
         } finally {
             vi.unstubAllGlobals();
@@ -1124,7 +1204,7 @@ describe('buildWorkerWalletProvider', () => {
             const provider = workerExports.buildWorkerWalletProvider(entry);
             const ttl = new Date(Date.now() + 5 * 60 * 1000);
             await provider.balanceTx({}, ttl);
-            expect((facade.balanceUnboundTransaction as any).mock.calls[0][2].ttl).toBe(ttl);
+            expect((facade.balanceUnboundTransaction as any).mock.calls[0][1].ttl).toBe(ttl);
         } finally {
             vi.unstubAllGlobals();
         }
@@ -1136,7 +1216,7 @@ describe('buildWorkerWalletProvider', () => {
             const { entry, facade, finalized } = makeEntry(DUST_EMPTY);
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await expect(provider.balanceTx({})).rejects.toThrow(/EMPTY DustActions section.*117 NotNormalized/s);
-            expect(facade.revert).toHaveBeenCalledWith(finalized);
+            expect(facade.revert).toHaveBeenCalledWith(sealedHandle(finalized));
         } finally {
             vi.unstubAllGlobals();
         }
@@ -1149,7 +1229,7 @@ describe('buildWorkerWalletProvider', () => {
             facade.finalizeRecipe = vi.fn(async () => { throw new Error('prove boom'); });
             const provider = workerExports.buildWorkerWalletProvider(entry);
             await expect(provider.balanceTx({})).rejects.toThrow('prove boom');
-            expect(facade.revert).toHaveBeenCalledWith({ recipe: true });
+            expect(facade.revert).toHaveBeenCalledWith({ type: 'UNBOUND_TRANSACTION', recipe: true });
         } finally {
             vi.unstubAllGlobals();
         }
@@ -1203,7 +1283,7 @@ describe('buildWorkerWalletProvider', () => {
             await expect(provider.submitTx(finalized)).rejects.toThrow('1014');
 
             expect(dustRestore).toHaveBeenCalledWith('BLOB-DU');
-            expect(freshDust.start).toHaveBeenCalledWith(entry.dustKey);
+            expect(freshDust.start).toHaveBeenCalledWith(DUST_KEYS_BY_EPOCH);
             expect(facade.dust).toBe(freshDust);
             expect(oldDust.stop).toHaveBeenCalled();
             expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
@@ -1218,7 +1298,7 @@ describe('buildWorkerWalletProvider', () => {
             expect((entry as any).dustEpoch).toBe(1);
             expect((entry as any).dustRestoresPersisted).toBe(1);
             // The facade's rule: a failed submit frees the booked spends (the dust note is the snapshot's job).
-            expect(facade.revert).toHaveBeenCalledWith(finalized);
+            expect(facade.revert).toHaveBeenCalledWith(sealedHandle(finalized));
         } finally {
             restoreSubmit();
             undoAck();
@@ -1494,7 +1574,7 @@ describe('buildWorkerWalletProvider', () => {
             expect(submitCount() - submitsBefore).toBe(2);
             expect(dustRestore).toHaveBeenCalledWith('BLOB-DU');
             expect(facade.dust).toBe(freshDust);
-            expect(facade.revert).toHaveBeenCalledWith(finalized);
+            expect(facade.revert).toHaveBeenCalledWith(sealedHandle(finalized));
         } finally {
             undoAck(); restoreSubmit(); restore(); vi.unstubAllGlobals();
         }
@@ -1657,7 +1737,7 @@ describe('buildWorkerWalletProvider', () => {
             // on-chain failure spent the fee: no dust restore; the booked spends are freed as the facade would
             expect(dustRestore).not.toHaveBeenCalled();
             expect((entry as any).preSubmitDustSnapshot).toBeUndefined();
-            expect(facade.revert).toHaveBeenCalledWith(finalized);
+            expect(facade.revert).toHaveBeenCalledWith(sealedHandle(finalized));
         } finally {
             restoreSubmit(); restore(); vi.unstubAllGlobals();
         }
@@ -1858,7 +1938,7 @@ describe('snapshot replay', () => {
             undo();
         }
         expect(entry.facade.dust).toBe(freshDust);
-        expect(freshDust.start).toHaveBeenCalledWith(entry.dustKey);
+        expect(freshDust.start).toHaveBeenCalledWith(DUST_KEYS_BY_EPOCH);
         expect(oldDust.stop).toHaveBeenCalled();
         expect(entry.dustEpoch).toBe(1);
         expect(entry.restoredSubWallets).toEqual({ shielded: true, dust: false });
@@ -1884,7 +1964,7 @@ describe('snapshot replay', () => {
             undo();
         }
         expect(entry.facade.shielded).toBe(freshShielded);
-        expect(freshShielded.start).toHaveBeenCalledWith(entry.zswapKeys);
+        expect(freshShielded.start).toHaveBeenCalledWith({ v8: { v8ZswapKeys: true }, v9: entry.zswapKeys });
         expect(entry.shieldedEpoch).toBe(1);
         // the dust sub-wallet saw no dust rejection and stays restored
         expect(entry.restoredSubWallets).toEqual({ shielded: false, dust: true });
@@ -1947,10 +2027,12 @@ describe('progress watch tick', () => {
         wsTip.maxId = '100';
         facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
         stubIndexerTip(Date.now());
+        // the label of a finished prewarm wait must not stick to the idle reports
+        workerExports.syncProgress.set(SESSION, { ...workerExports.syncProgress.get(SESSION), label: 'prewarm', updatedAt: new Date().toISOString() });
 
         await workerExports.progressWatchTick(SESSION, entry, Date.now() + 120_000);
         const pushed = fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'sync-progress' && m.sessionId === SESSION);
-        expect(pushed.at(-1).snapshot).toMatchObject({ caughtUp: true, appliedIndex: '95', streamTip: '100', blockHeight: '500', indexerFresh: true });
+        expect(pushed.at(-1).snapshot).toMatchObject({ caughtUp: true, appliedIndex: '95', streamTip: '100', blockHeight: '500', indexerFresh: true, label: 'idle' });
 
         // a stale indexer fails the gate the same way it fails a job
         stubIndexerTip(Date.now() - 3_600_000);
@@ -1965,6 +2047,36 @@ describe('progress watch tick', () => {
         await workerExports.progressWatchTick(SESSION, entry, Date.now() + 360_000);
         const refused = fakeParentPort.postMessage.mock.calls.map(c => c[0]).filter((m: any) => m.kind === 'sync-progress' && m.sessionId === SESSION).at(-1);
         expect(refused.snapshot).toMatchObject({ caughtUp: false, indexerFresh: false, indexerError: 'HTTP 403', indexerTipAgeMs: null });
+        await rpc('evict', { sessionId: SESSION });
+    });
+
+    it('logs a change of the indexer check once, and its recovery', async () => {
+        const SESSION = 'session-watch-liveness-mmmmmm';
+        await initSession(SESSION);
+        const entry = workerExports.facades.get(SESSION);
+        stubIndexerTip(Date.now());
+        const lines = () => fakeParentPort.postMessage.mock.calls.map(c => c[0])
+            .filter((m: any) => m.kind === 'log' && /indexer check/.test(m.message) && m.message.includes(SESSION.slice(0, 16)));
+        const tickWith = async (indexerLiveness: unknown, minutes: number) => {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } }, unshielded: { progress: { indexerLiveness } } };
+            await workerExports.progressWatchTick(SESSION, entry, Date.now() + minutes * 120_000);
+        };
+
+        await tickWith({ _tag: 'Unknown' }, 1);
+        await tickWith({ _tag: 'InSync', indexerHeight: 1n, finalizedHeight: 1n }, 2);
+        expect(lines()).toEqual([]);
+
+        await tickWith({ _tag: 'Unavailable', consecutiveFailures: 1, lastError: 'WebSocket is not connected' }, 3);
+        await tickWith({ _tag: 'Unavailable', consecutiveFailures: 2, lastError: 'WebSocket is not connected' }, 4);
+        expect(lines()).toHaveLength(1);
+        expect(lines()[0]).toMatchObject({ level: 'warn', message: expect.stringContaining('WebSocket is not connected') });
+
+        await tickWith({ _tag: 'InSync', indexerHeight: 2n, finalizedHeight: 2n }, 5);
+        expect(lines()).toHaveLength(2);
+        expect(lines()[1]).toMatchObject({ level: 'info', message: expect.stringContaining('in sync again') });
+
+        await tickWith({ _tag: 'Behind', indexerHeight: 1n, finalizedHeight: 31n, lag: 30n }, 6);
+        expect(lines()[2]).toMatchObject({ level: 'warn', message: expect.stringContaining('30 blocks behind') });
         await rpc('evict', { sessionId: SESSION });
     });
 
@@ -2422,44 +2534,50 @@ describe('buildSponsoredWalletProvider', () => {
      * facade attribution assertable.
      */
     function makePair(sponsorFinalDust: any = DUST_OK) {
-        const callerFinalized = { stage: 'caller-finalized', intents: new Map<any, any>([[0, {}]]) };
-        const sponsorFinalized = { stage: 'sponsor-finalized', intents: new Map<any, any>([[0, { dustActions: sponsorFinalDust }]]), identifiers: () => ['0xsponsored'] };
+        const callerFinalized = { name: 'caller-finalized', intents: new Map<any, any>([[0, {}]]) };
+        const sponsorFinalized = { name: 'sponsor-finalized', intents: new Map<any, any>([[0, { dustActions: sponsorFinalDust }]]), identifiers: () => ['0xsponsored'] };
+        // The handle the caller's finalize returns, which the sponsor balances.
+        const callerHandle = handleOf(callerFinalized);
 
-        const callerSigned = { stage: 'caller-signed' };
+        const callerSigned = { type: 'UNBOUND_TRANSACTION', name: 'caller-signed' };
         const callerFacade = makeFakeFacade();
-        callerFacade.balanceUnboundTransaction = vi.fn(async () => ({ stage: 'caller-recipe' }));
+        callerFacade.balanceUnboundTransaction = vi.fn(async () => CALLER_RECIPE);
         callerFacade.signRecipe = vi.fn(async () => callerSigned);
-        callerFacade.finalizeRecipe = vi.fn(async () => callerFinalized);
+        callerFacade.finalizeRecipe = vi.fn(async () => callerHandle);
         callerFacade.submitTransaction = vi.fn(async () => { throw new Error('caller must never submit a sponsored tx'); });
 
         const sponsorFacade = makeFakeFacade();
-        sponsorFacade.balanceFinalizedTransaction = vi.fn(async () => ({ stage: 'sponsor-recipe' }));
-        sponsorFacade.finalizeRecipe = vi.fn(async () => sponsorFinalized);
+        sponsorFacade.balanceFinalizedTransaction = vi.fn(async () => SPONSOR_RECIPE);
+        sponsorFacade.finalizeRecipe = vi.fn(async () => handleOf(sponsorFinalized));
 
         const caller = {
             facade: callerFacade,
-            walletConfiguration: { relayURL: new URL('ws://relay.test') },
+            walletConfiguration: { relayURL: new URL('ws://relay.test'), forks: { v9: 9_000_000n } },
             sdkVersion: 'test',
             zswapKeys: { coinPublicKey: 'caller-cpk', encryptionPublicKey: 'caller-epk' },
             dustKey: { caller: true },
             unshieldedKeystore: { signData: vi.fn(() => 'caller-sig') },
+            walletSeeds: { shielded: new Uint8Array(32), unshielded: new Uint8Array(32), dust: new Uint8Array(32) },
             networkId: 'preprod',
             indexerHttpUrl: 'http://indexer.test/api/v4/graphql',
             attestationSecret: new Uint8Array(32)
         };
         const sponsor = {
             facade: sponsorFacade,
-            walletConfiguration: { relayURL: new URL('ws://relay.test') },
+            walletConfiguration: { relayURL: new URL('ws://relay.test'), forks: { v9: 9_000_000n } },
             sdkVersion: 'test',
             zswapKeys: { coinPublicKey: 'sponsor-cpk', encryptionPublicKey: 'sponsor-epk' },
             dustKey: { sponsor: true },
             unshieldedKeystore: { signData: vi.fn(() => 'sponsor-sig') },
+            walletSeeds: { shielded: new Uint8Array(32), unshielded: new Uint8Array(32), dust: new Uint8Array(32) },
             networkId: 'preprod',
             indexerHttpUrl: 'http://indexer.test/api/v4/graphql',
             attestationSecret: new Uint8Array(32)
         };
-        return { caller, sponsor, callerFacade, sponsorFacade, callerFinalized, sponsorFinalized, callerSigned };
+        return { caller, sponsor, callerFacade, sponsorFacade, callerFinalized, callerHandle, sponsorFinalized, callerSigned };
     }
+    const CALLER_RECIPE = { type: 'UNBOUND_TRANSACTION', name: 'caller-recipe' };
+    const SPONSOR_RECIPE = { type: 'FINALIZED_TRANSACTION', name: 'sponsor-recipe' };
 
     function withSyncedIndexer() {
         vi.stubGlobal('fetch', vi.fn(async () => ({
@@ -2480,36 +2598,36 @@ describe('buildSponsoredWalletProvider', () => {
     it('balanceTx runs the two-phase choreography with a shared TTL', async () => {
         withSyncedIndexer();
         try {
-            const { caller, sponsor, callerFacade, sponsorFacade, callerFinalized, sponsorFinalized, callerSigned } = makePair();
+            const { caller, sponsor, callerFacade, sponsorFacade, callerHandle, sponsorFinalized, callerSigned } = makePair();
             const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
             const tx = { unbound: true };
 
             const result = await provider.balanceTx(tx);
             expect(result).toBe(sponsorFinalized);
 
-            // Phase 1: caller balances ONLY shielded/unshielded with its keys.
+            // Phase 1: caller balances ONLY shielded/unshielded.
             expect(callerFacade.balanceUnboundTransaction).toHaveBeenCalledWith(
-                tx,
-                { shieldedSecretKeys: caller.zswapKeys, dustSecretKey: caller.dustKey },
+                sealedHandle(tx, 'Unbound'),
                 { ttl: expect.any(Date), tokenKindsToBalance: ['shielded', 'unshielded'] }
             );
-            expect(callerFacade.signRecipe).toHaveBeenCalledWith({ stage: 'caller-recipe' }, expect.any(Function));
+            expect(callerFacade.signRecipe).toHaveBeenCalledWith(CALLER_RECIPE, expect.any(Function));
+            // The signer is async and signs with the caller's key.
+            await expect(callerFacade.signRecipe.mock.calls[0][1](new Uint8Array([1]))).resolves.toBe('caller-sig');
             expect(callerFacade.finalizeRecipe).toHaveBeenCalledWith(callerSigned);
 
-            // Phase 2: sponsor balances ONLY dust on the caller-finalized tx.
+            // Phase 2: sponsor balances ONLY dust on the caller-finalized handle.
             expect(sponsorFacade.balanceFinalizedTransaction).toHaveBeenCalledWith(
-                callerFinalized,
-                { shieldedSecretKeys: sponsor.zswapKeys, dustSecretKey: sponsor.dustKey },
+                callerHandle,
                 { ttl: expect.any(Date), tokenKindsToBalance: ['dust'] }
             );
 
             // Both phases share ONE ttl instance.
-            const callerTtl = (callerFacade.balanceUnboundTransaction as any).mock.calls[0][2].ttl;
-            const sponsorTtl = (sponsorFacade.balanceFinalizedTransaction as any).mock.calls[0][2].ttl;
+            const callerTtl = (callerFacade.balanceUnboundTransaction as any).mock.calls[0][1].ttl;
+            const sponsorTtl = (sponsorFacade.balanceFinalizedTransaction as any).mock.calls[0][1].ttl;
             expect(sponsorTtl).toBe(callerTtl);
 
             // The sponsor never re-signs; only its own dust balancing is proven.
-            expect(sponsorFacade.finalizeRecipe).toHaveBeenCalledWith({ stage: 'sponsor-recipe' });
+            expect(sponsorFacade.finalizeRecipe).toHaveBeenCalledWith(SPONSOR_RECIPE);
         } finally {
             vi.unstubAllGlobals();
         }
@@ -2522,8 +2640,8 @@ describe('buildSponsoredWalletProvider', () => {
             const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
             const ttl = new Date(Date.now() + 5 * 60 * 1000);
             await provider.balanceTx({}, ttl);
-            expect((callerFacade.balanceUnboundTransaction as any).mock.calls[0][2].ttl).toBe(ttl);
-            expect((sponsorFacade.balanceFinalizedTransaction as any).mock.calls[0][2].ttl).toBe(ttl);
+            expect((callerFacade.balanceUnboundTransaction as any).mock.calls[0][1].ttl).toBe(ttl);
+            expect((sponsorFacade.balanceFinalizedTransaction as any).mock.calls[0][1].ttl).toBe(ttl);
         } finally {
             vi.unstubAllGlobals();
         }
@@ -2556,8 +2674,8 @@ describe('buildSponsoredWalletProvider', () => {
             const { caller, sponsor, callerFacade, sponsorFacade, callerFinalized, sponsorFinalized } = makePair(DUST_EMPTY);
             const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
             await expect(provider.balanceTx({})).rejects.toThrow(/EMPTY DustActions section.*117 NotNormalized/s);
-            expect(sponsorFacade.revert).toHaveBeenCalledWith(sponsorFinalized);
-            expect(callerFacade.revert).toHaveBeenCalledWith(callerFinalized);
+            expect(sponsorFacade.revert).toHaveBeenCalledWith(sealedHandle(sponsorFinalized));
+            expect(callerFacade.revert).toHaveBeenCalledWith(sealedHandle(callerFinalized));
         } finally {
             vi.unstubAllGlobals();
         }
@@ -2570,7 +2688,7 @@ describe('buildSponsoredWalletProvider', () => {
             callerFacade.finalizeRecipe = vi.fn(async () => { throw new Error('caller prove boom'); });
             const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
             await expect(provider.balanceTx({})).rejects.toThrow('caller prove boom');
-            expect(callerFacade.revert).toHaveBeenCalledWith({ stage: 'caller-recipe' });
+            expect(callerFacade.revert).toHaveBeenCalledWith(CALLER_RECIPE);
             expect(sponsorFacade.balanceFinalizedTransaction).not.toHaveBeenCalled();
             expect(sponsorFacade.revert).not.toHaveBeenCalled();
         } finally {
@@ -2585,21 +2703,19 @@ describe('buildSponsoredWalletProvider', () => {
             sponsorFacade.finalizeRecipe = vi.fn(async () => { throw new Error('sponsor prove boom'); });
             const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
             await expect(provider.balanceTx({})).rejects.toThrow('sponsor prove boom');
-            expect(sponsorFacade.revert).toHaveBeenCalledWith({ stage: 'sponsor-recipe' });
-            expect(callerFacade.revert).toHaveBeenCalledWith(callerFinalized);
+            expect(sponsorFacade.revert).toHaveBeenCalledWith(SPONSOR_RECIPE);
+            expect(callerFacade.revert).toHaveBeenCalledWith(sealedHandle(callerFinalized));
         } finally {
             vi.unstubAllGlobals();
         }
     });
 
-    it('submitTx books the send with the SPONSOR facade only and sends on a dedicated client', async () => {
+    it('submitTx sends through the SPONSOR on a dedicated client and leaves the caller untouched', async () => {
         const { caller, sponsor, callerFacade, sponsorFacade, sponsorFinalized } = makePair();
         const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
         const result = await provider.submitTx(sponsorFinalized);
         expect(result).toBe('0xsponsored');
         expect(lastSubmitArgs()[0]).toBe(sponsorFinalized);
-        expect(sponsorFacade.pendingTransactionsService.addPendingTransaction).toHaveBeenCalledWith(sponsorFinalized);
-        expect(callerFacade.pendingTransactionsService.addPendingTransaction).not.toHaveBeenCalled();
         expect(callerFacade.submitTransaction).not.toHaveBeenCalled();
         expect(sponsorFacade.submitTransaction).not.toHaveBeenCalled();
         expect(callerFacade.revert).not.toHaveBeenCalled();
@@ -2614,9 +2730,9 @@ describe('buildSponsoredWalletProvider', () => {
 
             await provider.balanceTx({});
             await expect(provider.submitTx(sponsorFinalized)).rejects.toThrow('relay boom');
-            expect(callerFacade.revert).toHaveBeenCalledWith(callerFinalized);
+            expect(callerFacade.revert).toHaveBeenCalledWith(sealedHandle(callerFinalized));
             // the sponsor's booked dust spend is freed too (the facade's own rule)
-            expect(sponsorFacade.revert).toHaveBeenCalledWith(sponsorFinalized);
+            expect(sponsorFacade.revert).toHaveBeenCalledWith(sealedHandle(sponsorFinalized));
             restoreSubmit();
         } finally {
             vi.unstubAllGlobals();
@@ -2629,7 +2745,7 @@ describe('buildSponsoredWalletProvider', () => {
         const provider = workerExports.buildSponsoredWalletProvider(caller, sponsor);
 
         await expect(provider.submitTx(sponsorFinalized)).rejects.toThrow('relay boom');
-        expect(callerFacade.revert).toHaveBeenCalledWith(sponsorFinalized);
+        expect(callerFacade.revert).toHaveBeenCalledWith(sealedHandle(sponsorFinalized));
         restoreSubmit();
     });
 });
@@ -2684,8 +2800,11 @@ describe('transferNight', () => {
         expect(facade.signRecipe).toHaveBeenCalled();
         expect(facade.finalizeRecipe).toHaveBeenCalled();
         expect(lastSubmitArgs()[0]).toMatchObject({ finalized: true });
-        expect(facade.pendingTransactionsService.addPendingTransaction).toHaveBeenCalledWith(lastSubmitArgs()[0]);
+        expect(facade.transferTransaction.mock.calls[0][1]).toEqual({ ttl: expect.any(Date) });
+        // The signer is async, as the final facade takes it.
+        await expect(facade.signRecipe.mock.calls[0][1](new Uint8Array([1]))).resolves.toBe('night-signature');
         expect(facade.submitTransaction).not.toHaveBeenCalled();
+        expect(facade.revert).not.toHaveBeenCalled();
     });
 
     it('tokenTypeHex overrides the NIGHT raw type', async () => {
@@ -2701,6 +2820,19 @@ describe('transferNight', () => {
         const outputs = facade.transferTransaction.mock.calls[0][0];
         expect(outputs[0].type).toBe('shielded');
         expect(outputs[0].outputs[0].type).toBe(custom);
+    });
+
+    it('releases the booked inputs when signing fails', async () => {
+        const facade = await initSession('session-transfer-signfail-dd');
+        facade.signRecipe = vi.fn(async () => { throw new Error('Signer callback failed'); });
+        const reply = await rpc('transferNight', {
+            sessionId: 'session-transfer-signfail-dd',
+            receiverAddress: UNSHIELDED_RECEIVER,
+            amount: '1'
+        });
+        expect(reply.ok).toBe(false);
+        expect(reply.error.message).toMatch(/Signer callback failed/);
+        expect(facade.revert).toHaveBeenCalledWith(await facade.transferTransaction.mock.results[0].value);
     });
 
     it('rejects a receiver with a foreign prefix', async () => {
@@ -2785,6 +2917,7 @@ describe('getBalance / estimateTransferFee', () => {
 
     it('estimateTransferFee prices via calculateTransactionFee and ALWAYS reverts the recipe', async () => {
         const facade = await initSession('session-estimate-eeeeeeee');
+        const submitsBefore = submitCount();
         const reply = await rpc('estimateTransferFee', {
             sessionId: 'session-estimate-eeeeeeee',
             receiverAddress: UNSHIELDED_RECEIVER,
@@ -2793,8 +2926,8 @@ describe('getBalance / estimateTransferFee', () => {
         expect(reply.ok).toBe(true);
         expect(reply.result).toEqual({ fee: '42', toLedger: 'unshielded' });
         expect(facade.calculateTransactionFee).toHaveBeenCalled();
-        expect(facade.revert).toHaveBeenCalled();
-        expect(facade.pendingTransactionsService.addPendingTransaction).not.toHaveBeenCalled();
+        expect(facade.revert).toHaveBeenCalledWith(await facade.transferTransaction.mock.results[0].value);
+        expect(submitCount()).toBe(submitsBefore);
     });
 });
 
@@ -2935,7 +3068,9 @@ describe('registerDustGeneration / deregisterDustGeneration', () => {
         expect(coins).toEqual([reg1]);
         // The recipe is fee-less by design; the caller must balance ['dust']
         // (otherwise node error 138) and must NOT re-sign (error 192).
-        const balanceOpts = facade.balanceUnprovenTransaction.mock.calls[0][2];
+        const recipe = await facade.deregisterFromDustGeneration.mock.results[0].value;
+        const [balancedTx, balanceOpts] = facade.balanceUnprovenTransaction.mock.calls[0];
+        expect(balancedTx).toBe(recipe.transaction);
         expect(balanceOpts.tokenKindsToBalance).toEqual(['dust']);
         expect(facade.signRecipe).not.toHaveBeenCalled();
     });
@@ -2988,11 +3123,8 @@ describe('submitContractCall private-state seeding', () => {
         const opts = findDeployedContract.mock.calls[0][1];
         expect(opts.initialPrivateState).toEqual({ seeded: true });
 
-        // The probe must set the contract address BEFORE reading the state,
-        // or the provider rejects with "Contract address not set".
-        const methods = privateState.calls.map(c => c.method);
-        expect(methods.indexOf('setContractAddress')).toBeGreaterThanOrEqual(0);
-        expect(methods.indexOf('setContractAddress')).toBeLessThan(methods.indexOf('get'));
+        // The probe reads the state of THIS contract: every call names the address.
+        expect(privateState.calls.find(c => c.method === 'get')?.args).toEqual(['ab'.repeat(32), 'fakePrivateState']);
     });
 
     it('NEVER passes initialPrivateState when state already exists (it would overwrite it)', async () => {
@@ -3130,7 +3262,7 @@ describe('withFindContractQueryCache', () => {
 
     it('keeps at most 256 cached queries', async () => {
         const { withFindContractQueryCache, findContractQueryCache } = await import('../../srv/midnight/worker/contracts.js');
-        const provider = withFindContractQueryCache({ watchForDeployTxData: vi.fn(async (a: string) => a) }, 'http://indexer.bound-test/graphql');
+        const provider = withFindContractQueryCache({ watchForDeployTxData: vi.fn(async (a: string) => a) } as unknown as PublicDataProvider, 'http://indexer.bound-test/graphql');
         for (let i = 0; i < 300; i++) await provider.watchForDeployTxData(i.toString(16).padStart(64, '0'));
         expect(findContractQueryCache.size).toBeLessThanOrEqual(256);
     });
@@ -3210,24 +3342,22 @@ describe('sponsorUnboundTx concurrency contract', () => {
             ];
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: { core: true }, capabilities: { coinsAndBalances: { getAvailableCoins: () => notes } } });
+                    obs.next(dustStateOf(() => notes));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(() => callerTx());
+            mockUnboundCaller(() => callerTx());
             spendCoins.mockClear();
 
             // Every prove blocks until released, so we can observe whether the
             // second job reaches proving while the first is still proving.
             const releases: Array<() => void> = [];
             const proveCalls: any[] = [];
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async (unproven: any) => {
-                    proveCalls.push(unproven);
-                    await new Promise<void>((r) => releases.push(r));
-                    return { merge: (caller: any) => ({ bind: () => ({ bound: true, caller, identifiers: () => ['tx-id-fixture'] }) }) };
-                }
-            }));
+            facade.provingService.prove = vi.fn(async (unproven: any) => {
+                proveCalls.push(unproven);
+                await new Promise<void>((r) => releases.push(r));
+                return v9Tx({ merge: (caller: any) => ({ bind: () => ({ bound: true, caller, identifiers: () => ['tx-id-fixture'] }) }) });
+            });
             // Both submits must be in flight AT ONCE to prove they got distinct
             // clients: hold each submit until both were issued.
             const submitReleases: Array<() => void> = [];
@@ -3272,7 +3402,6 @@ describe('sponsorUnboundTx concurrency contract', () => {
             expect(facade.dust.serializeState).not.toHaveBeenCalled();
         } finally {
             vi.unstubAllGlobals();
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
             await rpc('evict', { sessionId: SESSION });
         }
     });
@@ -3288,14 +3417,12 @@ describe('sponsorUnboundTx concurrency contract', () => {
             wsTip.maxId = '100';
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-A' }, generatedNow: 10n ** 9n }] } } });
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-A' }, generatedNow: 10n ** 9n }]));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(() => callerTx());
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-id-fixture'] }) }) })
-            }));
+            mockUnboundCaller(() => callerTx());
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-id-fixture'] }) }) }));
             // The client pool is worker-wide (slots from the previous test are
             // reused, that is the point of the pool): make every existing AND
             // any new client reject this one submit.
@@ -3316,7 +3443,6 @@ describe('sponsorUnboundTx concurrency contract', () => {
             expect(stateSaves()).toEqual([]);
         } finally {
             vi.unstubAllGlobals();
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
             // Only one slot consumed its once-reject; drop the rest so later
             // tests reuse clean pool slots.
             for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
@@ -3348,17 +3474,15 @@ describe('dedicated submit clients: settle window + closing-socket retry', () =>
             wsTip.maxId = '100';
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-A' }, generatedNow: 10n ** 9n }] } } });
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-A' }, generatedNow: 10n ** 9n }]));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(() => ({
+            mockUnboundCaller(() => ({
                 intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
                 feesWithMargin: () => 1_000n
             }));
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-after-retry'] }) }) })
-            }));
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-after-retry'] }) }) }));
             // Exactly ONE send (whichever slot gets it) dies on the closing socket.
             let died = false;
             const closingOnce = async () => {
@@ -3387,7 +3511,6 @@ describe('dedicated submit clients: settle window + closing-socket retry', () =>
             expect(died).toBe(true);
         } finally {
             vi.unstubAllGlobals();
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
             for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
             await rpc('evict', { sessionId: SESSION });
         }
@@ -3423,14 +3546,12 @@ describe('dust backing stays reserved until the wallet lists the spend', () => {
             let notes = [{ token: { backingNight: 'backing-H', nonce: 'note-1' }, generatedNow: 10n ** 9n }];
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => notes } } });
+                    obs.next(dustStateOf(() => notes));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(callerTx);
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-hold'] }) }) })
-            }));
+            mockUnboundCaller(callerTx);
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-hold'] }) }) }));
             const reply = await rpc('sponsorUnboundTx', sponsorArgs(SESSION));
             expect(reply.ok).toBe(true);
             // Landed, but the wallet still lists the spent note: the backing stays reserved.
@@ -3441,7 +3562,6 @@ describe('dust backing stays reserved until the wallet lists the spend', () => {
             expect(await until(() => held(`${SESSION}|backing-H`) === undefined, 3_000)).toBe(true);
         } finally {
             vi.unstubAllGlobals();
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
             await rpc('evict', { sessionId: SESSION });
         }
     }, 15_000);
@@ -3464,16 +3584,14 @@ describe('dust backing stays reserved until the wallet lists the spend', () => {
             ];
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => notes } } });
+                    obs.next(dustStateOf(() => notes));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
             // The caller pays 1000 alone; with two dust spends the whole tx costs 1100.
-            ledgerTx.deserialize.mockImplementation(() => ({ ...callerTx(), eraseProofs: () => ({ merge: () => ({ feesWithMargin: () => 1_100n }) }) }));
+            mockUnboundCaller(() => ({ ...callerTx(), eraseProofs: () => ({ merge: () => ({ feesWithMargin: () => 1_100n }) }) }));
             ledgerTx.fromParts.mockImplementation(() => ({ addIntent: (segment: any, intent: any) => ({ dustUnproven: true, segment, intent, eraseProofs: () => ({}) }) }));
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-multi'] }) }) })
-            }));
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-multi'] }) }) }));
             spendCoins.mockClear();
             const reply = await rpc('sponsorUnboundTx', sponsorArgs(SESSION));
             expect(reply.ok).toBe(true);
@@ -3489,7 +3607,42 @@ describe('dust backing stays reserved until the wallet lists the spend', () => {
         } finally {
             vi.unstubAllGlobals();
             ledgerTx.fromParts.mockImplementation(fromParts!);
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
+            await rpc('evict', { sessionId: SESSION });
+        }
+    }, 15_000);
+
+    it("prices the fee with the tip block's ledger parameters and with the sponsor's own dust spend", async () => {
+        const SESSION = 'session-sponsor-unbound-price1';
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now(), ledgerParameters: 'c0ffee' } } })
+        })));
+        const fromParts = ledgerTx.fromParts.getMockImplementation();
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-P', nonce: 'p1' }, generatedNow: 5_000n }]));
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            // The caller's part costs 1000; with the sponsor's dust spend the whole tx costs 1300.
+            const callerFee = vi.fn((_params: unknown, _margin: number) => 1_000n);
+            const wholeFee = vi.fn((_params: unknown, _margin: number) => 1_300n);
+            mockUnboundCaller(() => ({ ...callerTx(), feesWithMargin: callerFee, eraseProofs: () => ({ merge: () => ({ feesWithMargin: wholeFee }) }) }));
+            ledgerTx.fromParts.mockImplementation(() => ({ addIntent: (segment: any, intent: any) => ({ dustUnproven: true, segment, intent, eraseProofs: () => ({}) }) }));
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-priced'] }) }) }));
+            spendCoins.mockClear();
+            const reply = await rpc('sponsorUnboundTx', sponsorArgs(SESSION));
+            expect(reply.ok).toBe(true);
+            expect(callerFee).toHaveBeenCalledWith({ ofTipBlock: 'c0ffee' }, workerExports.FEE_BLOCKS_MARGIN);
+            expect(wholeFee).toHaveBeenCalledWith({ ofTipBlock: 'c0ffee' }, workerExports.FEE_BLOCKS_MARGIN);
+            expect(spendCoins.mock.calls.at(-1)![2].map((c: any) => [c.token.nonce, c.value])).toEqual([['p1', 1_300n]]);
+        } finally {
+            vi.unstubAllGlobals();
+            ledgerTx.fromParts.mockImplementation(fromParts!);
             await rpc('evict', { sessionId: SESSION });
         }
     }, 15_000);
@@ -3507,14 +3660,12 @@ describe('dust backing stays reserved until the wallet lists the spend', () => {
             wsTip.maxId = '100';
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-R', nonce: 'note-1' }, generatedNow: 10n ** 9n }] } } });
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-R', nonce: 'note-1' }, generatedNow: 10n ** 9n }]));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(callerTx);
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-reject'] }) }) })
-            }));
+            mockUnboundCaller(callerTx);
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-reject'] }) }) }));
             const restoreSubmit = withSubmit(async () => { throw new Error('1010: Invalid Transaction: Custom error: 196'); });
             try {
                 const reply = await rpc('sponsorUnboundTx', sponsorArgs(SESSION));
@@ -3525,7 +3676,6 @@ describe('dust backing stays reserved until the wallet lists the spend', () => {
             }
         } finally {
             vi.unstubAllGlobals();
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
             await rpc('evict', { sessionId: SESSION });
         }
     });
@@ -3648,17 +3798,15 @@ describe('dedicated submit client pool cap', () => {
             const notes = ['A', 'B', 'C', 'D'].map((b) => ({ token: { backingNight: `backing-${b}` }, generatedNow: 10n ** 9n }));
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => notes } } });
+                    obs.next(dustStateOf(() => notes));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(() => ({
+            mockUnboundCaller(() => ({
                 intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
                 feesWithMargin: () => 1_000n
             }));
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-cap'] }) }) })
-            }));
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-cap'] }) }) }));
             const created: any[] = [];
             makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
                 const svc = { submitTransaction: vi.fn(async () => { await new Promise((r) => setTimeout(r, 30)); }), close: vi.fn(async () => undefined) };
@@ -3676,7 +3824,6 @@ describe('dedicated submit client pool cap', () => {
             vi.unstubAllGlobals();
             workerExports.__submitClientPoolForTests.setMax(8);
             workerExports.__submitClientPoolForTests.reset();
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
             for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
             await rpc('evict', { sessionId: SESSION });
         }
@@ -3702,17 +3849,15 @@ describe('sponsor submit watchdog (a watch that never sees Finalized)', () => {
             wsTip.maxId = '100';
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-W' }, generatedNow: 10n ** 9n }] } } });
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-W' }, generatedNow: 10n ** 9n }]));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(() => ({
+            mockUnboundCaller(() => ({
                 intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
                 feesWithMargin: () => 1_000n
             }));
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-hung-watch'] }) }) })
-            }));
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-hung-watch'] }) }) }));
             const closed: any[] = [];
             makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
                 const svc = {
@@ -3735,7 +3880,6 @@ describe('sponsor submit watchdog (a watch that never sees Finalized)', () => {
         } finally {
             vi.unstubAllGlobals();
             workerExports.__submitClientPoolForTests.reset();
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
             for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
             await rpc('evict', { sessionId: SESSION });
         }
@@ -3752,17 +3896,17 @@ describe('sponsor dust spend proving', () => {
             wsTip.maxId = '100';
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-P' }, generatedNow: 10n ** 9n }] } } });
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-P' }, generatedNow: 10n ** 9n }]));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(() => ({
+            mockUnboundCaller(() => ({
                 intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
                 feesWithMargin: () => 1_000n
             }));
-            const facadeProve = vi.fn(async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-facade-prover'] }) }) }));
+            const facadeProve = vi.fn(async (_tx: unknown, _version: unknown) => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-facade-prover'] }) }) }));
             facade.provingService = { prove: facadeProve };
-            makeWasmProvingService.mockClear();
+            makeV9WasmProvingService.mockClear();
             makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
                 const svc = { submitTransaction: vi.fn(async () => undefined), close: vi.fn(async () => undefined) };
                 submitServices.push(svc);
@@ -3775,7 +3919,9 @@ describe('sponsor dust spend proving', () => {
             expect(reply.ok).toBe(true);
             expect(reply.result.txHash).toBe('tx-facade-prover');
             expect(facadeProve).toHaveBeenCalledTimes(1);
-            expect(makeWasmProvingService).not.toHaveBeenCalled();
+            // Proven at the protocol version the sponsor wallet's state reports.
+            expect(facadeProve).toHaveBeenCalledWith(expect.objectContaining({ dustUnproven: true }), 9_000_000);
+            expect(makeV9WasmProvingService).not.toHaveBeenCalled();
         } finally {
             vi.unstubAllGlobals();
             workerExports.__submitClientPoolForTests.reset();
@@ -3783,6 +3929,42 @@ describe('sponsor dust spend proving', () => {
             await rpc('evict', { sessionId: SESSION });
         }
     }, 30_000);
+
+    it('refuses a dust spend the prover returned for another ledger, sends nothing and frees the backing', async () => {
+        const SESSION = 'session-sponsor-prover-v8xxxx';
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-V8' }, generatedNow: 10n ** 9n }]));
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            mockUnboundCaller(() => ({
+                intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+                feesWithMargin: () => 1_000n
+            }));
+            // Not an instance of the ledger 9 Transaction class.
+            facade.provingService.prove = vi.fn(async () => ({ merge: () => ({ bind: () => ({ identifiers: () => ['tx-v8'] }) }) }));
+            const submitsBefore = submitCount();
+            submitIntents.length = 0;
+            const reply = await rpc('sponsorUnboundTx', {
+                sponsorSessionId: SESSION, unboundTxB64: Buffer.from('x').toString('base64'), networkId: 'preprod',
+                allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest']
+            });
+            expect(reply.ok).toBe(false);
+            expect(reply.error.message).toMatch(/proven for ledger 8/);
+            expect(submitIntents).toEqual([]);
+            expect(submitCount()).toBe(submitsBefore);
+            expect(workerExports.__noteLeaseForTests.held(`${SESSION}|backing-V8`)).toBeUndefined();
+        } finally {
+            vi.unstubAllGlobals();
+            await rpc('evict', { sessionId: SESSION });
+        }
+    });
 });
 
 describe('sponsored call apply check', () => {
@@ -3803,17 +3985,15 @@ describe('sponsored call apply check', () => {
             wsTip.maxId = '100';
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-AC' }, generatedNow: 10n ** 9n }] } } });
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-AC' }, generatedNow: 10n ** 9n }]));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(() => ({
+            mockUnboundCaller(() => ({
                 intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
                 feesWithMargin: () => 1_000n
             }));
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-partial'] }) }) })
-            }));
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-partial'] }) }) }));
             // The watch never fires -> watchdog (3 s here) -> indexer says PARTIAL_SUCCESS.
             makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
                 const svc = { submitTransaction: vi.fn(() => new Promise(() => { /* hung */ })), close: vi.fn(async () => undefined) };
@@ -3848,17 +4028,15 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
             wsTip.maxId = '100';
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-I' }, generatedNow: 10n ** 9n }] } } });
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-I' }, generatedNow: 10n ** 9n }]));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(() => ({
+            mockUnboundCaller(() => ({
                 intents: new Map([[0, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
                 feesWithMargin: () => 1_000n
             }));
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-intent-nack'] }) }) })
-            }));
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-intent-nack'] }) }) }));
             const sends: any[] = [];
             makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
                 const svc = { submitTransaction: vi.fn(async () => { sends.push(1); }), close: vi.fn(async () => undefined) };
@@ -3877,7 +4055,6 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
             submitIntentHook = undefined;
             vi.unstubAllGlobals();
             workerExports.__submitClientPoolForTests.reset();
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
             for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
             await rpc('evict', { sessionId: SESSION });
         }
@@ -3891,17 +4068,15 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
             wsTip.maxId = '100';
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-J' }, generatedNow: 10n ** 9n }] } } });
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-J' }, generatedNow: 10n ** 9n }]));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(() => ({
+            mockUnboundCaller(() => ({
                 intents: new Map([[1, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
                 feesWithMargin: () => 1_000n
             }));
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async () => ({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-intent-timeout'] }) }) })
-            }));
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-intent-timeout'] }) }) }));
             const sends: any[] = [];
             makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
                 const svc = { submitTransaction: vi.fn(async () => { sends.push(1); }), close: vi.fn(async () => undefined) };
@@ -3921,7 +4096,6 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
             submitIntentHook = undefined;
             vi.unstubAllGlobals();
             workerExports.__submitClientPoolForTests.reset();
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
             for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
             await rpc('evict', { sessionId: 'session-sponsor-intent-bbbbbb' });
         }
@@ -3935,18 +4109,16 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
             wsTip.maxId = '100';
             facade.dust.state = {
                 subscribe(obs: any) {
-                    obs.next({ state: {}, capabilities: { coinsAndBalances: { getAvailableCoins: () => [{ token: { backingNight: 'backing-S' }, generatedNow: 10n ** 9n }] } } });
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-S' }, generatedNow: 10n ** 9n }]));
                     return { unsubscribe() { /* noop */ } };
                 }
             };
-            ledgerTx.deserialize.mockImplementation(() => ({
+            mockUnboundCaller(() => ({
                 intents: new Map([[1, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }], [2, { actions: [], guaranteedUnshieldedOffer: null, dustActions: null }]]),
                 feesWithMargin: () => 1_000n
             }));
             const proven: any[] = [];
-            makeWasmProvingService.mockImplementation(() => ({
-                prove: async (unproven: any) => { proven.push(unproven); return { merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-segment'] }) }) }; }
-            }));
+            facade.provingService.prove = vi.fn(async (unproven: any) => { proven.push(unproven); return v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-segment'] }) }) }); });
             makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
                 const svc = { submitTransaction: vi.fn(async () => undefined), close: vi.fn(async () => undefined) };
                 submitServices.push(svc);
@@ -3963,18 +4135,55 @@ describe('pre-broadcast submit intent (external-effect boundary)', () => {
             submitIntentHook = undefined;
             vi.unstubAllGlobals();
             workerExports.__submitClientPoolForTests.reset();
-            makeWasmProvingService.mockImplementation((..._a: any[]) => ({ wasmProver: true }));
             for (const svc of submitServices) { svc.submitTransaction.mockReset(); svc.submitTransaction.mockImplementation(async () => undefined); }
             await rpc('evict', { sessionId: 'session-sponsor-segment-aaaaa' });
         }
     }, 30_000);
 
+    it('caller bytes that read as bound are bound to the dust spend first and then merged', async () => {
+        const SESSION = 'session-sponsor-boundcall-aaa';
+        const facade = await initSession(SESSION);
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } }) })));
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-BC' }, generatedNow: 10n ** 9n }]));
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            const callerTx = {
+                intents: new Map([[1, { actions: [{ address: 'aa'.repeat(32), entryPoint: 'attest' }], guaranteedUnshieldedOffer: null, dustActions: null }]]),
+                feesWithMargin: () => 1_000n
+            };
+            ledgerTx.deserialize.mockImplementation(() => callerTx);
+            const order: string[] = [];
+            facade.provingService.prove = vi.fn(async () => v9Tx({
+                merge: () => { order.push('merge-first'); return { bind: () => ({ identifiers: () => ['tx-wrong-order'] }) }; },
+                bind: () => { order.push('bind'); return { merge: (other: unknown) => { order.push(other === callerTx ? 'merge-caller' : 'merge-other'); return { identifiers: () => ['tx-bound-caller'] }; } }; }
+            }));
+            const reply = await rpc('sponsorUnboundTx', {
+                sponsorSessionId: SESSION, unboundTxB64: Buffer.from('x').toString('base64'), networkId: 'preprod',
+                allowedContracts: ['aa'.repeat(32)], allowedCircuits: ['attest']
+            });
+            expect(reply.ok).toBe(true);
+            expect(reply.result.txHash).toBe('tx-bound-caller');
+            expect(order).toEqual(['bind', 'merge-caller']);
+        } finally {
+            vi.unstubAllGlobals();
+            workerExports.__submitClientPoolForTests.reset();
+            await rpc('evict', { sessionId: SESSION });
+        }
+    }, 30_000);
+
     it('freeSegmentId: the lowest id in 1..65535 the transaction does not use; a full transaction is refused', async () => {
         const { freeSegmentId } = await import('../../srv/midnight/worker/sponsor.js');
-        expect(freeSegmentId({ intents: new Map() })).toBe(1);
-        expect(freeSegmentId({ intents: new Map([[1, {}], [2, {}], [4, {}]]) })).toBe(3);
-        const full = new Map(Array.from({ length: 65535 }, (_, i) => [i + 1, {}]));
-        expect(() => freeSegmentId({ intents: full })).toThrow(/every segment id/);
+        // Only the segment ids are read, so the intents are empty stand-ins.
+        const segments = (ids: number[]) => new Map(ids.map((id): [number, SegmentIntent] => [id, {} as SegmentIntent]));
+        expect(freeSegmentId({ intents: segments([]) })).toBe(1);
+        expect(freeSegmentId({ intents: segments([1, 2, 4]) })).toBe(3);
+        expect(() => freeSegmentId({ intents: segments(Array.from({ length: 65535 }, (_, i) => i + 1)) })).toThrow(/every segment id/);
     });
 });
 

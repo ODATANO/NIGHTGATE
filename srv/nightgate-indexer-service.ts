@@ -6,7 +6,8 @@ import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, crawlerStartConfig } from './utils/nightgate-config';
 import { ensureSyncStateSingleton } from './utils/sync-state';
 import { isCrawlerRunning, startCrawler, stopCrawler } from './crawler';
-import { rollbackIndexedDataFromHeight, RollbackResult } from './crawler/rollback';
+import { pendingReindexHeight, reindexInProgress, startReindex, type ReindexCrawlerControl, type ReindexOutcome } from './crawler/reindex';
+import { configMs } from './utils/config';
 import { SyncState, ReorgLog } from '#cds-models/midnight';
 import {
     buildHealth,
@@ -26,35 +27,16 @@ import type { Request } from '@sap/cds';
 
 const log = cds.log('nightgate:indexer');
 
+const REINDEX_RUNNING = 'a reindex is running; the log reports each slice it removed, call again once it finished';
+const CRAWLER_STARTING = 'the crawler is starting, call again once it runs';
+
+let crawlerStarting = false;
+
 export default class NightgateIndexerService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
 
     private resolveCrawlerStartConfig(): ReturnType<typeof crawlerStartConfig> {
         return crawlerStartConfig(resolveNightgateRuntimeConfig(getNightgatePluginConfig()));
-    }
-
-    private async rollbackFromHeight(fromHeight: number): Promise<{
-        blocksRolledBack: number;
-        transactionsRolledBack: number;
-        effectiveStartHeight: number;
-    }> {
-        // Commits before the caller restarts the crawler, so the crawler never sees the old rows.
-        const result: RollbackResult = await this.db.tx(async (tx) =>
-            rollbackIndexedDataFromHeight(tx, fromHeight, {
-                syncStatus: 'stopped',
-                extraSyncState: { syncProgress: 0 }
-            })
-        ) as RollbackResult;
-
-        const effectiveStartHeight = result.forkBlock?.height != null
-            ? Number(result.forkBlock.height) + 1
-            : 0;
-
-        return {
-            blocksRolledBack: result.blocksRolledBack,
-            transactionsRolledBack: result.transactionsRolledBack,
-            effectiveStartHeight
-        };
     }
 
     async init(): Promise<void> {
@@ -122,7 +104,8 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('getMetrics', async () => buildMetricsText(this.db));
 
-        this.on('pauseCrawler', async () => {
+        this.on('pauseCrawler', async (req: Request) => {
+            if (reindexInProgress()) return req.reject(409, REINDEX_RUNNING);
             if (!isCrawlerRunning()) {
                 return {
                     status: 'ok',
@@ -146,6 +129,9 @@ export default class NightgateIndexerService extends cds.ApplicationService {
         });
 
         this.on(resumeCrawler, async (req) => {
+            // The crawler must not index again while blocks below it are still being removed.
+            if (reindexInProgress()) return req.reject(409, REINDEX_RUNNING);
+            if (crawlerStarting) return req.reject(409, CRAWLER_STARTING);
             if (isCrawlerRunning()) {
                 return {
                     status: 'ok',
@@ -154,7 +140,18 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                 };
             }
 
+            crawlerStarting = true;
             try {
+                const openReindex = await pendingReindexHeight(this.db);
+                if (openReindex !== null) {
+                    startReindex(this.db, openReindex, { stop: async () => true, start: () => startCrawler(this.resolveCrawlerStartConfig()) })
+                        .catch(err => log.error(`reindex from ${openReindex} failed: ${errorMessage(err)}`));
+                    return {
+                        status: 'ok',
+                        running: false,
+                        message: `A reindex from ${openReindex} is not finished. It finishes first, then the crawler starts.`
+                    };
+                }
                 await startCrawler(this.resolveCrawlerStartConfig());
                 return {
                     status: 'ok',
@@ -164,6 +161,8 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             } catch (err) {
                 const message = errorMessage(err);
                 return req.reject(500, `Failed to resume crawler: ${message}`);
+            } finally {
+                crawlerStarting = false;
             }
         });
 
@@ -174,36 +173,58 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             if (!Number.isInteger(requestedHeight) || requestedHeight < 0) {
                 return req.reject(400, 'height must be a non-negative integer');
             }
+            if (reindexInProgress()) return req.reject(409, REINDEX_RUNNING);
+            if (crawlerStarting) return req.reject(409, CRAWLER_STARTING);
 
-            const wasRunning = isCrawlerRunning();
-            if (wasRunning) {
-                await stopCrawler();
+            // No await before the claim: a second call in between would pass the check above.
+            const crawler: ReindexCrawlerControl = {
+                stop: async () => {
+                    const wasRunning = isCrawlerRunning();
+                    if (wasRunning) await stopCrawler();
+                    return wasRunning;
+                },
+                start: () => startCrawler(this.resolveCrawlerStartConfig())
+            };
+            const run = startReindex(this.db, requestedHeight, crawler);
+            run.catch(() => { /* recorded in SyncState and the log by the reindex */ });
+
+            // A long rollback continues in the background, so an HTTP timeout leaves nothing half done.
+            const waitMs = configMs('NIGHTGATE_REINDEX_REPLY_WAIT_MS');
+            let timer: NodeJS.Timeout | undefined;
+            let finished: ReindexOutcome | null;
+            try {
+                finished = await Promise.race([
+                    run,
+                    new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), waitMs); })
+                ]);
+            } catch (err) {
+                return req.reject(500, `Reindex failed: ${errorMessage(err)}. The crawler stays stopped until a reindex or resumeCrawler finishes the rollback.`);
+            } finally {
+                clearTimeout(timer);
             }
-
-            const rollback = await this.rollbackFromHeight(requestedHeight);
-
-            let crawlerResumed = false;
-            let resumeError: string | null = null;
-            if (wasRunning) {
-                try {
-                    await startCrawler(this.resolveCrawlerStartConfig());
-                    crawlerResumed = true;
-                } catch (err) {
-                    resumeError = errorMessage(err);
-                    log.error('Failed to resume crawler after reindex:', resumeError);
-                }
+            if (finished === null) {
+                const progress = reindexInProgress();
+                return {
+                    status: 'running',
+                    message: 'Reindex continues in the background. A running crawler resumes when it finishes. A failure shows in getSyncStatus.',
+                    requestedHeight,
+                    effectiveStartHeight: null,
+                    blocksRolledBack: progress?.blocksRolledBack ?? 0,
+                    transactionsRolledBack: progress?.transactionsRolledBack ?? 0,
+                    crawlerResumed: false
+                };
             }
 
             return {
-                status: resumeError ? 'partial' : 'ok',
-                message: resumeError
-                    ? `Reindex prepared but crawler resume failed: ${resumeError}`
+                status: finished.resumeError ? 'partial' : 'ok',
+                message: finished.resumeError
+                    ? `Reindex prepared but crawler resume failed: ${finished.resumeError}`
                     : 'Reindex prepared',
                 requestedHeight,
-                effectiveStartHeight: rollback.effectiveStartHeight,
-                blocksRolledBack: rollback.blocksRolledBack,
-                transactionsRolledBack: rollback.transactionsRolledBack,
-                crawlerResumed
+                effectiveStartHeight: finished.progress.effectiveStartHeight,
+                blocksRolledBack: finished.progress.blocksRolledBack,
+                transactionsRolledBack: finished.progress.transactionsRolledBack,
+                crawlerResumed: finished.crawlerResumed
             };
         });
 

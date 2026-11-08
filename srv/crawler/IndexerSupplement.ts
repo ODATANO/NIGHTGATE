@@ -13,7 +13,7 @@ import {
     type ContractStatePolicy
 } from './contract-state';
 import { advancePassCursor, blocksInRange, readPassWindow, windowIsEmpty, PassPause, type PassPosition } from './cursor-pass';
-import { affectedRows, type DbRunner } from '../utils/db-types';
+import { affectedRows, type DbRunner, type Row } from '../utils/db-types';
 import { isIndexerRateLimit } from '../utils/indexer-graphql';
 import { Blocks, Transactions, TransactionResults, TransactionSegments, TransactionFees, ContractActions, ContractBalances, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, type Block, type Transaction, type ContractAction, type TransactionResult } from '#cds-models/midnight';
 
@@ -245,7 +245,7 @@ export class IndexerSupplement {
         // Two calls on one contract have different states, so actions are paired in order,
         // and only if both sides have the same count. After a partial success the counts differ,
         // and no state is better than a wrong one.
-        const ours = new Map<string, any[]>();
+        const ours = new Map<string, ContractAction[]>();
         for (const action of actions) {
             const key = `${action.address}:${action.actionType}`;
             const list = ours.get(key) ?? [];
@@ -324,7 +324,7 @@ export class IndexerSupplement {
             ID: cds.utils.uuid(),
             eventId: event.eventId,
             maxId: event.maxId,
-            raw: event.raw as any,
+            raw: event.raw == null ? null : capBinaryInput(event.raw),
             transaction_ID: transactionId
         }))));
         return events.length;
@@ -341,7 +341,7 @@ export class IndexerSupplement {
             ID: cds.utils.uuid(),
             eventId: event.eventId,
             maxId: event.maxId,
-            raw: event.raw as any,
+            raw: event.raw == null ? null : capBinaryInput(event.raw),
             eventType: event.eventType,
             dustOutputNonce: event.dustOutputNonce,
             transaction_ID: transactionId
@@ -363,7 +363,7 @@ export class IndexerSupplement {
         return updated;
     }
 
-    private async endBefore(start: PassPosition, blocks: any[], index: number, result: SupplementRunResult): Promise<SupplementRunResult> {
+    private async endBefore(start: PassPosition, blocks: Row<Block, 'ID' | 'height'>[], index: number, result: SupplementRunResult): Promise<SupplementRunResult> {
         if (index === 0) return EMPTY_RUN;
         result.blocks = index;
         await this.setCursor(start, Number(blocks[index].height) - 1);

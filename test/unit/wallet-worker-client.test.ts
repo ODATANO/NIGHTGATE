@@ -622,12 +622,15 @@ describe('wallet-worker-client', () => {
         });
 
         describe('private-state-rpc dispatch', () => {
-            const fakeProvider: any = {
-                setContractAddress: vi.fn(),
+            const contractView = {
                 set: vi.fn(async (k: string, v: any) => ({ k, v })),
                 get: vi.fn(async (k: string) => ({ k })),
                 remove: vi.fn(async () => undefined),
-                clear: vi.fn(async () => undefined),
+                clear: vi.fn(async () => undefined)
+            };
+            const fakeProvider: any = {
+                forContract: vi.fn(() => contractView),
+                clearAll: vi.fn(async () => undefined),
                 setSigningKey: vi.fn(async () => undefined),
                 getSigningKey: vi.fn(async () => 'key'),
                 removeSigningKey: vi.fn(async () => undefined),
@@ -635,7 +638,7 @@ describe('wallet-worker-client', () => {
             };
 
             beforeEach(async () => {
-                for (const fn of Object.values(fakeProvider) as Mock[]) fn.mockClear?.();
+                for (const fn of [...Object.values(fakeProvider), ...Object.values(contractView)] as Mock[]) fn.mockClear?.();
                 registerPrivateStateProvider('proxy-1', fakeProvider);
                 await startWalletWorker();
             });
@@ -676,55 +679,25 @@ describe('wallet-worker-client', () => {
                 return { port2 };
             }
 
-            it('routes setContractAddress synchronously without requiring a port', () => {
-                latestWorker!.emit('message', {
-                    kind: 'private-state-rpc',
-                    proxyId: 'proxy-1',
-                    method: 'setContractAddress',
-                    args: ['addr-aaaa']
-                });
-                expect(fakeProvider.setContractAddress).toHaveBeenCalledWith('addr-aaaa');
-            });
-
-            it('warns when setContractAddress targets an unknown proxyId', () => {
-                latestWorker!.emit('message', {
-                    kind: 'private-state-rpc',
-                    proxyId: 'proxy-unknown',
-                    method: 'setContractAddress',
-                    args: ['addr']
-                });
-                expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('unknown proxyId'));
-            });
-
-            it('warns and continues when setContractAddress throws', () => {
-                fakeProvider.setContractAddress.mockImplementationOnce(() => { throw new Error('boom'); });
-                latestWorker!.emit('message', {
-                    kind: 'private-state-rpc',
-                    proxyId: 'proxy-1',
-                    method: 'setContractAddress',
-                    args: ['addr']
-                });
-                expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('setContractAddress failed'), expect.any(String));
-            });
-
             it('replies with the provider result for known methods', async () => {
-                const { port2 } = emitRpc('set', ['k', 'v']);
+                const { port2 } = emitRpc('set', ['addr-aaaa', 'k', 'v']);
                 const reply: any = await new Promise(resolve => port2.once('message', resolve));
                 expect(reply.ok).toBe(true);
                 expect(reply.result).toEqual({ k: 'k', v: 'v' });
-                expect(fakeProvider.set).toHaveBeenCalledWith('k', 'v');
+                expect(fakeProvider.forContract).toHaveBeenCalledWith('addr-aaaa');
+                expect(contractView.set).toHaveBeenCalledWith('k', 'v');
             });
 
             it('replies with PrivateStateProxyMissing for an unknown proxyId', async () => {
-                const { port2 } = emitRpc('get', ['k'], { proxyId: 'no-such-proxy' });
+                const { port2 } = emitRpc('get', ['addr', 'k'], { proxyId: 'no-such-proxy' });
                 const reply: any = await new Promise(resolve => port2.once('message', resolve));
                 expect(reply.ok).toBe(false);
                 expect(reply.error.name).toBe('PrivateStateProxyMissing');
             });
 
             it('replies with the error name + message when the provider throws', async () => {
-                fakeProvider.get.mockRejectedValueOnce(Object.assign(new Error('not found'), { name: 'NotFound' }));
-                const { port2 } = emitRpc('get', ['k']);
+                contractView.get.mockRejectedValueOnce(Object.assign(new Error('not found'), { name: 'NotFound' }));
+                const { port2 } = emitRpc('get', ['addr', 'k']);
                 const reply: any = await new Promise(resolve => port2.once('message', resolve));
                 expect(reply.ok).toBe(false);
                 expect(reply.error).toEqual({ name: 'NotFound', message: 'not found' });
@@ -737,7 +710,7 @@ describe('wallet-worker-client', () => {
                 expect(reply.error.message).toMatch(/Unsupported private-state RPC method/);
             });
 
-            it('warns when a non-setContractAddress message arrives without a port', () => {
+            it('warns when a message arrives without a port', () => {
                 latestWorker!.emit('message', {
                     kind: 'private-state-rpc',
                     proxyId: 'proxy-1',

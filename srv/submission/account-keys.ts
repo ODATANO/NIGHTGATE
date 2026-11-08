@@ -7,6 +7,7 @@ import cds from '@sap/cds';
 import { encrypt, decrypt, inspectCiphertext, KeyRing, UnknownEncryptionKeyError, UnboundEnvelopeError } from '../utils/crypto';
 import { accountDekBinding, accountDekViewingKeySealBinding } from '../utils/envelope-bindings';
 import type { DbRunner } from '../utils/db-types';
+import type { AccountKey } from '#cds-models/midnight';
 import { NightgateError } from '../utils/errors';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
@@ -188,7 +189,7 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
     const { db, ring, accountId, storagePassword } = args;
     const create = args.create !== false;
 
-    const row: Record<string, any> | null = await db.run(SELECT.one.from(ENTITY).where({ accountId }));
+    const row: AccountKey | null = await db.run(SELECT.one.from(ENTITY).where({ accountId }));
     if (row?.wrappedDek) {
         let dek: Buffer | undefined;
         let ringError: unknown;
@@ -264,7 +265,7 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
     } catch (err) {
         // Another request created the key first. Read that one.
         dek.fill(0);
-        const again: Record<string, any> | null = await db.run(SELECT.one.from(ENTITY).where({ accountId }));
+        const again: Pick<AccountKey, 'wrappedDek'> | null = await db.run(SELECT.one.from(ENTITY).where({ accountId }));
         if (!again?.wrappedDek) throw err;
         return resolveUncached(args, token);
     }

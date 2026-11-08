@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto';
 import { createTxBuilder } from '@odatano/nightgate-tx';
 import {
     deserializeTransaction, txIdentifiers, submitFinalized,
-    isTransportFailure, isAlreadyImported, waitLanded, withDustGuard
+    isTransportFailure, isAlreadyImported, waitLanded, sealTx, openTx
 } from '@odatano/nightgate-tx/txbuilder';
 import { prepareAttest } from '@odatano/nightgate-tx/calls';
 import { Contract } from '@odatano/nightgate-tx/attestation-vault';
@@ -26,21 +26,20 @@ import { InMemoryTransactionHistoryStorage } from '@midnightntwrk/wallet-sdk-abs
 import { ShieldedWallet } from '@midnightntwrk/wallet-sdk-shielded';
 import { UnshieldedWallet, createKeystore, PublicKey } from '@midnightntwrk/wallet-sdk-unshielded-wallet';
 import { DustWallet } from '@midnightntwrk/wallet-sdk-dust-wallet';
-import { makeWasmProvingService } from '@midnightntwrk/wallet-sdk-capabilities/proving';
-import { ZswapSecretKeys, DustSecretKey, LedgerParameters } from '@midnight-ntwrk/ledger-v8';
+import { LedgerParameters } from '@midnightntwrk/ledger-v9';
 
 const VAULT = process.env.VAULT;
 const SEED_HEX = process.env.SEED_HEX;
 const ZK_CONFIG_URL = process.env.ZK_CONFIG_URL;   // a public /zk-config/attestation-vault
-const NETWORK = process.env.NETWORK || 'preprod';
+const NETWORK = process.env.NETWORK || 'mainnet';
 // Paying yourself needs a synced wallet, so an indexer you can reach (your own, or a hosted one with a key).
 const INDEXER_HTTP = process.env.INDEXER_HTTP_URL;
 const INDEXER_WS = process.env.INDEXER_WS_URL || (INDEXER_HTTP ? INDEXER_HTTP.replace(/^http/, 'ws') + '/ws' : undefined);
-const NODE_URL = process.env.NODE_URL || `wss://rpc.${NETWORK}.midnight.network/`;
+const NODE_URL = process.env.NODE_URL;
 const file = process.argv[2];
 
-if (!VAULT || !SEED_HEX || !ZK_CONFIG_URL || !INDEXER_HTTP || !file) {
-    console.error('usage: VAULT=<addr> SEED_HEX=<128 hex> ZK_CONFIG_URL=<url> INDEXER_HTTP_URL=<url> node self-funded.mjs <file.json>');
+if (!VAULT || !SEED_HEX || !ZK_CONFIG_URL || !INDEXER_HTTP || !NODE_URL || !file) {
+    console.error('usage: VAULT=<addr> SEED_HEX=<128 hex> ZK_CONFIG_URL=<url> INDEXER_HTTP_URL=<url> NODE_URL=<url> node self-funded.mjs <file.json>');
     process.exit(2);
 }
 
@@ -66,64 +65,59 @@ console.log(`built + proven locally (${built.serializedBytes} bytes)`);
 const hd = HDWallet.fromSeed(new Uint8Array(Buffer.from(SEED_HEX, 'hex')));
 const account = hd.hdWallet.selectAccount(0);
 const roleSeed = (r) => account.selectRole(r).deriveKeyAt(0).key;
-const zswapKeys = ZswapSecretKeys.fromSeed(roleSeed(Roles.Zswap));
-const dustKey = DustSecretKey.fromSeed(roleSeed(Roles.Dust));
-const keystore = createKeystore(roleSeed(Roles.NightExternal), NETWORK);
+const seeds = { shielded: roleSeed(Roles.Zswap), unshielded: roleSeed(Roles.NightExternal), dust: roleSeed(Roles.Dust) };
+const keystore = createKeystore({ kind: 'schnorr', secret: seeds.unshielded }, NETWORK);
 hd.hdWallet.clear();
 
-const configuration = {
+const configuration = WalletFacade.resolveConfiguration({
     networkId: NETWORK,
     relayURL: new URL(NODE_URL),
-    provingServerUrl: new URL('http://127.0.0.1:6300'),   // unused: wasm proving
+    provers: { v9: { kind: 'wasm' } },
     indexerClientConnection: { indexerHttpUrl: INDEXER_HTTP, indexerWsUrl: INDEXER_WS },
     txHistoryStorage: new InMemoryTransactionHistoryStorage(WalletEntrySchema, mergeWalletEntries),
     costParameters: { additionalFeeOverhead: 1n, feeBlocksMargin: 5 }
-};
+});
 const facade = await WalletFacade.init({
     configuration,
-    provingService: () => makeWasmProvingService({}),
-    shielded: () => ShieldedWallet(configuration).startWithSecretKeys(zswapKeys),
+    shielded: () => ShieldedWallet(configuration).startWithSeed(seeds.shielded),
     unshielded: () => UnshieldedWallet(configuration).startWithPublicKey(PublicKey.fromKeyStore(keystore)),
-    dust: () => DustWallet(configuration).startWithSecretKey(dustKey, LedgerParameters.initialParameters().dust)
+    dust: () => DustWallet(configuration).startWithSeed(seeds.dust, LedgerParameters.initialParameters().dust)
 });
-await facade.start(zswapKeys, dustKey);
-// A fee proven against a stale dust root is rejected (1010/170). A long-lived
-// runner should gate on real dust progress before every balance; for a
-// one-shot script the SDK's own synced-state wait does.
+await facade.start(seeds);
+// A fee proven against a stale dust root is rejected (1010/170), so the wallet syncs to the tip first.
 console.log('syncing the fee wallet to the chain tip (a fresh seed syncs from genesis)...');
 await facade.waitForSyncedState();
 
-// 3. Pay the fee, submit, confirm; the dust guard restores the wallet if the
-//    node rejects the transaction before it reaches the mempool.
+// 3. Pay the fee, submit, confirm. The wallet takes and returns transactions as sealed handles.
+//    After a reject for good, revertTransaction frees the coins the fee reserved.
 const tx = await deserializeTransaction(built.finalizedTxB64);
-const landed = await withDustGuard(facade, { configuration, dustKey }, async () => {
-    const recipe = await facade.balanceFinalizedTransaction(
-        tx, { shieldedSecretKeys: zswapKeys, dustSecretKey: dustKey },
-        { ttl: new Date(Date.now() + 30 * 60_000), tokenKindsToBalance: ['dust'] }
-    );
-    const finalized = await facade.finalizeRecipe(recipe);
-    const identifier = txIdentifiers(finalized).at(-1);
-    console.log(`submitting ${identifier.slice(0, 16)}... to ${NODE_URL}`);
-    for (let attempt = 0; ; attempt++) {
-        try { await submitFinalized(finalized, { nodeUrl: NODE_URL }); break; }
-        catch (e) {
-            // 1013 Already Imported = the transaction IS in the pool: go
-            // straight to the confirmation loop.
-            if (isAlreadyImported(e)) break;
-            // ANY other reject of a RESEND can mean the first send landed
-            // (e.g. a 1010 whose note it already spent) while the indexer
-            // still lags: wait for the identifier before trusting the
-            // reject. A first-send reject gets one immediate probe.
-            const found = await waitLanded(identifier, { indexerHttpUrl: INDEXER_HTTP, timeoutMs: attempt > 0 ? 30_000 : 0 });
-            if (found) return found;
-            if (!isTransportFailure(e) || attempt >= 2) throw e;
-            await new Promise((r) => setTimeout(r, 5_000));
+const recipe = await facade.balanceFinalizedTransaction(
+    await sealTx('Finalized', tx, configuration.forks),
+    { ttl: new Date(Date.now() + 30 * 60_000), tokenKindsToBalance: ['dust'] }
+);
+const handle = await facade.finalizeRecipe(recipe);
+const finalized = await openTx(handle);
+const identifier = txIdentifiers(finalized).at(-1);
+console.log(`submitting ${identifier.slice(0, 16)}... to ${NODE_URL}`);
+let landed;
+for (let attempt = 0; !landed; attempt++) {
+    try { await submitFinalized(finalized, { nodeUrl: NODE_URL }); break; }
+    catch (e) {
+        // 1013 Already Imported = the transaction is in the pool: go on to the confirmation.
+        if (isAlreadyImported(e)) break;
+        // Any other reject of a resend can mean the first send landed while the indexer lags,
+        // so the identifier is looked up before the reject is trusted.
+        landed = await waitLanded(identifier, { indexerHttpUrl: INDEXER_HTTP, timeoutMs: attempt > 0 ? 30_000 : 0 });
+        if (landed) break;
+        if (!isTransportFailure(e) || attempt >= 2) {
+            await facade.revertTransaction(handle).catch(() => { /* the reject is the error to report */ });
+            throw e;
         }
+        await new Promise((r) => setTimeout(r, 5_000));
     }
-    const found = await waitLanded(identifier, { indexerHttpUrl: INDEXER_HTTP, timeoutMs: 240_000, pollMs: 6_000 });
-    if (found) return found;
-    throw new Error('not visible on the indexer yet; it may still land');
-});
+}
+landed ??= await waitLanded(identifier, { indexerHttpUrl: INDEXER_HTTP, timeoutMs: 240_000, pollMs: 6_000 });
+if (!landed) throw new Error('not visible on the indexer yet; it may still land');
 
 if (!landed.applied) {
     // In a block but the call failed: the fee was spent, rebuild against

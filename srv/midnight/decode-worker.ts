@@ -20,7 +20,10 @@ export const handlers: WorkerRpcHandlers = {
     readAttestationState: (args) => readAttestationStateForContract(args as ReadAttestationStateForContractArgs),
     readDisclosureGrants: (args) => readDisclosureGrants(args as ReadDisclosureGrantsArgs),
     readHolderRegistration: (args) => readHolderRegistration(args as HolderRegistrationQuery),
-    decodeLedgerPayload: (args) => decodeLedgerPayload((args as { bytes: Uint8Array }).bytes)
+    decodeLedgerPayload: (args) => {
+        const { bytes, specVersion } = args as { bytes: Uint8Array; specVersion?: number | null };
+        return decodeLedgerPayload(bytes, specVersion);
+    }
 };
 
 if (!parentPort) {

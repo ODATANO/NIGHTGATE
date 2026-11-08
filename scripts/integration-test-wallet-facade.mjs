@@ -6,19 +6,18 @@ import { WalletFacade } from '@midnightntwrk/wallet-sdk-facade';
 import { ShieldedWallet } from '@midnightntwrk/wallet-sdk-shielded';
 import { UnshieldedWallet, PublicKey, createKeystore } from '@midnightntwrk/wallet-sdk-unshielded-wallet';
 import { DustWallet } from '@midnightntwrk/wallet-sdk-dust-wallet';
-import { InMemoryTransactionHistoryStorage, NetworkId } from '@midnightntwrk/wallet-sdk-abstractions';
-import { ZswapSecretKeys, DustSecretKey } from '@midnight-ntwrk/ledger-v8';
+import { InMemoryTransactionHistoryStorage } from '@midnightntwrk/wallet-sdk-abstractions';
+import { ZswapSecretKeys } from '@midnightntwrk/ledger-v9';
 
-const seed = randomBytes(32);
-const zswapKeys = ZswapSecretKeys.fromSeed(new Uint8Array(seed));
-const dustKey   = DustSecretKey.fromSeed(new Uint8Array(seed));
+const seed = new Uint8Array(randomBytes(32));
+const zswapKeys = ZswapSecretKeys.fromSeed(seed);
 
 console.log('OK   keys derived');
 console.log('     coinPublicKey:', zswapKeys.coinPublicKey.slice(0, 24) + '...');
 
-// Probe configuration, preprod URLs (won't connect during init).
+// Probe configuration, preview URLs (won't connect during init).
 const configuration = {
-    networkId: NetworkId.PreProd,
+    networkId: process.env.NIGHTGATE_NETWORK || 'preview',
     provingServerUrl: new URL('http://localhost:6300'),
     relayURL: new URL(process.env.NIGHTGATE_NODE_URL || 'ws://127.0.0.1:9944'),
     indexerClientConnection: {
@@ -33,11 +32,11 @@ console.log('OK   configuration built');
 try {
     const facade = await WalletFacade.init({
         configuration,
-        shielded:   (cfg) => ShieldedWallet(cfg).startWithSecretKeys(zswapKeys),
+        shielded:   (cfg) => ShieldedWallet(cfg).startWithSeed(seed),
         unshielded: (cfg) => UnshieldedWallet(cfg).startWithPublicKey(
-            PublicKey.fromKeyStore(createKeystore(new Uint8Array(seed), cfg.networkId))
+            PublicKey.fromKeyStore(createKeystore({ kind: 'schnorr', secret: seed }, cfg.networkId))
         ),
-        dust:       (cfg) => DustWallet(cfg)
+        dust:       (cfg) => DustWallet(cfg).startWithSeed(seed)
     });
     console.log('OK   WalletFacade.init() completed');
     console.log('     facade has methods:', Object.keys(facade).filter(k => !k.startsWith('_')).slice(0, 8).join(', '));

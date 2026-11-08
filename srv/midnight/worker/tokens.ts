@@ -6,18 +6,25 @@ import { errorMessage } from '../../utils/errors';
 
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 import { type MessagePort } from 'node:worker_threads';
-import { encodeAddressString, ensureNetworkId, facades, loadAddressFormat, loadSdk, log, parseReceiverAddress } from './context';
+import { encodeAddressString, facades, loadAddressFormat, loadSdk, log, parseReceiverAddress, type ReceiverParsed, type WalletSdk } from './context';
+import type { CombinedTokenTransfer, UnprovenTransactionRecipe } from '@midnightntwrk/wallet-sdk-facade';
 import { parseMidnightAddress } from '../../utils/midnight-address';
 import { BALANCE_SYNC_TIMEOUT_MS, SYNC_POLL_MS, countAllNightUtxos, countRegisteredNightUtxos, peekFacadeState, waitForGenuineSync, waitForSyncedStateBounded } from './facades';
-import { captureDustSnapshot, feeOfDiscardedRecipe, submitWithDustGuard } from './submit';
+import { captureDustSnapshot, feeOfDiscardedRecipe, revertRecipeBestEffort, submitWithDustGuard } from './submit';
+import { openTx, type FinalizedLedgerTx } from './wallet-tx';
 import { resolveSponsorEntry } from './sponsor';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 /** The SDK outputs of one payment, to a shielded or an unshielded address. The ttl defaults to ten minutes. */
-async function transferOutputs(sdk: any, networkId: string, a: { receiverAddress: string; amount: string; tokenTypeHex?: string; ttlIso?: string }) {
+async function transferOutputs(
+    sdk: WalletSdk, networkId: string, a: { receiverAddress: string; amount: string; tokenTypeHex?: string; ttlIso?: string }
+): Promise<{ receiver: ReceiverParsed; outputs: CombinedTokenTransfer[]; ttl: Date }> {
     const receiver = await parseReceiverAddress(a.receiverAddress, networkId);
-    const output = { type: a.tokenTypeHex || sdk.ledger.nativeToken().raw, receiverAddress: receiver.addr, amount: BigInt(a.amount) };
-    const outputs: any[] = [{ type: receiver.kind, outputs: [output] }];
+    const type = a.tokenTypeHex || sdk.ledger.nativeToken().raw;
+    const amount = BigInt(a.amount);
+    const outputs: CombinedTokenTransfer[] = receiver.kind === 'shielded'
+        ? [{ type: 'shielded', outputs: [{ type, receiverAddress: receiver.addr, amount }] }]
+        : [{ type: 'unshielded', outputs: [{ type, receiverAddress: receiver.addr, amount }] }];
     const ttl = a.ttlIso ? new Date(a.ttlIso) : new Date(Date.now() + 10 * 60 * 1000);
     return { receiver, outputs, ttl };
 }
@@ -38,13 +45,13 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
     log('info', `dust-register: synced.`);
 
     // `availableCoins` leaves out registered UTXOs, so those are counted from the full coin set.
-    const availableCoins: any[] = synced?.unshielded?.availableCoins ?? [];
+    const availableCoins = synced?.unshielded?.availableCoins ?? [];
     const unregistered = availableCoins.filter(
-        (c: any) => c?.meta?.registeredForDustGeneration !== true
+        (c) => c?.meta?.registeredForDustGeneration !== true
     );
     const registeredUtxosBefore = countRegisteredNightUtxos(synced);
     // Used as the total when the full coin set is missing.
-    const registeredInAvailable = availableCoins.filter((c: any) => c?.meta?.registeredForDustGeneration === true).length;
+    const registeredInAvailable = availableCoins.filter((c) => c?.meta?.registeredForDustGeneration === true).length;
     const totalNightUtxos = countAllNightUtxos(synced, availableCoins.length + registeredUtxosBefore - registeredInAvailable);
 
     const myDustAddr = await entry.facade.dust.getAddress();
@@ -79,14 +86,16 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
         };
     }
 
-    let receiverParsed: AddressFormat.DustAddress | string = receiverRaw;
+    let receiverParsed: AddressFormat.DustAddress;
     if (typeof receiverRaw === 'string') {
         const af = await loadAddressFormat();
         receiverParsed = (await parseMidnightAddress(af, receiverRaw)).decode(af.DustAddress, entry.networkId);
+    } else {
+        receiverParsed = receiverRaw;
     }
 
     const verifyingKey = entry.unshieldedKeystore.getPublicKey();
-    const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
+    const signFn = async (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
 
     await captureDustSnapshot(entry, 'dust-register');
     const recipe = await entry.facade.registerNightUtxosForDustGeneration(
@@ -95,7 +104,13 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
         signFn,
         receiverParsed
     );
-    const finalized = await entry.facade.finalizeRecipe(recipe);
+    let finalized: FinalizedLedgerTx;
+    try {
+        finalized = await openTx(await entry.facade.finalizeRecipe(recipe));
+    } catch (e) {
+        await revertRecipeBestEffort(entry, recipe, 'dust-register');
+        throw e;
+    }
     const txId = await submitWithDustGuard(entry, finalized, 'dust-register', { replyPort: __replyPort, note: 'dust-register' });
 
     log('info', `dust-register: submitted ${unregistered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
@@ -153,9 +168,9 @@ export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, spons
     log('info', `dust-deregister: synced.`);
 
     // `availableCoins` leaves out registered UTXOs, so use `totalCoins`.
-    const allCoins: any[] = synced?.unshielded?.totalCoins ?? [];
+    const allCoins = synced?.unshielded?.totalCoins ?? [];
     const registered = allCoins.filter(
-        (c: any) => c?.meta?.registeredForDustGeneration === true
+        (c) => c?.meta?.registeredForDustGeneration === true
     );
 
     if (registered.length === 0) {
@@ -168,7 +183,7 @@ export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, spons
     }
 
     const verifyingKey = entry.unshieldedKeystore.getPublicKey();
-    const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
+    const signFn = async (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
 
     const recipe = await entry.facade.deregisterFromDustGeneration(
         registered,
@@ -182,12 +197,19 @@ export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, spons
         await waitForGenuineSync(sponsorEntry, BALANCE_SYNC_TIMEOUT_MS, 'deregister sponsor');
     }
     await captureDustSnapshot(payer, 'dust-deregister');
-    const balanced = await payer.facade.balanceUnprovenTransaction(
-        recipe.transaction,
-        { shieldedSecretKeys: payer.zswapKeys, dustSecretKey: payer.dustKey },
-        { ttl: new Date(Date.now() + 10 * 60000), tokenKindsToBalance: ['dust'] }
-    );
-    const finalized = await payer.facade.finalizeRecipe(balanced);
+    let balanced: UnprovenTransactionRecipe | undefined;
+    let finalized: FinalizedLedgerTx;
+    try {
+        balanced = await payer.facade.balanceUnprovenTransaction(
+            recipe.transaction,
+            { ttl: new Date(Date.now() + 10 * 60000), tokenKindsToBalance: ['dust'] }
+        );
+        finalized = await openTx(await payer.facade.finalizeRecipe(balanced));
+    } catch (e) {
+        await revertRecipeBestEffort(entry, recipe, 'dust-deregister');
+        if (balanced) await revertRecipeBestEffort(payer, balanced, 'dust-deregister payer');
+        throw e;
+    }
     const txId = await submitWithDustGuard(payer, finalized, 'dust-deregister', { replyPort: __replyPort, note: 'dust-deregister' });
 
     log('info', `dust-deregister: submitted ${registered.length} UTXO(s), txId=${String(txId).slice(0, 16)}...`);
@@ -213,7 +235,6 @@ export async function transferNight({ sessionId, receiverAddress, amount, ttlIso
     const entry = facades.get(sessionId);
     if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
     const sdk = await loadSdk();
-    await ensureNetworkId(entry.networkId, sdk);
 
     log('info', `transfer: waiting for synced state...`);
     await waitForSyncedStateBounded(entry, 'transfer', syncTimeoutMs);
@@ -226,13 +247,18 @@ export async function transferNight({ sessionId, receiverAddress, amount, ttlIso
     await captureDustSnapshot(entry, 'transfer');
     const recipe = await entry.facade.transferTransaction(
         outputs,
-        { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
         { ttl }
     );
     // Unshielded inputs need a signature.
-    const signFn = (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
-    const signed = await entry.facade.signRecipe(recipe, signFn);
-    const finalized = await entry.facade.finalizeRecipe(signed);
+    const signFn = async (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
+    let finalized: FinalizedLedgerTx;
+    try {
+        finalized = await openTx(await entry.facade.finalizeRecipe(await entry.facade.signRecipe(recipe, signFn)));
+    } catch (e) {
+        // The pending booking is saved with the wallet state, so a failed build must release it.
+        await revertRecipeBestEffort(entry, recipe, 'transfer');
+        throw e;
+    }
     const txId = await submitWithDustGuard(entry, finalized, 'transfer', { replyPort: __replyPort, note: 'transfer' });
 
     log('info', `transfer: submitted, txId=${String(txId).slice(0, 16)}...`);
@@ -253,31 +279,30 @@ export async function getBalance({ sessionId, syncTimeoutMs }: {
     const entry = facades.get(sessionId);
     if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
     const sdk = await loadSdk();
-    await ensureNetworkId(entry.networkId, sdk);
 
     const synced = await waitForSyncedStateBounded(entry, 'getBalance', syncTimeoutMs);
 
-    const nightRawType: string = sdk.ledger.nativeToken().raw;
+    const nightRawType = sdk.ledger.nativeToken().raw;
     const shieldedBalances: Record<string, bigint> = synced?.shielded?.balances ?? {};
     const unshieldedBalances: Record<string, bigint> = synced?.unshielded?.balances ?? {};
-    const totalNightCoins: any[] = synced?.unshielded?.totalCoins ?? [];
+    const totalNightCoins = synced?.unshielded?.totalCoins ?? [];
 
     const shieldedNight = shieldedBalances[nightRawType] ?? 0n;
     const unshieldedNight = unshieldedBalances[nightRawType] ?? 0n;
 
     const dustBalance: bigint = synced?.dust ? synced.dust.balance(new Date()) : 0n;
     try {
-        const p: any = (synced as any)?.dust?.progress;
-        log('debug', `SYNC-PROGRESS isSynced=${(synced as any)?.isSynced} isConnected=${p?.isConnected} appliedIndex=${p?.appliedIndex} highestIndex=${p?.highestIndex} highestRelevantIndex=${p?.highestRelevantIndex}`);
+        const p = synced?.dust?.progress;
+        log('debug', `SYNC-PROGRESS isSynced=${synced?.isSynced} isConnected=${p?.isConnected} appliedIndex=${p?.appliedIndex} highestIndex=${p?.highestIndex} highestRelevantIndex=${p?.highestRelevantIndex}`);
     } catch (e: unknown) { log('debug', `SYNC-PROGRESS read failed: ${errorMessage(e)}`); }
     const registeredCount = totalNightCoins.filter(
-        (c: any) => c?.meta?.registeredForDustGeneration === true
+        (c) => c?.meta?.registeredForDustGeneration === true
     ).length;
-    const dustUtxos: any[] = synced?.dust?.totalCoins ?? [];
-    const dustPending: any[] = synced?.dust?.pendingCoins ?? [];
-    const dustAvailable: any[] | undefined = synced?.dust?.availableCoins;
+    const dustUtxos = synced?.dust?.totalCoins ?? [];
+    const dustPending = synced?.dust?.pendingCoins ?? [];
+    const dustAvailable: readonly unknown[] | undefined = synced?.dust?.availableCoins;
     const dustPendingValue = dustPending.reduce(
-        (sum: bigint, c: any) => sum + (typeof c?.generatedNow === 'bigint' ? c.generatedNow : 0n), 0n
+        (sum: bigint, c) => sum + (typeof c?.generatedNow === 'bigint' ? c.generatedNow : 0n), 0n
     );
 
     const shieldedTokens = Object.entries(shieldedBalances)
@@ -313,7 +338,6 @@ export async function estimateTransferFee({ sessionId, receiverAddress, amount, 
     const entry = facades.get(sessionId);
     if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
     const sdk = await loadSdk();
-    await ensureNetworkId(entry.networkId, sdk);
 
     await waitForSyncedStateBounded(entry, 'estimateTransferFee', syncTimeoutMs);
 
@@ -321,10 +345,9 @@ export async function estimateTransferFee({ sessionId, receiverAddress, amount, 
 
     const recipe = await entry.facade.transferTransaction(
         outputs,
-        { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
         { ttl }
     );
-    const fee = await feeOfDiscardedRecipe(entry.facade, recipe, 'estimateTransferFee');
+    const fee = await feeOfDiscardedRecipe(entry, recipe, 'estimateTransferFee');
     return { fee: fee.toString(), toLedger: receiver.kind };
 }
 

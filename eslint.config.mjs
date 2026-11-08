@@ -72,8 +72,8 @@ export default [
         rules: { '@typescript-eslint/no-explicit-any': 'warn' }
     },
     {
-        // SDK objects are duck-typed (real types would pull in the ESM-only SDK type graphs); test doubles too.
-        files: ['srv/midnight/**/*.ts', 'test/**/*.ts'],
+        // Test doubles stand in for SDK objects.
+        files: ['test/**/*.ts'],
         rules: { '@typescript-eslint/no-explicit-any': 'off' }
     }
 ]

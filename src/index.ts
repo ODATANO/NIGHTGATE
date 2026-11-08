@@ -2,6 +2,7 @@ import cds from '@sap/cds';
 import { NightgateError, errorMessage } from '../srv/utils/errors';
 
 import { startCrawler, stopCrawler } from '../srv/crawler/index';
+import { pendingReindexHeight, startReindex } from '../srv/crawler/reindex';
 import { ensureNightgateModelLoaded } from '../srv/utils/cds-model';
 import {
     isNightgatePluginConfigured,
@@ -122,7 +123,7 @@ function resolveDbPath(): string {
 async function ensureSchemaDeployed(): Promise<void> {
     const requiredTables: Array<{ table: string; columns?: string[] }> = [
         { table: 'midnight.Blocks', columns: ['slot'] },
-        { table: 'midnight.SyncState', columns: ['authorBackfillHeight', 'authorsBackfilledAt'] },
+        { table: 'midnight.SyncState', columns: ['authorBackfillHeight', 'authorsBackfilledAt', 'reindexTargetHeight'] },
         { table: 'midnight.PendingSubmissions', columns: ['submitIntentData'] },
         { table: 'midnight.TransactionResults' },
         { table: 'midnight.PrivateStates' },
@@ -419,9 +420,18 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
 
     if (crawlerEnabled) {
         try {
-            log.info('Initializing crawler and starting catch-up...');
-            await startCrawler(crawlerStartConfig({ crawlerConfig, crawlerNodeUrl }));
-            logStartupState('syncing', 'crawler started');
+            const start = () => startCrawler(crawlerStartConfig({ crawlerConfig, crawlerNodeUrl }));
+            const openReindex = await pendingReindexHeight(cds.db);
+            if (openReindex !== null) {
+                log.warn(`A reindex from ${openReindex} was interrupted. It finishes first, then the crawler starts.`);
+                startReindex(cds.db, openReindex, { stop: async () => true, start })
+                    .catch(err => log.error(`Interrupted reindex did not finish: ${errorMessage(err)}`));
+                logStartupState('stopped', 'finishing an interrupted reindex');
+            } else {
+                log.info('Initializing crawler and starting catch-up...');
+                await start();
+                logStartupState('syncing', 'crawler started');
+            }
         } catch (err) {
             lastError = errorMessage(err);
             mode = 'offline';

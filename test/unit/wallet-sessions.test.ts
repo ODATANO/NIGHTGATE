@@ -67,7 +67,6 @@ const mockDeregisterNightUtxosFromDust = vi.hoisted(() => (vi.fn()));
 const mockSendNight = vi.hoisted(() => (vi.fn()));
 const mockGetWalletBalance = vi.hoisted(() => (vi.fn()));
 const mockEstimateSendNightFee = vi.hoisted(() => (vi.fn()));
-const mockEnsureNetworkId = vi.hoisted(() => (vi.fn()));
 const mockWalletWaitForSyncedState = vi.hoisted(() => (vi.fn()));
 const mockWalletGetSyncProgress = vi.hoisted(() => (vi.fn()));
 
@@ -99,10 +98,6 @@ vi.mock('../../srv/submission/token-ops', () => ({
     sendNight: mockSendNight,
     getWalletBalance: mockGetWalletBalance,
     estimateSendNightFee: mockEstimateSendNightFee
-}));
-
-vi.mock('../../srv/midnight/providers', () => ({
-    ensureNetworkId: mockEnsureNetworkId
 }));
 
 // connectWalletForSigning's fail-closed check derives the seed's viewing key
@@ -264,10 +259,9 @@ describe('wallet session handlers', () => {
         updateSetSpy.mockClear();
         insertEntriesSpy.mockReset();
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
-        (cds.env as any).requires = { nightgate: {} };
+        (cds.env as any).requires = { nightgate: { network: 'preprod' } };
         mockDeriveAccountId.mockReturnValue('acct-derived');
         mockDeriveStoragePassword.mockReturnValue('storage-pass-derived');
-        mockEnsureNetworkId.mockResolvedValue(undefined);
         mockGetOrBuildWalletFacade.mockResolvedValue({ facade: {} });
         mockWalletWaitForSyncedState.mockResolvedValue({ synced: true });
         mockEvictWalletFacade.mockResolvedValue(undefined);
@@ -517,6 +511,36 @@ describe('wallet session handlers', () => {
         });
     });
 
+    it('session cleanup moves the expiry of pool sponsors and warns before it removes a signing key', async () => {
+        let callback: (() => Promise<void>) | undefined;
+        const setIntervalSpy = vi.spyOn(global, 'setInterval').mockImplementation(((handler: TimerHandler) => {
+            callback = handler as () => Promise<void>;
+            return {} as ReturnType<typeof setInterval>;
+        }) as any);
+        const warn = vi.spyOn(cds.log('nightgate'), 'warn').mockImplementation(() => {});
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-in-pool';
+        const db = {
+            run: vi.fn()
+                .mockResolvedValueOnce(1)
+                .mockResolvedValueOnce(1)
+                .mockResolvedValueOnce([{ sessionId: 'removed-sponsor-1', encryptedSeedKey: 'seed', userId: 'u' }])
+                .mockResolvedValue([])
+        };
+        updateWhereSpy.mockClear();
+        try {
+            startSessionCleanup(db);
+            await callback?.();
+            const movedExpiry = updateWhereSpy.mock.calls.filter(([where]: any[]) => where?.sessionId?.in?.[0] === 'sponsor-in-pool');
+            expect(movedExpiry).toHaveLength(2);
+            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: { in: ['removed-sponsor-1'] } });
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining('removed-'));
+        } finally {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            warn.mockRestore();
+            setIntervalSpy.mockRestore();
+        }
+    });
+
     it('startSessionCleanup is a no-op when nothing is expiring', async () => {
         vi.useFakeTimers();
         // Cleanup SELECTs the expiring rows first; with none, it neither
@@ -572,6 +596,8 @@ describe('wallet session handlers', () => {
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-sponsor-1';
         const db = {
             run: vi.fn()
+                .mockResolvedValueOnce(1)   // expiry of the pool sponsors, at the start
+                .mockResolvedValueOnce(1)   // and on this run
                 .mockResolvedValueOnce([row('pool-sponsor-1', 'hash-pool'), row('caller-1', 'hash-c')])
                 .mockResolvedValueOnce(1)   // deactivate UPDATE: ONLY the caller row
                 .mockResolvedValueOnce([])  // guard for the caller's wallet
@@ -755,7 +781,6 @@ describe('wallet session handlers', () => {
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
             // The pre-warm call moves into startJob's `work` closure, not
             // called synchronously by the handler.
-            expect(mockEnsureNetworkId).not.toHaveBeenCalled();
             expect(mockGetOrBuildWalletFacade).not.toHaveBeenCalled();
 
             expect(result).toEqual({
@@ -773,7 +798,6 @@ describe('wallet session handlers', () => {
 
             // Drive work() to confirm it dispatches the actual pre-warm call.
             await runPersistedCommand(args);
-            expect(mockEnsureNetworkId).toHaveBeenCalledWith('preprod');
             expect(mockGetOrBuildWalletFacade).toHaveBeenCalledWith('acct-derived', expect.objectContaining({
                 seedHex:   VALID_SEED,
                 networkId: 'preprod',

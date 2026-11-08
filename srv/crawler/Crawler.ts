@@ -851,7 +851,7 @@ export class MidnightCrawler {
                 UPDATE.entity(SyncState).set({
                     lastError: message.slice(0, 500),
                     lastErrorAt: new Date().toISOString(),
-                    consecutiveErrors: { xpr: [{ func: 'coalesce', args: [{ ref: ['consecutiveErrors'] }, { val: 0 }] }, '+', { val: 1 }] } as any,
+                    consecutiveErrors: { xpr: [{ func: 'coalesce', args: [{ ref: ['consecutiveErrors'] }, { val: 0 }] }, '+', { val: 1 }] },
                     ...(markErrored ? { syncStatus: 'error' } : {})
                 }).where({ ID: 'SINGLETON' })
             );

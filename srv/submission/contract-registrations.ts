@@ -19,6 +19,7 @@ import {
 } from './contract-registry';
 import { effectiveModuleFormat, runtimeNodeModulesDir } from './artifact-digest';
 import { hasAllProverKeys } from './prover-keys';
+import { zkArtifactManifestProblem } from './zk-artifact-manifest';
 import { configString } from '../utils/config';
 import type { DbRunner } from '../utils/db-types';
 import { NightgateError, errorMessage } from '../utils/errors';
@@ -138,7 +139,7 @@ function probeCopiedModule(artifactPath: string, timeoutMs: number): Promise<{ o
             return done({ ok: false, hasContract: false, error: errorMessage(e) });
         }
         timer = setTimeout(() => { done({ ok: false, hasContract: false, error: `import did not finish within ${timeoutMs}ms` }); void w.terminate(); }, timeoutMs);
-        w.once('message', (m: any) => { done({ ok: !!m?.ok, hasContract: !!m?.hasContract, error: m?.error }); void w.terminate(); });
+        w.once('message', (m: { ok?: unknown; hasContract?: unknown; error?: string } | null | undefined) => { done({ ok: !!m?.ok, hasContract: !!m?.hasContract, error: m?.error }); void w.terminate(); });
         w.once('error', (e) => done({ ok: false, hasContract: false, error: errorMessage(e) }));
         w.once('exit', (code) => done({ ok: false, hasContract: false, error: `validation worker exited with code ${code} before reporting` }));
     });
@@ -175,6 +176,8 @@ export async function validateRuntimeRegistration(input: RuntimeRegistrationInpu
     if (!zkirIsDir) {
         throw new ContractRegistrationError(400, `zkConfigPath has no zkir/ directory: ${zkConfigPath}`);
     }
+    const manifestProblem = zkArtifactManifestProblem(zkConfigPath);
+    if (manifestProblem) throw new ContractRegistrationError(400, manifestProblem);
     const hasProverKeys = hasAllProverKeys(zkConfigPath);
 
     const probe = await probeArtifactModule(artifactPath);

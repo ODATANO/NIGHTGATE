@@ -21,8 +21,8 @@ export interface LedgerDecoderConfig {
     intervalMs: number;
     /** Distance to the indexed tip. */
     lagBlocks: number;
-    /** Decodes one ledger transaction. The crawler passes the decode worker's method. */
-    decode: (payload: Uint8Array) => Promise<LedgerPayloadFacts>;
+    /** Decodes one ledger transaction of a block with that runtime version. The crawler passes the decode worker's method. */
+    decode: (payload: Uint8Array, specVersion: number | null) => Promise<LedgerPayloadFacts>;
 }
 
 export interface DecodeRunResult {
@@ -110,7 +110,7 @@ export class LedgerPayloadDecoder {
         // All transactions of the block are decoded, even ones decoded before.
         // Only the cursor decides what is decoded, so resetting it decodes the range again.
         const rows: Row<Transaction, 'ID'>[] = await this.db.run(
-            SELECT.from(Transactions).columns('ID', 'raw', 'payloadDecode', 'transactionType', 'txType', 'isShielded', 'hasProof')
+            SELECT.from(Transactions).columns('ID', 'raw', 'payloadDecode', 'transactionType', 'txType', 'isShielded', 'hasProof', 'protocolVersion')
                 .where({ block_ID: blockId })
         ) || [];
         if (rows.length === 0) return EMPTY_RUN;
@@ -139,7 +139,7 @@ export class LedgerPayloadDecoder {
                 continue;
             }
             try {
-                updates.push({ id: row.ID, facts: await this.config.decode(payload), state: 'decoded', txType: (row as { txType?: string | null }).txType });
+                updates.push({ id: row.ID, facts: await this.config.decode(payload, row.protocolVersion ?? null), state: 'decoded', txType: (row as { txType?: string | null }).txType });
                 result.decoded++;
             } catch (err) {
                 log.warn(`transaction ${row.ID}: ledger payload did not decode: ${(err as Error).message}`);
@@ -194,7 +194,7 @@ export class LedgerPayloadDecoder {
         ) || [];
         if (actions.length === 0) return;
 
-        const ours = new Map<string | null, any[]>();
+        const ours = new Map<string | null, Row<ContractAction, 'ID' | 'address'>[]>();
         for (const action of actions) {
             const list = ours.get(action.address) ?? [];
             list.push(action);

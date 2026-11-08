@@ -8,6 +8,7 @@ import { readCapBinary, capBinaryInput } from './cap-binary';
 import { Blocks, ContractActions, ContractStates, SyncState, type Block, type ContractAction, type ContractState } from '#cds-models/midnight';
 import type { DbRunner, DbService, Row } from '../utils/db-types';
 import { bareHex } from '../utils/hex-patterns';
+import { errorMessage } from '../utils/errors';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
@@ -110,6 +111,8 @@ export interface ContractStateSnapshot {
 }
 
 export interface FetchedContractState {
+    /** Block of the contract action the state belongs to. */
+    height: number | null;
     state: string | null;
     zswapState: string | null;
     blockHash: string | null;
@@ -135,7 +138,12 @@ export class IndexerBehind extends Error {
     constructor(readonly address: string, readonly height: number) { super(`the indexer has not reached the contract's action at block ${height} yet; retry in a few seconds`); }
 }
 
-type LocatedSnapshot = Omit<ContractStateSnapshot, 'blockHash' | 'ledgerParameters' | 'coveredHeight' | 'chainHeight'>;
+/** No indexer answered the state read. The message names the indexer's error and is safe to show the caller. */
+export class IndexerUnavailable extends Error {
+    constructor(cause: unknown) { super(errorMessage(cause), { cause }); }
+}
+
+type LocatedSnapshot =Omit<ContractStateSnapshot, 'blockHash' | 'ledgerParameters' | 'coveredHeight' | 'chainHeight'>;
 
 /** How far the database is: the supplement writes the states, the crawler knows the chain tip. */
 async function coverageOf(db: DbService): Promise<Pick<ContractStateSnapshot, 'coveredHeight' | 'chainHeight'>> {
@@ -202,7 +210,7 @@ export async function contractStateAt(
         verified: null
     }, fetchState);
 
-    let newest: any = null;
+    let newest: (Row<ContractAction, 'ID'> & { height?: number | null }) | null | undefined = null;
     let staleHeight: number | null = null;
     if (height == null && current) {
         // The crawler stores an action before the supplement stores its state. Then the stored state is stale.
@@ -249,8 +257,17 @@ export async function contractStateAt(
         }
     }
 
-    // A stale stored state is fetched at the newest action's block, so equal requests share the answer.
-    const fetched = await fetchState(address, staleHeight ?? height);
+    // The indexer answers only for the block of an action. A known action is asked at its block, otherwise
+    // the newest state serves when its action is not above the height.
+    const actionHeight = staleHeight ?? (newest ? Number(newest.height) : null);
+    let fetched: FetchedContractState | null = null;
+    if (actionHeight == null && height != null) {
+        const latest = await fetchState(address, null);
+        // An unknown contract has no older state either, so the second ask is skipped.
+        if (!latest) return null;
+        if (latest.height != null && latest.height <= height) fetched = latest;
+    }
+    fetched ??= await fetchState(address, actionHeight ?? height);
     // The contract exists, so no answer at the newest action's block means the indexer is behind.
     if (!fetched) {
         if (staleHeight !== null) throw new IndexerBehind(address, staleHeight);
@@ -265,7 +282,7 @@ export async function contractStateAt(
     const expected = newest?.stateHash ?? null;
     return {
         address,
-        height: newest ? Number(newest.height) : null,
+        height: fetched.height ?? actionHeight,
         state: fetched.state,
         zswapState: fetched.zswapState,
         stateHash: digest.hash,
@@ -341,7 +358,7 @@ export async function compactStoredContractState(
             .orderBy('ID')
             .limit(batchSize);
         if (last !== undefined) query = query.and({ ID: { '>': last } });
-        const rows: any[] = await db.run(query) || [];
+        const rows: Row<ContractAction, 'ID'>[] = await db.run(query) || [];
         if (rows.length === 0) break;
         last = String(rows[rows.length - 1].ID);
 

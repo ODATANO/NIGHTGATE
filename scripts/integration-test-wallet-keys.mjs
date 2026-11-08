@@ -1,7 +1,7 @@
-// Checks that ledger-v8 seed-key derivation accepts our shapes and gives stable public keys for a fixed seed.
+// Checks that ledger-v9 seed-key derivation accepts our shapes and gives stable public keys for a fixed seed.
 // Run: node scripts/integration-test-wallet-keys.mjs
 
-import { ZswapSecretKeys, DustSecretKey } from '@midnight-ntwrk/ledger-v8';
+import { ZswapSecretKeys, DustSecretKey } from '@midnightntwrk/ledger-v9';
 
 const SEED_HEX = 'a'.repeat(64);          // 32-byte test seed
 const seedBytes = new Uint8Array(Buffer.from(SEED_HEX, 'hex'));

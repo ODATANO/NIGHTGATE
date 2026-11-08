@@ -28,7 +28,7 @@ export interface BoardStatus {
 }
 
 async function countRows(db: DbRunner, query: unknown): Promise<number> {
-    const row = await runWithoutAmbientTx(() => db.run(query as any)) as { count?: number | string } | null | undefined;
+    const row = await runWithoutAmbientTx(() => db.run(query)) as { count?: number | string } | null | undefined;
     const n = Number(row?.count ?? 0);
     return Number.isFinite(n) ? n : 0;
 }

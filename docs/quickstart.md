@@ -1,84 +1,54 @@
 # Quickstart
 
-From `npm ci` to a wallet-signed transaction, in three steps:
-
-1. **Read-side only**: index Preprod blocks.
-2. **Wallet sessions**: connect a wallet, query its balance.
-3. **Submission**: send NIGHT or deploy a contract.
+From `npm ci` to a wallet-signed transaction, run from a clone of this repository.
 
 ## Prerequisites
 
-- Node.js >= 22, npm
-- Docker, only for a local proof server or indexer
-- A Midnight node and indexer for the network: on preview the public ones are built in; on preprod and mainnet set `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL` to your own or to hosted ones ([self-hosted.md](self-hosted.md))
-- For wallet operations: a 24-word BIP39 mnemonic and viewing key, e.g. from [Lace](https://www.lace.io/)
+- Node.js 22.12 or later
+- A Midnight node and indexer. Mainnet needs your own or hosted ones in `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL`, see [self-hosted.md](self-hosted.md).
+- For wallet operations: a 24-word BIP39 mnemonic, for example from [Lace](https://www.lace.io/)
 
-## Path 1: Read-side only
+## 1. Index blocks
+
+`.env` in the repository root (gitignored, never commit a real seed):
+
+```env
+NIGHTGATE_NETWORK=mainnet
+NIGHTGATE_NODE_URL=ws://<node-host>:9944
+NIGHTGATE_INDEXER_HTTP_URL=http://<indexer-host>:8088/api/v4/graphql
+ENCRYPTION_KEY=<output of openssl rand -hex 32>
+```
 
 ```bash
 npm ci
 npm run dev
 ```
 
-`npm run dev` runs `cds watch` with a 12 GB heap against the node in `.env` (`NIGHTGATE_NODE_URL`; on preview no `.env` is needed). The crawler catches up from genesis on the first run and resumes afterwards. Wait for `[Crawler] Live subscription active`, then:
+The crawler catches up from genesis on the first run and resumes afterwards. Once the log shows `Live subscription active`:
+
 ```bash
-curl "http://localhost:4004/odata/v4/midnight-indexer/getHealth()"
 curl "http://localhost:4004/odata/v4/midnight-indexer/getSyncStatus()"
 curl "http://localhost:4004/odata/v4/midnight/Blocks?\$top=5&\$orderby=height desc"
 ```
 
-Expect a non-zero `chainHeight` and five blocks.
+## 2. Connect a wallet
 
-## Path 2: Wallet sessions
-
-Proving options:
-
-- **Default, wasm:** wallet and contract circuits prove in-process; prover keys are fetched on first use. Costs tens of seconds to minutes of worker CPU per proof.
-- **Production, proof server:** `docker compose -f docker/docker-compose.yml up -d proof-server`, then set `NIGHTGATE_PROOF_SERVER_URL` (or `proofServerUrl`), which selects server proving. `NIGHTGATE_PROVING_MODE` overrides. ZK parameters persist in the `proof-server-data` volume.
-
-### Configure wallet credentials
-
-`.env` in the repo root (gitignored, never commit a real seed):
+Add the wallet to `.env`. `NIGHTGATE_CRAWLER_ENABLED=false` leaves CPU and memory to the wallet worker.
 
 ```env
-NIGHTGATE_NETWORK=preprod
-# your node and indexer, or hosted ones with the access token (self-hosted.md)
-NIGHTGATE_NODE_URL=ws://<node-host>:9944
-NIGHTGATE_INDEXER_HTTP_URL=http://<indexer-host>:8088/api/v4/graphql
-
-# Optional: frees CPU and memory for the wallet worker
 NIGHTGATE_CRAWLER_ENABLED=false
-
-# 64-hex viewing key + BIP39 mnemonic (keys are HD-derived server-side like Lace)
-LACE_VIEWING_KEY=a32699a5a29e453f6e92624c2fbefdee173d3f1178e3f9c71bc3edb7d91c1403
-LACE_MNEMONIC="word1 word2 word3 ... word24"
+LACE_VIEWING_KEY=<64 hex>
+LACE_MNEMONIC="word1 word2 ... word24"
 ```
 
-Viewing key from a mnemonic:
-```bash
-LACE_MNEMONIC="word1 word2 ... word24" node scripts/derive-keys.mjs
-```
+`LACE_MNEMONIC="..." node scripts/derive-keys.mjs` prints the viewing key of a mnemonic.
 
-### Start the server
-
-`serve:sync` uses the persistent file DB, which is not deployed automatically:
+Long syncs run under `serve:sync`, which uses the file database and does not restart on file changes:
 
 ```bash
-npm run deploy        # cds deploy --to sqlite:db/midnight.db (first run, after schema changes)
-npm run serve:sync    # cds-serve, 12 GB heap
+npm run deploy        # first run and after schema changes
+npm run serve:sync
 ```
-
-Expected log:
-```
-[serve.mjs] NODE_OPTIONS = --max-old-space-size=12288
-[cds] - server listening on { url: 'http://localhost:4004' }
-[wallet-worker-client] worker ready
-[odatano-nightgate] Wallet worker thread ready
-[odatano-nightgate] Network: preprod
-[odatano-nightgate] Startup state: stopped (crawler disabled)
-```
-
-### Bootstrap a wallet session
 
 In a second terminal:
 
@@ -86,107 +56,56 @@ In a second terminal:
 npm run sync:start
 ```
 
-Calls `connectWallet` and `connectWalletForSigning` with the `.env` credentials:
-
-```
---- 1. connectWallet ---
-OK   sessionId = c07b1f0a-7251-488d-a64e-1bf69045d7a9
-
---- 2. connectWalletForSigning ---
-OK   { ..., "signingEnabled": true }
-
-Session to reuse: c07b1f0a-7251-488d-a64e-1bf69045d7a9
-```
-
-The wallet then syncs in the worker thread:
-
-```
-[wallet-sessions] facade pre-warm kicked off for d4c0f3cc9d3d285c
-[facade] restored prior state for d4c0f3cc9d3d285c: shielded=true unshielded=true dust=true   (false on first run)
-[worker] facade started for d4c0f3cc9d3d285c
-[facade-persist] saved d4c0f3cc9d3d285c sh=4032 un=369 du=487021                              (every 60 s)
-```
-
-A cold sync from a fresh seed takes hours and several GB of worker heap; later runs resume from `WalletSyncStates`. Track it with `getWalletSyncProgress(sessionId)`.
-
-### Query the wallet
-
-After the sync reaches the tip (`caughtUp: true`):
+It calls `connectWallet` and `connectWalletForSigning` and prints the session id. The wallet then syncs in the worker. A first sync takes long and needs several GB of heap. Later runs resume from the saved state. Watch it with `getWalletSyncProgress(sessionId)` until `caughtUp` is true, then:
 
 ```bash
-curl "http://localhost:4004/odata/v4/midnight/getWalletBalance(sessionId='c07b1f0a-...')"
+curl "http://localhost:4004/odata/v4/midnight/getWalletBalance(sessionId='<session>')"
 ```
 
-Response:
-```json
-{
-  "shieldedNight": "1000000000000",
-  "unshieldedNight": "0",
-  "dustBalance": "2098000",
-  "registeredNightUtxoCount": 1,
-  "totalNightUtxoCount": 1
-}
-```
+## 3. Send a transaction
 
-## Path 3: Send a transaction
+Mainnet submission is off by default. Set `cds.requires.nightgate.allowMainnetSubmission` to `true` in `package.json` or `.cdsrc.json` first. The transaction spends real NIGHT and DUST.
 
-Requires a synced wallet with DUST.
-
-### Estimate the fee
+The wallet needs DUST. Estimate the fee first and compare it with `dustBalance`:
 
 ```bash
-curl "http://localhost:4004/odata/v4/midnight/estimateSendNightFee(sessionId='...',receiverAddress='mn_addr_preprod1...',amount='1000000')"
+curl "http://localhost:4004/odata/v4/midnight/estimateSendNightFee(sessionId='<session>',receiverAddress='mn_addr1...',amount='1000000')"
 ```
 
-Response: `{"fee":"123456","toLedger":"unshielded"}`; compare with `dustBalance`.
-
-### Send NIGHT
+Send NIGHT:
 
 ```bash
 curl -X POST http://localhost:4004/odata/v4/midnight/sendNight \
   -H "Content-Type: application/json" \
-  -d '{
-    "sessionId": "c07b1f0a-...",
-    "receiverAddress": "mn_addr_preprod1xcmxw094zxek0jp0tdc6e294tgrx0qn0l40ugjqhtqy3w5x7dkusuzphxg",
-    "amount": "1000000"
-  }'
+  -d '{ "sessionId": "<session>", "receiverAddress": "mn_addr1...", "amount": "1000000" }'
 ```
 
-Response: `{"jobId":"...","status":"pending"}`. Poll `getJobStatus(jobId, sessionId)` until `succeeded`; `result` holds `{"txId":"0x...","toLedger":"unshielded","amount":"1000000",...}`.
+The answer is `{ "jobId": "...", "status": "pending" }`. Poll `getJobStatus` until `status` is `succeeded`. `result` holds the `txId`.
 
-### Deploy a contract
-
-The contract lineages are npm dependencies (`@odatano/contract-counter`, `-attestation-vault`, `-attestation-vault-32`, `-shielded-token`, `-token-factory`, `-holder-registry`) and registered in `package.json` (`cds.requires.nightgate.contracts`, one `{ "package": "..." }` entry each). `attestation-vault` carries 16 fields per document, `attestation-vault-32` 32; cross-document proofs need the same width. Sources, compiled artifacts and release assets: [NIGHTGATE-CONTRACTS](https://github.com/ODATANO/NIGHTGATE-CONTRACTS).
+Deploy a contract:
 
 ```bash
 curl -X POST http://localhost:4004/odata/v4/midnight/deployContract \
   -H "Content-Type: application/json" \
-  -d '{
-    "compiledArtifactRef": "counter",
-    "sessionId": "c07b1f0a-...",
-    "initialPrivateState": "{}"
-  }'
+  -d '{ "compiledArtifactRef": "counter", "sessionId": "<session>", "initialPrivateState": {} }'
 ```
 
-Poll `getJobStatus`; `result` is `{"submissionId":"...","txHash":"0x...","contractAddress":"0x...","status":"included"}`.
+The job's `result` carries `txHash` and `contractAddress`. `npm run deploy:e2e` runs connect, prewarm, dust registration and deploy end to end.
 
-End to end (connect, prewarm, `registerForDustGeneration`, `deployContract`):
+## Contracts
 
-```bash
-npm run deploy:e2e
-```
+The contracts are npm dependencies, registered in `cds.requires.nightgate.contracts` with one `{ "package": "..." }` entry each: `@odatano/contract-counter`, `-attestation-vault`, `-attestation-vault-32`, `-shielded-token`, `-token-factory`, `-holder-registry`. Sources: [NIGHTGATE-CONTRACTS](https://github.com/ODATANO/NIGHTGATE-CONTRACTS).
 
-## Use NIGHTGATE in another CAP app
+The packages ship verifier keys and zkir but no prover keys. The first proving job fetches them. `NIGHTGATE_ZK_ASSET_URL` overrides the source. Without outbound access, run `npx nightgate-fetch-keys <contract>` once.
 
-`npm install @odatano/nightgate @cap-js/sqlite` and the `cds.requires.nightgate`
-block from the [README](../README.md#use-as-a-cap-plugin-in-another-app). The
-package ships verifier keys and zkir, not the prover keys: the first proving job
-fetches them (`NIGHTGATE_ZK_ASSET_URL` overrides the source), or run
-`npx nightgate-fetch-keys <contract>` once where there is no outbound access.
+## Proving
+
+- Default: wasm in-process. A proof costs tens of seconds to minutes of worker CPU.
+- Production: `docker compose -f docker/docker-compose.yml up -d proof-server` and `NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300`. A proof-server URL selects server proving. `NIGHTGATE_PROVING_MODE` overrides.
 
 ## Next
 
+- [Install as a CAP plugin](../README.md#install-as-a-cap-plugin)
 - [actions.md](actions.md): actions and functions
-- [operations.md](operations.md): scripts, local indexer, troubleshooting
-- [architecture.md](architecture.md): worker thread, submission flow, persistence
+- [operations.md](operations.md): scripts, own indexer, troubleshooting
 - [reference.md#configuration](reference.md#configuration): configuration

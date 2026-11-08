@@ -8,7 +8,10 @@ import { classifySubmitFailure, isPreMempoolFailure } from '../submit-error-clas
 import { classificationHaystack, formatErrWithCauses, safeDeepInspect } from '../../utils/format-error';
 import { NightgateError, errorMessage } from '../../utils/errors';
 import { type MessagePort } from 'node:worker_threads';
-import { FacadeEntry, loadSdk, loadNodeClientSdk, log, loadLedger } from './context';
+import { FacadeEntry, loadSdk, loadNodeClientSdk, log, loadLedger, replaceSubWallet } from './context';
+import type { Bindingish, Proofish, Signaturish, Transaction } from '@midnightntwrk/ledger-v9';
+import { asRevertible, dustKeysByEpoch, openTx, sealTx, type FinalizedLedgerTx, type Revertible, type UnboundLedgerTx } from './wallet-tx';
+import type { BalancingRecipe } from '@midnightntwrk/wallet-sdk-facade';
 import { createPhasedSubmitService, createSdkNodeAdapter, submitPhaseOf, type PhasedSubmitService } from './phased-submit';
 import { BALANCE_SYNC_TIMEOUT_MS, pushStateSaveAcked, restoreSaveAckTimeoutMs, waitForGenuineSync } from './facades';
 import { indexerQuery } from '../../utils/indexer-graphql';
@@ -16,7 +19,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { withTimeout } from '../../utils/timeout';
 
 /** Refuses a balanced tx with an empty DustActions section, which the node rejects as 1010/117. `revert` frees its coins first. */
-async function refuseEmptyDustActions(finalized: any, what: string, revert: () => Promise<void>): Promise<void> {
+async function refuseEmptyDustActions(finalized: FinalizedLedgerTx, what: string, revert: () => Promise<void>): Promise<void> {
     const dust = describeTxDust(finalized);
     log('info', `${what} dust sections: ${dust.summary}`);
     if (!dust.emptyDustActions) return;
@@ -25,14 +28,14 @@ async function refuseEmptyDustActions(finalized: any, what: string, revert: () =
 }
 
 /** Logs the dust sections of a transaction about to be sent, and warns on an empty DustActions section. */
-function noteDustBeforeSubmit(tx: any, what: string): void {
+function noteDustBeforeSubmit(tx: FinalizedLedgerTx, what: string): void {
     const dust = describeTxDust(tx);
     log('info', `pre-submit ${what} dust sections: ${dust.summary}`);
     if (dust.emptyDustActions) log('warn', `pre-submit ${what} has an EMPTY DustActions section (node rejects as 1010/117 NotNormalized): ${dust.summary}`);
 }
 
 /** Describes the dust parts of a tx for logging. Never throws. */
-export function describeTxDust(tx: any): { summary: string; emptyDustActions: boolean } {
+export function describeTxDust<S extends Signaturish, P extends Proofish, B extends Bindingish>(tx: Transaction<S, P, B>): { summary: string; emptyDustActions: boolean } {
     try {
         const parts: string[] = [];
         let empty = false;
@@ -59,20 +62,20 @@ export function describeTxDust(tx: any): { summary: string; emptyDustActions: bo
 }
 
 /** Frees the coins a built but unsent tx reserved. Never throws. */
-export async function revertRecipeBestEffort(facade: any, txOrRecipe: any, site: string): Promise<void> {
+export async function revertRecipeBestEffort(entry: Pick<FacadeEntry, 'facade' | 'walletConfiguration'>, txOrRecipe: Revertible | undefined, site: string): Promise<void> {
     if (!txOrRecipe) return;
     try {
-        await facade.revert(txOrRecipe);
+        await entry.facade.revert(await asRevertible(txOrRecipe, entry.walletConfiguration));
     } catch (e) {
         log('warn', `${site}: recipe revert failed (coins may stay pending until a fresh resync): ${errorMessage(e)}`);
     }
 }
 
-export async function feeOfDiscardedRecipe(facade: any, recipe: any, site: string): Promise<bigint> {
+export async function feeOfDiscardedRecipe(entry: Pick<FacadeEntry, 'facade' | 'walletConfiguration'>, recipe: Extract<BalancingRecipe, { type: 'UNPROVEN_TRANSACTION' }>, site: string): Promise<bigint> {
     try {
-        return await facade.calculateTransactionFee(recipe.transaction);
+        return await entry.facade.calculateTransactionFee(recipe.transaction);
     } finally {
-        await revertRecipeBestEffort(facade, recipe, site);
+        await revertRecipeBestEffort(entry, recipe, site);
     }
 }
 
@@ -97,13 +100,14 @@ export class SubmitOutcomeUnknownError extends Error {
 
 /** Marks a failure where no attempt sent anything, so the dust state may be restored. */
 function markNothingSent(err: unknown): void {
-    if (err && typeof err === 'object') (err as any).nothingSent = true;
+    if (err && typeof err === 'object') (err as { nothingSent?: boolean }).nothingSent = true;
 }
 export function isNothingSent(err: unknown): boolean {
-    let cur: any = err;
+    let cur: unknown = err;
     for (let depth = 0; cur && depth < 8; depth++) {
-        if (cur.nothingSent === true) return true;
-        cur = cur.cause;
+        const e = cur as { nothingSent?: unknown; cause?: unknown };
+        if (e.nothingSent === true) return true;
+        cur = e.cause;
     }
     return false;
 }
@@ -126,9 +130,8 @@ export async function restoreDustFromSnapshot(entry: FacadeEntry, site: string):
     try {
         const sdk = await loadSdk();
         const fresh = sdk.dust.DustWallet(entry.walletConfiguration).restore(snapshot);
-        await fresh.start(entry.dustKey);
-        const old = entry.facade.dust;
-        entry.facade.dust = fresh;
+        await fresh.start(await dustKeysByEpoch(entry.walletSeeds.dust));
+        const old = replaceSubWallet(entry.facade, 'dust', fresh);
         try { await old.stop(); } catch { /* already dead is fine */ }
         // A periodic save may have stored the broken state meanwhile. Save the restored state now
         // and raise the epoch, so no older save can overwrite it.
@@ -147,13 +150,13 @@ export async function restoreDustFromSnapshot(entry: FacadeEntry, site: string):
 }
 
 /** Logs the tx size and cost, so a block limit reject shows which limit was hit. Never throws. */
-export async function logTxCost(tx: any, site: string): Promise<void> {
+export async function logTxCost(tx: FinalizedLedgerTx, site: string): Promise<void> {
     try {
         const bytes = typeof tx?.serialize === 'function' ? tx.serialize() : undefined;
         const size = bytes?.length ?? bytes?.byteLength;
         let costSummary = 'n/a';
         try {
-            const ledger: any = await loadLedger();
+            const ledger = await loadLedger();
             const params = ledger.LedgerParameters.initialParameters();
             if (params && typeof tx?.cost === 'function') {
                 const c = tx.cost(params);
@@ -206,11 +209,10 @@ export interface BoundSubmitIntent {
 }
 
 /** Restores the saved dust state only when the tx surely never reached the mempool, because a tx that may have reached it spent its fee. */
-export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: string, intent?: BoundSubmitIntent): Promise<any> {
+export async function submitWithDustGuard(entry: FacadeEntry, tx: FinalizedLedgerTx, site: string, intent?: BoundSubmitIntent): Promise<string> {
     if (intent?.replyPort) {
         try {
             // A tx that was not announced could never be traced, so refuse to send it.
-            if (typeof tx?.identifiers !== 'function') throw new Error(`${site}: transaction exposes no identifiers(); refusing to broadcast unannounced`);
             await announceSubmitIntent(intent.replyPort, {
                 txHash: String(tx.identifiers().at(-1)),
                 contractAddress: intent.contractAddress, circuits: intent.circuits, note: intent.note, ttl: intent.ttl,
@@ -218,7 +220,7 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: any, site: str
             });
         } catch (e) {
             // Not sent, so free the reserved coins and dust. The SDK does this only after a failed submit.
-            await revertRecipeBestEffort(entry.facade, tx, `${site} intent`);
+            await revertRecipeBestEffort(entry, tx, `${site} intent`);
             await restoreDustFromSnapshot(entry, `${site} intent`);
             throw e;
         }
@@ -245,7 +247,7 @@ export let SUBMIT_CLIENT_POOL_MAX = 8;
 let submitClientSettleMs = 2500;
 /** Limit for closing a stuck client. The SDK's close waits for the client's start, which may be what hangs. */
 export const SUBMIT_CLOSE_TIMEOUT_MS = 5000;
-export type SubmitClientSlot = { svc: any; busy: Promise<unknown> | null; readyAt: number };
+export type SubmitClientSlot = { svc: PhasedSubmitService | null; busy: Promise<unknown> | null; readyAt: number };
 export const submitClientPools = new Map<string, SubmitClientSlot[]>();
 export const submitClientWaiters = new Map<string, number>(); // callers waiting for a client, per node URL
 export type SubmitServiceFactory = (relayURL: URL) => Promise<PhasedSubmitService> | PhasedSubmitService;
@@ -268,7 +270,7 @@ export class SubmitWatchTimeoutError extends NightgateError {
     constructor(ms: number) { super('SUBMIT_WATCH_TIMEOUT', `submit watch timed out after ${ms}ms without a final answer from the node`); }
 }
 
-export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any) => Promise<T>, opts: { abandonAfterMs?: number; label?: string } = {}): Promise<T> {
+export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: PhasedSubmitService) => Promise<T>, opts: { abandonAfterMs?: number; label?: string } = {}): Promise<T> {
     const key = relayURL.toString();
     let pool = submitClientPools.get(key);
     if (!pool) { pool = []; submitClientPools.set(key, pool); }
@@ -308,7 +310,7 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
     } finally {
         submitClientWaiters.set(key, Math.max(0, (submitClientWaiters.get(key) ?? 1) - 1));
     }
-    const run = fn(slot.svc);
+    const run = fn(slot.svc!);
     slot.busy = run.catch(() => undefined);
     const label = opts.label ?? 'submit';
     // Drop a client whose state is unknown.
@@ -352,16 +354,23 @@ export async function withDedicatedSubmitClient<T>(relayURL: URL, fn: (svc: any)
 }
 
 /** Finds a tx on the indexer with its ledger result. A block whose call failed is no success. Null when unknown or unreachable. */
+/** The indexer's answer to TX_BLOCK_QUERY, as it comes off the wire. */
+interface TxBlockAnswer {
+    transactions?: Array<{
+        block?: { height?: string | number | null } | null;
+        transactionResult?: { status?: string | null; segments?: Array<{ id: number | string; success?: boolean }> | null } | null;
+    } | null>;
+}
 const TX_BLOCK_QUERY = 'query($offset: TransactionOffset!) { transactions(offset: $offset) { block { height } ... on RegularTransaction { transactionResult { status segments { id success } } } } }';
 
 export async function indexerBlockOfIdentifier(indexerHttpUrl: string, identifier: string): Promise<{ height: string; status: string | null; failedSegments: number[] } | null> {
     try {
-        const data: any = await indexerQuery(indexerHttpUrl, TX_BLOCK_QUERY, { variables: { offset: { identifier } } });
+        const data = await indexerQuery<TxBlockAnswer | null>(indexerHttpUrl, TX_BLOCK_QUERY, { variables: { offset: { identifier } } });
         const t = data?.transactions?.[0];
         const h = t?.block?.height;
         if (h == null) return null;
         const res = t?.transactionResult;
-        const failed = Array.isArray(res?.segments) ? res.segments.filter((s: any) => s?.success === false).map((s: any) => Number(s.id)) : [];
+        const failed = Array.isArray(res?.segments) ? res.segments.filter((s) => s?.success === false).map((s) => Number(s.id)) : [];
         return { height: String(h), status: res?.status ?? null, failedSegments: failed };
     } catch { return null; }
 }
@@ -444,7 +453,7 @@ export async function announceSubmitIntent(port: MessagePort | undefined, intent
     const startedAt = Date.now();
     await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => { port.off('message', onMsg); reject(new NightgateError('SUBMIT_INTENT_TIMEOUT', `submit-intent was not acknowledged by the main thread within ${ackTimeoutMs}ms; not broadcasting`)); }, ackTimeoutMs);
-        const onMsg = (m: any) => {
+        const onMsg = (m: { kind?: unknown; txHash?: unknown; ok?: unknown; error?: unknown } | null) => {
             if (m?.kind === 'submit-intent-ack' && m.txHash === txHash) {
                 clearTimeout(timer); port.off('message', onMsg);
                 if (m.ok === false) { reject(new NightgateError('SUBMIT_INTENT_REJECTED', `submit-intent rejected by the main thread: ${m.error ?? 'unknown'}`)); return; }
@@ -463,18 +472,9 @@ export function isClosingSocketReject(err: unknown): boolean {
     return /disconnected from \S*:\s*1000\s*::\s*Normal Closure/i.test(classificationHaystack(err));
 }
 
-/** Marks the tx's coins as spent, like the SDK's own submit does. */
-async function bookPending(entry: FacadeEntry, tx: any, site: string): Promise<void> {
-    const svc = entry.facade?.pendingTransactionsService;
-    if (typeof svc?.addPendingTransaction !== 'function') {
-        log('warn', `${site}: facade exposes no pending-transaction service; spends are booked only once the sync sees the transaction`);
-        return;
-    }
-    await svc.addPendingTransaction(tx);
-}
-
-/** Sends a tx on its own node connection. A connection failure resends, a timeout looks it up on the indexer, a node rejection is never resent. */
-export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site: string, opts: { book?: boolean } = {}): Promise<any> {
+/** Sends a tx on its own node connection. A connection failure resends, a timeout looks it up on the indexer, a node rejection is never resent.
+ *  `book` names a tx the facade balanced. Its coins stay booked until the sync sees the spend, and a failed send releases them. */
+export async function submitOnDedicatedClient(entry: FacadeEntry, tx: FinalizedLedgerTx, site: string, opts: { book?: boolean } = {}): Promise<string> {
     await logTxCost(tx, site);
     const relayURL: URL = entry.walletConfiguration.relayURL;
     const identifier = String(tx.identifiers().at(-1));
@@ -495,7 +495,6 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
         log('warn', `${site}: ${identifier.slice(0, 16)}: ${reason}; resending the SAME transaction (no rebuild, no re-proving)`);
         await sleep(submitTransportBackoffMs());
     };
-    if (opts.book) await bookPending(entry, tx, site);
     try {
         for (let attempt = 0, resends = 0; ; attempt++) {
             try {
@@ -547,39 +546,43 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: any, site:
         }
     } catch (e) {
         // Free the reserved coins, like the SDK does after a failed submit.
-        if (opts.book) await revertRecipeBestEffort(entry.facade, tx, `${site} pending`);
+        if (opts.book) await revertRecipeBestEffort(entry, tx, `${site} pending`);
         throw e;
     }
 }
 
+/** The worker's wallet as midnight-js wants it: `createLedger9WalletProvider` and `createLedger9MidnightProvider` wrap it. */
+export interface WorkerWalletProvider {
+    getCoinPublicKey(): string;
+    getEncryptionPublicKey(): string;
+    balanceTx(tx: UnboundLedgerTx, ttl?: Date): Promise<FinalizedLedgerTx>;
+    submitTx(tx: FinalizedLedgerTx): Promise<string>;
+}
+
 /** The wallet as the SDK's WalletProvider and MidnightProvider. */
-export function buildWorkerWalletProvider(entry: FacadeEntry, intent?: BoundSubmitIntent): any {
+export function buildWorkerWalletProvider(entry: FacadeEntry, intent?: BoundSubmitIntent): WorkerWalletProvider {
     return {
         getCoinPublicKey(): string { return entry.zswapKeys.coinPublicKey; },
         getEncryptionPublicKey(): string { return entry.zswapKeys.encryptionPublicKey; },
-        async balanceTx(tx: any, ttl?: Date): Promise<any> {
+        async balanceTx(tx: UnboundLedgerTx, ttl?: Date): Promise<FinalizedLedgerTx> {
             await waitForGenuineSync(entry, BALANCE_SYNC_TIMEOUT_MS, 'balance');
             // Save the dust state before the build marks the dust as spent.
             await captureDustSnapshot(entry, 'balance');
             const effectiveTtl = ttl ?? new Date(Date.now() + 60 * 60 * 1000);
             if (intent) intent.ttl = effectiveTtl.toISOString();
-            const recipe = await entry.facade.balanceUnboundTransaction(
-                tx,
-                { shieldedSecretKeys: entry.zswapKeys, dustSecretKey: entry.dustKey },
-                { ttl: effectiveTtl }
-            );
-            let finalized: any;
+            const recipe = await entry.facade.balanceUnboundTransaction(await sealTx('Unbound', tx, entry.walletConfiguration), { ttl: effectiveTtl });
+            let finalized: FinalizedLedgerTx;
             try {
-                finalized = await entry.facade.finalizeRecipe(recipe);
+                finalized = await openTx(await entry.facade.finalizeRecipe(recipe));
             } catch (e) {
                 // On a failed proof the SDK frees only part of the reserved coins, so free them here.
-                await revertRecipeBestEffort(entry.facade, recipe, 'balance');
+                await revertRecipeBestEffort(entry, recipe, 'balance');
                 throw e;
             }
-            await refuseEmptyDustActions(finalized, 'balanced transaction', () => revertRecipeBestEffort(entry.facade, finalized, 'balance'));
+            await refuseEmptyDustActions(finalized, 'balanced transaction', () => revertRecipeBestEffort(entry, finalized, 'balance'));
             return finalized;
         },
-        async submitTx(tx: any): Promise<any> {
+        async submitTx(tx: FinalizedLedgerTx): Promise<string> {
             noteDustBeforeSubmit(tx, 'tx');
             return submitWithDustGuard(entry, tx, 'submit', intent);
         }
@@ -587,14 +590,13 @@ export function buildWorkerWalletProvider(entry: FacadeEntry, intent?: BoundSubm
 }
 
 /** Wallet provider for a sponsored tx. The caller pays all but the fee, signs and finalizes. The sponsor adds the dust fee and sends. */
-export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: FacadeEntry, intent?: BoundSubmitIntent): any {
+export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: FacadeEntry, intent?: BoundSubmitIntent): WorkerWalletProvider {
     // The caller's finalized tx from the last successful balanceTx, freed if the submit fails.
-    let lastCallerFinalized: any;
+    let lastCallerFinalized: FinalizedLedgerTx | undefined;
     return {
         getCoinPublicKey(): string { return caller.zswapKeys.coinPublicKey; },
         getEncryptionPublicKey(): string { return caller.zswapKeys.encryptionPublicKey; },
-        async balanceTx(tx: any, ttl?: Date): Promise<any> {
-
+        async balanceTx(tx: UnboundLedgerTx, ttl?: Date): Promise<FinalizedLedgerTx> {
             if (configEnum('NIGHTGATE_SPONSORED_CALLER_SYNC') === 'skip') {
                 log('info', 'sponsored-balance: caller sync SKIPPED (NIGHTGATE_SPONSORED_CALLER_SYNC=skip)');
             } else {
@@ -605,54 +607,49 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
             if (intent) intent.ttl = effectiveTtl.toISOString();
 
             const recipe = await caller.facade.balanceUnboundTransaction(
-                tx,
-                { shieldedSecretKeys: caller.zswapKeys, dustSecretKey: caller.dustKey },
+                await sealTx('Unbound', tx, caller.walletConfiguration),
                 { ttl: effectiveTtl, tokenKindsToBalance: ['shielded', 'unshielded'] }
             );
-            const callerSign = (payload: Uint8Array) => caller.unshieldedKeystore.signData(payload);
-            let callerFinalized: any;
+            const callerSign = async (payload: Uint8Array) => caller.unshieldedKeystore.signData(payload);
+            let callerFinalized: Awaited<ReturnType<typeof caller.facade.finalizeRecipe>>;
             try {
                 const signed = await caller.facade.signRecipe(recipe, callerSign);
                 callerFinalized = await caller.facade.finalizeRecipe(signed);
             } catch (e) {
                 // The SDK frees nothing after a failed signature and only part after a failed proof.
-                await revertRecipeBestEffort(caller.facade, recipe, 'sponsored-balance caller');
+                await revertRecipeBestEffort(caller, recipe, 'sponsored-balance caller');
                 throw e;
             }
 
             try {
                 // The next step spends the sponsor's dust, so save the sponsor's dust state first.
                 await captureDustSnapshot(sponsor, 'sponsored-balance sponsor');
-                const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(
-                    callerFinalized,
-                    { shieldedSecretKeys: sponsor.zswapKeys, dustSecretKey: sponsor.dustKey },
-                    { ttl: effectiveTtl, tokenKindsToBalance: ['dust'] }
-                );
-                let finalized: any;
+                const sponsorRecipe = await sponsor.facade.balanceFinalizedTransaction(callerFinalized, { ttl: effectiveTtl, tokenKindsToBalance: ['dust'] });
+                let finalized: FinalizedLedgerTx;
                 try {
-                    finalized = await sponsor.facade.finalizeRecipe(sponsorRecipe);
+                    finalized = await openTx(await sponsor.facade.finalizeRecipe(sponsorRecipe));
                 } catch (e) {
-                    await revertRecipeBestEffort(sponsor.facade, sponsorRecipe, 'sponsored-balance sponsor');
+                    await revertRecipeBestEffort(sponsor, sponsorRecipe, 'sponsored-balance sponsor');
                     throw e;
                 }
 
-                await refuseEmptyDustActions(finalized, 'sponsored balanced transaction', () => revertRecipeBestEffort(sponsor.facade, finalized, 'sponsored-balance sponsor'));
-                lastCallerFinalized = callerFinalized;
+                await refuseEmptyDustActions(finalized, 'sponsored balanced transaction', () => revertRecipeBestEffort(sponsor, finalized, 'sponsored-balance sponsor'));
+                lastCallerFinalized = await openTx(callerFinalized);
                 return finalized;
             } catch (e) {
                 // The caller's tx will never be sent, so free its coins now.
-                await revertRecipeBestEffort(caller.facade, callerFinalized, 'sponsored-balance caller');
+                await revertRecipeBestEffort(caller, callerFinalized, 'sponsored-balance caller');
                 throw e;
             }
         },
-        async submitTx(tx: any): Promise<any> {
+        async submitTx(tx: FinalizedLedgerTx): Promise<string> {
             noteDustBeforeSubmit(tx, 'sponsored tx');
             try {
                 const result = await submitWithDustGuard(sponsor, tx, 'sponsored-submit sponsor', intent);
                 lastCallerFinalized = undefined;
                 return result;
             } catch (e) {
-                await revertRecipeBestEffort(caller.facade, lastCallerFinalized ?? tx, 'sponsored-submit caller');
+                await revertRecipeBestEffort(caller, lastCallerFinalized ?? tx, 'sponsored-submit caller');
                 lastCallerFinalized = undefined;
                 throw e;
             }
@@ -666,34 +663,33 @@ export class BuildOnlyStop extends Error {
 }
 
 /** Builds, signs and finalizes as the caller, then keeps the tx in `holder` instead of sending it. */
-export function buildBuildOnlyWalletProvider(caller: FacadeEntry, holder: { captured?: any }): any {
+export function buildBuildOnlyWalletProvider(caller: FacadeEntry, holder: { captured?: FinalizedLedgerTx }): WorkerWalletProvider {
     return {
         getCoinPublicKey(): string { return caller.zswapKeys.coinPublicKey; },
         getEncryptionPublicKey(): string { return caller.zswapKeys.encryptionPublicKey; },
-        async balanceTx(tx: any, ttl?: Date): Promise<any> {
+        async balanceTx(tx: UnboundLedgerTx, ttl?: Date): Promise<FinalizedLedgerTx> {
             if (configEnum('NIGHTGATE_SPONSORED_CALLER_SYNC') !== 'skip') {
                 await waitForGenuineSync(caller, BALANCE_SYNC_TIMEOUT_MS, 'build-only caller');
             }
             const effectiveTtl = ttl ?? new Date(Date.now() + 30 * 60 * 1000);
             log('info', 'build-only: balanceUnboundTransaction (shielded/unshielded)');
             const recipe = await caller.facade.balanceUnboundTransaction(
-                tx,
-                { shieldedSecretKeys: caller.zswapKeys, dustSecretKey: caller.dustKey },
+                await sealTx('Unbound', tx, caller.walletConfiguration),
                 { ttl: effectiveTtl, tokenKindsToBalance: ['shielded', 'unshielded'] }
             );
-            const callerSign = (payload: Uint8Array) => caller.unshieldedKeystore.signData(payload);
+            const callerSign = async (payload: Uint8Array) => caller.unshieldedKeystore.signData(payload);
             try {
                 log('info', 'build-only: signRecipe + finalizeRecipe');
                 const signed = await caller.facade.signRecipe(recipe, callerSign);
-                const fin = await caller.facade.finalizeRecipe(signed);
+                const fin = await openTx(await caller.facade.finalizeRecipe(signed));
                 log('info', 'build-only: finalized (fee-unpaid); returning to callTx');
                 return fin;
             } catch (e) {
-                await revertRecipeBestEffort(caller.facade, recipe, 'build-only caller');
+                await revertRecipeBestEffort(caller, recipe, 'build-only caller');
                 throw e;
             }
         },
-        async submitTx(tx: any): Promise<any> {
+        async submitTx(tx: FinalizedLedgerTx): Promise<string> {
             holder.captured = tx;
             throw new BuildOnlyStop();
         }

@@ -1,5 +1,6 @@
 // Reads the result of each extrinsic from a block's decoded `System.Events`.
 // The extrinsic only says what the transaction asked for. The Midnight pallet events say what it did.
+import type { EventRecord } from '@polkadot/types/interfaces';
 import { bareHex } from '../utils/hex-patterns';
 import { toBigInt, toInt } from '../utils/numbers';
 
@@ -39,7 +40,7 @@ const CONTRACT_ACTION_BY_METHOD: Record<string, ContractEvent['actionType']> = {
 };
 
 /** Events carry `midnight:contract-address[vN]:` plus the 32 bytes. Everywhere else only the 32 bytes are used. */
-export function stripContractAddressPrefix(rawHex: string): string {
+export function stripContractAddressPrefix(rawHex: unknown): string {
     const clean = bareHex(rawHex);
     if (clean.length <= 64 || clean.length % 2 !== 0) return clean;
     const prefixBytes = Buffer.from(clean.slice(0, clean.length - 64), 'hex');
@@ -73,7 +74,7 @@ function emptyEvents(): ExtrinsicEvents {
 }
 
 /** A record that cannot be read is skipped, so the rest of the block is still processed. */
-export function readBlockEvents(records: Iterable<any>): Map<number, ExtrinsicEvents> {
+export function readBlockEvents(records: Iterable<EventRecord>): Map<number, ExtrinsicEvents> {
     const byExtrinsic = new Map<number, ExtrinsicEvents>();
 
     const at = (index: number): ExtrinsicEvents => {
@@ -96,9 +97,11 @@ export function readBlockEvents(records: Iterable<any>): Map<number, ExtrinsicEv
         }
         if (section !== 'midnight') continue;
 
-        let payload: any;
-        try { payload = record.event.data.toHuman()?.[0]; } catch { continue; }
-        if (payload == null) continue;
+        let human: unknown;
+        try { human = record.event.data.toHuman(); } catch { continue; }
+        const first: unknown = Array.isArray(human) ? human[0] : undefined;
+        if (first == null) continue;
+        const payload: Record<string, unknown> = typeof first === 'object' && !Array.isArray(first) ? { ...first } : {};
 
         const txHash = bareHex(payload.txHash);
         if (txHash) at(index).ledgerTxHash = txHash;

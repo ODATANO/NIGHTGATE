@@ -78,6 +78,35 @@ export interface SupplementBlock {
     transactions: SupplementTransaction[];
 }
 
+// Answer to BLOCK_QUERY. Values are read defensively, so the leaves stay unknown.
+interface LedgerEventAnswer {
+    __typename?: unknown;
+    id?: unknown;
+    raw?: unknown;
+    maxId?: unknown;
+    output?: { nonce?: unknown } | null;
+}
+
+interface TransactionAnswer {
+    hash?: unknown;
+    unshieldedCreatedOutputs?: Array<{ intentHash?: unknown; outputIndex?: unknown; registeredForDustGeneration?: unknown } | null> | null;
+    contractActions?: Array<{
+        __typename?: unknown;
+        address?: unknown;
+        state?: unknown;
+        zswapState?: unknown;
+        unshieldedBalances?: Array<{ tokenType?: unknown; amount?: unknown } | null> | null;
+    } | null> | null;
+    zswapLedgerEvents?: unknown;
+    dustLedgerEvents?: unknown;
+    fee?: unknown;
+    transactionResult?: { status?: string | null; segments?: Array<{ id?: unknown; success?: unknown } | null> | null } | null;
+}
+
+export interface BlockAnswer {
+    block?: { height?: unknown; ledgerParameters?: unknown; transactions?: Array<TransactionAnswer | null> | null } | null;
+}
+
 const ACTION_TYPE: Record<string, SupplementContractAction['actionType']> = {
     ContractDeploy: 'DEPLOY',
     ContractCall: 'CALL',
@@ -86,7 +115,7 @@ const ACTION_TYPE: Record<string, SupplementContractAction['actionType']> = {
 
 function readEvents(list: unknown): SupplementLedgerEvent[] {
     if (!Array.isArray(list)) return [];
-    return list.map((e: any) => ({
+    return list.map((e: LedgerEventAnswer | null) => ({
         eventId: toInt(e?.id),
         maxId: toInt(e?.maxId),
         raw: hexToBase64(e?.raw)
@@ -103,7 +132,7 @@ const DUST_EVENT_TYPE: Record<string, SupplementDustEvent['eventType']> = {
 function readDustEvents(list: unknown): SupplementDustEvent[] {
     if (!Array.isArray(list)) return [];
     const out: SupplementDustEvent[] = [];
-    for (const e of list as any[]) {
+    for (const e of list as Array<LedgerEventAnswer | null>) {
         const eventType = DUST_EVENT_TYPE[String(e?.__typename)];
         // Unknown kinds are skipped, so they are never stored under a wrong kind.
         if (!eventType) continue;
@@ -118,7 +147,7 @@ function readDustEvents(list: unknown): SupplementDustEvent[] {
     return out;
 }
 
-export function readSupplementBlock(payload: any): SupplementBlock | null {
+export function readSupplementBlock(payload: BlockAnswer | null | undefined): SupplementBlock | null {
     const block = payload?.block;
     if (!block) return null;
 
@@ -128,7 +157,7 @@ export function readSupplementBlock(payload: any): SupplementBlock | null {
         if (!ledgerTxHash) continue;
 
         const contractActions: SupplementContractAction[] = [];
-        for (const action of tx.contractActions ?? []) {
+        for (const action of tx?.contractActions ?? []) {
             const actionType = ACTION_TYPE[String(action?.__typename)];
             const address = bareHex(action?.address);
             if (!actionType || !address) continue;
@@ -138,7 +167,7 @@ export function readSupplementBlock(payload: any): SupplementBlock | null {
                 state: hexToBase64(action?.state),
                 zswapState: hexToBase64(action?.zswapState),
                 balances: (action?.unshieldedBalances ?? [])
-                    .map((b: any) => ({ tokenType: bareHex(b?.tokenType), amount: String(b?.amount ?? '0') }))
+                    .map(b => ({ tokenType: bareHex(b?.tokenType), amount: String(b?.amount ?? '0') }))
                     .filter((b: SupplementBalance) => b.tokenType)
             });
         }
@@ -148,13 +177,13 @@ export function readSupplementBlock(payload: any): SupplementBlock | null {
             status: tx?.transactionResult?.status ?? null,
             fee: tx?.fee == null ? null : String(tx.fee),
             segments: (tx?.transactionResult?.segments ?? [])
-                .map((s: any) => ({ segmentId: toInt(s?.id), success: Boolean(s?.success) })),
+                .map(s => ({ segmentId: toInt(s?.id), success: Boolean(s?.success) })),
             contractActions,
             zswapEvents: readEvents(tx?.zswapLedgerEvents),
             dustEvents: readDustEvents(tx?.dustLedgerEvents),
             dustRegisteredOutputs: (tx?.unshieldedCreatedOutputs ?? [])
-                .filter((u: any) => u?.registeredForDustGeneration)
-                .map((u: any) => ({ intentHash: bareHex(u?.intentHash), outputIndex: toInt(u?.outputIndex) }))
+                .filter(u => u?.registeredForDustGeneration)
+                .map(u => ({ intentHash: bareHex(u?.intentHash), outputIndex: toInt(u?.outputIndex) }))
         });
     }
 
@@ -172,7 +201,7 @@ export interface IndexerClient {
 export function createIndexerClient(url: string, timeoutMs = 20000): IndexerClient {
     return {
         async fetchBlock(height: number): Promise<SupplementBlock | null> {
-            return readSupplementBlock(await indexerQuery(url, BLOCK_QUERY, { variables: { height }, timeoutMs }));
+            return readSupplementBlock(await indexerQuery<BlockAnswer>(url, BLOCK_QUERY, { variables: { height }, timeoutMs }));
         }
     };
 }
@@ -180,7 +209,7 @@ export function createIndexerClient(url: string, timeoutMs = 20000): IndexerClie
 const CONTRACT_STATE_QUERY = `query($address: HexEncoded!, $offset: ContractActionOffset) {
   contractAction(address: $address, offset: $offset) {
     state zswapState
-    transaction { block { hash ledgerParameters } }
+    transaction { block { hash height ledgerParameters } }
   }
 }`;
 
@@ -193,12 +222,14 @@ export async function fetchContractState(
     timeoutMs = 20000
 ): Promise<FetchedContractState | null> {
     const offset = height == null ? null : { blockOffset: { height } };
-    type Answer = { contractAction?: { state?: unknown; zswapState?: unknown; transaction?: { block?: { hash?: unknown; ledgerParameters?: unknown } } } | null };
+    type Answer = { contractAction?: { state?: unknown; zswapState?: unknown; transaction?: { block?: { hash?: unknown; height?: unknown; ledgerParameters?: unknown } } } | null };
     const data = await indexerQuery<Answer>(url, CONTRACT_STATE_QUERY, { variables: { address, offset }, timeoutMs });
     const action = data?.contractAction;
     if (!action) return null;
     const blockHash = bareHex(action.transaction?.block?.hash);
+    const blockHeight = action.transaction?.block?.height;
     return {
+        height: blockHeight == null ? null : Number(blockHeight),
         state: hexToBase64(action.state),
         zswapState: hexToBase64(action.zswapState),
         blockHash: blockHash ? `0x${blockHash}` : null,

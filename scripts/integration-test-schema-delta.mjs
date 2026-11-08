@@ -396,6 +396,7 @@ ok('delta 0.23: the legacy submission row survived with null coordinates',
     ok('delta 0.33: the identifier backfill marker was added to SyncState', syncCols.has('identifiersBackfilledAt'), [...syncCols].join(','));
     ok('delta 0.41: the author backfill cursor and marker were added to SyncState',
         syncCols.has('authorBackfillHeight') && syncCols.has('authorsBackfilledAt'), [...syncCols].join(','));
+    ok('delta 0.42: the open reindex target was added to SyncState', syncCols.has('reindexTargetHeight'), [...syncCols].join(','));
 }
 
 {

@@ -2,6 +2,8 @@
 // Write actions run as background jobs and return `{ jobId, status }`. `waitForJob` polls until the job ends.
 // SPDX-License-Identifier: Apache-2.0
 
+import { randomUUID } from 'node:crypto';
+
 /** Error of a failed server call, with the server's status and error code. `retryAfterSeconds` comes from `Retry-After` when the server sent it. */
 export class NightgateApiError extends Error {
     constructor(status, code, message, retryAfterSeconds) {
@@ -202,7 +204,8 @@ export function connect(opts) {
             if (job.status === 'succeeded') {
                 let result = {};
                 try { result = job.result ? JSON.parse(job.result) : {}; } catch { result = { raw: job.result }; }
-                return { ...result, jobId, txHash: result.txHash ?? job.txHash, transactionHash: job.transactionHash ?? null };
+                // A receipt exists only once the chain confirmed the job. The session lets a caller ask for it later.
+                return { ...result, jobId, sessionId, txHash: result.txHash ?? job.txHash, transactionHash: job.transactionHash ?? null, ...(job.receipt ? { receipt: job.receipt } : {}) };
             }
             if (job.status === 'failed' || job.status === 'reconciliation_required') {
                 throw new NightgateJobError({ ...job, jobId });
@@ -213,9 +216,9 @@ export function connect(opts) {
         }
     }
 
-    /** Starts a job and waits for its result. */
+    /** Starts a job and waits for its result. A key from this client lets a request lost on a dead connection go out again without a second job. */
     async function act(name, params) {
-        const started = await callAction(name, params);
+        const started = await callAction(name, { ...params, idempotencyKey: params?.idempotencyKey || randomUUID() });
         if (!started?.jobId) return started;
         // Use the session id the server returns. Sponsored jobs run under a session the
         // server picks, so the caller cannot know it.
@@ -238,6 +241,12 @@ export function connect(opts) {
         return orNull(callFunction('Transactions/byIdentifier', { identifier: hexOf(identifier) }));
     }
 
+    /** The serialized ledger transaction as base64, or null while the server has not indexed it. */
+    async function ledgerTransaction(hash) {
+        if (!hash) throw new Error('ledgerTransaction: hash is required');
+        return (await orNull(callFunction('Transactions/ledgerTransaction', { hash })))?.ledgerTransaction ?? null;
+    }
+
     /** The transaction that deployed the contract, or null while the server has not indexed it. */
     async function contractDeploy(address) {
         if (!address) throw new Error('contractDeploy: address is required');
@@ -254,6 +263,8 @@ export function connect(opts) {
             ledgerTxHash: tx.ledgerTxHash ?? null,
             blockHeight: Number(tx.block.height),
             blockHash: tx.block.hash,
+            blockTimestamp: Number(tx.block.timestamp),
+            protocolVersion: Number(tx.block.protocolVersion),
             status: tx.transactionResult?.status ?? null,
             failedSegments: segments.filter(s => s?.success === false).map(s => Number(s.segmentId)),
             identifiers,
@@ -271,8 +282,9 @@ export function connect(opts) {
         contractStateAt,
         transactionByIdentifier,
         contractDeploy,
+        ledgerTransaction,
 
-        // ---- checks that read the chain directly. No wallet, no login. ----
+        // ---- checks that read the chain directly. No wallet. ----
         verifyAttestation: (p) => callFunction('verifyAttestationState', p),
         verifyPredicate: (p) => callFunction('verifyPredicateState', p),
         verifyPredicateAttestation: (p) => callFunction('verifyPredicateAttestation', p),
@@ -333,6 +345,9 @@ export function connect(opts) {
         sponsorSwap: (p) => act('sponsorSwap', p),
         /** Takes a plain transfer (`transferTxB64`, `tokenType`, `amount`) built by the swap wallet. The server pays the fee and submits. */
         sponsorTransfer: (p) => act('sponsorTransfer', p),
-        buildSponsorable: (p) => act('buildSponsorable', p)
+        buildSponsorable: async (p) => {
+            const started = await callAction('buildSponsorable', p);
+            return started?.jobId ? waitForJob({ jobId: started.jobId, sessionId: started.sessionId ?? p.sessionId }) : started;
+        }
     };
 }

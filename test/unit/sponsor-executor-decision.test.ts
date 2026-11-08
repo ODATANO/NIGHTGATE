@@ -28,11 +28,6 @@ vi.mock('../../srv/submission/fee-sponsor', async (importOriginal) => ({
     resolveFeeSponsor: vi.fn(async ({ sponsorSessionId }: { sponsorSessionId: string }) => ({ sponsorSessionId, accountId: `acct-${sponsorSessionId}` })),
     ensureFeeSponsorFacade: vi.fn(async () => undefined)
 }));
-vi.mock('../../srv/midnight/providers', async (importOriginal) => ({
-    ...(await importOriginal<typeof import('../../srv/midnight/providers')>()),
-    ensureNetworkId: vi.fn(async () => undefined)
-}));
-
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';
 import { __resetSponsorPoolForTests, sponsorCandidatesNonExclusive, PLATFORM_POOL_SENTINEL } from '../../srv/submission/sponsor-pool';
 

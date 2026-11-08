@@ -9,7 +9,6 @@ import { isNodeTransportError } from '../utils/retry';
 const log = cds.log('nightgate:crawler');
 
 type FaultEvent = 'unhandledRejection' | 'uncaughtException';
-const EVENTS: FaultEvent[] = ['unhandledRejection', 'uncaughtException'];
 
 // A fault is ignored only if it looks like a connection error and its stack comes from the crawler or node provider.
 // A TypeError in the crawler is a bug, and an ECONNRESET from the submission code must still shut down.
@@ -17,21 +16,23 @@ const EVENTS: FaultEvent[] = ['unhandledRejection', 'uncaughtException'];
 const CRAWLER_FRAME = /[/\\]srv[/\\](crawler|providers)[/\\]/;
 
 let installed = false;
-let delegates: Partial<Record<FaultEvent, Array<(...args: any[]) => void>>> = {};
+let delegates: {
+    unhandledRejection?: NodeJS.UnhandledRejectionListener[];
+    uncaughtException?: NodeJS.UncaughtExceptionListener[];
+} = {};
 let previousShutdownFlag: unknown;
 let absorbed = 0;
 
 // Ends the process the way CAP would. Listeners registered earlier, like error reporters, run first.
 // Then `cds.shutdown` is called, unless one of those listeners already was `cds.shutdown`.
-function shutDown(event: FaultEvent, reason: unknown, rest: unknown[]): void {
-    const captured = delegates[event] ?? [];
-    const shutdown = (cds as any).shutdown;
+function shutDown<L>(event: FaultEvent, reason: unknown, captured: L[], call: (listener: L) => void): void {
+    const shutdown = 'shutdown' in cds ? cds.shutdown : undefined;
     let alreadyShutDown = false;
 
     for (const listener of captured) {
         if (typeof shutdown === 'function' && listener === shutdown) alreadyShutDown = true;
         // A listener that throws must not prevent the shutdown.
-        try { listener(reason, ...rest); } catch { /* ignored, the shutdown follows */ }
+        try { call(listener); } catch { /* ignored, the shutdown follows */ }
     }
     if (alreadyShutDown) return;
 
@@ -53,33 +54,45 @@ export function isCrawlerTransportFault(reason: unknown): boolean {
     return isNodeTransportError(reason) && CRAWLER_FRAME.test(reason.stack ?? '');
 }
 
+function absorb(reason: unknown): boolean {
+    if (!isCrawlerTransportFault(reason)) return false;
+    absorbed++;
+    const message = errorMessage(reason);
+    log.warn(
+        `crawler transport fault absorbed (${absorbed} since start): ${message}. ` +
+        'The crawler retries on its own; the server stays up.'
+    );
+    return true;
+}
+
+function onUnhandledRejection(reason: unknown, promise: Promise<unknown>): void {
+    if (absorb(reason)) return;
+    shutDown('unhandledRejection', reason, delegates.unhandledRejection ?? [], listener => listener(reason, promise));
+}
+
+function onUncaughtException(error: Error, origin: NodeJS.UncaughtExceptionOrigin): void {
+    if (absorb(error)) return;
+    shutDown('uncaughtException', error, delegates.uncaughtException ?? [], listener => listener(error, origin));
+}
+
 /** Replaces the process fault listeners with this guard. Existing listeners still get the faults it does not ignore. */
 export function installCrawlerFaultGuard(): void {
     if (installed) return;
     installed = true;
 
     // cds serve reads this flag when the server starts listening, which happens after this call.
-    const server: any = (cds.env as any).server ?? ((cds.env as any).server = {});
+    const server: { shutdown_on_uncaught_errors?: unknown } = cds.env.server ?? (cds.env.server = {});
     previousShutdownFlag = server.shutdown_on_uncaught_errors;
     server.shutdown_on_uncaught_errors = false;
 
-    for (const event of EVENTS) {
-        delegates[event] = (process.listeners as any)(event) as Array<(...args: any[]) => void>;
-        for (const listener of delegates[event]!) (process.removeListener as any)(event, listener);
+    const rejections = process.listeners('unhandledRejection');
+    for (const listener of rejections) process.removeListener('unhandledRejection', listener);
+    const exceptions = process.listeners('uncaughtException');
+    for (const listener of exceptions) process.removeListener('uncaughtException', listener);
+    delegates = { unhandledRejection: rejections, uncaughtException: exceptions };
 
-        (process.on as any)(event, (reason: unknown, ...rest: unknown[]) => {
-            if (isCrawlerTransportFault(reason)) {
-                absorbed++;
-                const message = errorMessage(reason);
-                log.warn(
-                    `crawler transport fault absorbed (${absorbed} since start): ${message}. ` +
-                    'The crawler retries on its own; the server stays up.'
-                );
-                return;
-            }
-            shutDown(event, reason, rest);
-        });
-    }
+    process.on('unhandledRejection', onUnhandledRejection);
+    process.on('uncaughtException', onUncaughtException);
 
     log.info('crawler fault guard installed: a node transport fault no longer shuts the server down');
 }
@@ -87,11 +100,11 @@ export function installCrawlerFaultGuard(): void {
 /** For tests: restores the listeners that were in place before. */
 export function uninstallCrawlerFaultGuard(): void {
     if (!installed) return;
-    for (const event of EVENTS) {
-        for (const listener of (process.listeners as any)(event)) (process.removeListener as any)(event, listener);
-        for (const listener of delegates[event] ?? []) (process.on as any)(event, listener);
-    }
-    const server: any = (cds.env as any).server;
+    for (const listener of process.listeners('unhandledRejection')) process.removeListener('unhandledRejection', listener);
+    for (const listener of delegates.unhandledRejection ?? []) process.on('unhandledRejection', listener);
+    for (const listener of process.listeners('uncaughtException')) process.removeListener('uncaughtException', listener);
+    for (const listener of delegates.uncaughtException ?? []) process.on('uncaughtException', listener);
+    const server: { shutdown_on_uncaught_errors?: unknown } | undefined = cds.env.server;
     if (server) server.shutdown_on_uncaught_errors = previousShutdownFlag;
     delegates = {};
     installed = false;

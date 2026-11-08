@@ -22,7 +22,7 @@ export class SyncStateNetworkMismatchError extends NightgateError {
 }
 
 export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?: string): Promise<void> {
-    const existing: any = await db.run(
+    const existing: SyncState | null | undefined = await db.run(
         SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
     );
 

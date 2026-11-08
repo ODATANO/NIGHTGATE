@@ -46,10 +46,10 @@ fi
 
 # preprod and mainnet have no built-in node or indexer; without them the plugin stays offline and the
 # health check would restart the container for nothing.
-case "${NIGHTGATE_NETWORK:-preprod}" in
+case "${NIGHTGATE_NETWORK:-mainnet}" in
     preprod|mainnet)
         if [ -z "${NIGHTGATE_NODE_URL:-}" ] || [ -z "${NIGHTGATE_INDEXER_HTTP_URL:-}" ]; then
-            echo "FATAL: network ${NIGHTGATE_NETWORK:-preprod} has no built-in node or indexer: set NIGHTGATE_NODE_URL and NIGHTGATE_INDEXER_HTTP_URL (your own, or hosted ones with the access token in the URL; docs/self-hosted.md)." >&2
+            echo "FATAL: network ${NIGHTGATE_NETWORK:-mainnet} has no built-in node or indexer: set NIGHTGATE_NODE_URL and NIGHTGATE_INDEXER_HTTP_URL (your own, or hosted ones with the access token in the URL; docs/self-hosted.md)." >&2
             exit 1
         fi ;;
 esac
@@ -84,7 +84,7 @@ else
     fi
 fi
 
-echo "Starting NIGHTGATE (network=${NIGHTGATE_NETWORK:-preprod}, auth=$AUTH_KIND, db=$DB_LABEL)"
+echo "Starting NIGHTGATE (network=${NIGHTGATE_NETWORK:-mainnet}, auth=$AUTH_KIND, db=$DB_LABEL)"
 # node is PID 1 so SIGTERM reaches cds (an `sh -c` in between would not forward it).
 # No concurrent recompilation: a background compile can deadlock with the main
 # thread at a GC safepoint. V8 flags do not fit NODE_OPTIONS, so they go here.

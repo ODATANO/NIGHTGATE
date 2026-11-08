@@ -4,7 +4,6 @@ import cds from '@sap/cds';
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 import { type NightgateNetwork, VALID_NIGHTGATE_NETWORKS } from '../../utils/nightgate-config';
-import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
 import { vaultRef, liveProviderConfigured } from '../verify-state';
 import { agentOutputProducedAt } from '../document-proof';
@@ -42,7 +41,6 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             // Ownership first, so nothing is written for a caller who does not own the session.
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
@@ -185,7 +183,6 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
@@ -228,7 +225,6 @@ export function registerDocumentActions(ctx: Pick<SubmissionContext, 'srv' | 'db
         const contractAddressLc = data.contractAddress.toLowerCase();
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);

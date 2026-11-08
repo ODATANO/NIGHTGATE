@@ -4,6 +4,8 @@ const mockCdsDeployTo = vi.fn();
 const mockCdsDeploy = vi.hoisted(() => (vi.fn()));
 const mockConnectTo = vi.hoisted(() => (vi.fn()));
 const mockStartCrawler = vi.hoisted(() => (vi.fn()));
+const mockPendingReindexHeight = vi.hoisted(() => (vi.fn()));
+const mockStartReindex = vi.hoisted(() => (vi.fn()));
 const mockStopCrawler = vi.hoisted(() => (vi.fn()));
 const mockEnsureNightgateModelLoaded = vi.hoisted(() => (vi.fn()));
 const selectFromSpy = vi.hoisted(() => (vi.fn()));
@@ -74,6 +76,11 @@ vi.mock('@sap/cds', () => {
 vi.mock('../../srv/crawler/index', () => ({
     startCrawler: mockStartCrawler,
     stopCrawler: mockStopCrawler
+}));
+
+vi.mock('../../srv/crawler/reindex', () => ({
+    pendingReindexHeight: mockPendingReindexHeight,
+    startReindex: mockStartReindex
 }));
 
 vi.mock('../../srv/utils/cds-model', () => ({
@@ -174,6 +181,8 @@ describe('runtime initialize', () => {
         mockCdsDeploy.mockReturnValue({ to: mockCdsDeployTo });
         mockConnectTo.mockResolvedValue({ run: mockDbRun, deploy: mockDbDeploy });
         mockStartCrawler.mockResolvedValue(undefined);
+        mockPendingReindexHeight.mockResolvedValue(null);
+        mockStartReindex.mockReset();
         mockStopCrawler.mockResolvedValue(undefined);
         mockEnsureNightgateModelLoaded.mockResolvedValue(undefined);
 
@@ -192,6 +201,20 @@ describe('runtime initialize', () => {
         }
     });
 
+    it('finishes an interrupted reindex before the crawler starts', async () => {
+        mockPendingReindexHeight.mockResolvedValue(1234);
+        mockStartReindex.mockResolvedValue(undefined);
+
+        await initialize();
+
+        expect(mockStartCrawler).not.toHaveBeenCalled();
+        expect(mockStartReindex.mock.calls[0][1]).toBe(1234);
+        const crawler = mockStartReindex.mock.calls[0][2];
+        await expect(crawler.stop()).resolves.toBe(true);
+        await crawler.start();
+        expect(mockStartCrawler).toHaveBeenCalledTimes(1);
+    });
+
     it('loads the model before DB access, starts the crawler, and logs syncing startup state', async () => {
         const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
 
@@ -202,7 +225,7 @@ describe('runtime initialize', () => {
             expect(mockEnsureNightgateModelLoaded.mock.invocationCallOrder[0]).toBeLessThan(mockConnectTo.mock.invocationCallOrder[0]);
             expect(mockConnectTo).toHaveBeenCalledWith('db');
             expect(selectFromSpy).toHaveBeenCalledWith('midnight.Blocks', ['slot']);
-            expect(selectFromSpy).toHaveBeenCalledWith('midnight.SyncState', ['authorBackfillHeight', 'authorsBackfilledAt']);
+            expect(selectFromSpy).toHaveBeenCalledWith('midnight.SyncState', ['authorBackfillHeight', 'authorsBackfilledAt', 'reindexTargetHeight']);
             expect(mockDbRun).toHaveBeenNthCalledWith(1, expect.objectContaining({
                 __kind: 'one',
                 __table: 'midnight.Blocks'
@@ -300,7 +323,7 @@ describe('runtime initialize', () => {
 
         const err = await initialize().catch(e => e);
         expect(err).toBeInstanceOf(SchemaNotDeployedError);
-        expect(err.missingTable).toBe('midnight.SyncState (needs columns: authorBackfillHeight, authorsBackfilledAt)');
+        expect(err.missingTable).toBe('midnight.SyncState (needs columns: authorBackfillHeight, authorsBackfilledAt, reindexTargetHeight)');
         expect(err.message).toMatch(/npm run deploy/);
         expect(getStatus()).toEqual(expect.objectContaining({
             initialized: false,

@@ -107,6 +107,16 @@ service NightgateIndexerService {
         runtimeMode  : String;
         databaseKind : String;
         uptime       : Integer;
+        node         : { // null = no crawler runs
+            version            : String;
+            specName           : String;
+            specVersion        : Integer;
+            transactionVersion : Integer;
+            ledgerVersion      : String;
+            peers              : Integer;
+            isSyncing          : Boolean;
+            errors             : array of String;
+        };
         contracts    : array of {
             name           : String;
             artifactDigest : String;

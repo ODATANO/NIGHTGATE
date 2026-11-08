@@ -29,7 +29,7 @@ const ng = connect({
 async function build(i) {
   const vault = V[i % V.length];
   const b = await createTxBuilder({
-    seedHex: randomBytes(64).toString('hex'), networkId: process.env.NIGHTGATE_NETWORK || 'preprod',
+    seedHex: randomBytes(64).toString('hex'), networkId: process.env.NIGHTGATE_NETWORK || 'preview',
     indexerHttpUrl: IHTTP, indexerWsUrl: IWS, nodeUrl: NODE,
     zkConfigBaseUrl: `${BASE}/zk-config/attestation-vault`, contractClass: Contract,
     cacheDir: join(tmpdir(), 'nightgate-two-machine-proof'), circuits: ['attest']

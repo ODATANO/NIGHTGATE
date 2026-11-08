@@ -29,7 +29,7 @@ export interface SignedBlock {
         header: BlockHeader;
         extrinsics: string[];  // hex-encoded extrinsics
     };
-    justifications: any;
+    justifications: unknown;
 }
 
 export interface RuntimeVersion {
@@ -50,22 +50,22 @@ interface JsonRpcRequest {
 interface JsonRpcResponse {
     jsonrpc: '2.0';
     id?: number;
-    result?: any;
-    error?: { code: number; message: string; data?: any };
+    result?: unknown;
+    error?: { code: number; message: string; data?: unknown };
     method?: string;     // for subscription notifications
     params?: {           // for subscription notifications
         subscription: string;
-        result: any;
+        result: unknown;
     };
 }
 
 interface PendingRequest {
-    resolve: (value: any) => void;
+    resolve: (value: unknown) => void;
     reject: (error: Error) => void;
     timeout: ReturnType<typeof setTimeout>;
 }
 
-type SubscriptionCallback = (result: any) => void | Promise<void>;
+type SubscriptionCallback = (result: unknown) => void | Promise<void>;
 
 /** Caps the reconnect delay at reconnectInterval times this factor. With the defaults that is one attempt a minute. */
 const MAX_RECONNECT_DELAY_FACTOR = 12;
@@ -84,7 +84,7 @@ export class MidnightNodeProvider {
     private onReconnectCallback: (() => Promise<void>) | null = null;
     private onReconnectFailedCallback: (() => void) | null = null;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    private orphanNotifications: Map<string, any[]> = new Map();
+    private orphanNotifications: Map<string, unknown[]> = new Map();
     private heartbeat: ReturnType<typeof setInterval> | null = null;
     private alive = true;
 
@@ -252,7 +252,8 @@ export class MidnightNodeProvider {
         }, delay);
     }
 
-    async rpc(method: string, params: unknown[] = []): Promise<any> {
+    /** The answer is not validated. The typed methods below state the shape the node documents for each call. */
+    async rpc(method: string, params: unknown[] = []): Promise<unknown> {
         if (!this.ws || !this.connected) {
             throw new Error('Not connected to Midnight Node');
         }
@@ -279,14 +280,14 @@ export class MidnightNodeProvider {
     }
 
     /** Sends all calls in one JSON-RPC batch. Results come back in input order. Rejects if any call fails. */
-    async rpcBatch(requests: Array<{ method: string; params?: unknown[] }>): Promise<any[]> {
+    async rpcBatch(requests: Array<{ method: string; params?: unknown[] }>): Promise<unknown[]> {
         if (!this.ws || !this.connected) {
             throw new Error('Not connected to Midnight Node');
         }
         if (requests.length === 0) return [];
 
         const ids: number[] = [];
-        const promises: Promise<any>[] = [];
+        const promises: Promise<unknown>[] = [];
 
         for (const req of requests) {
             const id = ++this.requestId;
@@ -368,40 +369,40 @@ export class MidnightNodeProvider {
     }
 
     async getHeader(hash?: string): Promise<BlockHeader> {
-        return this.rpc('chain_getHeader', hash ? [hash] : []);
+        return this.rpc('chain_getHeader', hash ? [hash] : []) as Promise<BlockHeader>;
     }
 
     async getBlock(hash: string): Promise<SignedBlock> {
-        return this.rpc('chain_getBlock', [hash]);
+        return this.rpc('chain_getBlock', [hash]) as Promise<SignedBlock>;
     }
 
     async getBlockHash(height: number): Promise<string> {
-        return this.rpc('chain_getBlockHash', [height]);
+        return this.rpc('chain_getBlockHash', [height]) as Promise<string>;
     }
 
     async getFinalizedHead(): Promise<string> {
-        return this.rpc('chain_getFinalizedHead');
+        return this.rpc('chain_getFinalizedHead') as Promise<string>;
     }
 
     async getStorage(key: string, blockHash?: string): Promise<string | null> {
-        return this.rpc('state_getStorage', blockHash ? [key, blockHash] : [key]);
+        return this.rpc('state_getStorage', blockHash ? [key, blockHash] : [key]) as Promise<string | null>;
     }
 
     async getRuntimeVersion(blockHash?: string): Promise<RuntimeVersion> {
-        return this.rpc('state_getRuntimeVersion', blockHash ? [blockHash] : []);
+        return this.rpc('state_getRuntimeVersion', blockHash ? [blockHash] : []) as Promise<RuntimeVersion>;
     }
 
     /** SCALE-encoded runtime metadata. */
     async getMetadata(blockHash?: string): Promise<string> {
-        return this.rpc('state_getMetadata', blockHash ? [blockHash] : []);
+        return this.rpc('state_getMetadata', blockHash ? [blockHash] : []) as Promise<string>;
     }
 
 
-    private invokeSubscriptionCallback(callback: SubscriptionCallback, result: any): void {
+    private invokeSubscriptionCallback(callback: SubscriptionCallback, result: unknown): void {
         try {
             const r = callback(result);
-            if (r && typeof (r as any).then === 'function') {
-                void (r as Promise<any>).catch((err: unknown) => {
+            if (r && typeof r.then === 'function') {
+                void r.catch((err: unknown) => {
                     const errMsg = errorMessage(err);
                     log.error('Subscription callback failed:', errMsg);
                 });
@@ -413,7 +414,7 @@ export class MidnightNodeProvider {
     }
 
     /** Kept small on purpose. Late notifications for an id that is already unsubscribed would otherwise pile up until the next reconnect. */
-    private bufferOrphan(subscriptionId: string, result: any): void {
+    private bufferOrphan(subscriptionId: string, result: unknown): void {
         let buf = this.orphanNotifications.get(subscriptionId);
         if (!buf) {
             if (this.orphanNotifications.size >= ORPHAN_SUBSCRIPTIONS_MAX) {
@@ -438,8 +439,8 @@ export class MidnightNodeProvider {
 
 
     async subscribeFinalizedHeads(callback: (header: BlockHeader) => void): Promise<string> {
-        const subscriptionId = await this.rpc('chain_subscribeFinalizedHeads', []);
-        this.registerSubscription(subscriptionId, callback);
+        const subscriptionId = await (this.rpc('chain_subscribeFinalizedHeads', []) as Promise<string>);
+        this.registerSubscription(subscriptionId, result => callback(result as BlockHeader));
         return subscriptionId;
     }
 
@@ -447,7 +448,7 @@ export class MidnightNodeProvider {
     async unsubscribeFinalizedHeads(subscriptionId: string): Promise<boolean> {
         this.subscriptions.delete(subscriptionId);
         this.orphanNotifications.delete(subscriptionId);
-        return this.rpc('chain_unsubscribeFinalizedHeads', [subscriptionId]);
+        return this.rpc('chain_unsubscribeFinalizedHeads', [subscriptionId]) as Promise<boolean>;
     }
 
     static parseBlockNumber(hex: string): number {

@@ -79,12 +79,12 @@ describe('connect: service paths', () => {
         const old = fakeFetch([{ body: {} }]);
         const ngOld = connect({
             baseUrl: 'https://ng.example', fetchFn: old.fn as any,
-            servicePath: '/api/v1/nightgate', indexerServicePath: '/api/v1/indexer'
+            servicePath: '/gateway/midnight', indexerServicePath: '/gateway/midnight-indexer'
         });
         await ngOld.getHealth();
         await ngOld.verifyAttestation({ contractAddress: 'c', payloadHash: 'p' });
-        expect(old.calls[0].url).toBe('https://ng.example/api/v1/indexer/getHealth()');
-        expect(old.calls[1].url.startsWith('https://ng.example/api/v1/nightgate/verifyAttestationState(')).toBe(true);
+        expect(old.calls[0].url).toBe('https://ng.example/gateway/midnight-indexer/getHealth()');
+        expect(old.calls[1].url.startsWith('https://ng.example/gateway/midnight/verifyAttestationState(')).toBe(true);
     });
 });
 
@@ -139,7 +139,7 @@ describe('connect: jobs', () => {
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
         const out = await ng.sponsorFinalized({ finalizedTxB64: 'AAAA' });
         expect(out.txHash).toBe('00cd');
-        expect(JSON.parse(calls[0].init.body)).toEqual({ finalizedTxB64: 'AAAA' });
+        expect(JSON.parse(calls[0].init.body)).toMatchObject({ finalizedTxB64: 'AAAA' });
         expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 'sponsor-1', waitMs: 20_000 });
     });
 
@@ -152,7 +152,7 @@ describe('connect: jobs', () => {
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
         const out = await ng.sponsorSwap({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC' });
         expect(calls[0].url).toBe('https://ng.example/odata/v4/midnight/sponsorSwap');
-        expect(JSON.parse(calls[0].init.body)).toEqual({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC' });
+        expect(JSON.parse(calls[0].init.body)).toMatchObject({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC' });
         expect(JSON.parse(calls[1].init.body)).toMatchObject({ jobId: 'job-9', sessionId: 'sponsor-1' });
         expect(out).toMatchObject({ txHash: '00aa', swap: { gives: { amount: '10' } } });
     });
@@ -316,6 +316,57 @@ describe('connect: stale keep-alive socket', () => {
         expect(get).toHaveBeenCalledTimes(2);
     });
 
+    test('a finished job names its session and carries a receipt once there is one', async () => {
+        const { connect } = await importClient();
+        const receipt = { payload: '{}', signature: 'aa', publicKey: 'bb', algorithm: 'ed25519' };
+        const answers = [
+            { jobId: 'j1', status: 'pending', sessionId: 'pool' }, { status: 'succeeded', txHash: '00aa', result: '{}' },
+            { jobId: 'j2', status: 'pending', sessionId: 'pool' }, { status: 'succeeded', txHash: '00bb', result: '{}', receipt }
+        ];
+        const fn = vi.fn(async () => ({ ok: true, status: 200, text: async () => JSON.stringify(answers.shift()) }));
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        const first = await ng.sponsorTransfer({ transferTxB64: 'AA==', tokenType: 'ab', amount: '1' });
+        expect(first).toMatchObject({ jobId: 'j1', sessionId: 'pool' });
+        expect(first).not.toHaveProperty('receipt');
+        expect(await ng.sponsorTransfer({ transferTxB64: 'AA==', tokenType: 'ab', amount: '1' })).toMatchObject({ jobId: 'j2', sessionId: 'pool', receipt });
+    });
+
+    test('a job call gets its own key and goes out again on a dead connection with the same key', async () => {
+        const { connect } = await importClient();
+        const fn = vi.fn()
+            .mockRejectedValueOnce(staleSocket())
+            .mockResolvedValueOnce({ ok: true, status: 200, text: async () => JSON.stringify({ txHash: '0xabc' }) });
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        await expect(ng.sponsorUnbound({ unboundTxB64: 'AA==' })).resolves.toMatchObject({ txHash: '0xabc' });
+        expect(fn).toHaveBeenCalledTimes(2);
+        const [first, second] = fn.mock.calls.map(([, init]) => JSON.parse(init.body));
+        expect(first.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/);
+        expect(second.idempotencyKey).toBe(first.idempotencyKey);
+    });
+
+    test('two job calls get different keys, and a key from the caller is kept', async () => {
+        const { connect } = await importClient();
+        const fn = vi.fn(async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ txHash: '0xabc' }) }));
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        await ng.sponsorUnbound({ unboundTxB64: 'AA==' });
+        await ng.sponsorUnbound({ unboundTxB64: 'AA==' });
+        await ng.sponsorUnbound({ unboundTxB64: 'AA==', idempotencyKey: 'mine' });
+        await ng.sponsorUnbound({ unboundTxB64: 'AA==', idempotencyKey: undefined });
+        const keys = (fn.mock.calls as unknown as [string, { body: string }][]).map(([, init]) => JSON.parse(init.body).idempotencyKey);
+        expect(keys[0]).not.toBe(keys[1]);
+        expect(keys[2]).toBe('mine');
+        expect(keys[3]).toMatch(/^[0-9a-f-]{36}$/);
+    });
+
+    test('buildSponsorable sends no key, because the action does not declare one', async () => {
+        const { connect } = await importClient();
+        const fn = vi.fn(async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ finalizedTxB64: 'AA==' }) }));
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        await ng.buildSponsorable({ sessionId: 's' });
+        const [[, init]] = fn.mock.calls as unknown as [string, { body: string }][];
+        expect(JSON.parse(init.body)).toEqual({ sessionId: 's' });
+    });
+
     test('a write without an idempotencyKey is never sent twice: the error surfaces after one attempt', async () => {
         const { connect } = await importClient();
         const once = vi.fn().mockRejectedValue(staleSocket());
@@ -415,7 +466,7 @@ describe('connect: the chain reads a transaction builder needs', () => {
                 actionIndex: 1,
                 transaction: {
                     hash: '0xdeploy', ledgerTxHash: '0xledger', identifiers: JSON.stringify(['id0', 'id1']),
-                    block: { height: 7, hash: '0xb7' },
+                    block: { height: 7, hash: '0xb7', timestamp: 1700, protocolVersion: 2001000 },
                     transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ segmentId: 0, success: true }, { segmentId: 1, success: false }] }
                 }
             }]
@@ -427,9 +478,18 @@ describe('connect: the chain reads a transaction builder needs', () => {
         expect(url).toContain(`/ContractActions?$filter=address eq '${'ab'.repeat(32)}' and actionType eq 'DEPLOY'`);
         expect(url).toContain('$expand=transaction($expand=block,transactionResult($expand=segments))');
         expect(deploy).toEqual({
-            txHash: '0xdeploy', ledgerTxHash: '0xledger', blockHeight: 7, blockHash: '0xb7', status: 'PARTIAL_SUCCESS',
+            txHash: '0xdeploy', ledgerTxHash: '0xledger', blockHeight: 7, blockHash: '0xb7', blockTimestamp: 1700, protocolVersion: 2001000, status: 'PARTIAL_SUCCESS',
             failedSegments: [1], identifiers: ['id0', 'id1'], txId: 'id1'
         });
+    });
+
+    test('ledgerTransaction returns the base64 bytes, and null while the server has not indexed them', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([{ body: { hash: '0xdeploy', ledgerTransaction: 'dHg=' } }, { status: 404, body: { error: { message: 'none' } } }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        expect(await ng.ledgerTransaction('0xdeploy')).toBe('dHg=');
+        expect(decodeURIComponent(calls[0].url)).toContain('/Transactions/ledgerTransaction(');
+        expect(await ng.ledgerTransaction('0xother')).toBeNull();
     });
 
     test('contractDeploy is null while the server has no deploy action', async () => {

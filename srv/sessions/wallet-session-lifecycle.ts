@@ -11,7 +11,6 @@ import { withKeyedLock } from '../utils/keyed-lock';
 import { deriveAccountId, deriveStoragePassword } from '../submission/wallet-material-factory';
 import { registerNightUtxosForDust, deregisterNightUtxosFromDust } from '../submission/dust-registration';
 import { sendNight } from '../submission/token-ops';
-import { ensureNetworkId } from '../midnight/providers';
 import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
 import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
 import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
@@ -70,7 +69,6 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db:
         syncStatePassphrase: syncPass,
         accountIndex: session.accountIndex ?? 0
     };
-    await ensureNetworkId(network);
     await getOrBuildWalletFacade(accountId, { seedHex, ...facadeConfig });
 
     if (command.op === 'prewarm') {
@@ -120,7 +118,7 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db:
         const result = await withRejectBookkeeping(() => sendNight({ cacheKey: accountId, receiverAddress: command.receiverAddress, amount: command.amount, ttlIso: command.ttlIso, tokenTypeHex: command.tokenTypeHex, onSubmitIntent }));
         return { txId: result.txId, toLedger: result.toLedger, amount: result.amount, receiverAddress: result.receiverAddress };
     }
-    throw new Error(`Unsupported wallet command operation: ${(command as any).op}`);
+    throw new Error(`Unsupported wallet command operation: ${(command as { op: unknown }).op}`);
 }
 
 type SessionRefusal = { ok: false; status: number; msg: string };

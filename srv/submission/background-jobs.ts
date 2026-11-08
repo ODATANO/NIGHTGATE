@@ -24,7 +24,7 @@ export { recoverInterruptedJobs, BROADCAST_UNCONFIRMED, BROADCAST_NOT_INCLUDED, 
 export { startBackgroundJobProcessor, stopBackgroundJobProcessor, reclaimExpiredLeases, __pollOnceForTests } from './job-scheduler';
 export { REJECTED_ATTEMPT_BOOKKEEPING_PENDING, SponsorAttemptBookkeepingPendingError } from './job-execution-context';
 
-const { SELECT, INSERT } = cds.ql;
+const { SELECT, INSERT, UPDATE } = cds.ql;
 
 export interface StartJobArgs<TIn, TOut> {
     kind: string;
@@ -102,11 +102,11 @@ export async function startJob<TIn, TOut>(
     // Store the build's digest now so the job refuses to run if the name changes.
     let effectiveCommand: unknown = command;
     if (replayable && command && typeof command === 'object'
-        && typeof (command as any).compiledArtifactRef === 'string'
-        && (command as any).artifactDigest === undefined) {
+        && 'compiledArtifactRef' in command && typeof command.compiledArtifactRef === 'string'
+        && !('artifactDigest' in command && command.artifactDigest !== undefined)) {
         effectiveCommand = {
-            ...(command as object),
-            artifactDigest: getArtifactGenerationDigest((command as any).compiledArtifactRef)
+            ...command,
+            artifactDigest: getArtifactGenerationDigest(command.compiledArtifactRef)
         };
     }
     const serializedCommand = replayable ? safeStringify(effectiveCommand) : null;
@@ -280,7 +280,8 @@ export async function runChildCommand<T>(args: {
     }
 }
 
-/** The existing job for this idempotency key, or null. Throws when the key is reused with a different payload. */
+/** The existing job for this idempotency key, or null. Throws when the key is reused with a different payload.
+ *  A failed job releases its key, except a workflow step: the retry after an error is a new job, whatever its payload. */
 async function dedupExisting<TIn, TOut>(
     runner: DbRunner,
     sessionId: string,
@@ -294,6 +295,13 @@ async function dedupExisting<TIn, TOut>(
             .orderBy('createdAt desc')
     );
     if (!existing) return null;
+    // A workflow step keeps its key: a replayed parent must see the failed step, not pay for it again.
+    if (existing.status === 'failed' && !existing.parentJobId) {
+        // Only a terminal failure. A parked job (reconciliation_required) may be on chain and keeps its key.
+        await runner.run(UPDATE.entity(BackgroundJobs).set({ idempotencyKey: null }).where({ ID: existing.ID, status: 'failed' }));
+        cds.log('nightgate').info(`startJob(${kind}): idempotency key of failed job ${String(existing.ID).slice(0, 8)}… released for a retry`);
+        return null;
+    }
     if (existing.payloadFingerprint && existing.payloadFingerprint !== payloadFingerprint) {
         throw new IdempotencyConflictError(idempotencyKey);
     }

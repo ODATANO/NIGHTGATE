@@ -3,7 +3,7 @@
  *
  * The per-role HD derivation is what makes the account match Lace; a raw-seed
  * derivation lands on a different (unfunded) account. These tests import the
- * ACTUAL ESM SDKs (wallet-sdk-hd, ledger-v8, address-format,
+ * ACTUAL ESM SDKs (wallet-sdk-hd, ledger-v9, address-format,
  * unshielded-wallet; all offline, no chain) and pin the derivation of the
  * standard BIP39 test mnemonic, so any drift in our role/account/index path
  * or an SDK upgrade that changes key material fails loudly instead of

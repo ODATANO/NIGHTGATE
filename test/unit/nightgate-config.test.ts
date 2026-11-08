@@ -81,6 +81,10 @@ describe('normalizeNightgateNetwork', () => {
     it('returns DEFAULT_NETWORK with no invalidNetwork for undefined input', () => {
         expect(normalizeNightgateNetwork(undefined)).toEqual({ network: DEFAULT_NETWORK });
     });
+
+    it('defaults to mainnet', () => {
+        expect(DEFAULT_NETWORK).toBe('mainnet');
+    });
 });
 
 describe('isNightgatePluginConfigured', () => {

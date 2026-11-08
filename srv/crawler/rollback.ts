@@ -4,7 +4,7 @@
 import cds from '@sap/cds';
 import { toBigInt } from '../utils/numbers';
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
-import { Blocks, Transactions, ContractActions, ContractBalances, ContractStates, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults, TransactionSegments, TransactionIdentifiers, NightBalances, SyncState, PendingSubmissions, BackgroundJobs, type Block, type Transaction, type UnshieldedUtxo } from '#cds-models/midnight';
+import { Blocks, Transactions, ContractActions, ContractBalances, ContractStates, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, TransactionFees, TransactionResults, TransactionSegments, TransactionIdentifiers, NightBalances, SyncState, PendingSubmissions, BackgroundJobs, type Block, type Transaction, type UnshieldedUtxo, type ContractAction, type TransactionResult } from '#cds-models/midnight';
 import { bumpReorgGeneration } from '../submission/reorg-generation';
 import { NIGHT_RAW_TOKEN_TYPE } from './block-events';
 import { affectedRows, type DbRunner } from '../utils/db-types';
@@ -12,8 +12,8 @@ import { affectedRows, type DbRunner } from '../utils/db-types';
 // PostgreSQL allows at most 65535 parameters per statement, so long ID lists are split.
 const IN_CHUNK = 5000;
 
-async function chunked(ids: unknown[], query: (chunk: unknown[]) => Promise<any>): Promise<any[]> {
-    const rows: any[] = [];
+async function chunked<T = never>(ids: unknown[], query: (chunk: unknown[]) => Promise<unknown>): Promise<T[]> {
+    const rows: T[] = [];
     for (let i = 0; i < ids.length; i += IN_CHUNK) {
         const result = await query(ids.slice(i, i + IN_CHUNK));
         if (Array.isArray(result)) for (const row of result) rows.push(row);
@@ -64,11 +64,11 @@ export async function rollbackIndexedDataFromHeight(
         };
     }
 
-    const txsToDelete = await chunked(blockIds, ids => tx.run(
+    const txsToDelete = await chunked<Pick<Transaction, 'ID' | 'hash' | 'senderAddress' | 'receiverAddress'>>(blockIds, ids => tx.run(
         SELECT.from(Transactions).columns('ID', 'hash', 'senderAddress', 'receiverAddress')
             .where({ block_ID: { in: ids } })
     ));
-    const txIds = txsToDelete.map((t: { ID?: string }) => t.ID).filter(Boolean);
+    const txIds = txsToDelete.map(t => t.ID).filter(Boolean);
 
     // Collect the affected addresses before anything is deleted.
     const affected = new Set<string>();
@@ -78,23 +78,23 @@ export async function rollbackIndexedDataFromHeight(
     }
 
     if (txIds.length > 0) {
-        const utxoOwners = await chunked(txIds, ids => tx.run(
+        const utxoOwners = await chunked<Pick<UnshieldedUtxo, 'owner'>>(txIds, ids => tx.run(
             SELECT.from(UnshieldedUtxos).columns('owner').where({ createdAtTransaction_ID: { in: ids } })
         ));
         for (const u of utxoOwners) if (u.owner) affected.add(u.owner);
-        const spentOwners = await chunked(txIds, ids => tx.run(
+        const spentOwners = await chunked<Pick<UnshieldedUtxo, 'owner'>>(txIds, ids => tx.run(
             SELECT.from(UnshieldedUtxos).columns('owner').where({ spentAtTransaction_ID: { in: ids } })
         ));
         for (const u of spentOwners) if (u.owner) affected.add(u.owner);
 
-        const actionIds = (await chunked(txIds, ids => tx.run(
+        const actionIds = (await chunked<Pick<ContractAction, 'ID'>>(txIds, ids => tx.run(
             SELECT.from(ContractActions).columns('ID').where({ transaction_ID: { in: ids } })
-        ))).map((a: { ID: string }) => a.ID);
+        ))).map(a => a.ID);
         await chunked(actionIds, ids => tx.run(DELETE.from(ContractBalances).where({ contractAction_ID: { in: ids } })));
 
-        const resultIds = (await chunked(txIds, ids => tx.run(
+        const resultIds = (await chunked<Pick<TransactionResult, 'ID'>>(txIds, ids => tx.run(
             SELECT.from(TransactionResults).columns('ID').where({ transaction_ID: { in: ids } })
-        ))).map((r: { ID: string }) => r.ID);
+        ))).map(r => r.ID);
         await chunked(resultIds, ids => tx.run(DELETE.from(TransactionSegments).where({ transactionResult_ID: { in: ids } })));
 
         await chunked(txIds, async ids => {
@@ -244,13 +244,13 @@ export async function computeNightBalance(tx: DbRunner, address: string): Promis
         ...utxos.map(u => u.createdAtTransaction_ID),
         ...utxos.map(u => u.spentAtTransaction_ID)
     ].filter(Boolean))];
-    const activityTxs = await chunked(activityTxIds, ids => tx.run(
+    const activityTxs = await chunked<Pick<Transaction, 'ID' | 'block_ID'>>(activityTxIds, ids => tx.run(
         SELECT.from(Transactions).columns('ID', 'block_ID').where({ ID: { in: ids } })
     ));
     const blockIds = [...new Set(
         [...activityTxs.map(t => t.block_ID), ...sentTxs.map(t => t.block_ID)].filter(Boolean)
     )];
-    const blocks = await chunked(blockIds, ids => tx.run(
+    const blocks = await chunked<Pick<Block, 'ID' | 'height'>>(blockIds, ids => tx.run(
         SELECT.from(Blocks).columns('ID', 'height').where({ ID: { in: ids } })
     ));
     const heights = blocks.map(b => Number(b.height)).filter(Number.isFinite);

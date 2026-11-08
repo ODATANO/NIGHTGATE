@@ -1,6 +1,6 @@
 // One limiter per rate class, built on first use, and the one 429 answer for every limit.
 // The count of a class comes from the override source (the sponsor policy file), else its config key.
-import { RateLimiter, principalRateKey, grantRateKey, type RateCheckResult } from './rate-limiter';
+import { RateLimiter, principalRateKey, grantRateKey, type RateCheckResult, type RateKeySource } from './rate-limiter';
 import { RATE_CLASSES, RATE_CLASS_NAMES, describeWindow, type RateClass } from './rate-class-table';
 import { configNumber } from './config';
 
@@ -9,9 +9,9 @@ export { RATE_CLASSES, RATE_CLASS_NAMES, type RateClass } from './rate-class-tab
 /** Names of the limits that are not a class: the grant budgets and the shared indexer read budget. */
 export const BUDGET_LIMIT_NAMES = ['grant-hour', 'grant-day', 'indexer-budget'] as const;
 
-interface RejectingRequest {
+interface RejectingRequest extends RateKeySource {
     reject?: (status: number, message: string) => unknown;
-    http?: { res?: { set?: (name: string, value: string) => unknown; get?: (name: string) => string | undefined } };
+    http?: { req?: { ip?: unknown }; res?: { set?: (name: string, value: string) => unknown; get?: (name: string) => string | undefined } };
 }
 
 /** A limit as it stands for one caller after a check. */

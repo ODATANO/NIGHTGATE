@@ -39,6 +39,8 @@ vi.mock('@sap/cds', () => {
 
 const mockTopology = vi.hoisted(() => vi.fn());
 vi.mock('../../srv/utils/runtime-topology', () => ({ getRuntimeTopology: mockTopology }));
+const mockNodeProvider = vi.hoisted(() => vi.fn());
+vi.mock('../../srv/crawler/index', () => ({ getActiveNodeProvider: mockNodeProvider }));
 
 const mockListContracts = vi.hoisted(() => vi.fn());
 const mockGetRegistration = vi.hoisted(() => vi.fn());
@@ -357,13 +359,6 @@ describe('buildMetricsText', () => {
         expect(text).toContain('odatano_nightgate_wallet_worker_rotations 0');
     });
 
-    it('counts requests on the deprecated service paths per path', async () => {
-        const text = await buildMetricsText(db);
-        expect(text).toContain('# TYPE odatano_nightgate_legacy_path_requests_total counter');
-        expect(text).toContain('odatano_nightgate_legacy_path_requests_total{path="/api/v1/nightgate"} 0');
-        expect(text).toContain('odatano_nightgate_legacy_path_requests_total{path="/api/v1/indexer"} 0');
-    });
-
     it('carries the event-loop lag of the last window', async () => {
         const text = await buildMetricsText(db);
         expect(text).toMatch(/odatano_nightgate_event_loop_lag_p99_ms \d/);
@@ -407,7 +402,7 @@ describe('buildMetricsText', () => {
 });
 
 describe('buildRuntimeInfo', () => {
-    it('reports the artifact digest per registered contract', () => {
+    it('reports the artifact digest per registered contract', async () => {
         mockListContracts.mockReturnValue(['attestation-vault', 'attestation-vault-32']);
         mockGetRegistration.mockImplementation((name: string) =>
             name.endsWith('-32') ? { slotWidth: 32, privateStateId: 'ps' } : { privateStateId: 'ps' }
@@ -415,7 +410,7 @@ describe('buildRuntimeInfo', () => {
         mockGetDigest.mockImplementation((name: string) => `digest-${name}`);
         mockGetCurrentDigest.mockImplementation((name: string) => `digest-${name}`);
 
-        const info = buildRuntimeInfo();
+        const info = await buildRuntimeInfo();
         expect(info.network).toBe('preprod');
         expect(info.provingMode).toBe('wasm');
         expect(info.contracts).toEqual([
@@ -444,7 +439,7 @@ describe('buildRuntimeInfo', () => {
         ]);
     });
 
-    it('flags a digest the process loaded but no longer matches on disk', () => {
+    it('flags a digest the process loaded but no longer matches on disk', async () => {
         // The exact failure this endpoint exists to explain. The per-alias
         // digest cache keeps serving the LOADED generation, while
         // resolveContract recomputes uncached and refuses every job, so
@@ -454,13 +449,13 @@ describe('buildRuntimeInfo', () => {
         mockGetDigest.mockReturnValue('loaded-generation');
         mockGetCurrentDigest.mockReturnValue('recompiled-on-disk');
 
-        const contract = (buildRuntimeInfo().contracts as any[])[0];
+        const contract = ((await buildRuntimeInfo()).contracts as any[])[0];
         expect(contract.artifactDigest).toBe('loaded-generation');
         expect(contract.currentDigest).toBe('recompiled-on-disk');
         expect(contract.digestStale).toBe(true);
     });
 
-    it('reports a contract whose artifact does not load instead of hiding it', () => {
+    it('reports a contract whose artifact does not load instead of hiding it', async () => {
         // This is the case the function exists for: after a recompile under a
         // running server every write job dies on the generation guard, and
         // without this the cause is invisible from outside.
@@ -468,14 +463,32 @@ describe('buildRuntimeInfo', () => {
         mockGetRegistration.mockReturnValue({ privateStateId: 'ps' });
         mockGetDigest.mockImplementation(() => { throw new Error('Cannot find module ./managed/broken'); });
 
-        const contracts = buildRuntimeInfo().contracts as any[];
+        const contracts = (await buildRuntimeInfo()).contracts as any[];
         expect(contracts[0].artifactDigest).toBeNull();
         expect(contracts[0].digestError).toContain('Cannot find module');
     });
 
-    it('survives a layout where the package version cannot be read', () => {
+    it('survives a layout where the package version cannot be read', async () => {
         mockListContracts.mockReturnValue([]);
-        expect(typeof buildRuntimeInfo().version).toBe('string');
+        expect(typeof (await buildRuntimeInfo()).version).toBe('string');
+    });
+
+    it('reports node null while no crawler runs', async () => {
+        mockListContracts.mockReturnValue([]);
+        mockNodeProvider.mockReturnValue(null);
+        expect((await buildRuntimeInfo()).node).toBeNull();
+    });
+
+    it('reports the crawler node', async () => {
+        mockListContracts.mockReturnValue([]);
+        mockNodeProvider.mockReturnValue({
+            rpc: async (method: string) => ({ system_version: '1.0.400', midnight_ledgerVersion: '8.1.2', system_health: { peers: 3, isSyncing: false } } as Record<string, unknown>)[method],
+            getRuntimeVersion: async () => ({ specName: 'midnight', implName: 'midnight', specVersion: 1000300, implVersion: 0, transactionVersion: 3 })
+        });
+        expect((await buildRuntimeInfo()).node).toEqual({
+            version: '1.0.400', specName: 'midnight', specVersion: 1000300, transactionVersion: 3,
+            ledgerVersion: '8.1.2', peers: 3, isSyncing: false, errors: []
+        });
     });
 });
 

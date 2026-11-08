@@ -7,7 +7,7 @@
  * suite hermetic and fast, no SQLite spin-up needed.
  */
 
-import { extractEncryptedComponents } from '../../srv/utils/storage-encryption';
+import { extractEncryptedComponents, StorageEncryption } from '../../srv/utils/storage-encryption';
 import {
     CapDbPrivateStateProvider,
     privateStateStableSalt,
@@ -98,6 +98,7 @@ const ACCOUNT  = 'addr_test1q...accountA';
 const ACCOUNT_B = 'addr_test1q...accountB';
 const CONTRACT = '0xcontract-1';
 const CONTRACT_B = '0xcontract-2';
+const sk = (n: number) => ({ tag: 'schnorr' as const, value: n.toString(16).padStart(64, '0') });
 
 function newProvider(accountId = ACCOUNT, db = makeFakeDb()) {
     const provider = new CapDbPrivateStateProvider({
@@ -113,9 +114,8 @@ function newProvider(accountId = ACCOUNT, db = makeFakeDb()) {
 describe('CapDbPrivateStateProvider: password fallbacks', () => {
     test('a row under an older password is read through the fallback and rewritten under the current one', async () => {
         const { provider: old, db } = newProvider();
-        await old.setContractAddress(CONTRACT);
-        await old.set('ps-1', { v: 1 });
-        await old.setSigningKey(CONTRACT, 'sk-1');
+        await old.forContract(CONTRACT).set('ps-1', { v: 1 });
+        await old.setSigningKey(CONTRACT, sk(1));
         const before = db.tables['midnight.PrivateStates'][0].ciphertext;
 
         const current = new CapDbPrivateStateProvider({
@@ -124,23 +124,21 @@ describe('CapDbPrivateStateProvider: password fallbacks', () => {
             privateStoragePasswordFallbacks: () => ['not-this-one-but-long-enough', PASSWORD],
             db
         });
-        current.setContractAddress(CONTRACT);
-        expect(await current.get('ps-1')).toEqual({ v: 1 });
-        expect(await current.getSigningKey(CONTRACT)).toBe('sk-1');
+        expect(await current.forContract(CONTRACT).get('ps-1')).toEqual({ v: 1 });
+        expect(await current.getSigningKey(CONTRACT)).toEqual(sk(1));
         // rewritten: the stored blob now carries the current password's stable salt
         const after = db.tables['midnight.PrivateStates'][0].ciphertext;
         expect(after).not.toBe(before);
         expect(privateStateStableSalt(ACCOUNT, PASSWORD + '-rotated').equals(extractEncryptedComponents(Buffer.from(after, 'base64')).salt)).toBe(true);
         // and opens without any fallback from now on
         const strict = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD + '-rotated', db });
-        strict.setContractAddress(CONTRACT);
-        expect(await strict.get('ps-1')).toEqual({ v: 1 });
-        expect(await strict.getSigningKey(CONTRACT)).toBe('sk-1');
+        expect(await strict.forContract(CONTRACT).get('ps-1')).toEqual({ v: 1 });
+        expect(await strict.getSigningKey(CONTRACT)).toEqual(sk(1));
     });
 
     test('exporting signing keys reads a row under an older password through the fallback', async () => {
         const { provider: old, db } = newProvider();
-        await old.setSigningKey(CONTRACT, 'sk-1');
+        await old.setSigningKey(CONTRACT, sk(1));
         const current = new CapDbPrivateStateProvider({
             accountId: ACCOUNT,
             privateStoragePasswordProvider: () => PASSWORD + '-rotated',
@@ -150,30 +148,27 @@ describe('CapDbPrivateStateProvider: password fallbacks', () => {
         const exported = await current.exportSigningKeys({ password: 'export-password-long-enough' });
         expect(exported.format).toBe('midnight-signing-key-export');
         const strict = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD + '-rotated', db });
-        expect(await strict.getSigningKey(CONTRACT)).toBe('sk-1');
+        expect(await strict.getSigningKey(CONTRACT)).toEqual(sk(1));
     });
 
     test('without a matching fallback the original decrypt error surfaces', async () => {
         const { provider: old, db } = newProvider();
-        await old.setContractAddress(CONTRACT);
-        await old.set('ps-1', { v: 1 });
+        await old.forContract(CONTRACT).set('ps-1', { v: 1 });
         const current = new CapDbPrivateStateProvider({
             accountId: ACCOUNT,
             privateStoragePasswordProvider: () => PASSWORD + '-rotated',
             privateStoragePasswordFallbacks: () => ['some-other-password-of-length'],
             db
         });
-        current.setContractAddress(CONTRACT);
-        await expect(current.get('ps-1')).rejects.toThrow(/Salt mismatch/);
+        await expect(current.forContract(CONTRACT).get('ps-1')).rejects.toThrow(/Salt mismatch/);
     });
 });
 
 describe('CapDbPrivateStateProvider: key scheme marker', () => {
     test('every write and every fallback rewrite marks the row dek1', async () => {
         const { provider: old, db } = newProvider();
-        old.setContractAddress(CONTRACT);
-        await old.set('ps-1', { v: 1 });
-        await old.setSigningKey(CONTRACT, 'sk-1');
+        await old.forContract(CONTRACT).set('ps-1', { v: 1 });
+        await old.setSigningKey(CONTRACT, sk(1));
         expect(db.tables['midnight.PrivateStates'][0].keyScheme).toBe('dek1');
         expect(db.tables['midnight.ContractSigningKeys'][0].keyScheme).toBe('dek1');
         // A legacy row (no marker) read through a fallback comes back marked.
@@ -184,8 +179,7 @@ describe('CapDbPrivateStateProvider: key scheme marker', () => {
             privateStoragePasswordFallbacks: () => [PASSWORD],
             db
         });
-        current.setContractAddress(CONTRACT);
-        expect(await current.get('ps-1')).toEqual({ v: 1 });
+        expect(await current.forContract(CONTRACT).get('ps-1')).toEqual({ v: 1 });
         expect(db.tables['midnight.PrivateStates'][0].keyScheme).toBe('dek1');
     });
 });
@@ -193,59 +187,53 @@ describe('CapDbPrivateStateProvider: key scheme marker', () => {
 describe('CapDbPrivateStateProvider: CRUD', () => {
     test('set + get round-trips a JSON-serializable state', async () => {
         const { provider } = newProvider();
-        provider.setContractAddress(CONTRACT);
-        await provider.set('counter', { value: 42 });
-        const got = await provider.get('counter');
+        await provider.forContract(CONTRACT).set('counter', { value: 42 });
+        const got = await provider.forContract(CONTRACT).get('counter');
         expect(got).toEqual({ value: 42 });
     });
 
     test('get returns null for unknown id', async () => {
         const { provider } = newProvider();
-        provider.setContractAddress(CONTRACT);
-        expect(await provider.get('does-not-exist')).toBeNull();
+        expect(await provider.forContract(CONTRACT).get('does-not-exist')).toBeNull();
     });
 
     test('set on an existing id overwrites (no duplicate row)', async () => {
         const { provider, db } = newProvider();
-        provider.setContractAddress(CONTRACT);
-        await provider.set('counter', { value: 1 });
-        await provider.set('counter', { value: 2 });
-        expect(await provider.get('counter')).toEqual({ value: 2 });
+        await provider.forContract(CONTRACT).set('counter', { value: 1 });
+        await provider.forContract(CONTRACT).set('counter', { value: 2 });
+        expect(await provider.forContract(CONTRACT).get('counter')).toEqual({ value: 2 });
         const rows = (db.tables['midnight.PrivateStates'] || []).filter(r => r.privateStateId === 'counter');
         expect(rows.length).toBe(1);
     });
 
     test('remove deletes the state', async () => {
         const { provider } = newProvider();
-        provider.setContractAddress(CONTRACT);
-        await provider.set('counter', { value: 1 });
-        await provider.remove('counter');
-        expect(await provider.get('counter')).toBeNull();
+        await provider.forContract(CONTRACT).set('counter', { value: 1 });
+        await provider.forContract(CONTRACT).remove('counter');
+        expect(await provider.forContract(CONTRACT).get('counter')).toBeNull();
     });
 
     test('clear removes the private states of the current contract only', async () => {
         const { provider, db } = newProvider();
-        provider.setContractAddress(CONTRACT);
-        await provider.set('a', { x: 1 });
-        provider.setContractAddress(CONTRACT_B);
-        await provider.set('b', { y: 2 });
-        await provider.clear();
+        await provider.forContract(CONTRACT).set('a', { x: 1 });
+        await provider.forContract(CONTRACT_B).set('b', { y: 2 });
+        await provider.forContract(CONTRACT_B).clear();
         const left = db.tables['midnight.PrivateStates'].filter(r => r.accountId === ACCOUNT);
         expect(left.map(r => r.privateStateId)).toEqual(['a']);
-        provider.setContractAddress(CONTRACT);
-        expect(await provider.get('a')).toEqual({ x: 1 });
+        expect(await provider.forContract(CONTRACT).get('a')).toEqual({ x: 1 });
     });
 
-    test('clear needs a contract address like the other state operations', async () => {
+    test('forContract refuses an empty contract address', () => {
         const { provider } = newProvider();
-        await expect(provider.clear()).rejects.toThrow(/setContractAddress/);
+        expect(() => provider.forContract('')).toThrow(/must not be empty/);
     });
 
-    test('throws when contract address is not set before state operations', async () => {
-        const { provider } = newProvider();
-        await expect(provider.set('x', { v: 1 })).rejects.toThrow(/setContractAddress/);
-        await expect(provider.get('x')).rejects.toThrow(/setContractAddress/);
-        await expect(provider.remove('x')).rejects.toThrow(/setContractAddress/);
+    test('clearAll removes the private states of every contract of the account', async () => {
+        const { provider, db } = newProvider();
+        await provider.forContract(CONTRACT).set('a', { x: 1 });
+        await provider.forContract(CONTRACT_B).set('b', { y: 2 });
+        await provider.clearAll();
+        expect(db.tables['midnight.PrivateStates'].filter(r => r.accountId === ACCOUNT)).toEqual([]);
     });
 });
 
@@ -254,45 +242,51 @@ describe('CapDbPrivateStateProvider: account isolation', () => {
         const sharedDb = makeFakeDb();
         const a = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
         const b = new CapDbPrivateStateProvider({ accountId: ACCOUNT_B, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        a.setContractAddress(CONTRACT);
-        b.setContractAddress(CONTRACT);
-        await a.set('alice-key', { v: 'alice' });
-        expect(await b.get('alice-key')).toBeNull();
+        await a.forContract(CONTRACT).set('alice-key', { v: 'alice' });
+        expect(await b.forContract(CONTRACT).get('alice-key')).toBeNull();
     });
 
     test('clear is account-scoped: A.clear() leaves B intact', async () => {
         const sharedDb = makeFakeDb();
         const a = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
         const b = new CapDbPrivateStateProvider({ accountId: ACCOUNT_B, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        a.setContractAddress(CONTRACT); await a.set('k', { v: 1 });
-        b.setContractAddress(CONTRACT); await b.set('k', { v: 2 });
-        await a.clear();
-        expect(await b.get('k')).toEqual({ v: 2 });
+        await a.forContract(CONTRACT).set('k', { v: 1 });
+        await b.forContract(CONTRACT).set('k', { v: 2 });
+        await a.forContract(CONTRACT).clear();
+        expect(await b.forContract(CONTRACT).get('k')).toEqual({ v: 2 });
     });
 });
 
 describe('CapDbPrivateStateProvider: signing keys', () => {
+    test('a row holding a bare hex key reads as a Schnorr key', async () => {
+        const { provider, db } = newProvider();
+        await provider.setSigningKey(CONTRACT, sk(1));
+        const enc = new StorageEncryption(PASSWORD, privateStateStableSalt(ACCOUNT, PASSWORD));
+        db.tables['midnight.ContractSigningKeys'][0].ciphertext = enc.encrypt('ab'.repeat(32));
+        expect(await provider.getSigningKey(CONTRACT)).toEqual({ tag: 'schnorr', value: 'ab'.repeat(32) });
+    });
+
     test('set + get signing key round-trip', async () => {
         const { provider } = newProvider();
-        await provider.setSigningKey(CONTRACT, 'deadbeef-signing-key');
-        expect(await provider.getSigningKey(CONTRACT)).toBe('deadbeef-signing-key');
+        await provider.setSigningKey(CONTRACT, sk(3));
+        expect(await provider.getSigningKey(CONTRACT)).toEqual(sk(3));
     });
 
     test('setSigningKey overwrites', async () => {
         const { provider, db } = newProvider();
-        await provider.setSigningKey(CONTRACT, 'first');
-        await provider.setSigningKey(CONTRACT, 'second');
-        expect(await provider.getSigningKey(CONTRACT)).toBe('second');
+        await provider.setSigningKey(CONTRACT, sk(4));
+        await provider.setSigningKey(CONTRACT, sk(5));
+        expect(await provider.getSigningKey(CONTRACT)).toEqual(sk(5));
         expect(db.tables['midnight.ContractSigningKeys'].length).toBe(1);
     });
 
     test('removeSigningKey + clearSigningKeys', async () => {
         const { provider } = newProvider();
-        await provider.setSigningKey(CONTRACT, 'k1');
-        await provider.setSigningKey(CONTRACT_B, 'k2');
+        await provider.setSigningKey(CONTRACT, sk(6));
+        await provider.setSigningKey(CONTRACT_B, sk(7));
         await provider.removeSigningKey(CONTRACT);
         expect(await provider.getSigningKey(CONTRACT)).toBeNull();
-        expect(await provider.getSigningKey(CONTRACT_B)).toBe('k2');
+        expect(await provider.getSigningKey(CONTRACT_B)).toEqual(sk(7));
         await provider.clearSigningKeys();
         expect(await provider.getSigningKey(CONTRACT_B)).toBeNull();
     });
@@ -301,11 +295,10 @@ describe('CapDbPrivateStateProvider: signing keys', () => {
 describe('CapDbPrivateStateProvider: export / import', () => {
     test('exportPrivateStates produces SDK-format blob', async () => {
         const { provider } = newProvider();
-        provider.setContractAddress(CONTRACT);
-        await provider.set('a', { v: 1 });
-        await provider.set('b', { v: 2 });
+        await provider.forContract(CONTRACT).set('a', { v: 1 });
+        await provider.forContract(CONTRACT).set('b', { v: 2 });
 
-        const exported = await provider.exportPrivateStates();
+        const exported = await provider.forContract(CONTRACT).exportPrivateStates();
         expect(exported.format).toBe('midnight-private-state-export');
         expect(exported.encryptedPayload).toMatch(/^[A-Za-z0-9+/=]+$/);
         expect(exported.salt).toMatch(HEX64_ANY_CASE_RE);
@@ -315,84 +308,75 @@ describe('CapDbPrivateStateProvider: export / import', () => {
         // Export from A
         const sourceDb = makeFakeDb();
         const a = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sourceDb });
-        a.setContractAddress(CONTRACT);
-        await a.set('a', { v: 1 });
-        await a.set('b', { v: 2 });
-        const exported = await a.exportPrivateStates({ password: 'export-pass-of-sufficient-length' });
+        await a.forContract(CONTRACT).set('a', { v: 1 });
+        await a.forContract(CONTRACT).set('b', { v: 2 });
+        const exported = await a.forContract(CONTRACT).exportPrivateStates({ password: 'export-pass-of-sufficient-length' });
 
         // Import into B (fresh DB, fresh password)
         const targetDb = makeFakeDb();
         const b = new CapDbPrivateStateProvider({ accountId: ACCOUNT_B, privateStoragePasswordProvider: () => 'b-pass-of-sufficient-length', db: targetDb });
-        b.setContractAddress(CONTRACT);
-        const result = await b.importPrivateStates(exported, { password: 'export-pass-of-sufficient-length' });
+        const result = await b.forContract(CONTRACT).importPrivateStates(exported, { password: 'export-pass-of-sufficient-length' });
         expect(result).toEqual({ imported: 2, skipped: 0, overwritten: 0 });
-        expect(await b.get('a')).toEqual({ v: 1 });
-        expect(await b.get('b')).toEqual({ v: 2 });
+        expect(await b.forContract(CONTRACT).get('a')).toEqual({ v: 1 });
+        expect(await b.forContract(CONTRACT).get('b')).toEqual({ v: 2 });
     });
 
     test('import with wrong password → ExportDecryptionError', async () => {
         const { provider } = newProvider();
-        provider.setContractAddress(CONTRACT);
-        await provider.set('a', { v: 1 });
-        const exported = await provider.exportPrivateStates({ password: 'correct-pass-of-sufficient-length' });
+        await provider.forContract(CONTRACT).set('a', { v: 1 });
+        const exported = await provider.forContract(CONTRACT).exportPrivateStates({ password: 'correct-pass-of-sufficient-length' });
         // fresh provider, same contract address
         const targetDb = makeFakeDb();
         const fresh = new CapDbPrivateStateProvider({ accountId: ACCOUNT_B, privateStoragePasswordProvider: () => 'unused-pass-of-sufficient-length', db: targetDb });
-        fresh.setContractAddress(CONTRACT);
-        await expect(fresh.importPrivateStates(exported, { password: 'wrong-pass-of-sufficient-length' }))
+        await expect(fresh.forContract(CONTRACT).importPrivateStates(exported, { password: 'wrong-pass-of-sufficient-length' }))
             .rejects.toBeInstanceOf(ExportDecryptionError);
     });
 
     test('import with conflictStrategy=error throws ImportConflictError on overlap', async () => {
         const sharedDb = makeFakeDb();
         const a = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        a.setContractAddress(CONTRACT);
-        await a.set('a', { v: 1 });
-        const exported = await a.exportPrivateStates({ password: 'export-pass-of-sufficient-length' });
+        await a.forContract(CONTRACT).set('a', { v: 1 });
+        const exported = await a.forContract(CONTRACT).exportPrivateStates({ password: 'export-pass-of-sufficient-length' });
 
         // import back into same account/contract, every id will conflict
-        await expect(a.importPrivateStates(exported, { password: 'export-pass-of-sufficient-length' }))
+        await expect(a.forContract(CONTRACT).importPrivateStates(exported, { password: 'export-pass-of-sufficient-length' }))
             .rejects.toBeInstanceOf(ImportConflictError);
     });
 
     test('import with conflictStrategy=skip preserves existing values', async () => {
         const sharedDb = makeFakeDb();
         const a = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        a.setContractAddress(CONTRACT);
-        await a.set('a', { v: 1 });
-        const exported = await a.exportPrivateStates({ password: 'export-pass-of-sufficient-length' });
+        await a.forContract(CONTRACT).set('a', { v: 1 });
+        const exported = await a.forContract(CONTRACT).exportPrivateStates({ password: 'export-pass-of-sufficient-length' });
 
-        await a.set('a', { v: 'newer' }); // existing differs from export
-        const result = await a.importPrivateStates(exported, { password: 'export-pass-of-sufficient-length', conflictStrategy: 'skip' });
+        await a.forContract(CONTRACT).set('a', { v: 'newer' }); // existing differs from export
+        const result = await a.forContract(CONTRACT).importPrivateStates(exported, { password: 'export-pass-of-sufficient-length', conflictStrategy: 'skip' });
         expect(result).toEqual({ imported: 0, skipped: 1, overwritten: 0 });
-        expect(await a.get('a')).toEqual({ v: 'newer' });
+        expect(await a.forContract(CONTRACT).get('a')).toEqual({ v: 'newer' });
     });
 
     test('import with conflictStrategy=overwrite replaces existing values', async () => {
         const sharedDb = makeFakeDb();
         const a = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        a.setContractAddress(CONTRACT);
-        await a.set('a', { v: 'original' });
-        const exported = await a.exportPrivateStates({ password: 'export-pass-of-sufficient-length' });
+        await a.forContract(CONTRACT).set('a', { v: 'original' });
+        const exported = await a.forContract(CONTRACT).exportPrivateStates({ password: 'export-pass-of-sufficient-length' });
 
-        await a.set('a', { v: 'newer' });
-        const result = await a.importPrivateStates(exported, { password: 'export-pass-of-sufficient-length', conflictStrategy: 'overwrite' });
+        await a.forContract(CONTRACT).set('a', { v: 'newer' });
+        const result = await a.forContract(CONTRACT).importPrivateStates(exported, { password: 'export-pass-of-sufficient-length', conflictStrategy: 'overwrite' });
         expect(result).toEqual({ imported: 0, skipped: 0, overwritten: 1 });
-        expect(await a.get('a')).toEqual({ v: 'original' });
+        expect(await a.forContract(CONTRACT).get('a')).toEqual({ v: 'original' });
     });
 
     test('rejects export blob with wrong format identifier', async () => {
         const { provider } = newProvider();
-        provider.setContractAddress(CONTRACT);
-        await expect(provider.importPrivateStates(
+        await expect(provider.forContract(CONTRACT).importPrivateStates(
             { format: 'something-else' as any, encryptedPayload: 'AAA', salt: '00'.repeat(32) }
         )).rejects.toBeInstanceOf(InvalidExportFormatError);
     });
 
     test('rejects export blob with invalid salt format', async () => {
         const { provider } = newProvider();
-        provider.setContractAddress(CONTRACT);
-        await expect(provider.importPrivateStates(
+        await expect(provider.forContract(CONTRACT).importPrivateStates(
             { format: 'midnight-private-state-export', encryptedPayload: 'AAA', salt: 'not-hex' }
         )).rejects.toBeInstanceOf(InvalidExportFormatError);
     });
@@ -400,16 +384,16 @@ describe('CapDbPrivateStateProvider: export / import', () => {
     test('signing keys export/import round-trip', async () => {
         const sourceDb = makeFakeDb();
         const a = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sourceDb });
-        await a.setSigningKey(CONTRACT, 'sk-1');
-        await a.setSigningKey(CONTRACT_B, 'sk-2');
+        await a.setSigningKey(CONTRACT, sk(1));
+        await a.setSigningKey(CONTRACT_B, sk(2));
         const exported = await a.exportSigningKeys({ password: 'export-pass-of-sufficient-length' });
 
         const targetDb = makeFakeDb();
         const b = new CapDbPrivateStateProvider({ accountId: ACCOUNT_B, privateStoragePasswordProvider: () => 'b-pass-of-sufficient-length', db: targetDb });
         const result = await b.importSigningKeys(exported, { password: 'export-pass-of-sufficient-length' });
         expect(result).toEqual({ imported: 2, skipped: 0, overwritten: 0 });
-        expect(await b.getSigningKey(CONTRACT)).toBe('sk-1');
-        expect(await b.getSigningKey(CONTRACT_B)).toBe('sk-2');
+        expect(await b.getSigningKey(CONTRACT)).toEqual(sk(1));
+        expect(await b.getSigningKey(CONTRACT_B)).toEqual(sk(2));
     });
 });
 
@@ -434,8 +418,7 @@ describe('CapDbPrivateStateProvider: config validation', () => {
             privateStoragePasswordProvider: () => 'too-short',
             db: makeFakeDb()
         });
-        provider.setContractAddress(CONTRACT);
-        await expect(provider.set('x', { v: 1 })).rejects.toThrow(/at least 16 characters/);
+        await expect(provider.forContract(CONTRACT).set('x', { v: 1 })).rejects.toThrow(/at least 16 characters/);
     });
 });
 
@@ -447,32 +430,28 @@ describe('CapDbPrivateStateProvider: cross-instance reads', () => {
     test('a second provider instance reads what the first wrote', async () => {
         const sharedDb = makeFakeDb();
         const writer = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        writer.setContractAddress(CONTRACT);
-        await writer.set('demo', { count: 7, nested: { ok: true } });
+        await writer.forContract(CONTRACT).set('demo', { count: 7, nested: { ok: true } });
 
         const reader = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        reader.setContractAddress(CONTRACT);
-        await expect(reader.get('demo')).resolves.toEqual({ count: 7, nested: { ok: true } });
+        await expect(reader.forContract(CONTRACT).get('demo')).resolves.toEqual({ count: 7, nested: { ok: true } });
     });
 
     test('cross-instance signing-key read round-trips too', async () => {
         const sharedDb = makeFakeDb();
         const writer = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        await writer.setSigningKey(CONTRACT, 'signing-key-material');
+        await writer.setSigningKey(CONTRACT, sk(8));
 
         const reader = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        await expect(reader.getSigningKey(CONTRACT)).resolves.toBe('signing-key-material');
+        await expect(reader.getSigningKey(CONTRACT)).resolves.toEqual(sk(8));
     });
 
     test('a different account/password still cannot read (integrity preserved)', async () => {
         const sharedDb = makeFakeDb();
         const writer = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        writer.setContractAddress(CONTRACT);
-        await writer.set('demo', { secret: 1 });
+        await writer.forContract(CONTRACT).set('demo', { secret: 1 });
 
         // Different account → row is account-scoped, so get returns null (no row).
         const other = new CapDbPrivateStateProvider({ accountId: ACCOUNT_B, privateStoragePasswordProvider: () => PASSWORD, db: sharedDb });
-        other.setContractAddress(CONTRACT);
-        await expect(other.get('demo')).resolves.toBeNull();
+        await expect(other.forContract(CONTRACT).get('demo')).resolves.toBeNull();
     });
 });

@@ -109,13 +109,14 @@ export class WorkerSubmitError extends Error {
 
 /** The failure code an error already carries from the worker, or null. */
 export function carriedSubmitFailure(err: unknown): SubmitFailureInfo | null {
-    const e = err as any;
+    // Any thrown value may arrive here, so every field is checked before it is used.
+    const e = err as { [K in keyof SubmitFailureInfo]?: unknown } | null | undefined;
     if (!e || typeof e !== 'object' || !isSubmitFailureCode(e.code)) return null;
     return {
         code: e.code,
         ledgerCode: typeof e.ledgerCode === 'string' ? e.ledgerCode : undefined,
         retryable: e.retryable === true,
-        calls: Array.isArray(e.calls) ? e.calls : undefined,
-        blockHeight: Number.isInteger(e.blockHeight) ? e.blockHeight : undefined
+        calls: Array.isArray(e.calls) ? e.calls as BatchCallStageInfo[] : undefined,
+        blockHeight: Number.isInteger(e.blockHeight) ? e.blockHeight as number : undefined
     };
 }

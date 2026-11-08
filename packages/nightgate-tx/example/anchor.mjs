@@ -3,7 +3,7 @@
 // proof server, no Docker, no database.
 //
 //   npm install @odatano/nightgate-tx
-//   NIGHTGATE_URL=https://api.preprod.odatano.dev ODATANO_KEY=oda_... VAULT=... SEED_HEX=... node anchor.mjs ./mydoc.json
+//   NIGHTGATE_URL=https://<gateway> ODATANO_KEY=oda_... VAULT=... SEED_HEX=... node anchor.mjs ./mydoc.json
 //
 // What happens:
 //   1. your seed -> your attester id, locally
@@ -23,15 +23,15 @@ import { waitLanded } from '@odatano/nightgate-tx/txbuilder';
 import { prepareAttest } from '@odatano/nightgate-tx/calls';
 import { Contract } from '@odatano/nightgate-tx/attestation-vault-32';
 
-const BASE = (process.env.NIGHTGATE_URL || 'https://api.preprod.odatano.dev').replace(/\/+$/, '');
+const BASE = (process.env.NIGHTGATE_URL || '').replace(/\/+$/, '');
 const KEY = process.env.ODATANO_KEY;
 const VAULT = process.env.VAULT;
 const SEED_HEX = process.env.SEED_HEX;
-const NETWORK = process.env.NETWORK || 'preprod';
+const NETWORK = process.env.NETWORK || 'mainnet';
 const file = process.argv[2];
 
-if (!KEY || !VAULT || !SEED_HEX || !file) {
-    console.error('usage: ODATANO_KEY=oda_... VAULT=<64 hex> SEED_HEX=<128 hex> node anchor.mjs <file.json>');
+if (!BASE || !KEY || !VAULT || !SEED_HEX || !file) {
+    console.error('usage: NIGHTGATE_URL=<gateway> ODATANO_KEY=oda_... VAULT=<64 hex> SEED_HEX=<128 hex> node anchor.mjs <file.json>');
     process.exit(2);
 }
 

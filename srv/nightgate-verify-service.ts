@@ -13,7 +13,7 @@ import type { Request } from '@sap/cds';
  * The 404 matters for hosts that serve this path without the image's auth middleware. */
 export async function publicVerifyGate(req: Request): Promise<boolean> {
     if (!configFlag('NIGHTGATE_PUBLIC_VERIFY')) {
-        req.reject({ status: 404, code: 'PUBLIC_VERIFY_DISABLED', message: 'public verification is not enabled on this server' } as any);
+        req.reject({ status: 404, code: 'PUBLIC_VERIFY_DISABLED', message: 'public verification is not enabled on this server' });
         return false;
     }
     return checkRateClass('public-verify', 'public-verify', req);

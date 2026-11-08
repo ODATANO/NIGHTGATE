@@ -1,5 +1,118 @@
 # Changelog
 
+## 0.42.0 - 2026-11-08
+
+### Breaking
+
+- Runs on ledger 9 networks only. Server, sponsor and `@odatano/nightgate-tx`
+  build, sign, prove and submit ledger 9 transactions. Node and indexer must run
+  ledger 9. A network before its fork stays on 0.41.x.
+- Package set: midnight-js 5.0.0, wallet SDK 5.0.0, compact-js 3.0.0,
+  compact-runtime 0.21.0, `@midnightntwrk/ledger-v9` 1.0.0. Ledger 8 and zkir
+  come from `@midnightntwrk/ledger-v8` and `@midnightntwrk/zkir-v2`. A consumer
+  needs no `overrides`.
+- Contract packages are compiled with compactc 0.36. Their verifier keys are
+  new, so contracts are deployed again and documents anchored again.
+- Saved wallet states from wallet SDK 4 are not restored. Each wallet syncs
+  from the start once. Presync the sponsor wallets before the upgrade, see
+  `docs/operations.md`.
+- Contract signing keys are stored as `{ tag, value }`. A stored key in the
+  older hex form is read as a Schnorr key.
+- The browser `InMemoryPrivateStateProvider` reaches private state through
+  `forContract(address)`, which has `set`, `get`, `remove`, `clear`,
+  `exportPrivateStates` and `importPrivateStates`. These methods and
+  `setContractAddress` are removed from the provider itself.
+- The `/api/v1/...` service paths are removed. The services answer on
+  `/odata/v4/midnight...` only, and `getMetrics()` drops
+  `legacy_path_requests_total`.
+- A job or result recorded with the CommonJS artifact digest without the
+  module-format section is refused. It is issued again.
+- The default network is `mainnet`, for the server, the image, the compose
+  file, the proof server and `networkId` of the transaction builder. Submission
+  on mainnet stays off until `allowMainnetSubmission` is `true`.
+- The transaction builder keeps the wallet's proving material under
+  `<proverMaterialDir>/ledger-v9/<version>`. The wallet SDK downloads each file from its
+  host and checks it against the ledger release. `createProverMaterialProvider`
+  takes `dir`, `baseUrl` and `onProgress`; `createSwapWallet` drops `fetchFn`.
+
+### Changes
+
+- The crawler decodes the transactions of a block with the ledger of its
+  runtime: ledger 8 below runtime version 2000000, ledger 9 from it.
+- Unbound sponsoring prices the fee with the ledger parameters of the tip block
+  and a margin of 5 blocks, also for a spend from one dust note.
+- A failed job releases its idempotency key, so a retry with the same key
+  starts a new job. A job that may be on chain and a workflow step keep their
+  key.
+- A failed build of a transfer, a dust registration or a deregistration
+  releases the coins the wallet booked for it.
+- `/zk-config/<contract>/compiler/contract-manifest.json` serves the prover
+  manifest of a registered contract that has one.
+- `ContractStates/stateAt` asks the indexer at the block of the contract's
+  newest action, and indexer errors keep their cause in production.
+- `sponsorFinalizedTransaction` refuses an unbound transaction.
+  `sponsorUnboundTransaction` keeps the binding of the bytes it is given.
+- `getRuntimeInfo().node` reports the node the crawler reads: node version,
+  runtime `specVersion` and `transactionVersion`, ledger version, peers and
+  `isSyncing`. A call that fails leaves its field null and names itself in
+  `errors`. It is null while no crawler runs.
+
+### Fixes
+
+- `ZswapLedgerEvents.raw` and `DustLedgerEvents.raw` are written as binary on
+  PostgreSQL. Rows written before keep their text form.
+- The chain-outcome confirmer waits before it asks again about a job without
+  an outcome: 5 s, doubling up to `NIGHTGATE_CHAIN_CONFIRM_BACKOFF_MAX_MS`
+  (30 min). All its lookups share `NIGHTGATE_CHAIN_CONFIRM_LOOKUPS_PER_MINUTE`
+  (120). A `succeeded` job whose transaction the indexer does not know past its
+  ttl gets `chainStatus: dropped`, and so does a workflow parent with a dropped
+  child.
+- `reindexFromHeight` removes 2000 blocks per committed transaction and
+  answers `status: running` after `NIGHTGATE_REINDEX_REPLY_WAIT_MS` (20 s)
+  while the rest finishes in the background. `pauseCrawler`, `resumeCrawler`
+  and a second reindex answer 409 meanwhile. `SyncState.reindexTargetHeight`,
+  a new nullable column, keeps the target. A failed slice sets `syncStatus` to
+  `error`. A restart or `resumeCrawler` finishes the rollback before the crawler
+  indexes again.
+- `Transactions/ledgerTransaction(hash)` returns the ledger transaction of an
+  indexed transaction as base64. `createTxBuilder({ api })` reads the deploy with it.
+- `apiPublicDataProvider` takes `{ client, mjTypes, protocolVersion }` and answers
+  with the SDK's sealed records. `@odatano/contract-kit` 0.2.1 has `forContract`.
+- Wasm proving reads the zkir v3 of compiled contracts through
+  `@midnightntwrk/zkir-v3` 3.2.0, a new dependency. The ledger's standard circuits
+  stay on zkir v2.
+- A sponsor taken out of `NIGHTGATE_FEE_SPONSOR_SESSION` keeps its keys for one
+  session lifetime, not until the next cleanup. The cleanup logs a warning for
+  each signing key it removes.
+- A sponsor without dust for the fee fails over to the next pool member at once
+  instead of holding the job for `NIGHTGATE_BACKING_WAIT_MS`. A sponsor whose
+  backings stay busy past that wait fails over too.
+- A prover key download on the server and in the txbuilder gets up to three
+  more tries after a lost connection, a torn body, HTTP 429 or a 5xx. The last
+  error names its cause.
+- `createTxBuilder`: a wallet that `walletSync` leaves out starts on ledger 9.
+  A synced wallet starts on the version of the chain's first block and reads the
+  history from there.
+- SDK client: a finished job returns its `sessionId`, and `receipt` when there is
+  one. A pool job's receipt can be read with `getJobStatus` from those.
+- SDK client: every job call except `buildSponsorable` sends an
+  `idempotencyKey` of its own unless the caller gives one. A request lost on a
+  closed keep-alive connection goes out once more without a second job.
+- A failed node readiness check of the wallet SDK no longer logs an
+  `RPC-CORE: chain()` error line per retry. The worker logs one `indexer check`
+  line when the wallet's comparison of indexer and node changes its result.
+- A failed confirmer lookup pauses a job at most 60 s, so confirmations follow
+  soon after an indexer outage.
+- `getWalletSyncProgress` reports `phase: idle` once no job waits for the
+  wallet.
+- An unloaded wallet drops its unshielded signing key. A signature asked for
+  after that fails instead of using the key.
+- `@odatano/nightgate-tx` 0.21.0. `createTxBuilder({ api })` needs a server
+  whose crawler runs and says so when the server has no indexed block. The
+  wasm prover reads the ledger 9 key material of the standard circuits; it read
+  the ledger 8 files before. The prover material cache keeps a download in
+  progress of another builder.
+
 ## 0.41.0 - 2026-11-06
 
 ### Fixes

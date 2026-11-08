@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createRequire } from 'node:module';
-import { mkdir, writeFile, readFile, access, rename, rm } from 'node:fs/promises';
-import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readFile, access, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -18,15 +17,13 @@ import * as compactRuntime from '@midnight-ntwrk/compact-runtime';
 
 const require = createRequire(import.meta.url);
 const { assertSeedHex, HEX64_RE, HEX64_ANY_CASE_RE } = require('../../srv/utils/hex-patterns.js');
-
-// Each writer gets its own temporary file, so builders sharing a cache directory never mix their bytes.
-const partFileFor = (dest) => `${dest}.${process.pid}.${randomUUID()}.part`;
+const { fetchBody } = require('../../srv/utils/fetch-body.js');
 
 // Paying the fee yourself and submitting to the node directly.
 export {
     deserializeTransaction, txIdentifiers, submitFinalized, submitExtrinsic,
     classifyNodeReject, isPreMempoolReject, isTransportFailure, isAlreadyImported,
-    probeLanded, waitLanded, withDustGuard, nodeHttpUrlFor, rebuildOnStaleTranscript
+    probeLanded, waitLanded, nodeHttpUrlFor, rebuildOnStaleTranscript
 } from './submit.mjs';
 
 export {
@@ -40,6 +37,10 @@ export { holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from './holder.mjs';
 export { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
 import { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
 import { decodeOffer } from './swap.mjs';
+import { sealTx, openTx, shieldedKeysByEpoch } from './wallet-tx.mjs';
+export { sealTx, openTx };
+import { createProverMaterialProvider, defaultProverMaterialDir, writeAtomically, sha256Hex } from './prover-material.mjs';
+export { createProverMaterialProvider, defaultProverMaterialDir };
 
 // With `api` and no wallet sync the facade dials neither a node nor an indexer, so these are never used.
 const UNUSED_INDEXER = { indexerHttpUrl: 'http://unused.invalid/', indexerWsUrl: 'ws://unused.invalid/' };
@@ -76,6 +77,12 @@ export function walletSyncMode(walletSync) {
 }
 
 /** The sub-wallets a sync mode starts, in the facade's names. */
+/** A wallet that syncs keeps the SDK's default: it starts on the version that can read the chain's first block.
+ *  A wallet that never syncs would stay there, and this builder builds for ledger 9 only. So it starts on ledger 9. */
+export function walletConfiguration(wallet, synced, configuration, ledger9Version) {
+    return synced.includes(wallet) ? configuration : { ...configuration, chainVersionProbe: async () => ledger9Version };
+}
+
 export function syncedWallets(mode) {
     if (mode === 'all') return ['shielded', 'unshielded', 'dust'];
     if (mode === 'coins') return ['shielded', 'unshielded'];
@@ -149,17 +156,50 @@ export const ATTESTATION_VAULT_CIRCUITS = [
 
 const exists = (p) => access(p).then(() => true, () => false);
 
+// compactc writes it next to keys/ and zkir/. midnight-js checks every key and zkir against it before proving.
+const COMPILER_MANIFEST = 'compiler/contract-manifest.json';
+
 /** Downloads a contract's proving files into `cacheDir`, skipping files already there.
  *  With `package`, it fills in the missing prover keys of an installed contract package instead. */
 export async function ensureZkAssets(input) {
     if (input?.package) return ensurePackageProverKeys(input);
-    const { zkConfigBaseUrl, cacheDir, circuits = ATTESTATION_VAULT_CIRCUITS, verifierCircuits, fetchFn, onProgress } = input ?? {};
+    const { zkConfigBaseUrl, cacheDir, circuits = ATTESTATION_VAULT_CIRCUITS, verifierCircuits, fetchFn, retryDelaysMs, onProgress } = input ?? {};
     if (!zkConfigBaseUrl) throw new Error('ensureZkAssets: zkConfigBaseUrl is required (or `package`, an installed lineage package)');
     if (!cacheDir) throw new Error('ensureZkAssets: cacheDir is required without `package`');
     const doFetch = fetchFn || fetch;
     const base = String(zkConfigBaseUrl).replace(/\/$/, '');
     await mkdir(join(cacheDir, 'keys'), { recursive: true });
     await mkdir(join(cacheDir, 'zkir'), { recursive: true });
+    await mkdir(join(cacheDir, 'compiler'), { recursive: true });
+
+    // The compiler manifest comes first: without it nothing proves, so a server that lacks it fails before any key is downloaded.
+    // A cached copy stays when the server cannot be reached, so the second run works offline like the keys.
+    let fetched = 0;
+    let cached = 0;
+    let refreshed = 0;
+    {
+        const dest = join(cacheDir, COMPILER_MANIFEST);
+        const have = await exists(dest);
+        let res = null;
+        try { res = await doFetch(base + '/' + COMPILER_MANIFEST); } catch (e) { if (!have) throw e; }
+        if (res?.ok) {
+            const body = Buffer.from(await res.arrayBuffer());
+            if (have && Buffer.compare(await readFile(dest), body) === 0) {
+                cached++;
+            } else {
+                if (have) refreshed++;
+                await writeAtomically(dest, body);
+                fetched++;
+                onProgress?.({ phase: 'zk-asset', file: COMPILER_MANIFEST, fetched, cached, refreshed });
+            }
+        } else if (!have) {
+            throw new Error(res?.status === 404
+                ? 'ensureZkAssets: ' + base + ' serves no ' + COMPILER_MANIFEST + '; proving verifies every key against it. Update the server, or pass `package` to use the installed lineage package'
+                : 'ensureZkAssets: GET ' + base + '/' + COMPILER_MANIFEST + ' -> HTTP ' + (res?.status ?? 'error'));
+        } else {
+            cached++;
+        }
+    }
 
     // keys/manifest.json lists the sha256 of every current file.
     // A cached file with another hash is from an older build of the contract and is downloaded again.
@@ -174,9 +214,6 @@ export async function ensureZkAssets(input) {
     // The small verifier keys are needed for every circuit, because findDeployedContract reads them all.
     const verifierSet = [...new Set([...(verifierCircuits ?? []), ...circuits])];
 
-    let fetched = 0;
-    let cached = 0;
-    let refreshed = 0;
     const plan = [
         ...circuits.flatMap(c => [[c, 'keys', '.prover'], [c, 'zkir', '.bzkir']]),
         ...verifierSet.map(c => [c, 'keys', '.verifier'])
@@ -191,15 +228,12 @@ export async function ensureZkAssets(input) {
                 await rm(dest, { force: true });
                 refreshed++;
             }
-            const res = await doFetch(base + '/' + rel);
-            if (!res.ok) {
+            const { res, body } = await fetchBody(base + '/' + rel, { fetchFn: doFetch, delaysMs: retryDelaysMs });
+            if (!body) {
                 // A missing circuit is fine. Only the circuits you call must exist.
                 if (res.status === 404) continue;
                 throw new Error('ensureZkAssets: GET ' + base + '/' + rel + ' -> HTTP ' + res.status);
             }
-            // Write to a temporary file, then rename it.
-            // A file in the cache counts as complete, so a half-written key must never appear there.
-            const body = Buffer.from(await res.arrayBuffer());
             // With compression, content-length is the compressed size, so it can only be checked without it.
             const encoding = String(res.headers?.get?.('content-encoding') ?? '').trim().toLowerCase();
             const declared = encoding === '' || encoding === 'identity'
@@ -211,14 +245,7 @@ export async function ensureZkAssets(input) {
             if (expected && sha256Hex(body) !== expected) {
                 throw new Error('ensureZkAssets: ' + rel + ' does not match the sha256 in the served keys/manifest.json');
             }
-            const tmp = partFileFor(dest);
-            try {
-                await writeFile(tmp, body);
-                await rename(tmp, dest);
-            } catch (e) {
-                await rm(tmp, { force: true }).catch(() => { /* best effort */ });
-                throw e;
-            }
+            await writeAtomically(dest, body);
             fetched++;
             onProgress?.({ phase: 'zk-asset', circuit, file: rel, fetched, cached, refreshed });
         }
@@ -227,7 +254,7 @@ export async function ensureZkAssets(input) {
 }
 
 /** Downloads the prover keys a contract package does not ship and checks each against its keys/manifest.json. */
-async function ensurePackageProverKeys({ package: packageName, from, circuits, fetchFn, onProgress }) {
+async function ensurePackageProverKeys({ package: packageName, from, circuits, fetchFn, retryDelaysMs, onProgress }) {
     const pkg = resolveContractPackage(packageName, from ?? process.cwd());
     const zkConfigPath = pkg.zkConfigPath;
     const manifest = readProverKeyManifest(zkConfigPath);
@@ -237,26 +264,16 @@ async function ensurePackageProverKeys({ package: packageName, from, circuits, f
     if (unknown.length) throw new Error(`ensureZkAssets: ${pkg.name} has no circuit ${unknown.join(', ')} (it has ${all.join(', ')})`);
     const wanted = circuits ?? all;
     const missing = missingProverKeys(zkConfigPath).filter(c => wanted.includes(c));
-    const doFetch = fetchFn || fetch;
     const keysDir = join(zkConfigPath, 'keys');
     let fetched = 0;
     for (const circuit of missing) {
         const expected = manifest.prover?.[circuit];
         if (!expected) throw new Error(`ensureZkAssets: ${pkg.name}: keys/manifest.json lists no prover key for ${circuit}`);
         const url = proverKeyUrl(pkg.manifest.zkAssetUrl, pkg.manifest.zkAssetLayout, circuit);
-        const res = await doFetch(url);
-        if (!res.ok) throw new Error(`ensureZkAssets: GET ${url} -> HTTP ${res.status}`);
-        const body = Buffer.from(await res.arrayBuffer());
+        const { res, body } = await fetchBody(url, { fetchFn, delaysMs: retryDelaysMs });
+        if (!body) throw new Error(`ensureZkAssets: GET ${url} -> HTTP ${res.status}`);
         if (!keyMatchesManifest(body, expected)) throw new Error(`ensureZkAssets: ${circuit}.prover from ${url} does not match keys/manifest.json`);
-        const dest = join(keysDir, `${circuit}.prover`);
-        const tmp = partFileFor(dest);
-        try {
-            await writeFile(tmp, body);
-            await rename(tmp, dest);
-        } catch (e) {
-            await rm(tmp, { force: true }).catch(() => { /* best effort */ });
-            throw e;
-        }
+        await writeAtomically(join(keysDir, `${circuit}.prover`), body);
         fetched++;
         onProgress?.({ phase: 'zk-asset', circuit, file: `keys/${circuit}.prover`, fetched, cached: wanted.length - missing.length, refreshed: 0 });
     }
@@ -286,6 +303,7 @@ export async function resolveBuilderPackage({ package: packageName, from }) {
         contractName: pkg.manifest.name,
         privateStateId: pkg.manifest.privateStateId,
         zkConfigDir: pkg.zkConfigPath,
+        ...(pkg.manifest.slotWidth !== undefined ? { slotWidth: pkg.manifest.slotWidth } : {}),
         circuits: verifierCircuits(pkg.zkConfigPath)
     };
 }
@@ -303,15 +321,11 @@ async function fetchManifest(doFetch, base) {
     }
 }
 
-function sha256Hex(body) {
-    return createHash('sha256').update(body).digest('hex');
-}
-
 /** Releases what a built transaction reserved, in all sub-wallets whatever they sync, and drops it from the pending list. */
 // Exported for the unit tests only.
-export async function revertBuilt(facade, input) {
-    const { tx } = await decodeOffer(input);
-    await facade.revertTransaction(tx);
+export async function revertBuilt(facade, input, forks) {
+    const { tx, bound } = await decodeOffer(input);
+    await facade.revertTransaction(await sealTx(bound ? 'Finalized' : 'Unbound', tx, forks));
 }
 
 /** Runs a single call. Its `before` hook runs first, just as in a batch. */
@@ -324,30 +338,29 @@ export async function runSingleCall(single, fn) {
 /** Wallet provider that signs and keeps the transaction in `holder.captured` instead of submitting. Exported for unit tests.
  *  submitTx throws on purpose, because a fake id would make the SDK wait forever for a confirmation.
  *  `bind` false leaves sealing to the sponsor, which lets one sponsor pay for several transactions at once. */
-export function buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes, bind) {
+export function buildOnlyWalletProvider(facade, zswapKeys, keystore, holder, ttlMinutes, bind, forks) {
     return {
         getCoinPublicKey: () => zswapKeys.coinPublicKey,
         getEncryptionPublicKey: () => zswapKeys.encryptionPublicKey,
         async balanceTx(tx, ttl) {
             const effectiveTtl = ttl ?? new Date(Date.now() + ttlMinutes * 60 * 1000);
             const recipe = await facade.balanceUnboundTransaction(
-                tx,
-                { shieldedSecretKeys: zswapKeys, dustSecretKey: dustKey },
+                await sealTx('Unbound', tx, forks),
                 { ttl: effectiveTtl, tokenKindsToBalance: ['shielded', 'unshielded'] }
             );
-            const signed = await facade.signRecipe(recipe, (payload) => keystore.signData(payload));
+            const signed = await facade.signRecipe(recipe, async (payload) => keystore.signData(payload));
             if (bind === false) {
-                // The SDK passes what balanceTx returns on to submitTx, where it is captured.
+                // The SDK only takes a finalized answer here, so an unbound transaction is captured and the build stops.
                 // If the wallet had to add its own coins, there is a second transaction.
                 // The sponsor would only seal the first one, so this case needs bind: true.
                 if (signed?.balancingTransaction) {
                     await facade.revert(signed).catch(() => { /* the refusal is the error to report */ });
                     throw new Error('buildSponsorable({ bind: false }): this call needs a balancing transaction (it moves value); use the bound handover (bind: true / sponsorFinalizedTransaction) for it');
                 }
-                holder.unbound = true;
-                return signed?.baseTransaction ?? signed;
+                holder.captured = await openTx(signed.baseTransaction);
+                throw new Error('BUILD_ONLY_STOP');
             }
-            return await facade.finalizeRecipe(signed);
+            return openTx(await facade.finalizeRecipe(signed));
         },
         async submitTx(tx) {
             holder.captured = tx;
@@ -371,6 +384,69 @@ async function findDeployedWithRetry(contracts, providers, args) {
 /** Options for midnight-js' `httpClientProofProvider`. Without `proofTimeoutMs` the SDK default of 5 minutes applies. */
 export function proofProviderConfig(opts) {
     return opts?.proofTimeoutMs ? { timeout: opts.proofTimeoutMs } : undefined;
+}
+
+/** The multiplier for a call's declared gas, or undefined when none was asked for. */
+export function gasHeadroomFactor(value) {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 1 || value > 10) {
+        throw new Error(`buildSponsorable: gasHeadroom must be a number from 1 to 10, got ${String(value)}`);
+    }
+    return value;
+}
+
+const GAS_SCALE = 1000n;
+/** The transcript with its declared gas multiplied by `factor`, rounded up.
+ *  bytesDeleted stays: the ledger requires at least the declared amount, so a higher figure would fail. */
+export function scaleTranscriptGas(transcript, factor) {
+    const num = BigInt(Math.round(factor * Number(GAS_SCALE)));
+    const up = (v) => (BigInt(v) * num + GAS_SCALE - 1n) / GAS_SCALE;
+    const { readTime, computeTime, bytesWritten } = transcript.gas;
+    return { ...transcript, gas: { ...transcript.gas, readTime: up(readTime), computeTime: up(computeTime), bytesWritten: up(bytesWritten) } };
+}
+
+function gasFigures(gas) {
+    return gas ? Object.fromEntries(Object.entries(gas).map(([k, v]) => [k, String(v)])) : undefined;
+}
+
+/** Replaces the call of an unproven single-call transaction by one that declares `factor` times its gas.
+ *  Runs before proving, because the proof commits to the transcript. `contractState` is the chain's, read for the
+ *  verifier key. Returns the sealed transaction and the gas as built, for progress events. */
+export function applyGasHeadroom({ ledger, mjTypes }, data, factor, { contractAddress, circuitId, contractState }) {
+    const calls = data?.calls;
+    if (!Array.isArray(calls) || calls.length !== 1) {
+        throw new Error(`buildSponsorable: gasHeadroom covers a call on one contract; this call tree has ${Array.isArray(calls) ? calls.length : 'no'} calls`);
+    }
+    const [call] = calls;
+    const [guaranteed, fallible] = call.public.partitionedTranscript;
+    const state = contractState?.contractState;
+    if (typeof state?.serialize !== 'function') throw new Error(`buildSponsorable: no contract state found at ${contractAddress}`);
+    const op = ledger.ContractState.deserialize(state.serialize()).operation(circuitId);
+    if (!op?.verifierKey) throw new Error(`buildSponsorable: the contract state carries no verifier key for '${circuitId}'`);
+    const commitment = call.communicationCommitment;
+    const rand = commitment?._tag === 'Some' ? commitment.value.commCommRand : ledger.communicationCommitmentRandomness();
+    const keyLocation = mjTypes.encodeContractKeyLocation({ contractAddress, circuitId, verifierKeyHash: mjTypes.hashVerifierKey(op.verifierKey) });
+    const prototype = new ledger.ContractCallPrototype(
+        contractAddress, circuitId, op,
+        guaranteed ? scaleTranscriptGas(guaranteed, factor) : undefined,
+        fallible ? scaleTranscriptGas(fallible, factor) : undefined,
+        call.private.privateTranscriptOutputs, call.private.input, call.private.output, rand, keyLocation
+    );
+    // The SDK hands out a sealed handle. The edit runs on the transaction inside it, and the result is sealed again.
+    const tx = data.private.unprovenTx.deserialize({ v9: ledger.Transaction });
+    const intents = tx.intents;
+    if (typeof intents?.entries !== 'function' || intents.size !== 1) {
+        throw new Error(`buildSponsorable: gasHeadroom expects one intent in the built transaction, found ${typeof intents?.size === 'number' ? intents.size : 'none'}`);
+    }
+    const [[segmentId, intent]] = intents.entries();
+    // Only addCall derives the call's communication commitment; intoCall leaves it wrong and the prover refuses the call.
+    // The getter hands out copies, so the rebuilt intent goes back in through the setter.
+    intent.actions = [];
+    tx.intents = new Map([[segmentId, intent.addCall(prototype)]]);
+    return {
+        unprovenTx: mjTypes.LedgerTransaction.seal('v9', 'Unproven', tx),
+        declared: { guaranteed: gasFigures(guaranteed?.gas), fallible: gasFigures(fallible?.gas) }
+    };
 }
 
 /** Returns the address of the contract a deploy transaction creates. Throws unless it deploys exactly one contract. */
@@ -404,6 +480,9 @@ export async function describeLocalZkAssets(zkConfigDir, circuits = [], proveCir
     const isDir = (d) => { try { return statSync(d).isDirectory(); } catch { return false; } };
     if (!isDir(keysDir) || !isDir(zkirDir)) {
         throw new Error(`createTxBuilder: zkConfigDir ${zkConfigDir} must hold keys/ and zkir/ directories`);
+    }
+    if (!(await exists(join(zkConfigDir, COMPILER_MANIFEST)))) {
+        throw new Error(`createTxBuilder: zkConfigDir ${zkConfigDir} lacks ${COMPILER_MANIFEST}; compactc writes it next to keys/ and zkir/, and proving verifies every key against it`);
     }
     const files = readdirSync(keysDir);
     const zkirFiles = readdirSync(zkirDir);
@@ -441,18 +520,18 @@ export function trackingWebSocket(WebSocketImpl) {
 }
 
 /** All keys derived from the seed. `deriveIdentity` is the public version without secret keys. */
-async function deriveKeyMaterial({ seedHex, networkId = 'preprod', accountIndex = 0, attestationSecret: ownSecret }) {
+async function deriveKeyMaterial({ seedHex, networkId = 'mainnet', accountIndex = 0, attestationSecret: ownSecret }) {
     assertSeedHex(seedHex);
     const [unshielded, { deriveAttestationSecret }, ledger, addressFormat] = await Promise.all([
         import('@midnightntwrk/wallet-sdk-unshielded-wallet'),
         import('../browser/witnesses.mjs'),
-        import('@midnight-ntwrk/ledger-v8'),
+        import('@midnightntwrk/ledger-v9'),
         import('@midnightntwrk/wallet-sdk-address-format')
     ]);
     const { deriveRoleSeeds } = require('../../srv/utils/wallet-hd.js');
     const rt = compactRuntime;
     const roleSeeds = await deriveRoleSeeds(new Uint8Array(Buffer.from(seedHex, 'hex')), accountIndex);
-    const keystore = unshielded.createKeystore(roleSeeds.night, networkId);
+    const keystore = unshielded.createKeystore({ kind: 'schnorr', secret: roleSeeds.night }, networkId);
     const attestationSecret = ownSecret ?? deriveAttestationSecret(roleSeeds.zswap);
     const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
     const shieldedKeys = { coinPublicKey: String(zswapKeys.coinPublicKey), encryptionPublicKey: String(zswapKeys.encryptionPublicKey) };
@@ -496,7 +575,7 @@ export async function deriveIdentity(opts) {
 /** Creates a transaction builder for your seed. The options are typed and documented as `CreateTxBuilderInput` in index.d.ts. */
 export async function createTxBuilder(opts) {
     const {
-        seedHex, networkId = 'preprod', accountIndex = 0,
+        seedHex, networkId = 'mainnet', accountIndex = 0,
         nodeUrl, zkConfigBaseUrl,
         circuits, ttlMinutes = 30, onProgress
     } = opts ?? {};
@@ -526,6 +605,9 @@ export async function createTxBuilder(opts) {
     }
     if (opts.proofTimeoutMs !== undefined && !(Number.isInteger(opts.proofTimeoutMs) && opts.proofTimeoutMs > 0)) {
         throw new Error(`createTxBuilder: proofTimeoutMs must be a positive integer (ms), got ${String(opts.proofTimeoutMs)}`);
+    }
+    if (opts.proverMaterialDir !== undefined && (typeof opts.proverMaterialDir !== 'string' || opts.proverMaterialDir === '')) {
+        throw new Error('createTxBuilder: proverMaterialDir must be a directory path');
     }
     const syncMode = walletSyncMode(opts.walletSync);
     const shared = opts.shieldedWallet;
@@ -577,76 +659,88 @@ export async function createTxBuilder(opts) {
         });
     }
 
-    const [ledger, facadeSdk, shielded, unshielded, dust, abstractions, netId, compactJs, contracts, zkNode, indexerSdk, proving] = await Promise.all([
-        import('@midnight-ntwrk/ledger-v8'),
+    const [ledger, facadeSdk, shielded, unshielded, dust, abstractions, compactJs, contracts, zkNode, indexerSdk, mjTypes] = await Promise.all([
+        import('@midnightntwrk/ledger-v9'),
         import('@midnightntwrk/wallet-sdk-facade'),
         import('@midnightntwrk/wallet-sdk-shielded'),
         import('@midnightntwrk/wallet-sdk-unshielded-wallet'),
         import('@midnightntwrk/wallet-sdk-dust-wallet'),
         import('@midnightntwrk/wallet-sdk-abstractions'),
-        import('@midnight-ntwrk/midnight-js-network-id'),
         import('@midnight-ntwrk/compact-js'),
         import('@midnight-ntwrk/midnight-js-contracts'),
         import('@midnight-ntwrk/midnight-js-node-zk-config-provider'),
         import('@midnight-ntwrk/midnight-js-indexer-public-data-provider'),
-        import('@midnightntwrk/wallet-sdk-capabilities/proving')
+        import('@midnight-ntwrk/midnight-js-types')
     ]);
-    netId.setNetworkId?.(networkId);
 
     const { roleSeeds, keystore, attestationSecret, attesterId, addresses, shieldedKeys } = await deriveKeyMaterial({ seedHex, networkId, accountIndex, attestationSecret: opts.attestationSecret });
     const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
-    const dustKey = ledger.DustSecretKey.fromSeed(roleSeeds.dust);
+    // The wallets derive the keys of each ledger version from these seeds, so they can follow a fork.
+    const walletSeeds = { shielded: roleSeeds.zswap, unshielded: roleSeeds.night, dust: roleSeeds.dust };
 
+    // The wallet's circuits and the contract proofs share one provider, so each file is read or fetched once per process.
+    const proverMaterial = createProverMaterialProvider({ dir: opts.proverMaterialDir, onProgress });
+    const provingMode = opts.provingMode === 'server' ? 'server' : 'wasm';
     onProgress?.({ phase: 'wallet' });
-    const configuration = {
+    const configuration = facadeSdk.WalletFacade.resolveConfiguration({
         networkId,
-        // The SDK requires provingServerUrl even though the wallet proves in this process.
         relayURL: new URL(nodeUrl ?? UNUSED_NODE_URL),
-        provingServerUrl: new URL(opts.proofServerUrl ?? 'http://127.0.0.1:6300'),
+        // 'server' sends the wallet's proofs and the contract's to the same proof server.
+        provers: { v9: provingMode === 'server'
+            ? { kind: 'server', url: new URL(opts.proofServerUrl) }
+            : { kind: 'wasm', keyMaterialProvider: proverMaterial } },
         indexerClientConnection: hasIndexer ? { indexerHttpUrl, indexerWsUrl } : UNUSED_INDEXER,
         txHistoryStorage: new abstractions.InMemoryTransactionHistoryStorage(facadeSdk.WalletEntrySchema, facadeSdk.mergeWalletEntries),
         costParameters: { additionalFeeOverhead: 1n, feeBlocksMargin: 5 }
-    };
+    });
+    const configurationOf = (wallet) => walletConfiguration(wallet, synced, configuration, abstractions.ProtocolVersion.V9NativeForkVersion);
     const facade = await facadeSdk.WalletFacade.init({
         configuration,
         // Without a node the SDK's default service would dial the relay at init.
         ...(nodeUrl ? {} : { submissionService: buildOnlySubmissionService() }),
-        provingService: () => proving.makeWasmProvingService({}),
         shielded: () => (shared ? sharedShieldedWallet(shared)
-            : saved?.shielded ? shielded.ShieldedWallet(configuration).restore(saved.shielded)
-                : shielded.ShieldedWallet(configuration).startWithSecretKeys(zswapKeys)),
+            : saved?.shielded ? shielded.ShieldedWallet(configurationOf('shielded')).restore(saved.shielded)
+                : shielded.ShieldedWallet(configurationOf('shielded')).startWithSeed(walletSeeds.shielded)),
         unshielded: () => (saved?.unshielded
-            ? unshielded.UnshieldedWallet(configuration).restore(saved.unshielded)
-            : unshielded.UnshieldedWallet(configuration).startWithPublicKey(unshielded.PublicKey.fromKeyStore(keystore))),
+            ? unshielded.UnshieldedWallet(configurationOf('unshielded')).restore(saved.unshielded)
+            : unshielded.UnshieldedWallet(configurationOf('unshielded')).startWithPublicKey(unshielded.PublicKey.fromKeyStore(keystore))),
         dust: () => (saved?.dust
-            ? dust.DustWallet(configuration).restore(saved.dust)
-            : dust.DustWallet(configuration).startWithSecretKey(dustKey, ledger.LedgerParameters.initialParameters().dust))
+            ? dust.DustWallet(configurationOf('dust')).restore(saved.dust)
+            : dust.DustWallet(configurationOf('dust')).startWithSeed(walletSeeds.dust, ledger.LedgerParameters.initialParameters().dust))
     });
     // Syncing a wallet reads the whole chain and keeps this thread busy; a call that moves no
     // tokens needs none. A sponsor pays the fee, so 'shielded' and 'coins' leave the dust wallet out.
     const stopWatching = onProgress ? watchSync(facade, synced, onProgress) : () => {};
-    if (syncMode === 'all') await facade.start(zswapKeys, dustKey);
-    else if (syncMode === 'coins') await Promise.all([facade.shielded.start(zswapKeys), facade.unshielded.start()]);
-    else if (syncMode === 'shielded') await facade.shielded.start(zswapKeys);
+    if (syncMode === 'all') await facade.start(walletSeeds);
+    else if (syncMode === 'coins') await Promise.all([facade.shielded.start(await shieldedKeysByEpoch(roleSeeds.zswap)), facade.unshielded.start()]);
+    else if (syncMode === 'shielded') await facade.shielded.start(await shieldedKeysByEpoch(roleSeeds.zswap));
 
     const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
     if (!CompiledContract?.make) throw new Error('compact-js: CompiledContract.make not found');
     const zkConfigProvider = new zkNode.NodeZkConfigProvider(cacheDir);
-    // provingMode only affects the contract's circuits. The wallet's own proofs are always made in this process.
     let proofProvider;
-    const provingMode = opts.provingMode === 'server' ? 'server' : 'wasm';
     if (provingMode === 'server') {
         const { httpClientProofProvider } = await import('@midnight-ntwrk/midnight-js-http-client-proof-provider');
         proofProvider = httpClientProofProvider(opts.proofServerUrl, zkConfigProvider, proofProviderConfig(opts));
     } else {
         const { buildWasmProofProvider } = require('../../srv/midnight/wasm-proof-provider.js');
-        proofProvider = await buildWasmProofProvider(zkConfigProvider);
+        proofProvider = await buildWasmProofProvider(zkConfigProvider, proverMaterial);
     }
     const { InMemoryPrivateStateProvider } = await import('../browser/private-state.mjs');
+    // midnight-js hands over its own transaction handles, while the wallet works on ledger transactions.
+    const decoders = { v9: ledger.Transaction };
+    const walletProviders = (wallet) => ({
+        walletProvider: mjTypes.createLedger9WalletProvider({
+            getCoinPublicKey: () => wallet.getCoinPublicKey(),
+            getEncryptionPublicKey: () => wallet.getEncryptionPublicKey(),
+            balanceTx: (tx, ttl) => wallet.balanceTx(tx.deserialize(decoders), ttl)
+        }),
+        midnightProvider: mjTypes.createLedger9MidnightProvider((tx) => wallet.submitTx(tx.deserialize(decoders)))
+    });
     // One indexer provider per builder. One per transaction would leak a socket each time.
     const sockets = apiClient ? null : trackingWebSocket(require('ws'));
     const publicDataProvider = apiClient
-        ? apiPublicDataProvider({ client: apiClient, ledger, runtime: compactRuntime, ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
+        ? apiPublicDataProvider({ client: apiClient, mjTypes, protocolVersion: Number(configuration.forks?.v9 ?? abstractions.ProtocolVersion.V9NativeForkVersion), ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
         : indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, sockets.WebSocket);
 
     return {
@@ -674,7 +768,7 @@ export async function createTxBuilder(opts) {
 
         /** Builds, proves and signs one transaction of up to 8 calls for a sponsor to pay and submit.
          *  All calls share one witnesses object. A call's `before` hook sets what differs per call. */
-        async buildSponsorable({ contractAddress, call, calls, witnesses: sharedWitnesses, initialPrivateState, bind = true, attestationSecret: batchSecret, independentCalls = false, orderedPrefix = 0, recipients }) {
+        async buildSponsorable({ contractAddress, call, calls, witnesses: sharedWitnesses, initialPrivateState, bind = true, attestationSecret: batchSecret, independentCalls = false, orderedPrefix = 0, recipients, gasHeadroom }) {
             if (!contractAddress) throw new Error('buildSponsorable: contractAddress is required');
             const recipientKeys = recipientKeyMap(recipients);
             if (call && calls) throw new Error('buildSponsorable: pass either call or calls, not both');
@@ -687,6 +781,8 @@ export async function createTxBuilder(opts) {
                 if (!c?.circuitId) throw new Error('buildSponsorable: every call must come from a prepare* helper (or carry circuitId, args and witnesses)');
             }
             const isBatch = callList.length > 1;
+            const headroom = gasHeadroomFactor(gasHeadroom);
+            if (headroom !== undefined && isBatch) throw new Error('buildSponsorable: gasHeadroom applies to a single call, not to a batch');
             onProgress?.({ phase: 'build', circuit: callList.map(c => c.circuitId).join('+') });
 
             let witnesses;
@@ -734,17 +830,16 @@ export async function createTxBuilder(opts) {
                 CompiledContract.withCompiledFileAssets(cacheDir)
             );
             const holder = {};
-            const walletProvider = buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes, bind);
+            const walletProvider = buildOnlyWalletProvider(facade, zswapKeys, keystore, holder, ttlMinutes, bind, configuration.forks);
             const privateStateProvider = new InMemoryPrivateStateProvider();
             const providers = {
                 publicDataProvider,
                 zkConfigProvider,
                 proofProvider,
                 privateStateProvider,
-                walletProvider,
-                midnightProvider: walletProvider
+                ...walletProviders(walletProvider),
+                config: { networkId, ttlSeconds: ttlMinutes * 60 }
             };
-            privateStateProvider.setContractAddress?.(contractAddress);
             const found = await findDeployedWithRetry(contracts, providers, {
                 contractAddress,
                 compiledContract: compiled,
@@ -785,9 +880,20 @@ export async function createTxBuilder(opts) {
                     throw new Error("circuit '" + single.circuitId + "' is not on the contract at " + contractAddress);
                 }
                 // The contract's call function takes no recipient keys, so this calls the SDK function behind it.
-                const fn = recipientKeys
-                    ? (...args) => contracts.submitCallTx(providers, contracts.createCallTxOptions(compiled, single.circuitId, contractAddress, privateStateId, recipientKeys, args))
-                    : direct;
+                // With gasHeadroom the build pauses before proving, raises the declared gas and continues with the SDK's prove, balance and submit.
+                const callOptions = (args) => contracts.createCallTxOptions(compiled, single.circuitId, contractAddress, privateStateId, recipientKeys, args);
+                const fn = headroom !== undefined
+                    ? async (...args) => {
+                        // The call result carries the state value, not the operations. The verifier key is read from the chain.
+                        const [contractState, data] = await Promise.all([
+                            publicDataProvider.queryContractState(contractAddress),
+                            contracts.createUnprovenCallTx(providers, callOptions(args))
+                        ]);
+                        const { unprovenTx, declared } = applyGasHeadroom({ ledger, mjTypes }, data, headroom, { contractAddress, circuitId: single.circuitId, contractState });
+                        onProgress?.({ phase: 'gas-headroom', factor: headroom, ...declared });
+                        return contracts.submitTx(providers, { unprovenTx, circuitId: single.circuitId });
+                    }
+                    : recipientKeys ? (...args) => contracts.submitCallTx(providers, callOptions(args)) : direct;
                 // The wallet provider throws at submit on purpose, so an error with a captured transaction is success.
                 try {
                     await runSingleCall(single, fn);
@@ -808,20 +914,29 @@ export async function createTxBuilder(opts) {
         async buildDeploySponsorable({ initialPrivateState, constructorArgs, witnesses, bind = true, recipients } = {}) {
             const recipientKeys = recipientKeyMap(recipients);
             onProgress?.({ phase: 'build', circuit: '<deploy>' });
+            // The vault constructor reads the deployer's secret through a witness, so the vault family gets its witnesses here.
+            if (!witnesses && String(contractName).startsWith('attestation-vault')) {
+                const { buildAttestationVaultWitnesses } = await import('../browser/witnesses.mjs');
+                witnesses = buildAttestationVaultWitnesses({
+                    attestationSecret,
+                    merkleProofHolder: {},
+                    ...(fromPackage?.slotWidth !== undefined ? { slotWidth: fromPackage.slotWidth } : {})
+                });
+            }
             const compiled = CompiledContract.make(contractName, contractClass).pipe(
                 witnesses ? CompiledContract.withWitnesses(witnesses) : CompiledContract.withVacantWitnesses,
                 CompiledContract.withCompiledFileAssets(cacheDir)
             );
             const holder = {};
-            const walletProvider = buildOnlyWalletProvider(facade, zswapKeys, dustKey, keystore, holder, ttlMinutes, bind);
+            const walletProvider = buildOnlyWalletProvider(facade, zswapKeys, keystore, holder, ttlMinutes, bind, configuration.forks);
             const privateStateProvider = new InMemoryPrivateStateProvider();
             const providers = {
                 publicDataProvider,
                 zkConfigProvider,
                 proofProvider,
                 privateStateProvider,
-                walletProvider,
-                midnightProvider: walletProvider
+                ...walletProviders(walletProvider),
+                config: { networkId, ttlSeconds: ttlMinutes * 60 }
             };
             // The wallet provider throws at submit on purpose, so an error with a captured transaction is success.
             try {
@@ -846,7 +961,7 @@ export async function createTxBuilder(opts) {
 
         /** Releases what a built transaction reserved in the builder's wallets, a shared shielded wallet included. */
         async revert(input) {
-            await revertBuilt(facade, input);
+            await revertBuilt(facade, input, configuration.forks);
         },
 
         /** Stops the wallet sync and closes the indexer connections. */

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { Writable } from 'stream';
 import { mountZkConfigRoute } from '../../src/connector-routes';
 import { registerContract, unregisterContract } from '../../srv/submission/contract-registry';
 
@@ -21,6 +22,25 @@ function call(route: string, params: Record<string, string>): { status: number; 
     };
     handlers.get(route)!({ params, headers: {} }, res);
     return out;
+}
+
+/** The file handler, with a response that collects the piped bytes. */
+function serve(params: Record<string, string>): Promise<{ status: number; body: string; headers: Record<string, string> }> {
+    const handlers = new Map<string, (req: any, res: any) => void>();
+    mountZkConfigRoute({ get: (paths: string | string[], fn: any) => { for (const p of [paths].flat()) handlers.set(p, fn); } });
+    return new Promise((resolve) => {
+        const chunks: Buffer[] = [];
+        const headers: Record<string, string> = {};
+        let status = 200;
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve({ status, body: Buffer.concat(chunks).toString('utf8'), headers }); } };
+        const res: any = new Writable({ write(chunk, _enc, cb) { chunks.push(Buffer.from(chunk)); cb(); } });
+        res.setHeader = (k: string, v: string) => { headers[k] = v; };
+        res.status = (code: number) => { status = code; return res; };
+        res.json = () => res;
+        res.on('finish', finish);
+        handlers.get('/zk-config/:contract/:dir/:file')!({ params, headers: {} }, res);
+    });
 }
 
 describe('zk-config contract index', () => {
@@ -49,5 +69,20 @@ describe('zk-config contract index', () => {
 
     it('answers 404 for a contract that is not registered', () => {
         expect(call('/zk-config/:contract/', { contract: 'nope' }).status).toBe(404);
+    });
+
+    it('serves compiler/contract-manifest.json once the contract has one, and nothing else from compiler/', async () => {
+        // midnight-js verifies every key against this file, so a builder that downloads keys needs it too.
+        expect((await serve({ contract: NAME, dir: 'compiler', file: 'contract-manifest.json' })).status).toBe(404);
+        fs.mkdirSync(path.join(dir, 'compiler'));
+        fs.writeFileSync(path.join(dir, 'compiler', 'contract-manifest.json'), '{"manifest-version":"1"}');
+        fs.writeFileSync(path.join(dir, 'compiler', 'contract-info.json'), '{}');
+        expect(call('/zk-config/:contract', { contract: NAME }).body.files.compiler).toEqual(['contract-manifest.json']);
+        const served = await serve({ contract: NAME, dir: 'compiler', file: 'contract-manifest.json' });
+        expect(served).toMatchObject({ status: 200, body: '{"manifest-version":"1"}' });
+        expect(served.headers['Content-Type']).toBe('application/json');
+        expect((await serve({ contract: NAME, dir: 'compiler', file: 'contract-info.json' })).status).toBe(404);
+        expect((await serve({ contract: NAME, dir: 'keys', file: 'contract-manifest.json' })).status).toBe(404);
+        expect((await serve({ contract: NAME, dir: 'keys', file: 'attest.verifier' })).status).toBe(200);
     });
 });

@@ -1,6 +1,7 @@
 // Main-thread side of the wallets in the wallet worker thread. The worker exists because a syncing SDK wallet would block the main thread.
 // This module hands saved wallet state to the worker and stores the state it sends back.
 
+import type { NightgateNetwork } from '../utils/nightgate-config';
 import {
     walletInit,
     walletEvict,
@@ -28,7 +29,7 @@ const dbgSync = (msg: string): void => { if (DEBUG_SYNC) log.debug(msg); };
 
 export interface WalletFacadeBuildArgs {
     seedHex: string;
-    networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
+    networkId: NightgateNetwork;
     indexerHttpUrl: string;
     indexerWsUrl: string;
     proofServerUrl: string;

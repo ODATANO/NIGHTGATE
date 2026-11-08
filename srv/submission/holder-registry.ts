@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { holderClaimKey, holderEntry as kitHolderEntry, hexToBytes32 } from '@odatano/contract-kit';
 import { importArtifact } from './artifact-import';
-import { buildPublicDataProvider } from '../midnight/public-data-provider';
+import { buildPublicDataProvider, queryLedger9ContractState } from '../midnight/public-data-provider';
 import type { ContractArtifact } from './predicate-state';
 
 export const HOLDER_REGISTRY_REF = 'holder-registry';
@@ -37,9 +37,9 @@ export interface HolderRegistration {
 export async function readHolderRegistration(q: HolderRegistrationQuery): Promise<HolderRegistration | null> {
     const publicData = await buildPublicDataProvider(q.contractProvidersConfig);
     const artifact = await importArtifact(q.artifactPath, q.artifactDigest) as ContractArtifact<HolderRegistryLedger>;
-    const state = await publicData.queryContractState(q.contractAddress);
+    const state = await queryLedger9ContractState(publicData, q.contractAddress);
     if (!state) return null;
     const entry = holderEntry(artifact, q.tokenType, q.claimKey);
-    const led = artifact.ledger(state.data ?? state);
+    const led = artifact.ledger(state.data);
     return { registered: led.holders.member(hexToBytes32(entry)) === true, entry };
 }

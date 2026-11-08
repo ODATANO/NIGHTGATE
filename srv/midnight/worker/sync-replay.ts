@@ -20,17 +20,23 @@ export const lastReplayRejection: Partial<Record<ReplayKind, ReplayRejection>> =
 
 /** Which wallet part a replay error belongs to, or null when it is no replay error. */
 export function classifyReplayRejection(value: unknown): { kind: ReplayKind; message: string } | null {
-    let current: any = value;
+    let current: unknown = value;
     for (let depth = 0; depth < 6 && current != null; depth++) {
-        const message = typeof current === 'string'
-            ? current
-            : (typeof current.message === 'string' ? current.message : '');
+        const own = path(current, 'message');
+        const message = typeof current === 'string' ? current : (typeof own === 'string' ? own : '');
         for (const [kind, pattern] of REJECTION_SIGNATURES) {
             if (pattern.test(message)) return { kind, message: message.slice(0, 300) };
         }
-        current = typeof current === 'object' ? current.cause : undefined;
+        current = typeof current === 'object' ? path(current, 'cause') : undefined;
     }
     return null;
+}
+
+/** Follows `keys` through a value of unknown shape. Undefined where a step is missing. */
+function path(value: unknown, ...keys: string[]): unknown {
+    let cur = value;
+    for (const key of keys) cur = cur == null ? undefined : (cur as Record<string, unknown>)[key];
+    return cur;
 }
 
 export function noteConsoleErrorArgs(args: unknown[], now: number = Date.now()): void {
@@ -43,14 +49,16 @@ export function noteConsoleErrorArgs(args: unknown[], now: number = Date.now()):
 const TAPPED = Symbol.for('nightgate.replayRejectionTap');
 
 /** Wraps `console.error` to record replay errors. The original still prints. */
-export function installReplayRejectionTap(target: { error: (...args: any[]) => void } = console): void {
-    if ((target.error as any)[TAPPED]) return;
+type ErrorPrinter = ((...args: unknown[]) => void) & { [TAPPED]?: true };
+
+export function installReplayRejectionTap(target: { error: (...args: unknown[]) => void } = console): void {
+    if ((target.error as ErrorPrinter)[TAPPED]) return;
     const original = target.error;
-    const tapped = (...args: any[]) => {
+    const tapped: ErrorPrinter = (...args: unknown[]) => {
         try { noteConsoleErrorArgs(args); } catch { /* recording never breaks the log line */ }
         return original.apply(target, args);
     };
-    (tapped as any)[TAPPED] = true;
+    tapped[TAPPED] = true;
     target.error = tapped;
 }
 
@@ -88,12 +96,14 @@ export function shouldResetRestoredSubWallet(input: {
     return streamTip != null && streamTip > track.startIndex + tipGap;
 }
 
+// The readers below take a facade state of any shape: they only describe it for the log and never throw.
+
 /** A wallet part's `appliedIndex`, or null when it cannot be read. */
-export function appliedIndexOf(state: any, kind: ReplayKind): bigint | null {
+export function appliedIndexOf(state: unknown, kind: ReplayKind): bigint | null {
     try {
-        const progress = state?.[kind]?.progress ?? state?.[kind]?.state?.progress;
-        const value = progress?.appliedIndex;
-        return value == null ? null : BigInt(value);
+        const progress = path(state, kind, 'progress') ?? path(state, kind, 'state', 'progress');
+        const value = path(progress, 'appliedIndex');
+        return value == null ? null : BigInt(value as bigint | string | number);
     } catch {
         return null;
     }
@@ -116,9 +126,9 @@ function readSafely<T>(read: () => T): T | null {
 }
 
 /** The positions a saved state resumes from, for logging. Never throws. */
-export function describeSyncState(state: any): SyncStateDescription {
-    const syncTime = readSafely(() => state?.dust?.state?.state?.syncTime);
-    const firstFree = readSafely(() => state?.shielded?.state?.state?.firstFree);
+export function describeSyncState(state: unknown): SyncStateDescription {
+    const syncTime = readSafely(() => path(state, 'dust', 'state', 'state', 'syncTime'));
+    const firstFree = readSafely(() => path(state, 'shielded', 'state', 'state', 'firstFree'));
     const dustApplied = appliedIndexOf(state, 'dust');
     const shieldedApplied = appliedIndexOf(state, 'shielded');
     return {

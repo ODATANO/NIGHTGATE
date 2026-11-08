@@ -5,7 +5,7 @@ import cds from '@sap/cds';
 import { BackgroundJobs, PendingSubmissions, type PendingSubmission, type BackgroundJob } from '#cds-models/midnight';
 import { parseSubmitIntent } from './submit-intent';
 import { isChainOutcome, isChainAbsent, type ChainOutcome, type ChainLookup } from './chain-outcome-confirmer';
-import { configMs } from '../utils/config';
+import { configMs, configNumber } from '../utils/config';
 import { carriedSubmitFailure } from '../midnight/wallet-worker-protocol';
 import { readReorgGeneration, lockReorgGeneration } from './reorg-generation';
 import { affectedRows, type DbRunner, type DbService } from '../utils/db-types';
@@ -144,6 +144,60 @@ let chainConfirmActive = false;
 
 const CHAIN_CONFIRM_CONCURRENCY = 8;
 
+const CHAIN_CONFIRM_BACKOFF_START_MS = 5000;
+
+const CHAIN_CONFIRM_BACKOFF_ENTRIES = 10_000;
+
+// A failed lookup says nothing about the job, so its pause stays short. The shared budget bounds the load in an outage.
+const CHAIN_CONFIRM_ERROR_PAUSE_MAX_MS = 60_000;
+
+// Per job: lookups without an outcome so far and when to ask next. In memory, because only one server instance runs.
+const confirmBackoff = new Map<string, { misses: number; failures: number; nextAt: number }>();
+
+function dueForLookup(jobId: string, now: number): boolean {
+    return (confirmBackoff.get(jobId)?.nextAt ?? 0) <= now;
+}
+
+const doubledPause = (count: number, maxMs: number): number =>
+    Math.min(CHAIN_CONFIRM_BACKOFF_START_MS * 2 ** Math.min(count - 1, 30), maxMs, configMs('NIGHTGATE_CHAIN_CONFIRM_BACKOFF_MAX_MS'));
+
+function pauseJob(jobId: string, entry: { misses: number; failures: number; nextAt: number }): void {
+    confirmBackoff.delete(jobId);
+    confirmBackoff.set(jobId, entry);
+    // Drops the entry touched longest ago. A job that left the scan another way keeps no entry forever.
+    if (confirmBackoff.size > CHAIN_CONFIRM_BACKOFF_ENTRIES) confirmBackoff.delete(confirmBackoff.keys().next().value!);
+}
+
+function noteNoOutcome(jobId: string, now: number): void {
+    const misses = (confirmBackoff.get(jobId)?.misses ?? 0) + 1;
+    pauseJob(jobId, { misses, failures: 0, nextAt: now + doubledPause(misses, Number.POSITIVE_INFINITY) });
+}
+
+function noteLookupFailed(jobId: string, now: number): void {
+    const held = confirmBackoff.get(jobId);
+    const failures = (held?.failures ?? 0) + 1;
+    pauseJob(jobId, { misses: held?.misses ?? 0, failures, nextAt: now + doubledPause(failures, CHAIN_CONFIRM_ERROR_PAUSE_MAX_MS) });
+}
+
+// Shared lookup budget over all jobs, refilled per minute. A pass holds at most ten seconds' worth.
+const lookupBudget = { tokens: Number.NaN, at: 0 };
+
+function availableLookups(now: number): number {
+    const perMinute = configNumber('NIGHTGATE_CHAIN_CONFIRM_LOOKUPS_PER_MINUTE');
+    const capacity = Math.max(1, Math.ceil(perMinute / 6));
+    const before = Number.isNaN(lookupBudget.tokens) ? capacity : lookupBudget.tokens;
+    lookupBudget.tokens = Math.min(capacity, before + (now - lookupBudget.at) * perMinute / 60_000);
+    lookupBudget.at = now;
+    return Math.floor(lookupBudget.tokens);
+}
+
+// Keeps the jobs that are due, up to the budget, and spends the budget on them.
+function takeDueJobs(jobs: BackgroundJob[], now: number): BackgroundJob[] {
+    const due = jobs.filter(job => dueForLookup(job.ID, now)).slice(0, availableLookups(now));
+    lookupBudget.tokens -= due.length;
+    return due;
+}
+
 /** Error code of a parked job whose sent transaction is neither found on chain nor known to be missing. */
 export const BROADCAST_UNCONFIRMED = 'BROADCAST_UNCONFIRMED';
 
@@ -153,9 +207,12 @@ export const BROADCAST_NOT_INCLUDED = 'BROADCAST_NOT_INCLUDED';
 /** For rows without a stored ttl. The longest ttl any send path sets. */
 const LEGACY_BROADCAST_TTL_MS = 60 * 60 * 1000;
 
-// Fails a parked job as never included once the indexer that reported it missing is past its ttl plus a margin.
+// Marks a job never included once the indexer that reported it missing is past its ttl plus a margin. A parked job fails.
 // Only that indexer's tip counts. A lagging replica must not turn a landed transaction into a lost one, or the caller would pay twice.
-async function finalizeLostBroadcast(db: DbService, job: BackgroundJob, tipMs: number | null, generation: number): Promise<number> {
+async function finalizeLostBroadcast(
+    db: DbService, job: BackgroundJob, tipMs: number | null, generation: number,
+    fromStatus: 'reconciliation_required' | 'succeeded' = 'reconciliation_required'
+): Promise<number> {
     if (tipMs === null || job.errorCode === REJECTED_ATTEMPT_BOOKKEEPING_PENDING || jobKindTraits(job.kind).workflowParent) return 0;
     const submission: PendingSubmission | undefined = await db.run(SELECT.one.from(PendingSubmissions).where(attemptRowOf(job)));
     const coordinates = parseSubmitIntent(submission?.submitIntentData);
@@ -172,10 +229,12 @@ async function finalizeLostBroadcast(db: DbService, job: BackgroundJob, tipMs: n
     const earlier = job.errorCode ? ` Earlier: ${job.errorCode}${job.errorMessage ? `: ${String(job.errorMessage).slice(0, 1000)}` : ''}` : '';
     return withLockContentionRetry(`finalizeLostBroadcast(${job.ID})`, () => db.tx(async (tx) => {
         if (await lockReorgGeneration(tx) !== generation) return 0;
-        const affected = affectedRows(await tx.run(UPDATE.entity(BackgroundJobs).set({
-            status: 'failed', chainStatus: 'dropped', finishedAt: now,
-            errorCode: BROADCAST_NOT_INCLUDED, errorMessage: (message + earlier).slice(0, 4000)
-        }).where({ ID: job.ID, status: 'reconciliation_required' })));
+        const errorFields = { chainStatus: 'dropped' as const, errorCode: BROADCAST_NOT_INCLUDED, errorMessage: (message + earlier).slice(0, 4000) };
+        const affected = affectedRows(await tx.run(fromStatus === 'succeeded'
+            ? UPDATE.entity(BackgroundJobs).set({ ...errorFields, chainFinalizedAt: now })
+                .where({ ID: job.ID, status: 'succeeded', chainStatus: job.chainStatus ?? null })
+            : UPDATE.entity(BackgroundJobs).set({ ...errorFields, status: 'failed', finishedAt: now })
+                .where({ ID: job.ID, status: 'reconciliation_required' })));
         let rowClosed = 0;
         if (affected === 1 && submission?.ID) {
             rowClosed = affectedRows(await tx.run(UPDATE.entity(PendingSubmissions).set({
@@ -414,9 +473,10 @@ export async function refreshSucceededChainOutcomes(existingDb?: DbRunner): Prom
     for (const parent of parents) {
         const children = await db.run(SELECT.from(BackgroundJobs).where({ parentJobId: parent.ID })) as BackgroundJob[];
         if (children.length === 0) continue;
-        const aggregate = children.some(child => child.chainStatus === 'failure')
-            ? 'failure'
-            : children.every(child => child.chainStatus === 'success') ? 'success' : 'pending';
+        const aggregate = children.some(child => child.chainStatus === 'failure') ? 'failure'
+            : children.every(child => child.chainStatus === 'success') ? 'success'
+                : children.some(child => child.chainStatus === 'dropped') && children.every(child => child.chainStatus === 'success' || child.chainStatus === 'dropped') ? 'dropped'
+                    : 'pending';
         if (parent.chainStatus === aggregate) continue;
         const affected = await withLockContentionRetry(`refreshParentChainOutcome(${parent.ID})`, () => db.run(
             UPDATE.entity(BackgroundJobs).set({
@@ -455,14 +515,16 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: DbService): Pr
     let writeErrors = 0;
     // Rollback counter read before the lookups. Each write compares it again under the row lock.
     let generation = await readReorgGeneration(db);
-    for (const job of reconcilePage.rows) {
+    for (const job of takeDueJobs(reconcilePage.rows, Date.now())) {
         let outcome: ChainLookup;
         try { outcome = await confirmer(job.txHash!); } catch (err) {
             lookupErrors++;
+            noteLookupFailed(job.ID, Date.now());
             cds.log('nightgate').debug(`Reconciliation lookup for ${job.kind} job ${job.ID} deferred: ${errorMessage(err)}`);
             continue;
         }
         if (!isChainOutcome(outcome)) {
+            noteNoOutcome(job.ID, Date.now());
             // Only a clear "not found" counts. A transaction that is found but not yet confirmed may land.
             if (isChainAbsent(outcome)) {
                 try { updated += await finalizeLostBroadcast(db, job, outcome.asOfMs, generation); } catch (err) {
@@ -472,6 +534,7 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: DbService): Pr
             }
             continue;
         }
+        confirmBackoff.delete(job.ID);
         try {
             updated += await finalizeIdentifierKeyedJob(db, job, outcome, { fromStatus: 'reconciliation_required', generation });
         } catch (err) {
@@ -479,8 +542,8 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: DbService): Pr
             cds.log('nightgate').debug(`Crawler-free reconciliation of ${job.kind} job ${job.ID} deferred: ${errorMessage(err)}`);
         }
     }
-    const jobs = [...pendingPage.rows, ...legacyPage.rows]
-        .filter(job => !jobKindTraits(job.kind).workflowParent);
+    const jobs = takeDueJobs([...pendingPage.rows, ...legacyPage.rows]
+        .filter(job => !jobKindTraits(job.kind).workflowParent), Date.now());
     generation = await readReorgGeneration(db);
     let staleGeneration = 0;
     await mapWithConcurrency(jobs, CHAIN_CONFIRM_CONCURRENCY, async job => {
@@ -489,9 +552,22 @@ export async function confirmChainOutcomesViaIndexer(existingDb?: DbService): Pr
             outcome = await confirmer(job.txHash!);
         } catch {
             lookupErrors++;
+            noteLookupFailed(job.ID, Date.now());
             return;
         }
-        if (!isChainOutcome(outcome)) return;
+        if (!isChainOutcome(outcome)) {
+            noteNoOutcome(job.ID, Date.now());
+            if (isChainAbsent(outcome)) {
+                try {
+                    const n = await finalizeLostBroadcast(db, job, outcome.asOfMs, generation, 'succeeded');
+                    updated += n;
+                } catch {
+                    writeErrors++;
+                }
+            }
+            return;
+        }
+        confirmBackoff.delete(job.ID);
         // Update only if chainStatus is still the value read. `IN (...)` would never match a NULL.
         try {
             if (jobKindTraits(job.kind).identifierKeyed) {
@@ -604,4 +680,7 @@ export function __resetReconciliationForTests(): void {
     confirmerLegacyCursor = undefined;
     chainOutcomeConfirmer = null;
     chainConfirmActive = false;
+    confirmBackoff.clear();
+    lookupBudget.tokens = Number.NaN;
+    lookupBudget.at = 0;
 }

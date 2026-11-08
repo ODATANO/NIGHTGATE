@@ -57,16 +57,15 @@ function cfInstanceIndex(): number | undefined {
 }
 
 function multitenancyEnabled(): boolean {
-    const requires = (cds.env as any).requires ?? {};
-    const configured = requires.multitenancy;
+    const configured: unknown = cds.env.requires?.multitenancy;
     if (configured === true) return true;
-    if (configured && typeof configured === 'object' && configured.enabled !== false) return true;
+    if (configured && typeof configured === 'object' && (configured as { enabled?: unknown }).enabled !== false) return true;
     return process.env.CDS_MULTITENANCY === 'true';
 }
 
 
 function databaseKind(): string {
-    const db = (cds.env as any).requires?.db ?? {};
+    const db: { kind?: unknown; impl?: unknown } = cds.env.requires?.db ?? {};
     if (db.kind) return String(db.kind);
     const impl = String(db.impl ?? '');
     if (impl.includes('@cap-js/sqlite')) return 'sqlite';
@@ -76,7 +75,7 @@ function databaseKind(): string {
 }
 
 function authKind(): string {
-    return String((cds.env as any).requires?.auth?.kind ?? '');
+    return String(cds.env.requires?.auth?.kind ?? '');
 }
 
 function allowProductionSqlite(config: NightgatePluginConfig): boolean {

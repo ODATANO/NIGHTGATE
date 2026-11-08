@@ -1,8 +1,9 @@
 // Main-thread side of the wallet worker pool. A wallet's facade key always picks the same worker,
 // so the per-wallet locks inside a worker stay valid. See `NIGHTGATE_SPONSOR_WORKERS` for sponsors.
 
+import type { NightgateNetwork } from '../utils/nightgate-config';
 import cds from '@sap/cds';
-import { Worker, MessageChannel } from 'node:worker_threads';
+import { Worker, MessageChannel, type MessagePort } from 'node:worker_threads';
 import path from 'node:path';
 import type { CapDbPrivateStateProvider } from './CapDbPrivateStateProvider';
 import type { MerkleProofBundle } from '../submission/contract-witnesses';
@@ -17,6 +18,8 @@ import type { profileWorker } from '#cds-models/NightgateAdminService';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { profileSeconds } from './cpu-profile';
 import type { SyncProgressSnapshot } from './worker/facades';
+import type { SubmitIntent } from './worker/submit';
+import type { RpcErrorPayload } from './wallet-worker-protocol';
 
 const log = cds.log('nightgate:worker-client');
 
@@ -25,7 +28,7 @@ export interface WalletInitArgs {
     seedHex: string;
     /** BIP32 account index the seed signs with. Default 0. */
     accountIndex?: number;
-    networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
+    networkId: NightgateNetwork;
     indexerHttpUrl: string;
     indexerWsUrl: string;
     proofServerUrl: string;
@@ -49,6 +52,23 @@ export type StateSaveSink = (event: {
 
 /** A wallet's sync progress as the worker pushes it. A type import loads nothing at run time. */
 export type WalletSyncProgress = SyncProgressSnapshot;
+
+/** A message the wallet worker posts. Both ends are this package, so the worker's own types describe it. */
+type WorkerMessage =
+    | { kind: 'ready' }
+    | ({ kind: 'state-save' } & Parameters<StateSaveSink>[0])
+    | { kind: 'log'; level?: string; message?: unknown }
+    | { kind: 'sync-progress'; sessionId?: string; snapshot?: WalletSyncProgress }
+    | { kind: 'save-stats'; sessionId?: string; dust?: DustCollapseSample }
+    | ({ kind: 'private-state-rpc' } & PrivateStateRpcMessage)
+    | { kind: 'rotating'; generations?: number; inflight?: number }
+    | { kind: 'rotation-done'; generations?: number };
+
+/** A message on the reply port of one call: a send announcement, then the answer. */
+type WorkerPortMessage =
+    | ({ kind: 'submit-intent' } & SubmitIntent)
+    | { kind?: undefined; ok: true; result?: unknown }
+    | { kind?: undefined; ok?: false; error?: RpcErrorPayload | string };
 
 const syncProgressCache = new Map<string, WalletSyncProgress>();
 /** Which worker a wallet reported from, so a crash clears only that worker's wallets. */
@@ -237,7 +257,7 @@ async function startWorkerSlot(slot: WorkerSlot): Promise<void> {
     });
 
     const readyPromise = new Promise<void>((resolve, reject) => {
-        const onReady = (msg: any) => {
+        const onReady = (msg: WorkerMessage | null) => {
             if (msg?.kind === 'ready') {
                 worker.off('message', onReady);
                 resolve();
@@ -253,7 +273,7 @@ async function startWorkerSlot(slot: WorkerSlot): Promise<void> {
     slot.readyPromise = readyPromise;
     const tag = slots.size > 1 || slot.id !== DEFAULT_SLOT ? `worker ${slot.id}` : 'worker';
 
-    worker.on('message', (msg: any) => {
+    worker.on('message', (msg: WorkerMessage | null) => {
         if (msg?.kind === 'state-save') {
             // Ack only a stored save. One wallet's saves are stored in arrival order,
             // because a restored dust state relies on the last save winning.
@@ -275,7 +295,7 @@ async function startWorkerSlot(slot: WorkerSlot): Promise<void> {
                 : msg.level === 'error' ? 'error'
                     : msg.level === 'debug' ? 'debug'
                         : 'info';
-            (cds.log('nightgate:worker') as any)[level](msg.message);
+            cds.log('nightgate:worker')[level](msg.message);
         } else if (msg?.kind === 'sync-progress') {
             if (msg.sessionId && msg.snapshot) {
                 const snapshot = msg.snapshot as WalletSyncProgress;
@@ -535,7 +555,7 @@ async function rpcOnce<T>(slot: WorkerSlot, method: string, args: unknown, timeo
         const postAck = (ack: Record<string, unknown>): void => {
             try { port2.postMessage({ kind: 'submit-intent-ack', ...ack }); } catch { /* port already closed */ }
         };
-        port2.on('message', (msg: any) => {
+        port2.on('message', (msg: WorkerPortMessage | null) => {
             if (answered) return;
             if (msg?.kind === 'submit-intent') {
                 // Store, then ack or nack. Once the worker answered it gave up and did not send, so no ack.
@@ -571,8 +591,9 @@ async function rpcOnce<T>(slot: WorkerSlot, method: string, args: unknown, timeo
                     const coded = payload.nightgate
                         ? nightgateErrorFromPayload({ ...payload.nightgate, name: payload.name, message: payload.message })
                         : undefined;
-                    if (isSubmitFailureCode(payload.code)) {
-                        const submitErr = new WorkerSubmitError(payload);
+                    const code = payload.code;
+                    if (isSubmitFailureCode(code)) {
+                        const submitErr = new WorkerSubmitError({ ...payload, code });
                         if (coded) submitErr.cause = coded;
                         reject(submitErr);
                         return;
@@ -602,25 +623,17 @@ async function rpcOnce<T>(slot: WorkerSlot, method: string, args: unknown, timeo
     });
 }
 
-/**
- * `setContractAddress` has no reply port. Messages arrive in order, so it is applied before the next get or set.
- */
-function dispatchPrivateStateRpc(msg: any): void {
-    const { proxyId, method, args, port } = msg;
-    const provider = privateStateProviders.get(proxyId);
+/** A private-state call from the worker. Every per-contract method names its contract address first. */
+interface PrivateStateRpcMessage {
+    proxyId?: string;
+    method?: string;
+    args?: unknown[];
+    port?: MessagePort;
+}
 
-    if (method === 'setContractAddress') {
-        if (!provider) {
-            log.warn(`setContractAddress: unknown proxyId=${String(proxyId).slice(0, 16)}`);
-            return;
-        }
-        try {
-            provider.setContractAddress(...(args as [string]));
-        } catch (err) {
-            log.warn('setContractAddress failed:', errorMessage(err));
-        }
-        return;
-    }
+function dispatchPrivateStateRpc(msg: PrivateStateRpcMessage): void {
+    const { proxyId, method, args, port } = msg;
+    const provider = proxyId === undefined ? undefined : privateStateProviders.get(proxyId);
 
     if (!port) {
         log.warn(`private-state-rpc missing port for method=${method}`);
@@ -638,7 +651,7 @@ function dispatchPrivateStateRpc(msg: any): void {
 
     (async () => {
         try {
-            const result = await dispatchPrivateStateMethod(provider, method, args as unknown[]);
+            const result = await dispatchPrivateStateMethod(provider, String(method), args ?? []);
             port.postMessage({ ok: true, result });
         } catch (err: unknown) {
             port.postMessage({
@@ -660,12 +673,14 @@ async function dispatchPrivateStateMethod(
     method: string,
     args: unknown[]
 ): Promise<unknown> {
+    const contract = (): ReturnType<CapDbPrivateStateProvider['forContract']> => provider.forContract(args[0] as string);
     switch (method) {
-        case 'set': return provider.set(args[0] as string, args[1]);
-        case 'get': return provider.get(args[0] as string);
-        case 'remove': return provider.remove(args[0] as string);
-        case 'clear': return provider.clear();
-        case 'setSigningKey': return provider.setSigningKey(args[0] as string, args[1] as string);
+        case 'set': return contract().set(args[1] as string, args[2]);
+        case 'get': return contract().get(args[1] as string);
+        case 'remove': return contract().remove(args[1] as string);
+        case 'clear': return contract().clear();
+        case 'clearAll': return provider.clearAll();
+        case 'setSigningKey': return provider.setSigningKey(args[0] as string, args[1] as Parameters<CapDbPrivateStateProvider['setSigningKey']>[1]);
         case 'getSigningKey': return provider.getSigningKey(args[0] as string);
         case 'removeSigningKey': return provider.removeSigningKey(args[0] as string);
         case 'clearSigningKeys': return provider.clearSigningKeys();
@@ -877,7 +892,7 @@ export interface WalletDeployContractArgs {
     indexerHttpUrl: string;
     indexerWsUrl: string;
     proofServerUrl: string;
-    networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
+    networkId: NightgateNetwork;
     /** Initial private state for the new contract. Must be plain JSON. */
     initialPrivateState: unknown;
     sponsorSessionId?: string;
@@ -896,7 +911,7 @@ export interface WalletSubmitContractCallArgs {
     indexerHttpUrl: string;
     indexerWsUrl: string;
     proofServerUrl: string;
-    networkId: 'preprod' | 'testnet' | 'mainnet' | 'undeployed' | 'devnet' | 'qanet' | 'preview';
+    networkId: NightgateNetwork;
     merkleProof?: MerkleProofBundle;
     initialPrivateState?: unknown;
     sponsorSessionId?: string;

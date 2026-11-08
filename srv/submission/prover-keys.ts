@@ -16,6 +16,7 @@ import {
 } from '@odatano/contract-kit/node';
 import { configStringFrom } from '../utils/config';
 import { NightgateError, errorMessage } from '../utils/errors';
+import { fetchBody } from '../utils/fetch-body';
 
 export { readProverKeyManifest, verifierCircuits, missingProverKeys, hasAllProverKeys };
 export type { ProverKeyManifest, ZkAssetLayout };
@@ -58,6 +59,8 @@ export interface EnsureProverKeysOptions {
     fetchFn?: typeof fetch;
     env?: NodeJS.ProcessEnv;
     log?: (message: string) => void;
+    /** The pause before each further try of a download. Empty means one try. */
+    retryDelaysMs?: readonly number[];
 }
 
 const inFlight = new Map<string, Promise<{ fetched: string[]; source: string | null }>>();
@@ -104,7 +107,6 @@ async function ensureProverKeysNow(
             `set ${ZK_ASSET_URL_ENV} to a /zk-config base that serves them, or run "npx nightgate-fetch-keys ${name}" once`,
             name, missing, false);
     }
-    const doFetch = opts.fetchFn ?? fetch;
     const keysDir = path.join(zkConfigPath, 'keys');
     fs.mkdirSync(keysDir, { recursive: true });
     opts.log?.(`contract '${name}': fetching ${missing.length} prover key(s) from ${source.base}`);
@@ -112,18 +114,21 @@ async function ensureProverKeysNow(
     for (const circuit of missing) {
         const expected = manifest.prover[circuit];
         const url = proverKeyUrl(source.base, source.layout, circuit);
-        let res: Response;
+        let got: Awaited<ReturnType<typeof fetchBody>>;
         try {
-            res = await doFetch(url);
+            got = await fetchBody(url, {
+                fetchFn: opts.fetchFn, delaysMs: opts.retryDelaysMs,
+                onRetry: (reason) => opts.log?.(`contract '${name}': ${url} failed, trying again: ${reason}`)
+            });
         } catch (e) {
             throw new ProverKeysUnavailableError(
                 `contract '${name}': fetching ${url} failed: ${errorMessage(e)}`, name, [circuit], true);
         }
-        if (!res.ok) {
+        const { res, body } = got;
+        if (!body) {
             throw new ProverKeysUnavailableError(
                 `contract '${name}': ${url} answered HTTP ${res.status}`, name, [circuit], res.status >= 500 || res.status === 429);
         }
-        const body = Buffer.from(await res.arrayBuffer());
         const sha256 = crypto.createHash('sha256').update(body).digest('hex');
         if (body.length !== expected.bytes || sha256 !== expected.sha256) {
             throw new ProverKeysUnavailableError(

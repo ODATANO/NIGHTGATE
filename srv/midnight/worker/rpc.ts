@@ -16,7 +16,8 @@ import { sponsorHandlers } from './sponsor';
 import { rotationHandlers, rotationState, rotateIfDue } from './rotation';
 import { retainGeneration } from './artifacts';
 
-export const handlers: Record<string, (args: any) => Promise<unknown>> = {
+// Each handler names its own argument type. The arguments arrive untyped from the main thread.
+export const handlers: Record<string, (args: never) => Promise<unknown>> = {
     ...facadeHandlers,
     ...rotationHandlers,
     ...tokenHandlers,
@@ -24,14 +25,15 @@ export const handlers: Record<string, (args: any) => Promise<unknown>> = {
     ...sponsorHandlers
 };
 
-export async function handleMessage(msg: any): Promise<void> {
-    if (msg?.kind === 'state-save-ack') {
-        resolveSaveAckWaiter(msg.seq);
-        const entry = facades.get(String(msg.sessionId ?? ''));
-        if (entry) applySaveAck(entry, msg.seq);
+export async function handleMessage(msg: unknown): Promise<void> {
+    const m = msg as { kind?: unknown; seq?: number; sessionId?: unknown; port?: unknown } | null | undefined;
+    if (m?.kind === 'state-save-ack') {
+        resolveSaveAckWaiter(m.seq as number);
+        const entry = facades.get(String(m.sessionId ?? ''));
+        if (entry) applySaveAck(entry, m.seq as number);
         return;
     }
-    if (msg?.kind !== 'rpc' || !msg.port) {
+    if (m?.kind !== 'rpc' || !m.port) {
         log('warn', `unexpected message: ${JSON.stringify(msg).slice(0, 80)}`);
         return;
     }
@@ -53,16 +55,16 @@ async function dispatch(method: string, args: unknown, port: MessagePort): Promi
         // Submitting methods get the reply port to announce their tx before sending.
         const callArgs = submitting ? { ...(args as object), __replyPort: port } : args;
         // Keeps the contract's files from being cleaned up while the call runs.
-        const releaseGeneration = retainGeneration((args as any)?.registration?.artifactDigest);
+        const releaseGeneration = retainGeneration((args as { registration?: { artifactDigest?: string } } | undefined)?.registration?.artifactDigest);
         if (submitting) rotationState.inflight++;
         const cancel = new AbortController();
-        const onCancel = (m: any): void => { if (m?.kind === 'cancel') cancel.abort(); };
+        const onCancel = (m: { kind?: unknown } | null): void => { if (m?.kind === 'cancel') cancel.abort(); };
         port.on('message', onCancel);
         let result: unknown;
         try {
             result = await runInRpcScope(method, cancel.signal, () => SUBMIT_METHODS.has(method)
-                ? withSessionLocks(submitLockKeys(args), () => fn(callArgs))
-                : fn(callArgs));
+                ? withSessionLocks(submitLockKeys(args), () => fn(callArgs as never))
+                : fn(callArgs as never));
         } finally {
             port.off('message', onCancel);
             if (submitting) rotationState.inflight--;

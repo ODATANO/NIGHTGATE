@@ -366,7 +366,7 @@ describe('mintFactoryToken', () => {
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
             circuitArgTypesLoader: vi.fn((_: string, circuit: string) => (circuit === 'mint' ? mintArgTypes as any : undefined)),
             walletMaterialFactory: vi.fn(async () => ({
-                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {},
+                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' },
                 ensureFacade: vi.fn(async () => undefined)
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
@@ -492,7 +492,7 @@ describe('mintShieldedTestToken + deriveTokenType', () => {
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
             walletMaterialFactory: vi.fn(async () => ({
-                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {}
+                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -573,7 +573,7 @@ describe('error translation to OData status codes', () => {
             // Successful happy path by default
             resolveContractImpl: vi.fn(async (_name: string) => ({ ...RESOLVED_CONTRACT_FIXTURE })),
             walletMaterialFactory: vi.fn(async () => ({
-                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {}
+                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -754,7 +754,7 @@ describe('error translation to OData status codes', () => {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, db, {
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: vi.fn(async () => ({ accountId: 'acc', privateStoragePasswordProvider: () => 'x', walletAndMidnightProvider: {} })),
+            walletMaterialFactory: vi.fn(async () => ({ accountId: 'acc', privateStoragePasswordProvider: () => 'x', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' } })),
             submitterFactory: () => submitter
         });
         const processor = registeredProcessors.get(`submitContractCall\0${1}`);
@@ -771,7 +771,7 @@ describe('error translation to OData status codes', () => {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, db, {
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: vi.fn(async () => ({ accountId: 'acc', privateStoragePasswordProvider: () => 'x', walletAndMidnightProvider: {} })),
+            walletMaterialFactory: vi.fn(async () => ({ accountId: 'acc', privateStoragePasswordProvider: () => 'x', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' } })),
             submitterFactory: () => submitter
         });
         const processor = registeredProcessors.get(`submitContractCall\0${1}`);
@@ -873,7 +873,7 @@ describe('rate limiting', () => {
         registerSubmissionHandlers(srv as any, {} as any, {
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: vi.fn(async () => ({ accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {} })),
+            walletMaterialFactory: vi.fn(async () => ({ accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' } })),
             submitterFactory: () => makeSuccessfulSubmitter()
         });
 
@@ -893,7 +893,7 @@ describe('rate limiting', () => {
         registerSubmissionHandlers(srv as any, {} as any, {
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
-            walletMaterialFactory: vi.fn(async () => ({ accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {} })),
+            walletMaterialFactory: vi.fn(async () => ({ accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' } })),
             submitterFactory: () => makeSuccessfulSubmitter()
         });
 
@@ -938,7 +938,7 @@ describe('anchorDocument', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -1352,7 +1352,7 @@ describe('grantDisclosure', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             disclosureReindexer: reindexer,
@@ -1503,7 +1503,7 @@ describe('grantDisclosure', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             disclosureReindexer: reindexer
@@ -1544,7 +1544,7 @@ describe('grantDisclosure', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             disclosureReindexer: vi.fn()
@@ -1670,7 +1670,7 @@ describe('revokeDisclosure', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             disclosureReindexer: vi.fn().mockResolvedValue({ indexed: 0, deactivated: 1 }),
@@ -1747,7 +1747,7 @@ describe('registerPassport', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -2055,7 +2055,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
             walletMaterialFactory: vi.fn(async () => ({
-                accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {}
+                accountId: 'a', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: () => submitter,
             circuitArgTypesLoader: () => bindPassportTypes,
@@ -2197,7 +2197,7 @@ describe('issueFieldPredicateAttestation', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -2343,7 +2343,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -2549,7 +2549,7 @@ describe('issueFieldEqualityAttestation', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -2677,7 +2677,7 @@ describe('issueFieldMembershipAttestation', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             pureCircuitsLoader: vi.fn(async () => fakeSetPure),
@@ -2818,7 +2818,7 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -2960,7 +2960,7 @@ describe('issueDocumentIntegrityAttestation', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -3090,7 +3090,7 @@ describe('issueDocumentDiffAttestation', () => {
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -3176,7 +3176,7 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
             walletMaterialFactory: vi.fn(async () => ({
                 accountId: 'a',
                 privateStoragePasswordProvider: () => '0123456789ABCDEFG',
-                walletAndMidnightProvider: {}
+                walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => makeSuccessfulSubmitter()),
             ...overrides
@@ -3269,7 +3269,7 @@ describe('artifact-generation provenance', () => {
             attesterIdResolver: vi.fn(async () => ATTESTER_ID),
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
             walletMaterialFactory: vi.fn(async () => ({
-                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {}
+                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
             })),
             submitterFactory: vi.fn(() => submitter)
         });

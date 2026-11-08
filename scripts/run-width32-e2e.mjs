@@ -36,7 +36,7 @@ const artifact = await import(pathToFileURL(path.join(MANAGED, 'contract', 'inde
 const ContractClass = artifact.Contract ?? artifact.default;
 const cfgMod = await import(pathToFileURL(path.join(repoRoot, 'srv/utils/nightgate-config.js')).href);
 
-const NETWORK = process.env.NIGHTGATE_NETWORK || 'preprod';
+const NETWORK = process.env.NIGHTGATE_NETWORK || 'preview';
 const IHTTP = process.env.NIGHTGATE_INDEXER_HTTP_URL || cfgMod.DEFAULT_INDEXER_URLS?.[NETWORK]?.http;
 const IWS = process.env.NIGHTGATE_INDEXER_WS_URL
     || (process.env.NIGHTGATE_INDEXER_HTTP_URL && cfgMod.deriveIndexerWsUrl

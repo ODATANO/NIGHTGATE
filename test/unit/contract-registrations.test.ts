@@ -36,10 +36,14 @@ import {
 let root: string;
 let outside: string;
 
-function writeArtifact(dir: string, opts: { prover?: boolean; noVerifier?: boolean; body?: string } = {}) {
+function writeArtifact(dir: string, opts: { prover?: boolean; noVerifier?: boolean; noManifest?: boolean; body?: string } = {}) {
     fs.mkdirSync(path.join(dir, 'keys'), { recursive: true });
     fs.mkdirSync(path.join(dir, 'zkir'), { recursive: true });
     fs.mkdirSync(path.join(dir, 'contract'), { recursive: true });
+    if (!opts.noManifest) {
+        fs.mkdirSync(path.join(dir, 'compiler'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'compiler', 'contract-manifest.json'), '{"manifest-version":"1"}');
+    }
     if (!opts.noVerifier) fs.writeFileSync(path.join(dir, 'keys', 'attest.verifier'), 'vk-bytes');
     if (opts.prover) fs.writeFileSync(path.join(dir, 'keys', 'attest.prover'), 'pk-bytes');
     fs.writeFileSync(path.join(dir, 'zkir', 'attest.zkir'), 'zkir');
@@ -219,6 +223,12 @@ describe('registerContractAtRuntime / unregisterContractAtRuntime', () => {
             fs.rmSync(rootA, { recursive: true, force: true });
             fs.rmSync(rootB, { recursive: true, force: true });
         }
+    });
+
+    it('refuses a zk directory without the compiler manifest, because nothing proves from it', async () => {
+        const a = writeArtifact(path.join(root, 'no-manifest'), { noManifest: true });
+        await expect(validateRuntimeRegistration({ name: 'no-manifest', privateStateId: 'ps', ...a }))
+            .rejects.toMatchObject({ httpStatus: 400, message: expect.stringMatching(/no compiler\/contract-manifest\.json/) });
     });
 
     it('a regular FILE named zkir does not pass validation', async () => {

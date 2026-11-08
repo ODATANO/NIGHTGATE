@@ -117,7 +117,7 @@ const cfg: ContractProvidersConfig = {
 const wallet: WalletMaterial = vi.hoisted(() => ({
     accountId: 'addr_test1q...wallet',
     privateStoragePasswordProvider: () => 'a-test-passphrase-of-sufficient-length',
-    walletAndMidnightProvider: { stub: true },
+    walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' },
     privateStateBackend: 'cap-db'
 }));
 

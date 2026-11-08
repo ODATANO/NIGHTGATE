@@ -29,9 +29,17 @@ function groupOf(key: string): string {
 
 import { MARKER_PRINCIPALS } from './agent-token-transport';
 
+/** The request fields a rate-limit key is built from. A CAP request fits, and so does a plain test object. */
+export interface RateKeySource {
+    agentGrant?: { ID?: unknown } | null;
+    user?: { id?: unknown } | null;
+    http?: { req?: { ip?: unknown } };
+    ip?: unknown;
+}
+
 /** Rate-limit key `caller:scope`. The caller is the agent grant, else the real user, else the client IP address.
  *  The IP address is unreliable behind proxies. The caller part never contains ':'. */
-export function principalRateKey(req: any, scope: string): string {
+export function principalRateKey(req: RateKeySource | null | undefined, scope: string): string {
     const grant = req?.agentGrant?.ID;
     const rawUser = req?.user?.id;
     const user = typeof rawUser === 'string' && !MARKER_PRINCIPALS.has(rawUser) ? rawUser : undefined;

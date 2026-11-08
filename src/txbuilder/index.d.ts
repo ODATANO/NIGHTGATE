@@ -87,8 +87,8 @@ export interface CreateTxBuilderInput {
     proofServerUrl?: string;
     /**
      * 'wasm' (default) proves in this process.
-     * 'server' proves on `proofServerUrl`, which is faster for large circuits.
-     * The proof server sees your private inputs, so only use one you run yourself.
+     * 'server' proves the wallet's circuits and the contract's on `proofServerUrl`, several times faster.
+     * The proof server sees your private inputs and the coins you spend, so only use one you run yourself.
      */
     provingMode?: 'wasm' | 'server';
     /**
@@ -96,6 +96,11 @@ export interface CreateTxBuilderInput {
      * The SDK retries a timed-out proof, so set it above your slowest circuit.
      */
     proofTimeoutMs?: number;
+    /**
+     * Where the standard circuits' keys and the BLS parameters are kept, default
+     * `~/.cache/nightgate-txbuilder/prover-material`. Downloaded once, read from disk by every later process.
+     */
+    proverMaterialDir?: string;
     /** A server's `/zk-config/<contract>` URL. Files are downloaded once and cached. */
     zkConfigBaseUrl?: string;
     /**
@@ -169,7 +174,7 @@ export interface ShieldedPublicKeys {
 export interface DeriveIdentityInput {
     /** 128 hex chars (64-byte BIP39 seed). */
     seedHex: string;
-    /** Defaults to `preprod`. Only the address format depends on it. */
+    /** Defaults to `mainnet`. Only the address format depends on it. */
     networkId?: string;
     accountIndex?: number;
     /** Defaults to a secret derived from the seed. */
@@ -217,6 +222,11 @@ export interface BuildSponsorableInput {
     independentCalls?: boolean;
     /** Batch only, with `independentCalls`. The number of leading calls that keep their position. */
     orderedPrefix?: number;
+    /**
+     * Single call only. Multiplies the gas the call declares (the ledger adds 20 % on its own), so the call
+     * still fits after another transaction grew a map by a trie level. The fee grows with it. 1 to 10.
+     */
+    gasHeadroom?: number;
     /**
      * Other wallets that a call sends a private coin to, for example when minting for someone else.
      * Without their keys the build fails, because the coin cannot be encrypted for them.
@@ -298,8 +308,33 @@ export interface BuildDeploySponsorableUnboundInput extends BuildDeploySponsorab
 export interface BuiltBoundDeploy extends BuiltBoundTransaction { contractAddress: string; }
 export interface BuiltUnboundDeploy extends BuiltUnboundTransaction { contractAddress: string; }
 export type BuiltDeploy = BuiltBoundDeploy | BuiltUnboundDeploy;
+/** Seals a ledger transaction for a wallet SDK call. `forks` is the `forks` of the wallet's resolved configuration. */
+export declare function sealTx(stage: 'Unproven' | 'Unbound' | 'Finalized', tx: { serialize(): Uint8Array }, forks?: { v9: bigint }): Promise<unknown>;
+/** Reads the proven ledger transaction out of a handle the wallet SDK returned. */
+export declare function openTx(handle: unknown): Promise<any>;
 /** Options for the SDK's proof provider. Undefined without `proofTimeoutMs`. */
 export declare function proofProviderConfig(opts: { proofTimeoutMs?: number } | undefined): { timeout: number } | undefined;
+/** What the wallet SDK's wasm prover asks for: the standard circuits' keys by location, the BLS parameters by size. */
+export interface ProverMaterialProvider {
+    /** The directory the files are kept in. */
+    dir: string;
+    lookupKey(keyLocation: string): Promise<{ proverKey: Uint8Array; verifierKey: Uint8Array; ir: Uint8Array } | undefined>;
+    getParams(k: number): Promise<Uint8Array>;
+}
+export interface ProverMaterialOptions {
+    /** Default `~/.cache/nightgate-txbuilder/prover-material`. */
+    dir?: string;
+    /** The host the files are downloaded from, laid out as the wallet SDK's default host. Defaults to that host. */
+    baseUrl?: string;
+    /** `{ phase: 'prover-material', file, source: 'local' | 'remote', bytes }`. */
+    onProgress?: (e: Record<string, unknown>) => void;
+}
+/**
+ * Keeps the files the wasm prover needs on disk. The wallet SDK downloads a missing or damaged one and checks it against its ledger release.
+ * `createTxBuilder` and `createSwapWallet` use it; call it yourself to warm the directory or to hand it to the SDK.
+ */
+export declare function createProverMaterialProvider(opts?: ProverMaterialOptions): ProverMaterialProvider;
+export declare function defaultProverMaterialDir(): string;
 /** Returns the address of the contract a deploy transaction creates. Throws unless it deploys exactly one contract. */
 export declare function readDeployAddress(tx: unknown): string;
 
@@ -400,29 +435,17 @@ export declare function probeLanded(identifier: string, opts: LandedProbeSource 
 export declare function waitLanded(identifier: string, opts: LandedProbeSource & { timeoutMs?: number, pollMs?: number }): Promise<LandedProbeResult | null>;
 
 /** A midnight-js `PublicDataProvider` that reads contract state and deploys through the NIGHTGATE API. */
-export declare function apiPublicDataProvider(input: { client: NightgateClient; ledger: object; runtime: object; pollMs?: number; watchTimeoutMs?: number; maxLagBlocks?: number; stateRetryMs?: number }): object;
+export declare function apiPublicDataProvider(input: { client: NightgateClient; mjTypes: object; protocolVersion: number; pollMs?: number; watchTimeoutMs?: number; maxLagBlocks?: number; stateRetryMs?: number }): object;
 /** The client behind an `api` option: a connected client, or `connect()` on the options. */
 export declare function apiClientFor(api: ConnectOptions | NightgateClient): NightgateClient;
 /** A wallet facade submission service that never dials a node. The builder hands its transaction to a sponsor instead. */
 export declare function buildOnlySubmissionService(): (configuration: object) => { submitTransaction(): Promise<never>; close(): Promise<void> };
 
-export interface DustGuardOptions {
-    /** The configuration the facade was created with. */
-    configuration: object;
-    /** The facade's DUST secret key. */
-    dustKey: unknown;
-    /** Defaults to the SDK's DustWallet. */
-    dustWalletFactory?: (configuration: object) => { restore(snapshot: unknown): { start(dustKey: unknown): Promise<unknown> } };
-}
-
-/**
- * Runs `fn`, which builds and submits one transaction that pays its own fee.
- * If the node rejects it before the mempool, the DUST wallet is restored, because the SDK would keep the fee reserved.
- */
-export declare function withDustGuard<T>(facade: { dust: object }, opts: DustGuardOptions, fn: () => Promise<T>): Promise<T>;
-
 export declare const ATTESTATION_VAULT_CIRCUITS: string[];
-export declare function ensureZkAssets(input: EnsureZkAssetsInput): Promise<ZkAssetResult>;
+export declare function ensureZkAssets(input: EnsureZkAssetsInput & {
+    /** The pause before each further try of a download. Empty means one try. */
+    retryDelaysMs?: readonly number[];
+}): Promise<ZkAssetResult>;
 /** What the builder loads from an installed contract package. */
 export interface BuilderPackage {
     package: { name: string; version: string; root: string };
@@ -503,6 +526,10 @@ export interface CreateSwapWalletInput {
      */
     provingMode?: 'wasm' | 'server';
     proofServerUrl?: string;
+    /** Wasm proving. Where the standard circuits' keys and the BLS parameters are kept, see `CreateTxBuilderInput`. */
+    proverMaterialDir?: string;
+    /** Downloads of proving material. */
+    onProgress?: (e: Record<string, unknown>) => void;
     /** Saved state from `serializeState()`, to skip a full sync. */
     walletState?: string;
     /**

@@ -38,7 +38,7 @@ const ONLY = arg('--only', null);
 const TIP_GAP = BigInt(Number(process.env.NIGHTGATE_SYNC_TIP_GAP ?? '8') || 0);
 
 const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-const network = cfg.network ?? 'preprod';
+const network = cfg.network ?? 'mainnet';
 const indexerHttpUrl = cfg.indexerHttpUrl ?? DEFAULT_INDEXER_URLS[network]?.http;
 const indexerWsUrl = cfg.indexerWsUrl ?? (cfg.indexerHttpUrl ? deriveIndexerWsUrl(cfg.indexerHttpUrl) : DEFAULT_INDEXER_URLS[network]?.ws);
 const nodeUrl = cfg.nodeUrl ?? DEFAULT_NODE_URLS[network];
@@ -49,9 +49,8 @@ if (!Array.isArray(cfg.wallets) || cfg.wallets.length === 0) { console.error('wa
 const sdkVersion = getWalletSdkVersion();
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 
-const [ledger, networkIdSdk, facadeSdk, shieldedSdk, unshieldedSdk, dustSdk, abstractions, WebSocketModule] = await Promise.all([
-    import('@midnight-ntwrk/ledger-v8'),
-    import('@midnight-ntwrk/midnight-js-network-id'),
+const [ledger, facadeSdk, shieldedSdk, unshieldedSdk, dustSdk, abstractions, WebSocketModule] = await Promise.all([
+    import('@midnightntwrk/ledger-v9'),
     import('@midnightntwrk/wallet-sdk-facade'),
     import('@midnightntwrk/wallet-sdk-shielded'),
     import('@midnightntwrk/wallet-sdk-unshielded-wallet'),
@@ -60,7 +59,6 @@ const [ledger, networkIdSdk, facadeSdk, shieldedSdk, unshieldedSdk, dustSdk, abs
     import('ws')
 ]);
 const WebSocket = WebSocketModule.default;
-networkIdSdk.setNetworkId(network);
 
 /** The newest dust ledger event id on the indexer, read through a one-shot subscription. Null when it does not answer in 10 s. */
 function readDustStreamTip() {
@@ -146,33 +144,32 @@ async function syncWallet(w) {
     const restore = existing?.states;
 
     const roleSeeds = await deriveRoleSeeds(new Uint8Array(Buffer.from(seedHex, 'hex')), accountIndex);
-    const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
-    const dustKey = ledger.DustSecretKey.fromSeed(roleSeeds.dust);
-    const keystore = unshieldedSdk.createKeystore(roleSeeds.night, network);
+    const walletSeeds = { shielded: roleSeeds.zswap, unshielded: roleSeeds.night, dust: roleSeeds.dust };
+    const keystore = unshieldedSdk.createKeystore({ kind: 'schnorr', secret: roleSeeds.night }, network);
 
     // Same configuration as the server's wallet worker, so the serialized states fit its restore.
-    const configuration = {
+    const configuration = facadeSdk.WalletFacade.resolveConfiguration({
         networkId: network,
         provingServerUrl: new URL('http://127.0.0.1:6300'),
         relayURL: new URL(nodeUrl),
         indexerClientConnection: { indexerHttpUrl, indexerWsUrl },
         txHistoryStorage: new abstractions.InMemoryTransactionHistoryStorage(facadeSdk.WalletEntrySchema, facadeSdk.mergeWalletEntries),
         costParameters: { additionalFeeOverhead: 1n, feeBlocksMargin: 5 }
-    };
+    });
     const dustParameters = ledger.LedgerParameters.initialParameters().dust;
     const facade = await facadeSdk.WalletFacade.init({
         configuration,
         shielded: () => restore?.shielded
             ? shieldedSdk.ShieldedWallet(configuration).restore(restore.shielded)
-            : shieldedSdk.ShieldedWallet(configuration).startWithSecretKeys(zswapKeys),
+            : shieldedSdk.ShieldedWallet(configuration).startWithSeed(walletSeeds.shielded),
         unshielded: () => restore?.unshielded
             ? unshieldedSdk.UnshieldedWallet(configuration).restore(restore.unshielded)
             : unshieldedSdk.UnshieldedWallet(configuration).startWithPublicKey(unshieldedSdk.PublicKey.fromKeyStore(keystore)),
         dust: () => restore?.dust
             ? dustSdk.DustWallet(configuration).restore(restore.dust)
-            : dustSdk.DustWallet(configuration).startWithSecretKey(dustKey, dustParameters)
+            : dustSdk.DustWallet(configuration).startWithSeed(walletSeeds.dust, dustParameters)
     });
-    await facade.start(zswapKeys, dustKey);
+    await facade.start(walletSeeds);
     log(`${w.label}: wallet started (${restore ? `restored from ${existing.savedAt}, dust appliedIndex=${existing.reached?.dustAppliedIndex ?? '?'}` : 'from zero'})`);
 
     const started = Date.now();
@@ -208,7 +205,7 @@ async function syncWallet(w) {
         log(`${w.label}: ${atTip ? 'AT TIP' : 'not at tip'}, saved ${exportPath(w)} (dust appliedIndex=${reached?.dustAppliedIndex ?? '?'}, streamTip=${reached?.streamTip ?? '?'})`);
     } finally {
         try { await facade.stop?.(); } catch { /* already stopped */ }
-        zswapKeys.clear?.();
+        for (const seed of Object.values(walletSeeds)) seed.fill(0);
     }
     return atTip;
 }

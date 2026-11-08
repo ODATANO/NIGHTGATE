@@ -50,7 +50,7 @@ export async function deriveRawTokenType(contractAddress: string, domainSeparato
 }> {
     if (!contractAddress) throw new TokenTypeError('contractAddress is required');
     const sep = padDomainSeparator(domainSeparator);
-    const rt: any = await import('@midnight-ntwrk/compact-runtime');
+    const rt = await import('@midnight-ntwrk/compact-runtime');
     if (typeof rt.rawTokenType !== 'function') {
         throw new TokenTypeError('compact-runtime does not expose rawTokenType');
     }

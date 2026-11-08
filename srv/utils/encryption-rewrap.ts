@@ -15,6 +15,7 @@ import { StorageEncryption, decryptWithPassword, extractEncryptedComponents } fr
 // Imported statically so the data key cache is shared with the sessions that read the same rows.
 import { resolveAccountDek, privateStatePasswordFromDek, syncStatePassphraseFromDek, DEK_SCHEME } from '../submission/account-keys';
 import type { DbService } from './db-types';
+import type { WalletSyncState } from '#cds-models/midnight';
 import { errorMessage } from './errors';
 
 const log = cds.log('nightgate:crypto');
@@ -28,7 +29,7 @@ export interface CiphertextColumn {
     whereSql?: string;
     /** Extra columns the binding needs. */
     select?: string[];
-    binding: (row: Record<string, any>) => EnvelopeBinding;
+    binding: (row: Record<string, unknown>) => EnvelopeBinding;
     /** A value with this prefix is not ring-encrypted yet and only needs to be encrypted. */
     plainPrefix?: string;
 }
@@ -37,12 +38,12 @@ export interface CiphertextColumn {
 export const BARE_VIEWING_KEY_SEAL_PREFIX = 'vk1:';
 
 export const ENVELOPE_COLUMNS: readonly CiphertextColumn[] = [
-    { entity: 'midnight.WalletSessions', table: 'midnight_WalletSessions', key: 'ID', column: 'encryptedViewingKey', select: ['sessionId'], binding: r => walletSessionViewingKeyBinding(r.sessionId) },
-    { entity: 'midnight.WalletSessions', table: 'midnight_WalletSessions', key: 'ID', column: 'encryptedSeedKey', select: ['sessionId'], binding: r => walletSessionSeedBinding(r.sessionId) },
-    { entity: 'midnight.BackgroundJobs', table: 'midnight_BackgroundJobs', key: 'ID', column: 'command', where: { commandEncoding: 'aes-gcm-v1' }, whereSql: "commandEncoding = 'aes-gcm-v1'", binding: r => jobCommandBinding(r.ID) },
-    { entity: 'midnight.AccountKeys', table: 'midnight_AccountKeys', key: 'accountId', column: 'wrappedDek', binding: r => accountDekBinding(r.accountId) },
-    { entity: 'midnight.AccountKeys', table: 'midnight_AccountKeys', key: 'accountId', column: 'wrappedDekByViewingKey', binding: r => accountDekViewingKeySealBinding(r.accountId), plainPrefix: BARE_VIEWING_KEY_SEAL_PREFIX },
-    { entity: 'midnight.HolderDisclosureGrants', table: 'midnight_HolderDisclosureGrants', key: 'ID', column: 'content', binding: r => holderDisclosureContentBinding(r.ID) }
+    { entity: 'midnight.WalletSessions', table: 'midnight_WalletSessions', key: 'ID', column: 'encryptedViewingKey', select: ['sessionId'], binding: r => walletSessionViewingKeyBinding(String(r.sessionId)) },
+    { entity: 'midnight.WalletSessions', table: 'midnight_WalletSessions', key: 'ID', column: 'encryptedSeedKey', select: ['sessionId'], binding: r => walletSessionSeedBinding(String(r.sessionId)) },
+    { entity: 'midnight.BackgroundJobs', table: 'midnight_BackgroundJobs', key: 'ID', column: 'command', where: { commandEncoding: 'aes-gcm-v1' }, whereSql: "commandEncoding = 'aes-gcm-v1'", binding: r => jobCommandBinding(String(r.ID)) },
+    { entity: 'midnight.AccountKeys', table: 'midnight_AccountKeys', key: 'accountId', column: 'wrappedDek', binding: r => accountDekBinding(String(r.accountId)) },
+    { entity: 'midnight.AccountKeys', table: 'midnight_AccountKeys', key: 'accountId', column: 'wrappedDekByViewingKey', binding: r => accountDekViewingKeySealBinding(String(r.accountId)), plainPrefix: BARE_VIEWING_KEY_SEAL_PREFIX },
+    { entity: 'midnight.HolderDisclosureGrants', table: 'midnight_HolderDisclosureGrants', key: 'ID', column: 'content', binding: r => holderDisclosureContentBinding(String(r.ID)) }
 ];
 
 /** Tables whose rows use the per-account data key when `keyScheme` is 'dek1', and the legacy scheme when it is null. */
@@ -181,7 +182,7 @@ export async function rewrapStoredCiphertexts(db: DbService, opts: RewrapOptions
         for (;;) {
             let q = SELECT.from(column.entity).columns(column.key, column.column, ...(column.select ?? []), ...Object.keys(column.where ?? {})).orderBy(column.key).limit(batchSize);
             if (last !== undefined) q = q.where({ [column.key]: { '>': last } });
-            const rows: Array<Record<string, any>> = await db.run(q);
+            const rows: Array<Record<string, unknown>> = await db.run(q);
             if (!rows?.length) break;
             last = String(rows[rows.length - 1][column.key]);
             const updates: Array<{ id: string; value: string }> = [];
@@ -292,7 +293,7 @@ async function migrateLegacyRows(db: DbService, ring: KeyRing, dryRun: boolean, 
             { entity: 'midnight.PrivateStates', keys: ['accountId', 'contractAddress', 'privateStateId'] },
             { entity: 'midnight.ContractSigningKeys', keys: ['accountId', 'contractAddress'] }
         ]) {
-            const rows: Array<Record<string, any>> = await db.run(SELECT.from(table.entity).where({ accountId, keyScheme: null }));
+            const rows: Array<Record<string, unknown>> = await db.run(SELECT.from(table.entity).where({ accountId, keyScheme: null }));
             for (const row of (Array.isArray(rows) ? rows : [])) {
                 const blob = row.ciphertext;
                 if (typeof blob !== 'string' || !blob) continue;
@@ -324,7 +325,7 @@ async function migrateLegacyRows(db: DbService, ring: KeyRing, dryRun: boolean, 
         for (const r of readers.values()) r.clear();
         writer?.clear();
 
-        const row: Record<string, any> | null = await db.run(SELECT.one.from('midnight.WalletSyncStates').where({ accountId }));
+        const row: WalletSyncState | null = await db.run(SELECT.one.from('midnight.WalletSyncStates').where({ accountId }));
         if (row && row.keyScheme !== DEK_SCHEME) {
             report.syncState.accounts++;
             const legacyCandidates = syncStatePassphraseCandidates(ring, storagePassword);
@@ -366,7 +367,7 @@ async function migrateLegacyRows(db: DbService, ring: KeyRing, dryRun: boolean, 
 async function dropLegacySyncStates(db: DbService, dryRun: boolean, drop: boolean, migrated: Set<string>, report: RewrapReport, say: (m: string) => void): Promise<void> {
     if (!drop) return;
     const { SELECT, DELETE } = cds.ql;
-    const rows: Array<Record<string, any>> = await db.run(SELECT.from('midnight.WalletSyncStates').columns('accountId').where({ keyScheme: null }));
+    const rows: Array<Pick<WalletSyncState, 'accountId'>> = await db.run(SELECT.from('midnight.WalletSyncStates').columns('accountId').where({ keyScheme: null }));
     let dropped = 0;
     for (const r of (Array.isArray(rows) ? rows : [])) {
         if (migrated.has(String(r.accountId))) continue;

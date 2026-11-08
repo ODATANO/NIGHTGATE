@@ -37,7 +37,7 @@ export const DEFAULT_SWEEP_GRACE_MS = 10 * 60 * 1000;
 // One reindex per contract at a time. Two parallel runs could let the older state win.
 const reindexChains = new Map<string, Promise<unknown>>();
 
-function heightOf(row: any): number | null {
+function heightOf(row: { changedAtHeight?: unknown } | null | undefined): number | null {
     const h = row?.changedAtHeight;
     if (h === null || h === undefined || h === '') return null;
     const n = Number(h);

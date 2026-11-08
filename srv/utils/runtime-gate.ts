@@ -43,7 +43,7 @@ export function runtimeUnavailableReason(state: RuntimeState = readRuntimeState(
 export function isRuntimeWriteEvent(srv: cds.ApplicationService, event: string): boolean {
     if (MUTATING_EVENTS.has(event)) return true;
     if (RUNTIME_FREE_ACTIONS.has(event)) return false;
-    const definitions = ((srv as any).model?.definitions ?? (cds as any).model?.definitions ?? {}) as Record<string, { kind?: string } | undefined>;
+    const definitions: Record<string, { kind?: string } | undefined> = srv.model?.definitions ?? cds.model?.definitions ?? {};
     return definitions[`${srv.name}.${event}`]?.kind === 'action';
 }
 
@@ -55,6 +55,7 @@ export function attachRuntimeGate(srv: cds.ApplicationService): void {
         const reason = runtimeUnavailableReason();
         if (!reason) return;
         try { req.http?.res?.set?.('Retry-After', String(RUNTIME_RETRY_AFTER_SECONDS)); } catch { /* the header is optional */ }
-        return req.reject({ status: 503, code: RUNTIME_UNAVAILABLE_CODE, message: reason, $sanitize: false } as any);
+        const error = { status: 503, code: RUNTIME_UNAVAILABLE_CODE, message: reason, $sanitize: false };
+        return req.reject(error);
     });
 }

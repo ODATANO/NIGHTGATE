@@ -1,8 +1,42 @@
 // The SDK numbers each call's segment at random, and the ledger applies calls by ascending number.
 // The proof provider is the last point to change the numbers, so the wrapper renumbers them there.
 import { errorMessage } from '../utils/errors';
+import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
+import type { ProofProvider, UnprovenTx } from '@midnight-ntwrk/midnight-js-types';
 
 const utf8 = new TextDecoder();
+
+type AnyIntent = LedgerV9.Intent<LedgerV9.Signaturish, LedgerV9.Proofish, LedgerV9.Bindingish>;
+type AnyAction = LedgerV9.ContractAction<LedgerV9.Proofish>;
+/** A transaction of any stage, as far as its intents go. */
+export type IntentsTx = Pick<LedgerV9.Transaction<LedgerV9.Signaturish, LedgerV9.Proofish, LedgerV9.Bindingish>, 'intents'>;
+
+/** The call of an action. Deploys and maintenance updates have none. */
+function callOf(action: AnyAction | undefined): LedgerV9.ContractCall<LedgerV9.Proofish> | undefined {
+    return action && 'entryPoint' in action ? action : undefined;
+}
+
+/** Opens the unproven transaction handle midnight-js hands to `proveTx`, and seals an edited one again. */
+export interface UnprovenTxCodec {
+    open(handle: UnprovenTx): LedgerV9.UnprovenTransaction;
+    seal(tx: LedgerV9.UnprovenTransaction): UnprovenTx;
+}
+
+let codecOverride: UnprovenTxCodec | undefined;
+let defaultCodec: Promise<UnprovenTxCodec> | undefined;
+
+/** The codec for ledger 9 handles. Loaded on first use, because both packages are ESM only. */
+export function unprovenTxCodec(): Promise<UnprovenTxCodec> {
+    if (codecOverride) return Promise.resolve(codecOverride);
+    defaultCodec ??= Promise.all([import('@midnightntwrk/ledger-v9'), import('@midnight-ntwrk/midnight-js-types')]).then(([ledger, types]) => ({
+        open: (handle) => handle.deserialize({ v9: ledger.Transaction }),
+        seal: (tx) => types.LedgerTransaction.seal('v9', 'Unproven', tx)
+    }));
+    return defaultCodec;
+}
+
+// Test only.
+export const __unprovenTxCodecForTests = { set: (codec: UnprovenTxCodec | undefined) => { codecOverride = codec; } };
 
 function entryPointName(ep: unknown): string {
     if (typeof ep === 'string') return ep;
@@ -12,16 +46,17 @@ function entryPointName(ep: unknown): string {
 
 // Each call runs in a guaranteed part (`g`), a fallible part (`f`), or both.
 // The SDK splits by gas cost, so a circuit can move from `g` to `g+f` as the contract state grows.
-function gasOf(transcript: any): string {
+function gasOf(transcript: LedgerV9.Transcript<LedgerV9.AlignedValue> | undefined): string {
     const compute = transcript?.gas?.computeTime;
     if (typeof compute !== 'bigint' && typeof compute !== 'number') return '';
     return `:${(Number(compute) / 1e9).toFixed(2)}G`;
 }
 
-function transcriptStages(action: any): string {
+function transcriptStages(action: AnyAction | undefined): string {
     try {
-        const g = action?.guaranteedTranscript;
-        const f = action?.fallibleTranscript;
+        const call = callOf(action);
+        const g = call?.guaranteedTranscript;
+        const f = call?.fallibleTranscript;
         const stages = `${g ? `g${gasOf(g)}` : ''}${g && f ? '+' : ''}${f ? `f${gasOf(f)}` : ''}`;
         return stages || '-';
     } catch {
@@ -30,26 +65,26 @@ function transcriptStages(action: any): string {
 }
 
 /** Contract calls in apply order. Fee and dust parts without a circuit name are skipped. */
-function orderedCalls(tx: any): Array<{ name: string; segId: number; guaranteed: boolean; fallible: boolean }> {
-    const intents: Map<number, any> | undefined = tx?.intents;
+function orderedCalls(tx: IntentsTx): Array<{ name: string; segId: number; guaranteed: boolean; fallible: boolean }> {
+    const intents = tx?.intents;
     if (!intents || typeof intents.entries !== 'function') return [];
     const calls: Array<{ name: string; segId: number; guaranteed: boolean; fallible: boolean }> = [];
     for (const [segId, intent] of Array.from(intents.entries())) {
-        const action = intent?.actions?.[0];
-        const name = entryPointName(action?.entryPoint);
+        const call = callOf(intent?.actions?.[0]);
+        const name = entryPointName(call?.entryPoint);
         if (!name) continue;
         calls.push({
             name,
             segId,
-            guaranteed: Boolean(action?.guaranteedTranscript),
-            fallible: Boolean(action?.fallibleTranscript)
+            guaranteed: Boolean(call?.guaranteedTranscript),
+            fallible: Boolean(call?.fallibleTranscript)
         });
     }
     return calls.sort((a, b) => a.segId - b.segId);
 }
 
 /** Call names per segment of a batch (two or more calls); undefined for a single call. */
-export function callSegments(tx: any): Array<{ segment: number; calls: string[] }> | undefined {
+export function callSegments(tx: IntentsTx): Array<{ segment: number; calls: string[] }> | undefined {
     const calls = orderedCalls(tx);
     if (calls.length < 2) return undefined;
     const bySegment = new Map<number, string[]>();
@@ -58,7 +93,7 @@ export function callSegments(tx: any): Array<{ segment: number; calls: string[] 
 }
 
 /** Returns why the ledger would reject the order, or null. A fallible call must not come before a guaranteed one. */
-export function findCausalityViolation(tx: any): string | null {
+export function findCausalityViolation(tx: IntentsTx): string | null {
     const calls = orderedCalls(tx);
     for (let i = 0; i < calls.length; i++) {
         if (!calls[i].fallible) continue;
@@ -86,11 +121,11 @@ export interface BatchCallStage {
 }
 
 /** The batch's contract calls in apply order with their stages. Empty when the tx has no intents. */
-export function batchCallStages(tx: any): BatchCallStage[] {
+export function batchCallStages(tx: IntentsTx): BatchCallStage[] {
     return orderedCalls(tx).map(c => ({
         name: c.name,
         segId: c.segId,
-        stages: transcriptStages(tx.intents.get(c.segId)?.actions?.[0])
+        stages: transcriptStages(tx.intents?.get(c.segId)?.actions?.[0])
     }));
 }
 
@@ -106,14 +141,14 @@ export class BatchCausalityError extends Error {
 }
 
 /** `circuit=segId[stages]` for each call, for logging only. */
-export function describeBatchSegments(tx: any): string {
+export function describeBatchSegments(tx: IntentsTx): string {
     try {
-        const intents: Map<number, any> | undefined = tx?.intents;
+        const intents = tx?.intents;
         if (!intents || typeof intents.entries !== 'function') return 'no intents';
         return Array.from(intents.entries())
             .map(([segId, intent]) => {
                 const action = intent?.actions?.[0];
-                return `${entryPointName(action?.entryPoint) || '?'}=${segId}[${transcriptStages(action)}]`;
+                return `${entryPointName(callOf(action)?.entryPoint) || '?'}=${segId}[${transcriptStages(action)}]`;
             })
             .join(' ');
     } catch (e) {
@@ -132,31 +167,31 @@ export interface BatchOrderOptions {
 }
 
 /** The intents in call order, matched by build-time segment id. Null when the ids do not fit the calls. */
-function pickBySegmentIds(intents: Map<number, any>, circuitsInOrder: string[], segmentIds: number[] | undefined): Array<[number, any]> | null {
+function pickBySegmentIds<I extends AnyIntent>(intents: ReadonlyMap<number, I>, circuitsInOrder: string[], segmentIds: number[] | undefined): Array<[number, I | undefined]> | null {
     if (!segmentIds || segmentIds.length !== circuitsInOrder.length) return null;
     if (new Set(segmentIds).size !== segmentIds.length) return null;
-    const picked: Array<[number, any]> = [];
+    const picked: Array<[number, I | undefined]> = [];
     for (let i = 0; i < segmentIds.length; i++) {
         const intent = intents.get(segmentIds[i]);
-        if (entryPointName(intent?.actions?.[0]?.entryPoint) !== circuitsInOrder[i]) return null;
+        if (entryPointName(callOf(intent?.actions?.[0])?.entryPoint) !== circuitsInOrder[i]) return null;
         picked.push([segmentIds[i], intent]);
     }
     return picked;
 }
 
 /** Gives the calls the existing segment ids in call order. Returns false and leaves `tx` unchanged on a mismatch. */
-export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: BatchOrderOptions = {}): boolean {
-    const intents: Map<number, any> | undefined = tx?.intents;
+export function orderBatchSegments<I extends AnyIntent>(tx: { intents: Map<number, I> | undefined }, circuitsInOrder: string[], opts: BatchOrderOptions = {}): boolean {
+    const intents = tx?.intents;
     if (!intents || typeof intents.entries !== 'function') return false;
     if (circuitsInOrder.length < 2 || intents.size < 2) return false;
 
     const entries = Array.from(intents.entries());
     const byIds = pickBySegmentIds(intents, circuitsInOrder, opts.segmentIds);
-    let picked: Array<[number, any]> = byIds ?? [];
+    let picked: Array<[number, I | undefined]> = byIds ?? [];
     if (!byIds) {
-        const pools = new Map<string, Array<[number, any]>>();
+        const pools = new Map<string, Array<[number, I]>>();
         for (const [segId, intent] of entries) {
-            const name = entryPointName(intent?.actions?.[0]?.entryPoint);
+            const name = entryPointName(callOf(intent?.actions?.[0])?.entryPoint);
             const pool = pools.get(name);
             if (pool) pool.push([segId, intent]);
             else pools.set(name, [[segId, intent]]);
@@ -172,7 +207,7 @@ export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: Bat
         const prefix = Math.max(0, Math.min(Math.floor(opts.orderedPrefix ?? 0), picked.length));
         const rank = (i: number) => {
             if (i < prefix) return 0;
-            return picked[i][1]?.actions?.[0]?.fallibleTranscript ? 2 : 1;
+            return callOf(picked[i][1]?.actions?.[0])?.fallibleTranscript ? 2 : 1;
         };
         picked = picked
             .map((entry, i) => ({ entry, i, rank: rank(i) }))
@@ -180,31 +215,44 @@ export function orderBatchSegments(tx: any, circuitsInOrder: string[], opts: Bat
             .map(x => x.entry);
     }
 
-    const pickedIntents = new Set(picked.map(([, intent]) => intent));
+    const pickedIntents = new Set<I | undefined>(picked.map(([, intent]) => intent));
     const pickedIdsAsc = picked.map(([segId]) => segId).sort((a, b) => a - b);
 
-    const next = new Map<number, any>();
+    const next = new Map<number, I>();
     for (const [segId, intent] of entries) {
         if (!pickedIntents.has(intent)) next.set(segId, intent);
     }
-    picked.forEach(([, intent], i) => next.set(pickedIdsAsc[i], intent));
+    picked.forEach(([, intent], i) => { if (intent !== undefined) next.set(pickedIdsAsc[i], intent); });
     if (next.size !== intents.size) return false;
 
     tx.intents = next;
     return true;
 }
 
+/** The ledger 9 transaction inside the handle the SDK hands to `proveTx`. */
+async function ledger9Tx(handle: UnprovenTx): Promise<LedgerV9.UnprovenTransaction> {
+    assertLedger9(handle);
+    return (await unprovenTxCodec()).open(handle);
+}
+
+function assertLedger9(handle: UnprovenTx): void {
+    if (handle?.era !== 'v9') throw new Error(`batch segments: expected a ledger 9 transaction, got era ${String(handle?.era)}`);
+}
+
 /** Wraps a proof provider so it puts the calls in order and checks the order before proving. */
-export function withOrderedBatchSegments(
-    proofProvider: any,
+export function withOrderedBatchSegments<P extends Pick<ProofProvider, 'proveTx'>>(
+    proofProvider: P,
     circuitsInOrder: string[],
     opts: BatchOrderOptions = {},
     // Runs on the ordered transaction before proving and throws to stop the build.
-    preflight?: (tx: any) => Promise<void>
-): any {
-    const wrapped = Object.create(proofProvider);
-    wrapped.proveTx = async (tx: any, ...rest: unknown[]) => {
+    preflight?: (tx: LedgerV9.UnprovenTransaction) => Promise<void>
+): P {
+    // A prototype copy, so the provider's other members stay reachable unchanged.
+    const wrapped: P = Object.create(proofProvider);
+    wrapped.proveTx = async (handle, ...rest) => {
+        assertLedger9(handle);
         if (circuitsInOrder.length >= 2) {
+            const tx = await ledger9Tx(handle);
             const before = describeBatchSegments(tx);
             let ordered = false;
             try {
@@ -234,22 +282,23 @@ export function withOrderedBatchSegments(
                 );
             }
             await preflight?.(tx);
+            return proofProvider.proveTx((await unprovenTxCodec()).seal(tx), ...rest);
         }
-        return proofProvider.proveTx(tx, ...rest);
+        return proofProvider.proveTx(handle, ...rest);
     };
     return wrapped;
 }
 
 /** Wraps a proof provider so it only logs the segment ids and changes nothing. */
-export function withObservedBatchSegments(
-    proofProvider: any,
+export function withObservedBatchSegments<P extends Pick<ProofProvider, 'proveTx'>>(
+    proofProvider: P,
     circuitsInOrder: string[]
-): any {
-    const wrapped = Object.create(proofProvider);
-    wrapped.proveTx = async (tx: any, ...rest: unknown[]) => {
+): P {
+    const wrapped: P = Object.create(proofProvider);
+    wrapped.proveTx = async (handle, ...rest) => {
         // eslint-disable-next-line no-console -- shipped in the slim txbuilder, which has no logger
-        console.log(`[nightgate:batch-segments] OBSERVE (no rewrite) for [${circuitsInOrder.join('+')}]: ${describeBatchSegments(tx)}`);
-        return proofProvider.proveTx(tx, ...rest);
+        console.log(`[nightgate:batch-segments] OBSERVE (no rewrite) for [${circuitsInOrder.join('+')}]: ${describeBatchSegments(await ledger9Tx(handle))}`);
+        return proofProvider.proveTx(handle, ...rest);
     };
     return wrapped;
 }

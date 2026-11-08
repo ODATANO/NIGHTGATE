@@ -2,7 +2,6 @@
 // Re-exported from `@odatano/contract-kit/node`, which has no dependencies, so the worker thread and the contracts repository compute the same digest.
 export {
     computeArtifactGenerationDigest,
-    artifactGenerationMatch,
     artifactSlotWidth,
     effectiveModuleFormat,
     runtimeNodeModulesDir,

@@ -64,6 +64,16 @@ const TX_STATUS_QUERY =
     ' block { height timestamp } }';
 
 
+// Answer to TX_STATUS_QUERY. Every value is checked before use, so the leaves stay unknown.
+interface TxStatusAnswer {
+    transactions?: Array<{
+        hash?: unknown;
+        block?: { hash?: unknown; height?: unknown } | null;
+        transactionResult?: { status?: unknown; segments?: unknown } | null;
+    } | null> | null;
+    block?: { timestamp?: unknown } | null;
+}
+
 interface IndexedTxSlice {
     status: string;
     hash: string | null;
@@ -86,9 +96,9 @@ export function createHttpTxConfirmer(
     // The lookup by hash covers rows that stored a hash instead.
     type Lookup = { present: false; asOfMs: number | null; keyInvalid: boolean } | { present: true; slice: IndexedTxSlice | null };
     const lookup = async (offset: Record<string, string>): Promise<Lookup> => {
-        let data: any;
+        let data: TxStatusAnswer | null | undefined;
         try {
-            data = await indexerQuery(cfg.indexerHttpUrl, TX_STATUS_QUERY, { variables: { offset }, timeoutMs, fetchFn: doFetch });
+            data = await indexerQuery<TxStatusAnswer | null>(cfg.indexerHttpUrl, TX_STATUS_QUERY, { variables: { offset }, timeoutMs, fetchFn: doFetch });
         } catch (err) {
             // The value has the wrong form for this lookup. That proves nothing, so try the other one.
             if (err instanceof IndexerQueryError && /invalid transaction (hash|identifier)|cannot convert/i.test(err.messages[0] ?? '')) {
@@ -110,8 +120,10 @@ export function createHttpTxConfirmer(
                 hash: typeof tx?.hash === 'string' ? tx.hash : null,
                 blockHash: typeof tx?.block?.hash === 'string' ? tx.block.hash : null,
                 blockHeight: height,
-                failedSegments: Array.isArray(tx?.transactionResult?.segments)
-                    ? tx.transactionResult.segments.filter((s: any) => s?.success === false).map((s: any) => Number(s.id)).filter(Number.isInteger)
+                failedSegments: Array.isArray(tx.transactionResult?.segments)
+                    ? tx.transactionResult.segments
+                        .filter((s: { success?: unknown } | null) => s?.success === false)
+                        .map((s: { id?: unknown }) => Number(s.id)).filter(Number.isInteger)
                     : []
             }
         };

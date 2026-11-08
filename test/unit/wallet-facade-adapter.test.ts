@@ -2,7 +2,7 @@
  * Tests for the facade-backed wallet adapter.
  *
  * Mocks:
- *   - sdk-loader.loadLedgerV8: returns a stub ZswapSecretKeys.fromSeed.
+ *   - sdk-loader.loadLedger: returns a stub ZswapSecretKeys.fromSeed.
  *   - wallet-facade-builder.getOrBuildWalletFacade: returns a stub facade with
  *     spied balanceUnboundTransaction / finalizeRecipe / submitTransaction.
  *
@@ -36,7 +36,7 @@ vi.mock('../../srv/midnight/sdk-loader', async () => {
     const actual = await vi.importActual('../../srv/midnight/sdk-loader');
     return {
         ...actual,
-        loadLedgerV8: vi.fn(async () => ({
+        loadLedger: vi.fn(async () => ({
             ZswapSecretKeys: {
                 fromSeed: (seed: Uint8Array) => {
                     const h = crypto.createHash('sha256').update(Buffer.from(seed)).digest('hex');

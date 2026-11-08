@@ -9,8 +9,12 @@ import {
     type MerkleProof,
     type SchemaDescriptor,
     type SlotOpening,
-    type DocPair
+    type DocPair,
+    type AttestationVaultWitnesses,
+    type TokenFactoryWitnesses
 } from '@odatano/contract-kit';
+import type { Witnesses } from '@midnight-ntwrk/compact-js';
+import type { Types } from 'effect';
 
 export type WitnessFactoryInput = BuildWitnessesInput & {
     /** 32-byte issuer secret for the token factory's `issuerSecret()` witness. */
@@ -31,17 +35,18 @@ export function deriveTokenFactoryIssuerSecret(seedBytes: Uint8Array): Uint8Arra
     return deriveFactorySecret(seedBytes);
 }
 
-export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): any {
+// Simplify turns the kit's interfaces into plain object types, which fit the string-keyed witness record.
+export function buildAttestationVaultWitnesses(input: WitnessFactoryInput): Types.Simplify<AttestationVaultWitnesses> {
     return buildVaultWitnesses(input);
 }
 
 /** `burn` needs no secret. `mint` throws if the secret is missing. */
-export function buildTokenFactoryWitnesses(input: WitnessFactoryInput): any {
+export function buildTokenFactoryWitnesses(input: WitnessFactoryInput): Types.Simplify<TokenFactoryWitnesses> {
     const issuerSecret = input.issuerSecret;
     return tokenFactoryWitnesses(() => ({ issuerSecret }));
 }
 
-export type WitnessFactory = (input: WitnessFactoryInput) => any;
+export type WitnessFactory = (input: WitnessFactoryInput) => Witnesses<unknown>;
 
 const FACTORIES: Record<string, WitnessFactory> = {
     'attestation-vault': buildAttestationVaultWitnesses,

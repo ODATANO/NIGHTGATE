@@ -28,7 +28,7 @@ if (workerData?.encryptionKeyRing) setKeyRing(workerData.encryptionKeyRing);
 // The SDK only prints a failed sync update. checkSnapshotReplay needs it recorded.
 installReplayRejectionTap();
 
-parentPort.on('message', (msg: any) => { void handleMessage(msg); });
+parentPort.on('message', (msg: unknown) => { void handleMessage(msg); });
 
 parentPort.postMessage({ kind: 'ready' });
 log('info', 'ready');

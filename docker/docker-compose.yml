@@ -5,7 +5,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.41.0}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.42.0}
     container_name: odatano-nightgate
     # Loopback only by default: basic auth is plain text without TLS, so put a
     # TLS reverse proxy in front. NIGHTGATE_BIND_ADDRESS=0.0.0.0 publishes it.
@@ -23,7 +23,7 @@ services:
       # serves unauthenticated, local testing only).
       NIGHTGATE_HTTP_USER: "${NIGHTGATE_HTTP_USER:-nightgate}"
       NIGHTGATE_HTTP_PASSWORD: "${NIGHTGATE_HTTP_PASSWORD:-}"   # refused by cds-config.mjs when empty
-      NIGHTGATE_NETWORK: "${NIGHTGATE_NETWORK:-preprod}"
+      NIGHTGATE_NETWORK: "${NIGHTGATE_NETWORK:-mainnet}"
       NIGHTGATE_CRAWLER_ENABLED: "${NIGHTGATE_CRAWLER_ENABLED:-false}"
       # First height to index while the index is empty (unset = genesis) and the
       # catch-up rate cap that keeps the crawler off the submission side's CPU.
@@ -71,7 +71,7 @@ services:
   # Midnight Node, a local dev chain for development only.
   # Preprod and mainnet need their own node, or a hosted one with its token in the URL.
   node:
-    image: midnightntwrk/midnight-node:0.20.0
+    image: midnightntwrk/midnight-node:2.1.0-rc.4
     container_name: odatano-night-node
     ports:
       - "9944:9944" # Substrate RPC
@@ -108,14 +108,14 @@ services:
   # Substrate node in INDEXER_UPSTREAM_NODE_URL. A sync from genesis takes days on preprod.
   # NIGHTGATE uses it with NIGHTGATE_INDEXER_HTTP_URL=http://localhost:8088/api/v4/graphql.
   indexer:
-    image: midnightntwrk/indexer-standalone:4.3.3
+    image: midnightntwrk/indexer-standalone:4.4.0-rc.6
     container_name: odatano-night-indexer
     ports:
       - "8088:8088"
     environment:
       # The wallet-SDK queries via this network ID. Has to match NIGHTGATE's
       # configured network (cds.requires.nightgate.network).
-      APP__APPLICATION__NETWORK_ID: "${NIGHTGATE_NETWORK:-preprod}"
+      APP__APPLICATION__NETWORK_ID: "${NIGHTGATE_NETWORK:-mainnet}"
       # Upstream Substrate node of the same network, set in .env: your own preprod node, or a
       # hosted one with its token in the URL (wss://<node-host>?token=...).
       # The `node` service above is a local dev chain, not preprod. Empty = the indexer refuses to start.
@@ -155,11 +155,11 @@ services:
 
   # Midnight Proof Server. Makes the ZK proofs for contract calls and deploys. The crawler does not need it.
   # The first run downloads about 500 MB of ZK parameters. The named volume keeps them across restarts.
-  # NIGHTGATE_PROOF_NETWORK picks the network, default preprod. Use testnet for the local node.
+  # NIGHTGATE_PROOF_NETWORK picks the network, default mainnet. Use testnet for the local node.
   proof-server:
-    image: midnightntwrk/proof-server:8.1.0
+    image: midnightntwrk/proof-server:9.0.0
     container_name: odatano-night-proof-server
-    command: ["midnight-proof-server", "--network", "${NIGHTGATE_PROOF_NETWORK:-preprod}"]
+    command: ["midnight-proof-server", "--network", "${NIGHTGATE_PROOF_NETWORK:-mainnet}"]
     environment:
       # Per-job TTL of the proving pool, seconds (default 600). A finished
       # job past it answers 5xx; keep it above NIGHTGATE_PROOF_TIMEOUT_MS.

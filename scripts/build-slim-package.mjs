@@ -23,6 +23,8 @@ const FILES = [
     { path: 'src/txbuilder/submit.mjs' },
     { path: 'src/txbuilder/api-provider.mjs' },
     { path: 'src/txbuilder/swap.mjs' },
+    { path: 'src/txbuilder/prover-material.mjs' },
+    { path: 'src/txbuilder/wallet-tx.mjs' },
     { path: 'src/txbuilder/holder.mjs' },
     { path: 'src/txbuilder/holder.d.mts' },
     { path: 'src/txbuilder/factory.mjs' },
@@ -56,6 +58,8 @@ const FILES = [
     { path: 'srv/utils/indexer-graphql.d.ts', buildOutput: true },
     { path: 'srv/utils/runtime-version.js', buildOutput: true },
     { path: 'srv/utils/runtime-version.d.ts', buildOutput: true },
+    { path: 'srv/utils/fetch-body.js', buildOutput: true },
+    { path: 'srv/utils/fetch-body.d.ts', buildOutput: true },
     // offer files and addresses (bech32m); @scure/base only
     { path: 'srv/utils/bech32m.js', buildOutput: true },
     { path: 'srv/utils/bech32m.d.ts', buildOutput: true },

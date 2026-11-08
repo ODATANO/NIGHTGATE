@@ -9,7 +9,7 @@ const packages = [
     '@midnight-ntwrk/midnight-js-node-zk-config-provider',
     '@midnight-ntwrk/midnight-js-level-private-state-provider',
     '@midnight-ntwrk/compact-runtime',
-    '@midnight-ntwrk/ledger-v8',
+    '@midnightntwrk/ledger-v9',
     '@midnightntwrk/wallet-sdk-facade'
 ];
 

@@ -9,24 +9,28 @@ import { buildWasmProofProvider } from '../wasm-proof-provider';
 import { getContractWitnessFactory, type MerkleProofBundle } from '../../submission/contract-witnesses';
 import { type MessagePort } from 'node:worker_threads';
 import { BoundedCache } from './bounded-cache';
-import { FacadeEntry, ensureNetworkId, facades, loadContractsSdk, loadSdk, log, resolveProvingMode } from './context';
-import { ContractRegistration, artifactAssetPath, generationCacheSize, getContractScaffold, onGenerationEvicted } from './artifacts';
+import { ContractsSdkBundle, FacadeEntry, facades, loadContractsSdk, loadLedger, loadSdk, log, resolveProvingMode } from './context';
+import { ArtifactContract, ContractRegistration, artifactAssetPath, generationCacheSize, getContractScaffold, onGenerationEvicted } from './artifacts';
 import { createPrivateStateProxy } from './private-state';
-import { BoundSubmitIntent, buildSponsoredWalletProvider, buildWorkerWalletProvider } from './submit';
+import { BoundSubmitIntent, WorkerWalletProvider, buildSponsoredWalletProvider, buildWorkerWalletProvider } from './submit';
+import type * as CompactRuntime from '@midnight-ntwrk/compact-runtime';
+import type { CompiledContract, Witnesses } from '@midnight-ntwrk/compact-js';
+import type { Ledger9ContractProviders, Ledger9FoundContract } from '@midnight-ntwrk/midnight-js-contracts';
+import type { PrivateStateProvider, ProofProvider, PublicDataProvider, ZKConfigProvider } from '@midnight-ntwrk/midnight-js-types';
 import { DEPLOY_ENTRY_POINT, resolveSponsorEntry } from './sponsor';
 
 /** Vault constructors take attester and recovery id as plain arguments, because witness reads exceed the node's cost limit. All-zero recovery id means none. */
 export async function deployConstructorArgs(contractName: string, entry: FacadeEntry, recoveryId?: string): Promise<unknown[]> {
     if (!contractName.startsWith('attestation-vault')) return [];
-    const rt: any = await import('@midnight-ntwrk/compact-runtime');
+    const rt: typeof CompactRuntime = await import('@midnight-ntwrk/compact-runtime');
     const attesterId: Uint8Array = rt.persistentHash(new rt.CompactTypeBytes(32), entry.attestationSecret);
     const recovery = recoveryId ? Uint8Array.from(Buffer.from(recoveryId, 'hex')) : new Uint8Array(32);
     return [attesterId, recovery];
 }
 
 /** Witnesses for a contract we hold no witness code for. A proxy answers every name, so the constructor check passes, but each call throws. */
-export function unregisteredWitnessStub(contractName: string): Record<string, unknown> {
-    return new Proxy({}, {
+export function unregisteredWitnessStub(contractName: string): Witnesses<unknown> {
+    return new Proxy<Witnesses<unknown>>({}, {
         has: () => true,
         get: (_target, prop: string | symbol) => {
             if (typeof prop === 'symbol') return undefined;
@@ -41,6 +45,11 @@ export function unregisteredWitnessStub(contractName: string): Record<string, un
     });
 }
 
+export type ArtifactCompiledContract = CompiledContract.CompiledContract<ArtifactContract, unknown>;
+/** What midnight-js needs for a call on an artifact contract. */
+export type ArtifactContractProviders = Ledger9ContractProviders<ArtifactContract>;
+type ArtifactPrivateStateProvider = PrivateStateProvider<string, unknown>;
+
 /** Built for each call, because the witnesses carry the session's secret. */
 export async function getOrCompileContract(
     name: string,
@@ -48,7 +57,7 @@ export async function getOrCompileContract(
     entry: FacadeEntry,
     merkleProof?: MerkleProofBundle,
     merkleProofHolder?: { current?: MerkleProofBundle }
-): Promise<any> {
+): Promise<ArtifactCompiledContract> {
     const { contractClass } = await getContractScaffold(name, registration);
 
     const { compactJs } = await loadContractsSdk();
@@ -60,25 +69,25 @@ export async function getOrCompileContract(
     }
 
     const witnessFactory = getContractWitnessFactory(name);
-    const witnessStep = witnessFactory
-        ? CompiledContract.withWitnesses(witnessFactory({
+    const witnesses = witnessFactory
+        ? witnessFactory({
             attestationSecret: entry.attestationSecret, issuerSecret: entry.tokenFactoryIssuerSecret, merkleProof, merkleProofHolder,
             ...(registration.slotWidth !== undefined ? { slotWidth: registration.slotWidth } : {})
-        }))
-        : CompiledContract.withWitnesses(unregisteredWitnessStub(name));
+        })
+        : unregisteredWitnessStub(name);
 
-    return CompiledContract.make(name, contractClass).pipe(
-        witnessStep,
+    return CompiledContract.make<ArtifactContract>(name, contractClass).pipe(
+        CompiledContract.withWitnesses(witnesses),
         // Read keys from the snapshot, never from the registered folder that may change.
         CompiledContract.withCompiledFileAssets(artifactAssetPath(name, registration))
     );
 }
 
 // One indexer connection per endpoint. Proving providers are cached per proof server and contract version.
-export const publicDataProviders = new Map<string, Promise<any>>();
-export const zkProviderBundles = new BoundedCache<string, Promise<{ zkConfigProvider: any; proofProvider: any }>>(generationCacheSize(), (key) => onGenerationEvicted(key.split('|').pop() ?? ''));
+export const publicDataProviders = new Map<string, Promise<PublicDataProvider>>();
+export const zkProviderBundles = new BoundedCache<string, Promise<{ zkConfigProvider: ZKConfigProvider<string>; proofProvider: ProofProvider }>>(generationCacheSize(), (key) => onGenerationEvicted(key.split('|').pop() ?? ''));
 
-export function getPublicDataProvider(indexerHttpUrl: string, indexerWsUrl: string): Promise<any> {
+export function getPublicDataProvider(indexerHttpUrl: string, indexerWsUrl: string): Promise<PublicDataProvider> {
     const key = `${indexerHttpUrl}|${indexerWsUrl}`;
     let p = publicDataProviders.get(key);
     if (!p) {
@@ -100,14 +109,14 @@ export function buildWorkerContractProviders(args: {
     proofServerUrl: string;
     zkConfigPath: string;
     generation?: string;
-}): Promise<{ publicDataProvider: any; zkConfigProvider: any; proofProvider: any }> {
+}): Promise<{ publicDataProvider: PublicDataProvider; zkConfigProvider: ZKConfigProvider<string>; proofProvider: ProofProvider }> {
     const key = `${args.proofServerUrl}|${args.zkConfigPath}|${args.generation ?? ''}`;
     let bundleP = zkProviderBundles.get(key);
     if (!bundleP) {
         bundleP = (async () => {
             const { proof, zk } = await loadContractsSdk();
-            const zkConfigProvider = new zk.NodeZkConfigProvider(args.zkConfigPath);
-            let proofProvider;
+            const zkConfigProvider = new zk.NodeZkConfigProvider<string>(args.zkConfigPath);
+            let proofProvider: ProofProvider;
             if (resolveProvingMode() === 'wasm') {
                 proofProvider = await buildWasmProofProvider(zkConfigProvider);
                 log('info', 'contract proving: in-process (wasm), proof server not used');
@@ -131,10 +140,10 @@ export const FIND_CONTRACT_CACHED_METHODS = new Set(['watchForDeployTxData', 'qu
 // Limited in size, because the worker may run for months.
 export const findContractQueryCache = new BoundedCache<string, Promise<unknown>>(256);
 
-export function withFindContractQueryCache(publicDataProvider: any, indexerHttpUrl: string): any {
+export function withFindContractQueryCache(publicDataProvider: PublicDataProvider, indexerHttpUrl: string): PublicDataProvider {
     return new Proxy(publicDataProvider, {
         get(target, prop) {
-            const v = target[prop];
+            const v: unknown = Reflect.get(target, prop);
             if (typeof v !== 'function') return v;
             if (typeof prop !== 'string' || !FIND_CONTRACT_CACHED_METHODS.has(prop)) return v.bind(target);
             return (contractAddress: string, ...rest: unknown[]) => {
@@ -143,9 +152,10 @@ export function withFindContractQueryCache(publicDataProvider: any, indexerHttpU
                 const cacheKey = `${prop}|${indexerHttpUrl}|${contractAddress}`;
                 let p = findContractQueryCache.get(cacheKey);
                 if (!p) {
-                    p = v.call(target, contractAddress);
-                    p!.catch(() => { findContractQueryCache.delete(cacheKey); });
-                    findContractQueryCache.set(cacheKey, p!);
+                    const fresh: Promise<unknown> = v.call(target, contractAddress);
+                    fresh.catch(() => { findContractQueryCache.delete(cacheKey); });
+                    findContractQueryCache.set(cacheKey, fresh);
+                    p = fresh;
                 }
                 return p;
             };
@@ -177,84 +187,93 @@ export class PhaseTimer {
 }
 
 /** Measures proving, balancing and sending, and stops before proving or balancing when the caller cancelled. */
-export function wrapProvidersForTiming(providers: any, timer: PhaseTimer, callRegion: { start: number }): any {
+export function wrapProvidersForTiming(providers: ArtifactContractProviders, timer: PhaseTimer, callRegion: { start: number }): ArtifactContractProviders {
     const timed = async <T>(label: string, run: () => Promise<T>): Promise<T> => {
         const t = Date.now();
         try { return await run(); } finally { timer.add(label, Date.now() - t); }
     };
 
+    // Object.create keeps each provider's other members, such as supportedEras.
     let proveCalls = 0;
-    const proofProvider = typeof providers.proofProvider?.proveTx === 'function'
-        ? {
-            ...providers.proofProvider,
-            proveTx: (...pArgs: any[]) => {
-                // A running wasm proof cannot be stopped, so only the next one is skipped.
-                throwIfRpcCancelled('before proving');
-                const n = ++proveCalls;
-                if (n === 1 && callRegion.start > 0) {
-                    timer.add('circuitToProve', Date.now() - callRegion.start);
-                }
-                return timed(n === 1 ? 'prove' : `prove#${n}`, () => providers.proofProvider.proveTx(...pArgs));
+    const pp = providers.proofProvider;
+    const proofProvider: typeof pp = typeof pp?.proveTx === 'function' ? Object.create(pp) : pp;
+    if (proofProvider !== pp) {
+        proofProvider.proveTx = (...pArgs) => {
+            // A running wasm proof cannot be stopped, so only the next one is skipped.
+            throwIfRpcCancelled('before proving');
+            const n = ++proveCalls;
+            if (n === 1 && callRegion.start > 0) {
+                timer.add('circuitToProve', Date.now() - callRegion.start);
             }
-        }
-        : providers.proofProvider;
+            return timed(n === 1 ? 'prove' : `prove#${n}`, () => pp.proveTx(...pArgs));
+        };
+    }
 
     const wp = providers.walletProvider;
-    const walletProvider = {
-        ...wp,
-        ...(typeof wp?.balanceTx === 'function'
-            ? { balanceTx: (...a: any[]) => { throwIfRpcCancelled('before balancing'); return timed('balance', () => wp.balanceTx(...a)); } } : {}),
-        ...(typeof wp?.submitTx === 'function'
-            ? { submitTx: (...a: any[]) => timed('submit', () => wp.submitTx(...a)) } : {})
-    };
+    const walletProvider: typeof wp = typeof wp?.balanceTx === 'function' ? Object.create(wp) : wp;
+    if (walletProvider !== wp) {
+        walletProvider.balanceTx = (...a) => { throwIfRpcCancelled('before balancing'); return timed('balance', () => wp.balanceTx(...a)); };
+    }
+    const mp = providers.midnightProvider;
+    const midnightProvider: typeof mp = typeof mp?.submitTx === 'function' ? Object.create(mp) : mp;
+    if (midnightProvider !== mp) midnightProvider.submitTx = (...a) => timed('submit', () => mp.submitTx(...a));
 
-    return { ...providers, proofProvider, walletProvider, midnightProvider: walletProvider };
+    return { ...providers, proofProvider, walletProvider, midnightProvider };
 }
 
+
+/** How long a contract transaction built here stays valid. */
+export const CONTRACT_TX_TTL_SECONDS = 3600;
 
 /** The providers one contract call needs: indexer and proof server for the artifact, a private-state proxy to the main thread under `proxyId`, and the paying wallet. */
 export async function contractCallProviders(a: {
     contractName: string; registration: ContractRegistration; proxyId: string;
-    indexerHttpUrl: string; indexerWsUrl: string; proofServerUrl: string;
-    walletProvider: any;
+    indexerHttpUrl: string; indexerWsUrl: string; proofServerUrl: string; networkId: string;
+    walletProvider: WorkerWalletProvider;
     /** Caches findDeployedContract's indexer reads; a deploy has nothing to find. */
     cacheFindQueries: boolean;
-}) {
+}): Promise<{ providers: ArtifactContractProviders; privateStateProvider: ArtifactPrivateStateProvider }> {
     const contractProviders = await buildWorkerContractProviders({
         indexerHttpUrl: a.indexerHttpUrl, indexerWsUrl: a.indexerWsUrl, proofServerUrl: a.proofServerUrl,
         zkConfigPath: artifactAssetPath(a.contractName, a.registration), generation: a.registration.artifactDigest
     });
-    const privateStateProvider = createPrivateStateProxy(a.proxyId);
-    const providers = {
+    const privateStateProvider: ArtifactPrivateStateProvider = createPrivateStateProxy(a.proxyId);
+    const { types } = await loadContractsSdk();
+    const ledger = await loadLedger();
+    // midnight-js hands over its own transaction handles, while the worker wallet works on ledger transactions.
+    const decoders = { v9: ledger.Transaction };
+    const wallet = a.walletProvider;
+    const providers: ArtifactContractProviders = {
         ...contractProviders,
         ...(a.cacheFindQueries ? { publicDataProvider: withFindContractQueryCache(contractProviders.publicDataProvider, a.indexerHttpUrl) } : {}),
         privateStateProvider,
-        walletProvider: a.walletProvider,
-        midnightProvider: a.walletProvider
+        walletProvider: types.createLedger9WalletProvider({
+            getCoinPublicKey: () => wallet.getCoinPublicKey(),
+            getEncryptionPublicKey: () => wallet.getEncryptionPublicKey(),
+            balanceTx: (tx, ttl) => wallet.balanceTx(tx.deserialize(decoders), ttl)
+        }),
+        midnightProvider: types.createLedger9MidnightProvider((tx) => wallet.submitTx(tx.deserialize(decoders))),
+        config: { networkId: a.networkId, ttlSeconds: CONTRACT_TX_TTL_SECONDS }
     };
     return { providers, privateStateProvider };
 }
 
 /** Finds a deployed contract for this wallet. Seeds initial private state only when none exists, because seeding overwrites. */
-export async function findContractForWallet(contracts: any, providers: any, privateStateProvider: any, a: {
-    contractAddress: string; compiledContract: unknown; privateStateId: string; initialPrivateState?: unknown;
+export async function findContractForWallet(contracts: ContractsSdkBundle['contracts'], providers: ArtifactContractProviders, privateStateProvider: ArtifactPrivateStateProvider, a: {
+    contractAddress: string; compiledContract: ArtifactCompiledContract; privateStateId: string; initialPrivateState?: unknown;
     /** Names the caller in the seeding log line; none logs nothing. */
     site?: string;
     /** Runs between the private-state read and the lookup, for phase timing. */
     onProbed?: () => void;
-}): Promise<any> {
-    // The address must be set before the read.
-    privateStateProvider.setContractAddress(a.contractAddress);
-    const existing = await privateStateProvider.get(a.privateStateId);
+}): Promise<Ledger9FoundContract<ArtifactContract>> {
+    const existing = await privateStateProvider.forContract(a.contractAddress).get(a.privateStateId);
     const seed = existing === undefined || existing === null;
     if (seed && a.site) log('info', `${a.site}: no private state at '${a.privateStateId}' for this wallet, seeding the contract's initial private state`);
     a.onProbed?.();
-    return contracts.findDeployedContract(providers, {
-        contractAddress: a.contractAddress,
-        compiledContract: a.compiledContract,
-        privateStateId: a.privateStateId,
-        ...(seed ? { initialPrivateState: a.initialPrivateState ?? {} } : {})
-    });
+    const target = { contractAddress: a.contractAddress, compiledContract: a.compiledContract, privateStateId: a.privateStateId };
+    return seed
+        ? contracts.findDeployedContract(providers, { ...target, initialPrivateState: a.initialPrivateState ?? {} })
+        : contracts.findDeployedContract(providers, target);
 }
 
 export async function deployContract({
@@ -280,13 +299,12 @@ export async function deployContract({
     const entry = facades.get(sessionId);
     if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
     const sponsorEntry = resolveSponsorEntry(sponsorSessionId);
-    const sdk = await loadSdk();
-    await ensureNetworkId(networkId, sdk);
+    await loadSdk();
 
     const compiledContract = await getOrCompileContract(contractName, registration, entry);
     const intent: BoundSubmitIntent = { replyPort: __replyPort, note: 'deploy', circuits: [DEPLOY_ENTRY_POINT] };
     const { providers } = await contractCallProviders({
-        contractName, registration, proxyId, indexerHttpUrl, indexerWsUrl, proofServerUrl, cacheFindQueries: false,
+        contractName, registration, proxyId, indexerHttpUrl, indexerWsUrl, proofServerUrl, networkId, cacheFindQueries: false,
         walletProvider: sponsorEntry ? buildSponsoredWalletProvider(entry, sponsorEntry, intent) : buildWorkerWalletProvider(entry, intent)
     });
 
@@ -294,11 +312,12 @@ export async function deployContract({
     log('info', `deployContract: starting ${contractName} sess=${sessionId.slice(0, 16)}` +
         (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
     const constructorArgs = await deployConstructorArgs(contractName, entry, recoveryId);
+    // midnight-js reads missing constructor arguments as an empty list.
     const result = await contracts.deployContract(providers, {
         compiledContract,
         privateStateId: registration.privateStateId,
         initialPrivateState,
-        ...(constructorArgs.length > 0 ? { args: constructorArgs } : {})
+        args: constructorArgs
     });
     const pub = result?.deployTxData?.public;
     const out = {
@@ -342,15 +361,14 @@ export async function submitContractCall({
     const timer = new PhaseTimer();
     const callRegion = { start: 0 };
     try {
-        const sdk = await loadSdk();
-        await ensureNetworkId(networkId, sdk);
+        await loadSdk();
         timer.mark('init');
 
         const compiledContract = await getOrCompileContract(contractName, registration, entry, merkleProof);
         timer.mark('compile');
         const intent: BoundSubmitIntent = { replyPort: __replyPort, contractAddress, circuits: [circuit] };
         const built = await contractCallProviders({
-            contractName, registration, proxyId, indexerHttpUrl, indexerWsUrl, proofServerUrl, cacheFindQueries: true,
+            contractName, registration, proxyId, indexerHttpUrl, indexerWsUrl, proofServerUrl, networkId, cacheFindQueries: true,
             walletProvider: sponsorEntry ? buildSponsoredWalletProvider(entry, sponsorEntry, intent) : buildWorkerWalletProvider(entry, intent)
         });
         timer.mark('providers');
@@ -425,8 +443,7 @@ export async function submitContractCallBatch({
     const callRegion = { start: 0 };
     const circuits = calls.map(c => c.circuit);
     try {
-        const sdk = await loadSdk();
-        await ensureNetworkId(networkId, sdk);
+        await loadSdk();
         timer.mark('init');
 
         // With per-call proofs, each call sets the shared proof slot before it runs.
@@ -448,7 +465,7 @@ export async function submitContractCallBatch({
         timer.mark('compile');
         const intent: BoundSubmitIntent = { replyPort: __replyPort, contractAddress, circuits };
         const built = await contractCallProviders({
-            contractName, registration, proxyId, indexerHttpUrl, indexerWsUrl, proofServerUrl, cacheFindQueries: true,
+            contractName, registration, proxyId, indexerHttpUrl, indexerWsUrl, proofServerUrl, networkId, cacheFindQueries: true,
             walletProvider: sponsorEntry ? buildSponsoredWalletProvider(entry, sponsorEntry, intent) : buildWorkerWalletProvider(entry, intent)
         });
         timer.mark('providers');

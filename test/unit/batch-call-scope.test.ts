@@ -5,7 +5,15 @@
  * the findDeployedContract result.
  */
 
-import { lastCallSegmentId, runBatchInScope } from '../../srv/midnight/batch-call-scope';
+import * as batchCallScope from '../../srv/midnight/batch-call-scope';
+import { __unprovenTxCodecForTests } from '../../srv/midnight/batch-segment-order';
+
+// The fakes stand in for the contracts SDK and ledger objects, so the module is used untyped here.
+const { lastCallSegmentId, runBatchInScope } = batchCallScope as any;
+// A fake handle carries the transaction itself, so opening and sealing need no ledger.
+const codec: any = { open: (h: any) => h.tx, seal: (tx: any) => ({ era: 'v9', tx }) };
+beforeAll(() => __unprovenTxCodecForTests.set(codec));
+afterAll(() => __unprovenTxCodecForTests.set(undefined));
 
 const PROVIDERS = { fake: 'providers' };
 const ADDR = '0xCONTRACT';
@@ -186,8 +194,8 @@ describe('runBatchInScope', () => {
 
         // Proving through the wrapper reorders the segment ids into call order
         // (attest gets the smaller id), then delegates to the real provider.
-        await expect(scopeProviders.proofProvider.proveTx(tx)).resolves.toBe('proven');
-        expect(proveTx).toHaveBeenCalledWith(tx);
+        await expect(scopeProviders.proofProvider.proveTx({ era: 'v9', tx })).resolves.toBe('proven');
+        expect(proveTx).toHaveBeenCalledWith({ era: 'v9', tx });
         expect(tx.intents.get(4)).toBe(attest);
         expect(tx.intents.get(9)).toBe(bind);
     });
@@ -197,7 +205,7 @@ describe('runBatchInScope', () => {
         let last: number | undefined;
         const txCtx = {
             getLastUnsubmittedCallTxDataToTransact: () =>
-                [{ private: { unprovenTx: { intents: new Map([[last, { actions: [{ entryPoint: 'attest' }] }]]) } } }]
+                [{ private: { unprovenTx: { era: 'v9', tx: { intents: new Map([[last, { actions: [{ entryPoint: 'attest' }] }]]) } } } }]
         };
         const byId = new Map(built.map(id => [id, { actions: [{ entryPoint: 'attest' }], id }]));
         // The merged map comes back in no fixed order.
@@ -205,7 +213,7 @@ describe('runBatchInScope', () => {
         const contracts = {
             withContractScopedTransaction: vi.fn(async (p: any, fn: (ctx: unknown) => Promise<void>) => {
                 await fn(txCtx);
-                await p.proofProvider.proveTx(tx);
+                await p.proofProvider.proveTx({ era: 'v9', tx });
                 return { public: { txHash: '0x1', status: 'SucceedEntirely' } };
             })
         };
@@ -224,9 +232,9 @@ describe('runBatchInScope', () => {
     });
 
     test('lastCallSegmentId is NaN without exactly one intent', () => {
-        expect(lastCallSegmentId({})).toBeNaN();
-        const two = { getLastUnsubmittedCallTxDataToTransact: () => [{ private: { unprovenTx: { intents: new Map([[1, {}], [2, {}]]) } } }] };
-        expect(lastCallSegmentId(two)).toBeNaN();
+        expect(lastCallSegmentId({}, codec)).toBeNaN();
+        const two = { getLastUnsubmittedCallTxDataToTransact: () => [{ private: { unprovenTx: { era: 'v9', tx: { intents: new Map([[1, {}], [2, {}]]) } } } }] };
+        expect(lastCallSegmentId(two, codec)).toBeNaN();
     });
 
     // ---- segment mode selection (NIGHTGATE_BATCH_SEGMENT_MODE) -------------
@@ -241,7 +249,7 @@ describe('runBatchInScope', () => {
             withContractScopedTransaction: vi.fn(async (p: any, fn: (ctx: unknown) => Promise<void>) => {
                 await fn({});
                 const tx: any = { intents: new Map(layout.map(([id, ep]) => [id, { actions: [{ entryPoint: ep }] }])) };
-                await p.proofProvider.proveTx(tx);
+                await p.proofProvider.proveTx({ era: 'v9', tx });
                 return { public: { txHash: '0xlayout', status: 'SucceedEntirely' } };
             })
         };
@@ -279,7 +287,7 @@ describe('runBatchInScope', () => {
                 withContractScopedTransaction: vi.fn(async (p: any, fn: (ctx: unknown) => Promise<void>) => {
                     await fn({});
                     const tx: any = { intents: new Map([[9, { actions: [{ entryPoint: 'attest' }] }], [4, { actions: [{ entryPoint: 'bindPassport' }] }]]) };
-                    await p.proofProvider.proveTx(tx);
+                    await p.proofProvider.proveTx({ era: 'v9', tx });
                     provenTx = tx;
                     return { public: { txHash: '0xobserve', status: 'SucceedEntirely' } };
                 })
@@ -309,7 +317,7 @@ describe('runBatchInScope', () => {
             withContractScopedTransaction: vi.fn(async (p: any, fn: (ctx: unknown) => Promise<void>) => {
                 await fn({});
                 const tx: any = { intents: new Map(layout.map(([id, ep]) => [id, { actions: [{ entryPoint: ep }] }])) };
-                await p.proofProvider.proveTx(tx);
+                await p.proofProvider.proveTx({ era: 'v9', tx });
                 provenTx = tx;
                 return { public: { txHash: '0x8call', status: 'SucceedEntirely' } };
             })
@@ -345,7 +353,7 @@ describe('runBatchInScope', () => {
             { circuit: 'attest', args: [] },
             { circuit: 'bindPassport', args: [] }
         ], ADDR);
-        await expect(scopeProviders.proofProvider.proveTx(tx)).resolves.toBe('proven');
+        await expect(scopeProviders.proofProvider.proveTx({ era: 'v9', tx })).resolves.toBe('proven');
         // Rewrite semantics: ids permuted so attest gets the smaller id.
         expect(tx.intents.get(4)).toBe(attest);
         expect(tx.intents.get(9)).toBe(bind);

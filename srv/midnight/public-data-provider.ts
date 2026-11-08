@@ -3,6 +3,8 @@
 
 import WebSocket from 'ws';
 import { loadMidnightSdk } from './sdk-loader';
+import type { ContractState } from '@midnight-ntwrk/compact-runtime';
+import type { PublicDataProvider } from '@midnight-ntwrk/midnight-js-types';
 
 export interface IndexerEndpoints {
     indexerHttpUrl: string;
@@ -10,14 +12,26 @@ export interface IndexerEndpoints {
 }
 
 /** The part of the SDK's `PublicDataProvider` the readers use. */
-export interface ContractStateReader {
-    queryContractState(contractAddress: string, at?: { type: 'blockHeight'; blockHeight: number }): Promise<ContractStateLike | null>;
+export type ContractStateReader = Pick<PublicDataProvider, 'queryContractState'>;
+
+type ContractStateRead = NonNullable<Awaited<ReturnType<ContractStateReader['queryContractState']>>>;
+
+/** The decoded contract state, for a compiled contract's `ledger`. That function runs on compact-runtime and refuses ledger-v9's class of the same name.
+ *  A state written by ledger 8 cannot be decoded here. */
+export async function contractStateOf(read: ContractStateRead): Promise<ContractState> {
+    const serialized = read.contractState;
+    if (serialized.era !== 'v9') throw new Error(`contract state written by ledger ${String(serialized.era)}: this server reads ledger 9 states only`);
+    const runtime = await import('@midnight-ntwrk/compact-runtime');
+    return serialized.deserialize({ v9: runtime.ContractState });
 }
 
-/** The SDK hands the ledger state back either bare or wrapped in `data`. */
-export type ContractStateLike = { data?: unknown } & object;
-
 const providers = new Map<string, Promise<ContractStateReader>>();
+
+/** Reads a contract state and narrows it to ledger 9. Null when the contract has no state. */
+export async function queryLedger9ContractState(reader: ContractStateReader, contractAddress: string, at?: { type: 'blockHeight'; blockHeight: number }): Promise<ContractState | null> {
+    const read = await reader.queryContractState(contractAddress, at);
+    return read && contractStateOf(read);
+}
 
 export function buildPublicDataProvider(endpoints: IndexerEndpoints): Promise<ContractStateReader> {
     if (!endpoints.indexerHttpUrl || !endpoints.indexerWsUrl) {
@@ -32,8 +46,8 @@ export function buildPublicDataProvider(endpoints: IndexerEndpoints): Promise<Co
             return sdk.indexer.indexerPublicDataProvider(
                 endpoints.indexerHttpUrl,
                 endpoints.indexerWsUrl,
-                WebSocket as unknown as typeof import('isomorphic-ws').WebSocket
-            ) as ContractStateReader;
+                WebSocket
+            );
         })();
         providers.set(key, pending);
         pending.catch(() => providers.delete(key));

@@ -25,7 +25,7 @@ const EXPECTED = {
         'deserializeTransaction', 'txIdentifiers', 'submitFinalized', 'submitExtrinsic',
         'classifyNodeReject', 'isPreMempoolReject', 'isTransportFailure', 'isAlreadyImported',
         'rebuildOnStaleTranscript',
-        'probeLanded', 'waitLanded', 'withDustGuard', 'nodeHttpUrlFor',
+        'probeLanded', 'waitLanded', 'sealTx', 'openTx', 'nodeHttpUrlFor',
         'apiPublicDataProvider', 'apiClientFor', 'buildOnlySubmissionService',
         'createSwapWallet', 'readSwapTerms', 'sameSwapTerms', 'encodeOffer', 'decodeOffer', 'SWAP_OFFER_PREFIX',
         'SWAP_MAX_INPUTS', 'chooseSwapCoin', 'spendableWithin',
@@ -136,7 +136,9 @@ async function main() {
     await mkdir(probeRoot, { recursive: true });
     try {
         const tarName = execFileSync('npm', ['pack', '--pack-destination', probeRoot], { cwd: PKG_DIR, encoding: 'utf8', shell: process.platform === 'win32' }).trim().split(/\r?\n/).pop();
-        await writeFile(join(probeRoot, 'package.json'), JSON.stringify({ name: 'install-probe', private: true, type: 'module' }));
+        // A consumer copies the package's overrides: npm applies them from the root manifest only.
+        const { overrides } = JSON.parse(await readFile(join(PKG_DIR, 'package.json'), 'utf8'));
+        await writeFile(join(probeRoot, 'package.json'), JSON.stringify({ name: 'install-probe', private: true, type: 'module', ...(overrides ? { overrides } : {}) }));
         execFileSync('npm', ['install', '--no-audit', '--no-fund', tarName], { cwd: probeRoot, encoding: 'utf8', shell: process.platform === 'win32' });
         const probeMjs = join(probeRoot, 'probe.mjs');
         await writeFile(probeMjs, [

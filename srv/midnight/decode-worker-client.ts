@@ -55,8 +55,8 @@ export function readHolderRegistrationInWorker(args: HolderRegistrationQuery): P
     return client.rpc('readHolderRegistration', args);
 }
 
-export function decodeLedgerPayloadInWorker(bytes: Uint8Array): Promise<LedgerPayloadFacts> {
-    return client.rpc('decodeLedgerPayload', { bytes });
+export function decodeLedgerPayloadInWorker(bytes: Uint8Array, specVersion?: number | null): Promise<LedgerPayloadFacts> {
+    return client.rpc('decodeLedgerPayload', { bytes, specVersion });
 }
 
 export function __resetDecodeWorkerForTests(): Promise<void> {

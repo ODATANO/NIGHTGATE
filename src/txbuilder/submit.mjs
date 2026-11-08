@@ -23,7 +23,7 @@ const toBytes = (input) => {
 /** Decodes a built transaction from bytes or base64. Accepts sealed and unsealed transactions. */
 export async function deserializeTransaction(bytesOrB64) {
     const bytes = toBytes(bytesOrB64);
-    const { Transaction } = await import('@midnight-ntwrk/ledger-v8');
+    const { Transaction } = await import('@midnightntwrk/ledger-v9');
     let lastError;
     for (const tags of DESERIALIZE_TAGS) {
         try {
@@ -57,7 +57,7 @@ function rejectHaystack(err) {
 }
 
 /** Whether the node refused the transaction before the mempool (codes 1010, 1014, 1016). No fee was spent.
- *  If the transaction paid its own fee, restore the DUST wallet with `withDustGuard`. */
+ *  If the transaction paid its own fee, the wallet's `revertTransaction` frees the coins it reserved. */
 export function isPreMempoolReject(err) {
     return /\b101[046]\s*:|priority is too low|immediately dropped|invalid transaction/i.test(rejectHaystack(err));
 }
@@ -241,31 +241,5 @@ export async function waitLanded(identifier, { indexerHttpUrl, api, timeoutMs = 
         const left = deadline - Date.now();
         if (left <= 0) return null;
         await new Promise((r) => setTimeout(r, Math.min(pollMs, left)));
-    }
-}
-
-/** Runs `fn`, which builds and submits one self-paid transaction. After a pre-mempool rejection it restores the DUST wallet,
- *  because the SDK would keep the fee reserved. The rethrown error then has `dustRestored = true`, so save the restored state.
- *  Run only one guarded build per wallet at a time. */
-export async function withDustGuard(facade, { configuration, dustKey, dustWalletFactory } = {}, fn) {
-    if (!facade?.dust) throw new Error('withDustGuard: facade with a dust sub-wallet is required');
-    if (!configuration || !dustKey) throw new Error('withDustGuard: configuration and dustKey are required (the values the facade was created with)');
-    let snapshot = null;
-    try { snapshot = await facade.dust.serializeState(); } catch { snapshot = null; }
-    try {
-        return await fn();
-    } catch (e) {
-        if (snapshot && isPreMempoolReject(e)) {
-            try {
-                const factory = dustWalletFactory ?? (await import('@midnightntwrk/wallet-sdk-dust-wallet')).DustWallet;
-                const fresh = factory(configuration).restore(snapshot);
-                await fresh.start(dustKey);
-                const old = facade.dust;
-                facade.dust = fresh;
-                try { await old.stop(); } catch { /* already dead is fine */ }
-                try { e.dustRestored = true; } catch { /* frozen error */ }
-            } catch { /* restore failed: keep the old wallet */ }
-        }
-        throw e;
     }
 }

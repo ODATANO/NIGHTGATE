@@ -13,7 +13,7 @@ let backoffMs: readonly number[] = DEFAULT_BACKOFF_MS;
 const PG_RETRY_SQLSTATES = new Set(['40001', '40P01', '55P03', '57014']);
 
 export function isLockContention(err: unknown): boolean {
-    const code = String((err as any)?.code ?? '');
+    const code = String((err as { code?: unknown } | null | undefined)?.code ?? '');
     if (PG_RETRY_SQLSTATES.has(code) || code === 'SQLITE_BUSY') return true;
     const msg = errorMessage(err);
     return /database is locked|SQLITE_BUSY|could not serialize access|deadlock detected|lock timeout|canceling statement due to lock timeout|ResourceRequest timed out/i.test(msg);

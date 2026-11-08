@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { errorMessage } from '../../utils/errors';
+import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
+import type { DustLocalState } from '@midnightntwrk/ledger-v9';
+import type { DustWalletState } from '@midnightntwrk/wallet-sdk-dust-wallet';
 
 export interface OwnGeneration {
     firstFree: bigint;
@@ -37,10 +40,10 @@ export function foreignRanges(keep: Iterable<bigint>, firstFree: bigint): Array<
 }
 
 /** Collapses every entry of other wallets. Throws when one of our dust UTXOs has no entry, because collapsing it would crash the ledger wasm later. */
-export function collapseForeignGeneration(state: any): { state: any; ranges: number; ownLeaves: number } {
+export function collapseForeignGeneration(state: DustLocalState): { state: DustLocalState; ranges: number; ownLeaves: number } {
     const own = parseOwnGeneration(state.toString(true));
     if (!own) throw new Error('dust state string form has no generating_tree_first_free / night_indices');
-    for (const utxo of state.utxos as any[]) {
+    for (const utxo of state.utxos) {
         const night = String(utxo.backingNight).replace(/^0x/, '').toLowerCase();
         if (!own.nightIndices.has(night)) throw new Error(`own dust UTXO backing night ${night.slice(0, 16)} missing from night_indices`);
     }
@@ -71,15 +74,14 @@ export interface CollapsedDust {
     ownLeaves: number;
 }
 
-/** Collapses an SDK dust wallet state and records what a restore must reproduce. On a throw the caller saves `walletState.serialize()`. */
-export function collapseDustState(walletState: any): CollapsedDust {
-    const fullBlob: string = walletState.serialize();
-    const snapshot = JSON.parse(fullBlob);
+/** Collapses an SDK dust wallet state, whose ledger state is `full`, and records what a restore must reproduce. On a throw the caller saves `walletState.serialize()`. */
+export function collapseDustState(walletState: Pick<DustWalletState, 'serialize'>, full: DustLocalState): CollapsedDust {
+    const fullBlob = walletState.serialize();
+    const snapshot = parseSnapshot(fullBlob);
     const fullBytes = typeof snapshot.state === 'string' ? snapshot.state.length / 2 : 0;
-    const full = walletState.state.state;
     const { state, ranges, ownLeaves } = collapseForeignGeneration(full);
-    const bytes: Uint8Array = state.serialize();
-    const at: Date = full.syncTime;
+    const bytes = state.serialize();
+    const at = full.syncTime;
     return {
         fullBlob,
         fullBytes,
@@ -96,10 +98,15 @@ export function collapseDustState(walletState: any): CollapsedDust {
     };
 }
 
+/** The SDK's dust snapshot is JSON text it owns. Only its hex `state` field is read and replaced. */
+function parseSnapshot(blob: string): { state?: unknown } & Record<string, unknown> {
+    return JSON.parse(blob);
+}
+
 export type CollapsedDustVerdict = { ok: true } | { ok: false; reason: string };
 
 /** Restores the collapsed bytes and compares roots, balance and UTXO count with the full state's. */
-export function verifyCollapsedDust(bytes: Uint8Array, expect: CollapsedDustExpectation, DustLocalState: any): CollapsedDustVerdict {
+export function verifyCollapsedDust(bytes: Uint8Array, expect: CollapsedDustExpectation, DustLocalState: Pick<typeof LedgerV9.DustLocalState, 'deserialize'>): CollapsedDustVerdict {
     try {
         const back = DustLocalState.deserialize(bytes);
         const same = String(back.generatingTreeRoot()) === expect.generatingTreeRoot
@@ -115,14 +122,14 @@ export function verifyCollapsedDust(bytes: Uint8Array, expect: CollapsedDustExpe
 
 /** The SDK snapshot with its `state` replaced by the collapsed bytes. Every other field stays. */
 export function collapsedDustBlob(fullBlob: string, bytes: Uint8Array): string {
-    const snapshot = JSON.parse(fullBlob);
+    const snapshot = parseSnapshot(fullBlob);
     snapshot.state = Buffer.from(bytes).toString('hex');
     return JSON.stringify(snapshot);
 }
 
 /** Changes with every applied ledger event and spend, so an equal key means the saved dust state is current. Null when the figures are missing. */
-export function dustSaveKey(walletState: any): string | null {
-    const applied = walletState?.progress?.appliedIndex ?? walletState?.state?.progress?.appliedIndex;
+export function dustSaveKey(walletState: Pick<DustWalletState, 'progress' | 'totalCoins' | 'pendingCoins'> | undefined): string | null {
+    const applied = walletState?.progress?.appliedIndex;
     if (applied == null) return null;
     const count = (coins: unknown): string => (Array.isArray(coins) ? String(coins.length) : '-');
     return `${applied}:${count(walletState?.totalCoins)}:${count(walletState?.pendingCoins)}`;

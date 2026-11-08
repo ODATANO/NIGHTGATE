@@ -124,10 +124,12 @@ try {
 
     // InMemoryPrivateStateProvider basic ops.
     const psp = new mod.InMemoryPrivateStateProvider();
-    await psp.set('id', { a: 1 });
-    if ((await psp.get('id')).a !== 1) fail('InMemoryPrivateStateProvider get/set broken');
-    await psp.remove('id');
-    if ((await psp.get('id')) !== null) fail('InMemoryPrivateStateProvider remove broken');
+    const states = psp.forContract('aa'.repeat(32));
+    await states.set('id', { a: 1 });
+    if ((await states.get('id')).a !== 1) fail('InMemoryPrivateStateProvider get/set broken');
+    if ((await psp.forContract('bb'.repeat(32)).get('id')) !== null) fail('InMemoryPrivateStateProvider leaked state across contracts');
+    await states.remove('id');
+    if ((await states.get('id')) !== null) fail('InMemoryPrivateStateProvider remove broken');
 
     // prepareRevokeDisclosure shape.
     const call = mod.prepareRevokeDisclosure({ payloadHash: 'ab'.repeat(32), grantee: 'cd'.repeat(32), attestationSecret: secret });

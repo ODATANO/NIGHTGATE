@@ -3,7 +3,7 @@
 
 import { parentPort } from 'node:worker_threads';
 import { createDispatcher, type WorkerRpcHandlers } from './worker-rpc/dispatch';
-import { loadLedgerV8 } from './sdk-loader';
+import { loadLedger } from './sdk-loader';
 import { verifyCollapsedDust, type CollapsedDustExpectation, type CollapsedDustVerdict } from './worker/dust-collapse';
 
 export interface VerifyCollapsedDustArgs {
@@ -19,7 +19,7 @@ export function log(level: 'info' | 'warn' | 'debug' | 'error', message: string)
 export const handlers: WorkerRpcHandlers = {
     verifyCollapsedDust: async (args): Promise<CollapsedDustVerdict> => {
         const { bytes, expect } = args as VerifyCollapsedDustArgs;
-        const ledger = await loadLedgerV8();
+        const ledger = await loadLedger();
         return verifyCollapsedDust(bytes, expect, ledger.DustLocalState);
     }
 };

@@ -86,14 +86,9 @@ export async function buildProofProvider({ proving = 'server', connector, zkConf
 
     if (connectorCanProve && (proving === 'wallet' || proving === 'auto')) {
         // Loaded only here, so apps that prove on a server do not load the ledger.
-        const ledger = await import('@midnight-ntwrk/ledger-v8');
+        const { createLedger9ProofProvider } = await import('@midnight-ntwrk/midnight-js-types');
         const walletProver = await connector.getProvingProvider(zkConfigProvider.asKeyMaterialProvider());
-        return {
-            provingModality: 'wallet',
-            proofProvider: {
-                proveTx: (unprovenTx) => unprovenTx.prove(walletProver, ledger.CostModel.initialCostModel())
-            }
-        };
+        return { provingModality: 'wallet', proofProvider: createLedger9ProofProvider(walletProver) };
     }
 
     if (proverServerUri) {

@@ -13,14 +13,14 @@ import crypto from 'crypto';
 import { openDekByViewingKey, privateStatePasswordFromDek, clearAllAccountDeks } from '../../srv/submission/account-keys';
 import { accountDekBinding, walletSessionSeedBinding, walletSessionViewingKeyBinding } from '../../srv/utils/envelope-bindings';
 
-// Mock loadLedgerV8, ledger-v8 is ESM-only and cannot be loaded from this
+// Mock loadLedger, ledger-v9 is ESM-only and cannot be loaded from this
 // unit suite (repo rule: never the real SDK). Tests verify wiring/shape; real crypto derivation is
 // exercised by scripts/integration-test-wallet-keys.mjs.
 vi.mock('../../srv/midnight/sdk-loader', async () => {
     const actual = await vi.importActual('../../srv/midnight/sdk-loader');
     return {
         ...actual,
-        loadLedgerV8: vi.fn(async () => ({
+        loadLedger: vi.fn(async () => ({
             ZswapSecretKeys: {
                 fromSeed: (seed: Uint8Array) => {
                     // Deterministic stub: hash the seed to produce stable pubkeys.
@@ -460,8 +460,8 @@ describe('signing-capable wallet adapter (session with encryptedSeedKey)', () =>
         });
         const internal = material.walletAndMidnightProvider._internal;
         expect(internal).toBeDefined();
-        expect(internal.zswapKeys).toBeDefined();
-        expect(internal.dustKey).toBeDefined();
+        expect(internal?.zswapKeys).toBeDefined();
+        expect(internal?.dustKey).toBeDefined();
     });
 });
 

@@ -389,6 +389,22 @@ describe('Transactions', () => {
             .rejects.toMatchObject({ status: 400 });
     });
 
+    it('ledgerTransaction() reads the ledger transaction out of the stored extrinsic', async () => {
+        const blockId = await seedBlock(8);
+        const ledgerBytes = Buffer.from('ledger bytes');
+        // Unsigned extrinsic: compact length, version, pallet, call, then the bytes behind their compact length.
+        const body = Buffer.concat([Buffer.from([0x04, 5, 0, ledgerBytes.length << 2]), ledgerBytes]);
+        const raw = Buffer.concat([Buffer.from([body.length << 2]), body]).toString('base64');
+        await seedTransaction(blockId, { hash: '0xtx8', raw });
+        await seedTransaction(blockId, { hash: '0xtx8b', raw: null });
+
+        const res = await srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: { hash: '0xtx8' } });
+        expect(res).toEqual({ hash: '0xtx8', ledgerTransaction: ledgerBytes.toString('base64') });
+        await expect(srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: { hash: '0xtx8b' } })).rejects.toMatchObject({ status: 404 });
+        await expect(srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: { hash: '0xnone' } })).rejects.toMatchObject({ status: 404 });
+        await expect(srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: {} })).rejects.toMatchObject({ status: 400 });
+    });
+
     it('byHash() rejects when hash is missing', async () => {
         await expect(
             srv.send({ event: 'byHash', entity: 'Transactions', data: {} })
@@ -557,6 +573,35 @@ describe('ContractStates', () => {
             expect(fetchSpy).toHaveBeenCalledTimes(2);
         } finally {
             fetchSpy.mockRestore();
+        }
+    });
+
+    it('stateAt() names the cause of an indexer failure without its URL', async () => {
+        await new Promise(r => setTimeout(r, 1100));
+        const fetchSpy = vi.spyOn(globalThis, 'fetch')
+            .mockImplementation(async () => { throw new Error('connect ECONNREFUSED https://indexer.example/api?key=secret'); });
+        try {
+            const err: any = await srv.send({ event: 'stateAt', entity: 'ContractStates', data: { address: '12'.repeat(32), height: 40 } })
+                .catch((e: unknown) => e);
+            expect(err).toMatchObject({ status: 502, code: 'BAD_GATEWAY', $sanitize: false });
+            expect(err.message).toMatch(/at height 40: .*ECONNREFUSED <indexer>/);
+            expect(err.message).not.toMatch(/secret/);
+        } finally {
+            fetchSpy.mockRestore();
+        }
+    });
+
+    it('stateAt() leaves the text of an error outside the indexer to CAP, which hides it in production', async () => {
+        const contractState = require('../../srv/crawler/contract-state');
+        const spy = vi.spyOn(contractState, 'contractStateAt').mockRejectedValueOnce(new Error('SQLITE_ERROR: no such column x'));
+        try {
+            const err: any = await srv.send({ event: 'stateAt', entity: 'ContractStates', data: { address: '13'.repeat(32), height: 40 } })
+                .catch((e: unknown) => e);
+            expect(err.message).toMatch(/SQLITE_ERROR/);
+            expect(err.$sanitize).toBeUndefined();
+            expect(err.code).not.toBe('BAD_GATEWAY');
+        } finally {
+            spy.mockRestore();
         }
     });
 });

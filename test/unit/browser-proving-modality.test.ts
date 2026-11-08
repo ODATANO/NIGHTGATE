@@ -6,15 +6,13 @@
  * preimage off the user's machine without the caller ever knowing. So `proving:'wallet'` must
  * throw rather than degrade, and the assembled modality is reported back for logging.
  *
- * The ledger import is stubbed at the seam (same policy as wasm-proof-provider.test.ts); the real
- * ledger prove loop is exercised by the live wallet-proving lane.
+ * The midnight-js import is stubbed at the seam (same policy as wasm-proof-provider.test.ts); the real
+ * prove loop is exercised by the live wallet-proving lane.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 
-const initialCostModel = vi.hoisted(() => vi.fn(() => ({ marker: 'cost-model' })));
-vi.mock('@midnight-ntwrk/ledger-v8', () => ({
-    CostModel: { initialCostModel }
-}));
+const createLedger9ProofProvider = vi.hoisted(() => vi.fn((prover: unknown) => ({ marker: 'proof-provider', prover })));
+vi.mock('@midnight-ntwrk/midnight-js-types', async (importOriginal) => ({ ...(await importOriginal<object>()), createLedger9ProofProvider }));
 
 // Loaded in beforeAll, not at module scope: this file compiles as CommonJS under the repo's
 // tsconfig, where a top-level await is an error. Types come from providers.d.mts.
@@ -54,11 +52,9 @@ describe('buildProofProvider', () => {
         expect(getProvingProvider).toHaveBeenCalledWith({ marker: 'key-material' });
         expect(proofMod.httpClientProofProvider).not.toHaveBeenCalled(); // no server touched at all
 
-        // proveTx runs the ledger's own prove loop against the wallet's prover.
-        const prove = vi.fn(() => 'proven-tx');
-        const out = (res.proofProvider as any).proveTx({ prove });
-        expect(prove).toHaveBeenCalledWith({ marker: 'wallet-prover' }, { marker: 'cost-model' });
-        expect(out).toBe('proven-tx');
+        // The wallet's prover is wrapped by midnight-js, which proves with the initial cost model.
+        expect(createLedger9ProofProvider).toHaveBeenCalledWith({ marker: 'wallet-prover' });
+        expect(res.proofProvider).toEqual({ marker: 'proof-provider', prover: { marker: 'wallet-prover' } });
     });
 
     it("THROWS for proving:'wallet' against a wallet that cannot prove - never a silent downgrade", async () => {

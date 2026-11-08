@@ -7,13 +7,16 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { pathToFileURL } from 'url';
-import { computeArtifactGenerationDigest, artifactGenerationMatch } from './artifact-digest';
+import { computeArtifactGenerationDigest } from './artifact-digest';
 import { resolveContractPackage, contractPackageDigestProblem, type ZkAssetLayout } from '@odatano/contract-kit/node';
 import { versionString as compactRuntimeVersion } from '@midnight-ntwrk/compact-runtime';
 import { runtimeVersionProblem } from '../utils/runtime-version';
 import { ensureProverKeys, missingProverKeys, ZK_ASSET_URL_ENV } from './prover-keys';
+import { zkArtifactManifestProblem } from './zk-artifact-manifest';
 import { configMs } from '../utils/config';
 import { artifactImportSpec, importArtifactGeneration } from './artifact-import';
+import type { Contract } from '@midnight-ntwrk/compact-js';
+import type { Types } from 'effect';
 
 export { artifactImportSpec, importArtifactGeneration };
 import { NightgateError, errorMessage } from '../utils/errors';
@@ -137,18 +140,6 @@ function computeGenerationDigest(reg: ContractRegistration): string {
     return computeArtifactGenerationDigest(reg);
 }
 
-const legacyDigestNoted = new Set<string>();
-/** An older digest format can still describe the same build. See artifact-digest.ts. */
-function acceptsLegacyDigest(name: string, recorded: string): boolean {
-    const reg = registry.get(name);
-    if (!reg || artifactGenerationMatch(reg, recorded) !== 'legacy') return false;
-    if (!legacyDigestNoted.has(name)) {
-        legacyDigestNoted.add(name);
-        cds.log('nightgate').info(`contract '${name}': accepting pre-0.21.0 generation digest ${recorded.slice(0, 16)}… (same CommonJS artifact; the digest format gained the module-format section)`);
-    }
-    return true;
-}
-
 /** Throws unless a stored job or result was created for the build the name points to today. */
 export function assertArtifactGeneration(name: string, recorded: string | undefined, what: string): void {
     const current = getArtifactGenerationDigest(name);
@@ -157,7 +148,6 @@ export function assertArtifactGeneration(name: string, recorded: string | undefi
             `${what} carries no artifact-generation digest (created by an older release). ` +
             `Refusing to run it against whatever '${name}' resolves to today; re-issue the action.`);
     }
-    if (recorded !== current && acceptsLegacyDigest(name, recorded)) return;
     if (recorded !== current) {
         throw new Error(
             `${what} was created against artifact generation ${recorded.slice(0, 16)}… but '${name}' now ` +
@@ -247,6 +237,8 @@ export function loadRegistryFromConfig(config?: NightgatePluginConfig, baseDir =
         }
         registerContract(name, resolved);
         configNames.add(name);
+        const manifestProblem = zkArtifactManifestProblem(resolved.zkConfigPath);
+        if (manifestProblem) cds.log('nightgate').warn(`contract '${name}' cannot prove: ${manifestProblem}`);
         if (resolved.package) {
             cds.log('nightgate').info(`contract '${name}': ${resolved.package.name}@${resolved.package.version}, generation ${getArtifactGenerationDigest(name).slice(0, 16)}…`);
         }
@@ -279,7 +271,7 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
         // cached digest is enough. A main-thread import hashes the files fresh.
         const current = opts.compile ? computeGenerationDigest(reg) : getCurrentArtifactDigest(name);
         digest = current;
-        if (current !== expectedDigest && artifactGenerationMatch(reg, expectedDigest) !== 'legacy') {
+        if (current !== expectedDigest) {
             throw new Error(
                 `Contract '${name}' currently resolves to artifact generation ${current.slice(0, 16)}… but ` +
                 `${expectedDigest.slice(0, 16)}… was recorded. Refusing to load a different generation; ` +
@@ -296,10 +288,9 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
     // Jobs never import on the main thread, because the module would stay in Node's cache.
     let compiledContract: unknown;
     if (opts.compile) {
-        const mod: any = await importArtifactGeneration(reg.artifactPath, digest);
-        const ContractClass = mod.Contract ?? mod.default ?? mod;
-        const compactJs: any = await import('@midnight-ntwrk/compact-js');
-        const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
+        const ContractClass = artifactContractClass(await importArtifactGeneration(reg.artifactPath, digest) as ArtifactExports);
+        const compactJs = await import('@midnight-ntwrk/compact-js');
+        const CompiledContract = compactJs.CompiledContract;
         if (!CompiledContract?.make) {
             throw new Error(`CompiledContract.make not found in @midnight-ntwrk/compact-js exports; got keys: ${Object.keys(compactJs).join(',')}`);
         }
@@ -319,13 +310,25 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
     };
 }
 
-export async function importRegisteredArtifact(name: string): Promise<any> {
-    const reg = registry.get(name);
-    if (!reg) throw new ContractNotRegisteredError(name, listRegisteredContracts());
-    return importArtifactGeneration(reg.artifactPath, getArtifactGenerationDigest(name));
+/** Exports of a compiled Compact module. The module is generated code without declarations, so each export is unknown. */
+export interface ArtifactExports {
+    Contract?: unknown;
+    pureCircuits?: unknown;
+    default?: ArtifactExports;
 }
 
-export async function importArtifactByPath(artifactPath: string): Promise<any> {
+// The contract class is `Contract` or the default export. It is taken as a contract of unknown private state.
+function artifactContractClass(mod: ArtifactExports): Types.Ctor<Contract<unknown>> {
+    return (mod.Contract ?? mod.default ?? mod) as Types.Ctor<Contract<unknown>>;
+}
+
+export async function importRegisteredArtifact(name: string): Promise<ArtifactExports> {
+    const reg = registry.get(name);
+    if (!reg) throw new ContractNotRegisteredError(name, listRegisteredContracts());
+    return importArtifactGeneration(reg.artifactPath, getArtifactGenerationDigest(name)) as Promise<ArtifactExports>;
+}
+
+export async function importArtifactByPath(artifactPath: string): Promise<ArtifactExports> {
     const wanted = path.resolve(artifactPath);
     for (const [name, reg] of registry) {
         if (path.resolve(reg.artifactPath) === wanted) return importRegisteredArtifact(name);

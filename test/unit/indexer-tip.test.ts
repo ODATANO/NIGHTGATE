@@ -59,6 +59,12 @@ describe('getIndexerTip', () => {
         expect(wsTip.opened).toBe(0);
     });
 
+    it("carries the tip block's ledger parameters when the indexer answers them", async () => {
+        const now = Date.now();
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: { block: { height: '500', timestamp: now, ledgerParameters: 'c0ffee' } } }) })));
+        expect(await getIndexerTip(URL)).toEqual({ height: 500n, timestampMs: now, error: null, via: 'http', ledgerParameters: 'c0ffee' });
+    });
+
     // The HTTP query and the subscription fail independently at the indexer's edge.
     it('falls back to the blocks subscription when the HTTP query is refused', async () => {
         const now = Date.now();

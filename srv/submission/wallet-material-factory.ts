@@ -9,13 +9,14 @@ import crypto from 'crypto';
 import { decrypt, getEncryptionKey, deriveBoundSecret, KeyRing } from '../utils/crypto';
 import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../utils/envelope-bindings';
 import { resolveAccountDek, privateStatePasswordFromDek } from './account-keys';
-import { loadLedgerV8 } from '../midnight/sdk-loader';
+import { loadLedger } from '../midnight/sdk-loader';
 import { deriveRoleSeeds, type RoleSeeds } from '../utils/wallet-hd';
 import { deriveAttesterId } from '../utils/wallet-info';
 import { isSessionExpired } from '../utils/session-expiry';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
-import type { WalletMaterial, PrivateStateBackend } from '../midnight/providers';
+import type { WalletMaterial, PrivateStateBackend, WalletPublicKeys } from '../midnight/providers';
 import type { DbRunner } from '../utils/db-types';
+import type { DustSecretKey, ZswapSecretKeys } from '@midnightntwrk/ledger-v9';
 import { NightgateError } from '../utils/errors';
 
 // ---- Errors ---------------------------------------------------------------
@@ -62,7 +63,13 @@ const ACCOUNT_ID_LABEL = 'nightgate-account-id-v1';
 const PRIVATE_STATE_PASSWORD_LABEL = 'nightgate-private-state-password-v1';
 
 /** Loads a session as `WalletMaterial`. What the wallet adapter can do depends on whether the session has a seed. */
-export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOptions): Promise<WalletMaterial> {
+/** What a job needs to build a session's wallet material. Tests inject their own. */
+export type WalletMaterialFactory = (opts: BuildWalletMaterialOptions) => Promise<WalletMaterial>;
+
+/** Wallet material with the adapter this factory builds. */
+export type SessionWalletMaterial = WalletMaterial & { walletAndMidnightProvider: MainThreadWalletAdapter };
+
+export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOptions): Promise<SessionWalletMaterial> {
     const db = opts.db ?? await cds.connect.to('db');
     const where: Record<string, unknown> = { sessionId: opts.sessionId, isActive: true };
     if (opts.expectedUserId) where.userId = opts.expectedUserId;
@@ -99,7 +106,7 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
     // Taken from the session row, never from the caller, so it matches the viewing key's account.
     const accountIndex = session.accountIndex ?? 0;
 
-    let walletAndMidnightProvider: any;
+    let walletAndMidnightProvider: MainThreadWalletAdapter;
     let ensureFacade: (() => Promise<void>) | undefined;
     if (session.encryptedSeedKey) {
         let seedHex: string;
@@ -164,13 +171,20 @@ export function privateStatePasswordCandidates(ring: KeyRing, viewingKey: string
 
 // ---- Wallet adapter -------------------------------------------------------
 
+/** The wallet a job sees on the main thread. Balancing and submitting always run in the wallet worker. */
+export interface MainThreadWalletAdapter extends WalletPublicKeys {
+    balanceTx(tx?: unknown, ttl?: unknown): Promise<never>;
+    submitTx(tx?: unknown): Promise<never>;
+    _internal?: { zswapKeys: ZswapSecretKeys; cacheKey?: string; dustKey?: DustSecretKey };
+}
+
 /** Wallet adapter for a session with only a viewing key. Every method throws. */
-function createReadOnlyWalletAdapter(): any {
+function createReadOnlyWalletAdapter(): MainThreadWalletAdapter {
     return {
         getCoinPublicKey(): never        { throw new WalletSigningNotAvailable('getCoinPublicKey()'); },
         getEncryptionPublicKey(): never  { throw new WalletSigningNotAvailable('getEncryptionPublicKey()'); },
-        async balanceTx(_tx: any, _ttl?: any): Promise<any> { throw new WalletSigningNotAvailable('balanceTx()'); },
-        async submitTx(_tx: any): Promise<any>             { throw new WalletSigningNotAvailable('submitTx()'); }
+        async balanceTx(_tx?: unknown, _ttl?: unknown): Promise<never> { throw new WalletSigningNotAvailable('balanceTx()'); },
+        async submitTx(_tx?: unknown): Promise<never>                  { throw new WalletSigningNotAvailable('submitTx()'); }
     };
 }
 
@@ -179,14 +193,14 @@ async function createFacadeBackedWalletAdapter(
     accountId: string,
     seedHex: string,
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex'>
-): Promise<any> {
+): Promise<MainThreadWalletAdapter> {
     assertSeedHex(seedHex);
 
     // Derive the keys now, because the key getters are synchronous.
     // They come from the Zswap HD role, not from the raw seed.
     const bip39Seed = new Uint8Array(Buffer.from(seedHex, 'hex'));
     const roleSeeds = await deriveRoleSeeds(bip39Seed, facadeConfig.accountIndex ?? 0);
-    const ledger = await loadLedgerV8();
+    const ledger = await loadLedger();
     const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
     const coinPublicKey       = zswapKeys.coinPublicKey;
     const encryptionPublicKey = zswapKeys.encryptionPublicKey;
@@ -205,12 +219,12 @@ async function createFacadeBackedWalletAdapter(
 }
 
 /** Wallet adapter for a seed session without worker config. Public keys are real, signing throws. */
-async function createSigningCapableWalletAdapter(seedHex: string, accountIndex: number = 0): Promise<any> {
+async function createSigningCapableWalletAdapter(seedHex: string, accountIndex: number = 0): Promise<MainThreadWalletAdapter> {
     assertSeedHex(seedHex);
 
     const bip39Seed = new Uint8Array(Buffer.from(seedHex, 'hex'));
     const roleSeeds = await deriveRoleSeeds(bip39Seed, accountIndex);
-    const ledger = await loadLedgerV8();
+    const ledger = await loadLedger();
 
     const zswapKeys = ledger.ZswapSecretKeys.fromSeed(roleSeeds.zswap);
     const dustKey   = ledger.DustSecretKey.fromSeed(roleSeeds.dust);
@@ -221,12 +235,12 @@ async function createSigningCapableWalletAdapter(seedHex: string, accountIndex: 
     return {
         getCoinPublicKey(): string         { return coinPublicKey; },
         getEncryptionPublicKey(): string   { return encryptionPublicKey; },
-        async balanceTx(_tx: any, _ttl?: any): Promise<any> {
+        async balanceTx(_tx?: unknown, _ttl?: unknown): Promise<never> {
             throw new WalletSigningNotAvailable(
                 'balanceTx(): secret keys derived but no WalletFacade configured for this session'
             );
         },
-        async submitTx(_tx: any): Promise<any> {
+        async submitTx(_tx?: unknown): Promise<never> {
             throw new WalletSigningNotAvailable(
                 'submitTx(): secret keys derived but no WalletFacade configured for this session'
             );

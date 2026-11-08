@@ -2,8 +2,9 @@
 // Only the transaction names the called circuit, the zswap offers and the DUST actions.
 // Decoding is slow, so it runs in a separate pass and not in the main crawl loop.
 
+import type { Bindingish, Proofish, Signaturish } from '@midnightntwrk/ledger-v9';
 import { decodeCompact } from '../utils/scale';
-import { loadLedgerV8 } from '../midnight/sdk-loader';
+import { LEDGER_9_FIRST_SPEC_VERSION, loadLedger, loadLedger8 } from '../midnight/sdk-loader';
 import { stripContractAddressPrefix } from './block-events';
 import { errorMessage } from '../utils/errors';
 import { bareHex } from '../utils/hex-patterns';
@@ -37,15 +38,40 @@ export function extractLedgerPayload(buf: Buffer, argsOffset: number): Uint8Arra
     return new Uint8Array(buf.subarray(start, start + length));
 }
 
+interface ZswapOfferView {
+    inputs?: readonly unknown[];
+    outputs?: readonly unknown[];
+    transients?: readonly unknown[];
+}
+
+interface IntentView {
+    actions?: ReadonlyArray<{ address?: unknown; entryPoint?: unknown }>;
+    dustActions?: { spends?: ReadonlyArray<{ vFee?: unknown }>; registrations?: readonly unknown[] };
+}
+
+/** The parts of a ledger transaction read here. Transactions of ledger 8 and ledger 9 both fit. */
+export interface LedgerTxView {
+    identifiers(): readonly unknown[];
+    guaranteedOffer?: ZswapOfferView;
+    fallibleOffer?: { values(): Iterable<ZswapOfferView> };
+    intents?: { entries(): Iterable<[number, IntentView]> };
+}
+
+type Markers = readonly [Signaturish['instance'], Proofish['instance'], Bindingish['instance']];
+
+interface TransactionDecoder {
+    Transaction: { deserialize(...args: [...Markers, Uint8Array]): LedgerTxView };
+}
+
 // Serialization variants to try, in order. On-chain transactions use the first one.
 // The others cover transactions that are not yet bound or have erased signatures.
-const MARKERS: ReadonlyArray<readonly [string, string, string]> = [
+const MARKERS: ReadonlyArray<Markers> = [
     ['signature', 'proof', 'binding'],
     ['signature', 'proof', 'pre-binding'],
     ['signature-erased', 'proof', 'binding']
 ];
 
-function deserialize(ledger: any, bytes: Uint8Array): any {
+function deserialize(ledger: TransactionDecoder, bytes: Uint8Array): LedgerTxView {
     const errors: string[] = [];
     for (const [s, p, b] of MARKERS) {
         try {
@@ -63,7 +89,7 @@ function hex(value: unknown): string {
     return bareHex(value);
 }
 
-function entryPointOf(action: any): string | null {
+function entryPointOf(action: { entryPoint?: unknown } | undefined): string | null {
     const ep = action?.entryPoint;
     if (typeof ep === 'string') return ep;
     if (ep instanceof Uint8Array) return new TextDecoder().decode(ep);
@@ -80,7 +106,7 @@ function safe<T>(read: () => T, fallback: T): T {
     }
 }
 
-export function readLedgerFacts(tx: any): LedgerPayloadFacts {
+export function readLedgerFacts(tx: LedgerTxView): LedgerPayloadFacts {
     const facts: LedgerPayloadFacts = {
         identifiers: safe(() => (tx.identifiers() ?? []).map(hex).filter(Boolean), []),
         contractActions: [],
@@ -92,7 +118,7 @@ export function readLedgerFacts(tx: any): LedgerPayloadFacts {
         dustSpendValue: 0n
     };
 
-    const countOffer = (offer: any): void => {
+    const countOffer = (offer: ZswapOfferView | undefined): void => {
         if (!offer) return;
         facts.zswapInputCount += safe(() => offer.inputs?.length ?? 0, 0);
         facts.zswapOutputCount += safe(() => offer.outputs?.length ?? 0, 0);
@@ -101,7 +127,7 @@ export function readLedgerFacts(tx: any): LedgerPayloadFacts {
     countOffer(safe(() => tx.guaranteedOffer, undefined));
     const fallible = safe(() => tx.fallibleOffer, undefined);
     if (fallible && typeof fallible.values === 'function') {
-        for (const offer of Array.from(fallible.values() as Iterable<any>)) countOffer(offer);
+        for (const offer of Array.from(fallible.values())) countOffer(offer);
     }
 
     const intents = safe(() => tx.intents, undefined);
@@ -109,7 +135,7 @@ export function readLedgerFacts(tx: any): LedgerPayloadFacts {
 
     // Sorted by segment, the order in which the ledger applies them.
     // This gives the actions in the same order as the block events.
-    const bySegment = Array.from(intents.entries() as Iterable<[number, any]>)
+    const bySegment = Array.from(intents.entries())
         .sort((a, b) => Number(a[0]) - Number(b[0]));
 
     for (const [, intent] of bySegment) {
@@ -149,7 +175,8 @@ export function callFreeTxType(facts: LedgerPayloadFacts): 'shielded_transfer' |
     return null;
 }
 
-export async function decodeLedgerPayload(bytes: Uint8Array): Promise<LedgerPayloadFacts> {
-    const ledger = await loadLedgerV8();
+/** `specVersion` is the runtime version of the transaction's block. It names the ledger generation that wrote the bytes. */
+export async function decodeLedgerPayload(bytes: Uint8Array, specVersion?: number | null): Promise<LedgerPayloadFacts> {
+    const ledger: TransactionDecoder = specVersion != null && specVersion < LEDGER_9_FIRST_SPEC_VERSION ? await loadLedger8() : await loadLedger();
     return readLedgerFacts(deserialize(ledger, bytes));
 }

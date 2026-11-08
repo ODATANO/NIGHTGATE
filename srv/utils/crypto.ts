@@ -60,7 +60,15 @@ export class KeyRing {
     private readonly legacyKeys = new Map<string, Buffer>();
     private readonly spec: KeyRingSpec | undefined;
 
-    constructor(spec: KeyRingSpec) {
+    /** `{ kek }` is the single ready-made key that `fromKek` passes. */
+    constructor(spec: KeyRingSpec | { kek: Buffer }) {
+        if ('kek' in spec) {
+            this.keks.set(LEGACY_KEY_ID, spec.kek);
+            this.legacyKeys.set(LEGACY_KEY_ID, spec.kek);
+            this.activeId = LEGACY_KEY_ID;
+            this.spec = undefined;
+            return;
+        }
         if (!spec.keys.length) throw new Error('encryption key ring is empty');
         for (const { id, secret } of spec.keys) {
             if (!KEY_ID_PATTERN.test(id)) throw new Error(`invalid encryption key id '${id}' (allowed: [A-Za-z0-9_-]{1,16})`);
@@ -77,12 +85,7 @@ export class KeyRing {
     /** A ring with a single ready-made key under id `1`. */
     static fromKek(kek: Buffer): KeyRing {
         if (kek.length !== KEK_LENGTH) throw new Error(`encryption key must be ${KEK_LENGTH} bytes, got ${kek.length}`);
-        const ring = Object.create(KeyRing.prototype) as KeyRing;
-        (ring as any).keks = new Map([[LEGACY_KEY_ID, kek]]);
-        (ring as any).legacyKeys = new Map([[LEGACY_KEY_ID, kek]]);
-        (ring as any).activeId = LEGACY_KEY_ID;
-        (ring as any).spec = undefined;
-        return ring;
+        return new KeyRing({ kek });
     }
 
     ids(): string[] { return [...this.keks.keys()]; }

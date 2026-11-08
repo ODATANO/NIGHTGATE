@@ -17,15 +17,18 @@ export class SponsorRefusalError extends NightgateError {
 
 const MAX_CHAIN = 8;
 
+/** Fields an error from any layer may carry. Errors cross threads and SDKs, so none is guaranteed. */
+type ErrorFields = { name?: unknown; code?: unknown; calls?: unknown; phase?: unknown; blockHeight?: unknown; cause?: unknown } | null | undefined;
+
 /** The error followed by its nested causes, outermost first. Stops at a loop or after a few entries. */
 export function errorChain(err: unknown): unknown[] {
     const out: unknown[] = [];
     const seen = new Set<unknown>();
-    let cur: any = err;
+    let cur: unknown = err;
     while (cur != null && !seen.has(cur) && out.length < MAX_CHAIN) {
         seen.add(cur);
         out.push(cur);
-        cur = typeof cur === 'object' ? cur.cause : undefined;
+        cur = typeof cur === 'object' ? (cur as ErrorFields)?.cause : undefined;
     }
     return out;
 }
@@ -36,7 +39,8 @@ export function causeMessages(err: unknown): string[] {
 }
 
 function nameOf(e: unknown): string {
-    return typeof (e as any)?.name === 'string' ? String((e as any).name) : '';
+    const name = (e as ErrorFields)?.name;
+    return typeof name === 'string' ? name : '';
 }
 
 /** Reads the call list back out of a batch order error, e.g. `Stages in apply order: callA=1158[f]`. */
@@ -83,12 +87,12 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     const haystack = `${message} ${classificationHaystack(err)}`;
 
     // The SDK may pass on only the message, so the message text is also checked.
-    const causality = chain.find((e: any) => e?.code === 'BatchCausalityViolation' || nameOf(e) === 'BatchCausalityError');
+    const causality = chain.find((e) => (e as ErrorFields)?.code === 'BatchCausalityViolation' || nameOf(e) === 'BatchCausalityError') as ErrorFields;
     if (causality || /violates the ledger's causality constraint/.test(haystack)) {
-        const own = Array.isArray((causality as any)?.calls) ? (causality as any).calls as BatchCallStageInfo[] : undefined;
+        const own = Array.isArray(causality?.calls) ? causality.calls as BatchCallStageInfo[] : undefined;
         return { code: 'causality', retryable: false, calls: own?.length ? own : parseBatchCallStages(haystack) };
     }
-    if (chain.some((e: any) => e?.code === 'BatchGasBudgetExceeded') || /runs out of gas on the ledger/.test(haystack)) {
+    if (chain.some((e) => (e as ErrorFields)?.code === 'BatchGasBudgetExceeded') || /runs out of gas on the ledger/.test(haystack)) {
         return { code: 'gas-budget', retryable: false };
     }
     // An earlier send of the same transaction has no known outcome, so it may still land.
@@ -97,7 +101,7 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     const coded = codedSubmitFailure(findNightgateError(err));
     if (coded) return coded;
     // Only a failure while connecting is safe to resend. Later failures may have reached the node.
-    const phased = chain.find((e: any) => nameOf(e) === 'SubmitPhaseError' && typeof e?.phase === 'string') as any;
+    const phased = chain.find((e) => nameOf(e) === 'SubmitPhaseError' && typeof (e as ErrorFields)?.phase === 'string') as ErrorFields;
     if (phased) {
         if (phased.phase === 'connect') return { code: 'transport', ledgerCode: 'not-sent', retryable: true };
         if (phased.phase === 'request') return { code: 'ambiguous', ledgerCode: 'no-reply', retryable: false };
@@ -108,7 +112,7 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
     }
     if (names.includes('TxFailedError') || /did NOT apply|but did not apply/i.test(haystack)) {
         // The block height lets a chain rollback find the job. Without it the job waits for the indexer check.
-        const blockHeight = errorChain(err).map(e => (e as any)?.blockHeight).find(v => Number.isInteger(v) && v >= 0);
+        const blockHeight = errorChain(err).map(e => (e as ErrorFields)?.blockHeight).find((v): v is number => Number.isInteger(v) && (v as number) >= 0);
         return { code: 'landed-not-applied', retryable: false, ...(Number.isInteger(blockHeight) ? { blockHeight } : {}) };
     }
     if (names.includes('SponsorRefusalError') || /refusing to sponsor/i.test(haystack)) {

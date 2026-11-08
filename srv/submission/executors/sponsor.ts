@@ -3,7 +3,6 @@
 import cds from '@sap/cds';
 import { resolveFeeSponsor, ensureFeeSponsorFacade, getConfiguredFeeSponsorSessions } from '../fee-sponsor';
 import { getNightgatePluginConfig } from '../../utils/nightgate-config';
-import { ensureNetworkId } from '../../midnight/providers';
 import { SponsorAttemptBookkeepingPendingError } from '../background-jobs';
 import { reportSubmissionRejectedOn, reportBroadcastOn } from '../job-execution-context';
 import { PendingSubmissions, type BackgroundJob } from '#cds-models/midnight';
@@ -186,7 +185,6 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         let activeSponsorSessionId = String(command.sponsorSessionId ?? job.sessionId);
         const ledger = sponsorAttemptLedger(db, job, command, () => activeSponsorSessionId);
         const facadeCfg = facadeConfigFromEnv();
-        await ensureNetworkId(facadeCfg.networkId);
 
         let candidates = sponsorCandidates(command, pool => [...pool]);
         cds.log('nightgate').info(`sponsorFinalizedTransaction job: ${command.finalizedTxB64?.length ?? 0} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
@@ -264,7 +262,6 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         const command = raw as SponsorJobCommand;
         if (command?.op !== 'sponsorUnbound') throw new Error(`Invalid persisted sponsor command for job ${job.ID}`);
         const facadeCfg = facadeConfigFromEnv();
-        await ensureNetworkId(facadeCfg.networkId);
 
         const candidates = sponsorCandidates(command, pool => sponsorCandidatesNonExclusive(pool, Date.now(), sponsorAtSyncGate));
         const cooldownMs = configMs('NIGHTGATE_SPONSOR_COOLDOWN_MS');

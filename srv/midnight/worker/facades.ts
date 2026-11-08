@@ -13,7 +13,11 @@ import { getSharedKeyMaterialProvider } from '../wasm-proof-provider';
 import { deriveAttestationSecret, deriveTokenFactoryIssuerSecret } from '../../submission/contract-witnesses';
 import { deriveRoleSeeds } from '../../utils/wallet-hd';
 import { parentPort } from 'node:worker_threads';
-import { FacadeEntry, InitArgs, PendingSave, SerializedBlobs, ensureNetworkId, facades, getSdkVersion, loadProvingSdk, loadSdk, log, resolveProvingMode } from './context';
+import { FacadeEntry, InitArgs, PendingSave, SerializedBlobs, facades, replaceSubWallet, getSdkVersion, loadDustV2Sdk, loadSdk, log, resolveProvingMode } from './context';
+import type { FacadeState, WalletFacade } from '@midnightntwrk/wallet-sdk-facade';
+import type { DustWalletState } from '@midnightntwrk/wallet-sdk-dust-wallet';
+import { dustKeysByEpoch, shieldedKeysByEpoch } from './wallet-tx';
+import { revocableKeystore } from './revocable-keystore';
 import { collapseDustState, collapsedDustBlob, dustSaveKey } from './dust-collapse';
 import { verifyCollapsedDustInHelper } from './dust-verify';
 import type { DustCollapseSample } from '../dust-collapse-stats';
@@ -30,7 +34,7 @@ import { withTimeout } from '../../utils/timeout';
 export const BALANCE_SYNC_TIMEOUT_MS = configMs('NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS');
 
 /** `facade.waitForSyncedState()` never returns while the indexer lags, so it always gets a timeout. */
-export async function waitForSyncedStateBounded(entry: FacadeEntry, site: string, timeoutMs?: number): Promise<any> {
+export async function waitForSyncedStateBounded(entry: FacadeEntry, site: string, timeoutMs?: number): Promise<FacadeState> {
     const bound = timeoutMs && timeoutMs > 0 ? timeoutMs : BALANCE_SYNC_TIMEOUT_MS;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const cancelled = rpcCancellation(`${site} sync wait`);
@@ -101,13 +105,13 @@ export interface SyncDustFigures {
 }
 
 /** Counts like `getBalance`. Undefined when the state has no dust wallet or cannot be read. */
-export function dustFiguresOf(state: any, entry: Pick<FacadeEntry, 'dustRestoresPersisted'>, now: number = Date.now()): SyncDustFigures | undefined {
+export function dustFiguresOf(state: FacadeState, entry: Pick<FacadeEntry, 'dustRestoresPersisted'>, now: number = Date.now()): SyncDustFigures | undefined {
     try {
         const dust = state?.dust;
         if (!dust) return undefined;
-        const total: any[] = dust.totalCoins ?? [];
-        const pending: any[] = dust.pendingCoins ?? [];
-        const available: any[] | undefined = dust.availableCoins;
+        const total = dust.totalCoins ?? [];
+        const pending = dust.pendingCoins ?? [];
+        const available: readonly unknown[] | undefined = dust.availableCoins;
         return {
             balance: typeof dust.balance === 'function' ? String(dust.balance(new Date(now))) : '0',
             availableNotes: Array.isArray(available) ? available.length : Math.max(0, total.length - pending.length),
@@ -137,17 +141,25 @@ export interface IndexerTip {
     error: string | null;
     /** `cached` means the read failed and the values come from the last successful read. */
     via: 'http' | 'ws' | 'cached' | null;
+    /** Hex. The ledger parameters in effect at the tip block, which carry the chain's current fee prices. */
+    ledgerParameters?: string;
 }
 
-const BLOCK_TIP_QUERY = '{ block { height timestamp } }';
+const BLOCK_TIP_QUERY = '{ block { height timestamp ledgerParameters } }';
+
+/** Blocks of possible price rise a fee is priced for. 1 is too tight on quiet networks. */
+export const FEE_BLOCKS_MARGIN = 5;
+
+const tipParameters = (b: { ledgerParameters?: unknown } | null | undefined): Pick<IndexerTip, 'ledgerParameters'> =>
+    (typeof b?.ledgerParameters === 'string' && b.ledgerParameters !== '' ? { ledgerParameters: b.ledgerParameters } : {});
 
 async function readIndexerTipHttp(indexerHttpUrl: string): Promise<IndexerTip> {
     try {
-        const data = await indexerQuery<{ block?: { height?: unknown; timestamp?: unknown } }>(indexerHttpUrl, BLOCK_TIP_QUERY);
+        const data = await indexerQuery<{ block?: { height?: unknown; timestamp?: unknown; ledgerParameters?: unknown } }>(indexerHttpUrl, BLOCK_TIP_QUERY);
         const b = data?.block;
         const timestampMs = indexerTimestampMs(b?.timestamp);
         if (timestampMs === null) return { height: null, timestampMs: null, error: 'no block in the answer', via: null };
-        return { height: b?.height != null ? BigInt(String(b.height)) : null, timestampMs, error: null, via: 'http' };
+        return { height: b?.height != null ? BigInt(String(b.height)) : null, timestampMs, error: null, via: 'http', ...tipParameters(b) };
     } catch (err: unknown) {
         const error = err instanceof IndexerHttpError ? `HTTP ${err.status}`
             : errorName(err) === 'TimeoutError' ? 'timeout' : errorMessage(err).slice(0, 120);
@@ -156,10 +168,10 @@ async function readIndexerTipHttp(indexerHttpUrl: string): Promise<IndexerTip> {
 }
 
 async function readIndexerTipWs(indexerHttpUrl: string): Promise<IndexerTip | null> {
-    const b: any = await oneShotSubscription(indexerHttpUrl, 'subscription { blocks { height timestamp } }', (data) => data?.blocks ?? null);
+    const b = await oneShotSubscription(indexerHttpUrl, 'subscription { blocks { height timestamp ledgerParameters } }', (data) => data?.blocks ?? null);
     const timestampMs = indexerTimestampMs(b?.timestamp);
-    if (timestampMs === null) return null;
-    return { height: b.height != null ? BigInt(b.height) : null, timestampMs, error: null, via: 'ws' };
+    if (timestampMs === null || !b) return null;
+    return { height: b.height != null ? BigInt(String(b.height)) : null, timestampMs, error: null, via: 'ws', ...tipParameters(b) };
 }
 
 export const indexerTipCache = new Map<string, { tip: IndexerTip; at: number }>();
@@ -223,29 +235,33 @@ export async function getLedgerEventStreamTip(indexerHttpUrl: string, stream: Le
     const field = STREAM_FIELD[stream];
     const maxId = await oneShotSubscription(indexerHttpUrl, `subscription { ${field}(id: 0) { id maxId } }`, (data) => data?.[field]?.maxId ?? null);
     if (maxId != null) {
-        const tip = BigInt(maxId);
+        const tip = BigInt(String(maxId));
         streamTipCache.set(key, { tip, at: Date.now() });
         return tip;
     }
     return staleStreamTip(stream, cached);
 }
 
-let wsModule: Promise<any> | undefined;
-function loadWs(): Promise<any> {
-    wsModule ??= import('ws').catch((e) => { wsModule = undefined; throw e; });
+const importWs = () => import('ws');
+let wsModule: ReturnType<typeof importWs> | undefined;
+function loadWs(): ReturnType<typeof importWs> {
+    wsModule ??= importWs().catch((e) => { wsModule = undefined; throw e; });
     return wsModule;
 }
 
 /** The configured WebSocket URL of each indexer a facade was built against; the derived one for any other. */
 const indexerWsUrls = new Map<string, string>();
 
+/** The `data` of a subscription message, as it comes off the wire. */
+type SubscriptionData = Record<string, { height?: unknown; timestamp?: unknown; ledgerParameters?: unknown; maxId?: string | number | null } | null | undefined>;
+
 /** Opens a GraphQL subscription on the indexer and returns its first answer. Null on any error or after 10 s. */
-async function oneShotSubscription<T>(indexerHttpUrl: string, query: string, pick: (data: any) => T | null): Promise<T | null> {
+async function oneShotSubscription<T>(indexerHttpUrl: string, query: string, pick: (data: SubscriptionData | undefined) => T | null): Promise<T | null> {
     const wsUrl = indexerWsUrls.get(indexerHttpUrl) ?? deriveIndexerWsUrl(indexerHttpUrl);
     try {
         const { default: WebSocket } = await loadWs();
         return await new Promise<T | null>((resolve) => {
-            const sock: any = new (WebSocket as any)(wsUrl, 'graphql-transport-ws');
+            const sock = new WebSocket(wsUrl, 'graphql-transport-ws');
             let settled = false;
             const done = (v: T | null) => {
                 if (settled) return;
@@ -258,7 +274,7 @@ async function oneShotSubscription<T>(indexerHttpUrl: string, query: string, pic
             sock.on('open', () => sock.send(JSON.stringify({ type: 'connection_init' })));
             sock.on('message', (buf: Buffer) => {
                 try {
-                    const m = JSON.parse(buf.toString());
+                    const m: { type?: string; payload?: { data?: SubscriptionData } } = JSON.parse(buf.toString());
                     if (m.type === 'connection_ack') {
                         sock.send(JSON.stringify({ id: '1', type: 'subscribe', payload: { query } }));
                     } else if (m.type === 'next') {
@@ -290,7 +306,7 @@ export function isGenuinelyCaughtUp(r: { connected: boolean; applied: bigint; st
 interface Subscribable<T> { subscribe(observer: { next(v: T): void; error(e: unknown): void; complete(): void }): { unsubscribe?(): void } | undefined }
 
 /** The first value of an SDK observable. Rejects after `timeoutMs`; the subscription ends either way. */
-export function firstEmission<T = any>(source: Subscribable<T>, timeoutMs: number, what: string): Promise<T> {
+export function firstEmission<T>(source: Subscribable<T>, timeoutMs: number, what: string): Promise<T> {
     // Wrapped, because the SDK may bring its own rxjs copy and `from()` only takes its own kind.
     const observable = new Observable<T>(subscriber => {
         const sub = source.subscribe({ next: v => subscriber.next(v), error: e => subscriber.error(e), complete: () => subscriber.complete() });
@@ -300,7 +316,7 @@ export function firstEmission<T = any>(source: Subscribable<T>, timeoutMs: numbe
 }
 
 /** The wallet's current state without waiting for a sync, or null on timeout or error. */
-export async function peekFacadeState(facade: any, timeoutMs: number): Promise<any | null> {
+export async function peekFacadeState(facade: Pick<WalletFacade, 'state'>, timeoutMs: number): Promise<FacadeState | null> {
     try {
         return await firstEmission(facade.state(), timeoutMs, 'wallet state');
     } catch {
@@ -308,14 +324,14 @@ export async function peekFacadeState(facade: any, timeoutMs: number): Promise<a
     }
 }
 
-export function countRegisteredNightUtxos(state: any): number {
-    const all: any[] = state?.unshielded?.totalCoins ?? [];
-    return all.filter((c: any) => c?.meta?.registeredForDustGeneration === true).length;
+export function countRegisteredNightUtxos(state: FacadeState): number {
+    const all = state?.unshielded?.totalCoins ?? [];
+    return all.filter((c) => c?.meta?.registeredForDustGeneration === true).length;
 }
 
 /** All NIGHT UTXOs, registered or not. Returns `fallback` while the state has no coin list yet. */
-export function countAllNightUtxos(state: any, fallback: number): number {
-    const all: any[] | undefined = state?.unshielded?.totalCoins;
+export function countAllNightUtxos(state: FacadeState, fallback: number): number {
+    const all: readonly unknown[] | undefined = state?.unshielded?.totalCoins;
     return Array.isArray(all) ? all.length : fallback;
 }
 
@@ -388,7 +404,7 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
             await sleep(SYNC_POLL_MS);
             continue;
         }
-        const p: any = state?.dust?.progress;
+        const p = state?.dust?.progress;
         const applied = p?.appliedIndex != null ? BigInt(p.appliedIndex) : -1n;
         const streamTip = await getDustStreamTip(indexerHttpUrl);
         const highest = streamTip ?? -1n;
@@ -430,7 +446,6 @@ export async function waitForGenuineSync(entry: FacadeEntry, timeoutMs: number, 
 
 export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     const sdk = await loadSdk();
-    await ensureNetworkId(args.networkId, sdk);
 
     // Each key type comes from its own HD path, as in the Lace wallet.
     // accountIndex must match the session's WalletSessions.accountIndex.
@@ -444,12 +459,22 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
         sdk.facade.mergeWalletEntries
     );
     const { createKeystore, PublicKey } = sdk.unshielded;
-    const unshieldedKeystore = createKeystore(roleSeeds.night, args.networkId);
+    const unshieldedKeystore = revocableKeystore(createKeystore({ kind: 'schnorr', secret: roleSeeds.night }, args.networkId));
+    // The wallets derive the keys of each ledger version from these seeds, so they can follow a fork.
+    const walletSeeds = { shielded: roleSeeds.zswap, unshielded: roleSeeds.night, dust: roleSeeds.dust };
+
+    const provingMode = resolveProvingMode();
+    // Shared by all wallets, so the keys are downloaded only once.
+    const sharedKeys = provingMode === 'wasm' ? await getSharedKeyMaterialProvider() : undefined;
+    if (provingMode === 'wasm') {
+        log('info', 'proving mode: wasm (in-process prover; proof server not used for wallet proving)');
+    }
 
     if (args.indexerWsUrl) indexerWsUrls.set(args.indexerHttpUrl, args.indexerWsUrl);
-    const configuration = {
+    const configuration = sdk.facade.WalletFacade.resolveConfiguration({
         networkId: args.networkId,
         provingServerUrl: new URL(args.proofServerUrl),
+        ...(sharedKeys ? { provers: { v9: { kind: 'wasm', keyMaterialProvider: sharedKeys } } } : {}),
         relayURL: new URL(args.relayUrl),
         indexerClientConnection: {
             indexerHttpUrl: args.indexerHttpUrl,
@@ -457,9 +482,9 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
         },
         txHistoryStorage,
         // A fee of 0 makes the SDK build an empty dust part, which the node rejects with 1010/117.
-        // additionalFeeOverhead of at least 1 prevents that. feeBlocksMargin 1 is too tight on quiet networks.
-        costParameters: { additionalFeeOverhead: 1n, feeBlocksMargin: 5 }
-    };
+        // additionalFeeOverhead of at least 1 prevents that.
+        costParameters: { additionalFeeOverhead: 1n, feeBlocksMargin: FEE_BLOCKS_MARGIN }
+    });
 
     const dustParameters = sdk.ledger.LedgerParameters.initialParameters().dust;
     const ShieldedWallet = sdk.shielded.ShieldedWallet;
@@ -467,20 +492,11 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
     const DustWallet = sdk.dust.DustWallet;
     const restore = args.restoreBlobs;
 
-    const provingMode = resolveProvingMode();
-    const proving = provingMode === 'wasm' ? await loadProvingSdk() : undefined;
-    // Shared by all wallets, so the keys are downloaded only once.
-    const sharedKeys = provingMode === 'wasm' ? await getSharedKeyMaterialProvider() : undefined;
-    if (provingMode === 'wasm') {
-        log('info', 'proving mode: wasm (in-process prover; proof server not used for wallet proving)');
-    }
-
     const facade = await sdk.facade.WalletFacade.init({
         configuration,
-        ...(proving ? { provingService: () => proving.makeWasmProvingService({ keyMaterialProvider: sharedKeys }) } : {}),
         shielded: () => restore?.shielded
             ? ShieldedWallet(configuration).restore(restore.shielded)
-            : ShieldedWallet(configuration).startWithSecretKeys(zswapKeys),
+            : ShieldedWallet(configuration).startWithSeed(walletSeeds.shielded),
         unshielded: () => restore?.unshielded
             ? UnshieldedWallet(configuration).restore(restore.unshielded)
             : UnshieldedWallet(configuration).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
@@ -488,10 +504,10 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
         // spent (error 117). NIGHTGATE_DUST_COLD_START syncs the dust wallet from scratch instead.
         dust: () => (restore?.dust && !configFlag('NIGHTGATE_DUST_COLD_START'))
             ? DustWallet(configuration).restore(restore.dust)
-            : DustWallet(configuration).startWithSecretKey(dustKey, dustParameters)
+            : DustWallet(configuration).startWithSeed(walletSeeds.dust, dustParameters)
     });
 
-    await facade.start(zswapKeys, dustKey);
+    await facade.start(walletSeeds);
     log('info', `facade started for ${args.sessionId.slice(0, 16)} (restored=${!!restore})`);
 
     return {
@@ -504,6 +520,7 @@ export async function buildFacade(args: InitArgs): Promise<FacadeEntry> {
         sdkVersion: getSdkVersion(),
         zswapKeys,
         dustKey,
+        walletSeeds,
         unshieldedKeystore,
         networkId: args.networkId,
         indexerHttpUrl: args.indexerHttpUrl,
@@ -617,6 +634,22 @@ export function startProgressWatch(sessionId: string, entry: FacadeEntry): void 
     entry.progressTimer.unref();
 }
 
+/** Logs once when the SDK's comparison of indexer and node changes its result. The SDK only keeps that result in the wallet state. */
+export function noteIndexerLiveness(sessionId: string, entry: FacadeEntry, state: FacadeState): void {
+    const liveness = state?.unshielded?.progress?.indexerLiveness;
+    if (!liveness || liveness._tag === entry.lastIndexerLiveness) return;
+    const before = entry.lastIndexerLiveness;
+    entry.lastIndexerLiveness = liveness._tag;
+    const wallet = sessionId.slice(0, 16);
+    switch (liveness._tag) {
+        case 'Unavailable': return log('warn', `indexer check ${wallet}: unavailable, node or indexer not readable: ${liveness.lastError}`);
+        case 'Behind': return log('warn', `indexer check ${wallet}: indexer is ${liveness.lag} blocks behind the node`);
+        case 'Ahead': return log('warn', `indexer check ${wallet}: indexer is ${liveness.overshoot} blocks ahead of the node`);
+        case 'WrongNetwork': return log('warn', `indexer check ${wallet}: indexer and node name different blocks at height ${liveness.height}`);
+        case 'InSync': return before && before !== 'Unknown' && before !== 'Skipped' ? log('info', `indexer check ${wallet}: in sync again`) : undefined;
+    }
+}
+
 /** Checks for a stuck restored wallet, then reports progress. Skips the report after a recent sync-wait report or a part replacement. */
 export async function progressWatchTick(sessionId: string, entry: FacadeEntry, now: number = Date.now()): Promise<void> {
     if (facades.get(sessionId) !== entry) return;
@@ -626,10 +659,11 @@ export async function progressWatchTick(sessionId: string, entry: FacadeEntry, n
     if (refreshedByWait && !replayArmed) return;
     const state = await peekFacadeState(entry.facade, 5_000);
     if (state == null) return;
+    noteIndexerLiveness(sessionId, entry, state);
     if (replayArmed && await checkSnapshotReplay(sessionId, entry, state, now)) return;
     if (refreshedByWait || facades.get(sessionId) !== entry) return;
 
-    const p: any = state?.dust?.progress;
+    const p = state?.dust?.progress;
     const applied = p?.appliedIndex != null ? BigInt(p.appliedIndex) : -1n;
     const [streamTip, tip] = await Promise.all([getDustStreamTip(entry.indexerHttpUrl), getIndexerTip(entry.indexerHttpUrl)]);
     const highest = streamTip ?? -1n;
@@ -643,7 +677,8 @@ export async function progressWatchTick(sessionId: string, entry: FacadeEntry, n
         behindEvents: behind != null ? behind.toString() : null, eventsPerSecond: null, etaSeconds: caughtUp ? 0 : null,
         blockHeight: tip.height != null ? tip.height.toString() : null, isConnected: connected, indexerFresh,
         indexerTipAgeMs: indexerTipAgeMs(tip), indexerError: tip.error, caughtUp,
-        elapsedMs: 0, label: last?.label ?? 'idle', updatedAt: at,
+        // No job waits here, so the label of an earlier wait no longer applies.
+        elapsedMs: 0, label: 'idle', updatedAt: at,
         lastProgressAt: last && last.appliedIndex === applied.toString() ? last.lastProgressAt : at
     };
     syncProgress.set(sessionId, snapshot);
@@ -659,7 +694,7 @@ export function snapshotReplayResetMs(): number {
 }
 
 /** Replaces a restored wallet part that is stuck while the ledger rejects its events. Returns whether one was replaced. */
-export async function checkSnapshotReplay(sessionId: string, entry: FacadeEntry, state: any, now: number = Date.now()): Promise<boolean> {
+export async function checkSnapshotReplay(sessionId: string, entry: FacadeEntry, state: FacadeState, now: number = Date.now()): Promise<boolean> {
     const windowMs = snapshotReplayResetMs();
     let replaced = false;
     for (const kind of ['dust', 'shielded'] as const) {
@@ -693,23 +728,26 @@ export async function resetRestoredSubWallet(entry: FacadeEntry, kind: ReplayKin
     return withSessionLocks([entry.sessionId], async () => {
         if (facades.get(entry.sessionId) !== entry) return false;
         const id = entry.sessionId.slice(0, 16);
-        let fresh: any;
+        let fresh: FacadeEntry['facade']['dust'] | FacadeEntry['facade']['shielded'];
         try {
             const sdk = await loadSdk();
             if (kind === 'dust') {
-                fresh = sdk.dust.DustWallet(entry.walletConfiguration)
-                    .startWithSecretKey(entry.dustKey, sdk.ledger.LedgerParameters.initialParameters().dust);
-                await fresh.start(entry.dustKey);
+                const dust = await sdk.dust.DustWallet(entry.walletConfiguration)
+                    .startWithSeed(entry.walletSeeds.dust, sdk.ledger.LedgerParameters.initialParameters().dust);
+                await dust.start(await dustKeysByEpoch(entry.walletSeeds.dust));
+                fresh = dust;
             } else {
-                fresh = sdk.shielded.ShieldedWallet(entry.walletConfiguration).startWithSecretKeys(entry.zswapKeys);
-                await fresh.start(entry.zswapKeys);
+                const shielded = await sdk.shielded.ShieldedWallet(entry.walletConfiguration).startWithSeed(entry.walletSeeds.shielded);
+                await shielded.start(await shieldedKeysByEpoch(entry.walletSeeds.shielded));
+                fresh = shielded;
             }
         } catch (e) {
             log('warn', `snapshot replay ${id}: the fresh ${kind} sub-wallet did not start, the restored one stays: ${errorMessage(e)}`);
             return false;
         }
-        const old = entry.facade[kind];
-        entry.facade[kind] = fresh;
+        const old = kind === 'dust'
+            ? replaceSubWallet(entry.facade, 'dust', fresh as FacadeEntry['facade']['dust'])
+            : replaceSubWallet(entry.facade, 'shielded', fresh as FacadeEntry['facade']['shielded']);
         try { await old?.stop?.(); } catch { /* an already stopped wallet is fine */ }
         if (kind === 'dust') {
             entry.dustEpoch = (entry.dustEpoch ?? 0) + 1;
@@ -829,7 +867,7 @@ export interface CollectedStates {
 /** The last confirmed dust save, so an unchanged dust state is not serialized again. */
 export type SaveSkipContext = Pick<FacadeEntry, 'dustEpoch' | 'lastSavedDustKey'>;
 
-export async function collectSerializedStates(facade: any, skip?: SaveSkipContext): Promise<CollectedStates> {
+export async function collectSerializedStates(facade: Pick<WalletFacade, 'shielded' | 'unshielded' | 'dust'>, skip?: SaveSkipContext): Promise<CollectedStates> {
     const blobs: SerializedBlobs = {};
     const out: CollectedStates = { blobs };
     const tryOne = async (key: 'shielded' | 'unshielded' | 'dust') => {
@@ -838,7 +876,7 @@ export async function collectSerializedStates(facade: any, skip?: SaveSkipContex
             if (key === 'dust' && sub?.state && configFlag('NIGHTGATE_DUST_SNAPSHOT_COLLAPSE')) {
                 const started = Date.now();
                 try {
-                    const collapsed = await collapsedDustSave(sub, skip);
+                    const collapsed = await collapsedDustSave(facade.dust, skip);
                     out.dustCollapse = collapsed.sample;
                     if (collapsed.skipped) return;
                     blobs.dust = collapsed.blob;
@@ -874,16 +912,18 @@ type CollapsedDustSave =
     | { skipped: false; blob: string; dustKey: string | null; sample: DustCollapseSample };
 
 /** Like `serializeState()` with the dust tree shrunk. Skips an unchanged state. Saves the full blob if the restore check fails or times out. */
-async function collapsedDustSave(dust: any, skip?: SaveSkipContext): Promise<CollapsedDustSave> {
+async function collapsedDustSave(dust: WalletFacade['dust'], skip?: SaveSkipContext): Promise<CollapsedDustSave> {
     const started = Date.now();
-    const walletState = await firstEmission(dust.state, 30_000, 'dust state');
+    const walletState = await firstEmission<DustWalletState>(dust.state, 30_000, 'dust state');
     const dustKey = dustSaveKey(walletState);
     const last = skip?.lastSavedDustKey;
     if (dustKey !== null && last && last.key === dustKey && last.epoch === (skip?.dustEpoch ?? 0)) {
         log('debug', `dust snapshot unchanged (key ${dustKey}), collapse skipped`);
         return { skipped: true, sample: { outcome: 'skipped', ms: Date.now() - started, verifyMs: null, fullBytes: null, bytes: null, at: new Date().toISOString() } };
     }
-    const collapsed = collapseDustState(walletState);
+    const core = (await loadDustV2Sdk()).coreStateOf(walletState);
+    if (core._tag === 'None') throw new Error('the dust state is not a ledger 9 state, so it is not collapsed');
+    const collapsed = collapseDustState(walletState, core.value.state);
     const verifyStarted = Date.now();
     let verdict: { ok: true } | { ok: false; reason: string };
     try {
@@ -927,8 +967,9 @@ export function diffAgainstConfirmed(entry: FacadeEntry, blobs: SerializedBlobs)
 // Sponsored submits lock both wallets. Saving and restoring the dust state relies on this lock.
 export const sessionChains = new Map<string, Promise<unknown>>();
 
-export function submitLockKeys(args: any): string[] {
-    return [args?.sessionId, args?.sponsorSessionId]
+export function submitLockKeys(args: unknown): string[] {
+    const a = args as { sessionId?: unknown; sponsorSessionId?: unknown } | null | undefined;
+    return [a?.sessionId, a?.sponsorSessionId]
         .filter((k): k is string => typeof k === 'string' && k.length > 0);
 }
 
@@ -993,10 +1034,11 @@ async function zeroEntry(entry: FacadeEntry, sessionId: string): Promise<void> {
     try {
         entry.zswapKeys?.clear?.();
         entry.dustKey?.clear?.();
-        entry.unshieldedKeystore?.clear?.();
+        entry.unshieldedKeystore?.revoke?.();
         try { entry.attestationSecret?.fill?.(0); } catch { /* not a buffer */ }
         try { entry.tokenFactoryIssuerSecret?.fill?.(0); } catch { /* not a buffer */ }
         await entry.facade?.stop?.();
+        for (const seed of Object.values(entry.walletSeeds ?? {})) seed.fill(0);
     } catch (err) {
         log('warn', `evict cleanup failed for ${sessionId.slice(0, 16)}: ${errorMessage(err)}`);
     }

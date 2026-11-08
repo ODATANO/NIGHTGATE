@@ -453,9 +453,33 @@ describe('artifact snapshots: the worker verifies the pinned generation against 
         fs.writeFileSync(path.join(base, 'keys', 'attest.verifier'), 'vk-1');
         fs.writeFileSync(path.join(base, 'keys', 'attest.prover'), 'pk-1');
         fs.writeFileSync(path.join(base, 'zkir', 'attest.zkir'), 'ir-1');
+        fs.mkdirSync(path.join(base, 'compiler'), { recursive: true });
+        fs.writeFileSync(path.join(base, 'compiler', 'contract-manifest.json'), '{"manifest-version":"1"}');
         fs.writeFileSync(path.join(base, 'contract', 'index.mjs'), 'export class Contract {}\n');
         return { artifactPath: path.join(base, 'contract', 'index.mjs'), zkConfigPath: base, privateStateId: 'ps' };
     };
+
+    it('the snapshot carries compiler/contract-manifest.json, and a snapshot made without one gets it on the next use', async () => {
+        // midnight-js reads the manifest next to the keys it verifies. The digest does not cover it, so it is completed in place.
+        const { computeArtifactGenerationDigest } = await import('../../srv/submission/artifact-digest.js');
+        const snapRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-snap-manifest-'));
+        process.env.NIGHTGATE_ARTIFACT_SNAPSHOT_DIR = snapRoot;
+        try {
+            const reg = layout('m');
+            const digest = computeArtifactGenerationDigest(reg);
+            const snap = workerExports.materializeArtifactSnapshot('m', { ...reg, artifactDigest: digest });
+            const inSnapshot = path.join(snap.zkConfigPath, 'compiler', 'contract-manifest.json');
+            expect(fs.readFileSync(inSnapshot, 'utf8')).toBe('{"manifest-version":"1"}');
+            fs.rmSync(path.join(snap.zkConfigPath, 'compiler'), { recursive: true, force: true });
+            workerExports.__resetArtifactSnapshotsForTests();
+            expect(workerExports.materializeArtifactSnapshot('m', { ...reg, artifactDigest: digest }).zkConfigPath).toBe(snap.zkConfigPath);
+            expect(fs.existsSync(inSnapshot)).toBe(true);
+        } finally {
+            delete process.env.NIGHTGATE_ARTIFACT_SNAPSHOT_DIR;
+            workerExports.__resetArtifactSnapshotsForTests();
+            fs.rmSync(snapRoot, { recursive: true, force: true });
+        }
+    });
 
     it('the class is imported from the SNAPSHOT: a rewrite of the original between two loads of the same pinned generation cannot reach the job', async () => {
         const { computeArtifactGenerationDigest } = await import('../../srv/submission/artifact-digest.js');

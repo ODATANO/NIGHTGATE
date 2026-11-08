@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { getNightgatePluginConfig } from '../../utils/nightgate-config';
-import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
 import { vaultRef, liveProviderConfigured } from '../verify-state';
 import { deriveGranteeId } from '../grantee-identity';
@@ -45,7 +44,6 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             // Check session ownership first. The grant row controls who may read,
             // so nothing is written for a caller who does not own the session.
@@ -154,7 +152,6 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);

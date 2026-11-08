@@ -5,6 +5,8 @@ import { blake2b } from '@noble/hashes/blake2';
 import { bytesToHex } from '@noble/hashes/utils';
 import { TypeRegistry } from '@polkadot/types/create';
 import { Metadata } from '@polkadot/types/metadata';
+import type { Vec } from '@polkadot/types';
+import type { EventRecord } from '@polkadot/types/interfaces';
 import { MidnightNodeProvider, SignedBlock } from '../providers/MidnightNodeProvider';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { isUniqueViolation } from '../utils/db-errors';
@@ -76,6 +78,7 @@ const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
     23: { name: 'BeefyMmrLeaf', txType: 'system', isSystem: true },
     30: { name: 'Session', txType: 'system', isSystem: true },
     32: { name: 'Bridge', txType: 'night_transfer' }, // handle_transfers moves NIGHT across chains
+    33: { name: 'C2MBridge', txType: 'governance' }, // bridge configuration, governance calls only
     40: { name: 'Council', txType: 'governance' },
     41: { name: 'CouncilMembership', txType: 'governance' },
     42: { name: 'TechnicalCommittee', txType: 'governance' },
@@ -113,8 +116,14 @@ function buildPalletMap(): Map<number, PalletMapping> {
     return map;
 }
 
+/** A pallet entry of the runtime metadata. Codec values and plain values are both read. */
+export interface PalletEntry {
+    name: string | { toString(): string };
+    index: number | { toNumber(): number };
+}
+
 export function resolvePalletMapFromMetadata(
-    pallets: Array<{ name: unknown; index: unknown }>,
+    pallets: ReadonlyArray<PalletEntry>,
     overrides: Map<number, PalletMapping> = new Map()
 ): { map: Map<number, PalletMapping>; moved: string[]; unmapped: string[] } {
     const byName = new Map<string, PalletMapping>();
@@ -123,8 +132,8 @@ export function resolvePalletMapFromMetadata(
     const moved: string[] = [];
     const unmapped: string[] = [];
     for (const p of pallets) {
-        const name = String((p.name as any)?.toString?.() ?? p.name);
-        const index = Number((p.index as any)?.toNumber?.() ?? p.index);
+        const name = typeof p.name === 'string' ? p.name : String(p.name.toString());
+        const index = Number(typeof p.index === 'number' ? p.index : p.index.toNumber());
         if (!Number.isInteger(index)) continue;
         const mapping = byName.get(name);
         if (!mapping) { unmapped.push(`${name}@${index}`); continue; }
@@ -285,10 +294,10 @@ export class BlockProcessor {
                 requests.push({ method: 'state_getStorage', params: [BlockProcessor.LAST_RUNTIME_UPGRADE_STORAGE_KEY, hashes[i]] });
             }
             const flat = await this.nodeProvider.rpcBatch(requests);
-            blockResults = newIndices.map((_, k) => flat[k * 4]);
-            tsResults = newIndices.map((_, k) => flat[k * 4 + 1]);
-            eventResults = newIndices.map((_, k) => flat[k * 4 + 2]);
-            upgradeResults = newIndices.map((_, k) => flat[k * 4 + 3]);
+            blockResults = newIndices.map((_, k) => flat[k * 4] as SignedBlock);
+            tsResults = newIndices.map((_, k) => flat[k * 4 + 1] as string | null);
+            eventResults = newIndices.map((_, k) => flat[k * 4 + 2] as string | null);
+            upgradeResults = newIndices.map((_, k) => flat[k * 4 + 3] as string | null);
         }
 
         const fetchCompletedAt = Date.now();
@@ -905,8 +914,8 @@ export class BlockProcessor {
     }
 
     private palletMapFromMetadata(registry: TypeRegistry, specVersion: number): Map<number, PalletMapping> {
-        let pallets: Array<{ name: unknown; index: unknown }>;
-        try { pallets = ((registry.metadata as any)?.pallets ?? []) as Array<{ name: unknown; index: unknown }>; } catch (err) {
+        let pallets: ReadonlyArray<PalletEntry>;
+        try { pallets = registry.metadata?.pallets ?? []; } catch (err) {
             throw new Error(`Runtime metadata for specVersion ${specVersion} exposes no readable pallet list (unsupported metadata representation): ${(err as Error).message}`);
         }
         if (!Array.isArray(pallets) || pallets.length === 0) {
@@ -935,7 +944,7 @@ export class BlockProcessor {
             throw new Error(`No runtime metadata registry to decode System.Events for ${where || 'block'}`);
         }
         try {
-            return readBlockEvents(registry.createType('Vec<EventRecord>', rawEvents) as any);
+            return readBlockEvents(registry.createType<Vec<EventRecord>>('Vec<EventRecord>', rawEvents));
         } catch (err) {
             throw new Error(`System.Events of ${where || 'block'} do not decode: ${(err as Error).message}`);
         }

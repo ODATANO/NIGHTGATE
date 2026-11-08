@@ -1,125 +1,81 @@
 # Reference
 
-Configuration, runtime behavior, schema and development setup. Signatures: [actions.md](actions.md); design: [architecture.md](architecture.md); operations: [operations.md](operations.md).
+Configuration, runtime behavior and schema. Signatures: [actions.md](actions.md). Design: [architecture.md](architecture.md). Operations: [operations.md](operations.md).
 
 ## Configuration
 
-Configure the plugin under `cds.requires.nightgate`. Environment variables override CDS config. The network defaults to preprod. Node and indexer are built in for preview, testnet and undeployed; preprod and mainnet need your own or hosted ones, see [self-hosted.md](self-hosted.md).
-
-### Minimal
+The plugin reads `cds.requires.nightgate`. Environment variables override it. Without `network` the plugin serves OData but stays idle: no crawler, no submission.
 
 ```json
 {
   "cds": {
     "requires": {
       "nightgate": {
-        "network": "preprod",
+        "network": "mainnet",
         "nodeUrl": "ws://<node-host>:9944",
-        "indexerHttpUrl": "http://<indexer-host>:8088/api/v4/graphql"
-      }
-    }
-  }
-}
-```
-
-Without `network` the plugin serves OData but stays idle (no crawler, no submission). On preprod and mainnet `nodeUrl` and `indexerHttpUrl` are required and startup refuses without them; on preview the public endpoints are built in, so `network` alone is enough. Proving defaults to wasm. A legacy `"kind": "nightgate"` is ignored.
-
-### Full
-
-```json
-{
-  "cds": {
-    "requires": {
-      "nightgate": {
-        "network": "preprod",
-        "nodeUrl": "ws://<your-node>:9944",
-        "sessionTtlMs": 86400000,
-
-        "indexerHttpUrl": "http://<your-indexer>:8088/api/v4/graphql",
-        "indexerWsUrl":   "ws://<your-indexer>:8088/api/v4/graphql/ws",
+        "indexerHttpUrl": "http://<indexer-host>:8088/api/v4/graphql",
         "proofServerUrl": "http://localhost:6300",
-        "zkConfigBasePath": "./contracts",
-        "privateStateBackend": "cap-db",
-        "allowMainnetSubmission": false,
-        "runtimeMode": "single-instance",
-        "replicaCount": 1,
-        "allowProductionSqlite": false,
-
         "contracts": {
-          "counter":              { "package": "@odatano/contract-counter" },
-          "attestation-vault":    { "package": "@odatano/contract-attestation-vault" },
-          "attestation-vault-32": { "package": "@odatano/contract-attestation-vault-32" },
-          "shielded-token":       { "package": "@odatano/contract-shielded-token" },
-          "token-factory":        { "package": "@odatano/contract-token-factory" },
-          "holder-registry":      { "package": "@odatano/contract-holder-registry" },
+          "attestation-vault": { "package": "@odatano/contract-attestation-vault" },
           "my-contract": {
             "artifactPath":   "contracts/my-contract/managed/my-contract/contract/index.js",
             "privateStateId": "myContractPrivateState",
             "zkConfigPath":   "contracts/my-contract/managed/my-contract"
           }
         },
-
-        "crawler": {
-          "enabled": true,
-          "batchSize": 10,
-          "maxRetries": 3,
-          "retryDelay": 2000,
-          "requestTimeout": 30000
-        }
+        "crawler": { "enabled": true, "batchSize": 10 }
       }
     }
   }
 }
 ```
 
+Node and indexer are built in for preview, testnet and undeployed. Every other network refuses to start without `nodeUrl` and `indexerHttpUrl`, see [self-hosted.md](self-hosted.md). Proving runs in wasm unless a proof server is configured.
+
 ### CDS keys
 
 | Key | Default | Notes |
 |---|---|---|
-| `network` | `preprod` | `testnet` / `preprod` / `preview` / `mainnet` / `undeployed` (local stack: node `ws://127.0.0.1:9944`, indexer `127.0.0.1:8088`); an invalid value refuses to start |
-| `nodeUrl` | built in on preview, testnet and undeployed; required on preprod and mainnet | Substrate RPC WebSocket: your own node, or a hosted one with the access token in the URL ([self-hosted.md](self-hosted.md)) |
-| `indexerHttpUrl` | built in on preview, testnet and undeployed; required on preprod and mainnet | Indexer GraphQL for the wallet SDK and the verify service; not used by the crawler. Your own indexer, or a hosted one with the access token in the URL |
-| `indexerWsUrl` | derived from `indexerHttpUrl` (`http -> ws` + `/ws`) | Subscription endpoint, only for a non-standard indexer |
-| `proofServerUrl` | `http://localhost:6300` (server mode only) | Proof server for all submissions; setting it selects server proving, unset = wasm |
-| `proofTimeoutMs` | `300000` | Timeout of one proof request in server mode; midnight-js re-requests up to three times, so set it above the slowest proof. Ignored in wasm mode |
-| `zkConfigBasePath` | `./contracts` | Base for relative `contracts.<name>.zkConfigPath` |
-| `privateStateBackend` | `cap-db` | `cap-db` (encrypted CAP-DB tables) or `level` (SDK LevelDB, dev-only, blocked on worker-routed submissions) |
-| `contracts` | `{}` | `<ref>` → `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`, loaded at startup. `slotWidth` 16 (default) or 32 sizes masks, k bounds and inclusion paths of a vault-family artifact |
-| `sessionTtlMs` | `86400000` (24 h) | Wallet session lifetime |
-| `closeSessionsOnRestart` | `true` | Close the previous process's wallet sessions at startup (`feeSponsorSessions` exempt); `false` keeps them |
-| `jobs.concurrency.heavy` | `4` | Concurrent proof-generating jobs (deploy, call, send, attestations), all kinds together; 4 saturates one proof server. Workflow parents (the `issue*` attestations) have a separate cap of the same size, so a parent never holds a slot its children need |
-| `jobs.concurrency.light` | `16` | Concurrent jobs per remaining kind |
-| `jobs.concurrency.serial` | `1` | Concurrent `connectWalletForSigning` jobs; catch-up shares one worker thread, so serialized wallets become usable one by one instead of all late |
+| `network` | `mainnet` | `preview`, `testnet`, `preprod`, `mainnet`, `stagenet` or `undeployed`. An invalid value refuses to start |
+| `nodeUrl` | built in on preview, testnet, undeployed | Substrate RPC WebSocket. Required on every other network |
+| `indexerHttpUrl` | built in on preview, testnet, undeployed | Indexer GraphQL for the wallet SDK and the verify functions. Required on every other network |
+| `indexerWsUrl` | derived from `indexerHttpUrl` | Subscription endpoint, only for a non-standard indexer |
+| `proofServerUrl` | `http://localhost:6300` in server mode | Setting it selects server proving. Unset means wasm |
+| `proofTimeoutMs` | `300000` | One proof request in server mode. midnight-js retries up to three times |
+| `zkConfigBasePath` | `./contracts` | Base for relative `zkConfigPath` values |
+| `privateStateBackend` | `cap-db` | `cap-db` stores encrypted rows in the database. `level` is the SDK LevelDB store, dev only |
+| `contracts` | `{}` | `<ref>` to `{ package }` or `{ artifactPath, privateStateId, zkConfigPath }`. Optional `slotWidth` 16 or 32 for a vault artifact, `address` for `/contract-manifest` |
+| `sessionTtlMs` | `86400000` | Wallet session lifetime |
+| `closeSessionsOnRestart` | `true` | Close the previous process's wallet sessions at startup. Fee-sponsor sessions are exempt |
+| `feeSponsorSessions` | none | Platform fee-sponsor session ids. `NIGHTGATE_FEE_SPONSOR_SESSION` overrides it |
+| `jobs.concurrency.heavy` | `4` | Concurrent proof-generating jobs. Workflow parents have a separate cap of the same size |
+| `jobs.concurrency.light` | `16` | Concurrent jobs per other kind |
+| `jobs.concurrency.serial` | `1` | Concurrent `connectWalletForSigning` jobs |
 | `runtimeMode` | `single-instance` | Other modes fail closed |
-| `replicaCount` | `1` | Declared replica count; above 1 fails closed |
-| `allowProductionSqlite` | `false` | Escape hatch; production SQLite otherwise fails closed |
-| `crawler.enabled` | `true` | `false`: services load, no block indexing |
-| `crawler.nodeUrl` | top-level `nodeUrl` | Optional crawler-specific RPC override |
-| `crawler.batchSize` | `10` | Blocks per catch-up batch |
-| `crawler.fetchConcurrency` | `(default)` | Parallel RPC fetches during catch-up |
-| `crawler.rpcBatchSize` | `(default)` | Substrate JSON-RPC batch size |
-| `crawler.requestTimeout` | `30000` | RPC timeout (ms) |
-| `palletMap` | `(built-in)` | Override of the pallet-index → tx-type map of the `BlockProcessor` (`{ "<index>": { name, txType, isShielded?, isSystem? } }`); `isShielded` holds until the decode pass reads the payload |
+| `replicaCount` | `1` | Values above 1 fail closed |
+| `allowProductionSqlite` | `false` | Permits SQLite in production |
 | `allowMainnetSubmission` | `false` | Gate for mainnet submission |
-| `granteeBinding` | `wallet` | Principal → vault `Bytes<32>` grantee id: `wallet` (coin pubkey hash) / `did` (DID string) / `custom` (64 hex); used by `registerGranteeIdentity` and the disclosure read gate |
-| `allowSelfServiceGranteeRegistration` | `false` | Lets callers register their own grantee identity. NIGHTGATE does not verify ownership of the binding input, so under `wallet`/`did` a user could claim another party's id; off = `403`. Operators can write `GranteeIdentities` directly |
-| `networks` | `{}` | `{ "<network>": { indexerHttpUrl, indexerWsUrl } }` for the verify functions' `network` override; an unlisted network uses its built-in endpoints, which only preview, testnet and undeployed have. Top-level indexer URLs and `NIGHTGATE_INDEXER_*` apply to the configured network only |
+| `crawler.enabled` | `true` | `false` loads the services without block indexing |
+| `crawler.nodeUrl` | `nodeUrl` | RPC endpoint for the crawler only |
+| `crawler.batchSize` | `10` | Blocks per catch-up batch |
+| `crawler.fetchConcurrency` | `8` | Block batches fetched at the same time |
+| `crawler.rpcBatchSize` | `32` | Heights per JSON-RPC batch request |
+| `crawler.requestTimeout` | `30000` | RPC timeout in ms |
+| `crawler.maxRetries` | `3` | Attempts per block fetch |
+| `crawler.retryDelay` | `2000` | Base backoff in ms between attempts |
+| `palletMap` | built in | `{ "<index>": { name, txType, isShielded?, isSystem? } }`. Overrides defaults and runtime metadata |
+| `granteeBinding` | `wallet` | How a user maps to the vault grantee id: `wallet` (coin public key), `did` or `custom` (64 hex) |
+| `allowSelfServiceGranteeRegistration` | `false` | Lets callers register their own grantee id. Ownership of the input is not verified. Off answers `403` |
+| `networks` | `{}` | `{ "<network>": { indexerHttpUrl, indexerWsUrl } }` for the `network` parameter of the verify functions |
 
 ### Environment variables
 
-Declared in `srv/utils/config-table.ts` (kind, default, bounds); the table below
-is generated (`npm run config:table`) and pinned by a unit test. The wallet
-worker reads no environment; it receives the resolved values. Empty = unset; an
-unparsable value is logged once and the default applies; out-of-bounds numbers
-are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
-`on`/`off`. Except `ENCRYPTION_*`, each can be set as
-`cds.requires.nightgate.<camelCase>` (`NIGHTGATE_WORKER_RPC_TIMEOUT_MS` ->
-`workerRpcTimeoutMs`); env beats CAP beats default.
+Declared in `srv/utils/config-table.ts`. The table is generated with `npm run config:table` and pinned by a unit test. Empty means unset. An unparsable value is logged once and the default applies. Numbers out of bounds are clamped with a warning. Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on`, `off`. Every variable except the secrets can also be set as `cds.requires.nightgate.<camelCase>`, for example `workerRpcTimeoutMs`. Environment wins over CDS, CDS wins over the default.
 
 <!-- config-table:start -->
 | Variable | Kind | Default | Purpose |
 |---|---|---|---|
-| `NIGHTGATE_NETWORK` | `preview` / `testnet` / `preprod` / `mainnet` / `undeployed` |  | Override `network` |
+| `NIGHTGATE_NETWORK` | `preview` / `testnet` / `preprod` / `mainnet` / `stagenet` / `undeployed` |  | Override `network` |
 | `NIGHTGATE_NODE_URL` | url |  | Override `nodeUrl` |
 | `NIGHTGATE_CRAWLER_NODE_URL` | url |  | Override `crawler.nodeUrl` |
 | `NIGHTGATE_INDEXER_HTTP_URL` | url |  | Override `indexerHttpUrl` (e.g. point at local indexer container) |
@@ -216,7 +172,10 @@ are clamped with a warning; booleans: `true`/`false`, `1`/`0`, `yes`/`no`,
 | `NIGHTGATE_SUBMIT_REQUEST_TIMEOUT_MS` | ms (min 1) | `30000` | Request phase of a dedicated-client submit: from the send until the node's first status (subscription acknowledged); default `30000`. A timeout here is ambiguous (`no-reply`): the transaction may or may not be in the pool, the job parks for the confirmer. Read in the wallet worker. |
 | `NIGHTGATE_SUBMIT_LATE_GRACE_MS` | ms (min 0) | `300000` | After a request or watch phase timeout the attempt keeps its node subscription open this long and logs a late status or reject under the transaction identifier (evidence only; the job is parked for the confirmer either way); default `300000`. Read in the wallet worker. |
 | `NIGHTGATE_SUBMIT_WATCH_TIMEOUT_MS` | ms (min 1) | `75000` | Watch phase of a submit: from the node's first status until InBlock (or Finalized, `NIGHTGATE_SPONSOR_WAIT`); default `75000`. A timeout here is ambiguous: the node took the request and nothing was included in time; the indexer is asked for 90 s, then the job parks for the confirmer. On the facade (bound) path this is the whole wait after the send. Read in the wallet worker. |
-| `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` | ms (min 0) | `300000` | A job parked in `reconciliation_required` whose transaction the indexer does not know ends `failed / BROADCAST_NOT_INCLUDED` once the indexer tip is this far past the transaction's validity window (ttl); default `300000`. The ttl is recorded at the submit intent; rows without one use the submit time plus one hour. |
+| `NIGHTGATE_REINDEX_REPLY_WAIT_MS` | ms (min 0) | `20000` | How long `reindexFromHeight` waits for its rollback before it answers `status: running` and lets it finish in the background; default `20000`. The rollback removes 2000 blocks per committed transaction, from the tip down. |
+| `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` | ms (min 0) | `300000` | A job whose transaction the indexer does not know gets `chainStatus: dropped` and `BROADCAST_NOT_INCLUDED` once the indexer tip is this far past the transaction's validity window (ttl); default `300000`. A parked job also ends `failed`, a `succeeded` job keeps its status. The ttl is recorded at the submit intent; rows without one use the submit time plus one hour. |
+| `NIGHTGATE_CHAIN_CONFIRM_LOOKUPS_PER_MINUTE` | int (min 1) | `120` | Indexer lookups per minute of the chain-outcome confirmer, over all jobs; default `120`. One lookup asks the indexer up to twice. |
+| `NIGHTGATE_CHAIN_CONFIRM_BACKOFF_MAX_MS` | ms (min 1000) | `1800000` | Longest pause before the confirmer asks again about a job whose transaction has no outcome yet. The pause starts at 5 s and doubles per lookup; default 30 minutes. |
 | `NIGHTGATE_BATCH_SEGMENT_MODE` | `rewrite` / `observe` | `rewrite` | Batch segment ordering: `rewrite` (deterministic stage-grouped order) or `observe` (log only). Read in the wallet worker. |
 | `NIGHTGATE_SPONSOR_POLICY_FILE` | path |  | Path to a JSON file `{ "allowedContracts": [], "allowedCircuits": [], "allowDeploy": false, "allowedTokenTypes": [], "allowContractMints": false, "allowSwaps": false, "shareMintedTokenTypes": false, "contractCircuits": { "<address>": "*" }, "rateLimits": { "prove": 60 } }` that replaces `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS`/`_CIRCUITS` while set; `rateLimits` names rate classes and replaces their `NIGHTGATE_*_RATE_LIMIT` keys. `contractCircuits` maps a contract address (64 hex) to `"*"` or a circuit list that replaces `allowedCircuits` for calls on that contract; the contract counts as allowed. Calls on a grant's `deployedContracts` are exempt from `allowedCircuits`. Re-read per sponsored call behind an mtime cache, so the sponsor policy changes without a container recreate. Fail-closed: an unreadable or invalid file keeps the last good policy, and with none loaded yet sponsored calls answer `503 SPONSOR_POLICY_UNAVAILABLE`. |
 | `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS` | list |  | Comma list of contract addresses a sponsor pays for (platform floor); empty = any contract may be called. The same list names the contracts an unshielded offer may pay into besides the called one, and there an empty list names none. Replaced by `NIGHTGATE_SPONSOR_POLICY_FILE` while that is set. |
@@ -256,33 +215,33 @@ Read by the standalone image and the dev scripts, not by the plugin:
 
 | Variable | Purpose |
 |---|---|
-| `NIGHTGATE_DB_URL` | Image: `postgres://user:pw@host:5432/db` selects PostgreSQL, schema deployed each boot (additive). `?sslmode=` `disable`, `require` (unverified) or `verify-full` (optional `sslrootcert=<pem>`); other values refuse to start. Unset = SQLite at `NIGHTGATE_DB_PATH` |
-| `NIGHTGATE_DB_DEPLOY` | Image with `NIGHTGATE_DB_URL`: `auto` (default) deploys the schema at boot, `never` skips |
-| `NIGHTGATE_DB_WAIT_SECONDS` | Image `migrate` mode: wait for the PostgreSQL listener before `cds deploy` (default 60, 1..86400) |
-| `NIGHTGATE_HEAP_MB` | Heap size for `scripts/dev.mjs` / `scripts/serve.mjs` (default `12288`) |
-| `NIGHTGATE_PROOF_NETWORK` | Network passed to the proof-server container; defaults to `preprod` |
+| `NIGHTGATE_DB_URL` | Image: `postgres://user:pw@host:5432/db` selects PostgreSQL. `?sslmode=` accepts `disable`, `require` or `verify-full` with optional `sslrootcert=<pem>`. Unset means SQLite at `NIGHTGATE_DB_PATH` |
+| `NIGHTGATE_DB_DEPLOY` | Image with PostgreSQL: `auto` deploys the schema at boot, `never` skips. Default `auto` |
+| `NIGHTGATE_DB_WAIT_SECONDS` | Image `migrate` mode: wait for the PostgreSQL listener, 1 to 86400. Default 60 |
+| `NIGHTGATE_HEAP_MB` | Heap of `scripts/dev.mjs` and `scripts/serve.mjs`. Default `12288` |
+| `NIGHTGATE_PROOF_NETWORK` | Network of the proof-server container. Default `mainnet` |
 
-For local repository startup, drop these into a repo-root `.env`. The tracked template is at [.env.example](../.env.example).
+For a local checkout, put variables into a repo-root `.env`. Template: [.env.example](../.env.example).
 
 ## Runtime behavior
 
 ### Plugin lifecycle
 
-- `cds-plugin.js` loads `src/plugin.ts`
-- Model roots registered from `db/` and `srv/`
-- Connector routes (`/zk-config`, `/contract-manifest`) attached during CAP bootstrap; HTTP security remains host-owned. `GET /zk-config/<contract>` lists the circuits and the files served below it
-- `initialize()` runs on `cds.on('served')`:
-  1. Probes the CDS schema (SELECTs each required table). The schema is **not** auto-deployed - on the first missing table the plugin fails fast with `SchemaNotDeployedError` and instructs you to run `npm run deploy`
-  2. Loads `cds.requires.nightgate.contracts` into the contract registry
-  3. Spawns the wallet worker thread (`startWalletWorker()`) and wires the state-save sink
-  4. Starts the crawler if `enabled` (default true)
-- `shutdown()` runs on `cds.on('shutdown')`:
-  1. Stops the crawler
-  2. Stops the wallet worker (sends final state-save for each cached facade)
+- `cds-plugin.js` loads `src/plugin.ts`, which registers the models in `db/` and `srv/`.
+- The connector routes `/zk-config` and `/contract-manifest` attach at CAP bootstrap. `GET /zk-config/<contract>` lists the circuits and the files below it: `keys/`, `zkir/` and `compiler/contract-manifest.json`.
+- `initialize()` runs on `cds.on('served')`. It checks the schema, loads `contracts`, starts the wallet worker and, if enabled, the crawler.
+- `shutdown()` runs on `cds.on('shutdown')`. It stops the crawler and the worker, which saves every cached wallet first.
 
-### Pipelines and submission flow
+### Startup and failure
 
-The crawler (main thread, Substrate RPC) and the wallet SDK (worker thread, indexer GraphQL) write to one database and share no hash; the indexer confirmer ties a job to its block by the ledger identifier and a reorg rollback reverts outcomes at or above the fork height. Transaction outcomes come from `System.Events` only (`outcomeSource=substrate-system-events`); a block without them is retried, never stored as success. Diagram and the submission steps: [architecture.md](architecture.md).
+- The schema is never deployed automatically. A missing table or column keeps NIGHTGATE offline with `SCHEMA_NOT_DEPLOYED`. The host process keeps running.
+- An unreachable node logs a warning and starts in `offline` mode. Reads and submissions keep working.
+- A wallet worker that fails to start logs a warning. Submissions fail, reads work.
+- `initialize()` is idempotent and reloads `contracts`.
+
+### Pipelines
+
+The crawler reads the node on the main thread. The wallet SDK reads the indexer in the worker thread. Both write to one database and share no hash. The indexer confirmer records a job's block height, and a reorg rollback reverts outcomes at or above the fork height. Transaction outcomes come from `System.Events` only. A block without them is retried, never stored as success. The crawler decodes blocks below runtime version 2000000 with ledger 8 and later blocks with ledger 9. Details: [architecture.md](architecture.md).
 
 ### Error classification
 
@@ -290,7 +249,7 @@ Error codes of `classifySubmissionError(err, network)`: [actions.md#error-model]
 
 ### HTTP error codes
 
-Every error response carries `error.code`: a specific code where a client can act on it, otherwise the class of its HTTP status (`INVALID_ARGUMENT`, `NOT_FOUND`, ...). A 5xx keeps its code in production; only the message is withheld unless the code exposes it. Errors CAP raises before a service runs (unknown path, wrong method, the auth challenge) keep CAP's numeric code.
+Every error response carries `error.code`. It is a specific code where a client can act on it, else the class of its HTTP status. A 5xx keeps its code in production. Its message is withheld unless the code exposes it. Errors CAP raises before a service runs keep CAP's numeric code.
 
 <!-- error-codes:start -->
 | Code | HTTP | Retryable | Meaning |
@@ -352,33 +311,13 @@ Every error response carries `error.code`: a specific code where a client can ac
 | `WORKER_ROTATING` | 503 | yes | The wallet worker is rotating; retry. |
 <!-- error-codes:end -->
 
-### Startup + failure semantics
+### Runtime topology
 
-- The schema is not auto-deployed: a missing table keeps NIGHTGATE offline with a "run `npm run deploy`" error; the host process keeps running.
-- Unreachable node: warning, `offline` mode; reads and submissions (indexer + prover only) keep working.
-- Wallet worker fails to start: warning; submissions return an error, reads unaffected.
-- `initialize()` is idempotent and reloads `cds.requires.nightgate.contracts`.
+NIGHTGATE runs as exactly one process and one CAP tenant. Startup fails closed when a replica count above one is declared or CAP multitenancy is on. The count comes from `NIGHTGATE_REPLICA_COUNT`, `replicaCount`, `CF_INSTANCE_COUNT` or `KUBERNETES_REPLICA_COUNT`. `WEB_CONCURRENCY` is ignored. On Cloud Foundry every instance with `CF_INSTANCE_INDEX` other than `0` fails closed. The guard is no leader election, so deploy one instance. Production SQLite fails closed too.
 
-### Runtime topology contract
+### Database
 
-NIGHTGATE supports exactly one process and one CAP tenant (crawler, facade
-cache, job semaphore and cleanup are process-local). Startup fails closed when
-a replica count above one is declared or CAP multitenancy is on. Declare the
-count via `NIGHTGATE_REPLICA_COUNT` or `replicaCount`; `CF_INSTANCE_COUNT` and
-`KUBERNETES_REPLICA_COUNT` are read too, `WEB_CONCURRENCY` is ignored (HTTP
-workers, not replicas). Platforms inject none of these; on Cloud Foundry
-`CF_INSTANCE_INDEX` makes every instance other than `0` fail closed. The guard
-is not a lock or leader election: the deployment must start one instance.
-Health, readiness, liveness and metrics expose instance id and topology.
-
-Production SQLite is refused by the same guard; bind `@cap-js/postgres` or
-`@cap-js/hana`. `NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true` is a temporary escape
-hatch only.
-
-### Database profiles and migration
-
-The host chooses the database (SQLite for development, PostgreSQL or HANA for
-production); NIGHTGATE embeds no credentials. Typical profiles:
+The host chooses the database. SQLite is for development, PostgreSQL or HANA for production.
 
 ```json
 {
@@ -389,174 +328,118 @@ production); NIGHTGATE embeds no credentials. Typical profiles:
 }
 ```
 
-Inject credentials via a CAP service binding or `cds_requires_db_credentials_*`.
-The plugin sets `cds.features.use_generic_pool` to `true` unless the host sets
-it (CAP's built-in pool loses a connection per timed-out acquire). The
-standalone image uses `cds.requires.db.pool` `{ max: 20, acquireTimeoutMillis:
-30000, destroyTimeoutMillis: 5000 }` and `cds.requires.db.client`
-`{ connectionTimeoutMillis: 10000 }`. Run `cds deploy --profile production`
-before the first start; schema evolution cannot do lossy key or type changes,
-so inspect deltas and back up before each deployment.
+- Inject credentials through a CAP service binding or `cds_requires_db_credentials_*`.
+- The plugin sets `cds.features.use_generic_pool` to `true` unless the host sets it.
+- The image uses pool `{ max: 20, acquireTimeoutMillis: 30000, destroyTimeoutMillis: 5000 }` and client `{ connectionTimeoutMillis: 10000 }`.
+- Run `cds deploy --profile production` before the first start. Back up before each upgrade.
+- SQLite to PostgreSQL: [docker.md#postgresql](docker.md#postgresql).
+- Delete `db/midnight.db*` when switching networks.
 
-SQLite to PostgreSQL is a data migration (`npx nightgate-db-migrate`, or the image's `migrate` mode): [docker.md#postgresql](docker.md#postgresql). `db/midnight.db` holds indexed data and encrypted wallet state; delete `db/midnight.db*` when switching networks.
+### Background jobs
 
-### Background-job durability and restart safety
+`BackgroundJobs` is the durable record of wallet and contract operations. It holds the request fingerprint, attempts, lease, heartbeat, the `PendingSubmissions` id and the transaction hash.
 
-`BackgroundJobs` is the durable ledger of wallet and contract operations:
-request fingerprint, attempt budget, lease, heartbeat and, once known, the
-`PendingSubmissions.ID` and transaction hash. `(sessionId, kind,
-idempotencyKey)` is unique for good, failed jobs included: a new attempt needs a
-new key, the same key with a different request is rejected
-(`npm run check:job-idempotency` reports duplicates before an upgrade).
-
-Lifecycle: `pending -> running -> external_execution -> submitted ->
-succeeded|failed`. `external_execution` starts right before the SDK call that
-proves, balances and broadcasts; `submitted` once a transaction hash exists.
-`succeeded` means the workflow returned; `chainStatus` (`pending`, then
-`success`, `failure` or `dropped`) says what the chain did, set by the indexer
-confirmer with `chainBlockHeight`, `chainBlockHash` and `indexerTxHash`.
-
-After a process restart a job before the external effect fails
-(`PROCESS_RESTART_BEFORE_EXECUTION`, `PROCESS_RESTART_BEFORE_BROADCAST`) or
-re-queues from its persisted command if its session survived; a job past it parks
-as `reconciliation_required` (`PROCESS_RESTART_RECONCILE`). Without a restart a
-throw past the effect parks the same way (`EXTERNAL_EXECUTION_FAILED`,
-`BROADCAST_UNCONFIRMED`). A parked job leaves that state when the indexer shows
-its transaction (`succeeded`, or `failed / CHAIN_EXECUTION_FAILED` when the call
-did not apply), when the indexer tip passes its ttl by
-`NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` without it (`failed /
-BROADCAST_NOT_INCLUDED`, `chainStatus: dropped`), or when every child of a
-workflow parent succeeded. Only absence against the same indexer tip counts, so
-a lagging indexer never turns "not yet" into "never". A finalized transaction
-whose `System.Events` never decode stays parked: alert on a non-draining
-`odatano_nightgate_jobs_reconciliation_required`.
-
-Replayed commands carry no seed material: the processor reloads the encrypted
-signing material from the session, re-checks ownership and the artifact, and
-re-coerces arguments. Circuit arguments, private state and witnesses are stored
-as AES-256-GCM ciphertext only. A fresh `connectWalletForSigning` supersedes
-older prewarm jobs of the session. Predicate issuance is a parent workflow with
-one deterministic child per chain call; the parent submits nothing and a retry
-cannot repeat a completed child. Finalizers of anchoring and disclosure jobs
-restore their local rows without calling the wallet; results carry
-`reconciled: true`. Prometheus exposes queued, running, reconciliation-required
-and oldest-queued job gauges.
+- `(sessionId, kind, idempotencyKey)` is unique. The same key with a different request is rejected. A failed job releases its key, unless it may be on chain or is a workflow step.
+- Lifecycle: `pending`, `running`, `external_execution`, `submitted`, then `succeeded` or `failed`. `external_execution` starts right before the SDK call that proves, balances and broadcasts.
+- `chainStatus` is `pending`, `success`, `failure` or `dropped`. The indexer confirmer sets it together with `chainBlockHeight`, `chainBlockHash` and `indexerTxHash`.
+- After a restart, a job before the external effect fails or re-queues from its persisted command. A job past it parks as `reconciliation_required`.
+- A parked job ends when the indexer shows its transaction, when the indexer tip passes its ttl by `NIGHTGATE_BROADCAST_EXPIRY_MARGIN_MS` (`BROADCAST_NOT_INCLUDED`), or when every child of a workflow parent succeeded.
+- Alert on a `odatano_nightgate_jobs_reconciliation_required` that does not drain.
+- Replayed commands carry no seed material. Circuit arguments, private state and witnesses are stored as AES-256-GCM ciphertext.
 
 ### Encrypted rows
 
-`PrivateStates`, `ContractSigningKeys` and `WalletSyncStates` are encrypted
-under a per-account data key (`AccountKeys`), sealed under the ring's active key
-and under the viewing-key storage password. The ring alone opens an account's
-rows; the viewing key alone opens nothing. Rows with `keyScheme` null use the
-older derivation and migrate on a session read or through `nightgate-rewrap-keys`
-([operations.md#rotating-the-encryption-key](operations.md#rotating-the-encryption-key));
-keep their ring key until none remain. An unreadable sync blob counts as no
-cached state. Losing every ring key makes the stored keys unreadable: back up
-the secrets. A portable private-state export exists in code only: `CapDbPrivateStateProvider.exportPrivateStates({ password })`.
+`PrivateStates`, `ContractSigningKeys` and `WalletSyncStates` are encrypted under a per-account data key in `AccountKeys`. That key is sealed under the active ring key and under the viewing-key password. Rows with `keyScheme` null use the older derivation and migrate on a session read or through `nightgate-rewrap-keys`, see [operations.md#rotating-the-encryption-key](operations.md#rotating-the-encryption-key). Losing every ring key makes the stored keys unreadable, so back up the secrets.
 
-### Security middleware
+### HTTP security
 
-NIGHTGATE installs no global HTTP middleware; CORS, CSP, HSTS and preflight are
-host policy. Hosts serving `/zk-config/...` or `/contract-manifest`
-cross-origin add them to their CORS allow-list. The plugin registers two
-transport lanes with `@odatano/cap-auth` (agent token on `/odata/v4/midnight`,
-public verify under `NIGHTGATE_PUBLIC_VERIFY`); they act only in a host that
-runs that package as its `cds.requires.auth.impl`, as the standalone image
-does. There, with `NIGHTGATE_PUBLIC_VERIFY=true`, `/odata/v4/midnight-verify` is admitted
-without credentials and its preflight answered with `*`.
+NIGHTGATE installs no global HTTP middleware. CORS, CSP and HSTS are host policy. The plugin registers two transport lanes with `@odatano/cap-auth`: the agent token on `/odata/v4/midnight` and public verify on `/odata/v4/midnight-verify`. They act only where the host uses that package as `cds.requires.auth.impl`, as the image does.
 
 ## Programmatic API
 
 ```ts
-import {
-  initialize,
-  shutdown,
-  getStatus,
-  DEFAULT_NETWORK,
-  DEFAULT_NODE_URLS,
-  DEFAULT_INDEXER_URLS
-} from '@odatano/nightgate';
+import { initialize, shutdown, getStatus, DEFAULT_NETWORK, DEFAULT_NODE_URLS, DEFAULT_INDEXER_URLS } from '@odatano/nightgate';
 ```
 
-`getStatus()` returns:
+`getStatus()` returns `{ initialized, crawlerEnabled, network?, nodeUrl?, mode, lastError?, instanceId?, runtimeMode?, replicaCount?, databaseKind?, runtimeWarnings? }`. `mode` is `idle`, `active` or `offline`.
 
-```ts
-{
-  initialized: boolean,
-  crawlerEnabled: boolean,
-  network?: string,
-  nodeUrl?: string,
-  mode: 'idle' | 'active' | 'offline',
-  lastError?: string
-}
-```
-
-## Services + entities
+## Services and entities
 
 | Service | Path | Surface |
 |---|---|---|
-| `NightgateService` | `/odata/v4/midnight` | Blockchain entities + wallet sessions + token ops + contract ops |
-| `NightgateIndexerService` | `/odata/v4/midnight-indexer` | Sync state, health, reorgs, Prometheus metrics, crawler control |
-| `NightgateAnalyticsService` | `/odata/v4/midnight-analytics` | Aggregate counts |
-| `NightgateAdminService` | `/odata/v4/midnight-admin` | Session admin |
-| `NightgateVerifyService` | `/odata/v4/midnight-verify` | `verifyAttestationState` + `verifyPredicateState` without credentials (`NIGHTGATE_PUBLIC_VERIFY=true`; off: `404 PUBLIC_VERIFY_DISABLED`), per-address rate limit |
+| `NightgateService` | `/odata/v4/midnight` | Chain entities, wallet sessions, token and contract actions |
+| `NightgateIndexerService` | `/odata/v4/midnight-indexer` | `SyncState`, `ReorgLog`, health, metrics, crawler control |
+| `NightgateAnalyticsService` | `/odata/v4/midnight-analytics` | `BlockStatistics`, `ContractStatistics` |
+| `NightgateAdminService` | `/odata/v4/midnight-admin` | Sessions, jobs, roles, swap offers, learned token types |
+| `NightgateVerifyService` | `/odata/v4/midnight-verify` | `verifyAttestationState`, `verifyPredicateState` without credentials when `NIGHTGATE_PUBLIC_VERIFY=true` |
 
-For per-action signatures and curl examples, see [actions.md](actions.md).
+Signatures and examples: [actions.md](actions.md).
 
-### NightgateService entities (all `@readonly` unless noted)
+### NightgateService entities
 
-- `Blocks` (`author`: AURA public key of the validator that produced the block, stored only when the header seal verifies against it, else `null`; `slot`: the block's AURA slot; a block stored by an older version held the slot in `author` and is rewritten in the background, `SyncState.authorBackfillHeight` is the height up to which blocks carry the validator and `SyncState.authorsBackfilledAt` is set once all do), `Transactions` (`isShielded`: carries zswap coins; `hasProof`: carries a contract call or zswap proof, the DUST fee spend's proof does not count; both need `crawler.decodePayloads` and are `null` on a row not decoded; `txType` of a transaction without contract action or unshielded movement is `contract_call` until decoded, then `shielded_transfer` or `dust_registration`; `byIdentifier(identifier)` finds a transaction by one of its ledger identifiers and returns `hash`, `ledgerTxHash`, `blockHeight`, `blockHash`, `status` and `failedSegments`, 404 while not indexed), `TransactionResults`, `TransactionSegments`, `TransactionFees`
-- `ContractActions` (one row per contract action the `Midnight` pallet reported applied, with its `address`; `entryPoint` needs `crawler.decodePayloads`; `stateHash`/`stateSize`, `ContractBalances` and the full `state` need `crawler.indexerSupplement`, the full `state` only under `crawler.contractStateHistory` `watched`/`all`), `ContractBalances`
-- `ContractStates` (the newest state per contract, from the supplement); `stateAt(address, height)` returns the state after the contract's newest action at or below `height` (omitted: the current one) from this table, a kept per-action state, or the indexer, checked against the stored hash (`source`, `verified`; indexer reads capped by `NIGHTGATE_STATE_AT_INDEXER_RATE` across callers, 503 while the indexer has not reached the contract's newest action), with `blockHash`, the `ledgerParameters` in effect at that block (the newest the supplement stored at or below it, else asked from the indexer once; `null` when unknown) and how far the database is: `coveredHeight` (every contract state up to this block is stored; `null` for an indexer answer) and `chainHeight`
-- `UnshieldedUtxos` (from `Midnight.UnshieldedTokens`; `registeredForDustGeneration` needs `crawler.indexerSupplement`), `NightBalances` (derived from them)
-- `ZswapLedgerEvents`, `DustLedgerEvents` (the indexer's event streams; both need `crawler.indexerSupplement`)
-- `Documents`, `PredicateAttestations`, `DisclosureGrants`, `GranteeIdentities`
-- `PendingSubmissions`: read scoped to the caller's sessions (admins unfiltered)
-- `WalletSessions`: excludes `viewingKeyHash`, `encryptedViewingKey`, `encryptedSeedKey`; read scoped to the owning `userId` (admins unfiltered)
+All are read-only.
 
-### Schema additions
-
-| Entity / Field | Purpose |
+| Entity | Notes |
 |---|---|
-| `PendingSubmissions` | Submission lifecycle `pending` → `included` → `finalized` / `failed`, written before the SDK call |
-| `PrivateStates` | Encrypted private state per `(accountId, contractAddress, privateStateId)` |
-| `ContractSigningKeys` | Encrypted contract signing keys per `(accountId, contractAddress)` |
-| `WalletSyncStates` | Serialized sub-wallet blobs per `accountId`, restored on the next `connectWalletForSigning` |
-| `WalletSessions.encryptedSeedKey` | Set by `connectWalletForSigning`; null = read-only session |
-| `BackgroundJobs` | Async jobs; poll `getJobStatus(jobId, sessionId)` |
-| `Attestations` | Attestation index (payload hash, attester, public metadata) behind the `AttestationService` tiers |
-| `Documents` | `sha256` + caller `storageRef` (`s3://` \| `ipfs://` \| `file:///`); never the bytes. `anchorDocument` records `anchoredTxHash`, `verifyDocument` re-checks it |
-| `DisclosureRoles` | Off-chain per-user tiers (`userId`, `role`, `scope`, `validFrom`/`validUntil`), granted via admin `grantRole` |
-| `DisclosureGrants` | Chain-derived ACL from the vault `disclosures` map, reconciled after each grant/revoke |
-| `GranteeIdentities` | `userId` → vault `granteeId` (`bindingKind`, `scope`), set by `registerGranteeIdentity` |
-| `AgentGrants.mintedTokenTypes` | Raw token types minted under the grant (JSON array); sponsorable for it beyond platform list ∩ grant list |
+| `Blocks` | `author` is the validator's AURA key, null when the header seal does not verify. `slot` is the AURA slot. Older rows are rewritten in the background, tracked by `SyncState.authorBackfillHeight` and `authorsBackfilledAt` |
+| `Transactions` | `isShielded`, `hasProof` and the final `txType` need `crawler.decodePayloads`. `byIdentifier(identifier)` finds a transaction by a ledger identifier, 404 while not indexed |
+| `TransactionResults`, `TransactionSegments`, `TransactionFees` | Per-transaction outcome, segments and fees |
+| `ContractActions` | One row per applied contract action. `entryPoint` needs `crawler.decodePayloads`. `stateHash`, `stateSize` and `state` need `crawler.indexerSupplement` |
+| `ContractBalances` | Needs `crawler.indexerSupplement` |
+| `ContractStates` | Newest state per contract. `stateAt(address, height)` returns the state after the newest action at or below `height`, with `source`, `verified`, `blockHash`, `ledgerParameters`, `coveredHeight` and `chainHeight` |
+| `UnshieldedUtxos`, `NightBalances` | From `Midnight.UnshieldedTokens`. `registeredForDustGeneration` needs `crawler.indexerSupplement` |
+| `ZswapLedgerEvents`, `DustLedgerEvents` | Indexer event streams. Need `crawler.indexerSupplement` |
+| `Documents`, `PredicateAttestations`, `DisclosureGrants`, `GranteeIdentities` | Attestation and disclosure records |
+| `PendingSubmissions` | Scoped to the caller's sessions. Admins see all |
+| `WalletSessions` | Without key columns. Scoped to the owning user. Admins see all |
+| `AgentGrants` | Agent grants of the caller |
+
+### Stored tables
+
+| Entity | Purpose |
+|---|---|
+| `PendingSubmissions` | Submission lifecycle `pending`, `included`, `finalized` or `failed`. Written before the SDK call |
+| `BackgroundJobs` | Async jobs. Poll `getJobStatus(jobId, sessionId)` |
+| `PrivateStates` | Encrypted private state per account, contract and private-state id |
+| `ContractSigningKeys` | Encrypted contract signing keys per account and contract |
+| `AccountKeys` | Per-account data keys |
+| `WalletSyncStates` | Serialized sub-wallet states per account |
+| `WalletSessions.encryptedSeedKey` | Set by `connectWalletForSigning`. Null means read-only session |
+| `Attestations` | Attestation index: payload hash, attester, public metadata |
+| `Documents` | `sha256` and the caller's `storageRef`, never the bytes |
+| `DisclosureRoles` | Off-chain roles per user, granted by admin `grantRole` |
+| `DisclosureGrants` | Read from the vault `disclosures` map after each grant or revoke |
+| `HolderDisclosureGrants` | Disclosures granted to the holders of a token type |
+| `GranteeIdentities` | User to vault grantee id, set by `registerGranteeIdentity` |
+| `AgentGrants` | Agent tokens, rights and budgets. `mintedTokenTypes` lists token types minted under the grant |
+| `SwapOffers`, `LearnedTokenTypes` | Offer board and token types learned from sponsored mints |
+| `ContractRegistrations` | Contracts registered at runtime |
+| `TransactionIdentifiers` | Ledger identifiers of indexed transactions |
+| `SyncState`, `ReorgLog`, `InstanceLeases` | Crawler progress, reorg history, process lease |
 
 Enums in `db/types.cds`:
 
-- `PendingSubmissionStatus`: `pending` | `included` | `finalized` | `failed`
-- `BackgroundJobStatus`: `pending` | `running` | `external_execution` | `submitted` | `reconciliation_required` | `succeeded` | `failed`
-- `DisclosureRole`: `public_only` | `legitimate_interest` | `authority` (levels 0, 1, 2)
+- `BackgroundJobStatus`: `pending`, `running`, `external_execution`, `submitted`, `reconciliation_required`, `succeeded`, `failed`
+- `BackgroundJobChainStatus`: `pending`, `success`, `failure`, `dropped`
+- `DisclosureRole`: `public_only`, `legitimate_interest`, `authority`
+- `SwapOfferStatus`: `open`, `filled`, `retired`, `expired`
 
 ## Project structure
 
 ```
-src/
-  index.ts, plugin.ts     # initialize / shutdown / getStatus; cds-plugin entry, connector routes
-  browser/                # @odatano/nightgate/browser: dApp providers, prepare* calls
-  txbuilder/              # @odatano/nightgate/txbuilder: build, prove and sign without a server
-srv/
-  *.cds, *.ts             # the five OData services
-  crawler/                # block crawler, main thread
-  providers/              # Substrate RPC client
-  midnight/               # wallet SDK: worker entry, worker modules, main-thread RPC client
-  submission/             # actions, job executors, finalizers, contract registry
-  sessions/               # wallet sessions
-  utils/                  # config, encryption, errors
-docker/                   # image, compose (nightgate, node, indexer, proof server, postgres)
-scripts/                  # dev and serve wrappers, e2e lanes, migrations, key tools
-test/                     # unit and integration suites
+src/          plugin entry, connector routes, browser and txbuilder exports
+srv/          the five OData services
+  crawler/    block crawler
+  providers/  Substrate RPC client
+  midnight/   wallet SDK, worker threads
+  submission/ actions, job executors, finalizers, contract registry
+  sessions/   wallet sessions, agent grants
+  utils/      config, encryption, errors
+docker/       image and compose files
+scripts/      dev and serve wrappers, e2e lanes, migrations, key tools
+test/         unit and integration suites
 ```
 
 ## Development
 
-Scripts and lanes: [operations.md#scripts-at-a-glance](operations.md#scripts-at-a-glance). Before a tag: `npm run check:release` (build, lint, typecheck, tests, schema delta, browser bundle, slim package, exports), `check:release:full` adds the PostgreSQL lane.
+Scripts: [operations.md#scripts-at-a-glance](operations.md#scripts-at-a-glance). Before a tag run `npm run check:release`. `check:release:full` adds the PostgreSQL lane.

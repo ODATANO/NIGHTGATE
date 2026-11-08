@@ -5,7 +5,6 @@ import { assertArtifactGeneration } from '../contract-registry';
 import { resolveFeeSponsor, ensureFeeSponsorFacade } from '../fee-sponsor';
 import { coerceCircuitArgs } from '../arg-coercion';
 import { getNightgatePluginConfig } from '../../utils/nightgate-config';
-import { ensureNetworkId } from '../../midnight/providers';
 import { runChildCommand } from '../background-jobs';
 import { jobKindOp } from '../job-kinds';
 import { vaultDims } from '../verify-state';
@@ -288,7 +287,6 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
             };
         }
         const facadeCfg = facadeConfigFromEnv();
-        await ensureNetworkId(facadeCfg.networkId);
         // The resolver checks the digest against the exact copy it loads,
         // so a parallel registerContract cannot swap the contract in between.
         const resolved = await contractResolver(

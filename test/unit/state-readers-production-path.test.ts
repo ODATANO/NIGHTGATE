@@ -16,9 +16,19 @@
 import path from 'node:path';
 
 const queryContractState = vi.hoisted(() => (vi.fn()));
-const buildPublicDataProvider = vi.hoisted(() => (vi.fn(async () => ({ queryContractState }))));
+// The SDK hands over a serialized state tagged with the ledger era that wrote it. The tests script the decoded ledger 9 data.
+const buildPublicDataProvider = vi.hoisted(() => (vi.fn(async () => ({
+    queryContractState: async (address: string) => {
+        const state = await queryContractState(address);
+        if (!state) return state;
+        if (state.era) return { contractState: { era: state.era, deserialize: () => { throw new Error('not decodable'); } } };
+        const decoded = 'data' in state ? state : { data: state };
+        return { contractState: { era: 'v9', deserialize: () => decoded } };
+    }
+}))));
 
-vi.mock('../../srv/midnight/public-data-provider', () => ({
+vi.mock('../../srv/midnight/public-data-provider', async (importOriginal) => ({
+    ...await importOriginal<typeof import('../../srv/midnight/public-data-provider')>(),
     buildPublicDataProvider
 }));
 
@@ -162,15 +172,11 @@ describe('readAttestationStateForContract (production wrapper)', () => {
         expect(result).toMatchObject({ attested: true, contentRootOk: false, attesterId: ATTESTER, documentId: '' });
     });
 
-    it('accepts a bare StateValue (no .data wrapper)', async () => {
-        queryContractState.mockResolvedValue({ attestations: {}, content_anchors: {}, document_bindings: {} });
-        const result = await readAttestationStateForContract({
+    it('refuses a state written by ledger 8', async () => {
+        queryContractState.mockResolvedValue({ era: 'v8' });
+        await expect(readAttestationStateForContract({
             contractAddress: '0xvault', attesterId: ATTESTER, payloadHash: PAYLOAD, artifactPath: ARTIFACT, contractProvidersConfig: CFG
-        });
-        expect(result).toEqual({
-            attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false, attesterId: '', payloadHash: '', recordKey: RK,
-            documentId: '', contentRoot: '', schemaId: ''
-        });
+        })).rejects.toThrow(/written by ledger v8/);
     });
 });
 

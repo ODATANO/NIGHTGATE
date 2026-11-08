@@ -2,7 +2,7 @@
 // Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
 import { hexToBytes } from '../utils/hex';
 import { importArtifact } from './artifact-import';
-import { buildPublicDataProvider } from '../midnight/public-data-provider';
+import { buildPublicDataProvider, queryLedger9ContractState } from '../midnight/public-data-provider';
 import { computeRecordKey, type ContractArtifact } from './predicate-state';
 
 function hex(b: Uint8Array): string {
@@ -47,8 +47,8 @@ export interface ReadAttestationStateDeps {
     documentId?: string;
     contentRoot?: string;
     schemaId?: string;
-    ledger: (state: any) => AttestationLedger;
-    queryContractState: (contractAddress: string) => Promise<any | null>;
+    ledger: (state: unknown) => AttestationLedger;
+    queryContractState: (contractAddress: string) => Promise<{ data?: unknown } | null>;
 }
 
 const ZERO_ID = '00'.repeat(32);
@@ -136,6 +136,6 @@ export async function readAttestationStateForContract(
         contentRoot: args.contentRoot,
         schemaId: args.schemaId,
         ledger: artifact.ledger,
-        queryContractState: (addr: string) => publicData.queryContractState(addr)
+        queryContractState: (addr: string) => queryLedger9ContractState(publicData, addr)
     });
 }

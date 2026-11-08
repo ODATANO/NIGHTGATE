@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { type NightgateNetwork, VALID_NIGHTGATE_NETWORKS } from '../../utils/nightgate-config';
-import { ensureNetworkId } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
 import { vaultRef, UINT64_MAX, vaultDims, parsePredicate, coerceMask, liveProviderConfigured } from '../verify-state';
 import { blake2b256Hex, PureCircuitsUnavailableError } from '../document-proof';
@@ -86,7 +85,6 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
@@ -191,7 +189,6 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
@@ -341,7 +338,6 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
@@ -458,7 +454,6 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
@@ -571,7 +566,6 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
@@ -847,7 +841,6 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await ensureNetworkId(facadeCfg.networkId);
             await contractResolver(compiledRef);
             await walletFactory({ sessionId: data.sessionId!, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);

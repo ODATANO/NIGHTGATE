@@ -2,6 +2,7 @@
 // The raw seed would give a different, empty account.
 // Named imports, because bip39's CJS build has no default export.
 import { validateMnemonic, mnemonicToSeedSync } from 'bip39';
+import type * as WalletHd from '@midnightntwrk/wallet-sdk-hd';
 
 const ACCOUNT = 0;
 const KEY_INDEX = 0;
@@ -12,8 +13,8 @@ export interface RoleSeeds {
     night: Uint8Array;
 }
 
-let cachedHd: any;
-async function loadWalletHd(): Promise<any> {
+let cachedHd: typeof WalletHd | undefined;
+async function loadWalletHd(): Promise<typeof WalletHd> {
     if (!cachedHd) cachedHd = await import('@midnightntwrk/wallet-sdk-hd');
     return cachedHd;
 }
@@ -48,7 +49,7 @@ export async function deriveRoleSeeds(bip39Seed: Uint8Array, accountIndex: numbe
     }
 }
 
-function deriveOne(hd: any, role: number, accountIndex: number): Uint8Array {
+function deriveOne(hd: WalletHd.HDWallet, role: WalletHd.Role, accountIndex: number): Uint8Array {
     const d = hd.selectAccount(accountIndex).selectRole(role).deriveKeyAt(KEY_INDEX);
     if (d?.type !== 'keyDerived' || d.key?.length !== 32) {
         throw new Error(`HD key derivation failed for role ${role}: ${d?.type ?? 'no result'}`);

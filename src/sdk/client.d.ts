@@ -56,7 +56,7 @@ export type Params = Record<string, string | number | bigint | boolean | Int64Li
 export type ActionParams = Record<string, unknown>;
 /** The parsed job result, plus the job id and the transaction hash. */
 /** `txHash` is the ledger identifier; `transactionHash` the hash explorers show, null until indexed. */
-export type JobResult = Record<string, unknown> & { jobId: string; txHash?: string; transactionHash?: string | null };
+export type JobResult = Record<string, unknown> & { jobId: string; sessionId?: string; txHash?: string; transactionHash?: string | null; receipt?: Receipt };
 
 /** A contract's state as the server serves it. Binary fields are base64. */
 export interface ContractStateSnapshot {
@@ -96,6 +96,8 @@ export interface ContractDeployInfo {
     ledgerTxHash: string | null;
     blockHeight: number;
     blockHash: string;
+    blockTimestamp: number;
+    protocolVersion: number;
     status: string | null;
     failedSegments: number[];
     /** The transaction's ledger identifiers, in order. */
@@ -119,6 +121,8 @@ export interface NightgateClient {
     transactionByIdentifier(identifier: string): Promise<TransactionInclusion | null>;
     /** Null while the server has not indexed the deploy. */
     contractDeploy(address: string): Promise<ContractDeployInfo | null>;
+    /** The serialized ledger transaction as base64, or null while the server has not indexed it. */
+    ledgerTransaction(hash: string): Promise<string | null>;
 
     // checks that read the chain directly
     verifyAttestation(p: Params): Promise<any>;

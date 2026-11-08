@@ -60,7 +60,7 @@ let handlers: Record<string, (req: any) => Promise<unknown>>;
 let submitterBehaviour: { call: () => Promise<{ txHash: string }> };
 
 function walletMaterial() {
-    return { accountId: 'acct', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: {} };
+    return { accountId: 'acct', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' } };
 }
 
 function resolvedContract() {

@@ -50,7 +50,17 @@ service NightgateService {
             // identifier: a ledger identifier of the transaction, hex. 404 while the indexer has not seen it.
             @cds.odata.bindingparameter.collection
             function byIdentifier(identifier: String)       returns TransactionInclusion;
+
+            // hash: the transaction's hash as the row stores it. 404 while not indexed or when the row carries no ledger transaction.
+            @cds.odata.bindingparameter.collection
+            function ledgerTransaction(hash: String)        returns TransactionLedgerBytes;
         };
+
+    /** The serialized ledger transaction inside a transaction's extrinsic. */
+    type TransactionLedgerBytes {
+        hash              : String;
+        ledgerTransaction : String; // base64
+    }
 
     /** Where a transaction landed. `status` is null until the indexer supplement has the result. */
     type TransactionInclusion {
@@ -525,7 +535,7 @@ service NightgateService {
                                     contentRoot: Hex64, // optional; must match the stored content root
                                     schemaId: Hex64, // optional; must match the stored schema id
                                     compiledArtifactRef: String, // optional, default 'attestation-vault'
-                                    network: String // optional, default the server's network; e.g. 'preprod'
+                                    network: String // optional, default the server's network; e.g. 'preview'
     )                                                                         returns {
         verified          : Boolean;
         attested          : Boolean; // the payload hash is attested
@@ -562,7 +572,7 @@ service NightgateService {
                                   allowedMask: Integer64, // required for 'documentIntegrity'; bit i set = field i may differ
                                   k: Integer, // required for 'documentDiff'; minimum number of differing fields
                                   compiledArtifactRef: String, // optional, default 'attestation-vault'
-                                  network: String // optional, default the server's network; e.g. 'preprod'
+                                  network: String // optional, default the server's network; e.g. 'preview'
     )                                                                         returns {
         verified : Boolean;
         proven   : Boolean; // the proof is recorded on chain as true

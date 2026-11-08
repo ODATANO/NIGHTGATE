@@ -6,6 +6,7 @@ import type { Request, Response } from 'express';
 import { getNightgatePluginConfig, getConfiguredNightgateNetwork, DEFAULT_NETWORK } from '../srv/utils/nightgate-config';
 import { getContractRegistration, listRegisteredContracts } from '../srv/submission/contract-registry';
 import { configString } from '../srv/utils/config';
+import { ZK_ARTIFACT_MANIFEST_DIR, ZK_ARTIFACT_MANIFEST_FILE, hasZkArtifactManifest } from '../srv/submission/zk-artifact-manifest';
 
 // HTTP routes that browser apps use to load proving files and the contract list.
 // HTTP security and CORS are left to the host app.
@@ -32,7 +33,12 @@ function listZkFiles(zkConfigPath: string, dir: 'keys' | 'zkir'): string[] {
     } catch { return []; }
 }
 
-export function mountZkConfigRoute(app: any): void {
+/** The part of an express app the routes need. */
+export interface RouteApp {
+    get(path: string | string[], handler: (req: Request, res: Response) => void): unknown;
+}
+
+export function mountZkConfigRoute(app: RouteApp): void {
     // The bare contract path lists what is served below it.
     app.get(['/zk-config/:contract', '/zk-config/:contract/'], (req: Request, res: Response) => {
         const contract = String(req.params.contract);
@@ -42,13 +48,22 @@ export function mountZkConfigRoute(app: any): void {
         res.json({
             contract,
             circuits: listContractCircuits(reg.zkConfigPath),
-            files: { keys: listZkFiles(reg.zkConfigPath, 'keys'), zkir: listZkFiles(reg.zkConfigPath, 'zkir') }
+            files: {
+                keys: listZkFiles(reg.zkConfigPath, 'keys'),
+                zkir: listZkFiles(reg.zkConfigPath, 'zkir'),
+                ...(hasZkArtifactManifest(reg.zkConfigPath) ? { [ZK_ARTIFACT_MANIFEST_DIR]: [ZK_ARTIFACT_MANIFEST_FILE] } : {})
+            }
         });
     });
 
-    app.get('/zk-config/:contract/:dir/:file', (req: any, res: any) => {
-        const { contract, dir, file } = req.params;
-        if ((dir !== 'keys' && dir !== 'zkir') || !ZK_FILE_RE.test(file)) {
+    app.get('/zk-config/:contract/:dir/:file', (req: Request, res: Response) => {
+        const contract = String(req.params.contract);
+        const dir = String(req.params.dir);
+        const file = String(req.params.file);
+        const served = dir === ZK_ARTIFACT_MANIFEST_DIR
+            ? file === ZK_ARTIFACT_MANIFEST_FILE
+            : (dir === 'keys' || dir === 'zkir') && ZK_FILE_RE.test(file);
+        if (!served) {
             res.status(404).end();
             return;
         }
@@ -63,7 +78,7 @@ export function mountZkConfigRoute(app: any): void {
         res.setHeader('ETag', etag);
         // Not cached forever, because a contract upgrade serves new keys under the same path.
         res.setHeader('Cache-Control', 'public, no-cache');
-        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Type', file.endsWith('.json') ? 'application/json' : 'application/octet-stream');
         if (req.headers['if-none-match'] === etag) { res.status(304).end(); return; }
         fs.createReadStream(absPath)
             .on('error', () => { if (!res.headersSent) res.status(500).end(); })
@@ -84,8 +99,8 @@ function listContractCircuits(zkConfigPath: string): string[] {
 }
 
 // Lists registered contracts. Addresses are included only when set in the config.
-export function mountContractManifestRoute(app: any): void {
-    app.get('/contract-manifest', (req: any, res: any) => {
+export function mountContractManifestRoute(app: RouteApp): void {
+    app.get('/contract-manifest', (_req: Request, res: Response) => {
         const cfg = getNightgatePluginConfig();
         const network = getConfiguredNightgateNetwork(cfg) || DEFAULT_NETWORK;
         // Without a configured base URL the links are relative. The Host header is never used.

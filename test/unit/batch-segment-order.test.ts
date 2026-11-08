@@ -1,17 +1,25 @@
 /**
  * Tests for srv/midnight/batch-segment-order.ts: deterministic segment
  * ordering for batched contract calls. Fake transactions stand in for the
- * ledger-v8 WASM objects; the contract under test is pure Map surgery plus
+ * ledger-v9 WASM objects; the contract under test is pure Map surgery plus
  * the proof-provider wrapper semantics.
  */
 
-import {
+import * as batchSegmentOrder from '../../srv/midnight/batch-segment-order';
+
+// The fakes stand in for ledger objects, so the module is used untyped here.
+const {
     callSegments,
     BatchCausalityError,
     findCausalityViolation,
     orderBatchSegments,
-    withOrderedBatchSegments
-} from '../../srv/midnight/batch-segment-order';
+    withOrderedBatchSegments,
+    __unprovenTxCodecForTests
+} = batchSegmentOrder as any;
+
+// A fake handle carries the transaction itself, so opening and sealing need no ledger.
+beforeAll(() => __unprovenTxCodecForTests.set({ open: (h: any) => h.tx, seal: (tx: any) => ({ era: 'v9', tx }) }));
+afterAll(() => __unprovenTxCodecForTests.set(undefined));
 
 function intentFor(circuit: string | Uint8Array) {
     return { actions: [{ entryPoint: circuit }] };
@@ -196,6 +204,9 @@ describe('findCausalityViolation', () => {
     });
 });
 
+/** Stands for the handle midnight-js hands to `proveTx` for a ledger 9 transaction. */
+const v9 = (tx: unknown) => ({ era: 'v9', tx });
+
 describe('withOrderedBatchSegments', () => {
     test('reorders before delegating and passes all arguments through', async () => {
         const attest = intentFor('attest');
@@ -207,10 +218,10 @@ describe('withOrderedBatchSegments', () => {
         };
 
         const wrapped = withOrderedBatchSegments(provider, ['attest', 'bindPassport']);
-        const out = await wrapped.proveTx(tx, { zk: 'config' });
+        const out = await wrapped.proveTx(v9(tx), { zk: 'config' });
 
         expect(out).toBe('proven');
-        expect(seen).toEqual([[tx, { zk: 'config' }]]);
+        expect(seen).toEqual([[v9(tx), { zk: 'config' }]]);
         expect(tx.intents.get(4)).toBe(attest); // reordered before the delegate saw it
         expect(tx.intents.get(9)).toBe(bind);
     });
@@ -227,7 +238,7 @@ describe('withOrderedBatchSegments', () => {
 
         const wrapped = withOrderedBatchSegments(provider, ['attest', 'bindPassport'], {}, preflight);
 
-        await expect(wrapped.proveTx(tx)).rejects.toThrow(/runs out of gas/);
+        await expect(wrapped.proveTx(v9(tx))).rejects.toThrow(/runs out of gas/);
         expect(preflight).toHaveBeenCalledTimes(1);
         expect(provider.proveTx).not.toHaveBeenCalled();
     });
@@ -238,7 +249,7 @@ describe('withOrderedBatchSegments', () => {
 
         const wrapped = withOrderedBatchSegments(provider, ['a', 'b']);
 
-        await expect(wrapped.proveTx(evil))
+        await expect(wrapped.proveTx(v9(evil)))
             .rejects.toThrow(/wasm boundary says no.*aborting before proving/s);
         expect(provider.proveTx).not.toHaveBeenCalled();
     });
@@ -247,7 +258,7 @@ describe('withOrderedBatchSegments', () => {
         const provider = { proveTx: vi.fn(async () => 'ok') };
         const wrapped = withOrderedBatchSegments(provider, ['a', 'b']);
 
-        await expect(wrapped.proveTx(txWithIntents([[1, intentFor('a')]])))
+        await expect(wrapped.proveTx(v9(txWithIntents([[1, intentFor('a')]]))))
             .rejects.toThrow(/could not match.*aborting before proving/s);
         expect(provider.proveTx).not.toHaveBeenCalled();
     });
@@ -261,7 +272,7 @@ describe('withOrderedBatchSegments', () => {
 
         const wrapped = withOrderedBatchSegments(provider, ['attest', 'anchorContentRoot']);
 
-        await expect(wrapped.proveTx(tx))
+        await expect(wrapped.proveTx(v9(tx)))
             .rejects.toThrow(/violates the ledger's causality constraint.*FALLIBLE.*Aborted before proving/s);
         expect(provider.proveTx).not.toHaveBeenCalled();
     });
@@ -275,7 +286,7 @@ describe('withOrderedBatchSegments', () => {
 
         const wrapped = withOrderedBatchSegments(provider, ['attest', 'anchorContentRoot']);
 
-        await expect(wrapped.proveTx(tx)).resolves.toBe('proven');
+        await expect(wrapped.proveTx(v9(tx))).resolves.toBe('proven');
         expect(provider.proveTx).toHaveBeenCalledTimes(1);
     });
 
@@ -283,8 +294,15 @@ describe('withOrderedBatchSegments', () => {
         const provider = { proveTx: vi.fn(async () => 'ok') };
         const wrapped = withOrderedBatchSegments(provider, ['a']);
 
-        await expect(wrapped.proveTx(txWithIntents([[1, intentFor('a')]]))).resolves.toBe('ok');
+        await expect(wrapped.proveTx(v9(txWithIntents([[1, intentFor('a')]])))).resolves.toBe('ok');
         expect(provider.proveTx).toHaveBeenCalledTimes(1);
+    });
+
+    test('a ledger 8 payload is refused before proving', async () => {
+        const provider = { proveTx: vi.fn(async () => 'proven') };
+        await expect(withOrderedBatchSegments(provider, ['a', 'b']).proveTx({ era: 'v8', tx: {} }))
+            .rejects.toThrow(/expected a ledger 9 transaction/);
+        expect(provider.proveTx).not.toHaveBeenCalled();
     });
 
     test('preserves the rest of the provider surface via the prototype chain', () => {
@@ -370,9 +388,9 @@ describe('withOrderedBatchSegments: grouping and the structured refusal', () => 
         // predicate comes first, so call order yields g,f,g (refused).
         const mk = () => txWithIntents([[2, stagedIntent('proveFieldPredicate', 'f')], [1, stagedIntent('proveFieldMembership', 'g')], [3, stagedIntent('proveFieldPredicate', 'g')]]);
 
-        await expect(withOrderedBatchSegments(provider, names).proveTx(mk())).rejects.toThrow(/causality/);
+        await expect(withOrderedBatchSegments(provider, names).proveTx(v9(mk()))).rejects.toThrow(/causality/);
         expect(provider.proveTx).not.toHaveBeenCalled();
-        await expect(withOrderedBatchSegments(provider, names, { independentCalls: true }).proveTx(mk())).resolves.toBe('proven');
+        await expect(withOrderedBatchSegments(provider, names, { independentCalls: true }).proveTx(v9(mk()))).resolves.toBe('proven');
         expect(provider.proveTx).toHaveBeenCalledTimes(1);
     });
 
@@ -380,7 +398,7 @@ describe('withOrderedBatchSegments: grouping and the structured refusal', () => 
         const provider = { proveTx: vi.fn(async () => 'proven') };
         const tx = txWithIntents([[20, stagedIntent('anchorContentRoot', 'g')], [10, stagedIntent('attest', 'f')]]);
         let err: any;
-        try { await withOrderedBatchSegments(provider, ['attest', 'anchorContentRoot']).proveTx(tx); } catch (e) { err = e; }
+        try { await withOrderedBatchSegments(provider, ['attest', 'anchorContentRoot']).proveTx(v9(tx)); } catch (e) { err = e; }
         expect(err).toBeInstanceOf(BatchCausalityError);
         expect(err.code).toBe('BatchCausalityViolation');
         expect(err.calls).toEqual([

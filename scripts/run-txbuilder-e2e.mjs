@@ -61,7 +61,7 @@ function fnCall(name, params) {
     const t0 = Date.now();
     const builder = await createTxBuilder({
         seedHex,
-        networkId: process.env.NIGHTGATE_NETWORK || 'preprod',
+        networkId: process.env.NIGHTGATE_NETWORK || 'preview',
         indexerHttpUrl: INDEXER_HTTP,
         indexerWsUrl: INDEXER_WS,
         nodeUrl: NODE_URL,
