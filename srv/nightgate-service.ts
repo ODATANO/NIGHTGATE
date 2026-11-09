@@ -9,8 +9,8 @@ import { registerDocumentProofHandlers } from './submission/document-proof';
 import { receiptForJob } from './submission/receipts';
 import { getJobById, runWithoutAmbientTx } from './submission/background-jobs';
 import { LONG_POLL_MAX_MS, holdUntil, waiterPool } from './utils/long-poll';
-import { contractStateAt, IndexerBudgetExhausted, IndexerBehind, IndexerUnavailable, type ContractStateFetcher, type FetchedContractState } from './crawler/contract-state';
-import { fetchContractState } from './crawler/indexer-supplement';
+import { contractStateAt, IndexerBudgetExhausted, IndexerBehind, IndexerUnavailable, type ContractStateFetcher, type FetchedContractState, type LedgerParametersFetcher } from './crawler/contract-state';
+import { fetchContractState, fetchLedgerParameters } from './crawler/indexer-supplement';
 import { normalizeIdentifier } from './crawler/transaction-identifiers';
 import { readCapBinary } from './crawler/cap-binary';
 import { extractLedgerPayload } from './crawler/ledger-payload';
@@ -77,9 +77,42 @@ async function explorerHashOf(db: cds.DatabaseService, txHash: string | null | u
     return stored?.ledgerTxHash ?? null;
 }
 
-function fetchContractStateFromIndexers(): ContractStateFetcher {
+function indexerUrls(): string[] {
     const { crawlerConfig, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
-    const urls = [...new Set([String(crawlerConfig.indexerUrl || ''), submissionEndpoints.indexerHttpUrl].filter(Boolean))];
+    return [...new Set([String(crawlerConfig.indexerUrl || ''), submissionEndpoints.indexerHttpUrl].filter(Boolean))];
+}
+
+// Parameters change rarely, and a build on outdated ones is refused without a fee. So a short cache spares the indexer budget.
+const PARAMETERS_CACHE_MS = 30_000;
+const parametersCache = new Map<string, { at: number; value: string }>();
+
+/** Counts against the same budget as a state read. Only a database without stored parameters asks. */
+function fetchLedgerParametersFromIndexers(): LedgerParametersFetcher {
+    return async (height) => {
+        const key = String(height ?? 'tip');
+        const hit = parametersCache.get(key);
+        if (hit && Date.now() - hit.at < PARAMETERS_CACHE_MS) return hit.value;
+        const budget = stateAtIndexerLimiter().check('indexer');
+        if (!budget.allowed) throw new IndexerBudgetExhausted(budget.retryAfterMs);
+        let lastError: unknown;
+        for (const url of indexerUrls()) {
+            try {
+                const value = await fetchLedgerParameters(url, height);
+                if (value) {
+                    if (parametersCache.size >= 500) parametersCache.clear();
+                    parametersCache.set(key, { at: Date.now(), value });
+                }
+                return value;
+            } catch (err) {
+                lastError = err;
+            }
+        }
+        throw new IndexerUnavailable(lastError ?? new Error('no indexer configured'));
+    };
+}
+
+function fetchContractStateFromIndexers(): ContractStateFetcher {
+    const urls = indexerUrls();
     const read = async (address: string, height: number | null): Promise<FetchedContractState | null> => {
         let lastError: unknown;
         for (const url of urls) {
@@ -269,7 +302,7 @@ export default class NightgateService extends cds.ApplicationService {
             }
             try {
                 const snapshot = await contractStateAt(
-                    this.db, address, height == null ? null : Number(height), fetchContractStateFromIndexers()
+                    this.db, address, height == null ? null : Number(height), fetchContractStateFromIndexers(), fetchLedgerParametersFromIndexers()
                 );
                 if (!snapshot) return req.reject(404, `no state known for contract ${address}`);
                 return snapshot;
@@ -365,7 +398,7 @@ export default class NightgateService extends cds.ApplicationService {
         registerDocumentProofHandlers(this);
 
         this.on(getJobStatus, async (req) => {
-            const { jobId, sessionId, waitMs } = req.data;
+            const { jobId, sessionId, waitMs, untilChain } = req.data;
             if (!jobId) return req.reject(400, 'jobId is required');
             if (!sessionId) return req.reject(400, 'sessionId is required');
             if (waitMs != null && !(Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= LONG_POLL_MAX_MS)) {
@@ -397,7 +430,9 @@ export default class NightgateService extends cds.ApplicationService {
 
             if (waitMs) {
                 const found = job;
-                job = await holdUntil(req, waitMs, jobWaiters, found, async () => (await readJob(jobId)) ?? found, j => JOB_SETTLED.has(String(j.status)));
+                const settled = (j: BackgroundJob) => JOB_SETTLED.has(String(j.status))
+                    && !(untilChain === true && j.status === 'succeeded' && j.chainStatus === 'pending');
+                job = await holdUntil(req, waitMs, jobWaiters, found, async () => (await readJob(jobId)) ?? found, settled);
             }
             const transactionHash = await explorerHashOf(this.db, job.txHash);
 

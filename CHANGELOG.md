@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.42.1 - 2026-11-09
+
+### Changes
+
+- `@odatano/nightgate-tx` 0.21.1 builds calls on contracts deployed before
+  ledger 9. Such a contract keeps its ledger 8 verifier keys, so the builder
+  takes the package version compiled for ledger 8, npm tag `ledger8`, or an own
+  ledger 8 build through `contractClass` and `zkConfigDir`. The result is a
+  ledger 9 transaction, and a sponsor handles it like any other. One call per
+  transaction; a batch and `buildDeploySponsorable` are refused. See
+  `docs/txbuilder.md`.
+- `getJobStatus` takes `untilChain`. With `waitMs` it keeps holding a
+  `succeeded` job while `chainStatus` is `pending`.
+- SDK client: `ng.waitForReceipt({ jobId, sessionId })` waits for the receipt of
+  a sponsored transfer or swap. It throws when the job fails or can have none.
+  On a server without `untilChain` it polls.
+
+### Fixes
+
+- `ContractStates/stateAt` returns `ledgerParameters` for the requested height,
+  without a height for the chain's tip. Before, they came from the block of the
+  contract's newest action, so a contract idle since before a fork got the
+  parameters of the old ledger and a builder failed with
+  `PublicStatesEraMismatchError`.
+- The builder's chain reads over `{ api }` read the era of a deploy, a contract
+  state and the ledger parameters from their bytes. A deploy from before ledger
+  9 failed with `MIDNIGHT_JS_PR_INVALID_TRANSACTION_HANDLE`.
+- The server's own contract actions refuse a contract deployed before ledger 9
+  with a message that names the builder and `sponsorUnboundTransaction`. Before,
+  they reported a mismatch of verifier keys.
+
 ## 0.42.0 - 2026-11-08
 
 ### Breaking

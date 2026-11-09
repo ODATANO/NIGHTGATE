@@ -113,6 +113,11 @@ export interface NightgateClient {
     callAction(name: string, params?: ActionParams): Promise<any>;
     /** Polls getJobStatus until the job ends. Temporary poll errors are retried until they last longer than pollGraceMs, default 5 minutes. */
     waitForJob(input: { jobId: string; sessionId?: string; pollMs?: number; timeoutMs?: number; pollGraceMs?: number }): Promise<JobResult>;
+    /**
+     * Waits until the chain confirmed a sponsored swap or transfer and returns its receipt. Throws when the job fails or can have none.
+     * Holds one call on the server where it can. Otherwise it polls from `pollMs`, default 10000, doubling up to 60000. `timeoutMs` defaults to 10 minutes.
+     */
+    waitForReceipt(input: { jobId: string; sessionId?: string; pollMs?: number; timeoutMs?: number; pollGraceMs?: number }): Promise<Receipt>;
 
     // chain reads a transaction builder needs
     /** The contract's state at `height`, or its newest one. Null when the server knows no state. */

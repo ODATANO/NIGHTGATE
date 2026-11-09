@@ -24,12 +24,13 @@ Every submitting action returns `{ jobId, status: "pending" }` and runs as a bac
 - A `failed` job releases its key. The next request with that key starts a new job, with any payload.
 - A parked job (`reconciliation_required`) and a workflow step keep their key.
 
-### `getJobStatus(jobId, sessionId, waitMs?) → { jobId, kind, status, result, errorCode, errorMessage, attempt, maxAttempts, submissionId, txHash, transactionId, transactionHash, chainStatus, chainFinalizedAt, chainBlockHeight, chainBlockHash, chainSegments, queuedAt, externalExecutionAt, submittedAt, startedAt, finishedAt, receipt }`
+### `getJobStatus(jobId, sessionId, waitMs?, untilChain?) → { jobId, kind, status, result, errorCode, errorMessage, attempt, maxAttempts, submissionId, txHash, transactionId, transactionHash, chainStatus, chainFinalizedAt, chainBlockHeight, chainBlockHash, chainSegments, queuedAt, externalExecutionAt, submittedAt, startedAt, finishedAt, receipt }`
 
 An action that changes nothing.
 
 - `status`: `pending`, `running`, `external_execution`, `submitted`, `reconciliation_required`, `succeeded` or `failed`.
 - `waitMs` (at most 25000) holds the call until the job settles or the time is up. Past 100 waiting calls the server answers at once. A call ends when its client disconnects.
+- `untilChain: true` with `waitMs` keeps holding a `succeeded` job while `chainStatus` is `pending`. A receipt exists only after that.
 - `result` is JSON text. On failure `errorCode` and `errorMessage` are set, see [Error model](#error-model).
 - `txHash` equals `transactionId`, the ledger identifier. It exists once the transaction is built and stays the same when a sponsor adds its fee. `transactionHash` is the hash explorers show, `null` until indexed.
 - `chainStatus`: `null`, `pending`, `success`, `failure` or `dropped`. It is independent of `status`: `succeeded` with `failure` means the transaction finalized but the call reverted. `succeeded` with `dropped` means the transaction never landed before its ttl.
@@ -591,7 +592,7 @@ A hash can occur in more than one block, because the timestamp transaction repea
 
 `Transactions/byIdentifier` returns `{ identifier, hash, ledgerTxHash, blockHeight, blockHash, status, failedSegments }`. `status` is null until the indexer supplement has the result.
 
-`ContractStates/stateAt` returns the state at `height`, default the newest, with `source` `history`, `current` or `indexer`. `blockHash` and `ledgerParameters` come with it, null when unknown. 404 when no state is known. 503 while the crawler holds a newer action than the indexer; retry in a few seconds. 429 `indexer-budget` past the shared budget. 502 `BAD_GATEWAY` when the indexer fails, with the cause in the message and URLs removed.
+`ContractStates/stateAt` returns the state at `height`, default the newest, with `source` `history`, `current` or `indexer`. `blockHash` belongs to the state's block. `ledgerParameters` are those in effect at `height`, default the chain tip, because a contract at rest keeps its old state while the chain moves on. Both are null when unknown. 404 when no state is known. 503 while the crawler holds a newer action than the indexer; retry in a few seconds. 429 `indexer-budget` past the shared budget. 502 `BAD_GATEWAY` when the indexer fails, with the cause in the message and URLs removed.
 
 ## Error model
 

@@ -151,7 +151,7 @@ service NightgateService {
         source           : String(10); // history | current | indexer
         verified         : Boolean; // only for source indexer: the state matches the hash stored on chain
         blockHash        : String; // the block the state comes from
-        ledgerParameters : LargeString; // base64; in effect at that block; null = not known to this server
+        ledgerParameters : LargeString; // base64; in effect at the requested height, default the chain tip; null = not known to this server
         coveredHeight    : Integer64; // the database holds every contract state up to this block; null = supplement never ran, or source indexer
         chainHeight      : Integer64; // the chain tip the crawler last saw
     }
@@ -1313,7 +1313,8 @@ service NightgateService {
 
     action   getJobStatus(jobId: UUID,
                           sessionId: UUID,
-                          waitMs: Integer // ms; optional, at most 25000; hold the call until there is something to return
+                          waitMs: Integer, // ms; optional, at most 25000; hold the call until there is something to return
+                          untilChain: Boolean // default false; with waitMs, a succeeded job also waits for the chain's verdict
     )                                                                         returns {
         jobId               : UUID;
         kind                : String;

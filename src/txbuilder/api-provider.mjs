@@ -51,13 +51,24 @@ const notInBuildOnly = (method) => () => {
     throw new Error(`${method} is not available: this builder reads the chain through the NIGHTGATE API and never submits itself`);
 };
 
-// `mjTypes` (midnight-js-types) wraps the served bytes in the SDK's sealed record types. The SDK decodes them itself.
+// `mjTypes` seals the served bytes for the SDK. `mjUtils` and `mjProtocol` name the ledger that wrote a state or a record.
 // `protocolVersion` dates a read when the server names no block: the version at which ledger 9 starts on the chain.
 // `maxLagBlocks`: a state further behind the chain is refused. `stateRetryMs`: how long a 503 or 429 of stateAt is retried.
-export function apiPublicDataProvider({ client, mjTypes, protocolVersion, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 60, stateRetryMs = 30_000 }) {
+export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 60, stateRetryMs = 30_000 }) {
     if (!client) throw new Error('apiPublicDataProvider: client is required');
     if (!mjTypes?.SerializedContractState?.fromBytes || !mjTypes?.LedgerTransaction?.fromBytes) throw new Error('apiPublicDataProvider: mjTypes module (midnight-js-types) is required');
+    if (!mjUtils?.ledgerVersionOfContractState || !mjUtils?.ledgerVersionOfLedgerParameters) throw new Error('apiPublicDataProvider: mjUtils module (midnight-js-utils) is required');
+    if (!mjProtocol?.versionOfRecord) throw new Error('apiPublicDataProvider: mjProtocol module (midnight-js-protocol) is required');
     if (!(Number.isInteger(protocolVersion) && protocolVersion > 0)) throw new Error('apiPublicDataProvider: protocolVersion must be a positive integer');
+
+    const contractStateOf = (base64) => {
+        const raw = toBytes(base64);
+        return mjTypes.SerializedContractState.fromBytes(mjUtils.ledgerVersionOfContractState(raw), raw);
+    };
+    const ledgerParametersOf = (base64) => {
+        const raw = toBytes(base64);
+        return mjTypes.SerializedLedgerParameters.fromBytes(mjUtils.ledgerVersionOfLedgerParameters(raw), raw);
+    };
     if (!(Number.isInteger(maxLagBlocks) && maxLagBlocks >= 0)) throw new Error('apiPublicDataProvider: maxLagBlocks must be a non-negative integer');
 
     // 503: the server's indexer has not reached the newest action yet. 429: its indexer budget is used up.
@@ -144,9 +155,9 @@ export function apiPublicDataProvider({ client, mjTypes, protocolVersion, pollMs
         if (!snapshot?.state) return null;
         return {
             protocolVersion: datedBy(config),
-            contractState: mjTypes.SerializedContractState.fromBytes('v9', toBytes(snapshot.state)),
+            contractState: contractStateOf(snapshot.state),
             // The SDK refuses a call without them and names the reason, so a read that needs none stays possible.
-            ...(snapshot.ledgerParameters ? { ledgerParameters: mjTypes.SerializedLedgerParameters.fromBytes('v9', toBytes(snapshot.ledgerParameters)) } : {})
+            ...(snapshot.ledgerParameters ? { ledgerParameters: ledgerParametersOf(snapshot.ledgerParameters) } : {})
         };
     };
 
@@ -175,27 +186,32 @@ export function apiPublicDataProvider({ client, mjTypes, protocolVersion, pollMs
         async queryZSwapAndContractState(address, config) {
             const snapshot = await snapshotAt(address, heightAt(config));
             if (!snapshot?.state) return null;
+            const ledgerParameters = ledgerParametersOf(need(snapshot, 'ledgerParameters', address));
             return {
                 protocolVersion: datedBy(config),
-                contractState: mjTypes.SerializedContractState.fromBytes('v9', toBytes(snapshot.state)),
-                zswapChainState: mjTypes.SerializedZswapChainState.fromBytes('v9', toBytes(need(snapshot, 'zswapState', address))),
-                ledgerParameters: mjTypes.SerializedLedgerParameters.fromBytes('v9', toBytes(need(snapshot, 'ledgerParameters', address)))
+                contractState: contractStateOf(snapshot.state),
+                // The bytes of a zswap state name no ledger. It belongs to the ledger of its block's parameters.
+                zswapChainState: mjTypes.SerializedZswapChainState.fromBytes(ledgerParameters.era, toBytes(need(snapshot, 'zswapState', address))),
+                ledgerParameters
             };
         },
 
         async queryDeployContractState(address) {
             const deploy = await client.contractDeploy(address);
             if (!deploy) return null;
-            return contractState(address, { type: 'blockHeight', blockHeight: deploy.blockHeight });
+            const read = await contractState(address, { type: 'blockHeight', blockHeight: deploy.blockHeight });
+            return read && Number.isInteger(deploy.protocolVersion) ? { ...read, protocolVersion: deploy.protocolVersion } : read;
         },
 
         async watchForDeployTxData(address) {
             const deploy = await waitFor(`the deploy of contract ${address}`, () => client.contractDeploy(address));
             const tx = await client.ledgerTransaction(deploy.txHash);
             if (!tx) throw new Error(`the NIGHTGATE server holds no ledger transaction for the deploy of contract ${address}`);
+            const deployVersion = Number.isInteger(deploy.protocolVersion) ? deploy.protocolVersion : protocolVersion;
+            const era = mjProtocol.versionOfRecord({ protocolVersion: deployVersion });
             return {
-                era: 'v9',
-                tx: mjTypes.LedgerTransaction.fromBytes('v9', 'Finalized', toBytes(tx)),
+                era,
+                tx: mjTypes.LedgerTransaction.fromBytes(era, 'Finalized', toBytes(tx)),
                 status: TX_STATUS[deploy.status] ?? deploy.status ?? undefined,
                 txId: deploy.txId,
                 identifiers: deploy.identifiers,
@@ -205,7 +221,7 @@ export function apiPublicDataProvider({ client, mjTypes, protocolVersion, pollMs
                 blockTimestamp: deploy.blockTimestamp,
                 blockAuthor: null,
                 indexerId: 0,
-                protocolVersion: Number.isInteger(deploy.protocolVersion) ? deploy.protocolVersion : protocolVersion,
+                protocolVersion: deployVersion,
                 segmentStatusMap: undefined,
                 unshielded: { created: [], spent: [] }
             };

@@ -224,6 +224,49 @@ describe('connect: jobs', () => {
         expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 's' });
     });
 
+    const RECEIPT = { payload: '{}', signature: 'ab', publicKey: 'cd', algorithm: 'ed25519' };
+
+    test('waitForReceipt holds the call until the chain decided and returns the receipt', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([
+            { body: { status: 'succeeded', chainStatus: 'pending', receipt: null } },
+            { body: { status: 'succeeded', chainStatus: 'success', receipt: RECEIPT } }
+        ]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, longPollMs: 15_000 });
+        expect(await ng.waitForReceipt({ jobId: 'j1', sessionId: 's', pollMs: 1 })).toEqual(RECEIPT);
+        expect(JSON.parse(calls[0].init.body)).toEqual({ jobId: 'j1', sessionId: 's', waitMs: 15_000, untilChain: true });
+    });
+
+    test('waitForReceipt polls against a server that does not know untilChain', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([
+            { status: 400, body: { error: { message: "Property 'untilChain' does not exist in NightgateService.getJobStatus" } } },
+            { body: { status: 'succeeded', chainStatus: 'pending', receipt: null } },
+            { body: { status: 'succeeded', chainStatus: 'success', receipt: RECEIPT } }
+        ]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        expect(await ng.waitForReceipt({ jobId: 'j2', sessionId: 's', pollMs: 1 })).toEqual(RECEIPT);
+        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 's' });
+        expect(JSON.parse(calls[2].init.body)).toEqual({ jobId: 'j2', sessionId: 's' });
+    });
+
+    test('waitForReceipt throws for a failed job and for a job that gets no receipt', async () => {
+        const { connect, NightgateJobError } = await importClient();
+        const failed = fakeFetch([{ body: { status: 'failed', chainStatus: 'failure', errorCode: 'X', receipt: null } }]);
+        await expect(connect({ baseUrl: 'https://ng.example', fetchFn: failed.fn as any }).waitForReceipt({ jobId: 'j3', sessionId: 's' })).rejects.toBeInstanceOf(NightgateJobError);
+        const other = fakeFetch([{ body: { status: 'succeeded', kind: 'deployContract', chainStatus: 'success', receipt: null } }]);
+        await expect(connect({ baseUrl: 'https://ng.example', fetchFn: other.fn as any }).waitForReceipt({ jobId: 'j4', sessionId: 's' })).rejects.toThrow(/deployContract\) has no receipt/);
+    });
+
+    test('waitForReceipt times out, and backs off while it polls', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([{ body: { status: 'succeeded', chainStatus: 'pending', receipt: null } }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, longPollMs: 0 });
+        await expect(ng.waitForReceipt({ jobId: 'j5', sessionId: 's', pollMs: 40, timeoutMs: 100 })).rejects.toThrow(/no receipt after 100ms/);
+        // 40, 80 and 160 ms apart: a fixed interval would have asked more often.
+        expect(calls.length).toBeLessThanOrEqual(3);
+    });
+
     test('waitForJob keeps waitMs inside the server maximum and the request timeout', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([{ body: { status: 'succeeded', result: '{}' } }]);

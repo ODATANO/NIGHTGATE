@@ -11,7 +11,7 @@ const NETWORK = 'preview';
 const LEDGER_9_SPEC = 2_001_000;
 const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64');
 
-let ledger: any, contracts: any, mjTypes: any, compiled: any, zkConfigProvider: any;
+let ledger: any, contracts: any, mjTypes: any, mjUtils: any, mjProtocol: any, compiled: any, zkConfigProvider: any;
 let apiPublicDataProvider: any, InMemoryPrivateStateProvider: any, applyGasHeadroom: any;
 let contractAddress: string, stateBytes: Uint8Array;
 
@@ -46,13 +46,15 @@ function apiProvider() {
         transactionByIdentifier: async () => null,
         callFunction: async () => ({ hash: `0x${'ab'.repeat(32)}`, height: 5, protocolVersion: LEDGER_9_SPEC })
     };
-    return apiPublicDataProvider({ client, mjTypes, protocolVersion: 2_000_000 });
+    return apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion: 2_000_000 });
 }
 
 beforeAll(async () => {
     ledger = await import('@midnightntwrk/ledger-v9');
     contracts = await import('@midnight-ntwrk/midnight-js-contracts');
     mjTypes = await import('@midnight-ntwrk/midnight-js-types');
+    mjUtils = await import('@midnight-ntwrk/midnight-js-utils');
+    mjProtocol = await import('@midnight-ntwrk/midnight-js-protocol');
     const { CompiledContract } = await import('@midnight-ntwrk/compact-js');
     const { NodeZkConfigProvider } = await import('@midnight-ntwrk/midnight-js-node-zk-config-provider');
     ({ InMemoryPrivateStateProvider } = await import('@odatano/contract-kit' as string));
@@ -127,9 +129,27 @@ describe('txbuilder providers on the real SDK', () => {
         expect(counter.ledger(state.data).round).toBe(0n);
     });
 
+    it('reads the bytes of a contract from before the fork under ledger 8', async () => {
+        const ledger8: any = await import('@midnightntwrk/ledger-v8' as string);
+        const client = {
+            contractStateAt: async () => ({ height: 5, state: b64(new ledger8.ContractState().serialize()), ledgerParameters: b64(ledger8.LedgerParameters.initialParameters().serialize()) }),
+            contractDeploy: async () => ({ txHash: '0xdeploy', blockHeight: 5, blockHash: 'b5', protocolVersion: 1_000_300, status: 'SUCCESS', identifiers: ['id0'], txId: 'id0' }),
+            ledgerTransaction: async () => b64(ledger8.Transaction.fromParts(NETWORK).mockProve().serialize()),
+            transactionByIdentifier: async () => null
+        };
+        const provider = apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion: 2_000_000 });
+        const deploy = await provider.watchForDeployTxData(contractAddress);
+        expect(deploy.era).toBe('v8');
+        expect(deploy.tx.era).toBe('v8');
+        const state = await provider.queryDeployContractState(contractAddress);
+        expect(state.contractState.era).toBe('v8');
+        expect(state.ledgerParameters.era).toBe('v8');
+        expect(state.protocolVersion).toBe(1_000_300);
+    });
+
     it('a state of another kind is refused, not passed on', async () => {
         const client = { contractStateAt: async () => ({ height: 5, state: b64(new TextEncoder().encode('not a state')) }), callFunction: async () => null, contractDeploy: async () => null, transactionByIdentifier: async () => null };
-        const provider = apiPublicDataProvider({ client, mjTypes, protocolVersion: 2_000_000 });
+        const provider = apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion: 2_000_000 });
         await expect(provider.queryContractState(contractAddress)).rejects.toThrow();
     });
 });

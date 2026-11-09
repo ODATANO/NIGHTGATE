@@ -551,9 +551,29 @@ describe('ContractStates', () => {
         }
     });
 
+    it('stateAt() asks the indexer once for parameters the database does not hold', async () => {
+        const address = 'ee'.repeat(32);
+        const actionId = await seedContractAction(await seedTransaction(await seedBlock(510)), { address });
+        await db.run(cds.ql.INSERT.into(CONTRACT_STATES).entries({
+            address, height: 510, state: Buffer.from('st').toString('base64'), contractAction_ID: actionId
+        }));
+        await db.run(cds.ql.UPDATE.entity('midnight.Blocks').set({ ledgerParameters: null }).where({ ledgerParameters: { '!=': null } }));
+        await new Promise(r => setTimeout(r, 1100));
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ data: { block: { ledgerParameters: '0a0b' } } }), { status: 200 }));
+        try {
+            const ask = () => srv.send({ event: 'stateAt', entity: 'ContractStates', data: { address } });
+            const expected = Buffer.from('0a0b', 'hex').toString('base64');
+            expect(await ask()).toEqual(expect.objectContaining({ source: 'current', height: 510, ledgerParameters: expected }));
+            expect(await ask()).toEqual(expect.objectContaining({ ledgerParameters: expected }));
+            expect(fetchSpy).toHaveBeenCalledTimes(1);
+        } finally {
+            fetchSpy.mockRestore();
+        }
+    });
+
     it('stateAt() asks the indexer again after it answered from behind the newest action', async () => {
         const address = 'ef'.repeat(32);
-        const old = await seedContractAction(await seedTransaction(await seedBlock(520)), { address });
+        const old = await seedContractAction(await seedTransaction(await seedBlock(520, { ledgerParameters: Buffer.from('lp520').toString('base64') })), { address });
         await seedContractAction(await seedTransaction(await seedBlock(522)), { address });
         await db.run(cds.ql.INSERT.into(CONTRACT_STATES).entries({
             address, height: 520, state: Buffer.from('st').toString('base64'), contractAction_ID: old
@@ -923,6 +943,25 @@ describe('getJobStatus', () => {
         const t0 = Date.now();
         const out = await sendAs('alice', { waitMs: 5000 });
         expect(out.status).toBe('succeeded');
+        expect(Date.now() - t0).toBeLessThan(4000);
+    });
+
+    it('with untilChain holds a succeeded job until the chain has decided', async () => {
+        await seedJob({ requestedBy: 'alice', status: 'succeeded', chainStatus: 'pending', txHash: '0xCAFE78' });
+        expect((await sendAs('alice', { waitMs: 400 })).chainStatus).toBe('pending');
+        setTimeout(() => { void db.run(cds.ql.UPDATE.entity(BACKGROUND_JOBS).set({ chainStatus: 'success' }).where({ ID: VALID_JOB_ID })); }, 300);
+        const t0 = Date.now();
+        const out = await sendAs('alice', { waitMs: 5000, untilChain: true });
+        expect(out.chainStatus).toBe('success');
+        expect(Date.now() - t0).toBeLessThan(4000);
+    });
+
+    it('with untilChain gives a pending job back when the time is up, and a failed job at once', async () => {
+        await seedJob({ requestedBy: 'alice', status: 'succeeded', chainStatus: 'pending', txHash: '0xCAFE79' });
+        expect((await sendAs('alice', { waitMs: 600, untilChain: true })).chainStatus).toBe('pending');
+        await db.run(cds.ql.UPDATE.entity(BACKGROUND_JOBS).set({ status: 'failed', chainStatus: 'failure' }).where({ ID: VALID_JOB_ID }));
+        const t0 = Date.now();
+        expect((await sendAs('alice', { waitMs: 5000, untilChain: true })).status).toBe('failed');
         expect(Date.now() - t0).toBeLessThan(4000);
     });
 

@@ -96,6 +96,10 @@ function isStaleSocketError(err) {
     return /fetch failed/i.test(String(err?.message ?? '')) && /^(ECONNRESET|EPIPE|UND_ERR_SOCKET)$/.test(code);
 }
 
+// A receipt takes as long as the chain does, and a metered gateway may bill each poll.
+const RECEIPT_POLL_MS = 10_000;
+const RECEIPT_POLL_MAX_MS = 60_000;
+
 /** Connects to a hosted NIGHTGATE. `longPollMs` is capped at 25000 and at 5000 below `timeoutMs`, and 0 turns long polling off. */
 export function connect(opts) {
     const {
@@ -216,6 +220,45 @@ export function connect(opts) {
         }
     }
 
+    /** Waits until the chain confirmed a sponsored swap or transfer and returns its receipt. Throws when the job fails or can have none. */
+    async function waitForReceipt({ jobId, sessionId, pollMs: overridePollMs, timeoutMs: waitTimeoutMs = 10 * 60 * 1000, pollGraceMs = 5 * 60 * 1000 }) {
+        if (!jobId) throw new Error('waitForReceipt: jobId is required');
+        const deadline = Date.now() + waitTimeoutMs;
+        let holding = longPoll;
+        let interval = overridePollMs ?? RECEIPT_POLL_MS;
+        let firstPollFailure = null;
+        for (;;) {
+            let job;
+            const waitMs = holding ? Math.max(0, Math.min(longPollCapMs, deadline - Date.now())) : 0;
+            const asked = Date.now();
+            try {
+                job = await callAction('getJobStatus', waitMs > 0 ? { jobId, sessionId, waitMs, untilChain: true } : { jobId, sessionId });
+                firstPollFailure = null;
+            } catch (err) {
+                if (waitMs > 0 && err instanceof NightgateApiError && err.status === 400 && /waitMs|untilChain/.test(err.message) && !/waitMs must be/.test(err.message)) {
+                    holding = false;
+                    continue;
+                }
+                if (!isTransientPollError(err)) throw err;
+                firstPollFailure ??= Date.now();
+                if (Date.now() - firstPollFailure > pollGraceMs || Date.now() > deadline) throw err;
+                await new Promise(r => setTimeout(r, interval));
+                continue;
+            }
+            if (job.receipt) return job.receipt;
+            if (job.status === 'failed' || job.status === 'reconciliation_required') throw new NightgateJobError({ ...job, jobId });
+            if (job.status === 'succeeded' && job.chainStatus !== 'pending') {
+                throw new Error(`waitForReceipt: job ${jobId} (${job.kind ?? 'unknown kind'}) has no receipt, chain status ${job.chainStatus ?? 'none'}; only a sponsored swap or transfer that landed gets one`);
+            }
+            if (Date.now() > deadline) throw new Error(`waitForReceipt: job ${jobId} has no receipt after ${waitTimeoutMs}ms (status ${job.status}, chain status ${job.chainStatus ?? 'none'})`);
+            // A long poll that ran its time needs no pause; one the server answered at once does.
+            if (waitMs === 0 || Date.now() - asked < Math.min(waitMs, 1000)) {
+                await new Promise(r => setTimeout(r, interval));
+                interval = Math.min(interval * 2, RECEIPT_POLL_MAX_MS);
+            }
+        }
+    }
+
     /** Starts a job and waits for its result. A key from this client lets a request lost on a dead connection go out again without a second job. */
     async function act(name, params) {
         const started = await callAction(name, { ...params, idempotencyKey: params?.idempotencyKey || randomUUID() });
@@ -277,6 +320,7 @@ export function connect(opts) {
         callFunction,
         callAction,
         waitForJob,
+        waitForReceipt,
 
         // ---- chain reads a transaction builder needs. No wallet, no login beyond the token. ----
         contractStateAt,

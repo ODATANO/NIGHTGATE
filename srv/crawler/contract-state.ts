@@ -102,7 +102,7 @@ export interface ContractStateSnapshot {
     verified: boolean | null;
     /** Hash of the block the state comes from. Null if not known. */
     blockHash: string | null;
-    /** Ledger parameters in effect at that block, base64. Null if neither the database nor the indexer knows them. */
+    /** Ledger parameters in effect at the requested height or, without one, at the chain tip. Base64. Null if neither the database nor the indexer knows them. */
     ledgerParameters: string | null;
     /** The database holds every contract state up to this block. Null while the supplement never ran. */
     coveredHeight: number | null;
@@ -123,6 +123,9 @@ export type ContractStateFetcher = (
     address: string,
     height: number | null
 ) => Promise<FetchedContractState | null>;
+
+/** The ledger parameters of the block at `height`, or of the newest block without a height. */
+export type LedgerParametersFetcher = (height: number | null) => Promise<string | null>;
 
 function base64Of(bytes: Buffer | null): string | null {
     return bytes ? bytes.toString('base64') : null;
@@ -157,31 +160,35 @@ async function coverageOf(db: DbService): Promise<Pick<ContractStateSnapshot, 'c
 }
 
 // The supplement stores the parameters only in the block that changed them, so the newest row at or
-// below the height is the one in effect. Only a database that never had them asks the indexer; a used-up
-// budget is reported, any other failed ask leaves them null so the state itself is still served.
-async function withBlockOf(db: DbService, snapshot: LocatedSnapshot, fetchState: ContractStateFetcher): Promise<ContractStateSnapshot> {
-    const coverage = await coverageOf(db);
-    if (snapshot.height == null) return { ...snapshot, blockHash: null, ledgerParameters: null, ...coverage };
-    const block: Pick<Block, 'hash'> | undefined = await db.run(
-        SELECT.one.from(Blocks).columns('hash').where({ height: snapshot.height })
-    );
+// below the height is the one in effect.
+async function storedParameters(db: DbService, height: number | null): Promise<string | null> {
     const inEffect: Pick<Block, 'ledgerParameters'> | undefined = await db.run(
         SELECT.one.from(Blocks).columns('ledgerParameters')
-            .where({ height: { '<=': snapshot.height }, ledgerParameters: { '!=': null } })
+            .where(height == null ? { ledgerParameters: { '!=': null } } : { height: { '<=': height }, ledgerParameters: { '!=': null } })
             .orderBy('height desc')
     );
-    let blockHash = block?.hash ?? null;
-    let ledgerParameters = base64Of(await readCapBinary(inEffect?.ledgerParameters));
-    if (ledgerParameters == null) {
-        try {
-            const fetched = await fetchState(snapshot.address, snapshot.height);
-            ledgerParameters = fetched?.ledgerParameters ?? null;
-            blockHash = blockHash ?? fetched?.blockHash ?? null;
-        } catch (err) {
-            if (err instanceof IndexerBudgetExhausted) throw err;
-        }
+    return base64Of(await readCapBinary(inEffect?.ledgerParameters));
+}
+
+// A used-up budget is reported. Any other failed ask leaves the parameters null, so the state itself is still served.
+async function askedParameters(fetchParameters: LedgerParametersFetcher, height: number | null): Promise<string | null> {
+    try {
+        return await fetchParameters(height);
+    } catch (err) {
+        if (err instanceof IndexerBudgetExhausted) throw err;
+        return null;
     }
-    return { ...snapshot, blockHash, ledgerParameters, ...coverage };
+}
+
+// A contract at rest keeps its old state while the chain changes its parameters, so they follow the
+// requested height and not the block of the state. A call built on older ones partitions wrongly.
+async function withBlockOf(db: DbService, snapshot: LocatedSnapshot, requestedHeight: number | null, fetchParameters: LedgerParametersFetcher): Promise<ContractStateSnapshot> {
+    const coverage = await coverageOf(db);
+    const block: Pick<Block, 'hash'> | undefined = snapshot.height == null ? undefined : await db.run(
+        SELECT.one.from(Blocks).columns('hash').where({ height: snapshot.height })
+    );
+    const ledgerParameters = await storedParameters(db, requestedHeight) ?? await askedParameters(fetchParameters, requestedHeight);
+    return { ...snapshot, blockHash: block?.hash ?? null, ledgerParameters, ...coverage };
 }
 
 // The contract's state at `height`, or its current state when `height` is null. Null if no source knows an action of it.
@@ -190,7 +197,8 @@ export async function contractStateAt(
     db: DbService,
     rawAddress: string,
     height: number | null,
-    fetchState: ContractStateFetcher
+    fetchState: ContractStateFetcher,
+    fetchParameters: LedgerParametersFetcher
 ): Promise<ContractStateSnapshot | null> {
     const address = normalizeContractAddress(rawAddress);
     const current: ContractState | undefined = await db.run(
@@ -208,7 +216,7 @@ export async function contractStateAt(
         zswapStateHash: row.zswapStateHash ?? null,
         source: 'current',
         verified: null
-    }, fetchState);
+    }, height, fetchParameters);
 
     let newest: (Row<ContractAction, 'ID'> & { height?: number | null }) | null | undefined = null;
     let staleHeight: number | null = null;
@@ -251,7 +259,7 @@ export async function contractStateAt(
                     zswapStateHash: newest.zswapStateHash ?? null,
                     source: 'history',
                     verified: null
-                }, fetchState);
+                }, height, fetchParameters);
             }
             if (current && current.contractAction_ID === newest.ID) return fromCurrent(current);
         }
@@ -280,6 +288,13 @@ export async function contractStateAt(
     const digest = digestOfBase64(fetched.state);
     const zswapDigest = digestOfBase64(fetched.zswapState);
     const expected = newest?.stateHash ?? null;
+    const coverage = await coverageOf(db);
+    // An action past the database's cursor is newer than any stored row.
+    const newerThanStored = fetched.height != null && coverage.coveredHeight != null && fetched.height > coverage.coveredHeight;
+    const ledgerParameters = (newerThanStored ? fetched.ledgerParameters : null)
+        ?? await storedParameters(db, height)
+        ?? await askedParameters(fetchParameters, height)
+        ?? fetched.ledgerParameters;
     return {
         address,
         height: fetched.height ?? actionHeight,
@@ -290,10 +305,10 @@ export async function contractStateAt(
         source: 'indexer',
         verified: expected ? expected === digest.hash : null,
         blockHash: fetched.blockHash,
-        ledgerParameters: fetched.ledgerParameters,
+        ledgerParameters,
         // An indexer answer is as fresh as the indexer, not as the database.
         coveredHeight: null,
-        chainHeight: (await coverageOf(db)).chainHeight
+        chainHeight: coverage.chainHeight
     };
 }
 

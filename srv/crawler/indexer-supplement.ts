@@ -206,6 +206,18 @@ export function createIndexerClient(url: string, timeoutMs = 20000): IndexerClie
     };
 }
 
+const LEDGER_PARAMETERS_QUERY = `query($offset: BlockOffset) {
+  block(offset: $offset) { ledgerParameters }
+}`;
+
+// The ledger parameters of the block at `height`, or of the newest block without a height. Base64.
+export async function fetchLedgerParameters(url: string, height: number | null, timeoutMs = 20000): Promise<string | null> {
+    const offset = height == null ? null : { height };
+    type Answer = { block?: { ledgerParameters?: unknown } | null };
+    const data = await indexerQuery<Answer>(url, LEDGER_PARAMETERS_QUERY, { variables: { offset }, timeoutMs });
+    return hexToBase64(data?.block?.ledgerParameters);
+}
+
 const CONTRACT_STATE_QUERY = `query($address: HexEncoded!, $offset: ContractActionOffset) {
   contractAction(address: $address, offset: $offset) {
     state zswapState

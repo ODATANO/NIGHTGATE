@@ -181,6 +181,30 @@ trie level. `1.5` is a typical value. The fee grows with it. `onProgress`
 reports `{ phase: 'gas-headroom', factor, guaranteed, fallible }`. A batch
 takes no headroom, and a circuit that calls another contract is refused.
 
+### Contracts deployed before ledger 9
+
+The fork translates a contract's state but keeps its verifier keys. A contract
+deployed before the fork is therefore called with the package version compiled
+for ledger 8, under its own name next to the current one:
+
+```bash
+npm install vault-ledger8@npm:@odatano/contract-attestation-vault@ledger8
+```
+
+```js
+const builder = await createTxBuilder({ package: 'vault-ledger8', circuits: ['attest'], api, seedHex, networkId, walletSync: false });
+```
+
+- An own contract works the same way: pass `contractClass` and `zkConfigDir` of the ledger 8 build. The builder reads the compiler's runtime from `compiler/contract-info.json`. The build's folder needs `compact-runtime` 0.16.0 as a dependency of its `package.json`, and the project installs that folder as its own dependency, for example `file:./pot-ledger8`.
+- `expected instance of ChargedState` means two copies of `@midnight-ntwrk/onchain-runtime-v3`, usually from a separate `npm install` inside the build's folder. `npm ls @midnight-ntwrk/onchain-runtime-v3` must show one version in one place.
+- The result is a ledger 9 transaction. A sponsor handles it like any other.
+- Pass a contract deployed after the fork to a builder of the current package. Each builder serves one of the two.
+- One call per transaction. A batch is refused.
+- `buildDeploySponsorable` is refused. A new deploy uses the current package.
+- A circuit that spends a shielded coin the contract already holds is refused by midnight-js.
+- With the current package, such a contract fails with a message that names this section's cause.
+- The server's own contract actions, such as `submitContractCall` or `issue*`, use the current packages and refuse such a contract with a message that names this path. Build the call here and hand it to `sponsorUnboundTransaction`. The server's reads keep working.
+
 ## `buildDeploySponsorable({ initialPrivateState?, constructorArgs?, witnesses?, recipients?, bind? })`
 
 Builds, proves and signs a deploy with your key. Returns the same shape as
@@ -275,7 +299,9 @@ const { txHash } = await ng.sponsorTransfer({ transferTxB64: built.txB64, tokenT
 - `buildTransfer({ tokenType, amount, to, bind? })` returns `{ txB64, tx, bound, serializedBytes, inputs, terms, revert }`. `to` is a shielded address (`mn_shield-addr_...`).
 - The recipient gets one coin, the wallet its change.
 - A transfer nets to zero and shows no token type. The server records `tokenType` and `amount` as the caller's declaration (`declared: true` in the receipt). It checks the shape with the rule of `readTransferShape(tx)`.
-- `getJobStatus` of a landed swap or transfer carries `receipt`, once the chain confirmed the job. `sponsorSwap` and `sponsorTransfer` return `jobId` and `sessionId` for that call, and `receipt` when it is already there. `verifyReceipt(receipt, publicKey)` from the client checks it against the key `ng.getReceiptKey()` publishes.
+- `getJobStatus` of a landed swap or transfer carries `receipt`, once the chain confirmed the job. `sponsorSwap` and `sponsorTransfer` return `jobId` and `sessionId` for that call, and `receipt` when it is already there. It usually is not yet, because they return when the job succeeded and the chain confirms later.
+- `ng.waitForReceipt({ jobId, sessionId })` waits for the receipt and throws when the job fails or can have none. It holds a call on the server where it can, and otherwise polls from 10 s up to 60 s. A metered gateway may bill each call.
+- `verifyReceipt(receipt, publicKey)` from the client checks a receipt against the key `ng.getReceiptKey()` publishes.
 
 ### Offer files
 

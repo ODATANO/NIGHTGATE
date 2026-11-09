@@ -111,6 +111,7 @@ export interface CreateTxBuilderInput {
     /**
      * An installed contract package (`@odatano/contract-<name>`).
      * It supplies the contract class, names and proving files. Explicit options win over it.
+     * A contract deployed before ledger 9 needs the package version compiled for ledger 8.
      */
     package?: string;
     /** Directory to resolve the package from. Defaults to `process.cwd()`. */
@@ -435,7 +436,7 @@ export declare function probeLanded(identifier: string, opts: LandedProbeSource 
 export declare function waitLanded(identifier: string, opts: LandedProbeSource & { timeoutMs?: number, pollMs?: number }): Promise<LandedProbeResult | null>;
 
 /** A midnight-js `PublicDataProvider` that reads contract state and deploys through the NIGHTGATE API. */
-export declare function apiPublicDataProvider(input: { client: NightgateClient; mjTypes: object; protocolVersion: number; pollMs?: number; watchTimeoutMs?: number; maxLagBlocks?: number; stateRetryMs?: number }): object;
+export declare function apiPublicDataProvider(input: { client: NightgateClient; mjTypes: object; mjUtils: object; mjProtocol: object; protocolVersion: number; pollMs?: number; watchTimeoutMs?: number; maxLagBlocks?: number; stateRetryMs?: number }): object;
 /** The client behind an `api` option: a connected client, or `connect()` on the options. */
 export declare function apiClientFor(api: ConnectOptions | NightgateClient): NightgateClient;
 /** A wallet facade submission service that never dials a node. The builder hands its transaction to a sponsor instead. */
@@ -458,7 +459,9 @@ export interface BuilderPackage {
 }
 export declare function resolveBuilderPackage(input: { package: string; from?: string }): Promise<BuilderPackage>;
 /** Checks that a local directory has all proving files. Downloads nothing. */
-export declare function describeLocalZkAssets(zkConfigDir: string, circuits?: string[], proveCircuits?: string[]): Promise<ZkAssetResult>;
+export declare function describeLocalZkAssets(zkConfigDir: string, circuits?: string[], proveCircuits?: string[], options?: { ledger8?: boolean }): Promise<ZkAssetResult>;
+/** Whether the compiler that wrote a local directory built for ledger 8. A directory without `compiler/contract-info.json` counts as no. */
+export declare function isLedger8ZkDir(zkConfigDir: string): Promise<boolean>;
 export declare function createTxBuilder(opts: CreateTxBuilderInput): Promise<TxBuilder>;
 /** Derives the attester id, attestation secret and addresses of a seed. Needs no network. */
 export declare function deriveIdentity(opts: DeriveIdentityInput): Promise<Identity>;

@@ -3,6 +3,7 @@
  */
 
 import { proofRequestTimeoutMs } from '../../utils/proof-timeout';
+import { isPreForkKeyMismatch } from '../../utils/runtime-version';
 import { throwIfRpcCancelled } from './cancellation';
 import { runBatchInScope, landedHeight } from '../batch-call-scope';
 import { buildWasmProofProvider } from '../wasm-proof-provider';
@@ -271,9 +272,18 @@ export async function findContractForWallet(contracts: ContractsSdkBundle['contr
     if (seed && a.site) log('info', `${a.site}: no private state at '${a.privateStateId}' for this wallet, seeding the contract's initial private state`);
     a.onProbed?.();
     const target = { contractAddress: a.contractAddress, compiledContract: a.compiledContract, privateStateId: a.privateStateId };
-    return seed
-        ? contracts.findDeployedContract(providers, { ...target, initialPrivateState: a.initialPrivateState ?? {} })
-        : contracts.findDeployedContract(providers, target);
+    try {
+        return await (seed
+            ? contracts.findDeployedContract(providers, { ...target, initialPrivateState: a.initialPrivateState ?? {} })
+            : contracts.findDeployedContract(providers, target));
+    } catch (err) {
+        if (!await isPreForkKeyMismatch(err, contracts.ContractTypeError, providers.publicDataProvider, a.contractAddress)) throw err;
+        throw new Error(
+            `contract ${a.contractAddress} was deployed before ledger 9 and keeps its ledger 8 verifier keys, so this server cannot build calls on it. ` +
+            'Build the call with @odatano/nightgate-tx and the ledger8 tag of its contract package, then hand it to sponsorUnboundTransaction.',
+            { cause: err }
+        );
+    }
 }
 
 export async function deployContract({

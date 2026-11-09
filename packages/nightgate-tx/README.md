@@ -69,6 +69,8 @@ The reference is [`docs/txbuilder.md`](https://github.com/ODATANO/NIGHTGATE/blob
 - [Token factory](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#token-factory): mint named tokens from your own seed.
 - [Holder registry](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#holder-registry): register a token holding with `holderClaimKey`.
 - Your own contract: `createTxBuilder({ package: '@odatano/contract-<name>' })` or `{ contractClass, zkConfigDir }`. `buildDeploySponsorable()` builds a sponsored deploy.
+- [Contracts deployed before ledger 9](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#contracts-deployed-before-ledger-9): build with the contract package tagged `ledger8`.
+- `ng.waitForReceipt({ jobId, sessionId })` waits for the receipt of a sponsored transfer or swap.
 - [Self-funded submission](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#self-funded-submission): pay your own dust and submit to the node. Runnable: [`example/self-funded.mjs`](./example/self-funded.mjs).
 - `deriveIdentity({ seedHex })` returns the attester id and addresses without a builder.
 

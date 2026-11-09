@@ -172,7 +172,8 @@ vi.mock('@midnightntwrk/wallet-sdk-address-format', () => ({
 
 // Contract-path SDK seams (loadContractsSdk + buildWorkerContractProviders).
 const findDeployedContract = vi.hoisted(() => (vi.fn()));
-vi.mock('@midnight-ntwrk/midnight-js-contracts', () => ({ findDeployedContract }));
+const ContractTypeError = vi.hoisted(() => class ContractTypeError extends Error {});
+vi.mock('@midnight-ntwrk/midnight-js-contracts', () => ({ findDeployedContract, ContractTypeError }));
 // Query methods findDeployedContract hits per call; tracked so the
 // withFindContractQueryCache tests can count underlying indexer fetches.
 const publicDataMethods = vi.hoisted(() => ({
@@ -3145,6 +3146,28 @@ describe('submitContractCall private-state seeding', () => {
         const reply = await rpc('submitContractCall', callArgs('session-seed-nocircuit-ll'));
         expect(reply.ok).toBe(false);
         expect(reply.error.message).toMatch(/Circuit 'increment' not found/);
+    });
+
+    it('names the way out when the keys of a contract from before ledger 9 do not match', async () => {
+        await initSession('session-prefork-mismatch');
+        const original = new ContractTypeError('verifier keys mismatched');
+        findDeployedContract.mockRejectedValue(original);
+        publicDataMethods.watchForDeployTxData.mockResolvedValueOnce({ era: 'v8' } as never);
+        const reply = await rpc('submitContractCall', { ...callArgs('session-prefork-mismatch'), contractAddress: 'c1'.repeat(32) });
+        expect(reply.ok).toBe(false);
+        expect(reply.error.message).toMatch(/deployed before ledger 9/);
+        expect(reply.error.message).toMatch(/@odatano\/nightgate-tx/);
+        expect(reply.error.message).toMatch(/sponsorUnboundTransaction/);
+    });
+
+    it('keeps the error of a key mismatch on a contract from after ledger 9', async () => {
+        await initSession('session-postfork-mismatch');
+        findDeployedContract.mockRejectedValue(new ContractTypeError('verifier keys mismatched'));
+        publicDataMethods.watchForDeployTxData.mockResolvedValueOnce({ era: 'v9' } as never);
+        const reply = await rpc('submitContractCall', { ...callArgs('session-postfork-mismatch'), contractAddress: 'c2'.repeat(32) });
+        expect(reply.ok).toBe(false);
+        expect(reply.error.message).toMatch(/verifier keys mismatched/);
+        expect(reply.error.message).not.toMatch(/ledger 9/);
     });
 
     function timingLogs(): string[] {

@@ -17,6 +17,7 @@ import * as compactRuntime from '@midnight-ntwrk/compact-runtime';
 
 const require = createRequire(import.meta.url);
 const { assertSeedHex, HEX64_RE, HEX64_ANY_CASE_RE } = require('../../srv/utils/hex-patterns.js');
+const { isLedger8Runtime, isPreForkKeyMismatch } = require('../../srv/utils/runtime-version.js');
 const { fetchBody } = require('../../srv/utils/fetch-body.js');
 
 // Paying the fee yourself and submitting to the node directly.
@@ -277,7 +278,7 @@ async function ensurePackageProverKeys({ package: packageName, from, circuits, f
         fetched++;
         onProgress?.({ phase: 'zk-asset', circuit, file: `keys/${circuit}.prover`, fetched, cached: wanted.length - missing.length, refreshed: 0 });
     }
-    const local = await describeLocalZkAssets(zkConfigPath, all, wanted);
+    const local = await describeLocalZkAssets(zkConfigPath, all, wanted, { ledger8: isLedger8Runtime(pkg.manifest.compactRuntime) });
     return { ...local, fetched, cached: local.cached - fetched, refreshed: 0, verified: true, source: 'package' };
 }
 
@@ -292,13 +293,15 @@ export async function resolveBuilderPackage({ package: packageName, from }) {
     const pkg = resolveContractPackage(packageName, from ?? process.cwd());
     const problem = contractPackageDigestProblem(pkg);
     if (problem) throw new Error(`contract package ${packageName} is not the generation its contract.json describes: ${problem}`);
-    const runtimeProblem = runtimeVersionProblem(pkg.manifest);
+    const ledger8 = isLedger8Runtime(pkg.manifest.compactRuntime);
+    const runtimeProblem = ledger8 ? null : runtimeVersionProblem(pkg.manifest);
     if (runtimeProblem) throw new Error(`contract package ${packageName} ${runtimeProblem}`);
     const mod = await import(pathToFileURL(pkg.artifactPath).href);
     const contractClass = mod.Contract ?? mod.default?.Contract;
     if (typeof contractClass !== 'function') throw new Error(`contract package ${packageName}: ${pkg.artifactPath} exports no Contract class`);
     return {
         package: { name: pkg.name, version: pkg.version, root: pkg.root },
+        ledger8,
         contractClass,
         contractName: pkg.manifest.name,
         privateStateId: pkg.manifest.privateStateId,
@@ -379,6 +382,12 @@ async function findDeployedWithRetry(contracts, providers, args) {
         await new Promise((r) => setTimeout(r, 10_000));
         return contracts.findDeployedContract(providers, args);
     }
+}
+
+/** A contract deployed before ledger 9 keeps its ledger 8 verifier keys, so a key mismatch on it means the wrong package. Exported for unit tests. */
+export async function explainPreForkMismatch(err, ContractTypeError, publicDataProvider, contractAddress) {
+    if (!await isPreForkKeyMismatch(err, ContractTypeError, publicDataProvider, contractAddress)) return err;
+    return new Error(`contract ${contractAddress} was deployed before ledger 9 and keeps its ledger 8 verifier keys: build with the version of its contract package that was compiled for ledger 8 (compact-runtime 0.16)`, { cause: err });
 }
 
 /** Options for midnight-js' `httpClientProofProvider`. Without `proofTimeoutMs` the SDK default of 5 minutes applies. */
@@ -472,8 +481,17 @@ export function readDeployAddress(tx) {
     return found[0];
 }
 
+/** Whether the compiler that wrote a local directory built for ledger 8. A directory without `compiler/contract-info.json` counts as no. */
+export async function isLedger8ZkDir(zkConfigDir) {
+    try {
+        return isLedger8Runtime(JSON.parse(await readFile(join(zkConfigDir, 'compiler', 'contract-info.json'), 'utf8'))['runtime-version']);
+    } catch {
+        return false;
+    }
+}
+
 /** Checks that a local directory has all proving files. Downloads nothing. */
-export async function describeLocalZkAssets(zkConfigDir, circuits = [], proveCircuits = circuits) {
+export async function describeLocalZkAssets(zkConfigDir, circuits = [], proveCircuits = circuits, { ledger8 = false } = {}) {
     const { statSync, readdirSync } = await import('node:fs');
     const keysDir = join(zkConfigDir, 'keys');
     const zkirDir = join(zkConfigDir, 'zkir');
@@ -481,7 +499,8 @@ export async function describeLocalZkAssets(zkConfigDir, circuits = [], proveCir
     if (!isDir(keysDir) || !isDir(zkirDir)) {
         throw new Error(`createTxBuilder: zkConfigDir ${zkConfigDir} must hold keys/ and zkir/ directories`);
     }
-    if (!(await exists(join(zkConfigDir, COMPILER_MANIFEST)))) {
+    // The ledger 8 compiler writes no such manifest.
+    if (!ledger8 && !(await exists(join(zkConfigDir, COMPILER_MANIFEST)))) {
         throw new Error(`createTxBuilder: zkConfigDir ${zkConfigDir} lacks ${COMPILER_MANIFEST}; compactc writes it next to keys/ and zkir/, and proving verifies every key against it`);
     }
     const files = readdirSync(keysDir);
@@ -597,6 +616,7 @@ export async function createTxBuilder(opts) {
         throw new Error('createTxBuilder: zkConfigBaseUrl is required (a public /zk-config/<contract>), unless zkConfigDir names a local directory with keys/ and zkir/ or package names an installed lineage package');
     }
     if (typeof contractClass !== 'function') throw new Error('createTxBuilder: contractClass is required (the compiled Contract), or package');
+    const ledger8 = fromPackage?.ledger8 === true || (zkConfigDir !== undefined && await isLedger8ZkDir(zkConfigDir));
     if (opts.provingMode !== undefined && opts.provingMode !== 'wasm' && opts.provingMode !== 'server') {
         throw new Error(`createTxBuilder: provingMode must be 'wasm' or 'server' (got ${String(opts.provingMode)})`);
     }
@@ -648,7 +668,7 @@ export async function createTxBuilder(opts) {
         // Fall back to the vault's circuits, so an empty directory never passes the check.
         const verifierSet = allCircuits ?? ATTESTATION_VAULT_CIRCUITS;
         const proveSet = circuits ?? allCircuits ?? ATTESTATION_VAULT_CIRCUITS;
-        assets = await describeLocalZkAssets(zkConfigDir, verifierSet, proveSet);
+        assets = await describeLocalZkAssets(zkConfigDir, verifierSet, proveSet, { ledger8 });
     } else {
         assets = await ensureZkAssets({
             zkConfigBaseUrl, cacheDir,
@@ -659,7 +679,7 @@ export async function createTxBuilder(opts) {
         });
     }
 
-    const [ledger, facadeSdk, shielded, unshielded, dust, abstractions, compactJs, contracts, zkNode, indexerSdk, mjTypes] = await Promise.all([
+    const [ledger, facadeSdk, shielded, unshielded, dust, abstractions, compactJs, contracts, zkNode, indexerSdk, mjTypes, mjUtils, mjProtocol] = await Promise.all([
         import('@midnightntwrk/ledger-v9'),
         import('@midnightntwrk/wallet-sdk-facade'),
         import('@midnightntwrk/wallet-sdk-shielded'),
@@ -670,7 +690,9 @@ export async function createTxBuilder(opts) {
         import('@midnight-ntwrk/midnight-js-contracts'),
         import('@midnight-ntwrk/midnight-js-node-zk-config-provider'),
         import('@midnight-ntwrk/midnight-js-indexer-public-data-provider'),
-        import('@midnight-ntwrk/midnight-js-types')
+        import('@midnight-ntwrk/midnight-js-types'),
+        import('@midnight-ntwrk/midnight-js-utils'),
+        import('@midnight-ntwrk/midnight-js-protocol')
     ]);
 
     const { roleSeeds, keystore, attestationSecret, attesterId, addresses, shieldedKeys } = await deriveKeyMaterial({ seedHex, networkId, accountIndex, attestationSecret: opts.attestationSecret });
@@ -717,7 +739,15 @@ export async function createTxBuilder(opts) {
 
     const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
     if (!CompiledContract?.make) throw new Error('compact-js: CompiledContract.make not found');
-    const zkConfigProvider = new zkNode.NodeZkConfigProvider(cacheDir);
+    // The ledger 8 compiler writes no artifact manifest. The SDK still compares each verifier key with the chain's.
+    const zkConfigProvider = new zkNode.NodeZkConfigProvider(cacheDir, ledger8 ? { verify: 'off' } : undefined);
+    // The SDK tells the two contract shapes apart: a ledger 8 contract is the bare instance.
+    const compiledContract = (witnesses) => (ledger8
+        ? new contractClass(witnesses)
+        : CompiledContract.make(contractName, contractClass).pipe(
+            CompiledContract.withWitnesses(witnesses),
+            CompiledContract.withCompiledFileAssets(cacheDir)
+        ));
     let proofProvider;
     if (provingMode === 'server') {
         const { httpClientProofProvider } = await import('@midnight-ntwrk/midnight-js-http-client-proof-provider');
@@ -740,7 +770,7 @@ export async function createTxBuilder(opts) {
     // One indexer provider per builder. One per transaction would leak a socket each time.
     const sockets = apiClient ? null : trackingWebSocket(require('ws'));
     const publicDataProvider = apiClient
-        ? apiPublicDataProvider({ client: apiClient, mjTypes, protocolVersion: Number(configuration.forks?.v9 ?? abstractions.ProtocolVersion.V9NativeForkVersion), ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
+        ? apiPublicDataProvider({ client: apiClient, mjTypes, mjUtils, mjProtocol, protocolVersion: Number(configuration.forks?.v9 ?? abstractions.ProtocolVersion.V9NativeForkVersion), ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
         : indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, sockets.WebSocket);
 
     return {
@@ -781,6 +811,7 @@ export async function createTxBuilder(opts) {
                 if (!c?.circuitId) throw new Error('buildSponsorable: every call must come from a prepare* helper (or carry circuitId, args and witnesses)');
             }
             const isBatch = callList.length > 1;
+            if (ledger8 && isBatch) throw new Error('buildSponsorable: a contract compiled for ledger 8 takes one call per transaction after the fork; send the calls one by one');
             const headroom = gasHeadroomFactor(gasHeadroom);
             if (headroom !== undefined && isBatch) throw new Error('buildSponsorable: gasHeadroom applies to a single call, not to a batch');
             onProgress?.({ phase: 'build', circuit: callList.map(c => c.circuitId).join('+') });
@@ -825,10 +856,7 @@ export async function createTxBuilder(opts) {
                 if (!witnesses) throw new Error('buildSponsorable: the call carries no witnesses (pass `witnesses` on the call or on the input)');
             }
 
-            const compiled = CompiledContract.make(contractName, contractClass).pipe(
-                CompiledContract.withWitnesses(witnesses),
-                CompiledContract.withCompiledFileAssets(cacheDir)
-            );
+            const compiled = compiledContract(witnesses);
             const holder = {};
             const walletProvider = buildOnlyWalletProvider(facade, zswapKeys, keystore, holder, ttlMinutes, bind, configuration.forks);
             const privateStateProvider = new InMemoryPrivateStateProvider();
@@ -845,7 +873,7 @@ export async function createTxBuilder(opts) {
                 compiledContract: compiled,
                 privateStateId,
                 initialPrivateState: initialPrivateState ?? {}
-            });
+            }).catch(async (e) => { throw await explainPreForkMismatch(e, contracts.ContractTypeError, publicDataProvider, contractAddress); });
 
             if (isBatch) {
                 // The wallet provider throws at submit on purpose, so an error with a captured transaction is success.
@@ -912,6 +940,7 @@ export async function createTxBuilder(opts) {
         /** Builds, proves and signs a contract deploy for a sponsor to pay and submit.
          *  The server must allow sponsored deploys, and an agent token needs `allowDeploy` with budget left. */
         async buildDeploySponsorable({ initialPrivateState, constructorArgs, witnesses, bind = true, recipients } = {}) {
+            if (ledger8) throw new Error('buildDeploySponsorable: a contract compiled for ledger 8 cannot be deployed after the fork; deploy the version of its package compiled for ledger 9');
             const recipientKeys = recipientKeyMap(recipients);
             onProgress?.({ phase: 'build', circuit: '<deploy>' });
             // The vault constructor reads the deployer's secret through a witness, so the vault family gets its witnesses here.
