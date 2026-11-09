@@ -324,8 +324,11 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                             await sleep(dustBackoffMs);
                             continue; // rebuild the dust payment with the same sponsor
                         }
-                        // No rebuilds left. The problem is the caller's tx, so the sponsor is not paused.
-                        throw e;
+                        // No rebuilds left. A generic pool rejection points at the caller's tx.
+                        if (verdict.generic) throw e;
+                        // A known dust race may pass with another wallet. It says nothing about this sponsor's health, so it is not paused.
+                        cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)}: dust race after ${budget} rebuilds, moving to the next sponsor: ${String((e as Error).message).slice(-120)}`);
+                        break;
                     }
                     if (verdict.decision === 'fail') {
                         cds.log('nightgate').warn(`unbound sponsor ${sessionId.slice(0, 8)} failed, not retrying: ${errorMessage(e).slice(0, 200)}`);

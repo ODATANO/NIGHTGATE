@@ -193,7 +193,7 @@ describe('readSupplementBlock', () => {
                     { __typename: 'ParamChange', id: 1003, raw: null, maxId: 9 },
                     { __typename: 'SomethingNew', id: 1004, raw: null, maxId: 9 }
                 ],
-                fee: '1',
+                fees: { paidFees: '1', estimatedFees: '2' },
                 transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ id: 0, success: true }, { id: 3283, success: false }] }
             }]
         }
@@ -206,6 +206,7 @@ describe('readSupplementBlock', () => {
         expect(tx.ledgerTxHash).toBe('abc');
         expect(tx.status).toBe('PARTIAL_SUCCESS');
         expect(tx.fee).toBe('1');
+        expect(tx.estimatedFee).toBe('2');
         expect(tx.segments).toEqual([{ segmentId: 0, success: true }, { segmentId: 3283, success: false }]);
         expect(tx.contractActions).toEqual([{
             actionType: 'CALL',

@@ -210,7 +210,7 @@ Takes the proven and signed transaction from txbuilder `buildSponsorable({ bind:
 
 - One wallet sponsors as many transactions at once as it has registered dust backings. A request waits up to `NIGHTGATE_BACKING_WAIT_MS` (default 5 min).
 - A fee no single note covers is paid from up to `NIGHTGATE_SPONSOR_MAX_DUST_NOTES` backings (default 4).
-- A lost dust race is rebuilt on the same sponsor (`NIGHTGATE_SPONSOR_DUST_RETRIES`, default 4).
+- A lost dust race is rebuilt on the same sponsor (`NIGHTGATE_SPONSOR_DUST_RETRIES`, default 4), then the next sponsor in the pool takes over.
 - The job returns once in a block. `NIGHTGATE_SPONSOR_WAIT=finalized` waits for finality.
 
 ### `sponsorSwap(makerHalfB64 | offerId, takerHalfB64, idempotencyKey?, takerSecret?) → { jobId, status, sessionId }`

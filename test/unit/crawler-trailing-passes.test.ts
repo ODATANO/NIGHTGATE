@@ -425,6 +425,7 @@ describe('IndexerSupplement', () => {
                     ledgerTxHash: 'abc',
                     status: 'PARTIAL_SUCCESS',
                     fee: '7',
+                    estimatedFee: '6',
                     segments: [{ segmentId: 0, success: true }, { segmentId: 3283, success: false }],
                     contractActions: [{
                         actionType: 'CALL', address: CONTRACT,
@@ -449,6 +450,7 @@ describe('IndexerSupplement', () => {
         }));
         const fees = await db.run(cds.ql.SELECT.one.from('midnight.TransactionFees').where({ transaction_ID: txId }));
         expect(String(fees.paidFees)).toBe('7');
+        expect(String(fees.estimatedFees)).toBe('6');
         const segments = (await db.run(cds.ql.SELECT.from(TX_SEGMENTS).where({ transactionResult_ID: resultId })))
             .sort((a: any, b: any) => a.segmentId - b.segmentId);
         expect(segments.map((s: any) => [s.segmentId, s.success])).toEqual([[0, true], [3283, false]]);

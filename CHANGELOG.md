@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.42.2 - 2026-11-09
+
+### Fixes
+
+- `sponsorUnboundTransaction`, `sponsorSwap`, `sponsorTransfer`: after the rebuilds
+  of a known dust race (`1010/170`, `1010/171`, `1010/196`) the next sponsor in the
+  pool takes over. The sponsor is not paused. Before, the job failed on the first
+  sponsor. A generic pool rejection still fails the job after one rebuild.
+- `TransactionFees.estimatedFees` is filled from the indexer. Before, it stayed 0.
+  Rows already past `lastSupplementedHeight` keep 0 until that cursor is moved back.
+
 ## 0.42.1 - 2026-11-09
 
 ### Changes

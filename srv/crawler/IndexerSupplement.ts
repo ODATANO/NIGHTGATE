@@ -208,11 +208,13 @@ export class IndexerSupplement {
         return result;
     }
 
-    /** The crawler stores a zero fee, because the block does not contain the fee. */
+    /** The crawler stores zero fees, because the block does not contain them. */
     private async applyFee(dbTx: DbRunner, transactionId: string, tx: SupplementTransaction): Promise<number> {
         if (tx.fee == null) return 0;
         const changed = await dbTx.run(
-            UPDATE.entity(TransactionFees).set({ paidFees: tx.fee }).where({ transaction_ID: transactionId })
+            UPDATE.entity(TransactionFees)
+                .set({ paidFees: tx.fee, ...(tx.estimatedFee == null ? {} : { estimatedFees: tx.estimatedFee }) })
+                .where({ transaction_ID: transactionId })
         );
         return affectedRows(changed) > 0 ? 1 : 0;
     }

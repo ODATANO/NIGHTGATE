@@ -15,7 +15,7 @@ const BLOCK_QUERY = `query($height: Int!) {
         ... on DustInitialUtxo { output { nonce } }
       }
       ... on RegularTransaction {
-        fee
+        fees { paidFees estimatedFees }
         transactionResult { status segments { id success } }
       }
     }
@@ -64,6 +64,7 @@ export interface SupplementTransaction {
     status: string | null;
     /** Computing the fee needs ledger parameters the node does not provide, so it comes from the indexer. */
     fee: string | null;
+    estimatedFee: string | null;
     segments: SupplementSegment[];
     contractActions: SupplementContractAction[];
     zswapEvents: SupplementLedgerEvent[];
@@ -99,7 +100,7 @@ interface TransactionAnswer {
     } | null> | null;
     zswapLedgerEvents?: unknown;
     dustLedgerEvents?: unknown;
-    fee?: unknown;
+    fees?: { paidFees?: unknown; estimatedFees?: unknown } | null;
     transactionResult?: { status?: string | null; segments?: Array<{ id?: unknown; success?: unknown } | null> | null } | null;
 }
 
@@ -175,7 +176,8 @@ export function readSupplementBlock(payload: BlockAnswer | null | undefined): Su
         transactions.push({
             ledgerTxHash,
             status: tx?.transactionResult?.status ?? null,
-            fee: tx?.fee == null ? null : String(tx.fee),
+            fee: tx?.fees?.paidFees == null ? null : String(tx.fees.paidFees),
+            estimatedFee: tx?.fees?.estimatedFees == null ? null : String(tx.fees.estimatedFees),
             segments: (tx?.transactionResult?.segments ?? [])
                 .map(s => ({ segmentId: toInt(s?.id), success: Boolean(s?.success) })),
             contractActions,

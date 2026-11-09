@@ -103,6 +103,29 @@ describe('sponsor executors follow the failure code', () => {
         expect(sponsorCandidatesNonExclusive(['sp-1'])).toEqual(['sp-1']);
     });
 
+    it('unbound: a known dust race moves to the next sponsor after its rebuilds, without benching', async () => {
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sp-1,sp-2';
+        boot();
+        const run = registeredProcessors.get('sponsorUnboundTransaction\u00001')!;
+        const race = coded('dust-race', { ledgerCode: '1010/170', retryable: true });
+        sponsorCalls.unbound
+            .mockRejectedValueOnce(race).mockRejectedValueOnce(race).mockRejectedValueOnce(race)
+            .mockResolvedValueOnce({ txHash: 'h', circuits: ['attest'], contractAddress: 'c' });
+        const out: any = await run({ op: 'sponsorUnbound', unboundTxB64: 'AAAA', sponsorSessionId: PLATFORM_POOL_SENTINEL }, { ...JOB, kind: 'sponsorUnboundTransaction', sessionId: PLATFORM_POOL_SENTINEL });
+        expect(out.feeSponsor).toBe('sp-2');
+        expect(sponsorCalls.unbound).toHaveBeenCalledTimes(4);
+        expect(sponsorCandidatesNonExclusive(['sp-1', 'sp-2']).sort()).toEqual(['sp-1', 'sp-2']);
+    });
+
+    it('unbound: a known dust race on the only sponsor fails the job with that race', async () => {
+        boot();
+        const run = registeredProcessors.get('sponsorUnboundTransaction\u00001')!;
+        sponsorCalls.unbound.mockRejectedValue(coded('dust-race', { ledgerCode: '1010/170', retryable: true }));
+        await expect(run({ op: 'sponsorUnbound', unboundTxB64: 'AAAA', sponsorSessionId: 'sp-1' }, { ...JOB, kind: 'sponsorUnboundTransaction' })).rejects.toThrow(/worker failure/);
+        expect(sponsorCalls.unbound).toHaveBeenCalledTimes(3);
+        expect(sponsorCandidatesNonExclusive(['sp-1'])).toEqual(['sp-1']);
+    });
+
     it('unbound: an ambiguous outcome is thrown untouched for reconciliation, no rebuild', async () => {
         boot();
         const run = registeredProcessors.get('sponsorUnboundTransaction\u00001')!;
