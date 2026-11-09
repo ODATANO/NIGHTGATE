@@ -77,7 +77,7 @@ node scripts/import-wallet-state.mjs presync/*.json
 
 The import matches each file to a sponsor session by `sessionId`. It refuses a file whose seed fingerprint, account index, network or SDK version differs. Stop the server first, or a running wallet overwrites the row at its next save.
 
-A saved state restores only under the wallet SDK version that wrote it. After an upgrade to a new SDK version every wallet syncs from the start once. On mainnet that takes hours per wallet. To keep the sponsors serving, presync them with the new version before the switch and import the files right after it. The wallets then only catch up the blocks since the presync.
+A saved state restores under the wallet SDK version that wrote it. The one exception: a state from wallet SDK 4.1.0 also restores under 5.0.0. After an upgrade to any other SDK version, every wallet syncs from the start once. On mainnet that takes hours per wallet. To keep the sponsors serving, presync them with the new version before the switch and import the files right after it. The wallets then only catch up the blocks since the presync.
 
 ## Prover keys
 

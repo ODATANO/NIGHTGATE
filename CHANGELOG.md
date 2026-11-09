@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.42.3 - 2026-11-09
+
+### Fixes
+
+- Wallet snapshots saved under wallet SDK 4.1.0 restore under wallet SDK 5.0.0.
+  Before, every wallet synced from the start once after the upgrade. The
+  restore logs one line, and the next save stores the snapshot under 5.0.0.
+  Any other SDK version still starts a cold sync.
+
 ## 0.42.2 - 2026-11-09
 
 ### Fixes

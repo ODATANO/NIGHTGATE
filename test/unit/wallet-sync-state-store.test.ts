@@ -172,6 +172,36 @@ describe('saveSyncState / loadSyncState round-trip', () => {
         expect(loaded).toBeNull();
     });
 
+    test('restores a snapshot of an earlier SDK listed as restorable', async () => {
+        await saveSyncState({
+            accountId: 'acct-earlier',
+            passphrase: PASS,
+            sdkVersion: 'wallet-sdk-facade@4.1.0',
+            states: { shielded: 'sh-4', unshielded: 'un-4', dust: 'du-4' }
+        });
+        const loaded = await loadSyncState({
+            accountId: 'acct-earlier',
+            passphrase: PASS,
+            expectedSdkVersion: 'wallet-sdk-facade@5.0.0'
+        });
+        expect(loaded).toMatchObject({ shielded: 'sh-4', unshielded: 'un-4', dust: 'du-4' });
+    });
+
+    test('refuses a newer snapshot under an older SDK', async () => {
+        await saveSyncState({
+            accountId: 'acct-newer',
+            passphrase: PASS,
+            sdkVersion: 'wallet-sdk-facade@5.0.0',
+            states: { dust: 'du-5' }
+        });
+        const loaded = await loadSyncState({
+            accountId: 'acct-newer',
+            passphrase: PASS,
+            expectedSdkVersion: 'wallet-sdk-facade@4.1.0'
+        });
+        expect(loaded).toBeNull();
+    });
+
     test('refuses restore when the stored networkId differs (cold start)', async () => {
         await saveSyncState({
             accountId: 'acct-net', passphrase: PASS, sdkVersion: SDK,

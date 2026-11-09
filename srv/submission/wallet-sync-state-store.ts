@@ -257,6 +257,16 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
     await next;
 }
 
+// Snapshots of an earlier SDK that the running SDK was shown to restore with the same state.
+// The next save writes them under the running version.
+const RESTORABLE_EARLIER_SDK: Readonly<Record<string, readonly string[]>> = {
+    'wallet-sdk-facade@5.0.0': ['wallet-sdk-facade@4.1.0']
+};
+
+export function isRestorableEarlierSdk(stored: string, running: string): boolean {
+    return RESTORABLE_EARLIER_SDK[running]?.includes(stored) ?? false;
+}
+
 /** Loads and decrypts an account's snapshots. Returns null on any mismatch, and the wallet syncs from scratch. */
 export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSyncState | null> {
     const { accountId, passphrase, expectedSdkVersion, expectedNetworkId, expectedSeedFingerprint } = args;
@@ -270,7 +280,7 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
     );
     if (!row) return null;
 
-    if (row.sdkVersion !== expectedSdkVersion) {
+    if (row.sdkVersion !== expectedSdkVersion && !isRestorableEarlierSdk(row.sdkVersion, expectedSdkVersion)) {
         log.warn(
             `refusing restore for ${accountId.slice(0, 16)}: ` +
             `stored sdkVersion '${row.sdkVersion}' != expected '${expectedSdkVersion}' (cold start)`
@@ -291,6 +301,9 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
             `stored seed fingerprint does not match the session's seed (cold start)`
         );
         return null;
+    }
+    if (row.sdkVersion !== expectedSdkVersion) {
+        log.info(`restoring ${accountId.slice(0, 16)} from a '${row.sdkVersion}' snapshot under '${expectedSdkVersion}'`);
     }
 
     const ring = getEncryptionKey();
