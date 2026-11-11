@@ -6,6 +6,7 @@ import { connect } from '../sdk/client.mjs';
 
 const require = createRequire(import.meta.url);
 const { deriveIndexerWsUrl } = require('../../srv/utils/indexer-url.js');
+const { indexerQuery, IndexerHttpError, IndexerQueryError } = require('../../srv/utils/indexer-graphql.js');
 
 /** The client behind `api`: a connected `connect()` client, or the options to create one. */
 export function apiClientFor(api) {
@@ -24,6 +25,22 @@ export function gatewayIndexerUrls(api) {
     const http = new URL(`${baseUrl.replace(/\/+$/, '')}/indexer/api/v4/graphql`);
     http.searchParams.set('key', token);
     return { indexerHttpUrl: http.toString(), indexerWsUrl: deriveIndexerWsUrl(http.toString()) };
+}
+
+/**
+ * Asks the indexer for its newest block once, before a wallet starts to sync from it. The wallet SDK waits on an indexer that does not answer without an error.
+ */
+export async function assertIndexerAnswers(indexerHttpUrl, who) {
+    try {
+        await indexerQuery(indexerHttpUrl, '{ block { height } }', { timeoutMs: 10_000 });
+    } catch (e) {
+        // It answered and speaks GraphQL, so the wallet can talk to it.
+        if (e instanceof IndexerQueryError) return;
+        const why = e instanceof IndexerHttpError
+            ? `HTTP ${e.status}${e.detail ? `: ${e.detail}` : ''}`
+            : e?.name === 'TimeoutError' ? 'no answer within 10 s' : [e?.cause?.code, e?.message ?? String(e)].filter(Boolean).join(' ');
+        throw new Error(`${who}: no indexer answers at ${new URL(indexerHttpUrl).host} (${why}); pass indexerHttpUrl and indexerWsUrl of a running indexer, or api with a gateway key`);
+    }
 }
 
 /** The wallet facade's submission service for a builder that never submits. Nothing is dialed. */

@@ -238,6 +238,43 @@ describe('apiPublicDataProvider: what a build-only provider does not do', () => 
     });
 });
 
+describe('assertIndexerAnswers', () => {
+    const URL_WITH_KEY = 'https://gateway.example/indexer/api/v4/graphql?key=oda_secret';
+    const respond = (status: number, body: unknown) => vi.fn(async () => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status }));
+    const withFetch = async (fetchFn: unknown, run: () => Promise<unknown>) => {
+        vi.stubGlobal('fetch', fetchFn);
+        try { return await run(); } finally { vi.unstubAllGlobals(); }
+    };
+
+    it('passes for an indexer that answers, also when it only answers with a GraphQL error', async () => {
+        const { assertIndexerAnswers } = await importProvider();
+        const alive = respond(200, { data: { block: { height: 7 } } });
+        await withFetch(alive, () => assertIndexerAnswers(URL_WITH_KEY, 'createSwapWallet'));
+        expect(JSON.parse((alive.mock.calls[0] as unknown as [string, { body: string }])[1].body)).toEqual({ query: '{ block { height } }' });
+        await withFetch(respond(200, { errors: [{ message: 'unknown field' }] }), () => assertIndexerAnswers(URL_WITH_KEY, 'createSwapWallet'));
+    });
+
+    it('names the host and the reason of an indexer that is gone, and never the key', async () => {
+        const { assertIndexerAnswers } = await importProvider();
+        const gone = respond(410, { errors: [{ message: 'indexer.example was decommissioned on 2026-10-09.' }] });
+        const err = await withFetch(gone, () => assertIndexerAnswers(URL_WITH_KEY, 'createUnshieldedWallet').catch((e: Error) => e)) as Error;
+        expect(err.message).toBe('createUnshieldedWallet: no indexer answers at gateway.example (HTTP 410: indexer.example was decommissioned on 2026-10-09.); ' +
+            'pass indexerHttpUrl and indexerWsUrl of a running indexer, or api with a gateway key');
+        expect(err.message).not.toMatch(/oda_secret/);
+    });
+
+    it('reports a gateway answer, a body it cannot read and a host that is not there', async () => {
+        const { assertIndexerAnswers } = await importProvider();
+        const message = (fetchFn: unknown) => withFetch(fetchFn, () => assertIndexerAnswers(URL_WITH_KEY, 'createTxBuilder').then(() => 'passed', (e: Error) => e.message));
+        expect(await message(respond(402, { error: 'no units left on this key' }))).toMatch(/gateway\.example \(HTTP 402: no units left on this key\)/);
+        expect(await message(respond(502, '<html>Bad Gateway</html>'))).toMatch(/gateway\.example \(HTTP 502\);/);
+        const refused = vi.fn(async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }); });
+        expect(await message(refused)).toMatch(/gateway\.example \(ECONNREFUSED fetch failed\)/);
+        const slow = vi.fn(async () => { throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }); });
+        expect(await message(slow)).toMatch(/gateway\.example \(no answer within 10 s\)/);
+    });
+});
+
 describe('apiClientFor and buildOnlySubmissionService', () => {
     it('takes a connected client as it is and builds one from connect() options', async () => {
         const { apiClientFor } = await importProvider();

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createRequire } from 'node:module';
-import { gatewayIndexerUrls } from './api-provider.mjs';
+import { assertIndexerAnswers, gatewayIndexerUrls } from './api-provider.mjs';
 
 const require = createRequire(import.meta.url);
 const { assertSeedHex, bareHex, HEX64_RE } = require('../../srv/utils/hex-patterns.js');
@@ -14,7 +14,7 @@ export const SWAP_OFFER_PREFIX = 'swapoffer';
 const offerFile = () => require('../../srv/utils/offer-file.js');
 const midnightAddress = () => require('../../srv/utils/midnight-address.js');
 const loadLedger = () => import('@midnightntwrk/ledger-v9');
-import { sealTx, openTx, shieldedKeysByEpoch } from './wallet-tx.mjs';
+import { sealTx, openTx, shieldedKeysByEpoch, syncedAtLedger9 } from './wallet-tx.mjs';
 
 function rawTokenTypeOf(value, name) {
     const type = bareHex(value);
@@ -171,6 +171,7 @@ export async function createSwapWallet(opts) {
     if (provingMode === 'server' && !opts.proofServerUrl) throw new Error("createSwapWallet: provingMode 'server' requires proofServerUrl (a proof server YOU run; it sees the coins you spend)");
     const maxInputs = opts.maxInputs ?? SWAP_MAX_INPUTS;
     if (!Number.isInteger(maxInputs) || maxInputs < 1) throw new Error(`createSwapWallet: maxInputs must be a positive integer (got ${String(opts.maxInputs)})`);
+    await assertIndexerAnswers(indexerHttpUrl, 'createSwapWallet');
 
     const sdk = opts.sdk ?? {
         ledger: await loadLedger(),
@@ -323,7 +324,7 @@ export async function createSwapWallet(opts) {
         coinPublicKey: keys.coinPublicKey,
         encryptionPublicKey: keys.encryptionPublicKey,
 
-        async sync() { await wallet.waitForSyncedState(); },
+        async sync() { await syncedAtLedger9(wallet, configuration.forks); },
 
         maxInputs,
 

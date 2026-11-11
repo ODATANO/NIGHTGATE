@@ -4,7 +4,8 @@
  * Documents rows, never the operator's other sessions or rows without a
  * session; the bound read functions of the chain entities answer under a
  * token; an entity outside the agent-readable set answers 403; the
- * operator's own reads are untouched.
+ * operator's own reads are untouched. A token reads the jobs of its own
+ * grant by their id.
  */
 
 import cds from '@sap/cds';
@@ -23,6 +24,8 @@ const TOKEN = 'ngat_' + 'c'.repeat(64);
 const OPERATOR = 'operator-docs';
 const SESSION = 'a1a1a1a1-0000-4000-8000-000000000001';
 const OTHER_SESSION = 'a1a1a1a1-0000-4000-8000-000000000002';
+const GRANT = 'a1a1a1a1-0000-4000-8000-00000000000a';
+const POOL = '00000000-0000-0000-0000-706f6f6c0000';
 
 function sha256Hex(s: string): string { return crypto.createHash('sha256').update(s).digest('hex'); }
 
@@ -38,7 +41,7 @@ describe('agent token reads over HTTP', () => {
         const db = await cds.connect.to('db');
         const now = new Date().toISOString();
         await db.run(cds.ql.INSERT.into('midnight.AgentGrants').entries({
-            ID: cds.utils.uuid(), userId: OPERATOR, sessionId: SESSION, tokenHash: sha256Hex(TOKEN),
+            ID: GRANT, userId: OPERATOR, sessionId: SESSION, tokenHash: sha256Hex(TOKEN),
             allowedActions: JSON.stringify(['anchorDocument']), isActive: true, createdAt: now, modifiedAt: now
         }));
         const doc = (id: string, sessionId: string | null, storageRef: string) => ({
@@ -76,6 +79,31 @@ describe('agent token reads over HTTP', () => {
     it('a token cannot read GranteeIdentities', async () => {
         const res = await get('GranteeIdentities', asToken);
         expect(res.status).toBe(403);
+    });
+
+    it('a token reads a job of its own grant by its id alone, and no job of another grant', async () => {
+        const db = await cds.connect.to('db');
+        const now = new Date().toISOString();
+        const job = (ID: string, grantId: string | null) => ({
+            ID, kind: 'sponsorTransfer', sessionId: POOL, status: 'succeeded', requestedBy: OPERATOR, grantId, createdAt: now, modifiedAt: now
+        });
+        const own = 'b2b2b2b2-0000-4000-8000-000000000001';
+        const otherGrant = 'b2b2b2b2-0000-4000-8000-000000000002';
+        const noGrant = 'b2b2b2b2-0000-4000-8000-000000000003';
+        await db.run(cds.ql.INSERT.into('midnight.BackgroundJobs').entries([
+            job(own, GRANT), job(otherGrant, 'a1a1a1a1-0000-4000-8000-00000000000b'), job(noGrant, null)
+        ]));
+        const status = (body: Record<string, string>, headers: Record<string, string>) =>
+            cap.axios.post(`${API}/getJobStatus`, body, { headers, validateStatus: () => true });
+
+        const mine = await status({ jobId: own }, asToken);
+        expect([mine.status, mine.data.jobId, mine.data.status]).toEqual([200, own, 'succeeded']);
+        expect((await status({ jobId: otherGrant }, asToken)).status).toBe(404);
+        expect((await status({ jobId: noGrant }, asToken)).status).toBe(404);
+        // naming the session the job runs under works as before
+        expect((await status({ jobId: own, sessionId: POOL }, asToken)).status).toBe(200);
+        // the operator started all three
+        for (const jobId of [own, otherGrant, noGrant]) expect((await status({ jobId }, asOperator)).status).toBe(200);
     });
 
     it('the operator still reads every own row, sessions and legacy rows included', async () => {

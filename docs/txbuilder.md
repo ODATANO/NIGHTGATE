@@ -107,7 +107,7 @@ shieldedKeys, provingMode, walletSync, waitForSync, serializeWalletState,
 buildSponsorable, buildDeploySponsorable, revert, close }`.
 
 - `walletSync` is the resolved mode: `'all'`, `'coins'`, `'shielded'` or `'none'`.
-- `waitForSync()` resolves when every started sub-wallet reached the tip, a shared shielded wallet included.
+- `waitForSync()` resolves when every started sub-wallet reached the tip and reads the chain at ledger 9, a shared shielded wallet included. A wallet catches up a moment before it learns that the chain runs ledger 9. A build in that moment would be for the ledger before it.
 - `serializeWalletState()` returns `{ shielded?, unshielded?, dust? }` for the synced sub-wallets. It holds the coins, so store it like a key.
 - `revert(tx)` releases the coins a built transaction reserved, when it will not land. Takes an offer file, base64 or bytes, bound or not.
 - `close()` stops the wallet sync and the indexer sockets. Without it both run until the process exits.
@@ -308,8 +308,8 @@ const { txHash } = await ng.sponsorTransfer({ transferTxB64: built.txB64, tokenT
 - `buildTransfer({ tokenType, amount, to, bind? })` returns `{ txB64, tx, bound, serializedBytes, inputs, terms, revert }`. `to` is a shielded address (`mn_shield-addr_...`).
 - The recipient gets one coin, the wallet its change.
 - A transfer nets to zero and shows no token type. The server records `tokenType` and `amount` as the caller's declaration (`declared: true` in the receipt). It checks the shape with the rule of `readTransferShape(tx)`.
-- `getJobStatus` of a landed swap or transfer carries `receipt`, once the chain confirmed the job. `sponsorSwap` and `sponsorTransfer` return `jobId` and `sessionId` for that call, and `receipt` when it is already there. It usually is not yet, because they return when the job succeeded and the chain confirms later.
-- `ng.waitForReceipt({ jobId, sessionId })` waits for the receipt and throws when the job fails or can have none. It holds a call on the server where it can, and otherwise polls from 10 s up to 60 s. A metered gateway may bill each call.
+- `getJobStatus` of a landed swap or transfer carries `receipt`, once the chain confirmed the job. `sponsorSwap` and `sponsorTransfer` return the `jobId` for that call, and `receipt` when it is already there. It usually is not yet, because they return when the job succeeded and the chain confirms later.
+- `ng.waitForReceipt({ jobId })` waits for the receipt and throws when the job fails or can have none. A server before 0.43.1 also needs the returned `sessionId`. It holds a call on the server where it can, and otherwise polls from 10 s up to 60 s. A metered gateway may bill each call.
 - `verifyReceipt(receipt, publicKey)` from the client checks a receipt against the key `ng.getReceiptKey()` publishes.
 
 ### Unshielded transfers
@@ -328,6 +328,8 @@ const { txHash } = await ng.sponsorTransfer({ transferTxB64: built.txB64, tokenT
 - `buildTransfer({ amount, to, tokenType?, bind? })` returns the record of the shielded `buildTransfer`. `to` is an unshielded address (`mn_addr_...`). `tokenType` defaults to NIGHT.
 - The wallet signs the transfer with the seed's key. The sponsor pays the fee, so the wallet needs no DUST.
 - The recipient gets one coin, the wallet its change. A transfer to the wallet's own address is refused.
+- Await `sync()` before the first `buildTransfer`. It resolves once the wallet caught up and reads the chain at ledger 9. Before that `buildTransfer` refuses.
+- The wallet asks the indexer for its newest block before it starts. An indexer that does not answer fails `createUnshieldedWallet` with the reason it gave, for example `HTTP 410`, because the wallet SDK would wait on it without an error. `createSwapWallet` and a builder that syncs wallets do the same.
 - An unshielded transfer shows type, amount and recipient. The server reads them from the transaction and refuses a `tokenType` or `amount` that differs. `readUnshieldedTransfer(tx)` reads them by the same rule.
 - The receipt carries the recipient as `transfer.to` and `declared: false`.
 - A built transfer is valid for `ttlMinutes`, default 30. `revert(input)` releases the coins of one that did not land, from its base64 or bytes.

@@ -1,11 +1,22 @@
 // One POST client for the indexer's GraphQL API, shared by every server-side lookup.
 // SPDX-License-Identifier: Apache-2.0
 
-/** A non-2xx response from the indexer. The caller uses the status to decide how long to back off. */
+/** A non-2xx response from the indexer. The caller uses the status to decide how long to back off. `detail` is the reason the response gave, if any. */
 export class IndexerHttpError extends Error {
-    constructor(readonly status: number) {
+    constructor(readonly status: number, readonly detail?: string) {
         super(`indexer answered ${status}`);
         this.name = 'IndexerHttpError';
+    }
+}
+
+/** The reason an error response states: its first GraphQL error or its `error` text. Undefined for any other body. */
+async function errorDetail(res: Response): Promise<string | undefined> {
+    try {
+        const body: { errors?: Array<{ message?: unknown }>; error?: unknown } = JSON.parse(await res.text());
+        const reason = body?.errors?.[0]?.message ?? body?.error;
+        return typeof reason === 'string' && reason ? reason.slice(0, 200) : undefined;
+    } catch {
+        return undefined;
     }
 }
 
@@ -36,7 +47,7 @@ export async function indexerQuery<T = unknown>(url: string, query: string, opts
         body: JSON.stringify(opts.variables ? { query, variables: opts.variables } : { query }),
         signal: AbortSignal.timeout(opts.timeoutMs ?? 15_000)
     });
-    if (!res.ok) throw new IndexerHttpError(res.status);
+    if (!res.ok) throw new IndexerHttpError(res.status, await errorDetail(res));
     const body: { data?: T; errors?: Array<{ message?: unknown }> } = await res.json();
     if (body?.errors?.length) throw new IndexerQueryError(body.errors.map(e => String(e?.message ?? 'unknown')));
     return body?.data as T;

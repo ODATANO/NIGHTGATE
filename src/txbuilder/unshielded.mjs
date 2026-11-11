@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createRequire } from 'node:module';
-import { gatewayIndexerUrls } from './api-provider.mjs';
+import { assertIndexerAnswers, gatewayIndexerUrls } from './api-provider.mjs';
 import { decodeOffer, latest, sizeOf, swapProvingService } from './swap.mjs';
-import { sealTx, openTx } from './wallet-tx.mjs';
+import { sealTx, openTx, ledger9Version, readsLedger9, syncedAtLedger9 } from './wallet-tx.mjs';
 
 const require = createRequire(import.meta.url);
 const { assertSeedHex, bareHex, HEX64_RE } = require('../../srv/utils/hex-patterns.js');
@@ -68,6 +68,7 @@ export async function createUnshieldedWallet(opts) {
         ({ indexerHttpUrl, indexerWsUrl } = lane);
     }
     if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) throw new Error(`createUnshieldedWallet: ttlMinutes must be a positive number (got ${String(opts.ttlMinutes)})`);
+    await assertIndexerAnswers(indexerHttpUrl, 'createUnshieldedWallet');
 
     const sdk = opts.sdk ?? {
         ledger: await loadLedger(),
@@ -123,7 +124,11 @@ export async function createUnshieldedWallet(opts) {
             throw new Error(`buildTransfer: to is not an unshielded address of ${networkId}: ${e?.message ?? String(e)}`);
         }
         if (to.trim() === publicKey.address) throw new Error('buildTransfer: to is this wallet\'s own address; a sponsor pays only a transfer to another address');
-        const free = BigInt((await state())?.balances?.[type] ?? 0n);
+        const current = await state();
+        if (!readsLedger9(current, await ledger9Version(configuration.forks))) {
+            throw new Error('buildTransfer: the wallet does not read the chain at ledger 9 yet and would build for the ledger before it; await sync() first');
+        }
+        const free = BigInt(current?.balances?.[type] ?? 0n);
         if (free < atoms) throw new Error(`buildTransfer: sending ${atoms} of ${type.slice(0, 16)} needs more than the ${free} this wallet holds unreserved`);
 
         const handle = await wallet.transferTransaction([{ type, receiverAddress: receiver, amount: atoms }], new Date(Date.now() + ttlMinutes * 60_000));
@@ -154,7 +159,7 @@ export async function createUnshieldedWallet(opts) {
         /** The raw token type of NIGHT, the default of `buildTransfer`. */
         nightTokenType: night,
 
-        async sync() { await wallet.waitForSyncedState(); },
+        async sync() { await syncedAtLedger9(wallet, configuration.forks); },
 
         /** Balance of the unreserved coins per token type, in the smallest unit. */
         async balances() {

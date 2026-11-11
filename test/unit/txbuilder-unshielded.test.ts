@@ -19,10 +19,18 @@ vi.mock('@midnightntwrk/ledger-v9', () => ({
 }));
 
 // The wallet's sealed handles are plain records here: `{ sealed, tx }` going in, `{ stage, tx }` coming out.
-vi.mock('../../src/txbuilder/wallet-tx.mjs', () => ({
+vi.mock('../../src/txbuilder/wallet-tx.mjs', async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
     sealTx: async (stage: string, tx: unknown) => ({ sealed: stage, tx }),
     openTx: async (handle: { tx: unknown }) => handle.tx,
     shieldedKeysByEpoch: async () => ({ v8: 'keys-v8', v9: 'keys-v9' })
+}));
+
+// The one question to the indexer before a wallet starts is answered here; its own tests ask a stand-in indexer.
+const indexerCheck = vi.hoisted(() => ({ calls: [] as Array<[string, string]>, fail: null as Error | null }));
+vi.mock('../../src/txbuilder/api-provider.mjs', async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
+    assertIndexerAnswers: async (url: string, who: string) => { indexerCheck.calls.push([url, who]); if (indexerCheck.fail) throw indexerCheck.fail; }
 }));
 
 const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
@@ -68,11 +76,19 @@ describe('createUnshieldedWallet', () => {
     const TO = bech32m.encode('mn_addr_preprod', bech32m.toWords(Uint8Array.from(Buffer.from(TO_RAW, 'hex'))));
     const OWN_ADDRESS = bech32m.encode('mn_addr_preprod', bech32m.toWords(Uint8Array.from(Buffer.from(OWN, 'hex'))));
 
-    function fakeSdk(proven: any = paymentTx()) {
+    function fakeSdk(proven: any = paymentTx(), protocolVersion = 2_000_000n) {
         const calls: any = { transfers: [], signed: [], reverted: [], decoded: [], restored: [], configuration: undefined };
         const utxo = (value: bigint, type = NIGHT) => ({ utxo: { value, type }, meta: { registeredForDustGeneration: true } });
         const wallet = {
-            state: { subscribe: (o: any) => { o.next({ balances: { [NIGHT]: 5000n, [CREDIT]: 40n }, availableCoins: [utxo(5000n), utxo(40n, CREDIT)], pendingCoins: [utxo(7n)] }); return { unsubscribe() { /* nothing */ } }; } },
+            state: {
+                subscribe: (o: any) => {
+                    o.next({
+                        protocolVersion, progress: { isCompleteWithin: () => true },
+                        balances: { [NIGHT]: 5000n, [CREDIT]: 40n }, availableCoins: [utxo(5000n), utxo(40n, CREDIT)], pendingCoins: [utxo(7n)]
+                    });
+                    return { unsubscribe() { /* nothing */ } };
+                }
+            },
             start: vi.fn(async () => undefined),
             stop: vi.fn(async () => undefined),
             waitForSyncedState: vi.fn(async () => ({})),
@@ -110,7 +126,7 @@ describe('createUnshieldedWallet', () => {
         return { sdk, wallet, calls };
     }
 
-    beforeEach(() => vi.clearAllMocks());
+    beforeEach(() => { vi.clearAllMocks(); indexerCheck.calls.length = 0; indexerCheck.fail = null; });
 
     it('syncs the unshielded wallet of the seed and shows its coins', async () => {
         const { createUnshieldedWallet } = await importTxBuilder();
@@ -120,7 +136,8 @@ describe('createUnshieldedWallet', () => {
         expect(wallet.start).toHaveBeenCalledTimes(1);
         expect(w).toMatchObject({ address: OWN_ADDRESS, nightTokenType: NIGHT });
         await w.sync();
-        expect(wallet.waitForSyncedState).toHaveBeenCalledTimes(1);
+        // Caught up alone is not synced, so the SDK's own wait is not what sync() uses.
+        expect(wallet.waitForSyncedState).not.toHaveBeenCalled();
         expect(await w.balances()).toEqual({ [NIGHT]: 5000n, [CREDIT]: 40n });
         expect(await w.coins()).toEqual([{ tokenType: NIGHT, amount: 5000n }, { tokenType: CREDIT, amount: 40n }]);
         expect(await w.pending()).toEqual([{ tokenType: NIGHT, amount: 7n }]);
@@ -131,6 +148,29 @@ describe('createUnshieldedWallet', () => {
         const resumed = fakeSdk();
         await createUnshieldedWallet({ ...URLS, seedHex: SEED, sdk: resumed.sdk, walletState: '{"saved":true}' });
         expect(resumed.calls.restored).toEqual(['{"saved":true}']);
+    });
+
+    it('is not synced and builds nothing while the wallet reads the chain before ledger 9', async () => {
+        const { createUnshieldedWallet } = await importTxBuilder();
+        const { sdk, wallet } = fakeSdk(paymentTx(), 1_000_000n);
+        const w = await createUnshieldedWallet({ ...URLS, seedHex: SEED, sdk });
+        const waited = await Promise.race([w.sync().then(() => 'synced'), new Promise((resolve) => setTimeout(() => resolve('waiting'), 30))]);
+        expect(waited).toBe('waiting');
+        await expect(w.buildTransfer({ amount: 700n, to: TO })).rejects.toThrow(/does not read the chain at ledger 9 yet/);
+        expect(wallet.transferTransaction).not.toHaveBeenCalled();
+    });
+
+    it('asks the indexer once before the wallet starts, and does not start against one that does not answer', async () => {
+        const { createUnshieldedWallet } = await importTxBuilder();
+        const alive = fakeSdk();
+        await createUnshieldedWallet({ ...URLS, seedHex: SEED, sdk: alive.sdk });
+        expect(indexerCheck.calls).toEqual([[URLS.indexerHttpUrl, 'createUnshieldedWallet']]);
+
+        indexerCheck.fail = new Error('createUnshieldedWallet: no indexer answers at indexer.example (HTTP 410: decommissioned)');
+        const dead = fakeSdk();
+        await expect(createUnshieldedWallet({ ...URLS, seedHex: SEED, sdk: dead.sdk })).rejects.toThrow(/no indexer answers at indexer\.example \(HTTP 410: decommissioned\)/);
+        expect(dead.wallet.start).not.toHaveBeenCalled();
+        expect(dead.calls.configuration).toBeUndefined();
     });
 
     it('needs an indexer or a gateway key', async () => {

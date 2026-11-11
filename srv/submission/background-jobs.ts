@@ -89,9 +89,10 @@ export async function startJob<TIn, TOut>(
     const reader = pinnedRunner ?? db;
 
     if (idempotencyKey && idempotencyKey.length > IDEMPOTENCY_KEY_MAX_LENGTH) throw new IdempotencyKeyInvalidError();
+    const caller: JobCaller = { requestedBy, grantId };
     // Quick check only. A parallel insert with the same key is caught by the unique constraint below.
     if (idempotencyKey) {
-        const dup = await dedupExisting<TIn, TOut>(reader, sessionId, kind, idempotencyKey, payloadFingerprint);
+        const dup = await dedupExisting<TIn, TOut>(reader, sessionId, kind, idempotencyKey, payloadFingerprint, caller);
         if (dup) return dup;
     }
 
@@ -155,7 +156,7 @@ export async function startJob<TIn, TOut>(
                 }
                 if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
                 if (!isUniqueViolation(insertErr)) throw insertErr;
-                const dup = await dedupExisting<TIn, TOut>(pinnedRunner, sessionId, kind, idempotencyKey, payloadFingerprint);
+                const dup = await dedupExisting<TIn, TOut>(pinnedRunner, sessionId, kind, idempotencyKey, payloadFingerprint, caller);
                 if (dup) return dup;
                 throw insertErr;
             }
@@ -167,7 +168,7 @@ export async function startJob<TIn, TOut>(
         } catch (insertErr) {
             if (isLockContention(insertErr)) throw new JobAdmissionBusyError(kind);
             if (!isUniqueViolation(insertErr)) throw insertErr;
-            const dup = await dedupExisting<TIn, TOut>(db, sessionId, kind, idempotencyKey, payloadFingerprint);
+            const dup = await dedupExisting<TIn, TOut>(db, sessionId, kind, idempotencyKey, payloadFingerprint, caller);
             if (dup) return dup;
             throw insertErr;
         }
@@ -280,6 +281,14 @@ export async function runChildCommand<T>(args: {
     }
 }
 
+/** Who asks for a job: the user and, for an agent token, its grant. */
+type JobCaller = Pick<StartJobArgs<unknown, unknown>, 'requestedBy' | 'grantId'>;
+
+/** Whether `caller` started `job`. Keys of one user are shared by its grants, so the grant counts too. */
+function startedBy(job: BackgroundJob, caller: JobCaller): boolean {
+    return !!caller.requestedBy && job.requestedBy === caller.requestedBy && (job.grantId ?? null) === (caller.grantId ?? null);
+}
+
 /** The existing job for this idempotency key, or null. Throws when the key is reused with a different payload.
  *  A failed job releases its key, except a workflow step: the retry after an error is a new job, whatever its payload. */
 async function dedupExisting<TIn, TOut>(
@@ -287,7 +296,8 @@ async function dedupExisting<TIn, TOut>(
     sessionId: string,
     kind: string,
     idempotencyKey: string,
-    payloadFingerprint: string
+    payloadFingerprint: string,
+    caller: JobCaller
 ): Promise<StartJobResult<TOut, TIn> | null> {
     const existing = await runner.run(
         SELECT.one.from(BackgroundJobs)
@@ -303,7 +313,10 @@ async function dedupExisting<TIn, TOut>(
         return null;
     }
     if (existing.payloadFingerprint && existing.payloadFingerprint !== payloadFingerprint) {
-        throw new IdempotencyConflictError(idempotencyKey);
+        const own = startedBy(existing, caller);
+        throw new IdempotencyConflictError(idempotencyKey, own
+            ? { jobId: existing.ID, status: existing.status, chainStatus: existing.chainStatus ?? null }
+            : undefined);
     }
     return {
         jobId: existing.ID,

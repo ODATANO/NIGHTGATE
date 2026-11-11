@@ -1128,7 +1128,9 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
             && data.sessionId !== grant.sessionId && !sponsorPoll) {
             return req.reject(403, 'sessionId does not match this agent grant');
         }
-        if (!sponsorPoll) data.sessionId = grant.sessionId;
+        // A poll that names no session stays without one: the handler finds the grant's own job by its id.
+        const ownJobPoll = event === 'getJobStatus' && (data.sessionId === undefined || data.sessionId === null);
+        if (!sponsorPoll && !ownJobPoll) data.sessionId = grant.sessionId;
         // The sponsor actions take no sponsor parameter; their handlers read the grant's pin.
         if (allowlisted && !SPONSOR_PHASE2_ACTIONS.has(event)) {
             if (grant.sponsorSessionId) {

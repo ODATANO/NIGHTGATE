@@ -271,7 +271,7 @@ export interface TxBuilder {
     /** Another builder lists these under `recipients` to send this wallet a private coin. */
     shieldedKeys: ShieldedPublicKeys;
     walletSync: 'all' | 'coins' | 'shielded' | 'none';
-    /** Resolves once every syncing sub-wallet has caught up with the chain, a shared shielded wallet included. */
+    /** Resolves once every syncing sub-wallet has caught up with the chain and reads it at ledger 9, a shared shielded wallet included. */
     waitForSync(): Promise<void>;
     /** Saves the wallet state for `createTxBuilder({ walletState })`. */
     serializeWalletState(): Promise<WalletState>;
@@ -593,7 +593,7 @@ export interface SwapWallet {
     address: string;
     coinPublicKey: string;
     encryptionPublicKey: string;
-    /** Resolves once the wallet has caught up with the chain. */
+    /** Resolves once the wallet has caught up with the chain and reads it at ledger 9. */
     sync(): Promise<void>;
     maxInputs: number;
     /** Balance of the free coins per token type, in the smallest unit. */
@@ -671,7 +671,7 @@ export interface UnshieldedWallet {
     address: string;
     /** The raw token type of NIGHT. */
     nightTokenType: string;
-    /** Resolves once the wallet has caught up with the chain. */
+    /** Resolves once the wallet has caught up with the chain and reads it at ledger 9. */
     sync(): Promise<void>;
     /** Balance of the unreserved coins per token type, in the smallest unit. */
     balances(): Promise<Record<string, bigint>>;

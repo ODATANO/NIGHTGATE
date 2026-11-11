@@ -730,7 +730,7 @@ service NightgateService {
                                          idempotencyKey: String)              returns { // optional
         jobId     : UUID;
         status    : String;
-        sessionId : UUID; // pass it to getJobStatus
+        sessionId : UUID; // the session the job runs under
     };
 
     /** Pays the fee for a signed transaction that is not yet sealed and submits it.
@@ -739,7 +739,7 @@ service NightgateService {
                                        idempotencyKey: String)                returns { // optional
         jobId     : UUID;
         status    : String;
-        sessionId : UUID; // pass it to getJobStatus
+        sessionId : UUID; // the session the job runs under
     };
 
     /** Pays the fee for a shielded token swap and submits it.
@@ -752,7 +752,7 @@ service NightgateService {
                          takerSecret: String)                                 returns { // optional; required to take a directed offer
         jobId     : UUID;
         status    : String;
-        sessionId : UUID; // pass it to getJobStatus
+        sessionId : UUID; // the session the job runs under
     };
 
     /** Pays the fee for a plain transfer the caller built and submits it. A shielded transfer hides its terms, so `tokenType` and `amount` are the caller's statement.
@@ -763,7 +763,7 @@ service NightgateService {
                              idempotencyKey: String)                          returns { // optional
         jobId     : UUID;
         status    : String;
-        sessionId : UUID; // pass it to getJobStatus
+        sessionId : UUID; // the session the job runs under
     };
 
     // ---- Swap offer board ----
@@ -1311,7 +1311,7 @@ service NightgateService {
      * With `waitMs` the call holds until the job settles or the time is up, so one call replaces many polls. */
 
     action   getJobStatus(jobId: UUID,
-                          sessionId: UUID,
+                          sessionId: UUID, // optional; the job's session; without it a token reads the jobs of its own grant
                           waitMs: Integer, // ms; optional, at most 25000; hold the call until there is something to return
                           untilChain: Boolean // default false; with waitMs, a succeeded job also waits for the chain's verdict
     )                                                                         returns {

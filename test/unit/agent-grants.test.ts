@@ -1073,6 +1073,20 @@ describe('agent grants', () => {
             expect(req.reject).toHaveBeenCalledWith(403, expect.stringContaining('sessionId'));
         });
 
+        it('leaves a getJobStatus that names no session without one, and binds every other action to the grant session', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow());
+            const poll = tokenReq('getJobStatus', { jobId: 'j-1' });
+            await enforceAgentGrant(poll, db);
+            expect(poll.reject).not.toHaveBeenCalled();
+            expect(poll.data.sessionId).toBeUndefined();
+            expect(poll.agentGrant.ID).toBe('grant-1');
+
+            mockDbRun.mockResolvedValueOnce(grantRow());
+            const write = tokenReq('anchorDocument', {});
+            await enforceAgentGrant(write, db);
+            expect(write.data.sessionId).toBe('sess-1');
+        });
+
         it('rejects 403 on a session mismatch even for always-allowed getJobStatus', async () => {
             mockDbRun.mockResolvedValueOnce(grantRow());
             const req = tokenReq('getJobStatus', { jobId: 'j-1', sessionId: 'other-session' });

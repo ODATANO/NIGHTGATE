@@ -1357,6 +1357,34 @@ describe('startJob: idempotency', () => {
         });
     });
 
+    test('the conflict names the job to the caller that started it, and to nobody else', async () => {
+        const first = await startJob({
+            kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-named', requestedBy: 'operator', grantId: 'grant-a',
+            request: { amount: '1' }, work: async () => ({ ok: true })
+        });
+        await flushSpawn();
+        const again = async (caller: { requestedBy?: string; grantId?: string | null }): Promise<Record<string, unknown>> => {
+            try {
+                await startJob({
+                    kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-named', ...caller,
+                    request: { amount: '2' }, work: async () => ({ ok: true })
+                });
+            } catch (e) { return e as Record<string, unknown>; }
+            throw new Error('expected a conflict');
+        };
+
+        const own = await again({ requestedBy: 'operator', grantId: 'grant-a' });
+        expect(own).toMatchObject({ code: 'IDEMPOTENCY_KEY_CONFLICT', status: 409 });
+        expect(own['@nightgate.job']).toEqual({ jobId: first.jobId, status: 'succeeded', chainStatus: null });
+
+        const others = [{ requestedBy: 'operator', grantId: 'grant-b' }, { requestedBy: 'operator' }, { requestedBy: 'someone-else', grantId: 'grant-a' }, {}];
+        for (const caller of others) {
+            const err = await again(caller);
+            expect(err).toMatchObject({ code: 'IDEMPOTENCY_KEY_CONFLICT' });
+            expect('@nightgate.job' in err).toBe(false);
+        }
+    });
+
     test('deduplicates generated resource IDs using a stable semantic payload', async () => {
         const first = await startJob({
             kind: 'anchorDocument', sessionId: 'sess-1', idempotencyKey: 'anchor-1',

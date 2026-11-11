@@ -5,10 +5,38 @@
 const loadAbstractions = () => import('@midnightntwrk/wallet-sdk-abstractions');
 const loadLedger = () => import('@midnightntwrk/ledger-v9');
 
+/** The protocol version at which ledger 9 starts on the chain; `forks` comes from the wallet configuration. */
+export async function ledger9Version(forks) {
+    return forks?.v9 ?? (await loadAbstractions()).ProtocolVersion.V9NativeForkVersion;
+}
+
 /** Seals a ledger transaction for the wallet. `stage` is 'Unproven', 'Unbound' or 'Finalized'; `forks` comes from the wallet configuration. */
 export async function sealTx(stage, tx, forks) {
-    const { WalletTransaction, ProtocolVersion } = await loadAbstractions();
-    return WalletTransaction.adopt(stage, tx, forks?.v9 ?? ProtocolVersion.V9NativeForkVersion);
+    const { WalletTransaction } = await loadAbstractions();
+    return WalletTransaction.adopt(stage, tx, await ledger9Version(forks));
+}
+
+/** True when a wallet state reads the chain at ledger 9. Below `version` the wallet builds for the ledger before it. */
+export const readsLedger9 = (state, version) => BigInt(state?.protocolVersion ?? 0n) >= BigInt(version);
+
+/**
+ * Resolves once the wallet caught up and reads the chain at ledger 9. A wallet catches up a moment before it learns which ledger the chain runs.
+ */
+export async function syncedAtLedger9(wallet, forks) {
+    const version = await ledger9Version(forks);
+    return new Promise((resolve, reject) => {
+        let done = false;
+        const finish = (settle, value) => {
+            if (done) return;
+            done = true;
+            setImmediate(() => sub?.unsubscribe?.());
+            settle(value);
+        };
+        const sub = wallet.state.subscribe({
+            next: (state) => { if (state.progress.isCompleteWithin(0n) && readsLedger9(state, version)) finish(resolve, state); },
+            error: (e) => finish(reject, e)
+        });
+    });
 }
 
 /** Reads the ledger transaction out of a handle, in the form its stage names: unproven, proven or sealed. */

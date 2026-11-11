@@ -857,10 +857,19 @@ describe('getJobStatus', () => {
         ).rejects.toMatchObject({ message: 'jobId is required' });
     });
 
-    it('rejects when sessionId is missing', async () => {
-        await expect(
-            srv.send('getJobStatus', { jobId: VALID_JOB_ID })
-        ).rejects.toMatchObject({ message: 'sessionId is required' });
+    it('finds a job by its id alone, for the caller that started it only', async () => {
+        await seedJob({ requestedBy: 'alice' });
+        const byId = (userId: string) => cds.tx({ user: new (cds as any).User({ id: userId, roles: [] }) } as any, () =>
+            srv.send('getJobStatus', { jobId: VALID_JOB_ID }));
+        expect(await byId('alice')).toMatchObject({ jobId: VALID_JOB_ID, status: 'succeeded' });
+        await expect(byId('mallory')).rejects.toMatchObject({ message: 'Job not found' });
+    });
+
+    it('by its id alone, a job without requestedBy stays closed to a caller who does not own its session', async () => {
+        await seedJob();
+        const user = new (cds as any).User({ id: 'mallory', roles: [] });
+        await expect(cds.tx({ user } as any, () => srv.send('getJobStatus', { jobId: VALID_JOB_ID })))
+            .rejects.toMatchObject({ message: 'Job not found' });
     });
 
     it('returns 404 for an unknown jobId', async () => {

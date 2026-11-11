@@ -38,9 +38,9 @@ export { holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from './holder.mjs';
 
 // Reading the chain through the NIGHTGATE API instead of an indexer.
 export { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
-import { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
+import { apiPublicDataProvider, apiClientFor, assertIndexerAnswers, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
 import { decodeOffer } from './swap.mjs';
-import { sealTx, openTx, shieldedKeysByEpoch } from './wallet-tx.mjs';
+import { sealTx, openTx, shieldedKeysByEpoch, syncedAtLedger9 } from './wallet-tx.mjs';
 export { sealTx, openTx };
 import { createProverMaterialProvider, defaultProverMaterialDir, writeAtomically, sha256Hex } from './prover-material.mjs';
 export { createProverMaterialProvider, defaultProverMaterialDir };
@@ -693,6 +693,7 @@ export async function createTxBuilder(opts) {
     if (shared && saved?.shielded !== undefined) {
         throw new Error('createTxBuilder: walletState.shielded and shieldedWallet exclude each other; the shared wallet keeps its own state');
     }
+    if (ownWallets.length && hasIndexer) await assertIndexerAnswers(indexerHttpUrl, 'createTxBuilder');
     const cacheDir = zkConfigDir ?? opts.cacheDir ?? join(homedir(), '.cache', 'nightgate-txbuilder', contractName);
 
     // List all circuits of the contract by creating it with dummy witnesses.
@@ -827,8 +828,7 @@ export async function createTxBuilder(opts) {
         walletSync: syncMode,
 
         async waitForSync() {
-            if (syncMode === 'all') await facade.waitForSyncedState();
-            else await Promise.all(synced.map(w => facade[w].waitForSyncedState()));
+            await Promise.all(synced.map(w => syncedAtLedger9(facade[w], configuration.forks)));
         },
 
         /** Saves the wallet state. Pass it to `createTxBuilder({ walletState })` to skip a full sync next time. */

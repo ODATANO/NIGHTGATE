@@ -399,7 +399,7 @@ All are read-only.
 | Entity | Purpose |
 |---|---|
 | `PendingSubmissions` | Submission lifecycle `pending`, `included`, `finalized` or `failed`. Written before the SDK call |
-| `BackgroundJobs` | Async jobs. Poll `getJobStatus(jobId, sessionId)` |
+| `BackgroundJobs` | Async jobs. Poll `getJobStatus(jobId)` |
 | `PrivateStates` | Encrypted private state per account, contract and private-state id |
 | `ContractSigningKeys` | Encrypted contract signing keys per account and contract |
 | `AccountKeys` | Per-account data keys |

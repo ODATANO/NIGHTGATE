@@ -5,6 +5,7 @@
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import cds from '@sap/cds';
 import { NightgateError } from '../../srv/utils/errors';
+import { IdempotencyConflictError } from '../../srv/submission/job-store';
 
 const cap = cds.test(__dirname + '/../..') as any;
 const P = '/odata/v4/midnight';
@@ -26,6 +27,8 @@ beforeAll(() => {
         const a = req.data?.contractAddress;
         if (a === 'throw-coded') throw new NightgateError('WALLET_NOT_SYNCED', 'wallet not at tip');
         if (a === 'throw-503') throw Object.assign(new Error('upstream secret'), { status: 503 });
+        if (a === 'throw-conflict-own') throw new IdempotencyConflictError('k1', { jobId: 'job-1', status: 'succeeded', chainStatus: 'success' });
+        if (a === 'throw-conflict-foreign') throw new IdempotencyConflictError('k1');
         if (a === 'throw-502-extras') {
             throw Object.assign(new Error('upstream secret'), { status: 502, reason: 'SECRET_REASON', innererror: { secret: 'INNER' }, details: [{ message: 'DETAIL' }] });
         }
@@ -46,6 +49,15 @@ describe('error codes over HTTP', () => {
     it('a thrown NightgateError answers with its own status and code', async () => {
         const { status, error } = await errorOf(cap.GET(`${P}/deriveTokenType(contractAddress='throw-coded')`));
         expect([status, error.code, error.message]).toEqual([503, 'WALLET_NOT_SYNCED', 'wallet not at tip']);
+    });
+
+    it('a key conflict carries the job that holds the key, when the error names one', async () => {
+        const own = await errorOf(cap.GET(`${P}/deriveTokenType(contractAddress='throw-conflict-own')`));
+        expect([own.status, own.error.code]).toEqual([409, 'IDEMPOTENCY_KEY_CONFLICT']);
+        expect(own.error['@nightgate.job']).toEqual({ jobId: 'job-1', status: 'succeeded', chainStatus: 'success' });
+        const foreign = await errorOf(cap.GET(`${P}/deriveTokenType(contractAddress='throw-conflict-foreign')`));
+        expect([foreign.status, foreign.error.code]).toEqual([409, 'IDEMPOTENCY_KEY_CONFLICT']);
+        expect(Object.keys(foreign.error).filter(k => k.startsWith('@nightgate'))).toEqual([]);
     });
 
     it('codes each $batch part', async () => {

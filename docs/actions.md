@@ -21,13 +21,16 @@ A minor release may change or remove an action, a patch release never does. A re
 Every submitting action returns `{ jobId, status: "pending" }` and runs as a background job. The job result named per action is the parsed `result` of `getJobStatus`.
 
 - A reused `idempotencyKey` returns the existing job. The same key with another payload is 409 `IDEMPOTENCY_KEY_CONFLICT`. A key over 128 characters is 400 `IDEMPOTENCY_KEY_INVALID`. Keys are per caller.
+- The conflict names the job that holds the key to the caller that started it: the error body carries `@nightgate.job` with `{ jobId, status, chainStatus }`. A token sees it for a job of its own grant.
 - A `failed` job releases its key. The next request with that key starts a new job, with any payload.
 - A parked job (`reconciliation_required`) and a workflow step keep their key.
 
-### `getJobStatus(jobId, sessionId, waitMs?, untilChain?) → { jobId, kind, status, result, errorCode, errorMessage, attempt, maxAttempts, submissionId, txHash, transactionId, transactionHash, chainStatus, chainFinalizedAt, chainBlockHeight, chainBlockHash, chainSegments, queuedAt, externalExecutionAt, submittedAt, startedAt, finishedAt, receipt }`
+### `getJobStatus(jobId, sessionId?, waitMs?, untilChain?) → { jobId, kind, status, result, errorCode, errorMessage, attempt, maxAttempts, submissionId, txHash, transactionId, transactionHash, chainStatus, chainFinalizedAt, chainBlockHeight, chainBlockHash, chainSegments, queuedAt, externalExecutionAt, submittedAt, startedAt, finishedAt, receipt }`
 
 An action that changes nothing.
 
+- `jobId` is enough. A caller reads the jobs it started, an agent token the jobs of its own grant. Any other job is 404.
+- `sessionId` is optional. When given it must be the session the job runs under. For a sponsored job that is the `sessionId` the sponsor action returned.
 - `status`: `pending`, `running`, `external_execution`, `submitted`, `reconciliation_required`, `succeeded` or `failed`.
 - `waitMs` (at most 25000) holds the call until the job settles or the time is up. Past 100 waiting calls the server answers at once. A call ends when its client disconnects.
 - `untilChain: true` with `waitMs` keeps holding a `succeeded` job while `chainStatus` is `pending`. A receipt exists only after that.
@@ -194,7 +197,7 @@ Without `contract-info.json`, untagged arguments are 400. Tagged values always w
 
 The caller builds, proves and signs a call. The sponsor pays the dust and submits. Only the serialized transaction moves between them. Client side: [txbuilder.md](txbuilder.md).
 
-The sponsor actions name no payer. The platform pool pays, or the wallet session the caller's grant is pinned to (`createAgentGrant` `sponsorSessionId`). Without either they answer 503. Poll `getJobStatus` with the returned `sessionId`.
+The sponsor actions name no payer. The platform pool pays, or the wallet session the caller's grant is pinned to (`createAgentGrant` `sponsorSessionId`). Without either they answer 503. Poll `getJobStatus` with the returned `jobId`.
 
 ### `buildSponsorable(contractAddress, circuit, compiledArtifactRef, sessionId, args) → { jobId, status }`
 

@@ -18,6 +18,11 @@ describe('indexerQuery', () => {
     it('throws the HTTP status and the GraphQL messages as typed errors', async () => {
         await expect(indexerQuery('http://i', '{ x }', { fetchFn: answer({}, { ok: false, status: 429 }) })).rejects.toBeInstanceOf(IndexerHttpError);
         expect(isIndexerRateLimit(new IndexerHttpError(429))).toBe(true);
+        const gone = (async () => new Response(JSON.stringify({ errors: [{ message: 'decommissioned on 2026-10-09' }] }), { status: 410 })) as unknown as typeof fetch;
+        const httpErr = await indexerQuery('http://i', '{ x }', { fetchFn: gone }).catch((e: IndexerHttpError) => e);
+        expect(httpErr).toMatchObject({ status: 410, detail: 'decommissioned on 2026-10-09', message: 'indexer answered 410' });
+        const page = (async () => new Response('<html>Bad Gateway</html>', { status: 502 })) as unknown as typeof fetch;
+        expect((await indexerQuery('http://i', '{ x }', { fetchFn: page }).catch((e: IndexerHttpError) => e) as IndexerHttpError).detail).toBeUndefined();
         const err = await indexerQuery('http://i', '{ x }', { fetchFn: answer({ errors: [{ message: 'bad offset' }] }) }).catch((e: IndexerQueryError) => e);
         expect(err).toBeInstanceOf(IndexerQueryError);
         expect((err as IndexerQueryError).messages).toEqual(['bad offset']);

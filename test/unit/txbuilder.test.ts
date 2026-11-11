@@ -13,6 +13,13 @@ vi.mock('../../src/txbuilder/wallet-tx.mjs', () => ({
 }));
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
+// The one question to the indexer before a wallet starts is answered here; its own tests ask a stand-in indexer.
+const indexerCheck = vi.hoisted(() => ({ calls: [] as Array<[string, string]>, fail: null as Error | null }));
+vi.mock('../../src/txbuilder/api-provider.mjs', async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
+    assertIndexerAnswers: async (url: string, who: string) => { indexerCheck.calls.push([url, who]); if (indexerCheck.fail) throw indexerCheck.fail; }
+}));
+
 const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
 
 const COMPILER_MANIFEST = 'compiler/contract-manifest.json';

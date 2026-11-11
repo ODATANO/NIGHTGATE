@@ -162,9 +162,20 @@ export class IdempotencyKeyInvalidError extends NightgateError {
     get httpStatus(): number { return this.status; }
 }
 
+/** The job that holds an idempotency key. */
+export interface ConflictingJob {
+    jobId: string;
+    status: string;
+    chainStatus: string | null;
+}
+
 export class IdempotencyConflictError extends NightgateError {
-    constructor(idempotencyKey: string) {
+    /** Sent with the error body. Pass `job` only for the caller that started it. */
+    declare readonly '@nightgate.job'?: ConflictingJob;
+
+    constructor(idempotencyKey: string, job?: ConflictingJob) {
         super('IDEMPOTENCY_KEY_CONFLICT', `Idempotency key '${idempotencyKey}' was already used with a different request payload.`);
+        if (job) this['@nightgate.job'] = job;
     }
     /** @deprecated use `status`. */
     get httpStatus(): number { return this.status; }

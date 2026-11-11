@@ -400,13 +400,12 @@ export default class NightgateService extends cds.ApplicationService {
         this.on(getJobStatus, async (req) => {
             const { jobId, sessionId, waitMs, untilChain } = req.data;
             if (!jobId) return req.reject(400, 'jobId is required');
-            if (!sessionId) return req.reject(400, 'sessionId is required');
             if (waitMs != null && !(Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= LONG_POLL_MAX_MS)) {
                 return req.reject(400, `waitMs must be an integer from 0 to ${LONG_POLL_MAX_MS}`);
             }
 
             let job = await readJob(jobId);
-            if (!job || job.sessionId !== sessionId) {
+            if (!job || (sessionId && job.sessionId !== sessionId)) {
                 return req.reject(404, 'Job not found');
             }
 
@@ -414,13 +413,18 @@ export default class NightgateService extends cds.ApplicationService {
             const user = req.user;
             if (!user?.is?.('admin')) {
                 const requesterId = user?.id;
+                // A token that names no session reads the jobs its own grant started.
+                if (!sessionId && req.agentGrant && job.grantId !== req.agentGrant.ID) {
+                    return req.reject(404, 'Job not found');
+                }
                 if (job.requestedBy) {
                     if (!requesterId || job.requestedBy !== requesterId) {
                         return req.reject(404, 'Job not found');
                     }
                 } else {
+                    const jobSessionId = job.sessionId;
                     const sess: WalletSession | undefined = await cds.tx({}, (tx) =>
-                        tx.run(cds.ql.SELECT.one.from(WalletSessions).columns('userId').where({ sessionId }))
+                        tx.run(cds.ql.SELECT.one.from(WalletSessions).columns('userId').where({ sessionId: jobSessionId }))
                     );
                     if (!sess?.userId || !requesterId || sess.userId !== requesterId) {
                         return req.reject(404, 'Job not found');

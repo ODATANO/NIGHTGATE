@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.43.1 - 2026-11-11
+
+### Changes
+
+- `getJobStatus` needs only `jobId`. A caller reads the jobs it started, an
+  agent token the jobs of its own grant; any other job is 404. `sessionId`
+  stays as an optional parameter and must then be the session the job runs
+  under, as before.
+- A 409 `IDEMPOTENCY_KEY_CONFLICT` names the job that holds the key: the
+  error body carries `@nightgate.job` with `{ jobId, status, chainStatus }`.
+  Only the caller that started that job sees it, a token only for a job of
+  its own grant. A client that rebuilt a transaction under the same key can
+  read that job instead of sending a second one.
+- `@odatano/nightgate-tx` 0.22.1: `sync()` of `createUnshieldedWallet` and
+  `createSwapWallet` and `waitForSync()` of the builder resolve once the
+  wallet caught up and reads the chain at ledger 9. Before, they resolved a
+  moment earlier, and a transfer built in that moment failed with `expected
+  header tag 'midnight:transaction[v12]...'`. With coins from before the
+  change to ledger 9 that moment lasted long enough to fail the first build
+  after `sync()`. `buildTransfer` of the unshielded wallet refuses with a
+  clear message while the wallet is not there yet.
+- `@odatano/nightgate-tx` 0.22.1: a wallet does not start against an indexer
+  that does not answer. `createUnshieldedWallet`, `createSwapWallet` and a
+  `createTxBuilder` that syncs wallets ask the indexer for its newest block
+  first and fail with the reason it gave, for example `no indexer answers at
+  indexer.preprod.midnight.network (HTTP 410: ... was decommissioned on
+  2026-10-09 ...)`. Before, `sync()` waited there without an error.
+
 ## 0.43.0 - 2026-11-11
 
 ### Changes

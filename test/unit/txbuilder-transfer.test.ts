@@ -20,6 +20,13 @@ vi.mock('../../src/txbuilder/wallet-tx.mjs', () => ({
     shieldedKeysByEpoch: async () => ({ v8: 'keys-v8', v9: 'keys-v9' })
 }));
 
+// The one question to the indexer before a wallet starts is answered here; its own tests ask a stand-in indexer.
+const indexerCheck = vi.hoisted(() => ({ calls: [] as Array<[string, string]>, fail: null as Error | null }));
+vi.mock('../../src/txbuilder/api-provider.mjs', async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
+    assertIndexerAnswers: async (url: string, who: string) => { indexerCheck.calls.push([url, who]); if (indexerCheck.fail) throw indexerCheck.fail; }
+}));
+
 const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
 
 /** A stand-in for a proven transfer: one offer, no deltas, as the ledger drops zero entries. */
