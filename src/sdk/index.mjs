@@ -4,4 +4,4 @@
 
 export { connect, int64, isRetryable, RETRYABLE_ERROR_CODES, NightgateApiError, NightgateJobError } from './client.mjs';
 export { verifyReceipt } from './receipt.mjs';
-export { createTxBuilder, deriveIdentity, ensureZkAssets, ATTESTATION_VAULT_CIRCUITS, createSwapWallet, readSwapTerms, readTransferShape, encodeOffer, decodeOffer, holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from '../txbuilder/index.mjs';
+export { createTxBuilder, deriveIdentity, ensureZkAssets, ATTESTATION_VAULT_CIRCUITS, createSwapWallet, readSwapTerms, readTransferShape, createUnshieldedWallet, readUnshieldedTransfer, encodeOffer, decodeOffer, holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from '../txbuilder/index.mjs';

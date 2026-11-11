@@ -33,7 +33,7 @@ function legOf(leg, name) {
     return { tokenType: rawTokenTypeOf(leg?.tokenType, `${name}.tokenType`), amount: amountOf(leg?.amount, `${name}.amount`) };
 }
 
-const sizeOf = (v) => (Array.isArray(v) ? v.length : typeof v?.size === 'number' ? v.size : typeof v?.length === 'number' ? v.length : null);
+export const sizeOf = (v) => (Array.isArray(v) ? v.length : typeof v?.size === 'number' ? v.size : typeof v?.length === 'number' ? v.length : null);
 
 /** Reads what a swap half gives and wants from the transaction itself.
  *  Throws unless it is a plain half that gives one token type and wants another, as the sponsor requires. */
@@ -133,7 +133,7 @@ export async function decodeOffer(input) {
     throw new Error(`not a proven transaction (${bytes.length} bytes; ${errors.join(' | ')})`);
 }
 
-const latest = (observable, what, timeoutMs = 10_000) => new Promise((resolve, reject) => {
+export const latest = (observable, what, timeoutMs = 10_000) => new Promise((resolve, reject) => {
     let done = false;
     const sub = observable?.subscribe?.({
         next: (v) => { if (!done) { done = true; setImmediate(() => sub?.unsubscribe?.()); resolve(v); } },

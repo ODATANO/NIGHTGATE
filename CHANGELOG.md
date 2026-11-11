@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.43.0 - 2026-11-11
+
+### Changes
+
+- `sponsorTransfer` takes a plain unshielded transfer, NIGHT included. The
+  caller builds and signs the payment from its own coins, the sponsor adds the
+  fee. Needs `NIGHTGATE_SPONSOR_ALLOW_TRANSFERS` and
+  `NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS`; a token needs `sponsorTransfer`
+  in `allowedActions` and `allowUnshieldedOffers` on its grant. The type is
+  NIGHT or one in `allowedUnshieldedTokenTypes`. A grant that holds both rights
+  can send these types to any address.
+- An unshielded transfer shows its terms, so the server reads type, amount and
+  recipient from the transaction and refuses a `tokenType` or `amount` that
+  differs. The job result carries `transfer.to`, the receipt `declared: false`.
+  `amount` counts against the grant's `maxValuePerDay`.
+- `@odatano/nightgate-tx` 0.22.0: `createUnshieldedWallet` syncs the seed's
+  unshielded coins and builds the transfer with `buildTransfer({ amount, to })`.
+  `readUnshieldedTransfer(tx)` reads its terms by the server's rule. See
+  `docs/txbuilder.md`.
+- The sponsor asks the ledger for the cost of the finished transaction before
+  it sends it. A transaction the node would refuse for its cost fails with
+  `SPONSOR_REFUSED` and the ledger's reason: over the time to dismiss for its
+  size, or over a block limit. `sponsorUnboundTransaction`, `sponsorSwap` and
+  `sponsorTransfer` check before the dust spend is proven. Before, the job
+  failed with the node's `1010/231`.
+- `@odatano/nightgate-tx` 0.22.0: `gasHeadroom` is an upper bound. The builder
+  reads the chain's limits on the time to dismiss and lowers the factor to what
+  fits once a sponsor added its dust spend. `onProgress` reports the applied
+  factor as `factor` and the asked one as `requested`. Before, a heavy call
+  with headroom was proven and then refused by the node with `1010/231`.
+
 ## 0.42.3 - 2026-11-09
 
 ### Fixes

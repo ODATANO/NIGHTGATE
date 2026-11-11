@@ -226,6 +226,7 @@ export interface BuildSponsorableInput {
     /**
      * Single call only. Multiplies the gas the call declares (the ledger adds 20 % on its own), so the call
      * still fits after another transaction grew a map by a trie level. The fee grows with it. 1 to 10.
+     * An upper bound: the builder lowers it to what the ledger's time to dismiss allows, and `onProgress` reports the factor applied.
      */
     gasHeadroom?: number;
     /**
@@ -571,11 +572,11 @@ export interface TakenOffer {
 export interface BuiltTransfer {
     /** The transfer as base64, for `sponsorTransfer({ transferTxB64 })`. */
     txB64: string;
-    /** The deserialized transfer, for `SwapWallet.revert` or `txIdentifiers`. */
+    /** The deserialized transfer, for the wallet's `revert` or `txIdentifiers`. */
     tx: LedgerTransaction;
     bound: boolean;
     serializedBytes: number;
-    /** What was asked: the type, the amount in atoms and the recipient's shielded address. */
+    /** What was asked: the type, the amount in atoms and the recipient's address. */
     terms: { tokenType: string; amount: bigint; to: string };
     /** Coins the transfer spends. */
     inputs: number;
@@ -642,6 +643,56 @@ export declare function chooseSwapCoin<C extends SwapCoin>(coins: readonly C[], 
 
 /** Creates a wallet for swapping. It syncs only the private coins of the seed. */
 export declare function createSwapWallet(opts: CreateSwapWalletInput): Promise<SwapWallet>;
+
+export interface CreateUnshieldedWalletInput {
+    /** 128 hex chars (64-byte BIP39 seed). Never leaves the process. */
+    seedHex: string;
+    networkId?: string;
+    accountIndex?: number;
+    /** The indexer the wallet syncs from. Required unless `api` holds a gateway key. */
+    indexerHttpUrl?: string;
+    indexerWsUrl?: string;
+    /** The `connect()` options of an ODATANO gateway (`{ baseUrl, token: 'oda_…' }`): the wallet syncs through its indexer lane. */
+    api?: ConnectOptions;
+    /** Saved state from `serializeState()`, to skip a full sync. */
+    walletState?: string;
+    /** How long a built transfer stays valid. Defaults to 30. */
+    ttlMinutes?: number;
+}
+
+/** What a plain unshielded transfer moves. `to` is the recipient's raw address (64 hex). */
+export interface UnshieldedTransferTerms { tokenType: string; amount: bigint; to: string; inputs: number; outputs: number }
+
+/** Reads type, amount and recipient of a plain unshielded transfer, by the sponsor's rule. Throws for anything else. */
+export declare function readUnshieldedTransfer(tx: LedgerTransaction): Promise<UnshieldedTransferTerms>;
+
+export interface UnshieldedWallet {
+    /** Unshielded address (`mn_addr_...`). */
+    address: string;
+    /** The raw token type of NIGHT. */
+    nightTokenType: string;
+    /** Resolves once the wallet has caught up with the chain. */
+    sync(): Promise<void>;
+    /** Balance of the unreserved coins per token type, in the smallest unit. */
+    balances(): Promise<Record<string, bigint>>;
+    /** The unreserved coins. */
+    coins(): Promise<SwapLeg[]>;
+    /** The coins the transfers built here keep reserved. */
+    pending(): Promise<SwapLeg[]>;
+    /**
+     * Builds and signs a plain transfer of `amount` of `tokenType` (default NIGHT) to the unshielded address `to`, for `sponsorTransfer`.
+     * Its coins stay reserved until the transfer lands or `revert()` is called. `terms.to` is the address as given.
+     */
+    buildTransfer(input: { amount: bigint | number | string; to: string; tokenType?: string; bind?: boolean }): Promise<BuiltTransfer>;
+    /** Releases the coins of a transfer whose build-time `revert()` is gone with its process: its base64 or bytes. Only for one that did not land. */
+    revert(input: string | Uint8Array): Promise<void>;
+    /** Saves the wallet state. It lists the wallet's coins. */
+    serializeState(): Promise<string>;
+    close(): Promise<void>;
+}
+
+/** Creates a wallet for plain transfers of unshielded tokens, NIGHT included. It syncs only the unshielded coins of the seed. */
+export declare function createUnshieldedWallet(opts: CreateUnshieldedWalletInput): Promise<UnshieldedWallet>;
 
 /** The circuits of the holder registry contract. */
 export declare const HOLDER_REGISTRY_CIRCUITS: readonly ['registerHolder', 'unregisterHolder'];

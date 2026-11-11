@@ -12,7 +12,7 @@ import { SponsorRefusalError } from '../submit-error-classification';
 import { type MerkleProofBundle } from '../../submission/contract-witnesses';
 import { type ContractCircuitRules } from '../../submission/sponsor-policy';
 import { type MessagePort } from 'node:worker_threads';
-import { FacadeEntry, facades, loadContractsSdk, loadDustV2Sdk, loadSdk, log, resolveProvingMode, loadLedger, type WalletSdk } from './context';
+import { FacadeEntry, encodeAddressString, facades, loadAddressFormat, loadContractsSdk, loadDustV2Sdk, loadSdk, log, resolveProvingMode, loadLedger, type WalletSdk } from './context';
 import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
 import type { DustWalletState } from '@midnightntwrk/wallet-sdk-dust-wallet';
 import type { CoinsAndBalances, CoreWallet as DustCoreWallet, Dust, DustFullInfo } from '@midnightntwrk/wallet-sdk-dust-wallet/v2';
@@ -620,11 +620,87 @@ export function checkTransferShape(tx: InspectedTx, maxInputs: number, prefix = 
     return { inputs: offer.inputs.length, outputs: offer.outputs.length, nullifiers: swapHalfNullifiers(tx) };
 }
 
+/** What an unshielded transfer moves, read from its offer. `to` is the recipient's raw address, `amount` is in atoms. */
+export interface UnshieldedTransferTerms { tokenType: string; amount: string; to: string }
+
+/** A shielded transfer carries no intent, an unshielded one lives in an intent. */
+function isUnshieldedTransfer(tx: InspectedTx): boolean {
+    return tx?.intents != null && sizeOf(tx.intents) !== 0;
+}
+
+/**
+ * One intent with one signed unshielded offer and nothing else. Every output pays the one recipient or goes back to a spender.
+ */
+export function checkUnshieldedTransferShape(
+    tx: InspectedTx, byteLength: number,
+    options: Pick<UnshieldedOfferOptions, 'addressFromKey' | 'sponsorInputKeys'>,
+    prefix = 'refusing to sponsor'
+): UnshieldedTransferTerms & { inputs: number; outputs: number } {
+    const refuse = (why: string): never => { throw new SponsorRefusalError(`${prefix}: the transfer ${why}`); };
+    const maxBytes = configNumber('NIGHTGATE_SPONSOR_MAX_TX_BYTES');
+    if (byteLength > maxBytes) refuse(`is ${byteLength}B, over the ${maxBytes}B budget (NIGHTGATE_SPONSOR_MAX_TX_BYTES)`);
+    if (tx?.guaranteedOffer != null || (tx?.fallibleOffer != null && sizeOf(tx.fallibleOffer) !== 0)) refuse('carries a shielded offer next to its intent');
+    const intents = tx?.intents;
+    if (!intents || typeof intents.entries !== 'function') return refuse('is not inspectable (no intents)');
+    const entries = Array.from(intents.entries());
+    if (entries.length !== 1) refuse(`carries ${entries.length} intents; a transfer has one`);
+    const [segmentId, intent] = entries[0];
+    if (sizeOf(intent?.actions ?? []) !== 0) refuse('carries a contract action');
+    if (offerNonEmpty(intent?.dustActions)) refuse('carries dust actions');
+    const keys = (['guaranteedUnshieldedOffer', 'fallibleUnshieldedOffer'] as const).filter(key => offerNonEmpty(intent?.[key]));
+    if (keys.length !== 1) refuse(keys.length === 0 ? 'carries no unshielded offer' : 'carries a guaranteed and a fallible unshielded offer; a transfer has one');
+    const offer = intent[keys[0]];
+    const inputs = Array.isArray(offer?.inputs) ? offer.inputs : undefined;
+    const outputs = Array.isArray(offer?.outputs) ? offer.outputs : undefined;
+    if (!inputs || !outputs) return refuse('is not inspectable (no inputs/outputs)');
+    if (inputs.length < 1) refuse('spends nothing');
+    if (outputs.length < 1 || outputs.length > 2) refuse(`carries ${outputs.length} outputs; a transfer has the recipient's coin and at most its change`);
+    if (sizeOf(offer?.signatures) !== inputs.length) refuse(`is not signed: ${sizeOf(offer?.signatures) ?? 0} signature(s) for ${inputs.length} input(s)`);
+    if (!options.addressFromKey) return refuse('cannot be checked without the ledger\'s addressFromKey');
+    const tokenType = bareHex(inputs[0]?.type);
+    if (!HEX64_RE.test(tokenType)) refuse('has an input without a readable token type');
+    const spenders = new Set<string>();
+    let spent = 0n;
+    for (const input of inputs) {
+        if (bareHex(input?.type) !== tokenType) refuse('spends more than one token type');
+        const owner = verifyingKeyHex(input?.owner);
+        if (!HEX64_RE.test(owner)) refuse('has an input without a readable owner key');
+        if (options.sponsorInputKeys?.includes(owner)) refuse('spends a UTXO of the sponsor itself');
+        spenders.add(bareHex(options.addressFromKey(input.owner)));
+        spent += utxoValue(input?.value, 'a transfer input');
+    }
+    let to: string | undefined;
+    let paid = 0n;
+    let created = 0n;
+    for (const output of outputs) {
+        if (bareHex(output?.type) !== tokenType) refuse('creates a token type it does not spend');
+        const owner = bareHex(output?.owner);
+        if (!HEX64_RE.test(owner)) refuse('has an output without a readable owner');
+        const value = utxoValue(output?.value, 'a transfer output');
+        created += value;
+        if (spenders.has(owner)) continue; // change back to a spender
+        if (to !== undefined && to !== owner) refuse('pays two addresses; a transfer pays one');
+        to = owner;
+        paid += value;
+    }
+    if (to === undefined || paid <= 0n) return refuse('pays nobody but its own spender');
+    if (spent !== created) refuse(`does not balance: it spends ${spent} and creates ${created}`);
+    const balance = ledgerBalance(tx, keys[0] === 'guaranteedUnshieldedOffer' ? 0 : Number(segmentId));
+    if (ledgerImbalance(balance, tokenType) !== 0n || Array.from(balance.values()).some(v => v !== 0n)) refuse('does not balance on the ledger');
+    return { tokenType, amount: paid.toString(), to, inputs: inputs.length, outputs: outputs.length };
+}
+
+/** A transfer's shape as the request path reads it. `unshielded` holds the terms when the bytes show them; `night` says the type is NIGHT. */
+export interface TransferDescription { bound: boolean; inputs: number; outputs: number; nullifiers: string[]; unshielded?: UnshieldedTransferTerms & { night: boolean } }
+
 /** Reads a transfer's shape for the request path, before a job exists. */
-export async function describeTransfer(args: { txB64: string }): Promise<{ bound: boolean; inputs: number; outputs: number; nullifiers: string[] }> {
+export async function describeTransfer(args: { txB64: string }): Promise<TransferDescription> {
     const { tx, bound } = await deserializeSwapHalf(args.txB64, 'transfer');
-    const shape = checkTransferShape(tx, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'), 'not a transfer');
-    return { bound, ...shape };
+    if (!isUnshieldedTransfer(tx)) return { bound, ...checkTransferShape(tx, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'), 'not a transfer') };
+    const ledger = await loadLedger();
+    const { inputs, outputs, ...unshielded } = checkUnshieldedTransferShape(
+        tx, Buffer.from(args.txB64, 'base64').length, { addressFromKey: (key) => String(ledger.addressFromKey(key)) }, 'not a transfer');
+    return { bound, inputs, outputs, nullifiers: [], unshielded: { ...unshielded, night: unshielded.tokenType === bareHex(ledger.nativeToken().raw) } };
 }
 
 /** The current dust wallet state. */
@@ -836,6 +912,7 @@ export async function sponsorAndSubmitFinalized(
         throw e;
     }
     try {
+        refuseOverCost(() => finalized, tipLedgerParameters(await loadSdk(), await getIndexerTip(sponsor.indexerHttpUrl)));
         await announceSubmitIntent(replyPort, {
             txHash: String(finalized.identifiers().at(-1)),
             contractAddress: calls?.[0]?.address, circuits: calls?.map(c => c.entryPoint), sponsorAccountId: sponsor.sessionId,
@@ -951,6 +1028,17 @@ function tipLedgerParameters(sdk: Pick<WalletSdk, 'ledger'>, tip: IndexerTip): L
     return sdk.ledger.LedgerParameters.initialParameters();
 }
 
+/**
+ * Refuses a transaction the node would drop for its cost: over the time to dismiss for its size, or over a block limit. Any other ledger error passes.
+ */
+export function refuseOverCost(assemble: () => Pick<FinalizedLedgerTx, 'fees'>, params: LedgerV9.LedgerParameters): void {
+    let why: string;
+    try { assemble().fees(params, true); return; }
+    catch (err) { why = errorMessage(err); }
+    if (!/time to dismiss|block limit/.test(why)) { log('warn', `cost check gave no answer, sponsoring anyway: ${why.slice(0, 200)}`); return; }
+    throw new SponsorRefusalError(`refusing to sponsor: the node would refuse this transaction for its cost: ${why.slice(0, 300)}`);
+}
+
 /** How often to pick another backing when the chosen one turns out to hold too little dust. */
 export const MAX_BACKING_RESELECTS = 3;
 
@@ -1045,7 +1133,7 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
     sponsorSessionId: string; unboundTxB64?: string; networkId: string;
     /** The two halves of a shielded swap, used instead of one caller tx. */
     swap?: { makerHalfB64: string; takerHalfB64: string }; allowSwaps?: boolean;
-    /** A plain shielded transfer with the terms the caller declares, used instead of one caller tx. */
+    /** A plain transfer with the terms the caller declares, used instead of one caller tx. */
     transfer?: { txB64: string; tokenType: string; amount: string }; allowTransfers?: boolean;
     /** Set by the dispatcher. Used to announce the tx before sending it. */
     __replyPort?: MessagePort;
@@ -1058,22 +1146,39 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
     let caller: ProvenCallerTx;
     let calls: Array<{ address: string; entryPoint: string }>;
     let swap: SwapTerms | undefined;
-    let transfer: { tokenType: string; amount: string } | undefined;
+    let transfer: { tokenType: string; amount: string; to?: string } | undefined;
     let nullifiers: string[] = [];
     const unshielded: UnshieldedMove[] = [];
     if (args.transfer) {
         if (args.allowTransfers !== true) throw new SponsorRefusalError('refusing to sponsor: transfers are not sponsored for this caller');
         const tokenType = bareHex(args.transfer.tokenType);
-        const listed = (args.allowedTokenTypes ?? []).map(bareHex);
-        if (!listed.includes(tokenType)) throw new SponsorRefusalError(`refusing to sponsor: the transfer declares token type ${tokenType.slice(0, 16)}…, not in allowedTokenTypes`);
-        if (tokenType === bareHex(sdk.ledger.nativeToken().raw)) throw new SponsorRefusalError('refusing to sponsor: the transfer declares NIGHT, which is never shielded');
+        const nightType = bareHex(sdk.ledger.nativeToken().raw);
         const deserialized = await deserializeSwapHalf(args.transfer.txB64, 'transfer');
-        const shape = checkTransferShape(deserialized.tx, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'));
         caller = deserialized;
-        nullifiers = shape.nullifiers;
-        transfer = { tokenType, amount: String(args.transfer.amount) };
         calls = [{ address: '', entryPoint: TRANSFER_ENTRY_POINT }];
-        log('info', `sponsorUnboundTx: transfer of ${transfer.amount} ${tokenType.slice(0, 12)} declared (${shape.inputs} input(s), ${caller.bound ? 'bound' : 'unbound'})`);
+        if (isUnshieldedTransfer(deserialized.tx)) {
+            if (args.allowUnshieldedOffers !== true) {
+                throw new SponsorRefusalError('refusing to sponsor: an unshielded transfer needs allowUnshieldedOffers on the grant and NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS on the server');
+            }
+            const shape = checkUnshieldedTransferShape(deserialized.tx, Buffer.from(args.transfer.txB64, 'base64').length, shapeOptions(sdk, sponsor, args, unshielded));
+            if (shape.tokenType !== nightType && !(args.allowedUnshieldedTokenTypes ?? []).map(bareHex).includes(shape.tokenType)) {
+                throw new SponsorRefusalError(`refusing to sponsor: the transfer moves token type ${shape.tokenType.slice(0, 16)}…, which is neither NIGHT nor in allowedUnshieldedTokenTypes`);
+            }
+            if (shape.tokenType !== tokenType || shape.amount !== String(args.transfer.amount)) {
+                throw new SponsorRefusalError(`refusing to sponsor: the transfer pays ${shape.amount} of ${shape.tokenType.slice(0, 16)}…, declared were ${String(args.transfer.amount)} of ${tokenType.slice(0, 16)}…`);
+            }
+            const af = await loadAddressFormat();
+            transfer = { tokenType, amount: shape.amount, to: await encodeAddressString(new af.UnshieldedAddress(Buffer.from(shape.to, 'hex')), args.networkId) };
+            log('info', `sponsorUnboundTx: unshielded transfer of ${transfer.amount} ${tokenType.slice(0, 12)} to ${String(transfer.to).slice(0, 24)} (${shape.inputs} input(s), ${caller.bound ? 'bound' : 'unbound'})`);
+        } else {
+            const listed = (args.allowedTokenTypes ?? []).map(bareHex);
+            if (!listed.includes(tokenType)) throw new SponsorRefusalError(`refusing to sponsor: the transfer declares token type ${tokenType.slice(0, 16)}…, not in allowedTokenTypes`);
+            if (tokenType === nightType) throw new SponsorRefusalError('refusing to sponsor: the transfer declares NIGHT, which is never shielded');
+            const shape = checkTransferShape(deserialized.tx, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'));
+            nullifiers = shape.nullifiers;
+            transfer = { tokenType, amount: String(args.transfer.amount) };
+            log('info', `sponsorUnboundTx: transfer of ${transfer.amount} ${tokenType.slice(0, 12)} declared (${shape.inputs} input(s), ${caller.bound ? 'bound' : 'unbound'})`);
+        }
     } else if (args.swap) {
         if (args.allowSwaps !== true) throw new SponsorRefusalError('refusing to sponsor: swaps are not sponsored for this caller');
         const maker = await deserializeSwapHalf(args.swap.makerHalfB64, 'maker half');
@@ -1144,6 +1249,8 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
     // Only a tx the node surely never took frees it at once.
     let sent = false;
     try {
+        // The dust spend is only mock-proven for this check, so a refusal costs no proof.
+        refuseOverCost(() => built!.dustUnproven.mockProve().merge(caller.bound ? caller.tx : caller.tx.bind()), params);
         const tProve = Date.now();
         // The facade's prover picks its backend by the protocol version the chain is on.
         const version = (await peekFacadeState(sponsor.facade, 5_000))?.activeProtocolVersion;

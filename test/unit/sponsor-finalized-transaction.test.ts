@@ -34,13 +34,15 @@ const unboundIntentHooks = vi.hoisted(() => [] as any[]);
 // The request-path byte check: ok by default, a test makes it refuse or fail.
 const describeImpl = vi.hoisted(() => ({
     tx: async (_args: any): Promise<any> => ({ bytes: 600, bound: true }),
-    half: async (_args: any): Promise<any> => ({ gives: { tokenType: 'a', amount: '1' }, wants: { tokenType: 'b', amount: '1' }, bound: false, inputs: 1, nullifiers: [] })
+    half: async (_args: any): Promise<any> => ({ gives: { tokenType: 'a', amount: '1' }, wants: { tokenType: 'b', amount: '1' }, bound: false, inputs: 1, nullifiers: [] }),
+    transfer: async (_args: any): Promise<any> => ({ bound: true, inputs: 1, outputs: 2, nullifiers: [] })
 }));
 const boundIntentHooks = vi.hoisted(() => [] as any[]);
 vi.mock('../../srv/midnight/wallet-worker-client', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
     walletDescribeTransaction: vi.fn(async (args: any) => describeImpl.tx(args)),
     walletDescribeSwapHalf: vi.fn(async (args: any) => describeImpl.half(args)),
+    walletDescribeTransfer: vi.fn(async (args: any) => describeImpl.transfer(args)),
     walletSponsorFinalizedTx: vi.fn(async (args: any, onSubmitIntent?: any) => { workerCalls.push(args); boundIntentHooks.push(onSubmitIntent); return workerImpl.fn(args); }),
     walletSponsorUnboundTx: vi.fn(async (args: any, onSubmitIntent?: any) => { unboundWorkerCalls.push(args); unboundIntentHooks.push(onSubmitIntent); return unboundWorkerImpl.fn(args); })
 }));
@@ -1093,6 +1095,114 @@ describe('sponsorSwap', () => {
         platform.policy = { ...closed, allowedTokenTypes: [T1, T2] };
         await proc({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B }, sponsorSessionId: 'sponsor-1' }, { ID: 'j2', kind: 'sponsorSwap', requestedBy: 'u' } as any);
         expect(unboundWorkerCalls[1].allowSwaps).toBe(false);
+    });
+});
+
+describe('sponsorTransfer', () => {
+    const T1 = 'ab'.repeat(32);
+    const NIGHT = '00'.repeat(32);
+    const CREDIT = 'cc'.repeat(32);
+    const TO = 'b2'.repeat(32);
+    const closed = { allowedContracts: [], allowedCircuits: [], allowedTokenTypes: [], allowDeploy: true };
+    const shielded = { bound: true, inputs: 1, outputs: 2, nullifiers: [] };
+    const unshielded = (tokenType = NIGHT, amount = '10') => ({ bound: true, inputs: 1, outputs: 2, nullifiers: [], unshielded: { tokenType, amount, to: TO, night: tokenType === NIGHT } });
+    const send = (tokenType: string, amount = '10') => makeReq({ transferTxB64: TX_A, tokenType, amount });
+    const ENV = ['FEE_SPONSOR_SESSION', 'SPONSOR_ALLOW_TRANSFERS', 'SPONSOR_ALLOWED_TOKEN_TYPES', 'SPONSOR_ALLOW_UNSHIELDED_OFFERS', 'SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES'];
+
+    beforeEach(() => {
+        startJobCalls.length = 0;
+        unboundWorkerCalls.length = 0;
+        __resetSponsorPoolForTests();
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        process.env.NIGHTGATE_SPONSOR_ALLOW_TRANSFERS = 'true';
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = T1;
+        platform.policy = { ...closed, allowedTokenTypes: [T1], allowTransfers: true };
+        describeImpl.transfer = async () => shielded;
+    });
+    afterEach(() => {
+        platform.policy = closed;
+        for (const key of ENV) delete process.env[`NIGHTGATE_${key}`];
+    });
+
+    test('a shielded transfer starts a job with the declared terms; its type must be listed', async () => {
+        const srv = setup();
+        const req = send(T1);
+        await srv.handlers['sponsorTransfer'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(startJobCalls[0]).toMatchObject({ kind: 'sponsorTransfer', sessionId: PLATFORM_POOL_SENTINEL });
+        expect(startJobCalls[0].command).toMatchObject({ op: 'sponsorUnbound', transfer: { txB64: TX_A, tokenType: T1, amount: '10' } });
+        const unlisted = send(CREDIT);
+        await srv.handlers['sponsorTransfer'](unlisted);
+        expect(unlisted.reject).toHaveBeenCalledWith(expect.objectContaining({ code: 'SPONSOR_POLICY_EMPTY', message: expect.stringMatching(/not in allowedTokenTypes/) }));
+        expect(startJobCalls).toHaveLength(1);
+    });
+
+    test('an unshielded transfer shows its terms: a declaration that differs is 400 before a job exists', async () => {
+        process.env.NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS = 'true';
+        describeImpl.transfer = async () => unshielded();
+        const srv = setup();
+        const amount = send(NIGHT, '11');
+        await srv.handlers['sponsorTransfer'](amount);
+        expect(amount.reject).toHaveBeenCalledWith(400, `the transfer pays 10 of token type ${NIGHT}, declared were 11 of ${NIGHT}`);
+        const type = send(T1);
+        await srv.handlers['sponsorTransfer'](type);
+        expect(type.reject).toHaveBeenCalledWith(400, expect.stringMatching(/declared were 10 of abab/));
+        expect(startJobCalls).toHaveLength(0);
+    });
+
+    test('an unshielded transfer needs the right to move unshielded tokens; NIGHT needs no list entry', async () => {
+        describeImpl.transfer = async () => unshielded();
+        const srv = setup();
+        const off = send(NIGHT);
+        await srv.handlers['sponsorTransfer'](off);
+        expect(off.reject).toHaveBeenCalledWith(expect.objectContaining({ code: 'SPONSOR_POLICY_EMPTY', message: expect.stringMatching(/unshielded transfers are not sponsored here/) }));
+        expect(startJobCalls).toHaveLength(0);
+
+        process.env.NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS = 'true';
+        const on = send(NIGHT);
+        await srv.handlers['sponsorTransfer'](on);
+        expect(on.reject).not.toHaveBeenCalled();
+        expect(startJobCalls[0].command).toMatchObject({ op: 'sponsorUnbound', transfer: { txB64: TX_A, tokenType: NIGHT, amount: '10' } });
+        expect(startJobCalls[0].request).toMatchObject({ tokenType: NIGHT, amount: '10' });
+    });
+
+    test('another unshielded token type must be listed for unshielded offers', async () => {
+        process.env.NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS = 'true';
+        describeImpl.transfer = async () => unshielded(CREDIT);
+        const srv = setup();
+        const unlisted = send(CREDIT);
+        await srv.handlers['sponsorTransfer'](unlisted);
+        expect(unlisted.reject).toHaveBeenCalledWith(expect.objectContaining({ code: 'SPONSOR_POLICY_EMPTY', message: expect.stringMatching(/neither NIGHT nor in allowedUnshieldedTokenTypes/) }));
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES = CREDIT;
+        const listed = send(CREDIT);
+        await srv.handlers['sponsorTransfer'](listed);
+        expect(listed.reject).not.toHaveBeenCalled();
+        expect(startJobCalls).toHaveLength(1);
+    });
+
+    test('bytes that are no transfer answer 400 before a job exists', async () => {
+        describeImpl.transfer = async () => { throw new Error('not a transfer: the transfer pays two addresses; a transfer pays one'); };
+        const srv = setup();
+        const req = send(NIGHT);
+        await srv.handlers['sponsorTransfer'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/pays two addresses/));
+        expect(startJobCalls).toHaveLength(0);
+    });
+
+    test('the executor hands the worker the transfer under the rights in force when the job runs', async () => {
+        setup();
+        platform.policy = { ...closed, allowTransfers: true, allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [CREDIT] };
+        const terms = { tokenType: NIGHT, amount: '10', to: 'mn_addr_preview1x' };
+        unboundWorkerImpl.fn = async () => ({ txHash: '00dd', circuits: ['<transfer>'], contractAddress: '', note: 'b', transfer: terms });
+        const proc = processors.get('sponsorTransfer')!;
+        const command = { op: 'sponsorUnbound', transfer: { txB64: TX_A, tokenType: NIGHT, amount: '10' }, sponsorSessionId: 'sponsor-1' };
+        const out: any = await proc(command, { ID: 'j', kind: 'sponsorTransfer', requestedBy: 'u' } as any);
+        expect(unboundWorkerCalls[0]).toMatchObject({ transfer: command.transfer, allowTransfers: true, allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [CREDIT] });
+        expect(out).toMatchObject({ txHash: '00dd', transfer: terms, feeSponsor: 'sponsor-1' });
+
+        platform.policy = { ...closed, allowTransfers: true };
+        await proc(command, { ID: 'j2', kind: 'sponsorTransfer', requestedBy: 'u' } as any);
+        expect(unboundWorkerCalls[1].allowUnshieldedOffers).toBe(false);
     });
 });
 

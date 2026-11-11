@@ -32,6 +32,8 @@ export {
     chooseSwapCoin, spendableWithin
 } from './swap.mjs';
 
+export { createUnshieldedWallet, readUnshieldedTransfer } from './unshielded.mjs';
+
 export { holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from './holder.mjs';
 
 // Reading the chain through the NIGHTGATE API instead of an indexer.
@@ -418,10 +420,42 @@ function gasFigures(gas) {
     return gas ? Object.fromEntries(Object.entries(gas).map(([k, v]) => [k, String(v)])) : undefined;
 }
 
-/** Replaces the call of an unproven single-call transaction by one that declares `factor` times its gas.
+/** What one dust spend of a sponsor adds to a transaction: its time to dismiss in picoseconds, and its size in bytes. */
+const SPONSOR_DUST_SPEND = { readTime: 1.9e9, computeTime: 3.6e9, bytes: 2700 };
+
+const PICOSECONDS = { ps: 1, ns: 1e3, 'μs': 1e6, 'µs': 1e6, us: 1e6, ms: 1e9, s: 1e12 };
+
+/** The ledger's limits on the time a node may need to dismiss a transaction, in picoseconds. Undefined when the parameters do not print them.
+ *  The ledger exposes them in its printed parameters only. */
+export function timeToDismissLimits(ledgerParameters) {
+    const text = String(ledgerParameters?.toString?.() ?? '');
+    const read = (name) => {
+        const found = new RegExp(`${name}:\\s*([0-9.]+)\\s*(ps|ns|μs|µs|us|ms|s)\\b`).exec(text);
+        return found ? Number(found[1]) * PICOSECONDS[found[2]] : undefined;
+    };
+    const perByte = read('time_to_dismiss_per_byte');
+    const min = read('min_time_to_dismiss');
+    return perByte !== undefined && min !== undefined ? { perByte, min } : undefined;
+}
+
+/** The largest gas factor up to `requested` at which the call still passes the time to dismiss once a sponsor added its dust spend. At least 1.
+ *  `cost` is the ledger's cost of the transaction as built. Only the guaranteed gas and the proof checks count toward that time. */
+export function headroomThatFits({ cost, guaranteed, fallible, limits, requested }) {
+    const cap = Math.max(limits.min, limits.perByte * (Number(cost.blockUsage) + SPONSOR_DUST_SPEND.bytes));
+    let fits = requested;
+    for (const time of ['readTime', 'computeTime']) {
+        const scaled = Number(guaranteed?.[time] ?? 0);
+        if (scaled <= 0) continue;
+        const asBuilt = Number(cost[time]) - Number(fallible?.[time] ?? 0) + SPONSOR_DUST_SPEND[time];
+        fits = Math.min(fits, 1 + (cap - asBuilt) / scaled);
+    }
+    return Math.max(1, Math.floor(fits * Number(GAS_SCALE)) / Number(GAS_SCALE));
+}
+
+/** Replaces the call of an unproven single-call transaction by one that declares up to `factor` times its gas.
  *  Runs before proving, because the proof commits to the transcript. `contractState` is the chain's, read for the
- *  verifier key. Returns the sealed transaction and the gas as built, for progress events. */
-export function applyGasHeadroom({ ledger, mjTypes }, data, factor, { contractAddress, circuitId, contractState }) {
+ *  verifier key. With `ledgerParameters` the factor is lowered to what the time to dismiss allows. */
+export function applyGasHeadroom({ ledger, mjTypes }, data, factor, { contractAddress, circuitId, contractState, ledgerParameters }) {
     const calls = data?.calls;
     if (!Array.isArray(calls) || calls.length !== 1) {
         throw new Error(`buildSponsorable: gasHeadroom covers a call on one contract; this call tree has ${Array.isArray(calls) ? calls.length : 'no'} calls`);
@@ -435,18 +469,25 @@ export function applyGasHeadroom({ ledger, mjTypes }, data, factor, { contractAd
     const commitment = call.communicationCommitment;
     const rand = commitment?._tag === 'Some' ? commitment.value.commCommRand : ledger.communicationCommitmentRandomness();
     const keyLocation = mjTypes.encodeContractKeyLocation({ contractAddress, circuitId, verifierKeyHash: mjTypes.hashVerifierKey(op.verifierKey) });
-    const prototype = new ledger.ContractCallPrototype(
-        contractAddress, circuitId, op,
-        guaranteed ? scaleTranscriptGas(guaranteed, factor) : undefined,
-        fallible ? scaleTranscriptGas(fallible, factor) : undefined,
-        call.private.privateTranscriptOutputs, call.private.input, call.private.output, rand, keyLocation
-    );
     // The SDK hands out a sealed handle. The edit runs on the transaction inside it, and the result is sealed again.
     const tx = data.private.unprovenTx.deserialize({ v9: ledger.Transaction });
     const intents = tx.intents;
     if (typeof intents?.entries !== 'function' || intents.size !== 1) {
         throw new Error(`buildSponsorable: gasHeadroom expects one intent in the built transaction, found ${typeof intents?.size === 'number' ? intents.size : 'none'}`);
     }
+    const limits = timeToDismissLimits(ledgerParameters);
+    let applied = factor;
+    if (limits) {
+        // A cost the ledger cannot give leaves the factor as asked. The sponsor checks the finished transaction anyway.
+        try { applied = headroomThatFits({ cost: tx.cost(ledgerParameters, false), guaranteed: guaranteed?.gas, fallible: fallible?.gas, limits, requested: factor }); }
+        catch { applied = factor; }
+    }
+    const prototype = new ledger.ContractCallPrototype(
+        contractAddress, circuitId, op,
+        guaranteed ? scaleTranscriptGas(guaranteed, applied) : undefined,
+        fallible ? scaleTranscriptGas(fallible, applied) : undefined,
+        call.private.privateTranscriptOutputs, call.private.input, call.private.output, rand, keyLocation
+    );
     const [[segmentId, intent]] = intents.entries();
     // Only addCall derives the call's communication commitment; intoCall leaves it wrong and the prover refuses the call.
     // The getter hands out copies, so the rebuilt intent goes back in through the setter.
@@ -454,6 +495,7 @@ export function applyGasHeadroom({ ledger, mjTypes }, data, factor, { contractAd
     tx.intents = new Map([[segmentId, intent.addCall(prototype)]]);
     return {
         unprovenTx: mjTypes.LedgerTransaction.seal('v9', 'Unproven', tx),
+        factor: applied,
         declared: { guaranteed: gasFigures(guaranteed?.gas), fallible: gasFigures(fallible?.gas) }
     };
 }
@@ -912,13 +954,15 @@ export async function createTxBuilder(opts) {
                 const callOptions = (args) => contracts.createCallTxOptions(compiled, single.circuitId, contractAddress, privateStateId, recipientKeys, args);
                 const fn = headroom !== undefined
                     ? async (...args) => {
-                        // The call result carries the state value, not the operations. The verifier key is read from the chain.
+                        // The call result carries the state value, not the operations. The verifier key and the ledger's limits are read from the chain.
                         const [contractState, data] = await Promise.all([
-                            publicDataProvider.queryContractState(contractAddress),
+                            publicDataProvider.queryZSwapAndContractState(contractAddress),
                             contracts.createUnprovenCallTx(providers, callOptions(args))
                         ]);
-                        const { unprovenTx, declared } = applyGasHeadroom({ ledger, mjTypes }, data, headroom, { contractAddress, circuitId: single.circuitId, contractState });
-                        onProgress?.({ phase: 'gas-headroom', factor: headroom, ...declared });
+                        let ledgerParameters;
+                        try { ledgerParameters = contractState?.ledgerParameters?.deserialize({ v9: ledger.LedgerParameters }); } catch { /* without them the factor stays as asked */ }
+                        const { unprovenTx, declared, factor } = applyGasHeadroom({ ledger, mjTypes }, data, headroom, { contractAddress, circuitId: single.circuitId, contractState, ledgerParameters });
+                        onProgress?.({ phase: 'gas-headroom', factor, requested: headroom, ...declared });
                         return contracts.submitTx(providers, { unprovenTx, circuitId: single.circuitId });
                     }
                     : recipientKeys ? (...args) => contracts.submitCallTx(providers, callOptions(args)) : direct;

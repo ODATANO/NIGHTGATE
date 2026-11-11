@@ -387,7 +387,7 @@ export function connect(opts) {
         sponsorUnbound: (p) => act('sponsorUnboundTransaction', p),
         /** Takes both halves of a private token swap. The server joins them, pays the fee and submits. */
         sponsorSwap: (p) => act('sponsorSwap', p),
-        /** Takes a plain transfer (`transferTxB64`, `tokenType`, `amount`) built by the swap wallet. The server pays the fee and submits. */
+        /** Takes a plain transfer (`transferTxB64`, `tokenType`, `amount`) built by the swap wallet or the unshielded wallet. The server pays the fee and submits. */
         sponsorTransfer: (p) => act('sponsorTransfer', p),
         buildSponsorable: async (p) => {
             const started = await callAction('buildSponsorable', p);

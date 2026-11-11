@@ -177,9 +177,18 @@ variant, and it spends the fee.
 
 `gasHeadroom` (single call, 1 to 10) multiplies the call's declared gas before
 proving, so the call still applies after a parallel caller opened the next
-trie level. `1.5` is a typical value. The fee grows with it. `onProgress`
-reports `{ phase: 'gas-headroom', factor, guaranteed, fallible }`. A batch
-takes no headroom, and a circuit that calls another contract is refused.
+trie level. The fee grows with it. A batch takes no headroom, and a circuit
+that calls another contract is refused.
+
+The factor is an upper bound. The ledger limits the time a node needs to
+dismiss a transaction: 15 ms, or 2 µs per byte for a larger one, on the current
+networks. The guaranteed gas and the checks of the proofs count toward it, and
+a transaction over the limit is refused with `1010/231`. The builder reads the
+chain's limits and lowers the factor to what fits once a sponsor added its dust
+spend, down to 1. A heavy call has room for less than `1.5`. `onProgress`
+reports `{ phase: 'gas-headroom', factor, requested, guaranteed, fallible }`,
+with `factor` the one applied. The sponsor checks the finished transaction
+again and refuses one over the limit before it sends it.
 
 ### Contracts deployed before ledger 9
 
@@ -302,6 +311,26 @@ const { txHash } = await ng.sponsorTransfer({ transferTxB64: built.txB64, tokenT
 - `getJobStatus` of a landed swap or transfer carries `receipt`, once the chain confirmed the job. `sponsorSwap` and `sponsorTransfer` return `jobId` and `sessionId` for that call, and `receipt` when it is already there. It usually is not yet, because they return when the job succeeded and the chain confirms later.
 - `ng.waitForReceipt({ jobId, sessionId })` waits for the receipt and throws when the job fails or can have none. It holds a call on the server where it can, and otherwise polls from 10 s up to 60 s. A metered gateway may bill each call.
 - `verifyReceipt(receipt, publicKey)` from the client checks a receipt against the key `ng.getReceiptKey()` publishes.
+
+### Unshielded transfers
+
+```js
+import { createUnshieldedWallet } from '@odatano/nightgate/txbuilder';
+
+const wallet = await createUnshieldedWallet({ seedHex, indexerHttpUrl, indexerWsUrl });
+await wallet.sync();
+const built = await wallet.buildTransfer({ amount: 2_000_000_000n, to: recipientAddress });
+const { txHash } = await ng.sponsorTransfer({ transferTxB64: built.txB64, tokenType: built.terms.tokenType, amount: String(built.terms.amount) });
+```
+
+- `createUnshieldedWallet({ seedHex, networkId?, accountIndex?, indexerHttpUrl, indexerWsUrl, api?, walletState?, ttlMinutes? })` syncs only the seed's unshielded coins. `api` with a gateway key replaces the indexer URLs.
+- The wallet returns `{ address, nightTokenType, sync, balances, coins, pending, buildTransfer, revert, serializeState, close }`.
+- `buildTransfer({ amount, to, tokenType?, bind? })` returns the record of the shielded `buildTransfer`. `to` is an unshielded address (`mn_addr_...`). `tokenType` defaults to NIGHT.
+- The wallet signs the transfer with the seed's key. The sponsor pays the fee, so the wallet needs no DUST.
+- The recipient gets one coin, the wallet its change. A transfer to the wallet's own address is refused.
+- An unshielded transfer shows type, amount and recipient. The server reads them from the transaction and refuses a `tokenType` or `amount` that differs. `readUnshieldedTransfer(tx)` reads them by the same rule.
+- The receipt carries the recipient as `transfer.to` and `declared: false`.
+- A built transfer is valid for `ttlMinutes`, default 30. `revert(input)` releases the coins of one that did not land, from its base64 or bytes.
 
 ### Offer files
 

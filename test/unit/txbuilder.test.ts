@@ -611,6 +611,69 @@ describe('txbuilder: gasHeadroom raises the declared gas of a single call before
         expect(() => applyGasHeadroom({ ledger, mjTypes }, data([call()], new Map([[1, intent({})]])), 1.5, { ...at, circuitId: 'other' })).toThrow(/no verifier key for 'other'/);
         expect(() => applyGasHeadroom({ ledger, mjTypes }, data([call()], new Map()), 1.5, at)).toThrow(/expects one intent.*found 0/);
     });
+
+    // The ledger's printed limits, as its parameters show them.
+    const LIMITS_TEXT = 'limits: TransactionLimits { transaction_byte_limit: 1048576, time_to_dismiss_per_byte: 2.000μs, min_time_to_dismiss: 15.000ms, block_limits: SyntheticCost { read_time: 1.000s } }';
+    const printed = (text: string) => ({ toString: () => text });
+
+    it('reads the two limits on the time to dismiss from the printed parameters, in picoseconds', async () => {
+        const { timeToDismissLimits } = await importTxBuilder();
+        expect(timeToDismissLimits(printed(LIMITS_TEXT))).toEqual({ perByte: 2e6, min: 15e9 });
+        expect(timeToDismissLimits(printed('time_to_dismiss_per_byte:\n  750.000ns,\n min_time_to_dismiss: 0.020s,'))).toEqual({ perByte: 750e3, min: 20e9 });
+        expect(timeToDismissLimits(printed('time_to_dismiss_per_byte: 2.000µs, min_time_to_dismiss: 15000.000us'))).toEqual({ perByte: 2e6, min: 15e9 });
+        expect(timeToDismissLimits(printed('min_time_to_dismiss: 15.000ms'))).toBeUndefined();
+        expect(timeToDismissLimits(printed('time_to_dismiss_per_byte: fast, min_time_to_dismiss: 15.000ms'))).toBeUndefined();
+        expect(timeToDismissLimits(undefined)).toBeUndefined();
+    });
+
+    it('lowers a factor to what fits under the time to dismiss once a sponsor added its dust spend', async () => {
+        const { headroomThatFits } = await importTxBuilder();
+        const limits = { perByte: 2e6, min: 15e9 };
+        // A heavy call of 6382 bytes: 13.277 ms as built, of which 8.455 ms are its guaranteed gas.
+        const heavy = { cost: { readTime: 6_783_000_000n, computeTime: 13_276_541_286n, blockUsage: 6382n }, guaranteed: { readTime: 3_978_000_000n, computeTime: 8_454_852_966n }, limits };
+        expect(headroomThatFits({ ...heavy, requested: 1.5 })).toBe(1.152);
+        expect(headroomThatFits({ ...heavy, requested: 1.1 })).toBe(1.1);
+        // A small transaction stays under the flat 15 ms: 13.277 ms and the sponsor's 3.6 ms are over it at any factor.
+        expect(headroomThatFits({ ...heavy, cost: { ...heavy.cost, blockUsage: 2000n }, requested: 1.5 })).toBe(1);
+        // A light call has room for all that was asked.
+        const light = { cost: { readTime: 3_009_000_000n, computeTime: 6_324_000_000n, blockUsage: 5158n }, guaranteed: { readTime: 204_000_000n, computeTime: 1_588_000_000n }, limits };
+        expect(headroomThatFits({ ...light, requested: 1.5 })).toBe(1.5);
+        expect(headroomThatFits({ ...light, requested: 10 })).toBe(4.647);
+    });
+
+    it('counts only what the node must do before it can dismiss: the fallible gas is left out, a call without guaranteed gas has no limit', async () => {
+        const { headroomThatFits } = await importTxBuilder();
+        const limits = { perByte: 2e6, min: 15e9 };
+        const cost = { readTime: 4_000_000_000n, computeTime: 16_000_000_000n, blockUsage: 3000n };
+        const guaranteed = { readTime: 500_000_000n, computeTime: 2_000_000_000n };
+        const fallible = { readTime: 1_000_000_000n, computeTime: 8_000_000_000n };
+        // 16 ms as built, 8 ms of it fallible: 8 ms and the sponsor's 3.6 ms leave 3.4 ms for 2 ms of guaranteed gas.
+        expect(headroomThatFits({ cost, guaranteed, fallible, limits, requested: 5 })).toBe(2.7);
+        expect(headroomThatFits({ cost, guaranteed: undefined, fallible, limits, requested: 5 })).toBe(5);
+    });
+
+    it('applies the lowered factor to both transcripts and reports it; without parameters or limits the factor stays as asked', async () => {
+        const { applyGasHeadroom } = await importTxBuilder();
+        const { protos, ledger, mjTypes, call, contractState, intent } = fakes();
+        const at = { contractAddress: 'ab'.repeat(32), circuitId: 'approve', contractState };
+        // As built the transaction takes 10 ms, 2 ms of it guaranteed gas: 15 - 3.6 - 10 leaves 1.4 ms, a factor of 0.7 more.
+        const heavyCall = () => ({ ...call(), public: { partitionedTranscript: [{ gas: { readTime: 100_000_000n, computeTime: 2_000_000_000n, bytesWritten: 3n, bytesDeleted: 7n } }, { gas: { readTime: 10n, computeTime: 10n, bytesWritten: 1n, bytesDeleted: 0n } }] } });
+        const costs: unknown[][] = [];
+        const built = (cost: (...a: unknown[]) => unknown) => ({ calls: [heavyCall()], public: {}, private: { unprovenTx: { deserialize: () => ({ intents: new Map([[1, intent({})]]), cost }) } } });
+        const cost = (...a: unknown[]) => { costs.push(a); return { readTime: 1_000_000_000n, computeTime: 10_000_000_010n, blockUsage: 4000n }; };
+        const params = printed(LIMITS_TEXT);
+
+        const capped = applyGasHeadroom({ ledger, mjTypes }, built(cost), 3, { ...at, ledgerParameters: params });
+        expect(capped.factor).toBe(1.7);
+        expect(costs).toEqual([[params, false]]);
+        expect(protos[0].args[3].gas.computeTime).toBe(3_400_000_000n);
+        expect(protos[0].args[4].gas.computeTime).toBe(17n);
+
+        expect(applyGasHeadroom({ ledger, mjTypes }, built(cost), 3, at).factor).toBe(3);
+        expect(applyGasHeadroom({ ledger, mjTypes }, built(cost), 3, { ...at, ledgerParameters: printed('nothing to read') }).factor).toBe(3);
+        expect(applyGasHeadroom({ ledger, mjTypes }, built(() => { throw new Error('no cost'); }), 3, { ...at, ledgerParameters: params }).factor).toBe(3);
+        expect(protos.at(-1).args[3].gas.computeTime).toBe(6_000_000_000n);
+    });
 });
 
 describe('txbuilder: trackingWebSocket lets close() end the indexer sockets the SDK provider hides', () => {

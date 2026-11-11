@@ -755,11 +755,10 @@ service NightgateService {
         sessionId : UUID; // pass it to getJobStatus
     };
 
-    /**
-     * Pays the fee for a plain shielded transfer the caller built and submits it. Recipient and amount are hidden: `tokenType` and `amount` are the caller's statement.
-     */
+    /** Pays the fee for a plain transfer the caller built and submits it. A shielded transfer hides its terms, so `tokenType` and `amount` are the caller's statement.
+     * An unshielded transfer shows them, so both must match the transaction. */
     action   sponsorTransfer(transferTxB64: LargeString, // base64; bound or unbound
-                             tokenType: Hex64, // the type moved; must be in the effective allowedTokenTypes
+                             tokenType: Hex64, // the type moved; must be allowed for the caller
                              amount: String, // decimal; atoms the recipient receives
                              idempotencyKey: String)                          returns { // optional
         jobId     : UUID;
@@ -1197,7 +1196,7 @@ service NightgateService {
                               allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent, needs NIGHTGATE_SPONSOR_ALLOW_DEPLOY
                               maxDeploys: Integer, // optional, default 1 when allowDeploy is true
                               allowedTokenTypes: array of Hex64, // optional, default all the platform allows
-                              allowUnshieldedOffers: Boolean, // optional; sponsored calls may pay the agent's own unshielded tokens in and the contract's payouts out, needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
+                              allowUnshieldedOffers: Boolean, // optional; sponsored calls may pay the agent's own unshielded tokens in and the contract's payouts out, and sponsorTransfer takes unshielded transfers; needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
                               allowedUnshieldedTokenTypes: array of Hex64, // optional, default all the platform allows besides NIGHT
                               maxValuePerDay: array of ValueBudget // optional, default no value limit
     )                                                                         returns {
@@ -1231,7 +1230,7 @@ service NightgateService {
                                allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent, needs NIGHTGATE_SPONSOR_ALLOW_DEPLOY
                                maxDeploys: Integer, // optional, default 1 when allowDeploy is true
                                allowedTokenTypes: array of Hex64, // optional, default all the platform allows
-                               allowUnshieldedOffers: Boolean, // optional; sponsored calls may pay the agent's own unshielded tokens in and the contract's payouts out, needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
+                               allowUnshieldedOffers: Boolean, // optional; sponsored calls may pay the agent's own unshielded tokens in and the contract's payouts out, and sponsorTransfer takes unshielded transfers; needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
                                allowedUnshieldedTokenTypes: array of Hex64, // optional, default all the platform allows besides NIGHT
                                maxValuePerDay: array of ValueBudget // optional, default no value limit
     )                                                                         returns {

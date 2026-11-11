@@ -66,6 +66,7 @@ The reference is [`docs/txbuilder.md`](https://github.com/ODATANO/NIGHTGATE/blob
 
 - [Batches](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#batches): up to 8 calls in one transaction with one fee.
 - [Shielded swaps](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#shielded-swaps): `createSwapWallet`, offer files and sponsored transfers.
+- [Unshielded transfers](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#unshielded-transfers): `createUnshieldedWallet` pays NIGHT to an address, a sponsor pays the fee.
 - [Token factory](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#token-factory): mint named tokens from your own seed.
 - [Holder registry](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#holder-registry): register a token holding with `holderClaimKey`.
 - Your own contract: `createTxBuilder({ package: '@odatano/contract-<name>' })` or `{ contractClass, zkConfigDir }`. `buildDeploySponsorable()` builds a sponsored deploy.

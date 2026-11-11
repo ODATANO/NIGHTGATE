@@ -97,6 +97,7 @@ export function receiptForJob(job: BackgroundJob, transactionHash: string | null
         blockHeight: job.chainBlockHeight ?? null,
         blockHash: job.chainBlockHash ?? null,
         finalizedAt: job.chainFinalizedAt ?? null,
-        ...(job.kind === 'sponsorSwap' ? { swap: terms } : { transfer: terms, declared: true })
+        // An unshielded transfer names its recipient, and its terms were read from the transaction.
+        ...(job.kind === 'sponsorSwap' ? { swap: terms } : { transfer: terms, declared: !('to' in terms) })
     });
 }

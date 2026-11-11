@@ -1000,7 +1000,7 @@ export function walletSponsorUnboundTx(args: SponsorPolicyArgs & {
     /** The two halves of a shielded swap, proven but not bound. The worker checks and merges them. */
     swap?: { makerHalfB64: string; takerHalfB64: string };
     allowSwaps?: boolean;
-    /** A plain shielded transfer with the terms the caller declares. The worker checks its shape. */
+    /** A plain transfer with the terms the caller declares. The worker checks its shape. */
     transfer?: { txB64: string; tokenType: string; amount: string };
     allowTransfers?: boolean;
     networkId: WalletSubmitContractCallArgs['networkId'];
@@ -1011,8 +1011,8 @@ export function walletSponsorUnboundTx(args: SponsorPolicyArgs & {
     return rpc('sponsorUnboundTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
-/** Checks that caller bytes are a plain shielded transfer: an offer and nothing else that nets to zero. Throws `SPONSOR_REFUSED` otherwise. */
-export async function walletDescribeTransfer(args: { txB64: string }): Promise<{ bound: boolean; inputs: number; outputs: number; nullifiers: string[] }> {
+/** Checks that caller bytes are a plain transfer and nothing else. `unshielded` holds the terms an unshielded one shows. Throws `SPONSOR_REFUSED` otherwise. */
+export async function walletDescribeTransfer(args: { txB64: string }): Promise<{ bound: boolean; inputs: number; outputs: number; nullifiers: string[]; unshielded?: { tokenType: string; amount: string; to: string; night: boolean } }> {
     return rpc('describeTransfer', args, RPC_TIMEOUT_MS);
 }
 

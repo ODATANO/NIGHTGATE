@@ -85,7 +85,7 @@ export const JOB_KINDS: Readonly<Record<string, JobKindDefinition>> = {
     sponsorSwap: {
         traits: { heavy: true, workflowParent: false, identifierKeyed: true }, executor: 'sponsorUnbound', finalizer: 'sponsoredSubmission'
     },
-    // Takes a plain shielded transfer with declared terms. Runs like the job above.
+    // Takes a plain transfer with declared terms. Runs like the job above.
     sponsorTransfer: {
         traits: { heavy: true, workflowParent: false, identifierKeyed: true }, executor: 'sponsorUnbound', finalizer: 'sponsoredSubmission'
     },

@@ -190,7 +190,7 @@ export interface NightgateClient {
      * and a directed offer needs its `takerSecret`. Each half is either offer file text (`swapoffer1...`) or base64.
      */
     sponsorSwap(p: ActionParams): Promise<JobResult>;
-    /** Takes `transferTxB64`, `tokenType`, `amount` and optionally `idempotencyKey`. The transfer comes from the swap wallet's `buildTransfer`. */
+    /** Takes `transferTxB64`, `tokenType`, `amount` and optionally `idempotencyKey`. The transfer comes from `buildTransfer` of the swap wallet or the unshielded wallet. */
     sponsorTransfer(p: ActionParams): Promise<JobResult>;
     buildSponsorable(p: ActionParams): Promise<JobResult>;
 

@@ -19,7 +19,7 @@ const exists = (p) => access(p).then(() => true, () => false);
 /** Expected surface per entry point: what the README promises. */
 const EXPECTED = {
     '.': ['connect', 'int64', 'createTxBuilder', 'deriveIdentity', 'ensureZkAssets', 'ATTESTATION_VAULT_CIRCUITS',
-        'createSwapWallet', 'readSwapTerms', 'encodeOffer', 'decodeOffer'],
+        'createSwapWallet', 'readSwapTerms', 'encodeOffer', 'decodeOffer', 'createUnshieldedWallet'],
     './client': ['connect', 'int64', 'NightgateApiError', 'NightgateJobError'],
     './txbuilder': ['createTxBuilder', 'deriveIdentity', 'ensureZkAssets',
         'deserializeTransaction', 'txIdentifiers', 'submitFinalized', 'submitExtrinsic',
@@ -29,6 +29,7 @@ const EXPECTED = {
         'apiPublicDataProvider', 'apiClientFor', 'buildOnlySubmissionService',
         'createSwapWallet', 'readSwapTerms', 'sameSwapTerms', 'encodeOffer', 'decodeOffer', 'SWAP_OFFER_PREFIX',
         'SWAP_MAX_INPUTS', 'chooseSwapCoin', 'spendableWithin',
+        'createUnshieldedWallet', 'readUnshieldedTransfer',
         'deriveRoleSeeds', 'recipientKeyMap'],
     './calls': ['prepareAttest', 'prepareAnchorContentRoot', 'prepareProveFieldMembership',
         'buildAttestationVaultWitnesses', 'generateAttestationSecret', 'CONTRACTS'],

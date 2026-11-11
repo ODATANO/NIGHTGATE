@@ -121,6 +121,31 @@ describe('txbuilder providers on the real SDK', () => {
         expect(after.bytesDeleted).toBe(before.bytesDeleted);
     }, 60_000);
 
+    it('gasHeadroom is lowered to what the ledger\'s time to dismiss leaves, with the limits read from the real parameters', async () => {
+        const { timeToDismissLimits } = await import('../../src/txbuilder/index.mjs' as string);
+        expect(timeToDismissLimits(ledger.LedgerParameters.initialParameters())).toEqual({ perByte: 2e6, min: 15e9 });
+
+        const publicDataProvider = apiProvider();
+        const { providers } = wrappedProviders(publicDataProvider);
+        const options = contracts.createCallTxOptions(compiled, 'increment', contractAddress, 'ps', undefined, []);
+        await providers.privateStateProvider.forContract(contractAddress).set('ps', {});
+        // One read gives the builder the verifier key and the chain's limits.
+        const read = await publicDataProvider.queryZSwapAndContractState(contractAddress);
+        const ledgerParameters = read.ledgerParameters.deserialize({ v9: ledger.LedgerParameters });
+        const at = { contractAddress, circuitId: 'increment', contractState: read };
+        const costOf = (sealed: any) => () => sealed.deserialize({ v9: ledger.Transaction }).cost(ledgerParameters, true);
+
+        const capped = applyGasHeadroom({ ledger, mjTypes }, await contracts.createUnprovenCallTx(providers, options), 10, { ...at, ledgerParameters });
+        expect(capped.factor).toBeGreaterThan(1.5);
+        expect(capped.factor).toBeLessThan(10);
+        expect(costOf(capped.unprovenTx)).not.toThrow();
+
+        // Without the parameters the factor stays as asked, and the ledger refuses that transaction.
+        const asAsked = applyGasHeadroom({ ledger, mjTypes }, await contracts.createUnprovenCallTx(providers, options), 10, at);
+        expect(asAsked.factor).toBe(10);
+        expect(costOf(asAsked.unprovenTx)).toThrow(/time to dismiss/);
+    }, 60_000);
+
     it('a state decoded for the readers works in the compiled contract\'s ledger function', async () => {
         const { contractStateOf } = await import('../../srv/midnight/public-data-provider' as string);
         const counter = await import('@odatano/contract-counter' as string);

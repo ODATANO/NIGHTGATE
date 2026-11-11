@@ -52,7 +52,7 @@ Every submit path persists the identifier as `txHash` before the broadcast. A `f
 
 ### Receipts
 
-`receipt` is `{ payload, signature, publicKey, algorithm: "ed25519" }`. `payload` is canonical JSON with sorted keys of `{ v: 1, kind, jobId, network, txHash, transactionHash, blockHeight, blockHash, finalizedAt, swap | transfer }` with `kind` `swap` or `transfer`. A transfer carries `declared: true`, because its terms are the caller's statement. The signature is Ed25519 over the UTF-8 payload. The key is `NIGHTGATE_RECEIPT_SIGNING_KEY`, else derived from the active encryption key, so a key rotation changes it. `getReceiptKey()` publishes it without credentials. A third party checks a receipt with `verifyReceipt` from `@odatano/nightgate-tx`. The same facts always give the same signature.
+`receipt` is `{ payload, signature, publicKey, algorithm: "ed25519" }`. `payload` is canonical JSON with sorted keys of `{ v: 1, kind, jobId, network, txHash, transactionHash, blockHeight, blockHash, finalizedAt, swap | transfer }` with `kind` `swap` or `transfer`. A shielded transfer carries `declared: true`, because its terms are the caller's statement. An unshielded transfer carries `declared: false` and the recipient as `transfer.to`, because the server read its terms from the transaction. The signature is Ed25519 over the UTF-8 payload. The key is `NIGHTGATE_RECEIPT_SIGNING_KEY`, else derived from the active encryption key, so a key rotation changes it. `getReceiptKey()` publishes it without credentials. A third party checks a receipt with `verifyReceipt` from `@odatano/nightgate-tx`. The same facts always give the same signature.
 
 ## Rate limits
 
@@ -228,9 +228,12 @@ Off unless `NIGHTGATE_SPONSOR_ALLOW_SWAPS` (policy file `allowSwaps`) is set, an
 
 ### `sponsorTransfer(transferTxB64, tokenType, amount, idempotencyKey?) → { jobId, status, sessionId }`
 
-Sponsors a plain shielded transfer built by the swap wallet's `buildTransfer`. The transaction is bound or unbound, base64 or offer-file text. Job result `{ txHash, circuits: ["<transfer>"], note, transfer: { tokenType, amount } }`. Rate class `sponsor`.
+Sponsors a plain transfer the caller built: a shielded one from the swap wallet's `buildTransfer`, or an unshielded one, NIGHT included, from `createUnshieldedWallet`. The transaction is bound or unbound, base64 or offer-file text. Job result `{ txHash, circuits: ["<transfer>"], note, transfer: { tokenType, amount, to? } }`. Rate class `sponsor`.
 
-Off unless `NIGHTGATE_SPONSOR_ALLOW_TRANSFERS` (policy file `allowTransfers`) is set, and a token needs `sponsorTransfer` in `allowedActions`. `tokenType` must be in the effective `allowedTokenTypes`. The transaction must carry an offer and nothing else, spend 1 to `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS` coins, create one or two, and net to zero. Recipient, amount and type are commitments, so `tokenType` and `amount` are the caller's declaration. They count against the value budget and appear in the receipt as `declared: true`.
+Off unless `NIGHTGATE_SPONSOR_ALLOW_TRANSFERS` (policy file `allowTransfers`) is set, and a token needs `sponsorTransfer` in `allowedActions`. `amount` counts against the value budget of `tokenType`.
+
+- **Shielded.** `tokenType` must be in the effective `allowedTokenTypes`. The transaction must carry an offer and nothing else, spend 1 to `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS` coins, create one or two, and net to zero. Recipient, amount and type are commitments, so `tokenType` and `amount` are the caller's declaration. The receipt says `declared: true`.
+- **Unshielded.** Also needs `NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS` (policy file `allowUnshieldedOffers`), and a token needs `allowUnshieldedOffers` on its grant. The type is NIGHT or one in the effective `allowedUnshieldedTokenTypes`. The transaction must carry one intent with one signed unshielded offer and nothing else. The offer pays one address, sends any change back to a spender, balances, and spends no UTXO of the sponsor. The transaction stays under `NIGHTGATE_SPONSOR_MAX_TX_BYTES`. The offer is public, so `tokenType` and `amount` must match it, else 400. The result's `transfer.to` is the recipient's address, and the receipt says `declared: false`.
 
 ### Sponsor policy
 
@@ -250,8 +253,9 @@ An empty list means no restriction. Whoever reaches the endpoint can then make y
 - **Token offers.** A zswap offer passes when every net change is on a listed type other than NIGHT and every contract-owned coin belongs to a sponsorable contract.
 - **Contract mints.** With `NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS` a type needs no list entry while a call of the same transaction mints it. A landed mint lists the type for its grant, or for every grant with `NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES`.
 - **Sponsored deploys.** Grant `allowDeploy` with `maxDeploys` (default 1, lifetime) and `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` let the sponsor pay a deploy the caller built. Ceiling `NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES` (default 40960). A node reject refunds the budget. The landed address joins the grant's `deployedContracts`. Maintenance updates are never sponsored.
-- **Unshielded offers.** Grant `allowUnshieldedOffers` and `NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS` let a call move the caller's own NIGHT or `allowedUnshieldedTokenTypes` into the called contract, and pay out what the contract's proven result requires. The sponsor adds dust only. The job result lists `unshielded: [{ type, amount, to }]`.
+- **Unshielded offers.** Grant `allowUnshieldedOffers` and `NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS` let a call move the caller's own NIGHT or `allowedUnshieldedTokenTypes` into the called contract, and pay out what the contract's proven result requires. The sponsor adds dust only. The job result lists `unshielded: [{ type, amount, to }]`. A grant that also holds `sponsorTransfer` may send these types to any address, see `sponsorTransfer` above.
 - **Value budgets.** Grant `maxValuePerDay` caps the atoms moved per UTC day and type by swaps, transfers, mints and burns. Over it is 429 `grant-value`.
+- **Cost.** The sponsor asks the ledger for the cost of the finished transaction before it sends it. One the node would refuse fails with `SPONSOR_REFUSED` and the ledger's reason: over the time to dismiss for its size, or over a block limit. `sponsorUnboundTransaction`, `sponsorSwap` and `sponsorTransfer` check before the dust spend is proven.
 
 **Pool.** `NIGHTGATE_FEE_SPONSOR_SESSION` sessions form a pool with one in-flight dust spend per wallet. Callers wait up to `NIGHTGATE_SPONSOR_LEASE_WAIT_MS` (default 120 s). A failing sponsor is benched for `NIGHTGATE_SPONSOR_COOLDOWN_MS` and the job tries the next. Pool jobs run under the session id `00000000-0000-0000-0000-706f6f6c0000`.
 
@@ -650,6 +654,7 @@ Raw node or SDK errors:
 
 - **`1010/103`**: a spent coin, or a zswap proof against a coin tree state the node no longer accepts. No fee, never rebuilt. A filled or aged swap half ends here.
 - **`1010/170`, `1010/171`, `1010/196`** (dust race): the dust spend was built on an outdated dust state. No fee. Deploy, call and batch rebuild in the worker (`NIGHTGATE_DUST_RACE_RETRIES`, default 2), sponsored paths per `NIGHTGATE_SPONSOR_DUST_RETRIES`.
+- **`1010/231`**: the transaction takes a node longer to dismiss than the ledger allows for its size. The guaranteed gas of its calls and the checks of its proofs count, the limit is 15 ms or 2 µs per byte on the current networks. No fee. A sponsor refuses such a transaction before sending it, see [Sponsor policy](#sponsor-policy).
 - **`failed assert: predicate false`**: a predicate circuit rejected the claim.
 - **`Wallet.InsufficientFunds`**: not enough dust for the fee or NIGHT for the outputs.
 - **`MalformedResult`**: the SDK returned without the expected fields.

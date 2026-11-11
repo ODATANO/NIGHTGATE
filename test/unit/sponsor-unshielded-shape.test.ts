@@ -205,3 +205,79 @@ describe('checkTransferShape', () => {
         expect(() => workerExports.checkTransferShape(transfer({}, { imbalances: () => new Map([[T, -3n]]) }), 4)).toThrow(/does not balance/);
     });
 });
+
+describe('checkUnshieldedTransferShape', () => {
+    const NIGHT = '00'.repeat(32);
+    const CREDIT = 'cc'.repeat(32);
+    const KEY_A = '11'.repeat(32);
+    const ADDR_A = 'a1'.repeat(32);
+    const ADDR_B = 'b2'.repeat(32);
+    const ADDR_C = 'c3'.repeat(32);
+    const SPONSOR_KEY = '99'.repeat(32);
+    const addressFromKey = (k: { value: string }) => (k.value === KEY_A ? ADDR_A : 'ee'.repeat(32));
+    const input = (value: unknown, owner = KEY_A, type = NIGHT) => ({ value, owner: { tag: 'schnorr', value: owner }, type, intentHash: '00'.repeat(32), outputNo: 0 });
+    const output = (value: bigint, owner: string, type = NIGHT) => ({ value, owner, type });
+    const offer = (inputs: unknown[], outputs: unknown[], signatures: unknown[] = inputs.map(() => ({}))) => ({ inputs, outputs, signatures });
+    const pay = offer([input(50n)], [output(10n, ADDR_B), output(40n, ADDR_A)]);
+    const send = (o: unknown = pay, key = 'fallibleUnshieldedOffer', intent: Record<string, unknown> = {}, top: Record<string, unknown> = {}) => tx([{ actions: [], [key]: o, ...intent }], top);
+    const check = (t: unknown, bytes = 600, options: Record<string, unknown> = {}) =>
+        workerExports.checkUnshieldedTransferShape(t, bytes, { addressFromKey, sponsorInputKeys: [SPONSOR_KEY], ...options });
+
+    it('reads type, amount and recipient from the offer, with or without change', () => {
+        expect(check(send())).toEqual({ tokenType: NIGHT, amount: '10', to: ADDR_B, inputs: 1, outputs: 2 });
+        const exact = offer([input(4n), input(6n)], [output(10n, ADDR_B)]);
+        expect(check(send(exact, 'guaranteedUnshieldedOffer'))).toEqual({ tokenType: NIGHT, amount: '10', to: ADDR_B, inputs: 2, outputs: 1 });
+        const twoCoins = offer([input(50n, KEY_A, CREDIT)], [output(20n, ADDR_B, CREDIT), output(30n, ADDR_B, CREDIT)]);
+        expect(check(send(twoCoins))).toMatchObject({ tokenType: CREDIT, amount: '50', to: ADDR_B });
+    });
+
+    it("reads the ledger balance of the offer's own segment", () => {
+        const seen: number[] = [];
+        const record = (t: ReturnType<typeof send>) => { const balance = t.imbalances; t.imbalances = (segment: number) => { seen.push(segment); return balance(segment); }; return t; };
+        check(record(send()));
+        check(record(send(pay, 'guaranteedUnshieldedOffer')));
+        expect(seen).toEqual([1, 0]);
+    });
+
+    it('refuses anything next to the one offer', () => {
+        expect(() => check(send(pay, 'fallibleUnshieldedOffer', {}, { guaranteedOffer: { inputs: [{}], outputs: [] } }))).toThrow(/carries a shielded offer next to its intent/);
+        expect(() => check(send(pay, 'fallibleUnshieldedOffer', {}, { fallibleOffer: new Map([[1, {}]]) }))).toThrow(/carries a shielded offer/);
+        expect(() => check(tx([{ actions: [], fallibleUnshieldedOffer: pay }, { actions: [] }]))).toThrow(/carries 2 intents; a transfer has one/);
+        expect(() => check(send(pay, 'fallibleUnshieldedOffer', { actions: [CALL('aa'.repeat(32), 'deposit')] }))).toThrow(/carries a contract action/);
+        expect(() => check(send(pay, 'fallibleUnshieldedOffer', { dustActions: { spends: [{}], registrations: [] } }))).toThrow(/carries dust actions/);
+        expect(() => check(send(pay, 'fallibleUnshieldedOffer', { guaranteedUnshieldedOffer: pay }))).toThrow(/a guaranteed and a fallible unshielded offer/);
+        expect(() => check(tx([{ actions: [] }]))).toThrow(/carries no unshielded offer/);
+    });
+
+    it('refuses an offer that is no payment to one address', () => {
+        expect(() => check(send(offer([input(50n)], [output(50n, ADDR_A)])))).toThrow(/pays nobody but its own spender/);
+        expect(() => check(send(offer([input(50n)], [output(10n, ADDR_B), output(40n, ADDR_C)])))).toThrow(/pays two addresses; a transfer pays one/);
+        expect(() => check(send(offer([input(50n)], [output(10n, ADDR_B), output(20n, ADDR_B), output(20n, ADDR_A)])))).toThrow(/carries 3 outputs/);
+        expect(() => check(send(offer([], [output(10n, ADDR_B)])))).toThrow(/spends nothing/);
+        expect(() => check(send(offer([input(50n), input(5n, KEY_A, CREDIT)], [output(55n, ADDR_B)])))).toThrow(/spends more than one token type/);
+        expect(() => check(send(offer([input(50n)], [output(50n, ADDR_B, CREDIT)])))).toThrow(/creates a token type it does not spend/);
+    });
+
+    it("refuses the sponsor's own UTXO, a missing signature and a transaction over the byte budget", () => {
+        expect(() => check(send(offer([input(50n, SPONSOR_KEY)], [output(50n, ADDR_B)])))).toThrow(/spends a UTXO of the sponsor itself/);
+        expect(() => check(send(offer([input(20n), input(30n)], [output(50n, ADDR_B)], [{}])))).toThrow(/is not signed: 1 signature\(s\) for 2 input\(s\)/);
+        expect(() => check(send(), 70_000)).toThrow(/is 70000B, over the 65536B budget/);
+        expect(() => check(send(), 600, { addressFromKey: undefined })).toThrow(/cannot be checked without the ledger's addressFromKey/);
+    });
+
+    it('refuses an offer that does not balance, by its own sums or on the ledger', () => {
+        expect(() => check(send(offer([input(50n)], [output(10n, ADDR_B), output(35n, ADDR_A)])))).toThrow(/does not balance: it spends 50 and creates 45/);
+        expect(() => check(send(pay, 'fallibleUnshieldedOffer', {}, { imbalances: () => new Map([[unshieldedKey(NIGHT), 5n]]) }))).toThrow(/does not balance on the ledger/);
+        expect(() => check(send(pay, 'fallibleUnshieldedOffer', {}, { imbalances: () => new Map() }))).toThrow(/does not balance on the ledger/);
+        expect(() => check(send(pay, 'fallibleUnshieldedOffer', {}, { imbalances: () => new Map([[unshieldedKey(NIGHT), 0n], [unshieldedKey(CREDIT), 1n]]) }))).toThrow(/does not balance on the ledger/);
+    });
+
+    it('fails closed on what it cannot read, under the prefix it is given', () => {
+        expect(() => check(send({ inputs: 'x', outputs: [], signatures: [] }))).toThrow(/not inspectable \(no inputs\/outputs\)/);
+        expect(() => check(send(offer([input('ten')], [output(10n, ADDR_B)])))).toThrow(/value that is not readable/);
+        expect(() => check(send(offer([{ ...input(50n), owner: { tag: 'schnorr', value: 'zz' } }], [output(50n, ADDR_B)])))).toThrow(/input without a readable owner key/);
+        expect(() => check(send(offer([input(50n)], [output(50n, 'short')])))).toThrow(/output without a readable owner/);
+        expect(() => check({ intents: undefined, imbalances: () => new Map() })).toThrow(/not inspectable \(no intents\)/);
+        expect(() => workerExports.checkUnshieldedTransferShape(tx([{ actions: [] }]), 600, { addressFromKey }, 'not a transfer')).toThrow(/^not a transfer: the transfer carries no unshielded offer/);
+    });
+});

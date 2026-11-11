@@ -23,6 +23,7 @@ const FILES = [
     { path: 'src/txbuilder/submit.mjs' },
     { path: 'src/txbuilder/api-provider.mjs' },
     { path: 'src/txbuilder/swap.mjs' },
+    { path: 'src/txbuilder/unshielded.mjs' },
     { path: 'src/txbuilder/prover-material.mjs' },
     { path: 'src/txbuilder/wallet-tx.mjs' },
     { path: 'src/txbuilder/holder.mjs' },

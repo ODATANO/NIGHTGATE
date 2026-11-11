@@ -20,12 +20,13 @@ export interface SubmitIntentCoordinates {
     deployReservation?: { grantId: string; count: number };
     /** Unshielded tokens the calls moved into a contract. */
     unshielded?: UnshieldedMove[];
-    /** The declared terms of a sponsored transfer. */
+    /** The terms of a sponsored transfer. */
     transfer?: DeclaredTransfer;
 }
 
 export interface UnshieldedMove { type: string; amount: string; to: string }
-export interface DeclaredTransfer { tokenType: string; amount: string }
+/** A shielded transfer hides its terms, so they are the caller's statement. An unshielded one shows them and names the recipient in `to`. */
+export interface DeclaredTransfer { tokenType: string; amount: string; to?: string }
 
 /** Parse a row's `submitIntentData`; missing or malformed data reads as no coordinates. */
 export function parseSubmitIntent(data: string | null | undefined): SubmitIntentCoordinates {

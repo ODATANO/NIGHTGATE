@@ -3472,6 +3472,57 @@ describe('sponsorUnboundTx concurrency contract', () => {
             await rpc('evict', { sessionId: 'session-sponsor-unbound-bbbbbb' });
         }
     });
+
+    it('a transaction the node would refuse for its cost is refused before the dust spend is proven, and its backing is free again', async () => {
+        const session = 'session-sponsor-unbound-cccccc';
+        const facade = await initSession(session);
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200,
+            json: async () => ({ data: { block: { height: '500', timestamp: Date.now() } } })
+        })));
+        const fromParts = ledgerTx.fromParts.getMockImplementation();
+        try {
+            facadeState.current = { dust: { progress: { appliedIndex: '95', isConnected: true } } };
+            wsTip.maxId = '100';
+            facade.dust.state = {
+                subscribe(obs: any) {
+                    obs.next(dustStateOf(() => [{ token: { backingNight: 'backing-A' }, generatedNow: 10n ** 9n }]));
+                    return { unsubscribe() { /* noop */ } };
+                }
+            };
+            const merged: unknown[] = [];
+            const fees = vi.fn((): bigint => { throw new Error('exceeded the maximum time to dismiss for transaction size; this transaction would take 17.504ms to dismiss, but given its size of 6382 bytes, it may take at most 15.000ms'); });
+            mockUnboundCaller(() => ({ ...callerTx(), bind: () => ({ boundCaller: true }) }));
+            ledgerTx.fromParts.mockImplementation(() => ({
+                addIntent: (segment: any, intent: any) => ({ dustUnproven: true, segment, intent, mockProve: () => ({ merge: (other: unknown) => { merged.push(other); return { fees }; } }) })
+            }));
+            facade.provingService.prove = vi.fn(async () => v9Tx({ merge: () => ({ bind: () => ({ bound: true, identifiers: () => ['tx-id-fixture'] }) }) }));
+
+            const refused = await rpc('sponsorUnboundTx', { ...args, sponsorSessionId: session });
+            expect(refused.ok).toBe(false);
+            expect(refused.error.message).toMatch(/refusing to sponsor: the node would refuse this transaction for its cost: exceeded the maximum time to dismiss.*17\.504ms/);
+            // the mock-proven dust spend is merged with the caller's bound form, and nothing is proven for it
+            expect(merged).toEqual([{ boundCaller: true }]);
+            expect(fees).toHaveBeenCalledWith(expect.anything(), true);
+            expect(facade.provingService.prove).not.toHaveBeenCalled();
+
+            fees.mockImplementation(() => 1n);
+            // an earlier test leaves the client factory rejecting; this submit gets a clean one
+            makeDefaultSubmissionService.mockImplementation((_cfg: any) => {
+                const svc = { submitTransaction: vi.fn(async () => undefined), close: vi.fn(async () => undefined) };
+                submitServices.push(svc);
+                return svc;
+            });
+            const next = await rpc('sponsorUnboundTx', { ...args, sponsorSessionId: session });
+            expect(next.error?.message).toBeUndefined();
+            expect(next.ok).toBe(true);
+            expect(next.result.note).toBe('backing-A');
+        } finally {
+            ledgerTx.fromParts.mockImplementation(fromParts!);
+            vi.unstubAllGlobals();
+            await rpc('evict', { sessionId: session });
+        }
+    });
 });
 
 describe('dedicated submit clients: settle window + closing-socket retry', () => {

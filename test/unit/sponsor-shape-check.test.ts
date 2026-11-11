@@ -796,3 +796,26 @@ describe('contractCircuits: a circuit rule per contract replaces the global list
             .toThrow(/not in the allow-list/);
     });
 });
+
+describe('refuseOverCost', () => {
+    const PARAMS = { ofTipBlock: true };
+    const DISMISS = 'exceeded the maximum time to dismiss for transaction size; this transaction would take 17.504ms to dismiss, but given its size of 6382 bytes, it may take at most 15.000ms';
+
+    it('asks the ledger for the fee with the time to dismiss enforced', () => {
+        const fees = vi.fn(() => 5n);
+        workerExports.refuseOverCost(() => ({ fees }), PARAMS);
+        expect(fees).toHaveBeenCalledWith(PARAMS, true);
+    });
+
+    it('refuses with the ledger\'s own words when the transaction is over the time to dismiss or a block limit', () => {
+        expect(() => workerExports.refuseOverCost(() => ({ fees: () => { throw new Error(DISMISS); } }), PARAMS))
+            .toThrow(/^refusing to sponsor: the node would refuse this transaction for its cost: exceeded the maximum time to dismiss.*17\.504ms.*6382 bytes.*15\.000ms$/);
+        expect(() => workerExports.refuseOverCost(() => ({ fees: () => { throw new Error('exceeded block limit in transaction fee computation'); } }), PARAMS))
+            .toThrow(/node would refuse this transaction for its cost: exceeded block limit/);
+    });
+
+    it('lets any other failure pass, of the fee or of assembling the transaction', () => {
+        expect(() => workerExports.refuseOverCost(() => ({ fees: () => { throw new Error('unreachable'); } }), PARAMS)).not.toThrow();
+        expect(() => workerExports.refuseOverCost(() => { throw new TypeError('mockProve is not a function'); }, PARAMS)).not.toThrow();
+    });
+});

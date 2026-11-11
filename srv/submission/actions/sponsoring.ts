@@ -145,7 +145,13 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (!effectiveSponsor) return;
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRateClass('sponsor', 'sponsor', req)) return;
-        if (!await rejectUnlessProven(req, () => walletDescribeTransfer({ txB64 }))) return;
+        let shape: Awaited<ReturnType<typeof walletDescribeTransfer>> | undefined;
+        if (!await rejectUnlessProven(req, async () => { shape = await walletDescribeTransfer({ txB64 }); })) return;
+        // An unshielded transfer shows its terms, so the declaration must match them.
+        const unshielded = shape?.unshielded;
+        if (unshielded && (unshielded.tokenType !== tokenType || unshielded.amount !== amount)) {
+            return req.reject(400, `the transfer pays ${unshielded.amount} of token type ${unshielded.tokenType}, declared were ${amount} of ${tokenType}`);
+        }
         if (!await takeValueBudget(req, db, tokenType, BigInt(amount))) return;
 
         return runSubmission(req, async () => {
@@ -154,7 +160,14 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
             if (policy.allowTransfers !== true) {
                 throw new NightgateError('SPONSOR_POLICY_EMPTY', 'transfers are not sponsored here (NIGHTGATE_SPONSOR_ALLOW_TRANSFERS or policy file allowTransfers, and sponsorTransfer in the grant)');
             }
-            if (!policy.allowedTokenTypes?.includes(tokenType)) {
+            if (unshielded) {
+                if (policy.allowUnshieldedOffers !== true) {
+                    throw new NightgateError('SPONSOR_POLICY_EMPTY', 'unshielded transfers are not sponsored here (NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS or policy file allowUnshieldedOffers, and allowUnshieldedOffers on the grant)');
+                }
+                if (!unshielded.night && !policy.allowedUnshieldedTokenTypes?.includes(tokenType)) {
+                    throw new NightgateError('SPONSOR_POLICY_EMPTY', `token type ${tokenType.slice(0, 16)}… is neither NIGHT nor in allowedUnshieldedTokenTypes for this caller`);
+                }
+            } else if (!policy.allowedTokenTypes?.includes(tokenType)) {
                 throw new NightgateError('SPONSOR_POLICY_EMPTY', `token type ${tokenType.slice(0, 16)}… is not in allowedTokenTypes for this caller`);
             }
             const job = await startJob({
