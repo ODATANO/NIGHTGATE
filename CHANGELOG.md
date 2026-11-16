@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.44.0 - 2026-11-16
+
+### Features
+
+- `verifyDisclosureState(contractAddress, attesterId, payloadHash, grantee,
+  minLevel?, compiledArtifactRef?, network?)` returns `{ verified, granted,
+  level }`: the disclosure level an attester granted a grantee on a payload
+  hash, read from the contract on chain. `verified` is true when a grant
+  exists and its level is at least `minLevel`, default 0. A revoked grant and
+  a retracted attestation leave no grant. The function needs no
+  `DisclosureGrants` row, no session and no crawler.
+- It is also served without credentials under `/odata/v4/midnight-verify`
+  when `NIGHTGATE_PUBLIC_VERIFY=true`, and an agent token may call it without
+  listing it in the grant.
+- `@odatano/nightgate-tx` 0.23.0: `ng.verifyDisclosure(params)`.
+
+### Changes
+
+- State verification decodes a contract's state once per change.
+  `verifyAttestationState`, `verifyPredicateState`, `verifyDisclosureState`
+  and the other state readers still ask the indexer on every call, and reuse
+  the decoded state while it returns the same bytes. Calls for one contract
+  that overlap share one indexer request. On a vault with 1000 records a
+  repeated check takes under a millisecond instead of about 0.6 s.
+  `NIGHTGATE_STATE_DECODE_CACHE_MB` (64) bounds the kept states by the size of
+  their serialized form, `0` decodes on every read.
+- New rate class `verify`: the three functions count 600 calls per minute per
+  caller on the service that needs credentials (`NIGHTGATE_VERIFY_RATE_LIMIT`,
+  or `rateLimits.verify` in the policy file). The first two had no limit
+  there. `getGrantUsage.limits.classes` lists the class. The public service
+  keeps `public-verify`.
+- A contract that is not a vault answers `verified: false` in all three
+  functions. Before, `verifyAttestationState` and `verifyPredicateState`
+  answered 500.
+
+### Fixes
+
+- Browser export: a contract call through the DApp connector failed with
+  `provider-cannot-declare-era`. `FetchZkConfigProvider` is now the provider
+  of `@midnight-ntwrk/midnight-js-fetch-zk-config-provider`. It names the
+  runtime version of the artifacts and checks every key and zkir against the
+  compiler manifest at `/zk-config/<contract>/compiler/contract-manifest.json`.
+  A host that passes `/zk-config` through must pass that file too.
+- `proving: 'wallet'` proves through `dappConnectorProofProvider` of
+  `@midnight-ntwrk/midnight-js-dapp-connector-proof-provider`, which resolves
+  the key locations a wallet asks for. `keyMaterialProvider()` resolves them
+  too.
+- `createNightgateConnectorProviders({ expectedManifestHash })` pins the
+  manifest by its SHA-256. `FetchZkConfigProvider` needs an absolute base URL
+  and takes the integrity options of midnight-js as a third parameter.
+
+No schema change, no circuit change.
+
 ## 0.43.1 - 2026-11-11
 
 ### Changes

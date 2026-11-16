@@ -6,7 +6,7 @@ import { setConfigWarnSink } from '../utils/config';
 import { createDispatcher, type WorkerRpcHandlers } from './worker-rpc/dispatch';
 import { readPredicateStateForContract, type ReadPredicateStateForContractArgs } from '../submission/predicate-state';
 import { readAttestationStateForContract, type ReadAttestationStateForContractArgs } from '../submission/attestation-state';
-import { readDisclosureGrants, type ReadDisclosureGrantsArgs } from '../submission/disclosure-grants';
+import { readDisclosureGrants, readDisclosureLevelForContract, type ReadDisclosureGrantsArgs, type ReadDisclosureLevelArgs } from '../submission/disclosure-grants';
 import { readHolderRegistration, type HolderRegistrationQuery } from '../submission/holder-registry';
 import { decodeLedgerPayload } from '../crawler/ledger-payload';
 
@@ -19,6 +19,7 @@ export const handlers: WorkerRpcHandlers = {
     readPredicateState: (args) => readPredicateStateForContract(args as ReadPredicateStateForContractArgs),
     readAttestationState: (args) => readAttestationStateForContract(args as ReadAttestationStateForContractArgs),
     readDisclosureGrants: (args) => readDisclosureGrants(args as ReadDisclosureGrantsArgs),
+    readDisclosureLevel: (args) => readDisclosureLevelForContract(args as ReadDisclosureLevelArgs),
     readHolderRegistration: (args) => readHolderRegistration(args as HolderRegistrationQuery),
     decodeLedgerPayload: (args) => {
         const { bytes, specVersion } = args as { bytes: Uint8Array; specVersion?: number | null };

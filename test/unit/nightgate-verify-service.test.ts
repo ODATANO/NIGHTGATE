@@ -95,13 +95,17 @@ describe('registerVerifyStateHandlers: one implementation behind both services',
 
     beforeEach(() => { attestationStateReader.mockClear(); });
 
-    test('a gate that refuses stops the handler before any state read', async () => {
+    test('a gate that refuses stops every handler before any state read', async () => {
+        const readers = { attestationStateReader: vi.fn(), predicateStateReader: vi.fn(), disclosureLevelReader: vi.fn() };
         const { srv, handlers } = stubService();
-        registerVerifyStateHandlers(srv, { attestationStateReader: attestationStateReader as any, contractResolver, gate: async (req: any) => { req.reject(404, 'off'); return false; } });
-        const req = makeReq(args);
-        expect(await handlers.verifyAttestationState(req)).toBeUndefined();
-        expect(req.reject).toHaveBeenCalledWith(404, 'off');
-        expect(attestationStateReader).not.toHaveBeenCalled();
+        registerVerifyStateHandlers(srv, { ...(readers as any), contractResolver, gate: async (req: any) => { req.reject(404, 'off'); return false; } });
+        expect(Object.keys(handlers).sort()).toEqual(['verifyAttestationState', 'verifyDisclosureState', 'verifyPredicateState']);
+        for (const name of Object.keys(handlers)) {
+            const req = makeReq({ ...args, grantee: 'd'.repeat(64), predicate: 'gte', fieldKey: 'f', threshold: 1 });
+            expect(await handlers[name](req)).toBeUndefined();
+            expect(req.reject).toHaveBeenCalledWith(404, 'off');
+        }
+        for (const reader of Object.values(readers)) expect(reader).not.toHaveBeenCalled();
     });
 
     test('with the gate open the public service returns exactly what the authenticated service returns', async () => {
@@ -118,6 +122,25 @@ describe('registerVerifyStateHandlers: one implementation behind both services',
             expect(a).toEqual({ verified: true, attested: true, contentRootOk: false, schemaOk: false, attesterId: 'att' });
             expect(attestationStateReader).toHaveBeenCalledTimes(2);
         } finally {
+            delete process.env.NIGHTGATE_INDEXER_HTTP_URL;
+            __resetConfigForTests();
+        }
+    });
+
+    test('a gate of its own replaces the rate class verify', async () => {
+        process.env.NIGHTGATE_VERIFY_RATE_LIMIT = '1';
+        process.env.NIGHTGATE_INDEXER_HTTP_URL = 'http://indexer.local/api/v1/graphql';
+        __resetConfigForTests();
+        try {
+            const { srv, handlers } = stubService();
+            registerVerifyStateHandlers(srv, { attestationStateReader: attestationStateReader as any, contractResolver, gate: async () => true });
+            for (let i = 0; i < 3; i++) {
+                const req = makeReq(args);
+                await handlers.verifyAttestationState(req);
+                expect(req.reject).not.toHaveBeenCalled();
+            }
+        } finally {
+            delete process.env.NIGHTGATE_VERIFY_RATE_LIMIT;
             delete process.env.NIGHTGATE_INDEXER_HTTP_URL;
             __resetConfigForTests();
         }

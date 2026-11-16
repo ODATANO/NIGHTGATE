@@ -20,19 +20,16 @@ export {
     type AttestationVaultWitnesses
 } from '@odatano/contract-kit';
 
-/** Loads a contract's proving files over HTTP from `/zk-config/<contract>`. */
-export class FetchZkConfigProvider {
-    constructor(baseUrl: string, fetchFn?: typeof fetch);
-    getProverKey(circuitId: string): Promise<Uint8Array>;
-    getVerifierKey(circuitId: string): Promise<Uint8Array>;
-    getZKIR(circuitId: string): Promise<Uint8Array>;
-    getVerifierKeys(circuitIds: string[]): Promise<[string, Uint8Array][]>;
-    get(circuitId: string): Promise<unknown>;
-    asKeyMaterialProvider(): {
-        getZKIR(loc: string): Promise<Uint8Array>;
-        getProverKey(loc: string): Promise<Uint8Array>;
-        getVerifierKey(loc: string): Promise<Uint8Array>;
-    };
+import {
+    FetchZkConfigProvider as MidnightFetchZkConfigProvider,
+    type FetchZkConfigProviderOptions
+} from '@midnight-ntwrk/midnight-js-fetch-zk-config-provider';
+import type { ZKConfigRegistry } from '@midnight-ntwrk/midnight-js-types';
+
+/** Loads a contract's proving files over HTTP from `/zk-config/<contract>` and checks each against the compiler's manifest there. */
+export class FetchZkConfigProvider extends MidnightFetchZkConfigProvider<string> {
+    /** `baseUrl` is absolute. `fetchFn` defaults to the platform's fetch. */
+    constructor(baseUrl: string, fetchFn?: typeof fetch, options?: Omit<FetchZkConfigProviderOptions, 'fetchFunc'>);
 }
 
 import type { InMemoryPrivateStateProvider } from '@odatano/contract-kit';
@@ -50,7 +47,7 @@ export interface ConnectorProvidersResult {
     config: { indexerUri: string; indexerWsUri: string; substrateNodeUri: string; networkId: string; proverServerUri?: string };
     walletKeys: { coinPublicKey?: string; encryptionPublicKey?: string; shieldedAddress?: string };
     zkConfigBaseUrl: string;
-    keyMaterialProvider(): { getZKIR(l: string): Promise<Uint8Array>; getProverKey(l: string): Promise<Uint8Array>; getVerifierKey(l: string): Promise<Uint8Array> };
+    keyMaterialProvider(): ReturnType<ZKConfigRegistry['asKeyMaterialProvider']>;
 }
 
 export function createNightgateConnectorProviders(opts: {
@@ -62,13 +59,14 @@ export function createNightgateConnectorProviders(opts: {
     fetchFn?: typeof fetch;
     webSocket?: any;
     proving?: ProvingModality;
+    expectedManifestHash?: string; // SHA-256 as 64 hex; optional; the compiler manifest the served files must match
 }): Promise<ConnectorProvidersResult>;
 
 /** Creates only the proof provider, for apps that set up the other providers themselves. */
 export function buildProofProvider(input: {
     proving?: ProvingModality;
     connector: any;
-    zkConfigProvider: FetchZkConfigProvider;
+    zkConfigProvider: MidnightFetchZkConfigProvider<string> | ZKConfigRegistry;
     proverServerUri?: string;
     proofMod: any;
 }): Promise<{ proofProvider: unknown | undefined; provingModality: AssembledProvingModality }>;

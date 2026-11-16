@@ -7,7 +7,7 @@ import { configMs, resolvedConfigSnapshot } from '../utils/config';
 import { WorkerRpcClient, type WorkerRpcStatus } from './worker-rpc/client';
 import type { ReadPredicateStateForContractArgs } from '../submission/predicate-state';
 import type { ReadAttestationStateForContractArgs, AttestationStateResult } from '../submission/attestation-state';
-import type { ReadDisclosureGrantsArgs, DisclosureGrantRecord } from '../submission/disclosure-grants';
+import type { ReadDisclosureGrantsArgs, DisclosureGrantRecord, ReadDisclosureLevelArgs } from '../submission/disclosure-grants';
 import type { HolderRegistrationQuery, HolderRegistration } from '../submission/holder-registry';
 import type { LedgerPayloadFacts } from '../crawler/ledger-payload';
 
@@ -49,6 +49,10 @@ export function readAttestationStateInWorker(args: ReadAttestationStateForContra
 
 export function readDisclosureGrantsInWorker(args: ReadDisclosureGrantsArgs): Promise<DisclosureGrantRecord[] | null> {
     return client.rpc('readDisclosureGrants', args);
+}
+
+export function readDisclosureLevelInWorker(args: ReadDisclosureLevelArgs): Promise<number | null> {
+    return client.rpc('readDisclosureLevel', args);
 }
 
 export function readHolderRegistrationInWorker(args: HolderRegistrationQuery): Promise<HolderRegistration | null> {

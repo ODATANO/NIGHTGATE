@@ -31,6 +31,8 @@ vi.mock('../../srv/submission/background-jobs', async () => ({
 }));
 
 import { registerSubmissionHandlers } from '../../srv/submission/handlers';
+import { __resetRateLimitersForTests, rateLimitedTotals } from '../../srv/utils/rate-classes';
+import { __resetConfigForTests } from '../../srv/utils/config';
 
 const WITH_PROVIDER = {
     network: 'preprod',
@@ -68,7 +70,54 @@ function makeDbWithSequence(rows: any[]) {
     return { run: vi.fn().mockImplementation(async () => queue.shift()) };
 }
 
-beforeEach(() => { mockRuntimeCfg = WITH_PROVIDER; });
+beforeEach(() => { mockRuntimeCfg = WITH_PROVIDER; __resetRateLimitersForTests(); });
+
+// ---- rate class verify ----------------------------------------------------
+
+describe('rate class verify', () => {
+    const GRANTEE = '2'.repeat(64);
+    const record = { contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD };
+
+    function setup() {
+        const srv = makeFakeService();
+        registerSubmissionHandlers(srv as any, { run: vi.fn() }, {
+            resolveContractImpl: vi.fn(async () => RESOLVED as any),
+            attestationStateReader: vi.fn(async () => null),
+            predicateStateReader: vi.fn(async () => null),
+            disclosureLevelReader: vi.fn(async () => null)
+        });
+        return srv;
+    }
+    afterEach(() => { delete process.env.NIGHTGATE_VERIFY_RATE_LIMIT; __resetConfigForTests(); });
+
+    test('the three state functions share one count per caller and refuse over it', async () => {
+        process.env.NIGHTGATE_VERIFY_RATE_LIMIT = '2';
+        __resetConfigForTests();
+        const srv = setup();
+        const refusedBefore = rateLimitedTotals().get('verify') ?? 0;
+
+        const first = makeReq(record);
+        await srv.handlers['verifyAttestationState'](first);
+        const second = makeReq({ ...record, grantee: GRANTEE });
+        await srv.handlers['verifyDisclosureState'](second);
+        expect(first.reject).not.toHaveBeenCalled();
+        expect(second.reject).not.toHaveBeenCalled();
+
+        const over = makeReq({ ...record, predicate: 'gte', fieldKey: 'co2', threshold: '1' });
+        expect(await srv.handlers['verifyPredicateState'](over)).toBeUndefined();
+        expect(over.reject).toHaveBeenCalledWith(429, expect.stringMatching(/verify: 2 per minute/));
+        expect(rateLimitedTotals().get('verify')).toBe(refusedBefore + 1);
+    });
+
+    test('the default leaves room for a page of checks', async () => {
+        const srv = setup();
+        for (let i = 0; i < 100; i++) {
+            const req = makeReq(record);
+            await srv.handlers['verifyAttestationState'](req);
+            expect(req.reject).not.toHaveBeenCalled();
+        }
+    });
+});
 
 // ---- verifyAttestationState ----------------------------------------------
 
@@ -415,6 +464,72 @@ describe('reindexDisclosures', () => {
         const r = await srv.handlers['reindexDisclosures'](req);
         expect(r).toMatchObject({ contractAddress: '0xzz', active: 0, deactivated: 0 });
         expect(reindexer).not.toHaveBeenCalled();
+    });
+});
+
+// ---- verifyDisclosureState ------------------------------------------------
+
+describe('verifyDisclosureState', () => {
+    const GRANTEE = 'b'.repeat(64);
+    const VALID = { contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, grantee: GRANTEE };
+
+    function setup(opts: any = {}) {
+        const srv = makeFakeService();
+        registerSubmissionHandlers(srv as any, { run: vi.fn() }, {
+            resolveContractImpl: vi.fn(async () => RESOLVED as any),
+            ...opts
+        });
+        return srv;
+    }
+
+    test.each(['contractAddress', 'attesterId', 'payloadHash', 'grantee'])('rejects a missing %s', async (name) => {
+        const reader = vi.fn();
+        const srv = setup({ disclosureLevelReader: reader });
+        const req = makeReq({ ...VALID, [name]: undefined });
+        await srv.handlers['verifyDisclosureState'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining(name));
+        expect(reader).not.toHaveBeenCalled();
+    });
+
+    test('a grant answers its level; the reader gets the ids lowercased', async () => {
+        const reader = vi.fn(async () => 1);
+        const srv = setup({ disclosureLevelReader: reader });
+        const r = await srv.handlers['verifyDisclosureState'](makeReq({ ...VALID, payloadHash: 'A'.repeat(64), grantee: 'B'.repeat(64) }));
+        expect(r).toEqual({ verified: true, granted: true, level: 1 });
+        expect(reader).toHaveBeenCalledWith(expect.objectContaining({
+            contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, grantee: GRANTEE, artifactPath: RESOLVED.artifactPath
+        }));
+    });
+
+    test('minLevel above the granted level: granted, not verified', async () => {
+        const srv = setup({ disclosureLevelReader: vi.fn(async () => 1) });
+        expect(await srv.handlers['verifyDisclosureState'](makeReq({ ...VALID, minLevel: 2 }))).toEqual({ verified: false, granted: true, level: 1 });
+        expect(await srv.handlers['verifyDisclosureState'](makeReq({ ...VALID, minLevel: 1 }))).toEqual({ verified: true, granted: true, level: 1 });
+    });
+
+    test('a level 0 grant is a grant', async () => {
+        const srv = setup({ disclosureLevelReader: vi.fn(async () => 0) });
+        expect(await srv.handlers['verifyDisclosureState'](makeReq(VALID))).toEqual({ verified: true, granted: true, level: 0 });
+    });
+
+    test('no grant answers the clean negative', async () => {
+        const srv = setup({ disclosureLevelReader: vi.fn(async () => null) });
+        expect(await srv.handlers['verifyDisclosureState'](makeReq(VALID))).toEqual({ verified: false, granted: false, level: null });
+    });
+
+    test('no live provider → clean negative, reader not called', async () => {
+        mockRuntimeCfg = NO_PROVIDER;
+        const reader = vi.fn();
+        const srv = setup({ disclosureLevelReader: reader });
+        expect(await srv.handlers['verifyDisclosureState'](makeReq(VALID))).toEqual({ verified: false, granted: false, level: null });
+        expect(reader).not.toHaveBeenCalled();
+    });
+
+    test('rejects an unknown network', async () => {
+        const srv = setup({ disclosureLevelReader: vi.fn() });
+        const req = makeReq({ ...VALID, network: 'moon' });
+        await srv.handlers['verifyDisclosureState'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/network must be one of/));
     });
 });
 

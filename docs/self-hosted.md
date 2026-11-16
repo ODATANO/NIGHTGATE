@@ -56,7 +56,7 @@ Probing and switching to your own indexer: [operations.md](operations.md).
 
 ## Verify calls on another network
 
-`verifyAttestationState` and `verifyPredicateState` take a `network` parameter. For a network other than the configured one, the indexer comes from `cds.requires.nightgate.networks.<network>.indexerHttpUrl`. Without that entry, mainnet and preprod answer "not verified" and preview uses its public indexer.
+`verifyAttestationState`, `verifyPredicateState` and `verifyDisclosureState` take a `network` parameter. For a network other than the configured one, the indexer comes from `cds.requires.nightgate.networks.<network>.indexerHttpUrl`. Without that entry, mainnet and preprod answer "not verified" and preview uses its public indexer.
 
 ## Library users
 

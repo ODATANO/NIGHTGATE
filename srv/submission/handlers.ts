@@ -14,6 +14,7 @@ import { reindexDisclosuresForContract } from './disclosure-indexer';
 import { readAttestationStateForContract } from './attestation-state';
 import { registerVerifyStateHandlers } from './verify-state';
 import { readPredicateStateForContract } from './predicate-state';
+import type { readDisclosureLevelForContract } from './disclosure-grants';
 import { readAttestationStateInWorker, readPredicateStateInWorker } from '../midnight/decode-worker-client';
 import { loadPureCircuitsFromRegistry } from './document-proof';
 import { tokenFactoryOps, type TokenFactoryOps } from './token-factory';
@@ -45,6 +46,7 @@ export interface SubmissionHandlersOptions {
     disclosureReindexer?: typeof reindexDisclosuresForContract;
     attestationStateReader?: typeof readAttestationStateForContract;
     predicateStateReader?: typeof readPredicateStateForContract;
+    disclosureLevelReader?: typeof readDisclosureLevelForContract;
     pureCircuitsLoader?: typeof loadPureCircuitsFromRegistry;
     tokenFactory?: TokenFactoryOps;
 }
@@ -119,5 +121,5 @@ export function registerSubmissionHandlers(
     registerDisclosureActions(ctx);
     registerSwapOfferActions(ctx);
     registerHolderDisclosureActions(ctx);
-    registerVerifyStateHandlers(srv, { contractResolver, attestationStateReader, predicateStateReader });
+    registerVerifyStateHandlers(srv, { contractResolver, attestationStateReader, predicateStateReader, disclosureLevelReader: options.disclosureLevelReader });
 }

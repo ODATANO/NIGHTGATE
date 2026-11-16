@@ -45,7 +45,7 @@ describe('readHolderRegistration', () => {
         const rt: any = await import('@midnight-ntwrk/compact-runtime');
         const contract = new artifact.Contract({});
         const initial = await contract.initialState(rt.createConstructorContext({}, '00'.repeat(32)));
-        providerState.state = { contractState: { era: 'v9', deserialize: () => ({ data: initial.currentContractState.data }) } };
+        providerState.state = { contractState: { era: 'v9', serialize: () => initial.currentContractState.serialize(), deserialize: () => ({ data: initial.currentContractState.data }) } };
         const miss = await readHolderRegistration({ contractAddress: 'cc'.repeat(32), tokenType: T, claimKey, artifactPath: ARTIFACT, contractProvidersConfig: {} as any });
         expect(miss).toEqual({ registered: false, entry });
         expect(providerState.queried).toEqual(['cc'.repeat(32)]);

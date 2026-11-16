@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.43.1",
+  "version": "0.44.0",
   "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -193,6 +193,8 @@
     "@midnight-ntwrk/compact-js": "3.0.0",
     "@midnight-ntwrk/compact-runtime": "0.21.0",
     "@midnight-ntwrk/midnight-js-contracts": "5.0.0",
+    "@midnight-ntwrk/midnight-js-dapp-connector-proof-provider": "5.0.0",
+    "@midnight-ntwrk/midnight-js-fetch-zk-config-provider": "5.0.0",
     "@midnight-ntwrk/midnight-js-http-client-proof-provider": "5.0.0",
     "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "5.0.0",
     "@midnight-ntwrk/midnight-js-level-private-state-provider": "5.0.0",

@@ -155,12 +155,14 @@ Declared in `srv/utils/config-table.ts`. The table is generated with `npm run co
 | `NIGHTGATE_SPONSOR_RATE_LIMIT` | int (min 1) | `120` | Rate class `sponsor`, calls per hour per principal that the pool or a pinned sponsor pays for: `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorSwap`, `mintFactoryToken`; default `120`. |
 | `NIGHTGATE_COMPUTE_RATE_LIMIT` | int (min 1) | `120` | Rate class `compute`, calls per hour per principal that compute or write without a transaction: `prepareDocumentProof`, `prepareMembershipSet`, `claimDisclosure`, `postSwapOffer`, `retireSwapOffer`, `reindexDisclosures` (per contract); default `120`. |
 | `NIGHTGATE_READ_RATE_LIMIT` | int (min 1) | `60` | Rate class `read`, calls per minute per principal: `listSwapOffers`, `getSwapOffer`, `getBoardStatus`, `getRuntimeInfo`, `getWalletBalance`, `getWalletSyncProgress`, `getSponsorPoolStatus`, `estimateSendNightFee`; default `60`. |
+| `NIGHTGATE_VERIFY_RATE_LIMIT` | int (min 1) | `600` | Rate class `verify`, calls per minute per principal: `verifyAttestationState`, `verifyPredicateState`, `verifyDisclosureState` on the service that needs credentials; default `600`. |
+| `NIGHTGATE_STATE_DECODE_CACHE_MB` | int (min 0, max 4096) | `64` | Decoded contract states kept for the state readers, as megabytes of their serialized form. A state is decoded once and reused until the indexer returns other bytes; `0` decodes on every read. Default `64`. |
 | `NIGHTGATE_WALLET_RATE_LIMIT` | int (min 1) | `10` | Rate class `wallet`, calls per minute per principal: `connectWallet`, `sendNight`, `registerForDustGeneration`, `deregisterFromDustGeneration`; default `10`. |
 | `NIGHTGATE_SIGNING_KEY_RATE_LIMIT` | int (min 1) | `10` | Rate class `signing`, `connectWalletForSigning` and `deriveWalletInfo` attempts per hour per principal; default `10`. |
 | `NIGHTGATE_ADMIN_RATE_LIMIT` | int (min 1) | `10` | Rate class `admin`, grant administration calls (`createAgentGrant`, `createAgentGrants`, `updateAgentGrant`, `rotateAgentGrantToken`, `revokeAgentGrant`) per hour per principal; default `10`. |
 | `NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR` | int (min 1) |  | `maxJobsPerHour` of a grant whose creation does not name it. Unset = no hourly budget. |
 | `NIGHTGATE_GRANT_DEFAULT_JOBS_PER_DAY` | int (min 1) |  | `maxJobsPerDay` of a grant whose creation does not name it. Unset = no daily budget. |
-| `NIGHTGATE_PUBLIC_VERIFY` | bool | `false` | Serve `verifyAttestationState` and `verifyPredicateState` without credentials under `/odata/v4/midnight-verify` (the image admits the path unauthenticated and answers CORS preflight with `*`); default off, the functions answer `404 PUBLIC_VERIFY_DISABLED`. |
+| `NIGHTGATE_PUBLIC_VERIFY` | bool | `false` | Serve `verifyAttestationState`, `verifyPredicateState` and `verifyDisclosureState` without credentials under `/odata/v4/midnight-verify` (the image admits the path unauthenticated and answers CORS preflight with `*`); default off, the functions answer `404 PUBLIC_VERIFY_DISABLED`. |
 | `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` | int (min 1) | `60` | Rate class `public-verify`, public verify calls per minute per client address; default `60`. |
 | `NIGHTGATE_CLAIM_LIFETIME_S` | int (min 60) | `31536000` | Default claim lifetime in seconds for the issue* actions when the caller passes no `validUntil`; default one year, the vault caps a claim at five years ahead. |
 | `NIGHTGATE_FEE_SPONSOR_SESSION` | list |  | Comma list of platform fee-sponsor session ids (the pool); overrides `feeSponsorSessions`. |
@@ -371,7 +373,7 @@ import { initialize, shutdown, getStatus, DEFAULT_NETWORK, DEFAULT_NODE_URLS, DE
 | `NightgateIndexerService` | `/odata/v4/midnight-indexer` | `SyncState`, `ReorgLog`, health, metrics, crawler control |
 | `NightgateAnalyticsService` | `/odata/v4/midnight-analytics` | `BlockStatistics`, `ContractStatistics` |
 | `NightgateAdminService` | `/odata/v4/midnight-admin` | Sessions, jobs, roles, swap offers, learned token types |
-| `NightgateVerifyService` | `/odata/v4/midnight-verify` | `verifyAttestationState`, `verifyPredicateState` without credentials when `NIGHTGATE_PUBLIC_VERIFY=true` |
+| `NightgateVerifyService` | `/odata/v4/midnight-verify` | `verifyAttestationState`, `verifyPredicateState`, `verifyDisclosureState` without credentials when `NIGHTGATE_PUBLIC_VERIFY=true` |
 
 Signatures and examples: [actions.md](actions.md).
 

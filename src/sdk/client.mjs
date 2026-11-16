@@ -331,6 +331,7 @@ export function connect(opts) {
         // ---- checks that read the chain directly. No wallet. ----
         verifyAttestation: (p) => callFunction('verifyAttestationState', p),
         verifyPredicate: (p) => callFunction('verifyPredicateState', p),
+        verifyDisclosure: (p) => callFunction('verifyDisclosureState', p),
         verifyPredicateAttestation: (p) => callFunction('verifyPredicateAttestation', p),
         verifyDocument: (p) => callFunction('verifyDocument', p),
         deriveTokenType: (p) => callFunction('deriveTokenType', p),

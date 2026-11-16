@@ -1,7 +1,8 @@
 // Sets up the midnight-js providers a browser app needs to build and prove a contract call.
-// The SDK packages load only when used, so importing `@odatano/nightgate/browser` stays cheap.
+// The indexer, proof and wallet proving packages load only when used.
 // Paying the fee and submitting the transaction are left to the app.
 
+import { ZKConfigRegistry } from '@midnight-ntwrk/midnight-js-types';
 import { FetchZkConfigProvider } from './zk-config.mjs';
 import { InMemoryPrivateStateProvider } from './private-state.mjs';
 
@@ -17,7 +18,7 @@ export function resolveManifestUrl(url, manifestUrl) {
 /** Builds the providers for one contract from a connected wallet and the parsed `/contract-manifest`.
  *  Pass `manifestUrl` when the manifest has relative URLs and the app runs on another origin. */
 export async function createNightgateConnectorProviders(opts = {}) {
-    const { connector, manifest, manifestUrl, contract, fetchFn, webSocket, proving = 'server' } = opts;
+    const { connector, manifest, manifestUrl, contract, fetchFn, webSocket, proving = 'server', expectedManifestHash } = opts;
     if (!connector) throw new Error('createNightgateConnectorProviders: connector is required');
     if (!contract) throw new Error('createNightgateConnectorProviders: contract is required');
 
@@ -35,7 +36,9 @@ export async function createNightgateConnectorProviders(opts = {}) {
         import('@midnight-ntwrk/midnight-js-http-client-proof-provider')
     ]);
 
-    const zkConfigProvider = new FetchZkConfigProvider(entry.zkConfigBaseUrl, fetchFn);
+    const zkConfigProvider = new FetchZkConfigProvider(entry.zkConfigBaseUrl, fetchFn, expectedManifestHash ? { expectedManifestHash } : {});
+    // midnight-js names a circuit by contract address and verifier key hash. The registry finds its files.
+    let registry;
     const publicDataProvider = indexerMod.indexerPublicDataProvider(cfg.indexerUri, cfg.indexerWsUri, WS);
     const { proofProvider, provingModality } = await buildProofProvider({
         proving,
@@ -65,7 +68,7 @@ export async function createNightgateConnectorProviders(opts = {}) {
         },
         zkConfigBaseUrl: entry.zkConfigBaseUrl,
         /** Key source for wallet proving: `connector.getProvingProvider(providers.keyMaterialProvider())`. */
-        keyMaterialProvider: () => zkConfigProvider.asKeyMaterialProvider()
+        keyMaterialProvider: () => (registry ??= new ZKConfigRegistry([zkConfigProvider])).asKeyMaterialProvider()
     };
 }
 
@@ -85,10 +88,13 @@ export async function buildProofProvider({ proving = 'server', connector, zkConf
     }
 
     if (connectorCanProve && (proving === 'wallet' || proving === 'auto')) {
-        // Loaded only here, so apps that prove on a server do not load the ledger.
-        const { createLedger9ProofProvider } = await import('@midnight-ntwrk/midnight-js-types');
-        const walletProver = await connector.getProvingProvider(zkConfigProvider.asKeyMaterialProvider());
-        return { provingModality: 'wallet', proofProvider: createLedger9ProofProvider(walletProver) };
+        // Loaded only here: proving on a server needs neither package.
+        const [{ dappConnectorProofProvider }, { CostModel }] = await Promise.all([
+            import('@midnight-ntwrk/midnight-js-dapp-connector-proof-provider'),
+            import('@midnight-ntwrk/midnight-js-protocol/v9')
+        ]);
+        const proofProvider = await dappConnectorProofProvider(connector, zkConfigProvider, CostModel.initialCostModel());
+        return { provingModality: 'wallet', proofProvider };
     }
 
     if (proverServerUri) {

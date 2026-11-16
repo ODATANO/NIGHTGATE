@@ -14,6 +14,7 @@ const HEX64_PARAMS: Record<string, string[]> = {
     'NightgateService.issueDocumentDiffAttestation': ['payloadHashA', 'payloadHashB', 'attesterIdA', 'attesterIdB', 'contentRootA', 'contentRootB', 'schemaId'],
     'NightgateService.verifyAttestationState': ['attesterId', 'payloadHash', 'documentId', 'contentRoot', 'schemaId'],
     'NightgateService.verifyPredicateState': ['attesterId', 'payloadHash', 'fieldKey', 'expectedDigest', 'setRoot', 'payloadHashB', 'attesterIdB'],
+    'NightgateService.verifyDisclosureState': ['attesterId', 'payloadHash', 'grantee'],
     'NightgateService.anchorDocument': ['sha256'],
     'NightgateService.verifyDocument': ['providedSha256'],
     'NightgateService.grantDisclosure': ['payloadHash', 'grantee'],
@@ -29,7 +30,8 @@ const HEX64_PARAMS: Record<string, string[]> = {
     'NightgateService.prepareMembershipSet': ['valueDigest'],
     'NightgateService.attestAgentOutput': ['inputHash', 'outputHash', 'policyHash'],
     'NightgateVerifyService.verifyAttestationState': ['attesterId', 'payloadHash', 'documentId', 'contentRoot', 'schemaId'],
-    'NightgateVerifyService.verifyPredicateState': ['attesterId', 'payloadHash', 'fieldKey', 'expectedDigest', 'setRoot', 'payloadHashB', 'attesterIdB']
+    'NightgateVerifyService.verifyPredicateState': ['attesterId', 'payloadHash', 'fieldKey', 'expectedDigest', 'setRoot', 'payloadHashB', 'attesterIdB'],
+    'NightgateVerifyService.verifyDisclosureState': ['attesterId', 'payloadHash', 'grantee']
 };
 
 /** `cds.validate` exists at runtime but is missing from the CAP type declarations. */

@@ -58,6 +58,7 @@ vi.mock('node:worker_threads', async () => {
 
 import {
     readAttestationStateInWorker,
+    readDisclosureLevelInWorker,
     decodeLedgerPayloadInWorker,
     getDecodeWorkerStatus,
     stopDecodeWorker,
@@ -95,6 +96,13 @@ describe('decode worker client', () => {
         expect(workers[0].opts.workerData).toHaveProperty('config');
         expect(workers[0].sent.at(-1)).toEqual({ method: 'readAttestationState', args: ATTEST_ARGS });
         expect(getDecodeWorkerStatus().running).toBe(true);
+    });
+
+    it('sends a disclosure read under its own method', async () => {
+        defaultRespond = () => ({ ok: true, result: 2 });
+        const args = { ...ATTEST_ARGS, grantee: 'cc'.repeat(32) };
+        await expect(readDisclosureLevelInWorker(args)).resolves.toBe(2);
+        expect(workers[0].sent.at(-1)).toEqual({ method: 'readDisclosureLevel', args });
     });
 
     it('rebuilds a coded error and keeps the name of a plain one', async () => {

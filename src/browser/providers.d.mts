@@ -2,12 +2,10 @@
  * Types for providers.mjs, so a direct import of that file is typed.
  * TypeScript only finds types for an `.mjs` file in a `.d.mts` file next to it.
  */
-// This interface is written out here on purpose. zk-config.mjs ships without types,
-// so importing its type would fail for users who type-check installed packages.
-/** The part of a zk-config provider this module uses. */
-export interface KeyMaterialSource {
-    asKeyMaterialProvider(): unknown;
-}
+import type { ZKConfigProvider, ZKConfigRegistry } from '@midnight-ntwrk/midnight-js-types';
+
+/** Where the proof provider finds a circuit's files: one contract's provider, or a registry of several. */
+export type KeyMaterialSource = ZKConfigProvider<string> | ZKConfigRegistry;
 
 /**
  * Where proofs are made.
@@ -28,6 +26,7 @@ export function createNightgateConnectorProviders(opts: {
     fetchFn?: typeof fetch;
     webSocket?: any;
     proving?: ProvingModality;
+    expectedManifestHash?: string; // SHA-256 as 64 hex; optional; the compiler manifest the served files must match
 }): Promise<Record<string, any> & { provingModality: AssembledProvingModality }>;
 
 export function buildProofProvider(input: {

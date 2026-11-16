@@ -41,6 +41,12 @@ export interface ContractArtifact<L> {
     pureCircuits: Record<string, (...args: unknown[]) => unknown>;
 }
 
+/** True when compact-runtime refused the read. On a state lookup that means the state belongs to another contract than the artifact. */
+export async function refusedByRuntime(err: unknown): Promise<boolean> {
+    const { CompactError } = await import('@midnight-ntwrk/compact-runtime');
+    return CompactError.is(err);
+}
+
 export interface ReadPredicateStateForContractArgs {
     contractAddress: string;
     /** The attester under whose entry for `payloadHash` the claim is stored. */
@@ -71,18 +77,28 @@ export interface ReadPredicateStateForContractArgs {
     nowSeconds?: number;
 }
 
-/**
- * Recomputes the claim key from the document root on chain right now, then looks it up. A claim made against an older root of the same document is not found.
- */
+/** Recomputes the claim key from the document root on chain right now, then looks it up. A claim made against an older root of the same document is not found.
+ *  Null without contract state and for a contract that is not a vault. */
 export async function readPredicateStateForContract(
     args: ReadPredicateStateForContractArgs
 ): Promise<boolean | null> {
+    try {
+        return await claimStateOf(args);
+    } catch (err) {
+        if (await refusedByRuntime(err)) return null;
+        throw err;
+    }
+}
+
+async function claimStateOf(args: ReadPredicateStateForContractArgs): Promise<boolean | null> {
     const publicData = await buildPublicDataProvider(args.contractProvidersConfig);
     const artifact = await importArtifact(args.artifactPath, args.artifactDigest) as ContractArtifact<PredicateLedger>;
 
     const state = await queryLedger9ContractState(publicData, args.contractAddress.toLowerCase());
     if (!state) return null;
     const led = artifact.ledger(state.data);
+    // An artifact without these maps is not a vault.
+    if (!(led as Partial<PredicateLedger>).content_anchors || !(led as Partial<PredicateLedger>).claims) return null;
 
     const recordKeyA = await computeRecordKey(args.attesterId, args.payloadHash);
     const anchorA = anchorOf(led, recordKeyA);

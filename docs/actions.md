@@ -68,6 +68,7 @@ Every limited call belongs to one rate class with a fixed window and one count. 
 | `sponsor` | hour | 120 | caller | `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorSwap`, `sponsorTransfer`, `mintFactoryToken` |
 | `compute` | hour | 120 | caller | `prepareDocumentProof`, `prepareMembershipSet`, `claimDisclosure`, `grantDisclosureToHolders`, `revokeHolderDisclosure`, `postSwapOffer`, `retireSwapOffer`, `reindexDisclosures` (per contract) |
 | `read` | minute | 60 | caller | `listSwapOffers`, `getSwapOffer`, `getBoardStatus`, `getReceiptKey`, `verifyDocument`, `verifyPredicateAttestation`, `getRuntimeInfo`, `getWalletBalance`, `getWalletSyncProgress`, `getSponsorPoolStatus`, `estimateSendNightFee` |
+| `verify` | minute | 600 | caller | `verifyAttestationState`, `verifyPredicateState`, `verifyDisclosureState` |
 | `wallet` | minute | 10 | caller | `connectWallet`, `sendNight`, `registerForDustGeneration`, `deregisterFromDustGeneration` |
 | `signing` | hour | 10 | caller | `connectWalletForSigning`, `deriveWalletInfo` |
 | `admin` | hour | 10 | caller | `createAgentGrant`, `createAgentGrants`, `updateAgentGrant`, `rotateAgentGrantToken`, `revokeAgentGrant` |
@@ -391,9 +392,9 @@ Proves at least `k` aligned slots differ, without revealing which. A change of v
 
 ## Crawler-free state verification
 
-Both functions read live contract state from the indexer. They need no crawler, transaction hash or server row. Absent state or no live provider is `verified: false`, not a 5xx. `network` reads another configured network (`cds.requires.nightgate.networks.<network>`), unknown is 400.
+The three functions read live contract state from the indexer. They need no crawler, transaction hash or server row. Absent state, no live provider and a contract that is not a vault are `verified: false`, not a 5xx. Every call asks the indexer; a contract's state is decoded once and reused until the indexer returns other bytes. Rate class `verify`. `network` reads another configured network (`cds.requires.nightgate.networks.<network>`), unknown is 400.
 
-**Public lane.** With `NIGHTGATE_PUBLIC_VERIFY=true` both functions answer without credentials under `/odata/v4/midnight-verify`, with the same signatures and CORS `*`. Off, they answer 404 `PUBLIC_VERIFY_DISABLED`. Rate class `public-verify`. Every call needs contract, payload and claim coordinates, so nothing is enumerable.
+**Public lane.** With `NIGHTGATE_PUBLIC_VERIFY=true` they answer without credentials under `/odata/v4/midnight-verify`, with the same signatures and CORS `*`. Off, they answer 404 `PUBLIC_VERIFY_DISABLED`. Rate class `public-verify`. Every call needs contract, payload and claim coordinates, so nothing is enumerable.
 
 Everything checked here is recomputable from public data: the claim key is a `persistentHash` over the tagged claim struct, with `recordKey = persistentHash({ tag 21, attesterId, payloadHash })` and root and schema id from `content_anchors`. The Compact source ships in `@odatano/contract-attestation-vault`.
 
@@ -404,6 +405,10 @@ Checks the attester's record of `payloadHash` and, when given, its content root 
 ### `verifyPredicateState(contractAddress, attesterId, payloadHash, fieldKey?, predicate, threshold?, expectedDigest?, setRoot?, payloadHashB?, attesterIdB?, allowedMask?, k?, compiledArtifactRef?, network?) → { verified, proven }` (function)
 
 Recomputes the claim key from the given coordinates and checks `claims` for an unexpired entry. The inputs must be exactly those of the proof, including the A and B order. The key embeds the record's current anchor, so a claim under a former anchor verifies false. Anyone holding the opening may prove the same claim again and extend its expiry. The attester withdraws claims by retracting the record.
+
+### `verifyDisclosureState(contractAddress, attesterId, payloadHash, grantee, minLevel?, compiledArtifactRef?, network?) → { verified, granted, level }` (function)
+
+Reads the grantee's entry in `disclosures` under the attester's record of `payloadHash`. `level` is 0 public, 1 legitimate interest, 2 authority, and null without a grant. `verified` is true when a grant exists and its level is at least `minLevel`, default 0. A revoked grant and a retracted attestation leave no grant. Needs no `DisclosureGrants` row, so it also answers for a grant submitted outside this server.
 
 ## Disclosure grants
 

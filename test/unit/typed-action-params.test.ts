@@ -47,6 +47,13 @@ describe('typed action parameters are validated by CAP', () => {
         expect(r.data.error.target).toBe('predicate');
     });
 
+    test('a function parameter outside its range is refused', async () => {
+        const r = await cap.axios.get(`${API}/verifyDisclosureState(contractAddress='0xVAULT',attesterId='${H('a')}',payloadHash='${H('b')}',grantee='${H('c')}',minLevel=3)`, AUTH);
+        expect(r.status).toBe(400);
+        expect(r.data.error.code).toBe('ASSERT_RANGE');
+        expect(r.data.error.target).toBe('minLevel');
+    });
+
     test('a parameter name of the former JSON-string API is refused', async () => {
         const r = await cap.axios.post(`${API}/prepareMembershipSet`, { allowedValuesJson: '["EEA"]' }, AUTH);
         expect(r.status).toBe(400);

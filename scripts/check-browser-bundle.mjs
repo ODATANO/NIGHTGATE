@@ -115,12 +115,26 @@ try {
     catch (e) { vac32AllOnes = /vacuous/.test(String(e && e.message)); }
     if (!vac32AllOnes) fail('slotWidth 32 all-ones mask must be rejected as vacuous');
 
-    // FetchZkConfigProvider with an injected fetch (no network).
-    const fakeFetch = async (url) => ({ ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer });
+    // FetchZkConfigProvider with an injected fetch (no network): the manifest names the runtime version and certifies the key.
+    const { createHash } = await import('node:crypto');
+    const proverKey = new Uint8Array([1, 2, 3]);
+    const zkManifest = JSON.stringify({
+        'manifest-version': '1', 'runtime-version': '0.21.0',
+        keys: { type: 'directory', 'revokeDisclosure.prover': { type: 'file', size: 3, hash: createHash('sha256').update(proverKey).digest('hex') } }
+    });
+    const fakeFetch = async (url) => {
+        const manifest = String(url).endsWith('compiler/contract-manifest.json');
+        const bytes = manifest ? new TextEncoder().encode(zkManifest) : proverKey;
+        return {
+            ok: true, status: 200, statusText: 'OK',
+            headers: { get: () => (manifest ? 'application/json' : 'application/octet-stream') },
+            arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+        };
+    };
     const zk = new mod.FetchZkConfigProvider('http://x/zk-config/attestation-vault', fakeFetch);
     const pk = await zk.getProverKey('revokeDisclosure');
     if (!(pk instanceof Uint8Array) || pk.length !== 3) fail('FetchZkConfigProvider.getProverKey wrong shape');
-    if (typeof zk.asKeyMaterialProvider().getProverKey !== 'function') fail('asKeyMaterialProvider missing');
+    if ((await zk.getArtifactRuntimeVersion()) !== '0.21.0') fail('FetchZkConfigProvider does not name the runtime version of the served manifest');
 
     // InMemoryPrivateStateProvider basic ops.
     const psp = new mod.InMemoryPrivateStateProvider();

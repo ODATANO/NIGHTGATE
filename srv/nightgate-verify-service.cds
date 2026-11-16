@@ -1,6 +1,6 @@
 using { Hex64 } from '../db/types';
 
-/** The two verify functions of the Nightgate service, without login.
+/** The verify functions of the Nightgate service, without login.
  * Off by default. Set `NIGHTGATE_PUBLIC_VERIFY=true` to enable it.
  * Requests per client address are limited by `NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT` per minute. */
 @path    : '/odata/v4/midnight-verify'
@@ -50,5 +50,22 @@ service NightgateVerifyService {
     )                                                                 returns {
         verified : Boolean;
         proven   : Boolean; // the proof is recorded on chain as true
+    };
+
+    /** Checks on chain which disclosure level an attester has granted to `grantee` on a payload hash.
+     * A revoked grant and a retracted attestation leave no grant.
+     * If nothing is found, the result is `verified: false`, not an error. */
+    function verifyDisclosureState(contractAddress: String,
+                                   attesterId: Hex64,
+                                   payloadHash: Hex64,
+                                   grantee: Hex64,
+                                   @assert.range: [0, 2]
+                                   minLevel: Integer, // optional, default 0; the lowest level that counts as verified
+                                   compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                   network: String // optional, default the server's network; e.g. 'preview'
+    )                                                                 returns {
+        verified : Boolean;
+        granted  : Boolean; // a grant for the grantee is recorded on chain
+        level    : Integer; // 0 public, 1 legitimate interest, 2 authority; null = no grant
     };
 }

@@ -3,12 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import cds, { type ActionRequest } from '@sap/cds';
-import { verifyAttestationState, verifyPredicateState } from '#cds-models/NightgateService';
+import { verifyAttestationState, verifyDisclosureState, verifyPredicateState } from '#cds-models/NightgateService';
 import { resolveContract, ContractNotRegisteredError, getContractRegistration, slotWidthOf } from './contract-registry';
 import { CoercionError } from './arg-coercion';
 import type { readAttestationStateForContract } from './attestation-state';
 import type { readPredicateStateForContract } from './predicate-state';
-import { readAttestationStateInWorker, readPredicateStateInWorker } from '../midnight/decode-worker-client';
+import type { readDisclosureLevelForContract } from './disclosure-grants';
+import { readAttestationStateInWorker, readDisclosureLevelInWorker, readPredicateStateInWorker } from '../midnight/decode-worker-client';
+import { checkRateClass } from '../utils/rate-classes';
 import type { ContractProvidersConfig } from '../midnight/providers';
 import {
     resolveNightgateRuntimeConfig,
@@ -109,7 +111,8 @@ export interface VerifyStateDeps {
     contractResolver?: typeof resolveContract;
     attestationStateReader?: typeof readAttestationStateForContract;
     predicateStateReader?: typeof readPredicateStateForContract;
-    /** Runs first; false means the gate already rejected the request. */
+    disclosureLevelReader?: typeof readDisclosureLevelForContract;
+    /** Runs first; false means the gate already rejected the request. Default: the rate class `verify`. */
     gate?: (req: ActionRequest<unknown, unknown>) => Promise<boolean> | boolean;
 }
 
@@ -123,15 +126,16 @@ async function runVerify<T>(req: ActionRequest<unknown, unknown>, op: () => Prom
     }
 }
 
-/** Register both state-verification functions on `srv`. */
+/** Registers the state-verification functions on `srv`. */
 export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: VerifyStateDeps = {}): void {
     const contractResolver = deps.contractResolver ?? resolveContract;
     const attestationStateReader = deps.attestationStateReader ?? readAttestationStateInWorker;
     const predicateStateReader = deps.predicateStateReader ?? readPredicateStateInWorker;
-    const gate = deps.gate;
+    const disclosureLevelReader = deps.disclosureLevelReader ?? readDisclosureLevelInWorker;
+    const gate = deps.gate ?? ((req: ActionRequest<unknown, unknown>) => checkRateClass('verify', 'verify', req));
 
     srv.on(verifyAttestationState, async (req) => {
-        if (gate && !(await gate(req))) return;
+        if (!(await gate(req))) return;
         const data = req.data;
 
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
@@ -182,7 +186,7 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
     });
 
     srv.on(verifyPredicateState, async (req) => {
-        if (gate && !(await gate(req))) return;
+        if (!(await gate(req))) return;
         const data = req.data;
 
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
@@ -273,6 +277,42 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
             });
 
             return { verified: proven === true, proven: proven === true };
+        });
+    });
+
+    srv.on(verifyDisclosureState, async (req) => {
+        if (!(await gate(req))) return;
+        const data = req.data;
+
+        if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
+        if (!data.attesterId) return req.reject(400, 'attesterId is required (the attester whose record carries the grant)');
+        if (!data.payloadHash) return req.reject(400, 'payloadHash is required');
+        if (!data.grantee) return req.reject(400, 'grantee is required');
+
+        const netParsed = parseVerifyNetworkOverride(data.network, req);
+        if (!netParsed.ok) return;
+
+        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const minLevel = data.minLevel ?? 0;
+
+        const NEGATIVE = { verified: false, granted: false, level: null };
+
+        if (!liveProviderConfigured(netParsed.network)) return NEGATIVE;
+
+        return runVerify(req, async () => {
+            const resolved = await contractResolver(compiledRef);
+            const level = await disclosureLevelReader({
+                contractAddress: data.contractAddress!,
+                attesterId: data.attesterId!.toLowerCase(),
+                payloadHash: data.payloadHash!.toLowerCase(),
+                grantee: data.grantee!.toLowerCase(),
+                artifactPath: resolved.artifactPath,
+                artifactDigest: resolved.artifactDigest,
+                contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
+            });
+
+            if (level === null) return NEGATIVE;
+            return { verified: level >= minLevel, granted: true, level };
         });
     });
 }

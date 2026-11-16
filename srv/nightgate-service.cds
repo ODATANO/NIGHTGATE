@@ -578,6 +578,23 @@ service NightgateService {
         proven   : Boolean; // the proof is recorded on chain as true
     };
 
+    /** Checks on chain which disclosure level an attester has granted to `grantee` on a payload hash.
+     * A revoked grant and a retracted attestation leave no grant.
+     * If nothing is found, the result is `verified: false`, not an error. */
+    function verifyDisclosureState(contractAddress: String,
+                                   attesterId: Hex64,
+                                   payloadHash: Hex64,
+                                   grantee: Hex64,
+                                   @assert.range: [0, 2]
+                                   minLevel: Integer, // optional, default 0; the lowest level that counts as verified
+                                   compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                   network: String // optional, default the server's network; e.g. 'preview'
+    )                                                                         returns {
+        verified : Boolean;
+        granted  : Boolean; // a grant for the grantee is recorded on chain
+        level    : Integer; // 0 public, 1 legitimate interest, 2 authority; null = no grant
+    };
+
     // ---- Disclosure ----
 
     /** Disclosure grants read from the contract on chain. `level` is 0 public, 1 legitimate interest, 2 authority. */

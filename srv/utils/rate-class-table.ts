@@ -4,7 +4,7 @@
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
 
-export const RATE_CLASS_NAMES = ['prove', 'deploy', 'sponsor', 'compute', 'read', 'wallet', 'signing', 'admin', 'public-verify'] as const;
+export const RATE_CLASS_NAMES = ['prove', 'deploy', 'sponsor', 'compute', 'read', 'verify', 'wallet', 'signing', 'admin', 'public-verify'] as const;
 export type RateClass = typeof RATE_CLASS_NAMES[number];
 
 export interface RateClassSpec {
@@ -24,6 +24,7 @@ export const RATE_CLASSES: Readonly<Record<RateClass, RateClassSpec>> = {
     sponsor: { windowMs: HOUR, envKey: 'NIGHTGATE_SPONSOR_RATE_LIMIT', grantVisible: true, doc: 'calls the pool or a pinned sponsor pays for: `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorSwap`, `mintFactoryToken`; per principal' },
     compute: { windowMs: HOUR, envKey: 'NIGHTGATE_COMPUTE_RATE_LIMIT', grantVisible: true, doc: 'calls that compute or write on the server without a transaction: `prepareDocumentProof`, `prepareMembershipSet`, `claimDisclosure`, `grantDisclosureToHolders`, `revokeHolderDisclosure`, `postSwapOffer`, `retireSwapOffer`, `reindexDisclosures` (per contract); per principal' },
     read: { windowMs: MINUTE, envKey: 'NIGHTGATE_READ_RATE_LIMIT', grantVisible: true, doc: 'read functions: the offer board, `getBoardStatus`, `verifyDocument`, `verifyPredicateAttestation`, `getRuntimeInfo`, wallet balance, sync progress, sponsor pool status, fee estimate; per principal' },
+    verify: { windowMs: MINUTE, envKey: 'NIGHTGATE_VERIFY_RATE_LIMIT', grantVisible: true, doc: 'state verification with credentials: `verifyAttestationState`, `verifyPredicateState`, `verifyDisclosureState`; per principal' },
     wallet: { windowMs: MINUTE, envKey: 'NIGHTGATE_WALLET_RATE_LIMIT', grantVisible: false, doc: 'wallet lifecycle: `connectWallet`, `sendNight`, dust registration; per principal, never grantable' },
     signing: { windowMs: HOUR, envKey: 'NIGHTGATE_SIGNING_KEY_RATE_LIMIT', grantVisible: false, doc: '`connectWalletForSigning` and `deriveWalletInfo`: a guard against guessing mnemonics; per principal' },
     admin: { windowMs: HOUR, envKey: 'NIGHTGATE_ADMIN_RATE_LIMIT', grantVisible: false, doc: 'grant administration: create, update, rotate, revoke; per principal' },

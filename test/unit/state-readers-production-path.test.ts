@@ -16,14 +16,16 @@
 import path from 'node:path';
 
 const queryContractState = vi.hoisted(() => (vi.fn()));
+const reads = vi.hoisted(() => ({ count: 0 }));
 // The SDK hands over a serialized state tagged with the ledger era that wrote it. The tests script the decoded ledger 9 data.
+// Every read has bytes of its own, so no decoded state is reused between tests.
 const buildPublicDataProvider = vi.hoisted(() => (vi.fn(async () => ({
     queryContractState: async (address: string) => {
         const state = await queryContractState(address);
         if (!state) return state;
         if (state.era) return { contractState: { era: state.era, deserialize: () => { throw new Error('not decodable'); } } };
         const decoded = 'data' in state ? state : { data: state };
-        return { contractState: { era: 'v9', deserialize: () => decoded } };
+        return { contractState: { era: 'v9', serialize: () => new TextEncoder().encode(`read ${++reads.count}`), deserialize: () => decoded } };
     }
 }))));
 

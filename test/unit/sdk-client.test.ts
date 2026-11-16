@@ -41,6 +41,14 @@ describe('connect: encoding', () => {
         expect(calls[0].init.method).toBe('GET');
     });
 
+    test('verifyDisclosure reads verifyDisclosureState', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([{ body: { verified: true, granted: true, level: 1 } }]);
+        const ng = connect({ baseUrl: 'https://ng.example/', fetchFn: fn as any });
+        expect(await ng.verifyDisclosure({ contractAddress: 'c', attesterId: 'a', payloadHash: 'p', grantee: 'g', minLevel: 1 })).toEqual({ verified: true, granted: true, level: 1 });
+        expect(calls[0].url).toBe("https://ng.example/odata/v4/midnight/verifyDisclosureState(contractAddress='c',attesterId='a',payloadHash='p',grantee='g',minLevel=1)");
+    });
+
     test('actions POST a JSON body; bigint becomes a string; undefined dropped', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([{ body: { jobId: null } }]);

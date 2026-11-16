@@ -99,6 +99,7 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     'verifyDocument',
     'verifyAttestationState',
     'verifyPredicateState',
+    'verifyDisclosureState',
     'verifyPredicateAttestation',
     'prepareDocumentProof', // only computes, writes nothing
     'prepareMembershipSet', // only computes, writes nothing

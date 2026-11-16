@@ -3,7 +3,7 @@
 import { hexToBytes } from '../utils/hex';
 import { importArtifact } from './artifact-import';
 import { buildPublicDataProvider, queryLedger9ContractState } from '../midnight/public-data-provider';
-import { computeRecordKey, type ContractArtifact } from './predicate-state';
+import { computeRecordKey, refusedByRuntime, type ContractArtifact } from './predicate-state';
 
 function hex(b: Uint8Array): string {
     return Buffer.from(b).toString('hex');
@@ -66,6 +66,8 @@ export async function readAttestationState(
     if (!state) return null;
 
     const led = deps.ledger(state.data ?? state);
+    // An artifact without the map is not a vault.
+    if (!(led as Partial<AttestationLedger>).attestations) return null;
 
     let recordKey = '';
     if (deps.documentId) {
@@ -122,6 +124,7 @@ export interface ReadAttestationStateForContractArgs {
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
 }
 
+/** Null without contract state and for a contract that is not a vault. */
 export async function readAttestationStateForContract(
     args: ReadAttestationStateForContractArgs
 ): Promise<AttestationStateResult | null> {
@@ -137,5 +140,8 @@ export async function readAttestationStateForContract(
         schemaId: args.schemaId,
         ledger: artifact.ledger,
         queryContractState: (addr: string) => queryLedger9ContractState(publicData, addr)
+    }).catch(async (err: unknown) => {
+        if (await refusedByRuntime(err)) return null;
+        throw err;
     });
 }

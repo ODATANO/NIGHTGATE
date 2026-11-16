@@ -132,6 +132,8 @@ export interface NightgateClient {
     // checks that read the chain directly
     verifyAttestation(p: Params): Promise<any>;
     verifyPredicate(p: Params): Promise<any>;
+    /** The disclosure level an attester granted a grantee on a payload hash. `level` is null without a grant. */
+    verifyDisclosure(p: Params): Promise<{ verified: boolean; granted: boolean; level: number | null }>;
     verifyPredicateAttestation(p: Params): Promise<any>;
     verifyDocument(p: Params): Promise<any>;
     deriveTokenType(p: Params): Promise<any>;

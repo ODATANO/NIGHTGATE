@@ -80,7 +80,7 @@ Actions that write to the chain return `{ jobId, status }`. Poll `getJobStatus`.
 - Compact contracts: `deployContract`, `submitContractCall`, `submitContractCallBatch` on registered artifacts.
 - Fee sponsoring: `sponsorSessionId` on submit actions, `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorTransfer`, platform sponsors in `NIGHTGATE_FEE_SPONSOR_SESSION`.
 - Documents and proofs: `anchorDocument`, `prepareDocumentProof`, field predicate, equality and membership attestations, cross-document integrity and diff attestations.
-- Verification without the crawler: `verifyAttestationState`, `verifyPredicateState`.
+- Verification without the crawler: `verifyAttestationState`, `verifyPredicateState`, `verifyDisclosureState`.
 - Disclosure: `grantDisclosure`, `revokeDisclosure`, `grantDisclosureToHolders`, `claimDisclosure`.
 - Agents: `createAgentGrant` issues scoped tokens for the `x-agent-token` header. MCP server: [`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP).
 - Offer board: `postSwapOffer`, `listSwapOffers`, `sponsorSwap`, `mintFactoryToken`.
