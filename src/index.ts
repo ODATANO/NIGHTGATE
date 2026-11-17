@@ -5,7 +5,7 @@ import { startCrawler, stopCrawler } from '../srv/crawler/index';
 import { pendingReindexHeight, startReindex } from '../srv/crawler/reindex';
 import { ensureNightgateModelLoaded } from '../srv/utils/cds-model';
 import {
-    isNightgatePluginConfigured,
+    isNightgateConfigured,
     resolveNightgateRuntimeConfig,
     crawlerStartConfig,
     missingEndpointsMessage,
@@ -13,7 +13,7 @@ import {
     resolveEffectiveProvingMode,
     resolveProofTimeoutMs,
     VALID_NIGHTGATE_NETWORKS,
-    getNightgatePluginConfig,
+    getNightgateConfig,
     isCloseSessionsOnRestartEnabled,
     DEFAULT_NETWORK
 } from '../srv/utils/nightgate-config';
@@ -179,14 +179,14 @@ async function ensureSchemaDeployed(): Promise<void> {
 export async function initialize(): Promise<NightgateIndexerStatus> {
     await ensureNightgateModelLoaded();
 
-    const nightgateConfig = getNightgatePluginConfig();
-    if (!isNightgatePluginConfigured(nightgateConfig)) {
+    const nightgateConfig = getNightgateConfig();
+    if (!isNightgateConfigured(nightgateConfig)) {
         setLastStatus({
             initialized: false,
             crawlerEnabled: false,
             mode: 'idle'
         });
-        logStartupState('stopped', 'plugin not configured');
+        logStartupState('stopped', 'no network configured');
         return getStatus();
     }
 

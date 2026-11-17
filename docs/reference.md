@@ -4,7 +4,7 @@ Configuration, runtime behavior and schema. Signatures: [actions.md](actions.md)
 
 ## Configuration
 
-The plugin reads `cds.requires.nightgate`. Environment variables override it. Without `network` the plugin serves OData but stays idle: no crawler, no submission.
+NIGHTGATE reads `cds.requires.nightgate`. Environment variables override it. Without `network` the server serves OData but stays idle: no crawler, no submission.
 
 ```json
 {
@@ -82,7 +82,7 @@ Declared in `srv/utils/config-table.ts`. The table is generated with `npm run co
 | `NIGHTGATE_INDEXER_WS_URL` | url |  | Override `indexerWsUrl`; optional, derived from the HTTP URL when unset |
 | `NIGHTGATE_PROOF_SERVER_URL` | url |  | Override `proofServerUrl` |
 | `NIGHTGATE_PROVING_MODE` | `server` / `wasm` |  | Proving mode `wasm` (in-process) or `server` (proof server). Unset: `server` when a proof server is configured, `wasm` otherwise. `initialize()` pins the effective value into the env for the worker. Read in the wallet worker. |
-| `NIGHTGATE_PROOF_TIMEOUT_MS` | ms (min 1) | `300000` | Override `proofTimeoutMs`; pinned into the env at plugin init for the wallet worker. The proof-server container has its own job TTL (`MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT`, default 600 s): raise both, or a finished-but-expired job answers 5xx and midnight-js re-proves. Read in the wallet worker. |
+| `NIGHTGATE_PROOF_TIMEOUT_MS` | ms (min 1) | `300000` | Override `proofTimeoutMs`; pinned into the env at startup for the wallet worker. The proof-server container has its own job TTL (`MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT`, default 600 s): raise both, or a finished-but-expired job answers 5xx and midnight-js re-proves. Read in the wallet worker. |
 | `NIGHTGATE_ZK_CONFIG_BASE` | path | `./contracts` | Override `zkConfigBasePath` |
 | `NIGHTGATE_ZK_CONFIG_PUBLIC_URL` | url |  | Public base URL advertised by `/contract-manifest` for the `/zk-config/...` routes (behind a reverse proxy); unset = relative URLs, resolved by the client against the origin it fetched the manifest from |
 | `NIGHTGATE_ZK_ASSET_URL` | string |  | A `/zk-config` base the server fetches missing prover keys from (`<url>/<contract>/keys/<circuit>.prover`, verified against `keys/manifest.json`); `none`/`off` disables the fetch. Unset: the release assets named by the installed lineage package (`contract.json#zkAssetUrl`), no source for a foreign artifact. Offline installs run `nightgate-fetch-keys` once. |
@@ -213,7 +213,7 @@ Declared in `srv/utils/config-table.ts`. The table is generated with `npm run co
 | `ENCRYPTION_KEY_ACTIVE` | string |  | Id of the ring key new ciphertexts are written under (required with more than one key). Startup refuses a database whose ciphertexts name a key id outside the ring; `nightgate-rewrap-keys` moves rows to the active key (see docs/operations.md, key rotation). Env only, no CAP mapping. |
 <!-- config-table:end -->
 
-Read by the standalone image and the dev scripts, not by the plugin:
+Read by the image and the dev scripts, not by the server:
 
 | Variable | Purpose |
 |---|---|
@@ -227,16 +227,16 @@ For a local checkout, put variables into a repo-root `.env`. Template: [.env.exa
 
 ## Runtime behavior
 
-### Plugin lifecycle
+### Server lifecycle
 
-- `cds-plugin.js` loads `src/plugin.ts`, which registers the models in `db/` and `srv/`.
+- CAP loads `srv/server.ts`, which registers the hooks below.
 - The connector routes `/zk-config` and `/contract-manifest` attach at CAP bootstrap. `GET /zk-config/<contract>` lists the circuits and the files below it: `keys/`, `zkir/` and `compiler/contract-manifest.json`.
 - `initialize()` runs on `cds.on('served')`. It checks the schema, loads `contracts`, starts the wallet worker and, if enabled, the crawler.
 - `shutdown()` runs on `cds.on('shutdown')`. It stops the crawler and the worker, which saves every cached wallet first.
 
 ### Startup and failure
 
-- The schema is never deployed automatically. A missing table or column keeps NIGHTGATE offline with `SCHEMA_NOT_DEPLOYED`. The host process keeps running.
+- The schema is never deployed automatically. A missing table or column keeps NIGHTGATE offline with `SCHEMA_NOT_DEPLOYED`. The server keeps running.
 - An unreachable node logs a warning and starts in `offline` mode. Reads and submissions keep working.
 - A wallet worker that fails to start logs a warning. Submissions fail, reads work.
 - `initialize()` is idempotent and reloads `contracts`.
@@ -319,7 +319,7 @@ NIGHTGATE runs as exactly one process and one CAP tenant. Startup fails closed w
 
 ### Database
 
-The host chooses the database. SQLite is for development, PostgreSQL or HANA for production.
+The CAP configuration chooses the database. SQLite is for development, PostgreSQL or HANA for production.
 
 ```json
 {
@@ -331,7 +331,7 @@ The host chooses the database. SQLite is for development, PostgreSQL or HANA for
 ```
 
 - Inject credentials through a CAP service binding or `cds_requires_db_credentials_*`.
-- The plugin sets `cds.features.use_generic_pool` to `true` unless the host sets it.
+- `cds.features.use_generic_pool` defaults to `true` unless the configuration sets it.
 - The image uses pool `{ max: 20, acquireTimeoutMillis: 30000, destroyTimeoutMillis: 5000 }` and client `{ connectionTimeoutMillis: 10000 }`.
 - Run `cds deploy --profile production` before the first start. Back up before each upgrade.
 - SQLite to PostgreSQL: [docker.md#postgresql](docker.md#postgresql).
@@ -355,15 +355,7 @@ The host chooses the database. SQLite is for development, PostgreSQL or HANA for
 
 ### HTTP security
 
-NIGHTGATE installs no global HTTP middleware. CORS, CSP and HSTS are host policy. The plugin registers two transport lanes with `@odatano/cap-auth`: the agent token on `/odata/v4/midnight` and public verify on `/odata/v4/midnight-verify`. They act only where the host uses that package as `cds.requires.auth.impl`, as the image does.
-
-## Programmatic API
-
-```ts
-import { initialize, shutdown, getStatus, DEFAULT_NETWORK, DEFAULT_NODE_URLS, DEFAULT_INDEXER_URLS } from '@odatano/nightgate';
-```
-
-`getStatus()` returns `{ initialized, crawlerEnabled, network?, nodeUrl?, mode, lastError?, instanceId?, runtimeMode?, replicaCount?, databaseKind?, runtimeWarnings? }`. `mode` is `idle`, `active` or `offline`.
+NIGHTGATE installs no global HTTP middleware. CORS, CSP and HSTS belong to the proxy in front of it. It registers two transport lanes with `@odatano/cap-auth`: the agent token on `/odata/v4/midnight` and public verify on `/odata/v4/midnight-verify`. They act only where `cds.requires.auth.impl` is that package, as in the image.
 
 ## Services and entities
 
@@ -429,7 +421,7 @@ Enums in `db/types.cds`:
 ## Project structure
 
 ```
-src/          plugin entry, connector routes, browser and txbuilder exports
+src/          startup and shutdown, connector routes, browser and txbuilder exports
 srv/          the five OData services
   crawler/    block crawler
   providers/  Substrate RPC client

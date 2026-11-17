@@ -143,7 +143,7 @@ describe('config table: the worker reads the resolved snapshot, not its env', ()
     });
 });
 
-describe('config table: docs and plugin schema pinned to the table', () => {
+describe('config table: docs pinned to the table', () => {
     const repo = path.resolve(__dirname, '../..');
 
     it('docs/reference.md carries exactly the generated rows', () => {
@@ -155,17 +155,13 @@ describe('config table: docs and plugin schema pinned to the table', () => {
         expect(block).toEqual(configTableMarkdownRows());
     });
 
-    it('every key is declared once, documented, and every env name src/plugin.ts advertises exists', () => {
+    it('every key is declared once and documented', () => {
         const keys = CONFIG_TABLE.map(s => s.key);
         expect(new Set(keys).size).toBe(keys.length);
         for (const spec of CONFIG_TABLE) expect(spec.doc.length, spec.key).toBeGreaterThan(10);
-        const plugin = fs.readFileSync(path.join(repo, 'src/plugin.ts'), 'utf8');
-        for (const name of new Set(plugin.match(/NIGHTGATE_[A-Z_0-9]+/g) ?? [])) {
-            expect(keys, name).toContain(name);
-        }
     });
 
-    it('no plugin source reads a NIGHTGATE_* variable past the table', () => {
+    it('no source reads a NIGHTGATE_* variable past the table', () => {
         const offenders: string[] = [];
         const allowed = new Set(['srv/utils/nightgate-config.ts', 'src/index.ts']);
         const walk = (dir: string) => {

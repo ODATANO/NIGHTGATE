@@ -5,7 +5,7 @@ import { isBackgroundFenced } from '../utils/instance-lease';
 import cds from '@sap/cds';
 import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
 import { classifySubmissionError } from './TransactionSubmitter';
-import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, DEFAULT_NETWORK, type NightgateNetwork } from '../utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, getNightgateConfig, DEFAULT_NETWORK, type NightgateNetwork } from '../utils/nightgate-config';
 import { runInJobExecutionContext } from './job-execution-context';
 import { isCallNotAppliedFailure } from './sponsor-pool';
 import { configMs } from '../utils/config';
@@ -75,7 +75,7 @@ let cachedNetwork: NightgateNetwork | undefined;
 function getNetwork(): NightgateNetwork {
     if (!cachedNetwork) {
         try {
-            cachedNetwork = resolveNightgateRuntimeConfig(getNightgatePluginConfig()).network;
+            cachedNetwork = resolveNightgateRuntimeConfig(getNightgateConfig()).network;
         } catch {
             cachedNetwork = DEFAULT_NETWORK;
         }

@@ -1,10 +1,10 @@
 /**
- * Tests for srv/midnight/batch-gas-preflight.ts on real ledger transactions:
+ * Tests for src/shared/batch-gas-preflight.mts on real ledger transactions:
  * two attests in one batch on a vault that holds one attestation.
  */
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { checkBatchGas } from '../../srv/midnight/batch-gas-preflight';
+import { checkBatchGas } from '../../src/shared/batch-gas-preflight.mjs';
 
 const VAULT = path.resolve(__dirname, '../../node_modules/@odatano/contract-attestation-vault/managed/attestation-vault/contract/index.js');
 

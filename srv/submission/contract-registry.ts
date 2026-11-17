@@ -1,7 +1,7 @@
 // In-memory map from a contract name (`compiledArtifactRef`) to its compiled module, `privateStateId` and `zkConfigPath`.
 // Filled from `cds.requires.nightgate.contracts`. A generation digest identifies the exact build behind a name: module, keys and settings.
 
-import type { NightgatePluginConfig } from '../utils/nightgate-config';
+import type { NightgateConfig } from '../utils/nightgate-config';
 import cds from '@sap/cds';
 import fs from 'fs';
 import path from 'path';
@@ -185,12 +185,12 @@ export function getContractRegistration(name: string): Readonly<ContractRegistra
 }
 
 // This file lives at <root>/srv/submission/. The contract packages are dependencies of this package.
-const PLUGIN_ROOT = path.resolve(__dirname, '..', '..');
+const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 
 export function registrationFromPackage(packageName: string, baseDir = process.cwd()): ContractRegistration {
     let pkg;
     try {
-        pkg = resolveContractPackage(packageName, PLUGIN_ROOT);
+        pkg = resolveContractPackage(packageName, PACKAGE_ROOT);
     } catch {
         pkg = resolveContractPackage(packageName, baseDir);
     }
@@ -213,7 +213,7 @@ export function registrationFromPackage(packageName: string, baseDir = process.c
 }
 
 /** An entry is either `{ package }` or `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`. */
-export function loadRegistryFromConfig(config?: NightgatePluginConfig, baseDir = process.cwd()): void {
+export function loadRegistryFromConfig(config?: NightgateConfig, baseDir = process.cwd()): void {
     const contracts = config?.contracts;
     if (!contracts || typeof contracts !== 'object') return;
     for (const [name, reg] of Object.entries(contracts)) {

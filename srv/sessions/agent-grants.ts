@@ -14,7 +14,7 @@ import {
 import { withKeyedLock } from '../utils/keyed-lock';
 import { runWithoutAmbientTx } from '../submission/background-jobs';
 import { resolveFeeSponsor, FeeSponsorError } from '../submission/fee-sponsor';
-import { getNightgatePluginConfig, resolveNightgateRuntimeConfig } from '../utils/nightgate-config';
+import { getNightgateConfig, resolveNightgateRuntimeConfig } from '../utils/nightgate-config';
 import { configInt } from '../utils/config';
 import { checkRateClass, peekRateClassForGrant, rejectRateLimited, noteRateLimitHeaders, RATE_CLASSES, RATE_CLASS_NAMES, type RateLimitState } from '../utils/rate-classes';
 import { isSessionExpired } from '../utils/session-expiry';
@@ -694,7 +694,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         // would only fail after budget was spent. It is checked again on each use.
         // Only the sponsoring actions can use the platform pool.
         if (data.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
-            const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+            const pool = getConfiguredFeeSponsorSessions(getNightgateConfig());
             if (pool.length === 0) {
                 req.reject(412, `sponsorSessionId: '${PLATFORM_POOL_SENTINEL}' requires a configured NIGHTGATE_FEE_SPONSOR_SESSION pool`);
                 return undefined;
@@ -712,7 +712,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
                     db,
                     sponsorSessionId: String(data.sponsorSessionId),
                     requestingUserId: userId,
-                    config: getNightgatePluginConfig()
+                    config: getNightgateConfig()
                 }));
             } catch (err) {
                 if (err instanceof FeeSponsorError) {
@@ -968,7 +968,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         const jobs = [...counts.values()].sort((a, b) => a.kind.localeCompare(b.kind) || a.status.localeCompare(b.status));
 
         // Fees are only known for transactions the crawler has indexed.
-        const crawlerOn = resolveNightgateRuntimeConfig(getNightgatePluginConfig()).crawlerConfig.enabled !== false;
+        const crawlerOn = resolveNightgateRuntimeConfig(getNightgateConfig()).crawlerConfig.enabled !== false;
         const dustPaid = crawlerOn ? await sumIndexedFees(db, landedHashes) : null;
 
         return {
@@ -1121,7 +1121,7 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
             && grant.sponsorSessionId !== PLATFORM_POOL_SENTINEL && data.sessionId === grant.sponsorSessionId;
         const poolPoll = polling && !pinnedPoll
             && (data.sessionId === PLATFORM_POOL_SENTINEL
-                || getConfiguredFeeSponsorSessions(getNightgatePluginConfig()).includes(String(data.sessionId ?? '')));
+                || getConfiguredFeeSponsorSessions(getNightgateConfig()).includes(String(data.sessionId ?? '')));
         const sponsorPoll = pinnedPoll || poolPoll;
         // Pool jobs are stored under the pool placeholder id, not under one pool wallet.
         if (poolPoll) data.sessionId = PLATFORM_POOL_SENTINEL;

@@ -18,7 +18,7 @@ vi.mock('../../srv/utils/nightgate-config', async () => {
     const actual = await vi.importActual('../../srv/utils/nightgate-config');
     return {
         ...actual,
-        getNightgatePluginConfig: () => ({}),
+        getNightgateConfig: () => ({}),
         resolveNightgateRuntimeConfig: () => mockRuntimeCfg
     };
 });

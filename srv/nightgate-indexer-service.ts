@@ -3,7 +3,7 @@ import { errorMessage } from './utils/errors';
 const { SELECT, UPDATE } = cds.ql;
 
 import { ensureNightgateModelLoaded } from './utils/cds-model';
-import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, crawlerStartConfig } from './utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, getNightgateConfig, crawlerStartConfig } from './utils/nightgate-config';
 import { ensureSyncStateSingleton } from './utils/sync-state';
 import { isCrawlerRunning, startCrawler, stopCrawler } from './crawler';
 import { pendingReindexHeight, reindexInProgress, startReindex, type ReindexCrawlerControl, type ReindexOutcome } from './crawler/reindex';
@@ -36,7 +36,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
 
     private resolveCrawlerStartConfig(): ReturnType<typeof crawlerStartConfig> {
-        return crawlerStartConfig(resolveNightgateRuntimeConfig(getNightgatePluginConfig()));
+        return crawlerStartConfig(resolveNightgateRuntimeConfig(getNightgateConfig()));
     }
 
     async init(): Promise<void> {

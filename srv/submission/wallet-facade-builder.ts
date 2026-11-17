@@ -259,7 +259,7 @@ export function __clearAllFacadesForTests(): void {
     sessionRegistry.clear();
 }
 
-/** Stores the state the worker sends. Call once at plugin start, after `startWalletWorker()` resolved. */
+/** Stores the state the worker sends. Call once at startup, after `startWalletWorker()` resolved. */
 export function wireWorkerStateSaveSink(): void {
     setStateSaveSink(event => {
         const running = handleStateSave(event);

@@ -8,7 +8,7 @@ import { resolveAccountDek } from '../submission/account-keys';
 import { getWalletBalance, estimateSendNightFee } from '../submission/token-ops';
 import { hasWalletFacade, getFacadeOrigin } from '../submission/wallet-facade-builder';
 import { walletGetSyncProgress } from '../midnight/wallet-worker-client';
-import { getNightgatePluginConfig, mainnetSubmissionBlockReason, getConfiguredNightgateNetwork, normalizeNightgateNetwork } from '../utils/nightgate-config';
+import { getNightgateConfig, mainnetSubmissionBlockReason, getConfiguredNightgateNetwork, normalizeNightgateNetwork } from '../utils/nightgate-config';
 import { startJob, registerBackgroundJobProcessor, runWithoutAmbientTx, supersedeQueuedJobs, findLatestJob, JobAdmissionBusyError } from '../submission/background-jobs';
 import { declaredJobKindTraits } from '../submission/job-kinds';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
@@ -73,7 +73,7 @@ const MAX_NIGHT_AMOUNT_ATOMS = 10n ** 18n;
 const MAX_CUSTOM_TOKEN_ATOMS = 2n ** 128n - 1n;
 
 function rejectIfMainnetBlocked(req: Request): boolean {
-    const reason = mainnetSubmissionBlockReason(getNightgatePluginConfig());
+    const reason = mainnetSubmissionBlockReason(getNightgateConfig());
     if (reason) {
         req.reject?.(403, reason);
         return true;
@@ -120,7 +120,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         const sessionId = cds.utils.uuid();
         const encryptedVk = encrypt(viewingKey, encKey, walletSessionViewingKeyBinding(sessionId));
 
-        const nightgateConfig = getNightgatePluginConfig();
+        const nightgateConfig = getNightgateConfig();
         const sessionTtlMs = nightgateConfig.sessionTtlMs || 24 * 60 * 60 * 1000;
         const expiresAt = new Date(Date.now() + sessionTtlMs).toISOString();
 
@@ -174,7 +174,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         }
 
         const { network } = normalizeNightgateNetwork(
-            getConfiguredNightgateNetwork(getNightgatePluginConfig())
+            getConfiguredNightgateNetwork(getNightgateConfig())
         );
         try {
             return await deriveWalletInfo({ mnemonic, seedHex, accountIndex: account, network });
@@ -381,7 +381,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
                     db,
                     sponsorSessionId,
                     requestingUserId: userId,
-                    config: getNightgatePluginConfig()
+                    config: getNightgateConfig()
                 });
             } catch (err) {
                 if (err instanceof FeeSponsorError) return req.reject(err.httpStatus, err.message);
@@ -466,7 +466,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         if (!userId) return;
         if (!checkRateClass('read', 'read', req)) return;
 
-        const sponsorIds = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+        const sponsorIds = getConfiguredFeeSponsorSessions(getNightgateConfig());
         if (sponsorIds.length === 0) return [];
 
         const isAdmin = Boolean(req.user?.is?.('admin'));

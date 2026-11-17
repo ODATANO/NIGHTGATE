@@ -3,7 +3,7 @@
 
 import { configNumber, configMs, configEnum } from '../../utils/config';
 import { markIntentAnnounced } from './cancellation';
-import { callSegments } from '../batch-segment-order';
+import { callSegments } from '../../../src/shared/batch-segment-order.mjs';
 import { classifySubmitFailure, isPreMempoolFailure } from '../submit-error-classification';
 import { classificationHaystack, formatErrWithCauses, safeDeepInspect } from '../../utils/format-error';
 import { NightgateError, errorMessage } from '../../utils/errors';

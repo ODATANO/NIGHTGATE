@@ -18,7 +18,7 @@ export function resolveManifestUrl(url, manifestUrl) {
 /** Builds the providers for one contract from a connected wallet and the parsed `/contract-manifest`.
  *  Pass `manifestUrl` when the manifest has relative URLs and the app runs on another origin. */
 export async function createNightgateConnectorProviders(opts = {}) {
-    const { connector, manifest, manifestUrl, contract, fetchFn, webSocket, proving = 'server', expectedManifestHash } = opts;
+    const { connector, manifest, manifestUrl, contract, fetchFn, webSocket, proving = 'server', proofServerUrl, expectedManifestHash } = opts;
     if (!connector) throw new Error('createNightgateConnectorProviders: connector is required');
     if (!contract) throw new Error('createNightgateConnectorProviders: contract is required');
 
@@ -44,7 +44,7 @@ export async function createNightgateConnectorProviders(opts = {}) {
         proving,
         connector,
         zkConfigProvider,
-        proverServerUri: cfg.proverServerUri,
+        proverServerUri: proofServerUrl ?? cfg.proverServerUri,
         proofMod
     });
     const privateStateProvider = new InMemoryPrivateStateProvider();

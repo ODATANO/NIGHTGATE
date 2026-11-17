@@ -1,11 +1,11 @@
 // Decides when a wallet session has expired. Sessions configured as platform fee sponsors never expire.
 // This module imports only config code, so modules that import each other can both use it.
 
-import { getNightgatePluginConfig, type NightgatePluginConfig } from './nightgate-config';
+import { getNightgateConfig, type NightgateConfig } from './nightgate-config';
 import { configList } from './config';
 
 /** Session ids any authenticated caller may use as fee sponsor. Env NIGHTGATE_FEE_SPONSOR_SESSION wins over cds config `feeSponsorSessions`. */
-export function getConfiguredFeeSponsorSessions(config?: NightgatePluginConfig): string[] {
+export function getConfiguredFeeSponsorSessions(config?: NightgateConfig): string[] {
     const fromEnv = configList('NIGHTGATE_FEE_SPONSOR_SESSION');
     if (fromEnv.length) return fromEnv;
     const raw = Array.isArray(config?.feeSponsorSessions)
@@ -15,9 +15,9 @@ export function getConfiguredFeeSponsorSessions(config?: NightgatePluginConfig):
     return raw.split(',').map(s => s.trim()).filter(Boolean);
 }
 
-export function isConfiguredPlatformSponsor(sessionId: string | undefined | null, config?: NightgatePluginConfig): boolean {
+export function isConfiguredPlatformSponsor(sessionId: string | undefined | null, config?: NightgateConfig): boolean {
     if (!sessionId) return false;
-    return getConfiguredFeeSponsorSessions(config ?? getNightgatePluginConfig()).includes(sessionId);
+    return getConfiguredFeeSponsorSessions(config ?? getNightgateConfig()).includes(sessionId);
 }
 
 /** Expired when `expiresAt` is in the past, unless the session is a configured sponsor.
@@ -25,7 +25,7 @@ export function isConfiguredPlatformSponsor(sessionId: string | undefined | null
 export function isSessionExpired(
     sessionId: string | undefined | null,
     expiresAt: unknown,
-    config?: NightgatePluginConfig
+    config?: NightgateConfig
 ): boolean {
     if (!expiresAt) return false;
     if (isConfiguredPlatformSponsor(sessionId, config)) return false;

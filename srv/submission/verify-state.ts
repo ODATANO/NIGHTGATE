@@ -17,7 +17,7 @@ import {
     type NightgateNetwork,
     VALID_NIGHTGATE_NETWORKS,
     resolveOverrideIndexerEndpoints,
-    getNightgatePluginConfig
+    getNightgateConfig
 } from '../utils/nightgate-config';
 import { errorMessage } from '../utils/errors';
 
@@ -61,16 +61,16 @@ export function coerceMask(raw: unknown): number | null {
 
 /** True when an indexer is configured for the requested network. When false, the verify functions answer "not verified" instead of an error. */
 export function liveProviderConfigured(networkOverride?: NightgateNetwork): boolean {
-    const { network, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    const { network, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgateConfig());
     if (networkOverride && networkOverride !== network) {
-        const eps = resolveOverrideIndexerEndpoints(networkOverride, getNightgatePluginConfig());
+        const eps = resolveOverrideIndexerEndpoints(networkOverride, getNightgateConfig());
         return Boolean(eps.indexerHttpUrl && eps.indexerWsUrl);
     }
     return Boolean(submissionEndpoints.indexerHttpUrl && submissionEndpoints.indexerWsUrl);
 }
 
 export function contractProvidersConfigFromEnv(zkConfigPath: string): ContractProvidersConfig {
-    const { submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    const { submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgateConfig());
     return {
         indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
         indexerWsUrl: submissionEndpoints.indexerWsUrl,
@@ -88,9 +88,9 @@ export function contractProvidersConfigForNetwork(
 ): ContractProvidersConfig {
     const base = contractProvidersConfigFromEnv(zkConfigPath);
     if (!networkOverride) return base;
-    const { network } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    const { network } = resolveNightgateRuntimeConfig(getNightgateConfig());
     if (networkOverride === network) return base;
-    const eps = resolveOverrideIndexerEndpoints(networkOverride, getNightgatePluginConfig());
+    const eps = resolveOverrideIndexerEndpoints(networkOverride, getNightgateConfig());
     return { ...base, indexerHttpUrl: eps.indexerHttpUrl, indexerWsUrl: eps.indexerWsUrl };
 }
 

@@ -20,7 +20,7 @@ export interface RequestAgentGrant {
     allowedUnshieldedTokenTypes: string[];
 }
 
-// Fields the plugin's before-handlers set on every CAP request.
+// Fields NIGHTGATE's before-handlers set on every CAP request.
 declare module '@sap/cds' {
     interface Request {
         agentGrant?: RequestAgentGrant;

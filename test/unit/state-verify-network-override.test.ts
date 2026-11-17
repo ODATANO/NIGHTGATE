@@ -15,16 +15,16 @@
  *      (readers only ever get the contract-only provider config).
  *
  * Same stub-service pattern as state-verification-handlers.test.ts, but the
- * plugin config is mockable too so the `networks` escape hatch can be tested.
+ * config is mockable too so the `networks` escape hatch can be tested.
  */
 
 let mockRuntimeCfg: any;
-let mockPluginCfg: any;
+let mockCfg: any;
 vi.mock('../../srv/utils/nightgate-config', async () => {
     const actual = await vi.importActual('../../srv/utils/nightgate-config');
     return {
         ...actual,
-        getNightgatePluginConfig: () => mockPluginCfg,
+        getNightgateConfig: () => mockCfg,
         resolveNightgateRuntimeConfig: () => mockRuntimeCfg
     };
 });
@@ -79,7 +79,7 @@ function setup(opts: any = {}) {
 
 beforeEach(() => {
     mockRuntimeCfg = CONFIGURED;
-    mockPluginCfg = {};
+    mockCfg = {};
 });
 
 // ---- verifyAttestationState ------------------------------------------------
@@ -127,7 +127,7 @@ describe('verifyAttestationState network override', () => {
     });
 
     test('override honours the cds.requires.nightgate.networks escape hatch', async () => {
-        mockPluginCfg = {
+        mockCfg = {
             networks: { preview: { indexerHttpUrl: 'http://own-preview-idx', indexerWsUrl: 'ws://own-preview-idx' } }
         };
         const reader = vi.fn(async () => POSITIVE);

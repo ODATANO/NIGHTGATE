@@ -13,7 +13,7 @@ import { registerNightUtxosForDust, deregisterNightUtxosFromDust } from '../subm
 import { sendNight } from '../submission/token-ops';
 import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
 import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
-import { resolveNightgateRuntimeConfig, getNightgatePluginConfig } from '../utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, getNightgateConfig } from '../utils/nightgate-config';
 import { runWithoutAmbientTx } from '../submission/background-jobs';
 import { reportExternalExecution, reportBroadcastOn, reportSubmissionRejectedOn } from '../submission/job-execution-context';
 import { isPreInclusionReject } from '../submission/sponsor-pool';
@@ -59,7 +59,7 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db:
     const seedHex = decrypt(session.encryptedSeedKey, encKey, walletSessionSeedBinding(session.sessionId));
     const accountId = deriveAccountId(viewingKey);
     const syncPass = deriveStoragePassword(viewingKey);
-    const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    const { network, nodeUrl, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgateConfig());
     const facadeConfig = {
         networkId: network,
         indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
@@ -106,7 +106,7 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db:
     }
     if (command.op === 'deregisterDust') {
         const sponsor = command.sponsorSessionId
-            ? await resolveFeeSponsor({ db, sponsorSessionId: command.sponsorSessionId, requestingUserId: job.requestedBy, config: getNightgatePluginConfig() })
+            ? await resolveFeeSponsor({ db, sponsorSessionId: command.sponsorSessionId, requestingUserId: job.requestedBy, config: getNightgateConfig() })
             : null;
         if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeConfig);
         await reportExternalExecution({});

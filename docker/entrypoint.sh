@@ -44,7 +44,7 @@ if [ -z "${ENCRYPTION_KEY:-}" ] && [ -z "${ENCRYPTION_KEYS:-}" ]; then
     exit 1
 fi
 
-# preprod and mainnet have no built-in node or indexer; without them the plugin stays offline and the
+# preprod and mainnet have no built-in node or indexer; without them NIGHTGATE stays offline and the
 # health check would restart the container for nothing.
 case "${NIGHTGATE_NETWORK:-mainnet}" in
     preprod|mainnet)

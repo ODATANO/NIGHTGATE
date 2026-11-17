@@ -1,7 +1,7 @@
 // Disclosure grants, reindexing and grantee identities.
 // SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
-import { getNightgatePluginConfig } from '../../utils/nightgate-config';
+import { getNightgateConfig } from '../../utils/nightgate-config';
 import { startJob } from '../background-jobs';
 import { vaultRef, liveProviderConfigured } from '../verify-state';
 import { deriveGranteeId } from '../grantee-identity';
@@ -221,7 +221,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
 
         // The server does not verify that the caller owns the binding input.
         // Deployments that rely on grants for access should disable self-service registration.
-        if (!isSelfServiceGranteeRegistrationAllowed(getNightgatePluginConfig())) {
+        if (!isSelfServiceGranteeRegistrationAllowed(getNightgateConfig())) {
             return req.reject(403, 'Self-service grantee registration is disabled on this deployment. ' +
                 'Identities are registered through the operator\'s proofing flow.');
         }
@@ -229,7 +229,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
         const { bindingInput, scope } = req.data;
         if (!bindingInput) return req.reject(400, 'bindingInput is required');
 
-        const bindingKind = getConfiguredGranteeBinding(getNightgatePluginConfig());
+        const bindingKind = getConfiguredGranteeBinding(getNightgateConfig());
         let granteeId: string;
         try {
             granteeId = deriveGranteeId(bindingKind, bindingInput);

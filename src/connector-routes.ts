@@ -3,13 +3,13 @@ import path from 'path';
 import fs from 'fs';
 import type { Request, Response } from 'express';
 
-import { getNightgatePluginConfig, getConfiguredNightgateNetwork, DEFAULT_NETWORK } from '../srv/utils/nightgate-config';
+import { getNightgateConfig, getConfiguredNightgateNetwork, DEFAULT_NETWORK } from '../srv/utils/nightgate-config';
 import { getContractRegistration, listRegisteredContracts } from '../srv/submission/contract-registry';
 import { configString } from '../srv/utils/config';
 import { ZK_ARTIFACT_MANIFEST_DIR, ZK_ARTIFACT_MANIFEST_FILE, hasZkArtifactManifest } from '../srv/submission/zk-artifact-manifest';
 
 // HTTP routes that browser apps use to load proving files and the contract list.
-// HTTP security and CORS are left to the host app.
+// HTTP security headers and CORS are left to the proxy in front of the server.
 
 // The URLs follow the folder layout on disk. Only registered contracts are served.
 const ZK_FILE_RE = /^([A-Za-z0-9_]+\.(prover|verifier|zkir|bzkir)|manifest\.json)$/;
@@ -101,7 +101,7 @@ function listContractCircuits(zkConfigPath: string): string[] {
 // Lists registered contracts. Addresses are included only when set in the config.
 export function mountContractManifestRoute(app: RouteApp): void {
     app.get('/contract-manifest', (_req: Request, res: Response) => {
-        const cfg = getNightgatePluginConfig();
+        const cfg = getNightgateConfig();
         const network = getConfiguredNightgateNetwork(cfg) || DEFAULT_NETWORK;
         // Without a configured base URL the links are relative. The Host header is never used.
         const base = (configString('NIGHTGATE_ZK_CONFIG_PUBLIC_URL') ?? '').replace(/\/+$/, '');

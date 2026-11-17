@@ -3,6 +3,7 @@ export {
     generateAttestationSecret,
     sealAttestationSecret,
     openAttestationSecret,
+    computeAttesterId,
     buildAttestationVaultWitnesses,
     type SealedAttestationSecret,
     type MerkleProof,

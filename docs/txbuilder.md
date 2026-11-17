@@ -13,13 +13,16 @@ process, and the on-chain attestation carries your attester id.
 
 ```bash
 npm install @odatano/nightgate-tx     # the caller side alone
-npm install @odatano/nightgate        # the full plugin, with the sponsor side
+npm install @odatano/nightgate        # the server package, which ships the same builder
 ```
 
 Both ship the same builder. In `@odatano/nightgate-tx`, `/browser` is
 `/calls` and `/browser/attestation-vault` is `/attestation-vault`. The other
 paths keep their name. The package ships the vault modules it builds calls
 for, so use a release that matches the vault you call.
+
+In a browser, where a connected wallet pays, use `connectContract`. See
+[browser.md](browser.md).
 
 ## Use
 
@@ -76,7 +79,7 @@ says whether the same call may be repeated.
 | `proverMaterialDir` | no | keys of the wallet's own circuits and the BLS parameters, default `~/.cache/nightgate-txbuilder/prover-material` |
 | `circuits` | no | circuits to fetch prover keys and zkir for. Default every circuit of `contractClass`, else the vault's 11 |
 | `ttlMinutes` | no | transaction TTL, default 30. The sponsor must submit within it |
-| `attestationSecret` | no | default derived from the seed |
+| `attestationSecret` | no | attestation vault only, default derived from the seed |
 | `provingMode` | no | `wasm` (default) proves in-process. `server` proves wallet and contract circuits on `proofServerUrl` |
 | `proofServerUrl` | with `server` | the proof server receives the witnesses and sees the coins you spend. Use only one you run |
 | `proofTimeoutMs` | no | server proving, timeout of one proof request, default 300000. The SDK retries a timed-out proof, so set it above your slowest circuit |
@@ -106,6 +109,7 @@ The builder returns `{ attestationSecret, attesterId, zkAssets, addresses,
 shieldedKeys, provingMode, walletSync, waitForSync, serializeWalletState,
 buildSponsorable, buildDeploySponsorable, revert, close }`.
 
+- `attestationSecret` and `attesterId` belong to the attestation vault. The secret goes into the `prepare*` helpers, the id is the attester of every attestation built here. A builder for another contract carries both and uses neither.
 - `walletSync` is the resolved mode: `'all'`, `'coins'`, `'shielded'` or `'none'`.
 - `waitForSync()` resolves when every started sub-wallet reached the tip and reads the chain at ledger 9, a shared shielded wallet included. A wallet catches up a moment before it learns that the chain runs ledger 9. A build in that moment would be for the ledger before it.
 - `serializeWalletState()` returns `{ shielded?, unshielded?, dust? }` for the synced sub-wallets. It holds the coins, so store it like a key.

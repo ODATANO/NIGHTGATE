@@ -4,7 +4,7 @@
  * The end-to-end runtime paths are already exercised via runtime-initialize
  * and the indexer/sessions tests. This file isolates the small helpers so we
  * cover the edge branches (invalid network, empty config, env-only flows,
- * private-state backend selection, etc.) without spinning up the full plugin.
+ * private-state backend selection, etc.) without spinning up the full server.
  */
 
 import {
@@ -14,7 +14,7 @@ import {
     getConfiguredNightgateNodeUrl,
     getConfiguredNightgateCrawlerNodeUrl,
     getConfiguredPrivateStateBackend,
-    isNightgatePluginConfigured,
+    isNightgateConfigured,
     isSelfServiceGranteeRegistrationAllowed,
     normalizeNightgateNetwork,
     resolveNightgateRuntimeConfig,
@@ -87,25 +87,25 @@ describe('normalizeNightgateNetwork', () => {
     });
 });
 
-describe('isNightgatePluginConfigured', () => {
+describe('isNightgateConfigured', () => {
     it('returns false for undefined config', () => {
-        expect(isNightgatePluginConfigured(undefined)).toBe(false);
+        expect(isNightgateConfigured(undefined)).toBe(false);
     });
 
     it('ignores the legacy kind marker: kind alone (no network) is NOT configured', () => {
-        expect(isNightgatePluginConfigured({ kind: 'nightgate' })).toBe(false);
+        expect(isNightgateConfigured({ kind: 'nightgate' })).toBe(false);
     });
 
     it('accepts configs that still carry the legacy kind marker alongside a network', () => {
-        expect(isNightgatePluginConfigured({ kind: 'nightgate', network: 'preprod' })).toBe(true);
+        expect(isNightgateConfigured({ kind: 'nightgate', network: 'preprod' })).toBe(true);
     });
 
     it('returns true when a network is set without the kind marker', () => {
-        expect(isNightgatePluginConfigured({ network: 'testnet' })).toBe(true);
+        expect(isNightgateConfigured({ network: 'testnet' })).toBe(true);
     });
 
     it('returns false for a bare empty object', () => {
-        expect(isNightgatePluginConfigured({})).toBe(false);
+        expect(isNightgateConfigured({})).toBe(false);
     });
 });
 

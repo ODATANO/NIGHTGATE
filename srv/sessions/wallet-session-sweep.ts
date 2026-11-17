@@ -3,7 +3,7 @@
  */
 import cds from '@sap/cds';
 import { WalletSessions, type WalletSession } from '#cds-models/midnight';
-import { getNightgatePluginConfig, type NightgatePluginConfig } from '../utils/nightgate-config';
+import { getNightgateConfig, type NightgateConfig } from '../utils/nightgate-config';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import type { DbRunner, Row } from '../utils/db-types';
 import { evictFacadeUnlessShared } from './wallet-session-lifecycle';
@@ -17,7 +17,7 @@ const SESSION_CLOSE_CHUNK = 200;
 const DEFAULT_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** At startup closes the previous process's view-only sessions and returns their ids. Assumes one server instance. Fee sponsors and key-holding sessions stay open. */
-export async function closeSessionsFromPreviousProcess(db: DbRunner, config?: NightgatePluginConfig): Promise<string[]> {
+export async function closeSessionsFromPreviousProcess(db: DbRunner, config?: NightgateConfig): Promise<string[]> {
     const exempt = new Set(getConfiguredFeeSponsorSessions(config));
     const active: Row<WalletSession, 'sessionId'>[] = (await db.run(
         SELECT.from(WalletSessions).columns('sessionId', 'encryptedSeedKey', 'expiresAt').where({ isActive: true })
@@ -47,7 +47,7 @@ export async function closeSessionsFromPreviousProcess(db: DbRunner, config?: Ni
 }
 
 // A sponsor's expiry moves with every run, so a sponsor taken out of the pool keeps its keys for one session lifetime.
-async function extendSponsorSessions(db: DbRunner, sponsors: readonly string[], config: NightgatePluginConfig): Promise<void> {
+async function extendSponsorSessions(db: DbRunner, sponsors: readonly string[], config: NightgateConfig): Promise<void> {
     if (sponsors.length === 0) return;
     const expiresAt = new Date(Date.now() + (config.sessionTtlMs || DEFAULT_SESSION_TTL_MS)).toISOString();
     await db.run(UPDATE.entity(WalletSessions).set({ expiresAt }).where({ sessionId: { in: [...sponsors] } }));
@@ -55,14 +55,14 @@ async function extendSponsorSessions(db: DbRunner, sponsors: readonly string[], 
 
 export function startSessionCleanup(db: DbRunner): ReturnType<typeof setInterval> {
     const SESSION_CLEANUP_INTERVAL = 15 * 60 * 1000;
-    const firstConfig = getNightgatePluginConfig();
+    const firstConfig = getNightgateConfig();
     extendSponsorSessions(db, getConfiguredFeeSponsorSessions(firstConfig), firstConfig)
         .catch(err => cds.log('nightgate').warn(`Sponsor session expiry not extended: ${errorMessage(err)}`));
     const timer = setInterval(async () => {
         try {
             const now = new Date().toISOString();
             // Platform fee sponsors never expire, so they are never closed or wiped.
-            const config = getNightgatePluginConfig();
+            const config = getNightgateConfig();
             const sponsors = getConfiguredFeeSponsorSessions(config);
             await extendSponsorSessions(db, sponsors, config);
             const platformSponsors = new Set(sponsors);

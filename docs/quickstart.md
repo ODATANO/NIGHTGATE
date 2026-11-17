@@ -105,7 +105,7 @@ The packages ship verifier keys and zkir but no prover keys. The first proving j
 
 ## Next
 
-- [Install as a CAP plugin](../README.md#install-as-a-cap-plugin)
+- [docker.md](docker.md): the container image
 - [actions.md](actions.md): actions and functions
 - [operations.md](operations.md): scripts, own indexer, troubleshooting
 - [reference.md#configuration](reference.md#configuration): configuration

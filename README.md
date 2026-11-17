@@ -2,7 +2,7 @@
 
 ![Header Image](/docs/readme_header.png)
 
-**SAP CAP plugin: Midnight blockchain indexer + transaction submission, exposed as OData V4.**
+**Midnight blockchain indexer + transaction submission, exposed as OData V4. Built on SAP CAP.**
 
 [![Tests](https://github.com/ODATANO/NIGHTGATE/actions/workflows/test.yaml/badge.svg)](https://github.com/ODATANO/NIGHTGATE/actions/workflows/test.yaml)
 [![Coverage](https://img.shields.io/codecov/c/github/ODATANO/NIGHTGATE)](https://codecov.io/gh/ODATANO/NIGHTGATE)
@@ -13,38 +13,15 @@
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E10-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-yellow)](LICENSE)
 
-`@odatano/nightgate` is an indexer and transaction service for the [Midnight](https://midnight.network/) blockchain, built on SAP CAP. It runs as a plugin inside a CAP application or as a standalone container. A crawler indexes blocks from a Midnight node into CAP entities. A wallet stack in worker threads builds, proves and submits transactions: Compact deploys and calls, NIGHT and custom-token transfers, dust generation and fee sponsoring. Everything is exposed as OData V4.
+`@odatano/nightgate` is an indexer and transaction service for the [Midnight](https://midnight.network/) blockchain, built on SAP CAP. It runs as a standalone server, from the container image or from a clone of this repository. A crawler indexes blocks from a Midnight node into CAP entities. A wallet stack in worker threads builds, proves and submits transactions: Compact deploys and calls, NIGHT and custom-token transfers, dust generation and fee sponsoring. Everything is exposed as OData V4.
 
 It runs on Midnight ledger 9 networks.
 
 ## Ways to use it
 
 - **Hosted**: call the gateway at `api.preview.odatano.dev` with a key. Start at the [hosted quickstart](https://api.preview.odatano.dev/quickstart).
-- **Self-hosted**: run NIGHTGATE as a CAP plugin or container with a Midnight node and indexer behind it. See [docs/self-hosted.md](docs/self-hosted.md).
+- **Self-hosted**: run the container or a clone of this repository with a Midnight node and indexer behind it. See [docs/self-hosted.md](docs/self-hosted.md).
 - **Library**: [`@odatano/nightgate-tx`](packages/nightgate-tx/README.md) builds, proves and signs on your machine and hands the transaction to a sponsor. See [docs/txbuilder.md](docs/txbuilder.md).
-
-## Install as a CAP plugin
-
-```bash
-npm install @odatano/nightgate @cap-js/sqlite
-```
-
-```json
-{
-  "cds": {
-    "requires": {
-      "db": { "kind": "sqlite" },
-      "nightgate": {
-        "network": "mainnet",
-        "nodeUrl": "ws://<node-host>:9944",
-        "indexerHttpUrl": "http://<indexer-host>:8088/api/v4/graphql"
-      }
-    }
-  }
-}
-```
-
-Then `cds watch`. Every network but preview, testnet and undeployed needs `nodeUrl` and `indexerHttpUrl`. Preview has built-in public endpoints, so `network` alone is enough there. Proving runs in-process by default. All options: [docs/reference.md#configuration](docs/reference.md#configuration).
 
 ## Run the container
 
@@ -58,7 +35,11 @@ docker run -d -p 4004:4004 \
   ghcr.io/odatano/nightgate:latest
 ```
 
-Configuration, PostgreSQL and upgrades: [docs/docker.md](docs/docker.md).
+The image defaults to mainnet. Every network but preview, testnet and undeployed needs `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL`. Preview has built-in public endpoints, so `NIGHTGATE_NETWORK=preview` alone is enough there. Proving runs in-process by default.
+
+Configuration, PostgreSQL and upgrades: [docs/docker.md](docs/docker.md). All options: [docs/reference.md#configuration](docs/reference.md#configuration).
+
+To run from a clone of this repository instead, follow the [quickstart](docs/quickstart.md).
 
 ## Services
 
@@ -84,7 +65,7 @@ Actions that write to the chain return `{ jobId, status }`. Poll `getJobStatus`.
 - Disclosure: `grantDisclosure`, `revokeDisclosure`, `grantDisclosureToHolders`, `claimDisclosure`.
 - Agents: `createAgentGrant` issues scoped tokens for the `x-agent-token` header. MCP server: [`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP).
 - Offer board: `postSwapOffer`, `listSwapOffers`, `sponsorSwap`, `mintFactoryToken`.
-- Browser dApps: `@odatano/nightgate/browser`, `GET /zk-config/<contract>/...`, `GET /contract-manifest`.
+- Browser dApps: `connectContract` in `@odatano/nightgate/browser`, `GET /zk-config/<contract>/...`, `GET /contract-manifest`.
 - Operations: liveness, readiness, Prometheus metrics, crawler pause, resume and reindex.
 
 ## Documentation
@@ -97,6 +78,7 @@ Actions that write to the chain return `{ jobId, status }`. Poll `getJobStatus`.
 - [Operations](docs/operations.md): scripts, wallet sync, troubleshooting
 - [Architecture](docs/architecture.md): threads, submission flow, persistence
 - [Transaction builder](docs/txbuilder.md): build sponsorable transactions without a server
+- [Browser](docs/browser.md): calls, batches and deploys through a connected wallet
 - [Changelog](CHANGELOG.md)
 
 ## Development

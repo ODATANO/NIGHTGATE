@@ -1,7 +1,7 @@
 // Loads and checks the wallet session that pays fees for other users.
 // Only sessions listed in the platform config may do that, so a guessed or leaked session id cannot spend someone else's dust.
 
-import type { NightgatePluginConfig } from '../utils/nightgate-config';
+import type { NightgateConfig } from '../utils/nightgate-config';
 import cds from '@sap/cds';
 const { SELECT } = cds.ql;
 import { WalletSessions } from '#cds-models/midnight';
@@ -52,7 +52,7 @@ export interface ResolveFeeSponsorOptions {
     sponsorSessionId: string;
     /** Required unless the sponsor is listed in the platform config. */
     requestingUserId?: string;
-    config?: NightgatePluginConfig;
+    config?: NightgateConfig;
     /** For tests. Defaults to the process key from srv/utils/crypto.ts. */
     encryptionKey?: Buffer;
 }
@@ -129,7 +129,7 @@ export async function ensureFeeSponsorFacade(
 // With a worker per sponsor they start side by side. A failing sponsor is logged and skipped, and the pool uses the others.
 export async function prewarmFeeSponsorPool(opts: {
     db: DbRunner;
-    config?: NightgatePluginConfig;
+    config?: NightgateConfig;
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex' | 'syncStatePassphrase'>;
     log?: { info: (m: string) => void; warn: (m: string) => void };
     encryptionKey?: Buffer;

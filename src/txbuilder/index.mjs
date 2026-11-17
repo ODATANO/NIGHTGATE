@@ -583,14 +583,13 @@ export function trackingWebSocket(WebSocketImpl) {
 /** All keys derived from the seed. `deriveIdentity` is the public version without secret keys. */
 async function deriveKeyMaterial({ seedHex, networkId = 'mainnet', accountIndex = 0, attestationSecret: ownSecret }) {
     assertSeedHex(seedHex);
-    const [unshielded, { deriveAttestationSecret }, ledger, addressFormat] = await Promise.all([
+    const [unshielded, { deriveAttestationSecret, computeAttesterId }, ledger, addressFormat] = await Promise.all([
         import('@midnightntwrk/wallet-sdk-unshielded-wallet'),
         import('../browser/witnesses.mjs'),
         import('@midnightntwrk/ledger-v9'),
         import('@midnightntwrk/wallet-sdk-address-format')
     ]);
     const { deriveRoleSeeds } = require('../../srv/utils/wallet-hd.js');
-    const rt = compactRuntime;
     const roleSeeds = await deriveRoleSeeds(new Uint8Array(Buffer.from(seedHex, 'hex')), accountIndex);
     const keystore = unshielded.createKeystore({ kind: 'schnorr', secret: roleSeeds.night }, networkId);
     const attestationSecret = ownSecret ?? deriveAttestationSecret(roleSeeds.zswap);
@@ -605,7 +604,7 @@ async function deriveKeyMaterial({ seedHex, networkId = 'mainnet', accountIndex 
         roleSeeds,
         keystore,
         attestationSecret,
-        attesterId: Buffer.from(rt.persistentHash(new rt.CompactTypeBytes(32), attestationSecret)).toString('hex'),
+        attesterId: await computeAttesterId(attestationSecret),
         addresses: { night: unshielded.PublicKey.fromKeyStore(keystore).address, shielded },
         shieldedKeys
     };
@@ -871,21 +870,10 @@ export async function createTxBuilder(opts) {
                     witnesses = perCall[0];
                     scopeCalls = callList.map(c => ({ circuit: c.circuitId, args: c.args ?? [], ...(typeof c.before === 'function' ? { before: c.before } : {}) }));
                 } else if (String(contractName).startsWith('attestation-vault')) {
-                    const widths = [...new Set(callList.map(c => c.slotWidth).filter(w => w !== undefined))];
-                    if (widths.length > 1) throw new Error(`buildSponsorable: batched calls target different slot widths (${widths.join(', ')})`);
-                    const { buildAttestationVaultWitnesses } = await import('../browser/witnesses.mjs');
-                    const proofHolder = {};
-                    witnesses = buildAttestationVaultWitnesses({
-                        attestationSecret: batchSecret ?? attestationSecret,
-                        merkleProofHolder: proofHolder,
-                        ...(widths.length === 1 ? { slotWidth: widths[0] } : {})
-                    });
-                    // Every call sets the proof, so a call without one never sees the previous call's proof.
-                    scopeCalls = callList.map(c => ({
-                        circuit: c.circuitId,
-                        args: c.args ?? [],
-                        before: () => { proofHolder.current = c.merkleProof; }
-                    }));
+                    const { prepareVaultBatch } = await import('../browser/attestation-vault-calls.mjs');
+                    const batch = prepareVaultBatch(callList, { attestationSecret: batchSecret ?? attestationSecret });
+                    witnesses = batch.witnesses;
+                    scopeCalls = batch.calls.map(c => ({ circuit: c.circuitId, args: c.args ?? [], before: c.before }));
                 } else {
                     throw new Error(
                         `buildSponsorable: a batch on '${contractName}' needs ONE shared witnesses object: pass \`witnesses\` on the input ` +
@@ -920,27 +908,14 @@ export async function createTxBuilder(opts) {
             if (isBatch) {
                 // The wallet provider throws at submit on purpose, so an error with a captured transaction is success.
                 // A call order the ledger would reject fails before proving. It gets the same error code as on the server.
-                // The SDK drops the error name, so the message is matched.
                 const { runBatchInScope } = require('../../srv/midnight/batch-call-scope.js');
+                const { tagBatchError } = await import('../shared/batch-call-scope.mjs');
                 try {
                     await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress, { independentCalls: independentCalls === true, orderedPrefix: Number(orderedPrefix) || 0 },
                         recipientKeys ? { additionalCoinEncPublicKeyMappings: recipientKeys } : undefined);
                 } catch (e) {
-                    if (/violates the ledger's causality constraint/.test(String(e?.message ?? e))) {
-                        try {
-                            e.code = 'BatchCausalityViolation';
-                            // Rebuild the per-call details from the message when the SDK dropped them.
-                            if (!Array.isArray(e.calls)) {
-                                const m = /Stages in apply order: (.*)$/.exec(String(e.message));
-                                if (m) e.calls = m[1].trim().split(/\s+/).map(t => { const mm = /^(.+?)=(\d+)\[(.*)\]$/.exec(t); return mm ? { name: mm[1], segId: Number(mm[2]), stages: mm[3] } : { name: t, segId: -1, stages: '?' }; });
-                            }
-                        } catch { /* frozen error */ }
-                        throw e;
-                    }
-                    if (/runs out of gas on the ledger/.test(String(e?.message ?? e))) {
-                        try { e.code = 'BatchGasBudgetExceeded'; } catch { /* frozen error */ }
-                        throw e;
-                    }
+                    const code = tagBatchError(e)?.code;
+                    if (code === 'BatchCausalityViolation' || code === 'BatchGasBudgetExceeded') throw e;
                     if (!holder.captured) throw e;
                 }
             } else {

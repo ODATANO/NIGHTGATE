@@ -4,6 +4,7 @@
 import { classificationHaystack, ledgerErrorCode } from '../utils/format-error';
 import { findNightgateError, NightgateError, errorMessage } from '../utils/errors';
 import { dustRaceLedgerCode } from '../submission/dust-race';
+import { parseBatchCallStages } from '../../src/shared/batch-segment-order.mjs';
 import {
     carriedSubmitFailure, type BatchCallStageInfo, type SubmitFailureInfo
 } from './wallet-worker-protocol';
@@ -43,19 +44,7 @@ function nameOf(e: unknown): string {
     return typeof name === 'string' ? name : '';
 }
 
-/** Reads the call list back out of a batch order error, e.g. `Stages in apply order: callA=1158[f]`. */
-export function parseBatchCallStages(text: string): BatchCallStageInfo[] {
-    const at = text.indexOf('Stages in apply order:');
-    if (at < 0) return [];
-    const calls: BatchCallStageInfo[] = [];
-    // The list ends at the first word of another shape, because the text may repeat the message.
-    for (const token of text.slice(at + 'Stages in apply order:'.length).trim().split(/\s+/)) {
-        const hit = /^(\S+?)=(\d+)\[([^\]]*)\]$/.exec(token);
-        if (!hit) break;
-        calls.push({ name: hit[1], segId: Number(hit[2]), stages: hit[3] });
-    }
-    return calls;
-}
+export { parseBatchCallStages };
 
 // The connection failed or closed, so the request may never have been sent.
 // The worker asks the indexer whether the transaction exists before it sends it again.

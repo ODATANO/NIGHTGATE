@@ -1,6 +1,6 @@
 /**
  * Runtime gate: write actions are refused with a retryable 503 while the
- * plugin's initialisation has not succeeded; reads and compute-only actions
+ * initialisation has not succeeded; reads and compute-only actions
  * stay reachable.
  *
  * The booted cds.test() server runs with SKIP_AUTO_INIT (runtime idle), so

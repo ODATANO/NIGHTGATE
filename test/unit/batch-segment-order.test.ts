@@ -1,11 +1,11 @@
 /**
- * Tests for srv/midnight/batch-segment-order.ts: deterministic segment
+ * Tests for src/shared/batch-segment-order.mts: deterministic segment
  * ordering for batched contract calls. Fake transactions stand in for the
  * ledger-v9 WASM objects; the contract under test is pure Map surgery plus
  * the proof-provider wrapper semantics.
  */
 
-import * as batchSegmentOrder from '../../srv/midnight/batch-segment-order';
+import * as batchSegmentOrder from '../../src/shared/batch-segment-order.mjs';
 
 // The fakes stand in for ledger objects, so the module is used untyped here.
 const {

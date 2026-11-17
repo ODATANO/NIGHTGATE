@@ -262,7 +262,7 @@ vi.mock('@sap/cds', () => {
 
 vi.mock('../../srv/utils/nightgate-config', () => ({
     resolveNightgateRuntimeConfig: vi.fn(() => ({ network: 'preprod' })),
-    getNightgatePluginConfig:      vi.fn(() => ({}))
+    getNightgateConfig:      vi.fn(() => ({}))
 }));
 
 // classifySubmissionError is the real implementation; it doesn't touch

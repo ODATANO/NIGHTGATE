@@ -1,5 +1,5 @@
 /* eslint-disable no-console -- docker's captured output is this process's only channel to the operator. */
-// Checks that NIGHTGATE works, not just that the port answers. The plugin keeps CAP alive while NIGHTGATE is offline.
+// Checks that NIGHTGATE works, not just that the port answers. CAP stays up while NIGHTGATE is offline.
 // `getReadiness()` answers 503 in that case. Any status but 2xx, including 401 and 404, counts as unhealthy.
 
 const PORT = process.env.PORT || '4004';

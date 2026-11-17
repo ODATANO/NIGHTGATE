@@ -15,7 +15,7 @@ import { normalizeIdentifier } from './crawler/transaction-identifiers';
 import { readCapBinary } from './crawler/cap-binary';
 import { extractLedgerPayload } from './crawler/ledger-payload';
 import { parseExtrinsicCall } from './utils/scale';
-import { getNightgatePluginConfig, resolveNightgateRuntimeConfig } from './utils/nightgate-config';
+import { getNightgateConfig, resolveNightgateRuntimeConfig } from './utils/nightgate-config';
 import { RateLimiter } from './utils/rate-limiter';
 import { configNumber } from './utils/config';
 import { rejectRateLimited } from './utils/rate-classes';
@@ -78,7 +78,7 @@ async function explorerHashOf(db: cds.DatabaseService, txHash: string | null | u
 }
 
 function indexerUrls(): string[] {
-    const { crawlerConfig, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgatePluginConfig());
+    const { crawlerConfig, submissionEndpoints } = resolveNightgateRuntimeConfig(getNightgateConfig());
     return [...new Set([String(crawlerConfig.indexerUrl || ''), submissionEndpoints.indexerHttpUrl].filter(Boolean))];
 }
 
@@ -463,7 +463,7 @@ export default class NightgateService extends cds.ApplicationService {
                 submittedAt: job.submittedAt,
                 startedAt: job.startedAt,
                 finishedAt: job.finishedAt,
-                receipt: receiptForJob(job, transactionHash, String(resolveNightgateRuntimeConfig(getNightgatePluginConfig()).network))
+                receipt: receiptForJob(job, transactionHash, String(resolveNightgateRuntimeConfig(getNightgateConfig()).network))
             };
         });
 

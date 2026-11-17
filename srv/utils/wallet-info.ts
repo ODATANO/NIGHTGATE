@@ -1,6 +1,6 @@
 // Derives a wallet's viewing key, addresses and attester id from a mnemonic or seed, without a session.
 // The derivation must match signing. The seed is never logged or returned, and secrets are wiped after use.
-import { persistentHash, CompactTypeBytes } from '@midnight-ntwrk/compact-runtime';
+import { computeAttesterId } from '@odatano/contract-kit';
 import { mnemonicToBip39SeedHex, deriveRoleSeeds, type RoleSeeds } from './wallet-hd';
 import { deriveAttestationSecret } from '../submission/contract-witnesses';
 import { loadLedger } from '../midnight/sdk-loader';
@@ -39,10 +39,10 @@ async function loadUnshielded(): Promise<typeof UnshieldedWallet> {
 
 
 /** The wallet's attester id. It is the same value the vault contract computes with `caller_id()`. */
-export function deriveAttesterId(zswapSeed: Uint8Array): string {
+export async function deriveAttesterId(zswapSeed: Uint8Array): Promise<string> {
     const secret = deriveAttestationSecret(zswapSeed);
     try {
-        return Buffer.from(persistentHash(new CompactTypeBytes(32), secret)).toString('hex');
+        return await computeAttesterId(secret);
     } finally {
         secret.fill(0);
     }
@@ -127,7 +127,7 @@ export async function deriveWalletInfo(opts: DeriveWalletInfoOptions): Promise<W
         }
 
         // The same on every network, and known before the wallet's first transaction.
-        const attesterId = deriveAttesterId(roleSeeds.zswap);
+        const attesterId = await deriveAttesterId(roleSeeds.zswap);
 
         return { viewingKey, shieldedAddress, nightAddress, dustAddress, attesterId, accountIndex, network: opts.network };
     } finally {

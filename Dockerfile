@@ -35,7 +35,7 @@ ENV NODE_ENV=production
 # default heap; override to match the container's memory limit.
 ENV NODE_OPTIONS=--max-old-space-size=8192
 ENV NIGHTGATE_DB_PATH=/data/nightgate.db
-# The plugin only initializes with an explicit network; mainnet is the image's default. The entrypoint
+# NIGHTGATE only starts with an explicit network; mainnet is the image's default. The entrypoint
 # refuses preprod and mainnet without NIGHTGATE_NODE_URL and NIGHTGATE_INDEXER_HTTP_URL (docs/self-hosted.md).
 ENV NIGHTGATE_NETWORK=mainnet
 # Attestation-server default: the verify surface is crawler-free, and a
@@ -50,7 +50,7 @@ RUN chmod +x /app/docker/entrypoint.sh && mkdir -p /data && chown node:node /dat
 USER node
 VOLUME /data
 EXPOSE 4004
-# docker/healthcheck.mjs asks getReadiness(), because the plugin keeps CAP alive while NIGHTGATE is offline.
+# docker/healthcheck.mjs asks getReadiness(), because CAP stays up while NIGHTGATE is offline.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
     CMD node /app/docker/healthcheck.mjs
 ENTRYPOINT ["/app/docker/entrypoint.sh"]

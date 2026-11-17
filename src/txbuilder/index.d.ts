@@ -127,7 +127,7 @@ export interface CreateTxBuilderInput {
     circuits?: string[];
     /** How long the transaction stays valid, default 30. The sponsor must submit it in that time. */
     ttlMinutes?: number;
-    attestationSecret?: Uint8Array;
+    attestationSecret?: Uint8Array; // 32 bytes; default derived from the seed; attestation vault only
     /**
      * `true` (default) syncs the wallet. This reads the whole chain and keeps a CPU core busy until it catches up.
      * `false` skips the sync. Calls that move no tokens, like all vault calls, work without it.
@@ -262,9 +262,9 @@ export type BuiltTransaction = BuiltBoundTransaction | BuiltUnboundTransaction;
 
 export interface TxBuilder {
     provingMode: 'wasm' | 'server';
-    /** Pass this to the `prepare*` helpers. */
+    /** Attestation vault only. Pass this to the `prepare*` helpers. */
     attestationSecret: Uint8Array;
-    /** The attester id (hex) that every attestation built here carries. */
+    /** Attestation vault only. The attester id (hex) that every attestation built here carries. */
     attesterId: string;
     zkAssets: ZkAssetResult;
     addresses: { night: string; shielded: string };

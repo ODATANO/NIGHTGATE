@@ -37,7 +37,7 @@ export const publicVerifyLane: TransportLane = {
     }
 };
 
-/** Registers both lanes at plugin load. Never throws, so a failure cannot crash the host app. */
+/** Registers both lanes when the server module loads. Never throws, so a failure cannot stop the server. */
 export function registerNightgateTransportLanes(): void {
     try {
         registerTransportLane(agentTokenLane);

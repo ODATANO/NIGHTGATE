@@ -3,7 +3,7 @@
 import cds from '@sap/cds';
 import { Documents, PredicateAttestations, Transactions, TransactionResults, type Transaction, type TransactionResult } from '#cds-models/midnight';
 import { getArtifactGenerationDigest } from '../contract-registry';
-import { resolveNightgateRuntimeConfig, getNightgatePluginConfig, mainnetSubmissionBlockReason } from '../../utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, getNightgateConfig, mainnetSubmissionBlockReason } from '../../utils/nightgate-config';
 import { WorkflowReconciliationRequiredError, type StartJobResult } from '../background-jobs';
 import { UINT64_MAX } from '../verify-state';
 import { effectiveSponsorPolicy, getGlobalSponsorPolicy, type SponsorPolicy } from '../sponsor-policy';
@@ -273,7 +273,7 @@ export function parseDocPairInputs(
  * WalletFacade config. Throws on an invalid network name, because the server keeps running after a failed init and must not fall back to a default network.
  */
 export function facadeConfigFromEnv() {
-    const nightgateConfig = getNightgatePluginConfig();
+    const nightgateConfig = getNightgateConfig();
     const { network, nodeUrl, submissionEndpoints, invalidNetwork } = resolveNightgateRuntimeConfig(nightgateConfig);
     if (invalidNetwork) {
         throw new Error(
@@ -299,7 +299,7 @@ export function artifactDigestOrNull(compiledRef: string): string | null {
 
 /** Rejects with 403 and returns true when mainnet submission is not allowed. Call it before any work. */
 export function rejectIfMainnetBlocked(req: ActionRequest<unknown, unknown>): boolean {
-    const reason = mainnetSubmissionBlockReason(getNightgatePluginConfig());
+    const reason = mainnetSubmissionBlockReason(getNightgateConfig());
     if (reason) {
         req.reject?.(403, reason);
         return true;

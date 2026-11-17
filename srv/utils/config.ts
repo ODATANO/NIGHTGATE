@@ -9,7 +9,7 @@ import {
 
 type WarnSink = (message: string) => void;
 
-// eslint-disable-next-line no-console -- cds-free module: the console is the sink until the host installs one
+// eslint-disable-next-line no-console -- cds-free module: the console is the sink until one is installed
 let warnSink: WarnSink = (message) => console.warn(`[nightgate:config] ${message}`);
 let overrideSource: (() => Record<string, unknown> | undefined | null) | undefined;
 let pinned: Record<string, ConfigValue> | undefined;
@@ -31,12 +31,12 @@ function pinFromWorkerDataOnce(): void {
     }
 }
 
-/** Sets where warnings about invalid values go. The plugin installs the cds logger. */
+/** Sets where warnings about invalid values go. `nightgate-config.ts` installs the cds logger. */
 export function setConfigWarnSink(sink: WarnSink): void {
     warnSink = sink;
 }
 
-/** Sets the source of the host app's `cds.requires.nightgate` config. It is read on every access. */
+/** Sets the source of the `cds.requires.nightgate` config. It is read on every access. */
 export function setConfigOverrideSource(source: (() => Record<string, unknown> | undefined | null) | undefined): void {
     overrideSource = source;
 }

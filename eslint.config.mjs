@@ -24,6 +24,8 @@ export default [
             'src/**/*.d.ts',
             'src/**/*.js.map',
             'src/**/*.d.ts.map',
+            'src/shared/*.mjs',
+            'src/shared/*.d.mts',
             'srv/**/*.js',
             'srv/**/*.d.ts',
             'srv/**/*.js.map',
@@ -55,7 +57,7 @@ export default [
         }
     },
     {
-        files: ['**/*.ts'],
+        files: ['**/*.ts', 'src/shared/*.mts'],
         languageOptions: { parser: tseslint.parser },
         plugins: { '@typescript-eslint': tseslint.plugin },
         rules: {

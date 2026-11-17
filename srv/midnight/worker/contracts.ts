@@ -14,7 +14,7 @@ import { ContractsSdkBundle, FacadeEntry, facades, loadContractsSdk, loadLedger,
 import { ArtifactContract, ContractRegistration, artifactAssetPath, generationCacheSize, getContractScaffold, onGenerationEvicted } from './artifacts';
 import { createPrivateStateProxy } from './private-state';
 import { BoundSubmitIntent, WorkerWalletProvider, buildSponsoredWalletProvider, buildWorkerWalletProvider } from './submit';
-import type * as CompactRuntime from '@midnight-ntwrk/compact-runtime';
+import { computeAttesterId, hexToBytes32 } from '@odatano/contract-kit';
 import type { CompiledContract, Witnesses } from '@midnight-ntwrk/compact-js';
 import type { Ledger9ContractProviders, Ledger9FoundContract } from '@midnight-ntwrk/midnight-js-contracts';
 import type { PrivateStateProvider, ProofProvider, PublicDataProvider, ZKConfigProvider } from '@midnight-ntwrk/midnight-js-types';
@@ -23,8 +23,7 @@ import { DEPLOY_ENTRY_POINT, resolveSponsorEntry } from './sponsor';
 /** Vault constructors take attester and recovery id as plain arguments, because witness reads exceed the node's cost limit. All-zero recovery id means none. */
 export async function deployConstructorArgs(contractName: string, entry: FacadeEntry, recoveryId?: string): Promise<unknown[]> {
     if (!contractName.startsWith('attestation-vault')) return [];
-    const rt: typeof CompactRuntime = await import('@midnight-ntwrk/compact-runtime');
-    const attesterId: Uint8Array = rt.persistentHash(new rt.CompactTypeBytes(32), entry.attestationSecret);
+    const attesterId = hexToBytes32(await computeAttesterId(entry.attestationSecret));
     const recovery = recoveryId ? Uint8Array.from(Buffer.from(recoveryId, 'hex')) : new Uint8Array(32);
     return [attesterId, recovery];
 }

@@ -1,7 +1,7 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.44.0",
-  "description": "CAP Plugin: Midnight Blockchain Indexer with OData V4 API",
+  "version": "0.45.0",
+  "description": "Midnight blockchain indexer and transaction service with an OData V4 API, built on SAP CAP",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
     "type": "git",
@@ -15,7 +15,6 @@
   "keywords": [
     "sap",
     "cap",
-    "cds-plugin",
     "midnight",
     "cardano",
     "blockchain",
@@ -39,8 +38,6 @@
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
     },
-    "./cds-plugin": "./cds-plugin.js",
-    "./cds-plugin.js": "./cds-plugin.js",
     "./package.json": "./package.json",
     "./types": {
       "types": "./srv/types/index.d.ts",
@@ -92,7 +89,6 @@
     }
   },
   "files": [
-    "cds-plugin.js",
     "db/schema.cds",
     "db/types.cds",
     "src/**/*.cds",
@@ -129,8 +125,7 @@
     "start": "npm run serve",
     "dev": "node scripts/dev.mjs",
     "dev:default-heap": "npm run cds:watch",
-    "build": "npm run build:plugin",
-    "build:plugin": "npm run cds:types && tsc -p tsconfig.build.json",
+    "build": "npm run cds:types && tsc -p tsconfig.build.json",
     "serve": "npm run cds:serve",
     "serve:sync": "node scripts/serve.mjs",
     "sync:start": "node --env-file=.env scripts/start-wallet-sync.mjs",
@@ -174,8 +169,8 @@
     "lint": "eslint . && node scripts/check-any-baseline.mjs",
     "check:release": "node scripts/release-stamp.mjs start && npm run build && npm run lint && npm run typecheck && npm test && npm run integration:schema-delta && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports && node scripts/release-stamp.mjs pass",
     "check:release:full": "npm run check:release && npm run integration:postgres",
-    "prepack": "npm run build:plugin",
-    "prepublishOnly": "(node scripts/release-stamp.mjs verified || npm run check:release) && npm run build:plugin",
+    "prepack": "npm run build",
+    "prepublishOnly": "(node scripts/release-stamp.mjs verified || npm run check:release) && npm run build",
     "integration:derive-wallet-info": "node --env-file=.env scripts/integration-test-derive-wallet-info.mjs",
     "integration:utxo-identity": "node scripts/integration-test-utxo-identity.mjs",
     "check:fresh-tree": "bash scripts/check-fresh-tree.sh",
@@ -223,7 +218,7 @@
     "@odatano/contract-attestation-vault-32": "0.2.0",
     "@odatano/contract-counter": "0.2.0",
     "@odatano/contract-holder-registry": "0.2.0",
-    "@odatano/contract-kit": "0.2.1",
+    "@odatano/contract-kit": "0.2.2",
     "@odatano/contract-shielded-token": "0.2.0",
     "@odatano/contract-token-factory": "0.2.0",
     "@polkadot/types": "^16.5.6",

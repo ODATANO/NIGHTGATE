@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.45.0 - 2026-11-17
+
+### Breaking
+
+- The CAP plugin mode is removed. `cds-plugin.js` and the exports
+  `./cds-plugin` and `./cds-plugin.js` are gone, so installing
+  `@odatano/nightgate` into a CAP application no longer adds the services.
+  Run the container image or a clone of the repository, see
+  `docs/self-hosted.md`.
+- The npm package keeps `/browser`, `/txbuilder`, `/client`, `/sdk`, the bins
+  and `db/*.cds`. The script `build:plugin` is now `build`.
+
+### Features
+
+- Browser export: `connectContract({ connector, contract, contractClass,
+  manifestUrl, contractAddress })` connects one contract through a DApp
+  connector wallet and returns `call(call)`, `batch(calls, opts?)` and
+  `deploy(input?)`. The wallet balances, pays and submits. It works for every
+  contract in the server's `/contract-manifest`.
+- A call is `{ circuitId, args?, witnesses?, before? }`, the shape the
+  `prepare*` helpers return.
+- `batch()` runs up to 8 calls in one transaction, in array order. A batch the
+  ledger would refuse fails before proving with `code:
+  'BatchCausalityViolation'` or `code: 'BatchGasBudgetExceeded'`.
+  `independentCalls` and `orderedPrefix` work as in `buildSponsorable`.
+- Browser export, from `@odatano/contract-kit` 0.2.2:
+  `prepareVaultBatch(calls, { attestationSecret })` returns the calls and the
+  one witnesses object of a vault batch, `computeAttesterId(attestationSecret)`
+  the attester id of an attestation secret.
+- `proofServerUrl` on `connectContract` and
+  `createNightgateConnectorProviders` names a proof server other than the one
+  the wallet reports.
+- `@odatano/nightgate-tx` 0.24.0: the same under
+  `@odatano/nightgate-tx/calls`.
+
+### Changes
+
+- The server, the builder and the browser export run the same batch code:
+  call order, causality check and gas check.
+
+No schema change, no circuit change. Docs: `docs/browser.md`.
+
 ## 0.44.0 - 2026-11-16
 
 ### Features

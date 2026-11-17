@@ -65,7 +65,7 @@ vi.mock('../../srv/submission/fee-sponsor', () => {
     return { resolveFeeSponsor: mockResolveFeeSponsor, FeeSponsorError, getConfiguredFeeSponsorSessions };
 });
 vi.mock('../../srv/utils/nightgate-config', () => ({
-    getNightgatePluginConfig: () => ({}),
+    getNightgateConfig: () => ({}),
     resolveNightgateRuntimeConfig: () => ({ crawlerConfig: { enabled: crawlerState.enabled } })
 }));
 

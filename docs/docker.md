@@ -76,7 +76,7 @@ NIGHTGATE_DB_URL=postgres://nightgate:$NIGHTGATE_PG_PASSWORD@nightgate-postgres:
   migrate --from /data/nightgate.db
 ```
 
-`migrate` waits for PostgreSQL up to `NIGHTGATE_DB_WAIT_SECONDS` (60), deploys the schema, copies every table and compares row counts. Flags: `--dry-run`, `--force` for a non-empty target, `--ignore-unknown` for unknown source tables. A plugin host runs `npx nightgate-db-migrate --from <file> --to <url>`. Keep the SQLite file until a backup and a smoke test of PostgreSQL succeed.
+`migrate` waits for PostgreSQL up to `NIGHTGATE_DB_WAIT_SECONDS` (60), deploys the schema, copies every table and compares row counts. Flags: `--dry-run`, `--force` for a non-empty target, `--ignore-unknown` for unknown source tables. From a clone, run `node scripts/migrate-sqlite-to-postgres.mjs --from <file> --to <url>`. Keep the SQLite file until a backup and a smoke test of PostgreSQL succeed.
 
 ## Health and watchdog
 

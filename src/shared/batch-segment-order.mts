@@ -1,6 +1,6 @@
 // The SDK numbers each call's segment at random, and the ledger applies calls by ascending number.
 // The proof provider is the last point to change the numbers, so the wrapper renumbers them there.
-import { errorMessage } from '../utils/errors';
+import { errorMessage } from './error-message.mjs';
 import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
 import type { ProofProvider, UnprovenTx } from '@midnight-ntwrk/midnight-js-types';
 
@@ -127,6 +127,22 @@ export function batchCallStages(tx: IntentsTx): BatchCallStage[] {
         segId: c.segId,
         stages: transcriptStages(tx.intents?.get(c.segId)?.actions?.[0])
     }));
+}
+
+const STAGES_LABEL = 'Stages in apply order:';
+
+/** Reads the call list back out of a batch order error, e.g. `Stages in apply order: callA=1158[f]`. */
+export function parseBatchCallStages(text: string): BatchCallStage[] {
+    const at = text.indexOf(STAGES_LABEL);
+    if (at < 0) return [];
+    const calls: BatchCallStage[] = [];
+    // The list ends at the first word of another shape, because the text may repeat the message.
+    for (const token of text.slice(at + STAGES_LABEL.length).trim().split(/\s+/)) {
+        const hit = /^(\S+?)=(\d+)\[([^\]]*)\]$/.exec(token);
+        if (!hit) break;
+        calls.push({ name: hit[1], segId: Number(hit[2]), stages: hit[3] });
+    }
+    return calls;
 }
 
 /** The message repeats `calls` because the SDK may pass on only the message. */
@@ -277,7 +293,7 @@ export function withOrderedBatchSegments<P extends Pick<ProofProvider, 'proveTx'
                 throw new BatchCausalityError(
                     `batch [${circuitsInOrder.join('+')}] violates the ledger's causality constraint: ${violation}. ` +
                     'Aborted before proving; nothing was submitted. ' +
-                    `Stages in apply order: ${calls.map(c => `${c.name}=${c.segId}[${c.stages}]`).join(' ')}`,
+                    `${STAGES_LABEL} ${calls.map(c => `${c.name}=${c.segId}[${c.stages}]`).join(' ')}`,
                     calls
                 );
             }

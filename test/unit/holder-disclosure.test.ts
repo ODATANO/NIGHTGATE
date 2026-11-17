@@ -24,7 +24,7 @@ const registryModule = require('../../srv/submission/holder-registry');
 const decodeWorker = require('../../srv/midnight/decode-worker-client');
 const verifyState = require('../../srv/submission/verify-state');
 const contractRegistry = require('../../srv/submission/contract-registry');
-const { getNightgatePluginConfig } = require('../../srv/utils/nightgate-config');
+const { getNightgateConfig } = require('../../srv/utils/nightgate-config');
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 const API = '/odata/v4/midnight';
@@ -49,7 +49,7 @@ async function post(action: string, body: Record<string, unknown>, headers: Reco
 
 describe('holder disclosure over HTTP', () => {
     beforeAll(async () => {
-        contractRegistry.loadRegistryFromConfig(getNightgatePluginConfig());
+        contractRegistry.loadRegistryFromConfig(getNightgateConfig());
         const db = await cds.connect.to('db');
         const now = new Date().toISOString();
         await db.run(cds.ql.INSERT.into('midnight.AgentGrants').entries({

@@ -12,6 +12,8 @@ export default defineConfig({
             // ESM-style relative imports with a `.js` extension (used by the
             // dynamic-import sites in srv/) → strip so the `.ts` source wins.
             { find: /^(\.{1,2}\/.*)\.js$/, replacement: '$1' },
+            // The same for `.mjs`, so a `.mts` source wins over its compiled twin.
+            { find: /^(\.{1,2}\/.*)\.mjs$/, replacement: '$1' },
             // cds-typer models; mirrors the tsconfig `#cds-models/*` path.
             {
                 find: /^#cds-models\/(.*)$/,

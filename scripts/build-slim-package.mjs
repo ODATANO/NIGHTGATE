@@ -47,6 +47,8 @@ const FILES = [
     { path: 'src/browser/private-state.mjs' },
     { path: 'src/browser/providers.mjs' },
     { path: 'src/browser/providers.d.mts' },
+    { path: 'src/browser/contract.mjs' },
+    { path: 'src/browser/contract.d.mts' },
     { path: 'src/browser/zk-config.mjs' },
     // helpers the builder requires by relative path (BUILD OUTPUT)
     { path: 'srv/utils/wallet-hd.js', buildOutput: true },
@@ -68,21 +70,25 @@ const FILES = [
     { path: 'srv/utils/offer-file.d.ts', buildOutput: true },
     { path: 'srv/utils/midnight-address.js', buildOutput: true },
     { path: 'srv/utils/midnight-address.d.ts', buildOutput: true },
-    // errorMessage(), imported by offer-file and batch-segment-order; no imports of its own
+    // errorMessage(), imported by offer-file; the function itself lives in src/shared
     { path: 'srv/utils/errors.js', buildOutput: true },
     { path: 'srv/utils/errors.d.ts', buildOutput: true },
+    { path: 'src/shared/error-message.mjs', buildOutput: true },
+    { path: 'src/shared/error-message.d.mts', buildOutput: true },
     { path: 'srv/midnight/runtime-config.js', buildOutput: true },
     { path: 'srv/midnight/runtime-config.d.ts', buildOutput: true },
     { path: 'srv/midnight/wasm-proof-provider.js', buildOutput: true },
     { path: 'srv/midnight/wasm-proof-provider.d.ts', buildOutput: true },
-    // Batch path: buildSponsorable({ calls }) requires the scope +
-    // segment-order helpers (dependency-clean, no CAP, no worker).
+    // Batch path: the scope runner, the segment order and the gas check.
+    // The builder and the browser runner load the same files.
     { path: 'srv/midnight/batch-call-scope.js', buildOutput: true },
     { path: 'srv/midnight/batch-call-scope.d.ts', buildOutput: true },
-    { path: 'srv/midnight/batch-segment-order.js', buildOutput: true },
-    { path: 'srv/midnight/batch-segment-order.d.ts', buildOutput: true },
-    { path: 'srv/midnight/batch-gas-preflight.js', buildOutput: true },
-    { path: 'srv/midnight/batch-gas-preflight.d.ts', buildOutput: true },
+    { path: 'src/shared/batch-call-scope.mjs', buildOutput: true },
+    { path: 'src/shared/batch-call-scope.d.mts', buildOutput: true },
+    { path: 'src/shared/batch-segment-order.mjs', buildOutput: true },
+    { path: 'src/shared/batch-segment-order.d.mts', buildOutput: true },
+    { path: 'src/shared/batch-gas-preflight.mjs', buildOutput: true },
+    { path: 'src/shared/batch-gas-preflight.d.mts', buildOutput: true },
     // the canonical membership-set rule (a public subpath of the main
     // package); a re-export of @odatano/contract-kit.
     { path: 'srv/submission/set-root.js', buildOutput: true },

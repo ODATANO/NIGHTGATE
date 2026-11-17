@@ -25,7 +25,7 @@ function step(n) { console.log(`\n--- ${n} ---`); }
 if (!VAULT) fail('NIGHTGATE_VAULT (the shared vault address) is required');
 if (!INDEXER_HTTP) fail('NIGHTGATE_INDEXER_HTTP_URL is required');
 if (!NODE_URL) fail('NIGHTGATE_NODE_URL is required');
-// Use the plugin's own derivation: the indexer path is versioned (/api/v4/…),
+// Use the server's own derivation: the indexer path is versioned (/api/v4/…),
 // so a hand-rolled regex silently drops the /ws suffix and the wallet never syncs.
 const { deriveIndexerWsUrl } = require('../srv/utils/nightgate-config.js');
 const INDEXER_WS = process.env.NIGHTGATE_INDEXER_WS_URL || deriveIndexerWsUrl(INDEXER_HTTP);

@@ -6,12 +6,14 @@ export {
     generateAttestationSecret,
     sealAttestationSecret,
     openAttestationSecret,
+    computeAttesterId,
     buildAttestationVaultWitnesses
 } from './witnesses.mjs';
 
 export { FetchZkConfigProvider } from './zk-config.mjs';
 export { InMemoryPrivateStateProvider } from './private-state.mjs';
 export { createNightgateConnectorProviders, buildProofProvider, resolveManifestUrl } from './providers.mjs';
+export { connectContract } from './contract.mjs';
 export {
     prepareRevokeDisclosure,
     prepareGrantDisclosure,
@@ -30,7 +32,8 @@ export {
     prepareProveFieldEquality,
     prepareProveFieldMembership,
     prepareProveFieldsUnchangedExcept,
-    prepareProveFieldsDiffer
+    prepareProveFieldsDiffer,
+    prepareVaultBatch
 } from './attestation-vault-calls.mjs';
 
 /** Fixed facts about the shipped contracts. Address and key URL come from the server's `/contract-manifest` route. */

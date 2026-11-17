@@ -39,7 +39,7 @@ try {
     process.exit(1);
 }
 
-// --- Register the same contracts the plugin config ships -------------------
+// --- Register the same contracts the default config ships ------------------
 const { resolveContractPackage } = await import('@odatano/contract-kit/node');
 const counterPkg = resolveContractPackage('@odatano/contract-counter', repoRoot);
 const vaultPkg   = resolveContractPackage('@odatano/contract-attestation-vault', repoRoot);

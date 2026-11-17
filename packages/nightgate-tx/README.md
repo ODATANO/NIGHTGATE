@@ -60,6 +60,27 @@ const proof = await ng.prepareDocumentProof({ document: doc, proofFields: [{ fie
 - Auth is one of `agentToken` (`ngat_...`, sent as `x-agent-token`), `token` (Bearer) or `username` with `password` (Basic). The public verify route needs none.
 - A refused call throws `NightgateApiError` with `status`, `code` and, on 429 and retryable 503, `retryAfterSeconds`. `isRetryable(err)` says whether to repeat it.
 
+## In the browser, the wallet pays
+
+```js
+import { connectContract } from '@odatano/nightgate-tx/calls';
+import { Contract } from './managed/counter/contract/index.js';
+
+const connector = await window.midnight.mnLace.connect('preprod');
+const counter = await connectContract({
+    connector,
+    contract: 'counter',            // its name in the server's manifest
+    contractClass: Contract,
+    manifestUrl: 'https://gateway.example/contract-manifest',
+    contractAddress: COUNTER
+});
+const tx = await counter.call({ circuitId: 'increment' });
+```
+
+- `call`, `batch` and `deploy` work for every contract the server lists. The wallet balances, pays and submits.
+- The `prepare*` helpers return a call, so their result goes straight into `call()` and `batch()`.
+- Reference: [`docs/browser.md`](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/browser.md).
+
 ## What else the builder does
 
 The reference is [`docs/txbuilder.md`](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md).
@@ -82,7 +103,7 @@ The reference is [`docs/txbuilder.md`](https://github.com/ODATANO/NIGHTGATE/blob
 | `@odatano/nightgate-tx` | `connect` and `createTxBuilder` |
 | `@odatano/nightgate-tx/client` | the hosted-endpoint client alone |
 | `@odatano/nightgate-tx/txbuilder` | the builder, the swap wallet, offer files, holder and token-factory helpers, submission helpers |
-| `@odatano/nightgate-tx/calls` | the `prepare*` call builders, witnesses, attestation-secret helpers |
+| `@odatano/nightgate-tx/calls` | `connectContract` for the browser, the `prepare*` call builders, witnesses, attestation-secret helpers |
 | `@odatano/nightgate-tx/attestation-vault` | the 16-slot vault's contract class and pure circuits |
 | `@odatano/nightgate-tx/attestation-vault-32` | the 32-slot vault. Pass `slotWidth: 32` to the `prepare*` helpers |
 | `@odatano/nightgate-tx/set-root` | the canonical membership-set rule |
@@ -100,8 +121,9 @@ The reference is [`docs/txbuilder.md`](https://github.com/ODATANO/NIGHTGATE/blob
 ## Related
 
 Generated from the [`@odatano/nightgate`](https://www.npmjs.com/package/@odatano/nightgate)
-tree, so call builders and witnesses are the code the server runs. Install the
-full plugin for the indexer, OData services and sponsor side. For MCP clients:
+tree, so call builders and witnesses are the code the server runs. The indexer,
+the OData services and the sponsor side are the NIGHTGATE server, see
+[self-hosted](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/self-hosted.md). For MCP clients:
 [`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP).
 
 Apache-2.0

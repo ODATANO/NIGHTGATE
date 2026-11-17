@@ -11,7 +11,7 @@ import { MidnightNodeProvider, SignedBlock } from '../providers/MidnightNodeProv
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { isUniqueViolation } from '../utils/db-errors';
 import {
-    getNightgatePluginConfig, getConfiguredNightgateNetwork, normalizeNightgateNetwork
+    getNightgateConfig, getConfiguredNightgateNetwork, normalizeNightgateNetwork
 } from '../utils/nightgate-config';
 import { parseExtrinsicCallIndices, parseExtrinsicCall, decodeCompactBigInt } from '../utils/scale';
 import {
@@ -92,7 +92,7 @@ const DEFAULT_PALLET_MAP: Record<number, PalletMapping> = {
 /** Entries from `cds.requires.nightgate.palletMap` override both the defaults and the runtime metadata. */
 function configPalletOverrides(): Map<number, PalletMapping> {
     const map = new Map<number, PalletMapping>();
-    const nightgateConfig = getNightgatePluginConfig();
+    const nightgateConfig = getNightgateConfig();
     const configMap = nightgateConfig.palletMap;
     if (configMap && typeof configMap === 'object') {
         for (const [idx, entry] of Object.entries(configMap)) {
@@ -644,7 +644,7 @@ export class BlockProcessor {
     private network(): string {
         if (!this.resolvedNetwork) {
             this.resolvedNetwork = normalizeNightgateNetwork(
-                getConfiguredNightgateNetwork(getNightgatePluginConfig())
+                getConfiguredNightgateNetwork(getNightgateConfig())
             ).network;
         }
         return this.resolvedNetwork;

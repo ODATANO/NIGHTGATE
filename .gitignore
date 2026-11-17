@@ -35,6 +35,10 @@ src/**/*.d.ts.map
 !src/sdk/client.d.ts
 !src/sdk/index.d.ts
 !src/txbuilder/index.d.ts
+# src/shared is TypeScript (.mts) that compiles to ES modules for the server, the txbuilder and the browser.
+src/shared/*.mjs
+src/shared/*.d.mts
+src/shared/*.mjs.map
 srv/**/*.js
 srv/**/*.d.ts
 srv/**/*.js.map

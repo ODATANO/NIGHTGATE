@@ -5,7 +5,7 @@ import cds from '@sap/cds';
 import { SwapOffers, BackgroundJobs } from '#cds-models/midnight';
 import type { DbRunner } from '../utils/db-types';
 import { getConfiguredFeeSponsorSessions } from './fee-sponsor';
-import { getNightgatePluginConfig } from '../utils/nightgate-config';
+import { getNightgateConfig } from '../utils/nightgate-config';
 import { loadSigningSessionAccountId } from '../sessions/wallet-session-lifecycle';
 import { walletGetSyncProgress } from '../midnight/wallet-worker-client';
 import { syncGateReading } from './sponsor-sync-gate';
@@ -74,7 +74,7 @@ async function computeBoardStatus(db: DbRunner, now: Date): Promise<BoardStatus>
         // Jobs that finished today without a chain failure. Some may not be confirmed on chain yet.
         countRows(db, SELECT.one.from(BackgroundJobs).columns('count(*) as count').where({ kind: 'sponsorSwap', status: 'succeeded' }).and("chainStatus is null or chainStatus != 'failure'").and('finishedAt >=', dayStart))
     ]);
-    const sponsorIds = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+    const sponsorIds = getConfiguredFeeSponsorSessions(getNightgateConfig());
     const sponsorsReady = sponsorIds.length ? await countReadySponsors(db, sponsorIds) : 0;
     const factoryContract = String(configString('NIGHTGATE_TOKEN_FACTORY_CONTRACT') ?? '').trim().toLowerCase() || null;
     return { openOffers, offersFilledToday, swapsToday, sponsorsConfigured: sponsorIds.length, sponsorsReady, factoryContract, version: packageVersion(), asOf: nowIso };

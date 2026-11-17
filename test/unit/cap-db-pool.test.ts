@@ -1,9 +1,9 @@
-// The CAP connection pool the plugin runs on. @cap-js/db-service's built-in
+// The CAP connection pool NIGHTGATE runs on. @cap-js/db-service's built-in
 // Pool loses a resource when it dispenses one to a request that already timed
 // out (generic-pool.js `#dispense`, non-pending branch: neither loaned nor
 // returned to `_available`); under load the pool empties and every request
-// fails with "Pool resource could not be acquired". The plugin therefore
-// selects `generic-pool` (features.use_generic_pool) unless the host decided.
+// fails with "Pool resource could not be acquired". NIGHTGATE therefore
+// selects `generic-pool` (features.use_generic_pool) unless the config decided.
 // The first test pins the upstream defect against the installed version: when
 // it starts failing, the workaround can go.
 import { describe, it, expect } from 'vitest';
@@ -50,13 +50,13 @@ describe('CAP db connection pool under acquire timeouts', () => {
         expect(s.available).toBe(1);                      // 2 released, 1 usable: the leak
     });
 
-    it('generic-pool (selected by the plugin): every released resource is available again', async () => {
+    it('generic-pool (selected by default): every released resource is available again', async () => {
         const s = await leakAfterTimedOutRequest(makePool(true));
         expect(s.borrowed).toBe(0);
         expect(s.available).toBe(2);
     });
 
-    it('the plugin defaults features.use_generic_pool to true and leaves an explicit host choice alone', async () => {
+    it('features.use_generic_pool defaults to true and an explicit choice is left alone', async () => {
         const { applyPoolDefault } = await import('../../src/cap-pool-default.js');
         const fresh: { features?: Record<string, unknown> } = {};
         expect(applyPoolDefault(fresh)).toBe(true);

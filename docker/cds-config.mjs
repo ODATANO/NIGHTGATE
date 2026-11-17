@@ -85,7 +85,7 @@ export function postgresKind() {
     return kind;
 }
 
-// CAP logs every request header except the masked ones. The image adds the agent token here, so the mask holds before the plugin loads.
+// CAP logs every request header except the masked ones. The image adds the agent token here, so the mask holds before the server module loads.
 export const LOG_MASK_HEADERS = ['/authorization/i', '/cookie/i', '/cert/i', '/ssl/i', '/api-key/i', '/x-agent-token/i'];
 
 /** With `dbOnly` it returns only the database binding, for the image's `migrate` mode. */
@@ -95,8 +95,8 @@ export function cdsConfig(env = process.env, { dbOnly = false } = {}) {
     const log = { mask_headers: LOG_MASK_HEADERS };
     if (db.kind === 'postgres') {
         requires.kinds = { postgres: postgresKind() };
-        // The plugin sets the same default at load; the image states it
-        // explicitly so `cds deploy` (no plugin hooks) uses the same pool.
+        // srv/server.ts sets the same default at load. The image states it
+        // explicitly so `cds deploy`, which does not load it, uses the same pool.
         return { features: { use_generic_pool: true }, log, requires };
     }
     return { log, requires };

@@ -122,7 +122,7 @@ describe('transport lanes', () => {
         expect(delegate).toHaveBeenCalledTimes(1);
     });
 
-    test('registering after the middleware was built logs instead of throwing (a plugin must not take the host down)', () => {
+    test('registering after the middleware was built logs instead of throwing (a late registration must not stop the server)', () => {
         const spy = vi.spyOn(cds.log('nightgate'), 'error').mockImplementation(() => undefined as never);
         registerNightgateTransportLanes(); // the registry froze in createTransportAuth
         expect(spy).toHaveBeenCalledWith(expect.stringContaining('transport lanes not registered'));

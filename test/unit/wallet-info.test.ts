@@ -46,30 +46,30 @@ describe('resolveBip39SeedHex', () => {
 describe('deriveAttesterId', () => {
     const zswapSeed = () => Uint8Array.from(Array(32).fill(1));
 
-    test('pins the golden vector (formula stability across releases)', () => {
+    test('pins the golden vector (formula stability across releases)', async () => {
         // caller_id() = persistentHash<Bytes<32>>(local_secret_key()), with the
         // secret from deriveAttestationSecret; the vault's attestation_owners
         // entry for a payload equals this derivation of the attester's zswap seed.
-        expect(deriveAttesterId(zswapSeed()))
+        expect(await deriveAttesterId(zswapSeed()))
             .toBe('7961a1e00d6341753fb38beb513ea72ea5e3cd990df81fb1435b1df9445814fe');
     });
 
-    test('equals persistentHash(Bytes<32>) of the witness secret', () => {
+    test('equals persistentHash(Bytes<32>) of the witness secret', async () => {
         const secret = deriveAttestationSecret(zswapSeed());
         const expected = Buffer.from(persistentHash(new CompactTypeBytes(32), secret)).toString('hex');
-        expect(deriveAttesterId(zswapSeed())).toBe(expected);
+        expect(await deriveAttesterId(zswapSeed())).toBe(expected);
     });
 
-    test('does not mutate the caller-owned seed', () => {
+    test('does not mutate the caller-owned seed', async () => {
         const seed = zswapSeed();
-        deriveAttesterId(seed);
+        await deriveAttesterId(seed);
         expect(Array.from(seed)).toEqual(Array(32).fill(1));
     });
 
-    test('is deterministic and seed-sensitive', () => {
-        expect(deriveAttesterId(zswapSeed())).toBe(deriveAttesterId(zswapSeed()));
+    test('is deterministic and seed-sensitive', async () => {
+        expect(await deriveAttesterId(zswapSeed())).toBe(await deriveAttesterId(zswapSeed()));
         const other = Uint8Array.from(Array(32).fill(2));
-        expect(deriveAttesterId(other)).not.toBe(deriveAttesterId(zswapSeed()));
+        expect(await deriveAttesterId(other)).not.toBe(await deriveAttesterId(zswapSeed()));
     });
 });
 

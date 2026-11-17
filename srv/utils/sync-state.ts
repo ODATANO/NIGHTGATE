@@ -4,7 +4,7 @@ import { isUniqueViolation } from './db-errors';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 
 import { SyncState, Blocks } from '#cds-models/midnight';
-import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig, getNightgatePluginConfig } from './nightgate-config';
+import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig, getNightgateConfig } from './nightgate-config';
 import { redactUrlCredentials } from './redact-url';
 
 import { configString } from './config';
@@ -27,7 +27,7 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
     );
 
     if (existing) {
-        const nightgateConfig = getNightgatePluginConfig();
+        const nightgateConfig = getNightgateConfig();
         const { network } = resolveNightgateRuntimeConfig(nightgateConfig);
         if (existing.networkId && existing.networkId !== network) {
             throw new SyncStateNetworkMismatchError(existing.networkId, network);
@@ -58,7 +58,7 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
 
     {
         try {
-            const nightgateConfig = getNightgatePluginConfig();
+            const nightgateConfig = getNightgateConfig();
             const { network } = resolveNightgateRuntimeConfig(nightgateConfig);
             const configuredNodeUrl = getConfiguredNightgateNodeUrl(nightgateConfig);
             await db.run(INSERT.into(SyncState).entries({

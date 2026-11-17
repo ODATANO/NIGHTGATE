@@ -6,8 +6,8 @@
 import { describe, it, expect } from 'vitest';
 import { classifySubmitFailure, isPreMempoolFailure, parseBatchCallStages, causeMessages, SponsorRefusalError } from '../../srv/midnight/submit-error-classification';
 import { WorkerSubmitError, carriedSubmitFailure, SUBMIT_FAILURE_CODES } from '../../srv/midnight/wallet-worker-protocol';
-import { BatchCausalityError } from '../../srv/midnight/batch-segment-order';
-import { BatchGasBudgetError } from '../../srv/midnight/batch-gas-preflight';
+import { BatchCausalityError } from '../../src/shared/batch-segment-order.mjs';
+import { BatchGasBudgetError } from '../../src/shared/batch-gas-preflight.mjs';
 import { NightgateError } from '../../srv/utils/errors';
 
 /** The SDK shape: generic wrappers on top, the node's line in the innermost cause. */

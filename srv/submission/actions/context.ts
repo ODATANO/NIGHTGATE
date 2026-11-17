@@ -6,7 +6,7 @@ import { resolveContract, type ResolvedContract } from '../contract-registry';
 import { attesterIdForSession, SessionNotFoundError, type WalletMaterialFactory } from '../wallet-material-factory';
 import { resolveFeeSponsor, type ResolvedFeeSponsor } from '../fee-sponsor';
 import { loadCircuitArgTypes } from '../arg-coercion';
-import { resolveNightgateRuntimeConfig, type NightgateNetwork, VALID_NIGHTGATE_NETWORKS, getConfiguredPrivateStateBackend, getNightgatePluginConfig } from '../../utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, type NightgateNetwork, VALID_NIGHTGATE_NETWORKS, getConfiguredPrivateStateBackend, getNightgateConfig } from '../../utils/nightgate-config';
 import { type ContractProvidersConfig } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
 import { reindexDisclosuresForContract } from '../disclosure-indexer';
@@ -238,7 +238,7 @@ export function createSubmissionSupport(deps: Pick<SubmissionDeps, 'db' | 'attes
         wallet: import('../../midnight/providers').WalletMaterial,
         sponsorAccountId?: string
     ): TransactionSubmitterDeps {
-        const nightgateConfig = getNightgatePluginConfig();
+        const nightgateConfig = getNightgateConfig();
         const { network, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
         const privateStateBackend = getConfiguredPrivateStateBackend(nightgateConfig);
 
@@ -267,7 +267,7 @@ export function createSubmissionSupport(deps: Pick<SubmissionDeps, 'db' | 'attes
             db,
             sponsorSessionId,
             requestingUserId: req.user?.id,
-            config: getNightgatePluginConfig()
+            config: getNightgateConfig()
         });
     }
 

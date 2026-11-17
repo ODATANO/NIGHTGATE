@@ -59,7 +59,7 @@ vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     getWalletWorkerStatus: mockWorkerStatus
 }));
 
-// Readiness reads the plugin's initialisation state from the flat holder in
+// Readiness reads the initialisation state from the flat holder in
 // srv/utils, which src/index publishes into. No cycle, no SDK graph.
 const mockGetStatus = vi.hoisted(() => vi.fn(() => ({ initialized: true, mode: 'active' })));
 const mockPrewarm = vi.hoisted(() => vi.fn(() => ({ running: false, total: 0, warmed: 0, failed: 0, startedAt: null, finishedAt: null })));
@@ -68,10 +68,10 @@ vi.mock('../../srv/utils/runtime-state', () => ({ readRuntimeState: mockGetStatu
 const mockListFacades = vi.hoisted(() => vi.fn(() => [] as string[]));
 vi.mock('../../srv/submission/wallet-facade-builder', () => ({ listWalletFacades: mockListFacades }));
 
-const mockPluginConfig = vi.hoisted(() => vi.fn(() => ({})));
+const mockConfig = vi.hoisted(() => vi.fn(() => ({})));
 const mockRuntimeConfig = vi.hoisted(() => vi.fn(() => ({ crawlerConfig: { enabled: true } })));
 vi.mock('../../srv/utils/nightgate-config', () => ({
-    getNightgatePluginConfig: mockPluginConfig,
+    getNightgateConfig: mockConfig,
     resolveNightgateRuntimeConfig: mockRuntimeConfig,
     getConfiguredNightgateNetwork: () => 'preprod',
     resolveEffectiveProvingMode: () => 'wasm'
@@ -237,8 +237,8 @@ describe('buildReadiness', () => {
     });
 
     it('is NOT ready while the process has not finished initialising', async () => {
-        // The startup phase, SKIP_AUTO_INIT, a host that never started the
-        // plugin, and the state after shutdown() all look like mode 'idle'.
+        // The startup phase, SKIP_AUTO_INIT, a server without a network
+        // and the state after shutdown() all look like mode 'idle'.
         // None of them can serve, so the load-bearing bit is `initialized`,
         // not the mode: a successful crawler-less start publishes
         // initialized:true with the very same 'idle'.

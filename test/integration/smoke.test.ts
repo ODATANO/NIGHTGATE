@@ -1,5 +1,5 @@
 /**
- * Harness smoke test: cds.test() boots the NIGHTGATE plugin against an
+ * Harness smoke test: cds.test() boots NIGHTGATE against an
  * in-memory SQLite DB, deploys the schema, and serves the OData services,
  * with the crawler + wallet worker skipped via SKIP_AUTO_INIT (vitest.setup.ts).
  */

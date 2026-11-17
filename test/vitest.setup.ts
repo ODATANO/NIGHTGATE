@@ -4,7 +4,7 @@
  * Mirrors the ODATANO core harness:
  *  - NO_TELEMETRY: stop the telemetry cds-plugin from loading.
  *  - SKIP_AUTO_INIT: the cds.test() server still serves all OData services, but
- *    src/plugin.ts skips initialize() (crawler + wallet worker thread) so tests
+ *    srv/server.ts skips initialize() (crawler + wallet worker thread) so tests
  *    run against the in-memory DB without live side-effects.
  *  - cds.User.default = Privileged: service-level @requires (e.g. 'admin') pass
  *    without supplying auth headers on every request.

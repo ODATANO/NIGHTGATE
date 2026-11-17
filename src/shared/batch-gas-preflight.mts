@@ -1,7 +1,7 @@
 // Applies an unproven batch to a local ledger before proving, the way the node will.
 // Only a gas failure stops the build. Any other failure, or a state that cannot be read, lets it go on.
-import { errorMessage } from '../utils/errors';
-import { describeBatchSegments } from './batch-segment-order';
+import { errorMessage } from './error-message.mjs';
+import { describeBatchSegments } from './batch-segment-order.mjs';
 import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
 import type { PublicDataProvider } from '@midnight-ntwrk/midnight-js-types';
 

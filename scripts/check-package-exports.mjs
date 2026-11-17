@@ -62,7 +62,7 @@ for (const { subpath, target } of targets) {
 }
 
 // Every hand-written packed file must be tracked by git, or a fresh checkout lacks it.
-// Build output next to a .ts source is untracked on purpose.
+// Build output next to a .ts or .mts source is untracked on purpose.
 let tracked;
 try {
     tracked = new Set(
@@ -77,10 +77,10 @@ if (tracked) {
     const untrackedSources = new Set();
     for (const rel of packed) {
         if (tracked.has(rel)) continue;
-        // tsc output must have its .ts source tracked, or a fresh checkout cannot build it.
+        // tsc output must have its .ts or .mts source tracked, or a fresh checkout cannot build it.
         // cds-typer output is generated at build time and not committed.
         if (rel.startsWith('@cds-models/')) continue;
-        const fromTs = rel.replace(/\.(js|d\.ts|js\.map|d\.ts\.map)$/, '.ts');
+        const fromTs = rel.replace(/\.(js|d\.ts|js\.map|d\.ts\.map)$/, '.ts').replace(/\.(mjs|d\.mts|mjs\.map)$/, '.mts');
         if (fromTs !== rel && existsSync(fromTs)) {
             if (tracked.has(fromTs)) continue;
             untrackedSources.add(fromTs);

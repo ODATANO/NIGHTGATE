@@ -6,7 +6,7 @@
  */
 
 import * as batchCallScope from '../../srv/midnight/batch-call-scope';
-import { __unprovenTxCodecForTests } from '../../srv/midnight/batch-segment-order';
+import { __unprovenTxCodecForTests } from '../../src/shared/batch-segment-order.mjs';
 
 // The fakes stand in for the contracts SDK and ledger objects, so the module is used untyped here.
 const { lastCallSegmentId, runBatchInScope } = batchCallScope as any;
@@ -32,7 +32,7 @@ function makeFakes() {
         withContractScopedTransaction: vi.fn(async (providers: unknown, fn: (ctx: unknown) => Promise<void>, options: any) => {
             expect(providers).toBe(PROVIDERS);
             await fn(txCtx);
-            return { public: { txHash: '0xbatch', status: 'SucceedEntirely' }, options };
+            return { public: { txId: 'id-batch', txHash: '0xbatch', status: 'SucceedEntirely' }, options };
         })
     };
     return { invoked, txCtx, found, contracts };
@@ -50,6 +50,7 @@ describe('runBatchInScope', () => {
         const out = await runBatchInScope(contracts, PROVIDERS, found, calls, ADDR);
 
         expect(out).toEqual({
+            txId: 'id-batch',
             txHash: '0xbatch',
             blockHeight: null,
             onChainStatus: 'SucceedEntirely',
@@ -117,7 +118,7 @@ describe('runBatchInScope', () => {
             })
         };
         const out = await runBatchInScope(contracts, PROVIDERS, found, [{ circuit: 'attest', args: [] }], ADDR);
-        expect(out).toEqual({ txHash: '', onChainStatus: '', blockHeight: null, circuits: ['attest'] });
+        expect(out).toEqual({ txId: '', txHash: '', onChainStatus: '', blockHeight: null, circuits: ['attest'] });
     });
 
     test('invokes a call entry\'s before() hook immediately before ITS callTx, in call order', async () => {

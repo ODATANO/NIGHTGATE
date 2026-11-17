@@ -7,7 +7,7 @@ import { startJob } from '../background-jobs';
 import { HEX64_RE } from '../../utils/hex';
 import { configString } from '../../utils/config';
 import { getConfiguredFeeSponsorSessions } from '../fee-sponsor';
-import { getNightgatePluginConfig } from '../../utils/nightgate-config';
+import { getNightgateConfig } from '../../utils/nightgate-config';
 import { PLATFORM_POOL_SENTINEL } from '../sponsor-pool';
 
 import { facadeConfigFromEnv, rejectIfMainnetBlocked, runSubmission, takeValueBudget } from './common';
@@ -29,7 +29,7 @@ function factoryAddressFor(req: Request, raw: unknown): string | undefined {
 function mintSessionFor(req: Request, raw: unknown): { sessionId: string; ownerUserId: string | undefined } | undefined {
     if (raw) return { sessionId: String(raw), ownerUserId: req.user?.id };
     if (!req.agentGrant) { req.reject(400, 'sessionId is required'); return undefined; }
-    const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+    const pool = getConfiguredFeeSponsorSessions(getNightgateConfig());
     const pinned = req.agentGrant.sponsorSessionId;
     const sessionId = pinned && pinned !== PLATFORM_POOL_SENTINEL ? String(pinned) : pool[0];
     if (!sessionId) { req.reject(503, 'no fee sponsor is configured on this server (NIGHTGATE_FEE_SPONSOR_SESSION), so there is no session to mint from'); return undefined; }

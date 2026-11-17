@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { NightgateError } from './errors';
 import cds from '@sap/cds';
-import type { NightgatePluginConfig } from './nightgate-config';
+import type { NightgateConfig } from './nightgate-config';
 import { configString, configInt, configFlag } from './config';
 import { isProduction } from './production';
 
@@ -38,7 +38,7 @@ function positiveInteger(value: unknown): number | undefined {
     return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-function configuredReplicaCount(config: NightgatePluginConfig): number {
+function configuredReplicaCount(config: NightgateConfig): number {
     // WEB_CONCURRENCY is ignored on purpose. It counts worker processes inside one instance, not instances.
     return configInt('NIGHTGATE_REPLICA_COUNT')
         ?? positiveInteger(process.env.CF_INSTANCE_COUNT)
@@ -78,12 +78,12 @@ function authKind(): string {
     return String(cds.env.requires?.auth?.kind ?? '');
 }
 
-function allowProductionSqlite(config: NightgatePluginConfig): boolean {
+function allowProductionSqlite(config: NightgateConfig): boolean {
     return configFlag('NIGHTGATE_ALLOW_PRODUCTION_SQLITE')
         || config.allowProductionSqlite === true;
 }
 
-export function getRuntimeTopology(config: NightgatePluginConfig = {}): RuntimeTopology {
+export function getRuntimeTopology(config: NightgateConfig = {}): RuntimeTopology {
     const requestedMode = config.runtimeMode ?? NIGHTGATE_RUNTIME_MODE;
     const replicaCount = configuredReplicaCount(config);
     const multitenancy = multitenancyEnabled();
@@ -135,7 +135,7 @@ export function getRuntimeTopology(config: NightgatePluginConfig = {}): RuntimeT
     };
 }
 
-export function assertSupportedRuntimeTopology(config: NightgatePluginConfig = {}): RuntimeTopology {
+export function assertSupportedRuntimeTopology(config: NightgateConfig = {}): RuntimeTopology {
     const topology = getRuntimeTopology(config);
     if (!topology.valid) throw new UnsupportedRuntimeTopologyError(topology);
     return topology;

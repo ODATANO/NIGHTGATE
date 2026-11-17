@@ -3,7 +3,7 @@
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
 import { resolveFeeSponsor } from '../fee-sponsor';
-import { getNightgatePluginConfig } from '../../utils/nightgate-config';
+import { getNightgateConfig } from '../../utils/nightgate-config';
 import { startJob } from '../background-jobs';
 import { PLATFORM_POOL_SENTINEL } from '../sponsor-pool';
 import { resolveSponsorPolicyForRequest } from '../sponsor-policy';
@@ -50,7 +50,7 @@ async function rejectUnlessProven(req: Request, describe: () => Promise<unknown>
 function sponsorSessionFor(req: Request): string | undefined {
     const pinned = req.agentGrant?.sponsorSessionId;
     if (pinned && pinned !== PLATFORM_POOL_SENTINEL) return String(pinned);
-    if (getConfiguredFeeSponsorSessions(getNightgatePluginConfig()).length === 0) {
+    if (getConfiguredFeeSponsorSessions(getNightgateConfig()).length === 0) {
         req.reject(503, 'no fee sponsor is configured on this server (NIGHTGATE_FEE_SPONSOR_SESSION)');
         return undefined;
     }
@@ -70,7 +70,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         // A pinned sponsor is checked here only against its database row. Loading its wallet is slow
         // and happens when the job runs. Pool jobs skip this, so one broken pool wallet cannot block requests.
         if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
-            await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: req.user?.id, config: getNightgatePluginConfig() });
+            await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: req.user?.id, config: getNightgateConfig() });
         }
         const caller = String(req.user?.id ?? 'anonymous');
         return {

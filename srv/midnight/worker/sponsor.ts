@@ -6,7 +6,7 @@
 import { configNumber, configMs } from '../../utils/config';
 import { errorMessage } from '../../utils/errors';
 import { throwIfRpcCancelled } from './cancellation';
-import { callSegments } from '../batch-segment-order';
+import { callSegments } from '../../../src/shared/batch-segment-order.mjs';
 import { SponsorRefusalError } from '../submit-error-classification';
 
 import { type MerkleProofBundle } from '../../submission/contract-witnesses';

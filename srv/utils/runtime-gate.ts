@@ -1,4 +1,4 @@
-// Refuses write actions with a retryable 503 until the plugin has started. Reads stay available.
+// Refuses write actions with a retryable 503 until NIGHTGATE has started. Reads stay available.
 // Accepting writes earlier would leave half-written state.
 import cds from '@sap/cds';
 import { isBackgroundFenced } from './instance-lease';

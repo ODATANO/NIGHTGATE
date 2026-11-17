@@ -1,4 +1,4 @@
-// The plugin startup state. `src/index.ts` writes it and code in srv/ reads it.
+// The startup state of NIGHTGATE. `src/index.ts` writes it and code in srv/ reads it.
 // It is a separate module because importing `src/index.ts` from srv/ would create an import cycle and load the Midnight SDK.
 
 export interface RuntimeState {

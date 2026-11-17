@@ -4,7 +4,7 @@ import cds from '@sap/cds';
 import { assertArtifactGeneration } from '../contract-registry';
 import { resolveFeeSponsor, ensureFeeSponsorFacade } from '../fee-sponsor';
 import { coerceCircuitArgs } from '../arg-coercion';
-import { getNightgatePluginConfig } from '../../utils/nightgate-config';
+import { getNightgateConfig } from '../../utils/nightgate-config';
 import { runChildCommand } from '../background-jobs';
 import { jobKindOp } from '../job-kinds';
 import { vaultDims } from '../verify-state';
@@ -296,7 +296,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
             sessionId: job.sessionId, db, facadeConfig: facadeCfg, expectedUserId: job.requestedBy
         });
         const sponsor = command.sponsorSessionId
-            ? await resolveFeeSponsor({ db, sponsorSessionId: command.sponsorSessionId, requestingUserId: job.requestedBy, config: getNightgatePluginConfig() })
+            ? await resolveFeeSponsor({ db, sponsorSessionId: command.sponsorSessionId, requestingUserId: job.requestedBy, config: getNightgateConfig() })
             : null;
         await wallet.ensureFacade?.();
         if (sponsor) await ensureFeeSponsorFacade(sponsor, facadeCfg);

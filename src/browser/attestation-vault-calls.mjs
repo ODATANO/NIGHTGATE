@@ -16,5 +16,6 @@ export {
     prepareProveFieldEquality,
     prepareProveFieldMembership,
     prepareProveFieldsUnchangedExcept,
-    prepareProveFieldsDiffer
+    prepareProveFieldsDiffer,
+    prepareVaultBatch
 } from '@odatano/contract-kit';

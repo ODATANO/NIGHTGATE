@@ -26,6 +26,7 @@ export function createNightgateConnectorProviders(opts: {
     fetchFn?: typeof fetch;
     webSocket?: any;
     proving?: ProvingModality;
+    proofServerUrl?: string; // optional; default the server the wallet reports; a proof server for 'server' and 'auto'
     expectedManifestHash?: string; // SHA-256 as 64 hex; optional; the compiler manifest the served files must match
 }): Promise<Record<string, any> & { provingModality: AssembledProvingModality }>;
 

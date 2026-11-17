@@ -129,7 +129,7 @@ The container HEALTHCHECK (`docker/healthcheck.mjs`) asks `getReadiness()`. Its 
 
 | `phase` | Meaning | `ready` |
 |---|---|---|
-| `starting` | Plugin init not finished | false |
+| `starting` | Init not finished | false |
 | `failed` | Init ended offline | false |
 | `warming` | Sponsor pool prewarm running. Database, crawler and node checks do not count | true if runtime and init pass |
 | `catching-up` | Crawler behind the tip | true |

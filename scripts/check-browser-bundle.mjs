@@ -21,17 +21,21 @@ const importRe = /(?:import|export)[^'"]*from\s*['"]([^'"]+)['"]|import\(\s*['"]
 let failures = 0;
 const fail = (m) => { console.error(`  ✗ ${m}`); failures++; };
 
-console.log('[browser-bundle] static import scan of src/browser/*.mjs');
-const files = readdirSync(browserDir).filter(f => f.endsWith('.mjs'));
-if (files.length === 0) fail('no .mjs files found in src/browser');
-for (const f of files) {
-    const src = readFileSync(join(browserDir, f), 'utf8');
-    let m;
-    const specs = new Set();
-    while ((m = importRe.exec(src)) !== null) specs.add(m[1] || m[2]);
-    for (const spec of specs) {
-        if (FORBIDDEN.some(re => re.test(spec))) fail(`${f}: forbidden import '${spec}'`);
-        else console.log(`    ${f} → ${spec} (ok)`);
+// src/shared is build output, so it is scanned after `npm run build`.
+const sharedDir = join(__dirname, '..', 'src', 'shared');
+for (const [label, dir] of [['src/browser', browserDir], ['src/shared', sharedDir]]) {
+    console.log(`[browser-bundle] static import scan of ${label}/*.mjs`);
+    const files = readdirSync(dir).filter(f => f.endsWith('.mjs'));
+    if (files.length === 0) fail(`no .mjs files found in ${label}; run \`npm run build\` first`);
+    for (const f of files) {
+        const src = readFileSync(join(dir, f), 'utf8');
+        let m;
+        const specs = new Set();
+        while ((m = importRe.exec(src)) !== null) specs.add(m[1] || m[2]);
+        for (const spec of specs) {
+            if (FORBIDDEN.some(re => re.test(spec))) fail(`${label}/${f}: forbidden import '${spec}'`);
+            else console.log(`    ${f} → ${spec} (ok)`);
+        }
     }
 }
 
@@ -41,8 +45,8 @@ try {
     for (const name of [
         'deriveAttestationSecret', 'generateAttestationSecret', 'sealAttestationSecret',
         'openAttestationSecret', 'buildAttestationVaultWitnesses', 'CONTRACTS',
-        'FetchZkConfigProvider', 'InMemoryPrivateStateProvider', 'createNightgateConnectorProviders',
-        'prepareRevokeDisclosure', 'prepareGrantDisclosure', 'prepareAttest'
+        'FetchZkConfigProvider', 'InMemoryPrivateStateProvider', 'createNightgateConnectorProviders', 'connectContract',
+        'prepareRevokeDisclosure', 'prepareGrantDisclosure', 'prepareAttest', 'prepareVaultBatch', 'computeAttesterId'
     ]) {
         if (mod[name] === undefined) fail(`missing export: ${name}`);
     }

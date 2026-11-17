@@ -102,7 +102,7 @@ beforeAll(async () => {
     // The [test] profile does not configure a pallet map; inject the Zswap entry
     // (pallet 15) so pallet-15 extrinsics classify as shielded_transfer /
     // isShielded. The BlockProcessor
-    // reads this in its constructor via getNightgatePluginConfig().
+    // reads this in its constructor via getNightgateConfig().
     const env = cds.env as any;
     env.requires = env.requires || {};
     env.requires.nightgate = env.requires.nightgate || {};

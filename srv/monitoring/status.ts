@@ -9,7 +9,7 @@ import { SyncState, BackgroundJobs } from '#cds-models/midnight';
 import { getRuntimeTopology } from '../utils/runtime-topology';
 import { packageVersion } from '../utils/package-version';
 import {
-    getNightgatePluginConfig,
+    getNightgateConfig,
     resolveNightgateRuntimeConfig,
     getConfiguredNightgateNetwork,
     resolveEffectiveProvingMode
@@ -44,13 +44,13 @@ const OPEN_JOB_STATUSES = ['pending', 'running', 'external_execution', 'submitte
 /** A crawler that indexed nothing for this long counts as cut off from its node. */
 const CRAWLER_ACTIVITY_WINDOW_MS = 5 * 60 * 1000;
 
-function crawlerEnabledFor(pluginConfig: ReturnType<typeof getNightgatePluginConfig>): boolean {
-    return resolveNightgateRuntimeConfig(pluginConfig).crawlerConfig?.enabled !== false;
+function crawlerEnabledFor(config: ReturnType<typeof getNightgateConfig>): boolean {
+    return resolveNightgateRuntimeConfig(config).crawlerConfig?.enabled !== false;
 }
 
 
 export function buildLiveness(): Record<string, unknown> {
-    const topology = getRuntimeTopology(getNightgatePluginConfig());
+    const topology = getRuntimeTopology(getNightgateConfig());
     return {
         status: 'alive',
         timestamp: new Date().toISOString(),
@@ -60,8 +60,8 @@ export function buildLiveness(): Record<string, unknown> {
 }
 
 export async function buildHealth(db: DbRunner): Promise<Record<string, unknown>> {
-    const pluginConfig = getNightgatePluginConfig();
-    const topology = getRuntimeTopology(pluginConfig);
+    const config = getNightgateConfig();
+    const topology = getRuntimeTopology(config);
     const syncState = await db.run(SELECT.one.from(SyncState).where({ ID: 'SINGLETON' }));
 
     if (!syncState) {
@@ -89,11 +89,11 @@ export async function buildHealth(db: DbRunner): Promise<Record<string, unknown>
     const finalizedHeight = Number(syncState.lastFinalizedHeight || 0);
     const lag = Math.max(chainHeight - indexedHeight, 0);
     const finalizedLag = Math.max(chainHeight - finalizedHeight, 0);
-    const halted = crawlerEnabledFor(pluginConfig) && (syncState.syncStatus === 'error' || syncState.syncStatus === 'stopped');
+    const halted = crawlerEnabledFor(config) && (syncState.syncStatus === 'error' || syncState.syncStatus === 'stopped');
     const idle = syncState.lastIndexedAt != null && Date.now() - new Date(syncState.lastIndexedAt).getTime() >= CRAWLER_ACTIVITY_WINDOW_MS;
     let status = 'healthy';
     if (halted || lag > 100) status = 'unhealthy';
-    else if (lag > 10 || (crawlerEnabledFor(pluginConfig) && idle)) status = 'degraded';
+    else if (lag > 10 || (crawlerEnabledFor(config) && idle)) status = 'degraded';
 
     return {
         status,
@@ -118,10 +118,10 @@ export type ReadinessPhase = 'starting' | 'warming' | 'catching-up' | 'ready' | 
 /** Answers in bounded time. The database read has its own timeout, all other checks read memory.
  *  While the sponsor pool warms, memory checks alone make it `ready`, so a slow start is not restarted. */
 export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<ReturnType<typeof getReadiness>>>> {
-    const pluginConfig = getNightgatePluginConfig();
-    const topology = getRuntimeTopology(pluginConfig);
+    const config = getNightgateConfig();
+    const topology = getRuntimeTopology(config);
     // A disabled crawler does not make the server unready. Its checks simply pass.
-    const crawlerEnabled = crawlerEnabledFor(pluginConfig);
+    const crawlerEnabled = crawlerEnabledFor(config);
 
     // Both conditions are needed. `initialized` is also set when startup ended offline.
     const runtime = readRuntimeStatus();
@@ -228,7 +228,7 @@ export async function buildMetricsText(db: DbRunner): Promise<string> {
     const errors = syncState?.consecutiveErrors || 0;
     const uptimeSec = Math.floor((Date.now() - processStartTime) / 1000);
     const syncStatus = syncState?.syncStatus || 'stopped';
-    const topology = getRuntimeTopology(getNightgatePluginConfig());
+    const topology = getRuntimeTopology(getNightgateConfig());
     // Count in SQL. Loading the job rows would be most expensive exactly when many jobs are queued.
     const jobCounts = new Map<string, number>();
     let oldestQueuedSeconds = 0;
@@ -386,7 +386,7 @@ export async function buildMetricsText(db: DbRunner): Promise<string> {
 /** Version, network, proving mode, the crawler's node and a hash of each contract's compiled files.
  *  The hashes show why writes are refused after contract files changed on disk. */
 export async function buildRuntimeInfo(): Promise<NonNullable<Awaited<ReturnType<typeof getRuntimeInfo>>>> {
-    const config = getNightgatePluginConfig();
+    const config = getNightgateConfig();
     const topology = getRuntimeTopology(config);
 
     const version = packageVersion();

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
 import { resolveFeeSponsor, ensureFeeSponsorFacade, getConfiguredFeeSponsorSessions } from '../fee-sponsor';
-import { getNightgatePluginConfig } from '../../utils/nightgate-config';
+import { getNightgateConfig } from '../../utils/nightgate-config';
 import { SponsorAttemptBookkeepingPendingError } from '../background-jobs';
 import { reportSubmissionRejectedOn, reportBroadcastOn } from '../job-execution-context';
 import { PendingSubmissions, type BackgroundJob } from '#cds-models/midnight';
@@ -123,7 +123,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     /** Sponsor wallets to try, in order. A named sponsor is never swapped for another, since grants pin it. */
     const sponsorCandidates = (command: SponsorJobCommand, fromPool: (pool: string[]) => string[]): string[] => {
         if (command.sponsorSessionId !== PLATFORM_POOL_SENTINEL) return [String(command.sponsorSessionId)];
-        const pool = getConfiguredFeeSponsorSessions(getNightgatePluginConfig());
+        const pool = getConfiguredFeeSponsorSessions(getNightgateConfig());
         if (pool.length === 0) throw new Error('platform sponsor pool is empty (NIGHTGATE_FEE_SPONSOR_SESSION)');
         return fromPool(pool);
     };
@@ -137,7 +137,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         setActive: (sponsorSessionId: string) => void,
         send: (sponsorAccountId: string, policy: SponsorPolicy) => Promise<T>
     ): Promise<{ sponsorSessionId: string; out: T }> => {
-        const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: sessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgatePluginConfig() });
+        const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: sessionId, requestingUserId: job.requestedBy ?? undefined, config: getNightgateConfig() });
         await ensureFeeSponsorFacade(sponsor, facadeCfg);
         setActive(sponsor.sponsorSessionId);
         const policy = await liveSponsorPolicyForJob(db, command);
