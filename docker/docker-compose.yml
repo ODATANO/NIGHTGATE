@@ -5,7 +5,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.45.0}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.45.1}
     container_name: odatano-nightgate
     # Loopback only by default: basic auth is plain text without TLS, so put a
     # TLS reverse proxy in front. NIGHTGATE_BIND_ADDRESS=0.0.0.0 publishes it.
@@ -71,7 +71,7 @@ services:
   # Midnight Node, a local dev chain for development only.
   # Preprod and mainnet need their own node, or a hosted one with its token in the URL.
   node:
-    image: midnightntwrk/midnight-node:2.1.0-rc.4
+    image: midnightntwrk/midnight-node:2.1.101
     container_name: odatano-night-node
     ports:
       - "9944:9944" # Substrate RPC
@@ -108,7 +108,7 @@ services:
   # Substrate node in INDEXER_UPSTREAM_NODE_URL. A sync from genesis takes days on preprod.
   # NIGHTGATE uses it with NIGHTGATE_INDEXER_HTTP_URL=http://localhost:8088/api/v4/graphql.
   indexer:
-    image: midnightntwrk/indexer-standalone:4.4.0-rc.6
+    image: midnightntwrk/indexer-standalone:4.4.101
     container_name: odatano-night-indexer
     ports:
       - "8088:8088"
@@ -157,7 +157,7 @@ services:
   # The first run downloads about 500 MB of ZK parameters. The named volume keeps them across restarts.
   # NIGHTGATE_PROOF_NETWORK picks the network, default mainnet. Use testnet for the local node.
   proof-server:
-    image: midnightntwrk/proof-server:9.0.0
+    image: midnightntwrk/proof-server:9.0.2
     container_name: odatano-night-proof-server
     command: ["midnight-proof-server", "--network", "${NIGHTGATE_PROOF_NETWORK:-mainnet}"]
     environment:

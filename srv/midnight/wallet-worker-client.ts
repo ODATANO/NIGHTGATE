@@ -345,8 +345,8 @@ async function startWorkerSlot(slot: WorkerSlot): Promise<void> {
             lastExitCode = code;
             lastExitAt = new Date().toISOString();
         }
-        const gone = forgetWorkerSessions(slot.id);
-        void notifyWorkerGone('exit', { workerId: slot.id, facades: gone });
+        forgetWorkerSessions(slot.id);
+        void notifyWorkerGone('exit', { workerId: slot.id });
         // Named so rpc() can retry a read on the new worker.
         rejectPendingRpcs(slot,
             rotated ? `wallet-worker rotated with in-flight calls` : `wallet-worker exited (code=${code}) with in-flight calls`,
@@ -358,11 +358,9 @@ async function startWorkerSlot(slot: WorkerSlot): Promise<void> {
     log.info(`${tag} ready`);
 }
 
-/** Drops the cached progress of the wallets that lived in the worker. Returns their keys. */
-function forgetWorkerSessions(slotId: string): string[] {
-    const gone = sessionsOf(slotId);
-    for (const s of gone) forgetSession(s);
-    return gone;
+/** Drops the cached progress of the wallets that lived in the worker. */
+function forgetWorkerSessions(slotId: string): void {
+    for (const s of sessionsOf(slotId)) forgetSession(s);
 }
 
 function forgetSession(sessionId: string): void {
@@ -375,13 +373,20 @@ function forgetSession(sessionId: string): void {
 export async function stopWalletWorker(timeoutMs = 60_000): Promise<void> {
     // A later call must not restart a worker that was stopped on purpose.
     everStarted = false;
-    const running = [...slots.values()].filter(s => s.worker);
-    await Promise.all(running.map(slot => stopWorkerSlot(slot, timeoutMs)));
+    await Promise.all([...slots.values()].map(slot => stopWorkerSlot(slot, timeoutMs)));
 }
 
+/** A slot without a worker gets the stop notice too. Only that releases what a crashed worker left behind. */
 async function stopWorkerSlot(slot: WorkerSlot, timeoutMs: number): Promise<void> {
     const w = slot.worker;
-    if (!w) return;
+    if (w) await shutDownWorker(slot, w, timeoutMs);
+    if (slot.worker) return; // a newer worker runs in the slot
+    // A forced terminate may skip the exit handler, so clear here too.
+    forgetWorkerSessions(slot.id);
+    await notifyWorkerGone('stop', { workerId: slot.id });
+}
+
+async function shutDownWorker(slot: WorkerSlot, w: Worker, timeoutMs: number): Promise<void> {
     slot.everStarted = false;
     const tag = slots.size > 1 || slot.id !== DEFAULT_SLOT ? `worker ${slot.id}` : 'worker';
     try {
@@ -406,15 +411,12 @@ async function stopWorkerSlot(slot: WorkerSlot, timeoutMs: number): Promise<void
     slot.readyPromise = null;
     slot.stoppingWorker = w;
     try { await w.terminate(); } catch { /* already exited */ }
-    // A forced terminate may skip the exit handler, so clear here too.
-    const gone = forgetWorkerSessions(slot.id);
-    await notifyWorkerGone('stop', { workerId: slot.id, facades: gone });
 }
 
-/** Why a worker is gone. After a crash (`exit`) listeners keep what queued jobs need. After `stop` they may release everything. */
+/** Why a worker is gone. After a crash (`exit`) listeners keep what queued jobs need. After `stop` they may release what the worker held. */
 export type WorkerGoneReason = 'exit' | 'stop';
-/** The worker that went and the wallets it held, as far as they reported progress. */
-export interface WorkerGoneInfo { workerId: string; facades: string[] }
+/** The worker that went. `workerIdFor` tells which wallets were its own. */
+export interface WorkerGoneInfo { workerId: string }
 type WorkerGoneListener = (reason: WorkerGoneReason, info: WorkerGoneInfo) => void | Promise<void>;
 const workerGoneListeners = new Set<WorkerGoneListener>();
 

@@ -43,7 +43,7 @@ vi.mock('node:worker_threads', async () => {
 
 import {
     __resetWalletWorkerForTests, assignDedicatedWorker, getWalletWorkerStatus, onWorkerGone, setStateSaveSink,
-    startWalletWorker, walletGetBalance, walletGetSyncProgress, walletInit, walletSponsorUnboundTx, walletSubmitContractCall,
+    startWalletWorker, stopWalletWorker, walletGetBalance, walletGetSyncProgress, walletInit, walletSponsorUnboundTx, walletSubmitContractCall,
     walletWorkerPoolConfig, workerIdFor
 } from '../../srv/midnight/wallet-worker-client';
 import { isNightgateError } from '../../srv/utils/errors';
@@ -139,7 +139,7 @@ describe('wallet worker pool', () => {
         const inZero = keys.find(k => workerIdFor(k) === 'user-0')!;
         const inOne = keys.find(k => workerIdFor(k) === 'user-1')!;
         await walletGetBalance({ sessionId: inOne }); // starts user-1
-        const gone: Array<{ reason: string; workerId: string; facades: string[] }> = [];
+        const gone: Array<{ reason: string; workerId: string }> = [];
         onWorkerGone((reason, info) => { gone.push({ reason, ...info }); });
         byId('user-0')!.emit('message', { kind: 'sync-progress', sessionId: inZero, snapshot: { sessionId: inZero, caughtUp: true, label: 'z', updatedAt: 'now' } });
         byId('user-1')!.emit('message', { kind: 'sync-progress', sessionId: inOne, snapshot: { sessionId: inOne, caughtUp: true, label: 'o', updatedAt: 'now' } });
@@ -156,7 +156,7 @@ describe('wallet worker pool', () => {
         expect(await stuckInZero).toBe('answered');
         expect(walletGetSyncProgress(inOne)).toBeNull();
         expect(walletGetSyncProgress(inZero)).not.toBeNull();
-        expect(gone).toEqual([{ reason: 'exit', workerId: 'user-1', facades: [inOne] }]);
+        expect(gone).toEqual([{ reason: 'exit', workerId: 'user-1' }]);
         const status = getWalletWorkerStatus();
         expect(status.exitCount).toBe(1);
         expect(status.running).toBe(false);
@@ -165,6 +165,23 @@ describe('wallet worker pool', () => {
         const again: any = await walletGetBalance({ sessionId: inOne });
         expect(again.ranIn).toBe('user-1');
         expect(getWalletWorkerStatus().running).toBe(true);
+    });
+
+    it('a full stop sends one stop notice per worker, also for a worker that crashed before', async () => {
+        process.env.NIGHTGATE_WALLET_WORKERS = '2';
+        await startWalletWorker();
+        const inOne = ['acct-1', 'acct-2', 'acct-3', 'acct-4', 'acct-5'].find(k => workerIdFor(k) === 'user-1')!;
+        await walletGetBalance({ sessionId: inOne }); // starts user-1
+        byId('user-1')!.emit('exit', 1);
+        const stops: string[] = [];
+        onWorkerGone((reason, info) => { if (reason === 'stop') stops.push(info.workerId); });
+
+        await stopWalletWorker(1000);
+
+        expect(stops.sort()).toEqual(['user-0', 'user-1']);
+        expect(byId('user-0')!.terminated).toBe(true);
+        expect(byId('user-0')!.sent.filter(m => m.kind === 'rpc' && m.method === 'shutdown')).toHaveLength(1);
+        expect(byId('user-1')!.sent.filter(m => m.kind === 'rpc' && m.method === 'shutdown')).toHaveLength(0);
     });
 
     it('saves of different wallets do not wait for each other, saves of one wallet stay in order', async () => {

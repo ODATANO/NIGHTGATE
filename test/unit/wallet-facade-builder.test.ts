@@ -19,14 +19,17 @@ const mockEvictEncryptionKey = vi.hoisted(() => (vi.fn(async () => undefined)));
 
 // Capture the worker-gone listener the module registers at load, so a test
 // can fire it the way a crash or a stop would.
-type GoneInfo = { workerId: string; facades: string[] };
+type GoneInfo = { workerId: string };
 const workerGoneListeners = vi.hoisted(() => [] as Array<(r: "exit" | "stop", info: GoneInfo) => void | Promise<void>>);
-// the one worker of a plain setup; no wallet reported progress, so the listener drops everything
-const GONE: GoneInfo = { workerId: 'user-0', facades: [] };
+// the one worker of a plain setup: every wallet lives in it
+const GONE: GoneInfo = { workerId: 'user-0' };
+// wallets a test puts into another worker; all others live in user-0
+const workerOf = vi.hoisted(() => new Map<string, string>());
 vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletInit: mockWalletInit,
     walletEvict: mockWalletEvict,
     setStateSaveSink: mockSetStateSaveSink,
+    workerIdFor: (key?: string) => (key && workerOf.get(key)) || 'user-0',
     onWorkerGone: (fn: (r: "exit" | "stop", info: GoneInfo) => void | Promise<void>) => { workerGoneListeners.push(fn); return () => { }; }
 }));
 
@@ -64,6 +67,7 @@ describe('wallet-facade-builder', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         __clearAllFacadesForTests();
+        workerOf.clear();
         mockWalletInit.mockResolvedValue({ facadeReady: true, alreadyExisted: false, sdkVersion: 'sdk-test' });
         mockWalletEvict.mockResolvedValue({ evicted: true });
         mockLoadSyncState.mockResolvedValue(undefined);
@@ -156,6 +160,55 @@ describe('wallet-facade-builder', () => {
                 }));
                 expect(__getPersistenceSizeForTests()).toBe(0);
                 expect(__getCacheSizeForTests()).toBe(0);
+            } finally {
+                logSpy.mockRestore();
+            }
+        });
+
+        it('a stopped worker releases only its own wallets, so the final save of another worker is still stored', async () => {
+            const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
+            const warnSpy = vi.spyOn(cds.log('nightgate:facade'), 'warn').mockImplementation(() => {});
+            try {
+                workerOf.set('cache-key-sponsor', 'sponsor-cache-key-spons');
+                await getOrBuildWalletFacade('cache-key-user', baseArgs);
+                await getOrBuildWalletFacade('cache-key-sponsor', baseArgs);
+                wireWorkerStateSaveSink();
+                const sink = mockSetStateSaveSink.mock.calls.at(-1)![0] as (e: any) => Promise<void>;
+
+                // The empty user worker is done first, while the sponsor worker still writes its final save.
+                for (const fire of workerGoneListeners) await fire('stop', GONE);
+                expect(hasWalletFacade('cache-key-user')).toBe(false);
+                expect(hasWalletFacade('cache-key-sponsor')).toBe(true);
+                expect(getFacadeOrigin('cache-key-sponsor')).not.toBeNull();
+                expect(__getPersistenceSizeForTests()).toBe(1);
+
+                await expect(sink({ sessionId: 'cache-key-sponsor', blobs: { dust: 'final' }, seq: 133 })).resolves.toBeUndefined();
+                expect(mockSaveSyncState).toHaveBeenCalledWith(expect.objectContaining({ accountId: 'cache-key-sponsor' }));
+                expect(warnSpy).not.toHaveBeenCalled();
+
+                for (const fire of workerGoneListeners) await fire('stop', { workerId: 'sponsor-cache-key-spons' });
+                expect(__getPersistenceSizeForTests()).toBe(0);
+                expect(__getCacheSizeForTests()).toBe(0);
+            } finally {
+                logSpy.mockRestore();
+                warnSpy.mockRestore();
+            }
+        });
+
+        it('a crashed worker takes only its own wallets out of the loaded set', async () => {
+            const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
+            try {
+                workerOf.set('cache-key-other', 'user-1');
+                await getOrBuildWalletFacade('cache-key-mine', baseArgs);
+                await getOrBuildWalletFacade('cache-key-other', baseArgs);
+
+                for (const fire of workerGoneListeners) await fire('exit', { workerId: 'user-1' });
+
+                expect(hasWalletFacade('cache-key-other')).toBe(false);
+                expect(getFacadeOrigin('cache-key-other')).toBeNull();
+                expect(hasWalletFacade('cache-key-mine')).toBe(true);
+                expect(getFacadeOrigin('cache-key-mine')).not.toBeNull();
+                expect(__getPersistenceSizeForTests()).toBe(2);
             } finally {
                 logSpy.mockRestore();
             }

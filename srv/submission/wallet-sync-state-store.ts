@@ -260,7 +260,7 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
 // Snapshots of an earlier SDK that the running SDK was shown to restore with the same state.
 // The next save writes them under the running version.
 const RESTORABLE_EARLIER_SDK: Readonly<Record<string, readonly string[]>> = {
-    'wallet-sdk-facade@5.0.0': ['wallet-sdk-facade@4.1.0']
+    'wallet-sdk-facade@5.0.1': ['wallet-sdk-facade@5.0.0', 'wallet-sdk-facade@4.1.0']
 };
 
 export function isRestorableEarlierSdk(stored: string, running: string): boolean {

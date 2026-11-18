@@ -116,7 +116,7 @@ The reference is [`docs/txbuilder.md`](https://github.com/ODATANO/NIGHTGATE/blob
 - Wasm proving blocks the thread for tens of seconds to minutes per proof. Memory follows the circuit's k, about 1.8 GB RSS at k=17 and 3.5 GB at k=18.
 - `provingMode: 'server'` proves on a proof server you run. It receives the witnesses and sees the coins you spend.
 - Built transactions expire after `ttlMinutes`, default 30.
-- Ledger 9 networks only. Pins midnight-js 5.0.0, compact-js 3.0.0, compact-runtime 0.21.0 and ledger-v9 1.0.0, with no `overrides` needed. Two copies of a wasm package reject each other's objects (`expected instance of ...`). Check with `npm ls @midnightntwrk/ledger-v9` that the tree holds one.
+- Ledger 9 networks only. Pins midnight-js 5.0.1, compact-js 3.0.2, compact-runtime 0.21.0 and ledger-v9 1.0.2, with no `overrides` needed. Two copies of a wasm package reject each other's objects (`expected instance of ...`). Check with `npm ls @midnightntwrk/ledger-v9` that the tree holds one.
 
 ## Related
 

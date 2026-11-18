@@ -7,6 +7,7 @@ import {
     walletEvict,
     setStateSaveSink,
     onWorkerGone,
+    workerIdFor,
     type WalletInitArgs
 } from '../midnight/wallet-worker-client';
 import { errorMessage } from '../utils/errors';
@@ -82,15 +83,15 @@ export function getFacadeOrigin(cacheKey: string): FacadeOrigin | null {
 const savesInFlight = new Set<Promise<void>>();
 
 onWorkerGone(async (reason, info) => {
-    // Wallets that never reported progress are unknown to the pool: then everything is dropped.
-    const known = info.facades.length > 0;
-    const dropped = known ? info.facades.filter(k => residentAccounts.has(k)) : [...residentAccounts];
+    // Only the wallets of the worker that went are touched. Another worker may still be saving its own.
+    const held = (key: string): boolean => workerIdFor(key) === info.workerId;
+    const dropped = [...residentAccounts].filter(held);
     if (dropped.length > 0) {
         log.info(`worker ${info.workerId} ${reason}: dropping ${dropped.length} facade residency claim(s)`);
         for (const k of dropped) residentAccounts.delete(k);
     }
     // Clear old entries, otherwise the next build would not record its own.
-    if (known) for (const k of info.facades) facadeOrigins.delete(k); else facadeOrigins.clear();
+    for (const k of [...facadeOrigins.keys()].filter(held)) facadeOrigins.delete(k);
     if (reason === 'exit') {
         // Crash: keep the passphrases, since queued saves still need them and the worker cannot resend.
         return;
@@ -99,9 +100,10 @@ onWorkerGone(async (reason, info) => {
         log.info(`worker stop: draining ${savesInFlight.size} state-save(s) before releasing passphrases`);
         await Promise.allSettled([...savesInFlight]);
     }
-    if (sessionRegistry.size > 0) {
-        log.info(`worker stop: releasing persistence material for ${sessionRegistry.size} account(s)`);
-        sessionRegistry.clear();
+    const released = [...sessionRegistry.keys()].filter(held);
+    if (released.length > 0) {
+        log.info(`worker ${info.workerId} stop: releasing persistence material for ${released.length} account(s)`);
+        for (const k of released) sessionRegistry.delete(k);
     }
 });
 

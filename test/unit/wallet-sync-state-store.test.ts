@@ -172,17 +172,17 @@ describe('saveSyncState / loadSyncState round-trip', () => {
         expect(loaded).toBeNull();
     });
 
-    test('restores a snapshot of an earlier SDK listed as restorable', async () => {
+    test.each(['5.0.0', '4.1.0'])('restores a snapshot of the earlier SDK %s listed as restorable', async (earlier) => {
         await saveSyncState({
-            accountId: 'acct-earlier',
+            accountId: `acct-earlier-${earlier}`,
             passphrase: PASS,
-            sdkVersion: 'wallet-sdk-facade@4.1.0',
+            sdkVersion: `wallet-sdk-facade@${earlier}`,
             states: { shielded: 'sh-4', unshielded: 'un-4', dust: 'du-4' }
         });
         const loaded = await loadSyncState({
-            accountId: 'acct-earlier',
+            accountId: `acct-earlier-${earlier}`,
             passphrase: PASS,
-            expectedSdkVersion: 'wallet-sdk-facade@5.0.0'
+            expectedSdkVersion: 'wallet-sdk-facade@5.0.1'
         });
         expect(loaded).toMatchObject({ shielded: 'sh-4', unshielded: 'un-4', dust: 'du-4' });
     });
@@ -191,13 +191,13 @@ describe('saveSyncState / loadSyncState round-trip', () => {
         await saveSyncState({
             accountId: 'acct-newer',
             passphrase: PASS,
-            sdkVersion: 'wallet-sdk-facade@5.0.0',
+            sdkVersion: 'wallet-sdk-facade@5.0.1',
             states: { dust: 'du-5' }
         });
         const loaded = await loadSyncState({
             accountId: 'acct-newer',
             passphrase: PASS,
-            expectedSdkVersion: 'wallet-sdk-facade@4.1.0'
+            expectedSdkVersion: 'wallet-sdk-facade@5.0.0'
         });
         expect(loaded).toBeNull();
     });

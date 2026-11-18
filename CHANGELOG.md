@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.45.1 - 2026-11-18
+
+### Changes
+
+- Midnight packages raised to the tooling patch of 2026-11-17, all pinned
+  exactly: midnight-js 5.0.1, compact-js 3.0.2, `@midnightntwrk/ledger-v9`
+  1.0.2, `@midnightntwrk/zkir-v3` 3.2.1 and the wallet SDK packages facade
+  5.0.1, dust wallet 5.1.0, shielded wallet, unshielded wallet, capabilities
+  and address format 4.0.1, prover client and node client 2.0.1.
+  `@midnightntwrk/onchain-runtime-v4` resolves to 4.0.2. The tree holds one
+  copy of each wasm package, without `overrides`.
+- Wallet states saved under wallet SDK 5.0.0 or 4.1.0 restore under 5.0.1, so
+  no wallet syncs from the start after the upgrade.
+- The ledger assigns the calls of a batch to the guaranteed and the fallible
+  section differently, so stages in logs and in a `BatchCausalityViolation`
+  can differ from 0.45.0. On a vault with 257 records a batch of `attest`,
+  `anchorContentRoot` and `grantDisclosure` had its second call in the
+  fallible section and failed the causality check. All three are guaranteed
+  now.
+- `docker/docker-compose.yml` runs proof server 9.0.2, node 2.1.101 and
+  indexer 4.4.101. Indexer 4.4.101 does not read a chain of node 2.1.0-rc.4,
+  so both move together.
+- `@odatano/nightgate-tx` 0.24.1 carries the same pins.
+
+### Fixes
+
+- A contract loads again after a map write left its state in a trie shape
+  that the earlier ledger refused. Before, `verifyAttestationState`,
+  `verifyPredicateState`, `verifyDisclosureState` and every call build on such
+  a contract failed with `Unable to deserialize ContractState`.
+- A contract call whose fee one DUST spend pays no longer fails the time to
+  dismiss (`1010/231`). The ledger sizes the guaranteed section of a call for
+  a fee intent with one DUST spend, the shape of a sponsored call.
+- A contract call that spends a shielded coin the contract holds and writes
+  the change back is no longer refused with `1010/104`.
+- Proof server mode: the wallet SDK keeps at most 10 requests waiting at the
+  proof server and repeats a request the server answered with 429, 502, 503 or
+  504, for up to 5 minutes.
+- With several wallet workers (`NIGHTGATE_WALLET_WORKERS` above 1 or
+  `NIGHTGATE_SPONSOR_WORKERS=dedicated`) a stop stores the final state of
+  every wallet. Before, the worker that finished first released the save
+  material of all wallets: the final saves of the others were dropped
+  (`DROPPED save for ...: no session in registry`), each of those workers
+  waited 30 s for the confirmation, and the next start restored a state up to
+  one save interval old.
+
+No schema change, no circuit change. The contract packages stay on Compact
+0.36.0: no recompile, no redeploy. Docs: `docs/operations.md`.
+
 ## 0.45.0 - 2026-11-17
 
 ### Breaking
