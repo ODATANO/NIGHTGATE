@@ -1,12 +1,24 @@
-// Lowercase hex without `0x`. A read or a function takes either spelling and any letter case.
+// Hex is lowercase without `0x`. A caller may send either spelling in any letter case.
 @nightgate.hex
 @assert.format        : '^(0[xX])?[0-9a-fA-F]*$'
 @assert.format.message: 'must be hex'
 type HexEncoded               : String(512);
 
-@assert.format        : '^[0-9a-fA-F]{64}$'
+@nightgate.hex
+@assert.format        : '^(0[xX])?[0-9a-fA-F]{64}$'
 @assert.format.message: 'must be 64 hex characters'
 type Hex64                    : String; // 32 bytes as 64 hex characters
+
+// Declare a list of hex values with one of these types. The items of a plain `array of Hex64` lose the annotation at runtime.
+@nightgate.hex
+type Hex64List                : array of Hex64;
+@nightgate.hex
+type HexList                  : array of HexEncoded;
+
+@nightgate.hex
+@assert.format        : '^(0[xX])?[0-9a-fA-F]{128}$'
+@assert.format.message: 'must be 128 hex characters'
+type SeedHex                  : String; // 64-byte BIP39 seed as 128 hex characters
 
 type UnshieldedAddr           : String(256); // Bech32m
 type DustAddr                 : String(256); // Bech32m

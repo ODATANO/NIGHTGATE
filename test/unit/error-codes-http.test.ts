@@ -73,7 +73,7 @@ describe('error codes over HTTP', () => {
     });
 
     it('keeps an existing specific code (verify service)', async () => {
-        const { error } = await errorOf(cap.GET(`/odata/v4/midnight-verify/verifyAttestationState(contractAddress='x',payloadHash='${'a'.repeat(64)}',attesterId='${'b'.repeat(64)}')`));
+        const { error } = await errorOf(cap.GET(`/odata/v4/midnight-verify/verifyAttestationState(contractAddress='ab',payloadHash='${'a'.repeat(64)}',attesterId='${'b'.repeat(64)}')`));
         expect(error.code).toBe('PUBLIC_VERIFY_DISABLED');
     });
 

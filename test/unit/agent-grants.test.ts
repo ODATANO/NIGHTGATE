@@ -534,11 +534,13 @@ describe('agent grants', () => {
             crawlerState.enabled = true;
             mockDbRun.mockResolvedValueOnce(grantRow());
             mockDbRun.mockResolvedValueOnce(usageRows);
-            mockDbRun.mockResolvedValueOnce([{ ID: 'tx-1' }, { ID: 'tx-2' }]);      // Transactions by hash
+            mockDbRun.mockResolvedValueOnce([{ ID: 'tx-1' }, { ID: 'tx-2' }]);      // Transactions by either hash
+            mockDbRun.mockResolvedValueOnce([{ transaction_ID: 'tx-2' }]);          // and by identifier
             mockDbRun.mockResolvedValueOnce([{ paidFees: '100' }, { paidFees: 50 }]); // their fee rows
             const result = await handlers.getGrantUsage(makeReq({ grantId: 'grant-1' }, { event: 'getGrantUsage' }));
             expect(result.dustPaid).toBe('150');
-            expect(selectFromChain.where).toHaveBeenCalledWith({ hash: { in: ['aa', 'bb'] } });
+            expect(selectFromChain.where).toHaveBeenCalledWith({ hash: { in: ['aa', 'bb'] }, or: { ledgerTxHash: { in: ['aa', 'bb'] } } });
+            expect(selectFromChain.where).toHaveBeenCalledWith({ identifier: { in: ['aa', 'bb'] } });
             expect(selectFromChain.where).toHaveBeenCalledWith({ transaction_ID: { in: ['tx-1', 'tx-2'] } });
         });
 

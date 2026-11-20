@@ -41,14 +41,14 @@ describe('typed action parameters are validated by CAP', () => {
     });
 
     test('a function parameter outside its enum is refused', async () => {
-        const r = await cap.axios.get(`${API}/verifyPredicateState(contractAddress='0xVAULT',attesterId='${H('a')}',payloadHash='${H('b')}',predicate='between')`, AUTH);
+        const r = await cap.axios.get(`${API}/verifyPredicateState(contractAddress='${H('d')}',attesterId='${H('a')}',payloadHash='${H('b')}',predicate='between')`, AUTH);
         expect(r.status).toBe(400);
         expect(r.data.error.code).toBe('ASSERT_ENUM');
         expect(r.data.error.target).toBe('predicate');
     });
 
     test('a function parameter outside its range is refused', async () => {
-        const r = await cap.axios.get(`${API}/verifyDisclosureState(contractAddress='0xVAULT',attesterId='${H('a')}',payloadHash='${H('b')}',grantee='${H('c')}',minLevel=3)`, AUTH);
+        const r = await cap.axios.get(`${API}/verifyDisclosureState(contractAddress='${H('d')}',attesterId='${H('a')}',payloadHash='${H('b')}',grantee='${H('c')}',minLevel=3)`, AUTH);
         expect(r.status).toBe(400);
         expect(r.data.error.code).toBe('ASSERT_RANGE');
         expect(r.data.error.target).toBe('minLevel');
@@ -60,12 +60,12 @@ describe('typed action parameters are validated by CAP', () => {
         expect(r.data.error.message).toMatch(/"allowedValuesJson" does not exist/);
     });
 
-    test('the hex format of a plain array is left to the handler', async () => {
-        // CAP does not apply @assert.format to the items of `array of Hex64`.
+    test('the hex format of a list is left to the handler', async () => {
+        // CAP does not apply @assert.format to the items of a list.
         const r = await cap.axios.post(`${API}/issueFieldPredicateAttestation`, {
             payloadHash: H('a'), fieldKey: H('b'), value: '1', fieldSalt: H('c'), threshold: 5, predicate: 'lessOrEqual',
             siblings: [H('1'), H('2'), H('3'), 'short'], dirs: [true, false, true, false],
-            sessionId: '00000000-0000-4000-8000-000000000001', contractAddress: '0xVAULT'
+            sessionId: '00000000-0000-4000-8000-000000000001', contractAddress: H('d')
         }, AUTH);
         expect(r.status).toBe(400);
         expect(r.data.error.message).toMatch(/siblings entries must be 64 hex/);

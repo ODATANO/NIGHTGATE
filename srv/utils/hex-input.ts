@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Hex is stored lowercase without `0x`. This module brings what a caller compares with a stored value into that
-// spelling: the operands of a read and the hex parameters of a function. The model marks the fields with `@nightgate.hex`.
+// Hex is stored lowercase without `0x`. This module brings what a caller sends into that spelling: the operands
+// of a read and the hex parameters of an action or function. The model marks the fields with `@nightgate.hex`.
 import type cds from '@sap/cds';
 import { bareHex } from './hex-patterns';
 
@@ -10,7 +10,7 @@ const STRING_MATCHES = new Set(['contains', 'startswith', 'endswith']);
 const BARE_HEX_RE = /^[0-9a-f]*$/;
 
 /** The parts of a linked model definition this module reads. */
-interface Field { [MARK]?: boolean; key?: boolean; _target?: Entity }
+interface Field { [MARK]?: boolean; key?: boolean; _target?: Entity; items?: Field; elements?: Record<string, Field> }
 interface Operation { params?: Record<string, Field> }
 interface Entity { elements?: Record<string, Field>; actions?: Record<string, Operation> }
 
@@ -113,13 +113,37 @@ export function normalizeHexOperands(select: Select, target: Entity | undefined,
     normalizeExpands(select.columns, target);
 }
 
-/** Rewrites the hex parameters in `data` in place. CAP has checked their format before. */
+const bareIfText = (value: unknown): unknown => typeof value === 'string' ? bareHex(value) : value;
+
+/** A marked list holds hex items. Any other list is walked with the definition of its items. */
+function normalizeList(list: unknown[], field: Field): void {
+    const { items } = field;
+    list.forEach((entry, i) => {
+        if (field[MARK]) list[i] = bareIfText(entry);
+        else if (items) list[i] = normalizeValue(entry, items);
+    });
+}
+
+/** `value` with its hex parts in the stored spelling. Lists and structures change in place. */
+function normalizeValue(value: unknown, field: Field): unknown {
+    if (Array.isArray(value)) {
+        normalizeList(value, field);
+        return value;
+    }
+    if (value && typeof value === 'object' && field.elements) normalizeFields(value as Record<string, unknown>, field.elements);
+    return field[MARK] ? bareIfText(value) : value;
+}
+
+function normalizeFields(values: Record<string, unknown>, fields: Record<string, Field>): void {
+    for (const [name, field] of Object.entries(fields)) {
+        if (values[name] !== undefined && values[name] !== null) values[name] = normalizeValue(values[name], field);
+    }
+}
+
+/** Rewrites the hex parameters in `data` in place, also inside lists and structures. It does not check that they are hex. */
 export function normalizeHexParams(data: unknown, operation: Operation | undefined): void {
     if (!operation?.params || !data || typeof data !== 'object') return;
-    const values = data as Record<string, unknown>;
-    for (const [name, param] of Object.entries(operation.params)) {
-        if (param[MARK] && typeof values[name] === 'string') values[name] = bareHex(values[name]);
-    }
+    normalizeFields(data as Record<string, unknown>, operation.params);
 }
 
 /** Registers the normalization on a service. Call it before the service's own handlers, so they see the stored spelling. */

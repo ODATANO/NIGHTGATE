@@ -4,7 +4,10 @@
 import { parseJsonStringList } from '../utils/json-list';
 import cds from '@sap/cds';
 import crypto from 'crypto';
-import { AgentGrants, WalletSessions, BackgroundJobs, Transactions, TransactionFees, type WalletSession, type AgentGrant } from '#cds-models/midnight';
+import {
+    AgentGrants, WalletSessions, BackgroundJobs, Transactions, TransactionFees, TransactionIdentifiers,
+    type WalletSession, type AgentGrant, type BackgroundJob
+} from '#cds-models/midnight';
 import { PLATFORM_POOL_SENTINEL } from '../submission/sponsor-pool';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
 import {
@@ -22,7 +25,7 @@ import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER, PUBLIC_VERIFY_TRANSPORT
 import type { DbRunner } from '../utils/db-types';
 import type { RequestAgentGrant } from '../utils/request-types';
 import { errorMessage } from '../utils/errors';
-import { HEX64_RE } from '../utils/hex-patterns';
+import { HEX64_RE, bareHex } from '../utils/hex-patterns';
 import { createAgentGrant, createAgentGrants, getGrantUsage, revokeAgentGrant, rotateAgentGrantToken, updateAgentGrant } from '#cds-models/NightgateService';
 import type { getSponsorPolicy } from '#cds-models/NightgateAdminService';
 import type { Request } from '@sap/cds';
@@ -943,10 +946,10 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
 
         const rows = (await runWithoutAmbientTx(() => db.run(
             SELECT.from(BackgroundJobs)
-                .columns('kind', 'status', 'chainStatus', 'txHash')
+                .columns('kind', 'status', 'chainStatus', 'txHash', 'indexerTxHash')
                 .where({ grantId: grant.ID, queuedAt: { '>=': fromIso } })
                 .and({ queuedAt: { '<=': toIso } })
-        )) ?? []) as Array<{ kind?: string; status?: string; chainStatus?: string | null; txHash?: string | null }>;
+        )) ?? []) as Array<Partial<Pick<BackgroundJob, 'kind' | 'status' | 'chainStatus' | 'txHash' | 'indexerTxHash'>>>;
 
         const counts = new Map<string, { kind: string; status: string; count: number }>();
         let landed = 0;
@@ -961,7 +964,7 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
             counts.set(key, c);
             if (r.chainStatus === 'success') {
                 landed += 1;
-                if (r.txHash) landedHashes.push(String(r.txHash).toLowerCase());
+                for (const hash of [r.txHash, r.indexerTxHash]) if (hash) landedHashes.push(bareHex(hash));
             }
             if (status === 'failed' || r.chainStatus === 'failure') failed += 1;
         }
@@ -1007,18 +1010,25 @@ async function loadOwnGrant(db: DbRunner, grantId: string, userId: string): Prom
     )) as AgentGrant | null;
 }
 
-/** Sum of the indexed fees (DUST atoms) of the given job `txHash`es, as a decimal string. */
-async function sumIndexedFees(db: DbRunner, hashes: string[]): Promise<string> {
+const chunksOf = <T>(list: T[], size = 500): T[][] => Array.from({ length: Math.ceil(list.length / size) }, (_, i) => list.slice(i * size, (i + 1) * size));
+
+/** Sum of the indexed fees (DUST atoms) of the transactions behind the given job hashes, as a decimal string.
+ *  A job names its transaction by an identifier, by the extrinsic hash or by the ledger hash. Each transaction counts once. */
+export async function sumIndexedFees(db: DbRunner, hashes: string[]): Promise<string> {
+    const ids = new Set<string>();
+    for (const chunk of chunksOf(hashes)) {
+        const byHash: Array<{ ID?: string | null }> = await runWithoutAmbientTx(() => db.run(
+            SELECT.from(Transactions).columns('ID').where({ hash: { in: chunk }, or: { ledgerTxHash: { in: chunk } } })
+        )) ?? [];
+        const byIdentifier: Array<{ transaction_ID?: string | null }> = await runWithoutAmbientTx(() => db.run(
+            SELECT.from(TransactionIdentifiers).columns('transaction_ID').where({ identifier: { in: chunk } })
+        )) ?? [];
+        for (const id of [...byHash.map(t => t.ID), ...byIdentifier.map(t => t.transaction_ID)]) if (id) ids.add(id);
+    }
     let total = 0n;
-    for (let i = 0; i < hashes.length; i += 500) {
-        const chunk = hashes.slice(i, i + 500);
-        const txs = (await runWithoutAmbientTx(() => db.run(
-            SELECT.from(Transactions).columns('ID').where({ hash: { in: chunk } })
-        )) ?? []) as Array<{ ID: string }>;
-        const ids = txs.map(t => t.ID).filter(Boolean);
-        if (ids.length === 0) continue;
+    for (const chunk of chunksOf([...ids])) {
         const fees = (await runWithoutAmbientTx(() => db.run(
-            SELECT.from(TransactionFees).columns('paidFees').where({ transaction_ID: { in: ids } })
+            SELECT.from(TransactionFees).columns('paidFees').where({ transaction_ID: { in: chunk } })
         )) ?? []) as Array<{ paidFees?: string | number | bigint | null }>;
         for (const f of fees) {
             if (f.paidFees === undefined || f.paidFees === null) continue;

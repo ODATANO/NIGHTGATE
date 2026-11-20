@@ -12,6 +12,8 @@ OData V4 actions (POST, side effects) and functions (GET, read-only). Parameter 
 
 A function parameter left out of the URL counts as `null`. An undeclared parameter answers 400.
 
+A hex parameter takes its value with or without `0x`, in either letter case, also inside a list or a structure. This holds for hashes, attester ids, field keys, salts, digests, token types, contract addresses, viewing keys and seeds. The server works with lowercase hex without `0x` and answers in that spelling.
+
 ## API versioning while 0.x
 
 A minor release may change or remove an action, a patch release never does. A removal is marked `@deprecated` in the CDS doc and here at least one minor release ahead. `getRuntimeInfo().apiVersion` reports the running major.minor.
@@ -295,7 +297,7 @@ Revokes at once. A grant of another user is 404. Rate class `admin`.
 
 ### `getGrantUsage(grantId?, since?, until?) → { grantId, since, until, jobs, landed, failed, deploysUsed, maxDeploys, jobsUsedToday, maxJobsPerDay, dustPaid, limits }` (function)
 
-Jobs by kind and status between `since` and `until` (default the last 30 days, at most 366). `dustPaid` is the indexed DUST fees, null without the crawler. `limits` holds `jobsPerHour`, `jobsPerDay`, `valuePerDay` and the rate `classes` the grant can reach, each with what is left. Owner-scoped. A token reads only its own grant and may leave `grantId` empty.
+Jobs by kind and status between `since` and `until` (default the last 30 days, at most 366). `dustPaid` is the indexed DUST fees of the landed jobs, null without the crawler. `limits` holds `jobsPerHour`, `jobsPerDay`, `valuePerDay` and the rate `classes` the grant can reach, each with what is left. Owner-scoped. A token reads only its own grant and may leave `grantId` empty.
 
 ## Offer board
 

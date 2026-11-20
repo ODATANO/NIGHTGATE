@@ -1,9 +1,11 @@
 /**
  * Hex is stored lowercase without `0x`. A read finds a stored value by either
- * spelling and letter case, a value that is not hex is refused. Runs against the
- * booted services and a real in-memory database.
+ * spelling and letter case, an action or function takes its hex parameters the
+ * same way, and a value that is not hex is refused. Runs against the booted
+ * services and a real in-memory database.
  */
 import cds from '@sap/cds';
+import { normalizeHexParams } from '../../srv/utils/hex-input';
 
 const cap = cds.test(__dirname + '/../..') as any;
 
@@ -175,5 +177,108 @@ describe('the read functions take either spelling', () => {
         const r = await cap.axios.get(`${API}/${path}`, ANY);
         expect(r.status).toBe(400);
         expect(r.data.error).toMatchObject({ code: 'ASSERT_FORMAT', target });
+    });
+});
+
+describe('the hex parameters of an action or function take either spelling', () => {
+    const X = (pair: string) => `0X${hex(pair).toUpperCase()}`;
+    const SESSION = '00000000-0000-4000-8000-000000000001';
+    const post = (action: string, body: object) => cap.axios.post(`${API}/${action}`, body, ANY);
+
+    test.each(SPELLINGS(CONTRACT))('a contract address, %s', async (_name, value) => {
+        const r = await cap.axios.get(`${API}/deriveTokenType(contractAddress='${value}')`, ANY);
+        expect(r.status).toBe(200);
+        expect(r.data.contractAddress).toBe(CONTRACT);
+    });
+
+    test('a seed and a viewing key', async () => {
+        const seed = 'ab'.repeat(64);
+        const stored = await post('deriveWalletInfo', { seedHex: seed });
+        const spelled = await post('deriveWalletInfo', { seedHex: `0X${seed.toUpperCase()}` });
+        expect(stored.status).toBe(200);
+        expect(spelled.data.viewingKey).toBe(stored.data.viewingKey);
+        expect((await post('connectWallet', { viewingKey: `0X${stored.data.viewingKey.toUpperCase()}` })).status).toBe(200);
+    });
+
+    // Each handler below refuses a 64-character value with `0x` itself. Past that check it stops at the unknown session.
+    test.each([
+        ['a list', 'issueFieldPredicateAttestation', (h: (pair: string) => string) => ({
+            payloadHash: h('a1'), fieldKey: h('b2'), value: '1', fieldSalt: h('c3'), threshold: 5, predicate: 'lessOrEqual',
+            siblings: [h('01'), h('02'), h('03'), h('04')], dirs: [true, false, true, false]
+        })],
+        ['a list inside a list of structures', 'issueFieldPredicateAttestationBatch', (h: (pair: string) => string) => ({
+            payloadHash: h('a1'),
+            claims: [{
+                predicate: 'lessOrEqual', fieldKey: h('b2'), value: '1', salt: h('c3'), threshold: 5,
+                siblings: [h('01'), h('02'), h('03'), h('04')], dirs: [true, false, true, false]
+            }]
+        })],
+        ['a structure', 'issueDocumentIntegrityAttestation', (h: (pair: string) => string) => {
+            const slots = Array.from({ length: 16 }, () => ({ present: true, value: '1', valueDigest: h('e5') }));
+            return {
+                payloadHashA: h('a1'), payloadHashB: h('b2'), allowedMask: 1,
+                schema: Array.from({ length: 16 }, () => ({ fieldKey: h('f6'), kind: 0, scale: '0' })),
+                openingA: { saltSeed: h('07'), slots }, openingB: { saltSeed: h('08'), slots }
+            };
+        }]
+    ])('%s reaches the handler in the stored spelling', async (_name, action, body) => {
+        const stored = await post(action, { ...body(hex), sessionId: SESSION, contractAddress: CONTRACT });
+        const spelled = await post(action, { ...body(X), sessionId: SESSION, contractAddress: X('3c') });
+        expect(stored.status).not.toBe(400);
+        expect(spelled.status).toBe(stored.status);
+        expect(spelled.data.error).toEqual(stored.data.error);
+    });
+
+    test.each([
+        ['a 64-character parameter', 'issueFieldPredicateAttestation', { payloadHash: `0x${'a'.repeat(63)}` }, 'payloadHash', 'must be 64 hex characters'],
+        ['a seed', 'deriveWalletInfo', { seedHex: 'zz' }, 'seedHex', 'must be 128 hex characters'],
+        ['a viewing key', 'connectWallet', { viewingKey: 'not-hex' }, 'viewingKey', 'must be 64 hex characters'],
+        ['a contract address', 'submitContractCall', { contractAddress: '0xVAULT', circuit: 'c' }, 'contractAddress', 'must be hex']
+    ])('%s that is not hex is refused', async (_name, action, body, target, message) => {
+        const r = await post(action, body);
+        expect(r.status).toBe(400);
+        expect(r.data.error).toMatchObject({ code: 'ASSERT_FORMAT', target, message });
+    });
+});
+
+describe('normalizeHexParams', () => {
+    const operation = (name: string) => (cds.services.NightgateService as any).actions[name];
+    const UPPER = `0X${hex('ab').toUpperCase()}`;
+    const BARE = hex('ab');
+
+    test('rewrites a value, a list and the fields of structures, however deep', () => {
+        const data = {
+            payloadHash: UPPER,
+            contractAddress: '0xAB',
+            claims: [{ fieldKey: UPPER, siblings: [UPPER, BARE], schema: [{ fieldKey: UPPER }], openingA: { saltSeed: UPPER, slots: [{ valueDigest: UPPER }] } }]
+        };
+        normalizeHexParams(data, operation('issueFieldPredicateAttestationBatch'));
+        expect(data).toEqual({
+            payloadHash: BARE,
+            contractAddress: 'ab',
+            claims: [{ fieldKey: BARE, siblings: [BARE, BARE], schema: [{ fieldKey: BARE }], openingA: { saltSeed: BARE, slots: [{ valueDigest: BARE }] } }]
+        });
+    });
+
+    test('leaves everything else as it is', () => {
+        const data = {
+            idempotencyKey: '0xKEY', compiledArtifactRef: '0xRef', validUntil: 5, payloadHash: null,
+            claims: [{ value: '0xAB', predicate: '0xP', siblings: [7, null], dirs: [true], unknown: UPPER }, null, 'text']
+        };
+        const before = structuredClone(data);
+        normalizeHexParams(data, operation('issueFieldPredicateAttestationBatch'));
+        expect(data).toEqual(before);
+    });
+
+    test('every list of hex values in the model carries the mark', async () => {
+        const unmarked: string[] = [];
+        const walk = (node: unknown, path: string): void => {
+            if (!node || typeof node !== 'object') return;
+            const def = node as { items?: { type?: unknown }; '@nightgate.hex'?: boolean };
+            if (['Hex64', 'HexEncoded'].includes(String(def.items?.type)) && !def['@nightgate.hex']) unmarked.push(path);
+            for (const [key, child] of Object.entries(node)) walk(child, `${path}/${key}`);
+        };
+        walk((await cds.load('*')).definitions, '');
+        expect(unmarked).toEqual([]);
     });
 });

@@ -1,4 +1,5 @@
 using { midnight } from '../db/schema';
+using { HexEncoded } from '../db/types';
 
 @path: '/odata/v4/midnight-admin'
 @requires: 'admin'
@@ -40,7 +41,7 @@ service NightgateAdminService {
     /** Exports the key that may upgrade a contract, taken from the session that deployed it.
      * The export is encrypted with `password`, at least 16 characters. No action restores it.
      * Whoever holds this key can change how the contract verifies proofs. */
-    action exportContractSigningKey(sessionId: UUID, contractAddress: String, password: String) returns {
+    action exportContractSigningKey(sessionId: UUID, contractAddress: HexEncoded, password: String) returns {
         format          : String;
         encryptedPayload: LargeString;
         salt            : String;

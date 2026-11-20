@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.46.1 - 2026-11-20
+
+### Features
+
+- Every hex parameter of an action or function takes its value with or
+  without `0x`, in either letter case, also inside a list or a structure:
+  the 64-character values such as `payloadHash`, `attesterId`, `fieldKey`,
+  salts, digests and token types, and `contractAddress`, `registryAddress`,
+  `viewingKey` and `seedHex`. The server works with lowercase hex without
+  `0x`, so rows and answers keep one spelling. A 64-character value with
+  `0x` answered 400 before.
+
+### Changes
+
+- `contractAddress` and `registryAddress` are checked before the handler: a
+  value that is not hex answers 400 `ASSERT_FORMAT` with `must be hex`.
+  `viewingKey` and `seedHex` answer `ASSERT_FORMAT` with `must be 64 hex
+  characters` and `must be 128 hex characters`.
+- `$metadata` carries the pattern of these parameters as
+  `Validation.Pattern`.
+
+### Fixes
+
+- `getGrantUsage.dustPaid` finds the transaction of a job by its identifier,
+  its extrinsic hash or its ledger hash and counts each transaction once. It
+  compared the job's hash with the extrinsic hash only, so a job that holds
+  an identifier or the ledger hash added nothing.
+
+No schema change, no circuit change. `@odatano/nightgate-tx` unchanged. Docs:
+`docs/actions.md`.
+
 ## 0.46.0 - 2026-11-20
 
 ### Breaking

@@ -1,4 +1,4 @@
-using { Hex64 } from '../db/types';
+using { Hex64, HexEncoded } from '../db/types';
 
 /** The verify functions of the Nightgate service, without login.
  * Off by default. Set `NIGHTGATE_PUBLIC_VERIFY=true` to enable it.
@@ -10,7 +10,7 @@ service NightgateVerifyService {
     /** Checks on chain whether an attester has attested a payload hash.
      * Only the attester vouches for its attestation, so check `attesterId` against attesters you trust.
      * If nothing is found, the result is `verified: false`, not an error. */
-    function verifyAttestationState(contractAddress: String,
+    function verifyAttestationState(contractAddress: HexEncoded,
                                     attesterId: Hex64,
                                     payloadHash: Hex64,
                                     documentId: Hex64, // instead of attesterId and payloadHash
@@ -33,7 +33,7 @@ service NightgateVerifyService {
     /** Checks on chain whether a proof about a document field was recorded as true.
      * The inputs must be exactly those of the proof, otherwise the result is `verified: false`.
      * For a comparison of two documents, A and B must be in the same order as when proving. */
-    function verifyPredicateState(contractAddress: String,
+    function verifyPredicateState(contractAddress: HexEncoded,
                                   attesterId: Hex64,
                                   payloadHash: Hex64, // document A when comparing two documents
                                   fieldKey: Hex64, // required for single-field predicates
@@ -55,7 +55,7 @@ service NightgateVerifyService {
     /** Checks on chain which disclosure level an attester has granted to `grantee` on a payload hash.
      * A revoked grant and a retracted attestation leave no grant.
      * If nothing is found, the result is `verified: false`, not an error. */
-    function verifyDisclosureState(contractAddress: String,
+    function verifyDisclosureState(contractAddress: HexEncoded,
                                    attesterId: Hex64,
                                    payloadHash: Hex64,
                                    grantee: Hex64,
