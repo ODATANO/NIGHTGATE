@@ -44,6 +44,7 @@ vi.mock('@sap/cds', () => {
             }
         },
         ApplicationService: class {
+            before() { /* the hex input hook; its own tests boot the services */ }
             on(event: string, handler: Function) {
                 registeredHandlers[event] = handler;
             }

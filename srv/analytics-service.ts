@@ -3,12 +3,14 @@ const { SELECT } = cds.ql;
 
 import { Transactions, ContractActions, Blocks } from '#cds-models/midnight';
 import { normalizeHttpError } from './utils/http-errors';
+import { attachHexInput } from './utils/hex-input';
 
 export default class NightgateAnalyticsService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
 
     async init(): Promise<void> {
         this.on('error', normalizeHttpError);
+        attachHexInput(this);
         this.db = await cds.connect.to('db');
 
         this.on('getBlockCount', async () => {

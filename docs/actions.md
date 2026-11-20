@@ -582,7 +582,13 @@ Every `@readonly` entity supports the OData V4 query options.
 curl "http://localhost:4004/odata/v4/midnight/Blocks?\$top=10&\$orderby=height desc"
 ```
 
-Bound read functions, for example `Transactions/byHash(hash='0x…')`. A list function takes `limit` (1 to 5000) and `skip`. A full page means more rows exist.
+Every entity holds hashes, contract addresses, token types and identifiers as lowercase hex without `0x`. A `$filter`, a key and a read function take such a value with or without `0x`, in either letter case. A value that is not hex answers 400.
+
+```bash
+curl "http://localhost:4004/odata/v4/midnight/Blocks?\$filter=hash eq '0x718C…7B2C'"
+```
+
+Bound read functions, for example `Transactions/byHash(hash='718c…7b2c')`. A list function takes `limit` (1 to 5000) and `skip`. A full page means more rows exist.
 
 | Function | Order | Default `limit` |
 |---|---|---|
@@ -600,7 +606,7 @@ Bound read functions, for example `Transactions/byHash(hash='0x…')`. A list fu
 | `NightBalances/getBalance(address)` | one balance | - |
 | `NightBalances/getTopHolders(limit, skip)` | highest first | 10 |
 
-A hash can occur in more than one block, because the timestamp transaction repeats its hash.
+A transaction has two hashes. `hash` is the hash of the extrinsic, as the node and Substrate tools show it. `ledgerTxHash` is the hash of the ledger transaction, as the Midnight indexer shows it. `byHash` and `ledgerTransaction` find a transaction by either. An extrinsic hash can occur in more than one block, because the timestamp transaction repeats its hash.
 
 `Transactions/byIdentifier` returns `{ identifier, hash, ledgerTxHash, blockHeight, blockHash, status, failedSegments }`. `status` is null until the indexer supplement has the result.
 

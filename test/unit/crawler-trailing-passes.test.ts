@@ -65,10 +65,11 @@ function inherentBase64(): string {
     return Buffer.from([0x0c, 0x04, 1, 0]).toString('base64');
 }
 
+/** `hash` in the node's spelling. The row holds it as the crawler stores it, without `0x`. */
 async function seedBlock(height: number, hash: string): Promise<string> {
     const ID = cds.utils.uuid();
     await db.run(cds.ql.INSERT.into(BLOCKS).entries({
-        ID, hash, height, protocolVersion: 1, timestamp: 1_700_000_000, stateRoot: '0xstate'
+        ID, hash: hash.replace(/^0x/, ''), height, protocolVersion: 1, timestamp: 1_700_000_000, stateRoot: 'state'
     }));
     return ID;
 }
@@ -78,7 +79,7 @@ async function seedTransaction(blockId: string, over: Record<string, any> = {}):
     await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
         ID,
         transactionId: over.transactionId ?? 0,
-        hash: over.hash ?? `0x${ID.slice(0, 8)}`,
+        hash: over.hash ?? ID.slice(0, 8),
         protocolVersion: 1,
         transactionType: 'REGULAR',
         block_ID: blockId,
@@ -1287,7 +1288,7 @@ describe('contract state storage', () => {
             await db.run(cds.ql.UPDATE.entity(BLOCKS).set({ ledgerParameters: b64('params12') }).where({ height: 12 }));
             const fetchState = vi.fn();
             const snap = await stateAt(db, CONTRACT, null, fetchState);
-            expect(snap).toEqual(expect.objectContaining({ source: 'current', blockHash: '0xcs12' }));
+            expect(snap).toEqual(expect.objectContaining({ source: 'current', blockHash: 'cs12' }));
             expect(text(snap!.ledgerParameters)).toBe('params12');
             expect(fetchState).not.toHaveBeenCalled();
         });
@@ -1299,7 +1300,7 @@ describe('contract state storage', () => {
             const snap = await stateAt(db, CONTRACT, null, fetchState, fetchParameters);
             expect(fetchParameters).toHaveBeenCalledWith(null);
             expect(fetchState).not.toHaveBeenCalled();
-            expect(snap).toEqual(expect.objectContaining({ source: 'current', blockHash: '0xcs12' }));
+            expect(snap).toEqual(expect.objectContaining({ source: 'current', blockHash: 'cs12' }));
             expect(text(snap!.state)).toBe('s12');
             expect(text(snap!.ledgerParameters)).toBe('tip');
             await stateAt(db, CONTRACT, 15, fetchState, fetchParameters);
@@ -1318,7 +1319,7 @@ describe('contract state storage', () => {
             await storeParams(10);
             const fetchState = vi.fn();
             const snap = await stateAt(db, CONTRACT, null, fetchState);
-            expect(snap).toEqual(expect.objectContaining({ height: 12, blockHash: '0xcs12' }));
+            expect(snap).toEqual(expect.objectContaining({ height: 12, blockHash: 'cs12' }));
             expect(text(snap!.ledgerParameters)).toBe('params10');
             expect(fetchState).not.toHaveBeenCalled();
         });
@@ -1328,7 +1329,7 @@ describe('contract state storage', () => {
             await storeParams(10, 12);
             const fetchState = vi.fn();
             const snap = await stateAt(db, CONTRACT, null, fetchState);
-            expect(snap).toEqual(expect.objectContaining({ height: 10, blockHash: '0xcs10' }));
+            expect(snap).toEqual(expect.objectContaining({ height: 10, blockHash: 'cs10' }));
             expect(text(snap!.state)).toBe('s10');
             expect(text(snap!.ledgerParameters)).toBe('params12');
             expect(text((await stateAt(db, CONTRACT, 11, fetchState))!.ledgerParameters)).toBe('params10');
@@ -1363,9 +1364,9 @@ describe('contract state storage', () => {
 
         it('returns the block hash and parameters the indexer answered with', async () => {
             await supplyBlocks(twoStates);
-            const fetchState = vi.fn(async () => ({ height: null, state: b64('s10'), zswapState: null, blockHash: '0xb10', ledgerParameters: b64('p10') }));
+            const fetchState = vi.fn(async () => ({ height: null, state: b64('s10'), zswapState: null, blockHash: 'b10', ledgerParameters: b64('p10') }));
             const snap = await stateAt(db, CONTRACT, 11, fetchState);
-            expect(snap).toEqual(expect.objectContaining({ source: 'indexer', blockHash: '0xb10' }));
+            expect(snap).toEqual(expect.objectContaining({ source: 'indexer', blockHash: 'b10' }));
             expect(text(snap!.ledgerParameters)).toBe('p10');
         });
     });

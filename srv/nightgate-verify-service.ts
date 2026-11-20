@@ -7,6 +7,7 @@ import { registerVerifyStateHandlers } from './submission/verify-state';
 import { checkRateClass } from './utils/rate-classes';
 import { configFlag } from './utils/config';
 import { normalizeHttpError } from './utils/http-errors';
+import { attachHexInput } from './utils/hex-input';
 import type { Request } from '@sap/cds';
 
 /** Rejects with 404 while the feature is off and with 429 when the caller is over its rate limit.
@@ -22,6 +23,7 @@ export async function publicVerifyGate(req: Request): Promise<boolean> {
 export default class NightgateVerifyService extends cds.ApplicationService {
     async init(): Promise<void> {
         this.on('error', normalizeHttpError);
+        attachHexInput(this);
         await ensureNightgateModelLoaded();
         registerVerifyStateHandlers(this, { gate: publicVerifyGate });
         await super.init();

@@ -12,6 +12,8 @@ import {
 } from '../../srv/crawler/block-author';
 
 const [plain, change, afterChange] = fixture.blocks;
+/** The fixture holds the node's spelling. The resolver names the validator as the database stores it, without `0x`. */
+const stored = (hex: string): string => hex.replace(/^0x/, '');
 const encodeAuthorities = (keys: string[]): string => new TypeRegistry().createType('Vec<H256>', keys).toHex();
 
 /** A node that answers `Aura.Authorities` per parent hash, as recorded in the fixture. */
@@ -59,15 +61,15 @@ describe('BlockAuthorResolver', () => {
     it('names the validator of a block from the parent state and proves it by the seal', async () => {
         const node = nodeWith([plain]);
         const producer = await new BlockAuthorResolver(node).resolve(plain.hash, plain.header);
-        expect(producer).toEqual({ author: plain.author, slot: plain.slot });
+        expect(producer).toEqual({ author: stored(plain.author), slot: plain.slot });
         expect(node.getStorage).toHaveBeenCalledExactlyOnceWith(AURA_AUTHORITIES_STORAGE_KEY, plain.header.parentHash);
     });
 
     it('follows a list change through the header, without a second storage read', async () => {
         const node = nodeWith([change]);
         const resolver = new BlockAuthorResolver(node);
-        expect(await resolver.resolve(change.hash, change.header)).toEqual({ author: change.author, slot: change.slot });
-        expect(await resolver.resolve(afterChange.hash, afterChange.header)).toEqual({ author: afterChange.author, slot: afterChange.slot });
+        expect(await resolver.resolve(change.hash, change.header)).toEqual({ author: stored(change.author), slot: change.slot });
+        expect(await resolver.resolve(afterChange.hash, afterChange.header)).toEqual({ author: stored(afterChange.author), slot: afterChange.slot });
         expect(node.getStorage).toHaveBeenCalledTimes(1);
     });
 
@@ -75,7 +77,7 @@ describe('BlockAuthorResolver', () => {
         const node = nodeWith([plain, afterChange]);
         const resolver = new BlockAuthorResolver(node);
         await resolver.resolve(plain.hash, plain.header);
-        expect((await resolver.resolve(afterChange.hash, afterChange.header)).author).toBe(afterChange.author);
+        expect((await resolver.resolve(afterChange.hash, afterChange.header)).author).toBe(stored(afterChange.author));
         expect(node.getStorage).toHaveBeenCalledTimes(2);
     });
 

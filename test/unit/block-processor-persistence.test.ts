@@ -149,11 +149,11 @@ describe('BlockProcessor persistence paths', () => {
         // Seed the block so blockExists() is true.
         await db.run(cds.ql.INSERT.into(BLOCKS).entries({
             ID: cds.utils.uuid(),
-            hash: '0xknown',
+            hash: 'known',
             height: 42,
             protocolVersion: 1,
             timestamp: 1_700_000_000,
-            stateRoot: '0xstate'
+            stateRoot: 'state'
         }));
 
         const provider = {
@@ -176,7 +176,7 @@ describe('BlockProcessor persistence paths', () => {
         expect(provider.getBlock).not.toHaveBeenCalled();
 
         // No duplicate block, no transactions persisted.
-        expect((await db.run(cds.ql.SELECT.from(BLOCKS).where({ hash: '0xknown' }))).length).toBe(1);
+        expect((await db.run(cds.ql.SELECT.from(BLOCKS).where({ hash: 'known' }))).length).toBe(1);
         expect((await db.run(cds.ql.SELECT.from(TRANSACTIONS))).length).toBe(0);
     });
 
@@ -231,8 +231,8 @@ describe('BlockProcessor persistence paths', () => {
 
         await processor.processBlockByHash(block.hash);
 
-        const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).columns('author', 'slot', 'height').where({ hash: block.hash }));
-        expect(row.author).toBe(block.author);
+        const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).columns('author', 'slot', 'height').where({ hash: block.hash.slice(2) }));
+        expect(row.author).toBe(block.author.slice(2));
         expect(Number(row.slot)).toBe(block.slot);
         expect(Number(row.height)).toBe(block.height);
         expect(provider.getStorage).toHaveBeenCalledWith(AURA_AUTHORITIES_STORAGE_KEY, block.header.parentHash);
@@ -247,11 +247,11 @@ describe('BlockProcessor persistence paths', () => {
         const parentId = cds.utils.uuid();
         await db.run(cds.ql.INSERT.into(BLOCKS).entries({
             ID: parentId,
-            hash: '0xparent',
+            hash: 'parent',
             height: 4,
             protocolVersion: 77,
             timestamp: 1_699_999_999,
-            stateRoot: '0xstate-parent'
+            stateRoot: 'state-parent'
         }));
 
         const extrinsics = [
@@ -301,15 +301,15 @@ describe('BlockProcessor persistence paths', () => {
         }));
 
         // --- Block row ---
-        const blockRow = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xnew' }));
+        const blockRow = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: 'new' }));
         expect(blockRow).toEqual(expect.objectContaining({
-            hash: '0xnew',
+            hash: 'new',
             protocolVersion: 77,
             timestamp: 1_700_000_000,
             // The digest names no AURA slot, so no validator is stored.
             author: null,
             slot: null,
-            stateRoot: '0xstate',
+            stateRoot: 'state',
             parent_ID: parentId
         }));
         // Integer64: number on CAP 9, string on CAP 10 (ieee754compatible).
@@ -335,7 +335,7 @@ describe('BlockProcessor persistence paths', () => {
         // payload is not decoded, so the column is null for every row.
         expect(txRows.every((t: any) => t.contractAddress === null)).toBe(true);
         expect(txRows.every((t: any) => t.block_ID === blockId)).toBe(true);
-        expect(txRows.every((t: any) => /^0x[0-9a-f]{64}$/.test(t.hash))).toBe(true);
+        expect(txRows.every((t: any) => /^[0-9a-f]{64}$/.test(t.hash))).toBe(true);
 
         // --- Transaction results: one SUCCESS per tx, linked to the tx ---
         const txIds = new Set(txRows.map((t: any) => t.ID));
@@ -364,7 +364,7 @@ describe('BlockProcessor persistence paths', () => {
         // --- SyncState advanced to the new tip ---
         const sync = await db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }));
         expect(Number(sync.lastIndexedHeight)).toBe(5);
-        expect(sync.lastIndexedHash).toBe('0xnew');
+        expect(sync.lastIndexedHash).toBe('new');
         expect(sync.syncStatus).toBe('syncing');
         expect(typeof sync.lastIndexedAt).toBe('string');
     });
@@ -393,12 +393,12 @@ describe('BlockProcessor persistence paths', () => {
         try {
             // runtime version unavailable -> refused, never a previous version's map
             await expect(processor.processBlockByHash('0xfallback')).rejects.toThrow(/No runtime version for block 0xfallback/);
-            expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xfallback' }))).toBeFalsy();
+            expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: 'fallback' }))).toBeFalsy();
 
             // runtime known, timestamp storage empty and no inherent -> refused, nothing persisted
             provider.getRuntimeVersion.mockResolvedValue({ specVersion: 7 });
             await expect(processor.processBlockByHash('0xfallback')).rejects.toThrow(/No timestamp for block 0xfallback/);
-            expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xfallback' }))).toBeFalsy();
+            expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: 'fallback' }))).toBeFalsy();
             expect(await db.run(cds.ql.SELECT.from(TRANSACTIONS))).toHaveLength(0);
         } finally {
             warnSpy.mockRestore();
@@ -416,7 +416,7 @@ describe('BlockProcessor persistence paths', () => {
         };
         const processor = makeProcessor(provider);
         await expect(processor.processBlockByHash('0xnoevents')).rejects.toThrow(/System.Events/);
-        expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xnoevents' }))).toBeFalsy();
+        expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: 'noevents' }))).toBeFalsy();
         expect(await db.run(cds.ql.SELECT.from(TRANSACTIONS).where({ hash: { like: '%' } }))).toHaveLength(0);
     });
 
@@ -431,11 +431,11 @@ describe('BlockProcessor persistence paths', () => {
         const parentId = cds.utils.uuid();
         await db.run(cds.ql.INSERT.into(BLOCKS).entries({
             ID: parentId,
-            hash: '0xparent-3',
+            hash: 'parent-3',
             height: 8,
             protocolVersion: 88,
             timestamp: 1_700_099_999,
-            stateRoot: '0xstate-parent-3'
+            stateRoot: 'state-parent-3'
         }));
 
         const transferExtrinsic = buildSignedTransferExtrinsic(0x11, 0x22, 100);
@@ -519,7 +519,7 @@ describe('parent enforcement (height-sequenced paths)', () => {
         ).rejects.toThrow('refusing to persist an orphan');
 
         // The insert ran inside a tx → rolled back, no partial block row.
-        const rows = await db.run(cds.ql.SELECT.from(BLOCKS).where({ hash: '0xorphan' }));
+        const rows = await db.run(cds.ql.SELECT.from(BLOCKS).where({ hash: 'orphan' }));
         expect(rows.length).toBe(0);
     });
 
@@ -529,7 +529,7 @@ describe('parent enforcement (height-sequenced paths)', () => {
         const result = await processor.persistPreparedBlock(preparedBlock(0, '0xgenesis', '0x' + '00'.repeat(32)));
         expect(result.blockHeight).toBe(0);
 
-        const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xgenesis' }));
+        const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: 'genesis' }));
         expect(row).toBeTruthy();
         expect(row.parent_ID).toBeNull();
     });
@@ -538,29 +538,29 @@ describe('parent enforcement (height-sequenced paths)', () => {
         const parentId = cds.utils.uuid();
         await db.run(cds.ql.INSERT.into(BLOCKS).entries({
             ID: parentId,
-            hash: '0xparent-6',
+            hash: 'parent-6',
             height: 6,
             protocolVersion: 1,
             timestamp: 1_700_000_000,
-            stateRoot: '0xstate'
+            stateRoot: 'state'
         }));
         const processor = makeProcessor({});
 
         const result = await processor.persistPreparedBlock(preparedBlock(7, '0xchild-7', '0xparent-6'));
         expect(result.blockHeight).toBe(7);
 
-        const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xchild-7' }));
+        const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: 'child-7' }));
         expect(row.parent_ID).toBe(parentId);
     });
 
     it('treats a block another writer landed meanwhile as already indexed instead of failing it', async () => {
         await db.run(cds.ql.INSERT.into(BLOCKS).entries({
             ID: cds.utils.uuid(),
-            hash: '0xparent-6',
+            hash: 'parent-6',
             height: 6,
             protocolVersion: 1,
             timestamp: 1_700_000_000,
-            stateRoot: '0xstate'
+            stateRoot: 'state'
         }));
         const processor = makeProcessor({});
         const warnSpy = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
@@ -574,7 +574,7 @@ describe('parent enforcement (height-sequenced paths)', () => {
             expect(twin).toMatchObject({ blockHeight: 7, blockHash: '0xchild-7', transactionCount: 0, contractActionCount: 0 });
             expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('indexed by another writer'));
 
-            const rows = await db.run(cds.ql.SELECT.from(BLOCKS).where({ hash: '0xchild-7' }));
+            const rows = await db.run(cds.ql.SELECT.from(BLOCKS).where({ hash: 'child-7' }));
             expect(rows.length).toBe(1);
             const state = await db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }));
             expect(Number(state.lastIndexedHeight)).toBe(7);

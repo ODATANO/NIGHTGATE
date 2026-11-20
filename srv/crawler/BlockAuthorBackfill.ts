@@ -113,14 +113,16 @@ export class BlockAuthorBackfill {
 
     private async resolve(blocks: Row<Block, 'ID' | 'hash' | 'height'>[]): Promise<BlockProducer[]> {
         if (blocks.length === 0) return [];
+        // The node takes a hash with `0x`. The database stores it without.
+        const hashes = blocks.map(block => `0x${block.hash}`);
         const headers = await this.node.rpcBatch(
-            blocks.map(block => ({ method: 'chain_getHeader', params: [block.hash] }))
+            hashes.map(hash => ({ method: 'chain_getHeader', params: [hash] }))
         ) as Array<BlockHeader | null>;
         const producers: BlockProducer[] = [];
         for (let i = 0; i < blocks.length; i++) {
             const header = headers[i];
             if (!header) throw new Error(`No header for block ${blocks[i].hash} at height ${blocks[i].height}`);
-            producers.push(await this.authors.resolve(blocks[i].hash, header));
+            producers.push(await this.authors.resolve(hashes[i], header));
             if (i % YIELD_EVERY === YIELD_EVERY - 1) await nextTurn();
         }
         return producers;

@@ -1,5 +1,5 @@
 using {midnight} from '../db/schema';
-using { Hex64, TxType } from '../db/types';
+using { Hex64, HexEncoded, TxType } from '../db/types';
 
 /** Midnight chain data, attestations, zero-knowledge proofs, wallet sessions and transaction jobs.
  * Actions that write to the chain return a `jobId` to poll with `getJobStatus`. A retry with the same `idempotencyKey` returns the first job.
@@ -40,20 +40,20 @@ service NightgateService {
             dustLedgerEvents
         }
         actions {
-            // The same extrinsic hash can land in more than one block. Newest first, limit default 100.
+            // hash: the extrinsic hash or the ledger hash. One extrinsic hash can land in more than one block. Newest first, limit default 100.
             @cds.odata.bindingparameter.collection
-            function byHash(hash: String, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of Transactions;
+            function byHash(hash: HexEncoded, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of Transactions;
 
             @cds.odata.bindingparameter.collection
             function byType(@assert.range txType: TxType, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of Transactions;
 
             // identifier: a ledger identifier of the transaction, hex. 404 while the indexer has not seen it.
             @cds.odata.bindingparameter.collection
-            function byIdentifier(identifier: String)       returns TransactionInclusion;
+            function byIdentifier(identifier: HexEncoded)   returns TransactionInclusion;
 
-            // hash: the transaction's hash as the row stores it. 404 while not indexed or when the row carries no ledger transaction.
+            // hash: the extrinsic hash or the ledger hash. 404 while not indexed or when the row carries no ledger transaction.
             @cds.odata.bindingparameter.collection
-            function ledgerTransaction(hash: String)        returns TransactionLedgerBytes;
+            function ledgerTransaction(hash: HexEncoded)    returns TransactionLedgerBytes;
         };
 
     /** The serialized ledger transaction inside a transaction's extrinsic. */
@@ -130,11 +130,11 @@ service NightgateService {
         actions {
             // Oldest first, limit default 100. Page with skip to read every action.
             @cds.odata.bindingparameter.collection
-            function byAddress(address: String, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of ContractActions;
+            function byAddress(address: HexEncoded, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of ContractActions;
 
             // Newest first, limit default 100.
             @cds.odata.bindingparameter.collection
-            function history(address: String, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer)   returns array of ContractActions;
+            function history(address: HexEncoded, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer)   returns array of ContractActions;
         };
 
     @readonly
@@ -166,7 +166,7 @@ service NightgateService {
         actions {
             // height: optional, default the current state
             @cds.odata.bindingparameter.collection
-            function stateAt(address: String, height: Integer64) returns ContractStateSnapshot;
+            function stateAt(address: HexEncoded, height: Integer64) returns ContractStateSnapshot;
         };
 
     @readonly

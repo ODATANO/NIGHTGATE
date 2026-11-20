@@ -68,15 +68,16 @@ async function getSyncState(): Promise<any> {
     return db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }));
 }
 
+/** `hash` in the node's spelling. The row holds it as the crawler stores it, without `0x`. */
 async function seedBlock(height: number, hash: string): Promise<string> {
     const id = cds.utils.uuid();
     await db.run(cds.ql.INSERT.into(BLOCKS).entries({
         ID: id,
-        hash,
+        hash: hash.replace(/^0x/, ''),
         height,
         protocolVersion: 1,
         timestamp: 1_700_000_000 + height,
-        stateRoot: '0xabcd'
+        stateRoot: 'abcd'
     }));
     return id;
 }
@@ -309,7 +310,7 @@ describe('MidnightCrawler orchestration', () => {
             };
 
             // lastIndexedHeight 0 with a non-null hash → catch-up resumes at height 1.
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0' });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0' });
 
             // Spy the batch retry shim so we can assert the height ranges requested.
             const fetchSpy = vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
@@ -347,7 +348,7 @@ describe('MidnightCrawler orchestration', () => {
             const row = await getSyncState();
             expect(Number(row.chainHeight)).toBe(2);
             expect(Number(row.lastFinalizedHeight)).toBe(2);
-            expect(row.lastFinalizedHash).toBe('0x2');
+            expect(row.lastFinalizedHash).toBe('2');
             expect(row.syncStatus).toBe('syncing');
         });
 
@@ -360,7 +361,7 @@ describe('MidnightCrawler orchestration', () => {
             (crawler as any).db = db;
 
             // Already indexed up to height 5 (> finalized head 2).
-            await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: '0x5' });
+            await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: '5' });
 
             await expect((crawler as any).catchUp()).resolves.toBe(0);
             expect((crawler as any).isCatchingUp).toBe(false);
@@ -480,7 +481,7 @@ describe('MidnightCrawler orchestration', () => {
                 fetchBlockBatch: mockProcessorFetchBlockBatch,
                 persistPreparedBlock: mockProcessorPersistPreparedBlock
             };
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0', consecutiveErrors: 0 });
 
             // Height 1 resolves slowly; heights 2 and up reject while the loop
             // is still busy with 1, which is exactly the window.
@@ -543,7 +544,7 @@ describe('MidnightCrawler orchestration', () => {
                 persistPreparedBlock: mockProcessorPersistPreparedBlock
             };
             // Resume at 90: a run-relative figure would read ~9% at height 91.
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 90, lastIndexedHash: '0x5a', consecutiveErrors: 0 });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 90, lastIndexedHash: '5a', consecutiveErrors: 0 });
 
             vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
                 .mockImplementation(async (...args: any[]) => preparedBlocks(args[0] as number[]));
@@ -624,7 +625,7 @@ describe('MidnightCrawler orchestration', () => {
                 fetchBlockBatch: mockProcessorFetchBlockBatch,
                 persistPreparedBlock: mockProcessorPersistPreparedBlock
             };
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0', consecutiveErrors: 0 });
 
             // Height 2 fails once (transient outage), then succeeds on the re-queue.
             let failedOnce = false;
@@ -671,7 +672,7 @@ describe('MidnightCrawler orchestration', () => {
                 fetchBlockBatch: mockProcessorFetchBlockBatch,
                 persistPreparedBlock: mockProcessorPersistPreparedBlock
             };
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0', consecutiveErrors: 0 });
 
             // Height 2 fails on every attempt.
             vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry')
@@ -821,7 +822,7 @@ describe('MidnightCrawler orchestration', () => {
             const paced = makeCrawler({ maxBlocksPerSecond: 10, rpcBatchSize: 10, fetchConcurrency: 1 }, provider);
             const sleep = vi.fn().mockResolvedValue(undefined);
             paced.crawler.sleep = sleep;
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0' });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0' });
 
             await expect(paced.crawler.catchUp()).resolves.toBe(3);
 
@@ -834,7 +835,7 @@ describe('MidnightCrawler orchestration', () => {
             const free = makeCrawler({ rpcBatchSize: 10, fetchConcurrency: 1 }, provider);
             const freeSleep = vi.fn().mockResolvedValue(undefined);
             free.crawler.sleep = freeSleep;
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0' });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0' });
 
             await expect(free.crawler.catchUp()).resolves.toBe(3);
             expect(freeSleep).not.toHaveBeenCalled();
@@ -846,7 +847,7 @@ describe('MidnightCrawler orchestration', () => {
                 getHeader: vi.fn().mockResolvedValue({ number: '0x3' })
             };
             const { crawler, fetchSpy } = makeCrawler({ rpcBatchSize: 1, fetchConcurrency: 1 }, provider);
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0', consecutiveErrors: 0 });
 
             // Permanent, not transient: the block itself does not index.
             fetchSpy.mockImplementation(async (...args: any[]) => {
@@ -880,7 +881,7 @@ describe('MidnightCrawler orchestration', () => {
                 getHeader: vi.fn().mockResolvedValue({ number: '0x3' })
             };
             const { crawler, fetchSpy } = makeCrawler({ rpcBatchSize: 1, fetchConcurrency: 1 }, provider);
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0', consecutiveErrors: 0 });
 
             fetchSpy.mockImplementation(async (...args: any[]) => {
                 const heights = args[0] as number[];
@@ -906,7 +907,7 @@ describe('MidnightCrawler orchestration', () => {
                 getHeader: vi.fn().mockResolvedValue({ number: '0x3' })
             };
             const { crawler, fetchSpy } = makeCrawler({ rpcBatchSize: 8, fetchConcurrency: 1 }, provider);
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0', consecutiveErrors: 0 });
 
             const first = crawler.catchUp();
             const second = crawler.catchUp();
@@ -949,7 +950,7 @@ describe('MidnightCrawler orchestration', () => {
                 })
             };
             const { crawler, fetchSpy } = makeCrawler({ rpcBatchSize: 8, fetchConcurrency: 1 }, provider);
-            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0x0', consecutiveErrors: 0 });
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: '0', consecutiveErrors: 0 });
             // The mocked persist advances the cursor as the real one does.
             mockProcessorPersistPreparedBlock.mockImplementation(async (prep: any) => {
                 await db.run(cds.ql.UPDATE.entity(SYNC_STATE).set({ lastIndexedHeight: prep.height, lastIndexedHash: prep.blockHash }).where({ ID: 'SINGLETON' }));
@@ -971,7 +972,7 @@ describe('MidnightCrawler orchestration', () => {
         it('tracks the chain but indexes nothing while a block is latched', async () => {
             const { crawler } = makeCrawler({}, {});
             crawler.poisonBlock = { height: 7, message: 'Invalid runtime specVersion for block 7' };
-            await setSyncState({ syncStatus: 'error', lastIndexedHeight: 6, lastIndexedHash: '0x6', chainHeight: 6 });
+            await setSyncState({ syncStatus: 'error', lastIndexedHeight: 6, lastIndexedHash: '6', chainHeight: 6 });
 
             const catchUpSpy = vi.spyOn(crawler, 'catchUp');
             const processSpy = vi.spyOn(crawler, 'processBlockWithRetry');
@@ -1001,7 +1002,7 @@ describe('MidnightCrawler orchestration', () => {
         it('does not report a failed catch-up as synced when the live subscription starts', async () => {
             const provider = { subscribeFinalizedHeads: vi.fn().mockResolvedValue('sub-poison') };
             const { crawler } = makeCrawler({}, provider);
-            await setSyncState({ syncStatus: 'error', lastIndexedHeight: 1, lastIndexedHash: '0x1' });
+            await setSyncState({ syncStatus: 'error', lastIndexedHeight: 1, lastIndexedHash: '1' });
 
             await crawler.subscribeLive();
 
@@ -1028,7 +1029,7 @@ describe('MidnightCrawler orchestration', () => {
             (crawler as any).startTime = Date.now() - 1000;
 
             const checkForReorgSpy = vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x2hash', lastIndexedHeight: 1 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '2hash', lastIndexedHeight: 1 });
             const processSpy = vi.spyOn(crawler as any, 'processBlockWithRetry').mockResolvedValue({
                 blockHeight: 2,
                 blockHash: '0x2hash',
@@ -1198,7 +1199,7 @@ describe('MidnightCrawler orchestration', () => {
             vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
             vi.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Request timeout'));
             const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 11, lastIndexedHeight: 1, lastIndexedHash: '0x1' });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 11, lastIndexedHeight: 1, lastIndexedHash: '1' });
             const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
             try {
@@ -1237,7 +1238,7 @@ describe('MidnightCrawler orchestration', () => {
             vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
             vi.spyOn(crawler as any, 'processBlockWithRetry').mockRejectedValue(new Error('Invalid block data'));
             const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 1, lastIndexedHeight: 1, lastIndexedHash: '0x1' });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ consecutiveErrors: 1, lastIndexedHeight: 1, lastIndexedHash: '1' });
             const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
 
             try {
@@ -1258,7 +1259,7 @@ describe('MidnightCrawler orchestration', () => {
             (crawler as any).db = db;
             (crawler as any).isRunning = true;
 
-            await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: '0x5' });
+            await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: '5' });
 
             const catchUpSpy = vi.spyOn(crawler as any, 'catchUp').mockResolvedValue(4);
             const checkForReorgSpy = vi.spyOn(crawler as any, 'checkForReorg');
@@ -1291,15 +1292,15 @@ describe('MidnightCrawler orchestration', () => {
 
             // Seed a real ReorgLog row that handleReorg "created"; the live handler
             // then updates it to completed with the re-indexed count.
-            await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 9, lastIndexedHash: '0x9' });
+            await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 9, lastIndexedHash: '9' });
 
             const reorgLogId = cds.utils.uuid();
             await db.run(cds.ql.INSERT.into(REORG_LOG).entries({
                 ID: reorgLogId,
                 detectedAt: new Date().toISOString(),
                 forkHeight: 9,
-                oldTipHash: '0xold',
-                newTipHash: '0xnew',
+                oldTipHash: 'old',
+                newTipHash: 'new',
                 blocksRolledBack: 1,
                 blocksReIndexed: 0,
                 status: 'in_progress'
@@ -1307,8 +1308,8 @@ describe('MidnightCrawler orchestration', () => {
 
             vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue({
                 forkHeight: 9,
-                oldTipHash: '0xold',
-                newTipHash: '0xnew'
+                oldTipHash: 'old',
+                newTipHash: 'new'
             });
             const handleReorgSpy = vi.spyOn(crawler as any, 'handleReorg').mockResolvedValue(reorgLogId);
             const catchUpSpy = vi.spyOn(crawler as any, 'catchUp').mockResolvedValue(4);
@@ -1345,18 +1346,18 @@ describe('MidnightCrawler orchestration', () => {
             // Header at tip+1 (0x2a = 42, indexed tip 41) with a diverging parent.
             const header = { number: '0x2a', parentHash: '0xold', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } };
 
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0xcurrent', lastIndexedHeight: 41 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: 'current', lastIndexedHeight: 41 });
             const findForkPointSpy = vi.spyOn(crawler as any, 'findForkPoint').mockResolvedValue(40);
 
             await expect((crawler as any).checkForReorg(header)).resolves.toEqual({
                 forkHeight: 40,
-                oldTipHash: '0xcurrent',
-                newTipHash: '0xold'
+                oldTipHash: 'current',
+                newTipHash: 'old'
             });
             expect(findForkPointSpy).toHaveBeenCalledWith(header);
 
             findForkPointSpy.mockClear();
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValueOnce({ lastIndexedHash: '0xold', lastIndexedHeight: 41 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValueOnce({ lastIndexedHash: 'old', lastIndexedHeight: 41 });
             await expect((crawler as any).checkForReorg(header)).resolves.toBeNull();
             expect(findForkPointSpy).not.toHaveBeenCalled();
         });
@@ -1369,7 +1370,7 @@ describe('MidnightCrawler orchestration', () => {
             (crawler as any).db = db;
             await seedBlock(9, '0x9');
 
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x12', lastIndexedHeight: 12 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '12', lastIndexedHeight: 12 });
             const findForkPointSpy = vi.spyOn(crawler as any, 'findForkPoint');
 
             await expect((crawler as any).checkForReorg({
@@ -1384,10 +1385,10 @@ describe('MidnightCrawler orchestration', () => {
             (crawler as any).db = db;
             await seedBlock(9, '0x9');
             await seedBlock(10, '0xa-ours');
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x12', lastIndexedHeight: 12 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '12', lastIndexedHeight: 12 });
             const head = { number: '0xa', parentHash: '0x9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } };
 
-            await expect((crawler as any).checkForReorg(head)).resolves.toEqual({ forkHeight: 10, oldTipHash: '0x12', newTipHash: '0xa-node' });
+            await expect((crawler as any).checkForReorg(head)).resolves.toEqual({ forkHeight: 10, oldTipHash: '12', newTipHash: 'a-node' });
             expect(getBlockHash).toHaveBeenCalledWith(10);
 
             getBlockHash.mockResolvedValue('0xa-ours');
@@ -1399,15 +1400,15 @@ describe('MidnightCrawler orchestration', () => {
             (crawler as any).db = db;
             await seedBlock(9, '0x9');
 
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x12', lastIndexedHeight: 12 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '12', lastIndexedHeight: 12 });
             const findForkPointSpy = vi.spyOn(crawler as any, 'findForkPoint').mockResolvedValue(10);
 
             await expect((crawler as any).checkForReorg({
                 number: '0xa', parentHash: '0xforeign-9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
             })).resolves.toEqual({
                 forkHeight: 10,
-                oldTipHash: '0x12',
-                newTipHash: '0xforeign-9'
+                oldTipHash: '12',
+                newTipHash: 'foreign-9'
             });
             expect(findForkPointSpy).toHaveBeenCalled();
         });
@@ -1415,7 +1416,7 @@ describe('MidnightCrawler orchestration', () => {
         it('treats a head far ahead of the index as a gap, not a reorg', async () => {
             const crawler = new MidnightCrawler({} as any, { enabled: true });
 
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x5', lastIndexedHeight: 5 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '5', lastIndexedHeight: 5 });
             const findForkPointSpy = vi.spyOn(crawler as any, 'findForkPoint');
 
             await expect((crawler as any).checkForReorg({
@@ -1428,7 +1429,7 @@ describe('MidnightCrawler orchestration', () => {
             const crawler = new MidnightCrawler({} as any, { enabled: true });
             (crawler as any).db = db;
 
-            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '0x5', lastIndexedHeight: 5 });
+            vi.spyOn(crawler as any, 'getSyncState').mockResolvedValue({ lastIndexedHash: '5', lastIndexedHeight: 5 });
 
             await expect((crawler as any).checkForReorg({
                 number: '0x0', parentHash: '0x0000', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] }
@@ -1549,8 +1550,8 @@ describe('MidnightCrawler orchestration', () => {
 
             const reorgLogId = await (crawler as any).handleReorg({
                 forkHeight: 10,
-                oldTipHash: '0xold',
-                newTipHash: '0xnew'
+                oldTipHash: 'old',
+                newTipHash: 'new'
             });
             expect(typeof reorgLogId).toBe('string');
 
@@ -1565,14 +1566,14 @@ describe('MidnightCrawler orchestration', () => {
             // SyncState reset to the fork block (height 9, hash 0x9).
             const sync = await getSyncState();
             expect(Number(sync.lastIndexedHeight)).toBe(9);
-            expect(sync.lastIndexedHash).toBe('0x9');
+            expect(sync.lastIndexedHash).toBe('9');
             expect(sync.syncStatus).toBe('syncing');
 
             // ReorgLog row recorded with rollback count 2 and status in_progress.
             const log = await db.run(cds.ql.SELECT.one.from(REORG_LOG).where({ ID: reorgLogId }));
             expect(log).toMatchObject({
-                oldTipHash: '0xold',
-                newTipHash: '0xnew',
+                oldTipHash: 'old',
+                newTipHash: 'new',
                 blocksRolledBack: 2,
                 blocksReIndexed: 0,
                 status: 'in_progress'
@@ -1588,8 +1589,8 @@ describe('MidnightCrawler orchestration', () => {
 
             const reorgLogId = await (crawler as any).handleReorg({
                 forkHeight: 10,
-                oldTipHash: '0xold',
-                newTipHash: '0xnew'
+                oldTipHash: 'old',
+                newTipHash: 'new'
             });
             expect(reorgLogId).toBeNull();
 
@@ -1669,8 +1670,8 @@ describe('MidnightCrawler orchestration', () => {
 
             const reorgLogId = await (crawler as any).handleReorg({
                 forkHeight: 10,
-                oldTipHash: '0xold',
-                newTipHash: '0xnew'
+                oldTipHash: 'old',
+                newTipHash: 'new'
             });
 
             // Tx-linked children of the rolled-back tx10 are gone.
@@ -1741,8 +1742,8 @@ describe('MidnightCrawler orchestration', () => {
 
             await (crawler as any).handleReorg({
                 forkHeight: 10,
-                oldTipHash: '0xold',
-                newTipHash: '0xnew'
+                oldTipHash: 'old',
+                newTipHash: 'new'
             });
 
             // addr_b is back to its exact pre-block-10 state, so re-indexing

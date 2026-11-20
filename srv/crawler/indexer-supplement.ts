@@ -246,7 +246,7 @@ export async function fetchContractState(
         height: blockHeight == null ? null : Number(blockHeight),
         state: hexToBase64(action.state),
         zswapState: hexToBase64(action.zswapState),
-        blockHash: blockHash ? `0x${blockHash}` : null,
+        blockHash: blockHash || null,
         ledgerParameters: hexToBase64(action.transaction?.block?.ledgerParameters)
     };
 }

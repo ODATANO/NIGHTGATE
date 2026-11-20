@@ -167,6 +167,36 @@ try {
     const again = await ensureIndexes(db, 'postgres', (m) => warnings.push(m));
     ok('postgres: ensureIndexes is idempotent', again === NIGHTGATE_INDEXES.length && warnings.length === 0);
 
+    // ---- 3b. Hashes stored with the node's 0x prefix are rewritten --------
+    const { dropStoredHexPrefix } = require('./srv/crawler/stored-hex-prefix.js');
+    await db.run("UPDATE midnight_blocks SET hash = '0x' || hash, stateroot = '0x' || stateroot");
+    await db.run("UPDATE midnight_transactions SET hash = '0x' || hash");
+    await db.run("UPDATE midnight_syncstate SET lastindexedhash = '0x' || lastindexedhash");
+    const indexDefinitions = async () => JSON.stringify(await db.run(`
+        SELECT 'index' AS kind, indexname AS name, indexdef AS definition FROM pg_indexes
+         WHERE tablename IN ('midnight_blocks', 'midnight_transactions')
+        UNION ALL
+        SELECT 'constraint', conname, pg_get_constraintdef(oid) FROM pg_constraint
+         WHERE conrelid IN ('midnight_blocks'::regclass, 'midnight_transactions'::regclass)
+        ORDER BY 1, 2`));
+    const indexesBefore = await indexDefinitions();
+    // A foreign key on the primary key refuses its drop, so the rewrite fails after it has dropped other indexes.
+    await db.run('CREATE TABLE ng_lane_ref (block_id varchar(36) REFERENCES midnight_blocks (id))');
+    const refused = await dropStoredHexPrefix(db).then(() => null, err => err);
+    await db.run('DROP TABLE ng_lane_ref');
+    const stillPrefixed = await db.run("SELECT count(*) AS n FROM midnight_blocks WHERE hash LIKE '0x%'");
+    ok('postgres: a rewrite that fails leaves rows and indexes as they were',
+        refused !== null && Number(stillPrefixed[0]?.n) === 1 && indexesBefore === await indexDefinitions(), refused?.message ?? 'no error');
+    const rewritten = await dropStoredHexPrefix(db);
+    ok('postgres: stored hashes lose the 0x prefix', rewritten.blocks === 1 && rewritten.transactions === 1, JSON.stringify(rewritten));
+    const spelled = await db.run("SELECT b.hash AS block, b.stateroot AS root, t.hash AS tx, s.lastindexedhash AS tip FROM midnight_blocks b, midnight_transactions t, midnight_syncstate s");
+    ok('postgres: the values are the old ones without the prefix',
+        spelled[0]?.block === 'rawbytes-pg' && spelled[0]?.root === 'state-pg' && /^[0-9a-f]{64}$/.test(spelled[0]?.tx) && spelled[0]?.tip === 'rawbytes-pg',
+        JSON.stringify(spelled[0]));
+    ok('postgres: the rewrite builds every index and constraint again as it was', indexesBefore === await indexDefinitions(), `${JSON.parse(indexesBefore).length} definitions`);
+    const rewrittenAgain = await dropStoredHexPrefix(db);
+    ok('postgres: a second run rewrites nothing', rewrittenAgain.blocks === 0 && rewrittenAgain.transactions === 0, JSON.stringify(rewrittenAgain));
+
     // ---- 4. Lock-contention classification on REAL errors -----------------
     const retry = require('./srv/submission/db-write-retry.js');
     const a = pgClient();

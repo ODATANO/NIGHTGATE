@@ -371,12 +371,12 @@ Signatures and examples: [actions.md](actions.md).
 
 ### NightgateService entities
 
-All are read-only.
+All are read-only. Hex values are lowercase without `0x`; a read takes either spelling, see [actions.md](actions.md).
 
 | Entity | Notes |
 |---|---|
 | `Blocks` | `author` is the validator's AURA key, null when the header seal does not verify. `slot` is the AURA slot. Older rows are rewritten in the background, tracked by `SyncState.authorBackfillHeight` and `authorsBackfilledAt` |
-| `Transactions` | `isShielded`, `hasProof` and the final `txType` need `crawler.decodePayloads`. `byIdentifier(identifier)` finds a transaction by a ledger identifier, 404 while not indexed |
+| `Transactions` | `hash` is the extrinsic hash, `ledgerTxHash` the hash the Midnight indexer shows. `isShielded`, `hasProof` and the final `txType` need `crawler.decodePayloads`. `byIdentifier(identifier)` finds a transaction by a ledger identifier, 404 while not indexed |
 | `TransactionResults`, `TransactionSegments`, `TransactionFees` | Per-transaction outcome, segments and fees |
 | `ContractActions` | One row per applied contract action. `entryPoint` needs `crawler.decodePayloads`. `stateHash`, `stateSize` and `state` need `crawler.indexerSupplement` |
 | `ContractBalances` | Needs `crawler.indexerSupplement` |

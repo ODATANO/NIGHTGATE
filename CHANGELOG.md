@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.46.0 - 2026-11-20
+
+### Breaking
+
+- Block hashes, state roots, validators and extrinsic hashes carry no `0x`
+  prefix any more: `Blocks.hash`, `Blocks.stateRoot`, `Blocks.author`,
+  `Transactions.hash`, `SyncState.lastIndexedHash`,
+  `SyncState.lastFinalizedHash`, `ReorgLog.oldTipHash` and
+  `ReorgLog.newTipHash`. They are lowercase hex without the prefix, like every
+  other hex value and like the Midnight indexer writes them. The same holds
+  for `blockHash` of `ContractStates/stateAt` and for `hash` and `blockHash`
+  of `Transactions/byIdentifier`. A client that compares one of these with a
+  `0x` string of its own drops the prefix.
+- The first start on an existing database removes the prefix from the stored
+  rows before the server listens, in one transaction: it drops the indexes
+  the rewrite would change entry by entry, updates the rows and builds the
+  same indexes again. On PostgreSQL these are all indexes and constraints of
+  `midnight_blocks` and `midnight_transactions`, and both tables are locked
+  for that time. On SQLite it is the index on `Transactions.hash`. A start
+  that fails or is stopped leaves the database as it was. An older version
+  cannot index on the rewritten database, so take a backup before the
+  upgrade.
+- A value that is not hex answers 400 instead of an empty list: `ASSERT_FORMAT`
+  on the parameters of `Transactions/byHash`, `byIdentifier`,
+  `ledgerTransaction`, `ContractActions/byAddress`, `history` and
+  `ContractStates/stateAt`, and `<field> must be hex` on a `$filter` or a key
+  that compares a hex field.
+
+### Features
+
+- A read finds a hex value in either spelling, with or without `0x` and in
+  either letter case. This holds for `$filter`, also inside `$expand`, behind
+  an association and in `any()`, for keys such as `ContractStates('0x…')` and
+  for the read functions named above, on the main, the indexer and the admin
+  service.
+- `Transactions/byHash` and `Transactions/ledgerTransaction` find a
+  transaction by its extrinsic hash or by its ledger hash, the hash the
+  Midnight indexer shows.
+
+### Changes
+
+- `$metadata` carries the pattern of every hex property as
+  `Validation.Pattern`.
+
+No schema change, no circuit change. Docs: `docs/actions.md`,
+`docs/operations.md`.
+
 ## 0.45.1 - 2026-11-18
 
 ### Changes

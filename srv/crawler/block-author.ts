@@ -6,6 +6,7 @@ import type { Header } from '@polkadot/types/interfaces';
 import { waitReady, sr25519Verify } from '@polkadot/wasm-crypto';
 import type { BlockHeader, MidnightNodeProvider } from '../providers/MidnightNodeProvider';
 import { errorMessage } from '../utils/errors';
+import { bareHex } from '../utils/hex-patterns';
 
 const log = cds.log('nightgate:crawler');
 const registry = new TypeRegistry();
@@ -64,7 +65,7 @@ export function readAuraHeader(header: BlockHeader): AuraHeaderFacts {
 }
 
 export interface BlockProducer {
-    /** AURA public key of the validator as `0x` hex. Null when the header names no slot or the seal does not match. */
+    /** AURA public key of the validator. Null when the header names no slot or the seal does not match. */
     author: string | null;
     slot: number | null;
 }
@@ -102,7 +103,7 @@ export class BlockAuthorResolver {
             }
             return { author: null, slot };
         }
-        return { author, slot };
+        return { author: bareHex(author), slot };
     }
 
     private async readAuthorities(atBlockHash: string): Promise<string[]> {

@@ -4,6 +4,7 @@ import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/w
 import { attachAgentGrantEnforcement, registerAgentGrantHandlers, awaitAgentPrincipal } from './sessions/agent-grants';
 import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { attachRuntimeGate } from './utils/runtime-gate';
+import { attachHexInput } from './utils/hex-input';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { registerDocumentProofHandlers } from './submission/document-proof';
 import { receiptForJob } from './submission/receipts';
@@ -162,6 +163,7 @@ export default class NightgateService extends cds.ApplicationService {
         attachAgentGrantEnforcement(this, this.db);
 
         attachRuntimeGate(this);
+        attachHexInput(this);
 
         this.on('READ', 'Blocks', async (req) => {
             return await this.db.run(req.query) || [];
@@ -214,13 +216,15 @@ export default class NightgateService extends cds.ApplicationService {
             const { hash } = req.data;
             if (!hash) return req.reject(400, 'hash is required');
             const page = listPage(req.data, 100);
-            return this.db.run(cds.ql.SELECT.from(Transactions).where({ hash }).orderBy('createdAt desc', 'ID').limit(page.limit, page.skip));
+            return this.db.run(
+                cds.ql.SELECT.from(Transactions).where`hash = ${hash} or ledgerTxHash = ${hash}`
+                    .orderBy('createdAt desc', 'ID').limit(page.limit, page.skip)
+            );
         });
 
         this.on(Transaction.actions.byIdentifier, 'Transactions', async (req) => {
-            const identifier = normalizeIdentifier(String(req.data.identifier ?? ''));
+            const { identifier } = req.data;
             if (!identifier) return req.reject(400, 'identifier is required');
-            if (!/^[0-9a-f]+$/.test(identifier)) return req.reject(400, 'identifier must be hex');
             const found = await locateByIdentifier(this.db, identifier);
             if (!found) return req.reject(404, `no indexed transaction carries identifier ${identifier}`);
             const result: Pick<TransactionResult, 'ID' | 'status'> | undefined = await this.db.run(
@@ -244,7 +248,7 @@ export default class NightgateService extends cds.ApplicationService {
             const { hash } = req.data;
             if (!hash) return req.reject(400, 'hash is required');
             const row: Pick<IndexedTransaction, 'raw'> | undefined = await this.db.run(
-                cds.ql.SELECT.one.from(Transactions).columns('raw').where({ hash }).orderBy('createdAt desc', 'ID')
+                cds.ql.SELECT.one.from(Transactions).columns('raw').where`hash = ${hash} or ledgerTxHash = ${hash}`.orderBy('createdAt desc', 'ID')
             );
             const raw = row ? await readCapBinary(row.raw) : null;
             const call = raw ? parseExtrinsicCall('0x' + raw.toString('hex')) : null;
@@ -296,7 +300,7 @@ export default class NightgateService extends cds.ApplicationService {
 
         this.on(ContractState.actions.stateAt, 'ContractStates', async (req) => {
             const { address, height } = req.data;
-            if (!address || !/^(0x)?[0-9a-fA-F]+$/.test(address)) return req.reject(400, 'address (hex) is required');
+            if (!address) return req.reject(400, 'address is required');
             if (height != null && (!Number.isInteger(Number(height)) || Number(height) < 0)) {
                 return req.reject(400, 'height must be a non-negative integer');
             }

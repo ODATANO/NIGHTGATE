@@ -76,10 +76,10 @@ function buildUnsignedExtrinsic(palletIndex: number, callIndex: number): string 
 describe('hashExtrinsic: blake2b-256', () => {
     const processor = new BlockProcessor({} as any);
 
-    it('produces a deterministic 66-char hex hash (0x + 64)', () => {
+    it('produces 64 lowercase hex characters without 0x', () => {
         const hex = '0xdeadbeef01020304';
         const result = (processor as any).hashExtrinsic(hex);
-        expect(result).toMatch(/^0x[0-9a-f]{64}$/);
+        expect(result).toMatch(/^[0-9a-f]{64}$/);
     });
 
     it('same input always produces same output', () => {
@@ -100,7 +100,7 @@ describe('hashExtrinsic: blake2b-256', () => {
     it('produces correct blake2b-256 for known input', () => {
         // blake2b-256 of empty bytes = known constant
         const emptyHash = (processor as any).hashExtrinsic('0x');
-        expect(emptyHash).toBe('0x' + bytesToHex(blake2b(Buffer.alloc(0), { dkLen: 32 })));
+        expect(emptyHash).toBe(bytesToHex(blake2b(Buffer.alloc(0), { dkLen: 32 })));
     });
 });
 
@@ -386,7 +386,7 @@ describe('BlockProcessor public helpers', () => {
         await expect(processor.processBlockByHeight(9)).rejects.toThrow('No block at height 9');
     });
 
-    it('checks block existence from the local DB', async () => {
+    it('checks block existence from the local DB, by the hash without 0x', async () => {
         const processor = new BlockProcessor({} as any);
         (processor as any).db = {
             run: vi.fn()
@@ -396,7 +396,7 @@ describe('BlockProcessor public helpers', () => {
 
         await expect(processor.blockExists('0xpresent')).resolves.toBe(true);
         await expect(processor.blockExists('0xmissing')).resolves.toBe(false);
-        expect(selectColumnsWhereSpy).toHaveBeenCalledWith({ hash: '0xpresent' });
-        expect(selectColumnsWhereSpy).toHaveBeenCalledWith({ hash: '0xmissing' });
+        expect(selectColumnsWhereSpy).toHaveBeenCalledWith({ hash: 'present' });
+        expect(selectColumnsWhereSpy).toHaveBeenCalledWith({ hash: 'missing' });
     });
 });

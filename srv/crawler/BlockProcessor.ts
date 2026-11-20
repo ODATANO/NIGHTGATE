@@ -271,14 +271,14 @@ export class BlockProcessor {
         const truthyHashes = hashes.filter((h): h is string => !!h);
         const existing: Array<{ hash: string }> = truthyHashes.length
             ? (await this.db.run(
-                SELECT.from(Blocks).columns('hash').where({ hash: { in: truthyHashes } })
+                SELECT.from(Blocks).columns('hash').where({ hash: { in: truthyHashes.map(bareHex) } })
             ) || [])
             : [];
         const existingSet = new Set(existing.map(r => r.hash));
 
         const newIndices: number[] = [];
         for (let i = 0; i < heights.length; i++) {
-            if (hashes[i] && !existingSet.has(hashes[i])) newIndices.push(i);
+            if (hashes[i] && !existingSet.has(bareHex(hashes[i]))) newIndices.push(i);
         }
 
         let blockResults: SignedBlock[] = [];
@@ -309,7 +309,7 @@ export class BlockProcessor {
             if (!blockHash) {
                 throw new Error(`No block at height ${heights[i]}`);
             }
-            if (existingSet.has(blockHash)) {
+            if (existingSet.has(bareHex(blockHash))) {
                 out[i] = {
                     blockHash,
                     height: heights[i],
@@ -394,7 +394,7 @@ export class BlockProcessor {
 
     async blockExists(hash: string): Promise<boolean> {
         const existing = await this.db.run(
-            SELECT.one.from(Blocks).columns('ID').where({ hash })
+            SELECT.one.from(Blocks).columns('ID').where({ hash: bareHex(hash) })
         );
         return !!existing;
     }
@@ -460,11 +460,13 @@ export class BlockProcessor {
         // so the transaction is not held open while waiting for them.
         const projections = await this.projectEvents(extrinsicEvents, timestamp, `block ${blockHash}`);
         const producer = await this.authors.resolve(blockHash, header);
+        // The node writes a hash with `0x`. The database stores it without.
+        const storedHash = bareHex(blockHash);
 
         const written = await this.db.tx(async (tx) => {
             const blockId = cds.utils.uuid();
             const parentBlock = await tx.run(
-                SELECT.one.from(Blocks).columns('ID').where({ hash: header.parentHash })
+                SELECT.one.from(Blocks).columns('ID').where({ hash: bareHex(header.parentHash) })
             );
 
             if (opts?.requireParent && height > 0 && !parentBlock) {
@@ -476,13 +478,13 @@ export class BlockProcessor {
 
             await tx.run(INSERT.into(Blocks).entries({
                 ID: blockId,
-                hash: blockHash,
+                hash: storedHash,
                 height: height,
                 protocolVersion,
                 timestamp,
                 author: producer.author,
                 slot: producer.slot,
-                stateRoot: header.stateRoot,
+                stateRoot: bareHex(header.stateRoot),
                 parent_ID: parentBlock?.ID || null
             }));
 
@@ -605,7 +607,7 @@ export class BlockProcessor {
             await tx.run(
                 UPDATE.entity(SyncState).set({
                     lastIndexedHeight: height,
-                    lastIndexedHash: blockHash,
+                    lastIndexedHash: storedHash,
                     lastIndexedAt: new Date().toISOString(),
                     syncStatus: 'syncing'
                 }).where({ ID: 'SINGLETON' })
@@ -880,7 +882,7 @@ export class BlockProcessor {
         const cleanHex = bareHex(hex);
         const bytes = Buffer.from(cleanHex, 'hex');
         const hash = blake2b(bytes, { dkLen: 32 });
-        return '0x' + bytesToHex(hash);
+        return bytesToHex(hash);
     }
 
     private async getEventRegistry(blockHash: string, specVersion: number): Promise<TypeRegistry | undefined> {

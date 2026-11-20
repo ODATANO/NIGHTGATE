@@ -28,6 +28,7 @@ import { describeSponsorPolicy } from './sessions/agent-grants';
 import { NightgateError, errorMessage } from './utils/errors';
 import type { Row } from './utils/db-types';
 import { normalizeHttpError } from './utils/http-errors';
+import { attachHexInput } from './utils/hex-input';
 import { exportContractSigningKey, getJobStats, getSponsorPolicy, grantRole, invalidateSession, profileWorker, registerContract, revokeRole, unregisterContract, reconcileNightBalances as reconcileNightBalancesAction, redecodeFromHeight as redecodeFromHeightAction } from '#cds-models/NightgateAdminService';
 
 /** Drops the cached in-memory wallet of a session, so its secret keys leave RAM too.
@@ -50,6 +51,7 @@ export default class NightgateAdminService extends cds.ApplicationService {
 
     async init(): Promise<void> {
         this.on('error', normalizeHttpError);
+        attachHexInput(this);
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 

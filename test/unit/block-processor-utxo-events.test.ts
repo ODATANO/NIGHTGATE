@@ -182,7 +182,7 @@ describe('UnshieldedTokens events become UTXO rows', () => {
         });
 
         const spentRow = await db.run(cds.ql.SELECT.one.from(UNSHIELDED_UTXOS).where({ intentHash: 'e1'.repeat(32) }));
-        const spendingTx = await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ block_ID: (await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xb21' }))).ID }));
+        const spendingTx = await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).where({ block_ID: (await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: 'b21' }))).ID }));
         expect(spentRow.spentAtTransaction_ID).toBe(spendingTx.ID);
 
         // Created and consumed inside one block still links up.
@@ -210,7 +210,7 @@ describe('UnshieldedTokens events become UTXO rows', () => {
             });
             expect(await db.run(cds.ql.SELECT.from(UNSHIELDED_UTXOS))).toHaveLength(0);
             // The block itself still persisted.
-            expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: '0xb3' }))).toBeTruthy();
+            expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: 'b3' }))).toBeTruthy();
         } finally {
             warn.mockRestore();
         }

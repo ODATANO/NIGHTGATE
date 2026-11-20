@@ -1,3 +1,7 @@
+// Lowercase hex without `0x`. A read or a function takes either spelling and any letter case.
+@nightgate.hex
+@assert.format        : '^(0[xX])?[0-9a-fA-F]*$'
+@assert.format.message: 'must be hex'
 type HexEncoded               : String(512);
 
 @assert.format        : '^[0-9a-fA-F]{64}$'

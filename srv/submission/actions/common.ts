@@ -357,12 +357,12 @@ export async function runSubmission<T>(req: ActionRequest<unknown, unknown>, op:
     }
 }
 
-/** True when the indexed transaction of a job's txHash landed with a success outcome. Matches the ledger hash, or the extrinsic hash older rows hold. */
+/** True when the indexed transaction of a job's txHash landed with a success outcome. Matches the ledger hash or the extrinsic hash. */
 export async function landedOnChain(db: DbRunner, txHash: string | null | undefined): Promise<boolean> {
     const bare = bareHex(txHash);
     if (!bare) return false;
     const tx: Pick<Transaction, 'ID'> | undefined = await db.run(
-        SELECT.one.from(Transactions).columns('ID').where`ledgerTxHash = ${bare} or hash = ${'0x' + bare}`
+        SELECT.one.from(Transactions).columns('ID').where`ledgerTxHash = ${bare} or hash = ${bare}`
     );
     if (!tx?.ID) return false;
     const result: Pick<TransactionResult, 'status' | 'outcomeSource'> | undefined = await db.run(

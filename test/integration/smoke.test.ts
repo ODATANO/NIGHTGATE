@@ -20,13 +20,13 @@ describe('cds.test harness boots', () => {
         const db = await cds.connect.to('db');
         await db.run(INSERT.into('midnight.Blocks').entries({
             ID: cds.utils.uuid(),
-            hash: '0x' + 'ab'.repeat(32),
+            hash: 'ab'.repeat(32),
             height: 42,
             protocolVersion: 1,
             timestamp: 1_700_000_000,
-            stateRoot: '0x' + '00'.repeat(8)
+            stateRoot: '00'.repeat(32)
         }));
         const row = await db.run(SELECT.one.from('midnight.Blocks').where({ height: 42 }));
-        expect(row?.hash).toBe('0x' + 'ab'.repeat(32));
+        expect(row?.hash).toBe('ab'.repeat(32));
     });
 });

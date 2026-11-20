@@ -137,6 +137,12 @@ vi.mock('../../srv/utils/sync-state', () => ({
     SyncStateNetworkMismatchError: class SyncStateNetworkMismatchError extends Error {}
 }));
 
+// The rewrite has its own tests against a real database (stored-hex-prefix.test.ts).
+const mockDropStoredHexPrefix = vi.hoisted(() => (vi.fn(async (..._args: unknown[]) => ({ blocks: 0, transactions: 0 }))));
+vi.mock('../../srv/crawler/stored-hex-prefix', () => ({
+    dropStoredHexPrefix: mockDropStoredHexPrefix
+}));
+
 // The lease has its own tests against a real database (instance-lease.test.ts).
 const mockAcquireLease = vi.hoisted(() => (vi.fn(async (..._args: unknown[]) => undefined)));
 const mockReleaseLease = vi.hoisted(() => (vi.fn(async () => undefined)));
@@ -471,5 +477,24 @@ describe('runtime initialize', () => {
         expect(mockStartJobProcessor).not.toHaveBeenCalled();
         expect(mockStartCrawler).not.toHaveBeenCalled();
         expect(getStatus()).toEqual(expect.objectContaining({ initialized: false, mode: 'offline' }));
+    });
+
+    it('rewrites stored hashes under the lease, before job recovery and the crawler', async () => {
+        await initialize();
+
+        const order = (mock: { mock: { invocationCallOrder: number[] } }) => mock.mock.invocationCallOrder[0];
+        expect(order(mockAcquireLease)).toBeLessThan(order(mockDropStoredHexPrefix));
+        expect(order(mockDropStoredHexPrefix)).toBeLessThan(order(mockRecoverJobs));
+        expect(order(mockDropStoredHexPrefix)).toBeLessThan(order(mockStartCrawler));
+    });
+
+    it('stays offline when the stored hashes cannot be rewritten', async () => {
+        mockDropStoredHexPrefix.mockRejectedValueOnce(new Error('database is locked'));
+
+        await expect(initialize()).rejects.toThrow(/database is locked/);
+        expect(mockRecoverJobs).not.toHaveBeenCalled();
+        expect(mockStartJobProcessor).not.toHaveBeenCalled();
+        expect(mockStartCrawler).not.toHaveBeenCalled();
+        expect(getStatus()).toEqual(expect.objectContaining({ initialized: false, mode: 'offline', lastError: 'database is locked' }));
     });
 });

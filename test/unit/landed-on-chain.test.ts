@@ -10,13 +10,14 @@ function fakeDb(tx: unknown, result: unknown) {
 }
 
 describe('landedOnChain', () => {
-    it('finds the transaction by the ledger hash or the 0x extrinsic hash', async () => {
+    it('finds the transaction by the ledger hash or the extrinsic hash, in the stored spelling', async () => {
         const { db, queries } = fakeDb({ ID: 't1' }, { status: 'SUCCESS', outcomeSource: 'substrate-system-events' });
         expect(await landedOnChain(db, '0x' + H.toUpperCase())).toBe(true);
         const where = JSON.stringify((queries[0] as { SELECT: { where: unknown } }).SELECT.where);
         expect(where).toContain('"ledgerTxHash"');
+        expect(where).toContain('"hash"');
         expect(where).toContain(`"${H}"`);
-        expect(where).toContain(`"0x${H}"`);
+        expect(where).not.toContain('0x');
     });
 
     it('is false without a hash, without a row, or without a success from system events', async () => {

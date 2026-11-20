@@ -39,6 +39,7 @@ import { recoverInterruptedJobs, dropPendingJobsForClosedSessions, startBackgrou
 import { createHttpTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
 import { TransactionResults } from '#cds-models/midnight';
 import { backfillTransactionIdentifiers } from '../srv/crawler/transaction-identifiers';
+import { dropStoredHexPrefix } from '../srv/crawler/stored-hex-prefix';
 import {
     assertSupportedRuntimeTopology,
     UnsupportedRuntimeTopologyError
@@ -321,6 +322,25 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             ...topologyStatus
         });
         logStartupState('offline', 'instance lease held by another process');
+        throw err;
+    }
+
+    // The job reconciliation and the crawler find rows by hash, so the stored hashes get one spelling first.
+    try {
+        await dropStoredHexPrefix(await cds.connect.to('db'));
+    } catch (err) {
+        const message = errorMessage(err);
+        initialized = false;
+        setLastStatus({
+            initialized: false,
+            crawlerEnabled,
+            network,
+            nodeUrl,
+            mode: 'offline',
+            lastError: message,
+            ...topologyStatus
+        });
+        logStartupState('offline', 'stored hashes not rewritten');
         throw err;
     }
 

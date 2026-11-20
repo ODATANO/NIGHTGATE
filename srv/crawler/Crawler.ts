@@ -3,6 +3,7 @@
 import cds from '@sap/cds';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { errorMessage } from '../utils/errors';
+import { bareHex } from '../utils/hex-patterns';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 import { MidnightNodeProvider, BlockHeader } from '../providers/MidnightNodeProvider';
 import { BlockProcessor, ProcessResult, type PreparedBlock } from './BlockProcessor';
@@ -342,7 +343,7 @@ export class MidnightCrawler {
                     syncStatus: 'syncing',
                     chainHeight: tipHeight,
                     lastFinalizedHeight: tipHeight,
-                    lastFinalizedHash: finalizedHash
+                    lastFinalizedHash: bareHex(finalizedHash)
                 }).where({ ID: 'SINGLETON' })
             );
 
@@ -696,7 +697,7 @@ export class MidnightCrawler {
                     blocksPerSecond: this.blocksProcessed / elapsed,
                     consecutiveErrors: 0,
                     lastFinalizedHeight: height,
-                    lastFinalizedHash: syncState?.lastIndexedHash || result.blockHash
+                    lastFinalizedHash: syncState?.lastIndexedHash || bareHex(result.blockHash)
                 }).where({ ID: 'SINGLETON' })
             );
 
@@ -729,7 +730,9 @@ export class MidnightCrawler {
         const syncState = await this.getSyncState();
         if (!syncState?.lastIndexedHash) return null;
 
-        if (header.parentHash === syncState.lastIndexedHash) return null;
+        // The node writes a hash with `0x`. The database stores it without.
+        const parentHash = bareHex(header.parentHash);
+        if (parentHash === syncState.lastIndexedHash) return null;
 
         const newHeight = MidnightNodeProvider.parseBlockNumber(header.number);
         const lastIndexedHeight = Number(syncState.lastIndexedHeight ?? 0);
@@ -744,25 +747,25 @@ export class MidnightCrawler {
             const localParent: Block | undefined = await this.db.run(
                 SELECT.one.from(Blocks).columns('hash').where({ height: newHeight - 1 })
             );
-            if (localParent?.hash === header.parentHash) {
+            if (localParent?.hash === parentHash) {
                 // Same parent, but our block at this height can still be a different child.
                 const local: Block | undefined = await this.db.run(
                     SELECT.one.from(Blocks).columns('hash').where({ height: newHeight })
                 );
-                const canonical = local ? await this.nodeProvider.getBlockHash(newHeight) : null;
+                const canonical = local ? bareHex(await this.nodeProvider.getBlockHash(newHeight)) : null;
                 if (!local || !canonical || local.hash === canonical) return null;
                 log.warn(`Reorg detected at height ${newHeight}: stored block ${local.hash} != node block ${canonical}`);
                 return { forkHeight: newHeight, oldTipHash: syncState.lastIndexedHash, newTipHash: canonical };
             }
         }
 
-        log.warn(`Reorg detected at height ${newHeight}: parent ${header.parentHash} != tip ${syncState.lastIndexedHash}`);
+        log.warn(`Reorg detected at height ${newHeight}: parent ${parentHash} != tip ${syncState.lastIndexedHash}`);
 
         const forkHeight = await this.findForkPoint(header);
         return {
             forkHeight,
             oldTipHash: syncState.lastIndexedHash,
-            newTipHash: header.parentHash
+            newTipHash: parentHash
         };
     }
 
@@ -772,7 +775,7 @@ export class MidnightCrawler {
 
         while (height > 0) {
             const localBlock = await this.db.run(
-                SELECT.one.from(Blocks).where({ hash: currentHash })
+                SELECT.one.from(Blocks).where({ hash: bareHex(currentHash) })
             );
 
             if (localBlock) {

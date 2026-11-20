@@ -20,6 +20,7 @@ import {
 
 import { checkRateClass } from './utils/rate-classes';
 import { normalizeHttpError } from './utils/http-errors';
+import { attachHexInput } from './utils/hex-input';
 import { buildBoardStatus } from './submission/board-status';
 import { receiptPublicKey } from './submission/receipts';
 import { getBoardStatus, getReadiness, getReceiptKey, getReorgHistory, getRuntimeInfo, reindexFromHeight, resumeCrawler } from '#cds-models/NightgateIndexerService';
@@ -41,6 +42,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
     async init(): Promise<void> {
         this.on('error', normalizeHttpError);
+        attachHexInput(this);
         await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 

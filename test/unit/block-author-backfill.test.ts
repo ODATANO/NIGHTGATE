@@ -14,6 +14,8 @@ const BLOCKS = 'midnight.Blocks';
 const SYNC_STATE = 'midnight.SyncState';
 const [plain, change, afterChange] = fixture.blocks;
 const CONFIG = { batchSize: 2, intervalMs: 1, retryMs: 1 };
+/** The fixture holds the node's spelling. The database stores hex without `0x`. */
+const stored = (hex: string): string => hex.replace(/^0x/, '');
 
 let db: any;
 
@@ -26,7 +28,7 @@ function slotAsAuthor(slot: number): string {
 
 async function seedBlock(block: { hash: string; height: number }, fields: Record<string, unknown>): Promise<void> {
     await db.run(cds.ql.INSERT.into(BLOCKS).entries({
-        ID: cds.utils.uuid(), hash: block.hash, height: block.height, protocolVersion: 1, timestamp: 1_700_000_000, ...fields
+        ID: cds.utils.uuid(), hash: stored(block.hash), height: block.height, protocolVersion: 1, timestamp: 1_700_000_000, ...fields
     }));
 }
 
@@ -38,7 +40,7 @@ async function setSync(fields: Record<string, unknown> = {}): Promise<void> {
 const readSync = (): Promise<any> => db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }));
 
 async function readBlock(hash: string): Promise<{ author: string | null; slot: number | null }> {
-    const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).columns('author', 'slot').where({ hash }));
+    const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).columns('author', 'slot').where({ hash: stored(hash) }));
     return { author: row.author, slot: row.slot == null ? null : Number(row.slot) };
 }
 
@@ -77,14 +79,14 @@ describe('BlockAuthorBackfill', () => {
         const backfill = await backfillWith(node);
 
         expect(await backfill.runOnce()).toBe(2);
-        expect(await readBlock(plain.hash)).toEqual({ author: plain.author, slot: plain.slot });
-        expect(await readBlock(change.hash)).toEqual({ author: change.author, slot: change.slot });
+        expect(await readBlock(plain.hash)).toEqual({ author: stored(plain.author), slot: plain.slot });
+        expect(await readBlock(change.hash)).toEqual({ author: stored(change.author), slot: change.slot });
         expect((await readBlock(afterChange.hash)).slot).toBeNull();
         expect(Number((await readSync()).authorBackfillHeight)).toBe(change.height);
         expect((await readSync()).authorsBackfilledAt).toBeNull();
 
         expect(await backfill.runOnce()).toBe(1);
-        expect(await readBlock(afterChange.hash)).toEqual({ author: afterChange.author, slot: afterChange.slot });
+        expect(await readBlock(afterChange.hash)).toEqual({ author: stored(afterChange.author), slot: afterChange.slot });
         // The list for this block came from the header of the block before it.
         expect(node.getStorage).toHaveBeenCalledTimes(2);
 
@@ -102,14 +104,14 @@ describe('BlockAuthorBackfill', () => {
         const backfill = await backfillWith(node);
 
         expect(await backfill.runOnce()).toBe(1);
-        expect(await readBlock(afterChange.hash)).toEqual({ author: afterChange.author, slot: afterChange.slot });
+        expect(await readBlock(afterChange.hash)).toEqual({ author: stored(afterChange.author), slot: afterChange.slot });
         expect((await readBlock(change.hash)).author).toBe(slotAsAuthor(change.slot));
         expect(node.getStorage).toHaveBeenCalledExactlyOnceWith(expect.any(String), afterChange.header.parentHash);
     });
 
     it('passes over blocks that already carry their slot without asking the node', async () => {
         await setSync();
-        await seedBlock(plain, { author: plain.author, slot: plain.slot });
+        await seedBlock(plain, { author: stored(plain.author), slot: plain.slot });
         const node = fixtureNode();
         const backfill = await backfillWith(node);
 
@@ -131,7 +133,7 @@ describe('BlockAuthorBackfill', () => {
         await seedBlock({ hash: '0xunknown', height: plain.height + 1 }, { author: slotAsAuthor(1) });
         const backfill = await backfillWith(fixtureNode());
 
-        await expect(backfill.runOnce()).rejects.toThrow(/No header for block 0xunknown/);
+        await expect(backfill.runOnce()).rejects.toThrow(/No header for block unknown/);
         expect((await readBlock(plain.hash)).author).toBe(slotAsAuthor(plain.slot));
         expect((await readSync()).authorBackfillHeight).toBeNull();
     });
@@ -148,7 +150,7 @@ describe('BlockAuthorBackfill', () => {
             await vi.waitFor(async () => expect((await readSync()).authorsBackfilledAt).toBeTruthy(), { timeout: 5000 });
             await backfill.stop();
             expect(warn).toHaveBeenCalledWith(expect.stringContaining('block author backfill pass failed: Not connected'));
-            expect(await readBlock(afterChange.hash)).toEqual({ author: afterChange.author, slot: afterChange.slot });
+            expect(await readBlock(afterChange.hash)).toEqual({ author: stored(afterChange.author), slot: afterChange.slot });
         } finally {
             warn.mockRestore();
         }

@@ -69,14 +69,15 @@ beforeAll(async () => {
     db = await cds.connect.to('db');
 });
 
+/** `hash` in the node's spelling. The row holds it as the crawler stores it, without `0x`. */
 async function seedBlock(height: number, hash: string): Promise<void> {
     await db.run(cds.ql.INSERT.into(BLOCKS).entries({
         ID: cds.utils.uuid(),
-        hash,
+        hash: hash.replace(/^0x/, ''),
         height,
         protocolVersion: 1,
         timestamp: 1700000000 + height,
-        stateRoot: '0xabcd'
+        stateRoot: 'abcd'
     }));
 }
 

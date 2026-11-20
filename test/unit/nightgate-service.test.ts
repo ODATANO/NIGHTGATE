@@ -81,11 +81,11 @@ async function seedBlock(height: number, overrides: Record<string, any> = {}): P
     const id = cds.utils.uuid();
     await db.run(cds.ql.INSERT.into(BLOCKS).entries({
         ID: id,
-        hash: `0xblock${height}`,
+        hash: `block${height}`,
         height,
         protocolVersion: 1,
         timestamp: 1700000000 + height,
-        stateRoot: '0xabcd',
+        stateRoot: 'abcd',
         ...overrides
     }));
     return id;
@@ -96,7 +96,7 @@ async function seedTransaction(blockId: string, overrides: Record<string, any> =
     await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
         ID: id,
         transactionId: nextTransactionPosition++,
-        hash: `0xtx-${id.slice(0, 8)}`,
+        hash: `tx-${id.slice(0, 8)}`,
         protocolVersion: 1,
         transactionType: 'REGULAR',
         block_ID: blockId,
@@ -109,7 +109,7 @@ async function seedContractAction(txId: string, overrides: Record<string, any> =
     const id = cds.utils.uuid();
     await db.run(cds.ql.INSERT.into(CONTRACT_ACTIONS).entries({
         ID: id,
-        address: '0xcontract',
+        address: 'c0',
         actionType: 'CALL',
         transaction_ID: txId,
         ...overrides
@@ -124,11 +124,11 @@ async function seedUtxo(txId: string, overrides: Record<string, any> = {}): Prom
     await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
         ID: id,
         owner: 'mn_addr_owner',
-        tokenType: '0xtoken',
+        tokenType: 'token',
         value: 1000,
-        intentHash: '0xintent',
+        intentHash: 'intent',
         outputIndex,
-        initialNonce: '0xnonce',
+        initialNonce: 'nonce',
         createdAtTransaction_ID: txId,
         ...overrides
     }));
@@ -251,7 +251,7 @@ describe('Blocks', () => {
 
         const res = await srv.send({ event: 'byHeight', entity: 'Blocks', data: { height: 42 } });
         expect(Number(res.height)).toBe(42);
-        expect(res.hash).toBe('0xblock42');
+        expect(res.hash).toBe('block42');
     });
 
     it('byHeight() rejects when height is missing', async () => {
@@ -334,22 +334,22 @@ describe('Transactions', () => {
 
     it('byHash() returns transactions matching the hash', async () => {
         const blockId = await seedBlock(1);
-        await seedTransaction(blockId, { hash: '0xabc' });
-        await seedTransaction(blockId, { hash: '0xdef' });
+        await seedTransaction(blockId, { hash: 'abc1' });
+        await seedTransaction(blockId, { hash: 'def2' });
 
-        const res = await srv.send({ event: 'byHash', entity: 'Transactions', data: { hash: '0xabc' } });
+        const res = await srv.send({ event: 'byHash', entity: 'Transactions', data: { hash: '0xABC1' } });
         expect(res.length).toBe(1);
-        expect(res[0].hash).toBe('0xabc');
+        expect(res[0].hash).toBe('abc1');
     });
 
     it('allows the same extrinsic hash in different blocks', async () => {
         const firstBlock = await seedBlock(1);
         const secondBlock = await seedBlock(2);
-        await seedTransaction(firstBlock, { transactionId: 0, hash: '0xreplayed' });
-        await seedTransaction(secondBlock, { transactionId: 0, hash: '0xreplayed' });
+        await seedTransaction(firstBlock, { transactionId: 0, hash: 'feed01' });
+        await seedTransaction(secondBlock, { transactionId: 0, hash: 'feed01' });
 
         const res = await srv.send({
-            event: 'byHash', entity: 'Transactions', data: { hash: '0xreplayed' }
+            event: 'byHash', entity: 'Transactions', data: { hash: 'feed01' }
         });
         expect(res).toHaveLength(2);
         expect(new Set(res.map((tx: any) => tx.block_ID))).toEqual(new Set([firstBlock, secondBlock]));
@@ -357,7 +357,7 @@ describe('Transactions', () => {
 
     it('byIdentifier() tells where the transaction landed and which segments failed', async () => {
         const blockId = await seedBlock(5);
-        const txId = await seedTransaction(blockId, { hash: '0xtx5', ledgerTxHash: '0xledger5' });
+        const txId = await seedTransaction(blockId, { hash: 'a5', ledgerTxHash: 'b5' });
         await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries({ identifier: 'cafe01', transaction_ID: txId }));
         const resultId = cds.utils.uuid();
         await db.run(cds.ql.INSERT.into(TX_RESULTS).entries({ ID: resultId, status: 'PARTIAL_SUCCESS', outcomeSource: 'substrate-system-events', transaction_ID: txId }));
@@ -368,16 +368,16 @@ describe('Transactions', () => {
 
         const res = await cap.GET(`${API}/Transactions/byIdentifier(identifier='0xCAFE01')`);
         expect(res.data).toEqual(expect.objectContaining({
-            identifier: 'cafe01', hash: '0xtx5', ledgerTxHash: '0xledger5', blockHeight: 5, blockHash: '0xblock5',
+            identifier: 'cafe01', hash: 'a5', ledgerTxHash: 'b5', blockHeight: 5, blockHash: 'block5',
             status: 'PARTIAL_SUCCESS', failedSegments: [1]
         }));
     });
 
     it('byIdentifier() reports a null status while the result is not indexed', async () => {
-        const txId = await seedTransaction(await seedBlock(6), { hash: '0xtx6' });
+        const txId = await seedTransaction(await seedBlock(6), { hash: 'a6' });
         await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries({ identifier: 'beef', transaction_ID: txId }));
         const res = await srv.send({ event: 'byIdentifier', entity: 'Transactions', data: { identifier: 'beef' } });
-        expect(res).toEqual(expect.objectContaining({ hash: '0xtx6', blockHeight: 6, status: null, failedSegments: [] }));
+        expect(res).toEqual(expect.objectContaining({ hash: 'a6', blockHeight: 6, status: null, failedSegments: [] }));
     });
 
     it('byIdentifier() answers 404 for an identifier the index has not seen and 400 for a bad one', async () => {
@@ -395,13 +395,15 @@ describe('Transactions', () => {
         // Unsigned extrinsic: compact length, version, pallet, call, then the bytes behind their compact length.
         const body = Buffer.concat([Buffer.from([0x04, 5, 0, ledgerBytes.length << 2]), ledgerBytes]);
         const raw = Buffer.concat([Buffer.from([body.length << 2]), body]).toString('base64');
-        await seedTransaction(blockId, { hash: '0xtx8', raw });
-        await seedTransaction(blockId, { hash: '0xtx8b', raw: null });
+        await seedTransaction(blockId, { hash: 'a8', ledgerTxHash: 'b8', raw });
+        await seedTransaction(blockId, { hash: 'a8b', raw: null });
 
-        const res = await srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: { hash: '0xtx8' } });
-        expect(res).toEqual({ hash: '0xtx8', ledgerTransaction: ledgerBytes.toString('base64') });
-        await expect(srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: { hash: '0xtx8b' } })).rejects.toMatchObject({ status: 404 });
-        await expect(srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: { hash: '0xnone' } })).rejects.toMatchObject({ status: 404 });
+        const res = await srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: { hash: '0xA8' } });
+        expect(res).toEqual({ hash: 'a8', ledgerTransaction: ledgerBytes.toString('base64') });
+        const byLedgerHash = await srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: { hash: 'b8' } });
+        expect(byLedgerHash.ledgerTransaction).toBe(ledgerBytes.toString('base64'));
+        await expect(srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: { hash: '0xa8b' } })).rejects.toMatchObject({ status: 404 });
+        await expect(srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: { hash: '0xdead' } })).rejects.toMatchObject({ status: 404 });
         await expect(srv.send({ event: 'ledgerTransaction', entity: 'Transactions', data: {} })).rejects.toMatchObject({ status: 400 });
     });
 
@@ -463,15 +465,15 @@ describe('ContractActions', () => {
     it('byAddress() returns actions for the address', async () => {
         const blockId = await seedBlock(1);
         const txId = await seedTransaction(blockId);
-        await seedContractAction(txId, { address: '0xcontract-1' });
-        await seedContractAction(txId, { address: '0xcontract-2' });
+        await seedContractAction(txId, { address: 'c1' });
+        await seedContractAction(txId, { address: 'c2' });
 
         const res = await srv.send({
             event: 'byAddress', entity: 'ContractActions',
-            data: { address: '0xcontract-1' }
+            data: { address: '0xC1' }
         });
         expect(res.length).toBe(1);
-        expect(res[0].address).toBe('0xcontract-1');
+        expect(res[0].address).toBe('c1');
     });
 
     it('byAddress() rejects when address is missing', async () => {
@@ -483,15 +485,15 @@ describe('ContractActions', () => {
     it('history() returns actions for the address (newest first, capped at 100)', async () => {
         const blockId = await seedBlock(1);
         const txId = await seedTransaction(blockId);
-        await seedContractAction(txId, { address: '0xc', entryPoint: 'a' });
-        await seedContractAction(txId, { address: '0xc', entryPoint: 'b' });
+        await seedContractAction(txId, { address: 'c3', entryPoint: 'a' });
+        await seedContractAction(txId, { address: 'c3', entryPoint: 'b' });
 
         const res = await srv.send({
             event: 'history', entity: 'ContractActions',
-            data: { address: '0xc' }
+            data: { address: '0xc3' }
         });
         expect(res.length).toBe(2);
-        expect(res.every((a: any) => a.address === '0xc')).toBe(true);
+        expect(res.every((a: any) => a.address === 'c3')).toBe(true);
     });
 
     it('history() rejects when address is missing', async () => {
@@ -526,7 +528,7 @@ describe('ContractStates', () => {
         expect(list.data.value.map((r: any) => r.address)).toEqual([ADDRESS]);
 
         const res = await cap.GET(`${API}/ContractStates/stateAt(address='0x${ADDRESS}',height=null)`);
-        expect(res.data).toEqual(expect.objectContaining({ address: ADDRESS, height: 7, source: 'current', stateHash: 'h1', blockHash: '0xblock7', coveredHeight: 9, chainHeight: 12 }));
+        expect(res.data).toEqual(expect.objectContaining({ address: ADDRESS, height: 7, source: 'current', stateHash: 'h1', blockHash: 'block7', coveredHeight: 9, chainHeight: 12 }));
         expect(Buffer.from(res.data.state, 'base64').toString()).toBe('st');
         expect(Buffer.from(res.data.ledgerParameters, 'base64').toString()).toBe('lp7');
     });
@@ -534,7 +536,7 @@ describe('ContractStates', () => {
     it('stateAt() rejects an address that is not hex', async () => {
         await expect(
             srv.send({ event: 'stateAt', entity: 'ContractStates', data: { address: 'not-hex' } })
-        ).rejects.toMatchObject({ message: 'address (hex) is required' });
+        ).rejects.toMatchObject({ code: 'ASSERT_FORMAT', target: 'address' });
     });
 
     it('stateAt() caps its indexer reads across callers', async () => {
@@ -589,7 +591,7 @@ describe('ContractStates', () => {
         try {
             const ask = () => srv.send({ event: 'stateAt', entity: 'ContractStates', data: { address } });
             await expect(ask()).rejects.toMatchObject({ status: 503 });
-            expect(await ask()).toEqual(expect.objectContaining({ source: 'indexer', height: 522, blockHash: '0xblock522' }));
+            expect(await ask()).toEqual(expect.objectContaining({ source: 'indexer', height: 522, blockHash: 'block522' }));
             expect(fetchSpy).toHaveBeenCalledTimes(2);
         } finally {
             fetchSpy.mockRestore();
@@ -664,7 +666,7 @@ describe('UnshieldedUtxos', () => {
     it('unspent() returns only UTXOs with no spending transaction', async () => {
         const blockId = await seedBlock(1);
         const txId = await seedTransaction(blockId);
-        const spendTxId = await seedTransaction(blockId, { hash: '0xspend' });
+        const spendTxId = await seedTransaction(blockId, { hash: 'spend' });
         await seedUtxo(txId, { owner: 'mn_addr_unspent' }); // spentAtTransaction null
         await seedUtxo(txId, { owner: 'mn_addr_spent', spentAtTransaction_ID: spendTxId });
 
@@ -935,13 +937,13 @@ describe('getJobStatus', () => {
     it('names the identifier and, once indexed, the hash explorers show', async () => {
         await seedJob({ requestedBy: 'alice', txHash: '0xCAFE77' });
         expect(await sendAs('alice')).toEqual(expect.objectContaining({ txHash: '0xCAFE77', transactionId: '0xCAFE77', transactionHash: null }));
-        const txId = await seedTransaction(await seedBlock(77), { hash: '0xtx77', ledgerTxHash: 'ab77' });
+        const txId = await seedTransaction(await seedBlock(77), { hash: 'tx77', ledgerTxHash: 'ab77' });
         await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries({ identifier: 'cafe77', transaction_ID: txId }));
         expect((await sendAs('alice')).transactionHash).toBe('ab77');
     });
 
     it('takes a job txHash that is the explorer hash itself', async () => {
-        await seedTransaction(await seedBlock(78), { hash: '0xtx78', ledgerTxHash: 'ab78' });
+        await seedTransaction(await seedBlock(78), { hash: 'tx78', ledgerTxHash: 'ab78' });
         await seedJob({ requestedBy: 'alice', txHash: 'ab78' });
         expect((await sendAs('alice')).transactionHash).toBe('ab78');
     });
