@@ -6,6 +6,7 @@
  */
 import cds from '@sap/cds';
 import { normalizeHexParams } from '../../srv/utils/hex-input';
+import { deriveAccountId } from '../../srv/submission/wallet-material-factory';
 
 const cap = cds.test(__dirname + '/../..') as any;
 
@@ -191,13 +192,26 @@ describe('the hex parameters of an action or function take either spelling', () 
         expect(r.data.contractAddress).toBe(CONTRACT);
     });
 
-    test('a seed and a viewing key', async () => {
+    test('a seed', async () => {
         const seed = 'ab'.repeat(64);
         const stored = await post('deriveWalletInfo', { seedHex: seed });
         const spelled = await post('deriveWalletInfo', { seedHex: `0X${seed.toUpperCase()}` });
         expect(stored.status).toBe(200);
         expect(spelled.data.viewingKey).toBe(stored.data.viewingKey);
-        expect((await post('connectWallet', { viewingKey: `0X${stored.data.viewingKey.toUpperCase()}` })).status).toBe(200);
+    });
+
+    // The account of a wallet is derived from the text of its viewing key, so the server must not change that text.
+    test('a viewing key is taken exactly as sent', async () => {
+        const sent = hex('9e').toUpperCase();
+        expect((await post('connectWallet', { viewingKey: sent })).status).toBe(200);
+        const db = await cds.connect.to('db');
+        const accounts = (id: string) => db.run(cds.ql.SELECT.from('midnight.AccountKeys').columns('accountId').where({ accountId: id }));
+        expect(await accounts(deriveAccountId(sent))).toHaveLength(1);
+        expect(await accounts(deriveAccountId(sent.toLowerCase()))).toHaveLength(0);
+
+        const prefixed = await post('connectWallet', { viewingKey: `0x${sent}` });
+        expect(prefixed.status).toBe(400);
+        expect(prefixed.data.error.message).toBe('viewingKey must be hex-encoded');
     });
 
     // Each handler below refuses a 64-character value with `0x` itself. Past that check it stops at the unknown session.
@@ -232,7 +246,6 @@ describe('the hex parameters of an action or function take either spelling', () 
     test.each([
         ['a 64-character parameter', 'issueFieldPredicateAttestation', { payloadHash: `0x${'a'.repeat(63)}` }, 'payloadHash', 'must be 64 hex characters'],
         ['a seed', 'deriveWalletInfo', { seedHex: 'zz' }, 'seedHex', 'must be 128 hex characters'],
-        ['a viewing key', 'connectWallet', { viewingKey: 'not-hex' }, 'viewingKey', 'must be 64 hex characters'],
         ['a contract address', 'submitContractCall', { contractAddress: '0xVAULT', circuit: 'c' }, 'contractAddress', 'must be hex']
     ])('%s that is not hex is refused', async (_name, action, body, target, message) => {
         const r = await post(action, body);

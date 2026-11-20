@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.46.2 - 2026-11-20
+
+### Fixes
+
+- `connectWallet` takes `viewingKey` exactly as sent again. 0.46.1 lowercased
+  it before deriving the wallet's account from it, so a wallet first connected
+  with uppercase hex got a new, empty account on its next `connectWallet`,
+  while its private state, contract signing keys and sync state stayed under
+  the old one. Sessions that were already open were not affected. A viewing
+  key with `0x` answers 400, as before 0.46.1.
+- A wallet connected under 0.46.1 with an uppercase key reaches what it
+  stored there by connecting with the lowercase key.
+
+No schema change. `@odatano/nightgate-tx` unchanged. Docs: `docs/actions.md`.
+
 ## 0.46.1 - 2026-11-20
 
 ### Features
@@ -8,7 +23,7 @@
   without `0x`, in either letter case, also inside a list or a structure:
   the 64-character values such as `payloadHash`, `attesterId`, `fieldKey`,
   salts, digests and token types, and `contractAddress`, `registryAddress`,
-  `viewingKey` and `seedHex`. The server works with lowercase hex without
+  `viewingKey` and `seedHex` (`viewingKey` no longer since 0.46.2). The server works with lowercase hex without
   `0x`, so rows and answers keep one spelling. A 64-character value with
   `0x` answered 400 before.
 

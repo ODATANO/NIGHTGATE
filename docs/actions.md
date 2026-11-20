@@ -12,7 +12,7 @@ OData V4 actions (POST, side effects) and functions (GET, read-only). Parameter 
 
 A function parameter left out of the URL counts as `null`. An undeclared parameter answers 400.
 
-A hex parameter takes its value with or without `0x`, in either letter case, also inside a list or a structure. This holds for hashes, attester ids, field keys, salts, digests, token types, contract addresses, viewing keys and seeds. The server works with lowercase hex without `0x` and answers in that spelling.
+A hex parameter takes its value with or without `0x`, in either letter case, also inside a list or a structure. This holds for hashes, attester ids, field keys, salts, digests, token types, contract addresses and seeds. The server works with lowercase hex without `0x` and answers in that spelling. The one exception is `connectWallet.viewingKey`: it is taken exactly as sent, without `0x`, because the wallet's account is derived from that text.
 
 ## API versioning while 0.x
 

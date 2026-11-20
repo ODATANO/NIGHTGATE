@@ -985,7 +985,7 @@ service NightgateService {
         };
 
     /** Creates a read-only wallet session. The viewing key is stored encrypted. */
-    action   connectWallet(viewingKey: Hex64,
+    action   connectWallet(viewingKey: String, // taken exactly as sent, never a hex type; the wallet's account is derived from this text
                            label: String // at most 100 characters; optional
     )                                                                         returns {
         ID          : UUID;
