@@ -7,7 +7,7 @@ import { configNumber } from './config';
 export { RATE_CLASSES, RATE_CLASS_NAMES, type RateClass } from './rate-class-table';
 
 /** Names of the limits that are not a class: the grant budgets and the shared indexer read budget. */
-export const BUDGET_LIMIT_NAMES = ['grant-hour', 'grant-day', 'indexer-budget'] as const;
+export const BUDGET_LIMIT_NAMES = ['grant-hour', 'grant-day', 'grant-value', 'indexer-budget'] as const;
 
 interface RejectingRequest extends RateKeySource {
     reject?: (status: number, message: string) => unknown;

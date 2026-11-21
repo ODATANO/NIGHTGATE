@@ -116,11 +116,12 @@ export function parseKeyRingSpec(env: NodeJS.ProcessEnv = process.env): KeyRingS
     const keys: Array<{ id: string; secret: string }> = [];
     const list = String(env.ENCRYPTION_KEYS ?? '').trim();
     if (list) {
-        for (const raw of list.split(',')) {
+        for (const [position, raw] of list.split(',').entries()) {
             const entry = raw.trim();
             if (!entry) continue;
             const eq = entry.indexOf('=');
-            if (eq <= 0) throw new Error(`ENCRYPTION_KEYS entry '${entry.slice(0, 8)}…' is not id=secret`);
+            // Such an entry is most likely a bare secret, so the message names its position and none of its characters.
+            if (eq <= 0) throw new Error(`ENCRYPTION_KEYS entry ${position + 1} is not id=secret`);
             keys.push({ id: entry.slice(0, eq).trim(), secret: entry.slice(eq + 1).trim() });
         }
     }

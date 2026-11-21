@@ -58,7 +58,7 @@ const proof = await ng.prepareDocumentProof({ document: doc, proofFields: [{ fie
 - One method per server action, such as `anchorDocument`, `proveFieldPredicate`, `grantDisclosure`, `sendNight`, `sponsorSwap` and `sponsorTransfer`. `callFunction` and `callAction` reach any other.
 - Write actions submit the job and wait for its result. They long-poll `getJobStatus`. `longPollMs: 0` polls instead.
 - Auth is one of `agentToken` (`ngat_...`, sent as `x-agent-token`), `token` (Bearer) or `username` with `password` (Basic). The public verify route needs none.
-- A refused call throws `NightgateApiError` with `status`, `code` and, on 429 and retryable 503, `retryAfterSeconds`. `isRetryable(err)` says whether to repeat it.
+- A refused call throws `NightgateApiError` with `status`, `code` and, on 429 and retryable 503, `retryAfterSeconds`. `isRetryable(err)` says whether to repeat it. A write that got no answer is sent once more under the same key. When that gets no answer either, the error carries `idempotencyKey`: repeat the call with that key, so a job the server did start is not started twice.
 
 ## In the browser, the wallet pays
 

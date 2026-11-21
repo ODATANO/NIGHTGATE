@@ -205,13 +205,17 @@ export async function probeLanded(identifier, { indexerHttpUrl, api, fetchFn, ti
         const segments = t.transactionResult.segments;
         const failedSegments = Array.isArray(segments) ? segments.filter((s) => s?.success === false).map((s) => Number(s.id)) : [];
         return { height: String(height), status: String(status), failedSegments, applied: status === 'SUCCESS' };
-    } catch {
+    } catch (err) {
+        // An indexer that refuses, is gone or does not exist will never know the transaction. An outage reads as unknown.
+        if (INDEXER_NEVER_ANSWERS.has(Number(err?.status))) throw err;
         return null;
     }
 }
 
 // A refused request (400, 401, 403) stays refused however often it is asked, so it is not "unknown".
 const REFUSED_STATUSES = new Set([400, 401, 403]);
+// The same for an indexer, plus a wrong path (404) and a decommissioned one (410).
+const INDEXER_NEVER_ANSWERS = new Set([...REFUSED_STATUSES, 404, 410]);
 
 /** The same question to a NIGHTGATE server. An outage or a busy server reads as unknown, a refusal is thrown. */
 async function probeLandedOnApi(identifier, api) {

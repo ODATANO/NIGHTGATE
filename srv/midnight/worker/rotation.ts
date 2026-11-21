@@ -61,9 +61,9 @@ export function rotateIfDue(): void {
 }
 
 /** Unloads every wallet after a final save. An unconfirmed save is counted as failed, but the wallet is still unloaded. */
-export async function evictAllFacades(site: string): Promise<{ evicted: number; failed: number }> {
+export async function evictAllFacades(site: string, deadline?: number): Promise<{ evicted: number; failed: number }> {
     const ids = [...facades.keys()];
-    const results = await Promise.allSettled(ids.map(sessionId => evict({ sessionId, awaitSaveAck: true })));
+    const results = await Promise.allSettled(ids.map(sessionId => evict({ sessionId, awaitSaveAck: true, deadline })));
     let failed = 0;
     results.forEach((r, i) => {
         if (r.status === 'rejected') {
@@ -80,16 +80,21 @@ export async function evictAllFacades(site: string): Promise<{ evicted: number; 
 /** Test seam: the dispatcher's admission decision. */
 export function __admitRpcForTests(): boolean { return !rotationState.draining; }
 
-/** Longest wait for running submits at shutdown. It stays under the main thread's 60 s limit, so the final saves still run. */
+/** Longest wait for running submits at shutdown. */
 const SHUTDOWN_DRAIN_MS = 40_000;
+/** Time of the budget kept for the final saves. */
+const SHUTDOWN_SAVE_MS = 15_000;
 
-/** Saves and unloads every wallet so a shutdown loses no sync progress. Sending calls get up to SHUTDOWN_DRAIN_MS to finish first. */
-export async function shutdown() {
+/** Saves and unloads every wallet so a shutdown loses no sync progress. Sending calls get time to finish first.
+ *  `budgetMs` is how long the main thread waits before it ends this thread. The drain and the saves share it. */
+export async function shutdown({ budgetMs }: { budgetMs?: number } = {}) {
     rotationState.draining = true;
-    const deadline = Date.now() + SHUTDOWN_DRAIN_MS;
-    while (rotationState.inflight > 0 && Date.now() < deadline) await sleep(100);
-    if (rotationState.inflight > 0) log('warn', `shutdown: ${rotationState.inflight} submitting call(s) still running after ${SHUTDOWN_DRAIN_MS} ms; saving the wallets anyway`);
-    const { evicted, failed } = await evictAllFacades('shutdown');
+    const startedAt = Date.now();
+    const deadline = budgetMs && budgetMs > 0 ? startedAt + budgetMs : undefined;
+    const drainUntil = Math.min(startedAt + SHUTDOWN_DRAIN_MS, deadline === undefined ? Infinity : deadline - SHUTDOWN_SAVE_MS);
+    while (rotationState.inflight > 0 && Date.now() < drainUntil) await sleep(100);
+    if (rotationState.inflight > 0) log('warn', `shutdown: ${rotationState.inflight} submitting call(s) still running after ${Date.now() - startedAt} ms; saving the wallets anyway`);
+    const { evicted, failed } = await evictAllFacades('shutdown', deadline);
     log(failed > 0 ? 'error' : 'info', `shutdown: ${evicted} facade(s) evicted, ${failed} without a confirmed final save`);
     return { evicted, failed };
 }

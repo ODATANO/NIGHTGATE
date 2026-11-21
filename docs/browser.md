@@ -77,9 +77,9 @@ midnight-js, with the fee spent.
 
 - `'server'` proves on a proof server. It receives the private inputs of the call.
 - `'wallet'` proves inside the wallet. It throws when the wallet cannot prove, so private inputs never reach a server unasked.
-- `'auto'` uses the wallet when it can prove, else the proof server.
+- `'auto'` uses the wallet when it can prove and agrees to, else the proof server.
 
-`provingModality` on the returned object says which one is in use.
+`provingModality` on the returned object says which one is in use. `connectContract` throws when nothing can prove: no `proofServerUrl`, a wallet that reports no proof server and does not prove itself.
 
 ## Batches
 

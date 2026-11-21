@@ -31,7 +31,8 @@ vi.mock('../../srv/submission/background-jobs', () => ({
 import cds from '@sap/cds';
 import {
     normalizeTokenTypes, recordLearnedTokenTypes, refreshLearnedTokenTypes, sharedLearnedTokenTypes, __resetLearnedTokenTypesForTests,
-    MAX_LEARNED_TOKEN_TYPES
+    MAX_LEARNED_TOKEN_TYPES,
+    MAX_LEARNED_TOKEN_TYPES_PER_GRANT
 } from '../../srv/submission/learned-token-types';
 
 const T1 = 'ab'.repeat(32);
@@ -58,6 +59,20 @@ describe('recordLearnedTokenTypes', () => {
         expect(await recordLearnedTokenTypes(db, [T2], { grantId: 'g1' })).toEqual([]);
         expect(insertEntries).not.toHaveBeenCalled();
         expect(logs.warn).toHaveBeenCalledWith(expect.stringContaining(`at most ${MAX_LEARNED_TOKEN_TYPES}`));
+    });
+
+    it('stops at one grant\'s share, so a single grant cannot use up the list', async () => {
+        dbRun.mockResolvedValueOnce([]).mockResolvedValueOnce([{ count: 40 }]).mockResolvedValueOnce([{ count: MAX_LEARNED_TOKEN_TYPES_PER_GRANT }]);
+        expect(await recordLearnedTokenTypes(db, [T2], { grantId: 'g1' })).toEqual([]);
+        expect(selectChain.where).toHaveBeenLastCalledWith({ grantId: 'g1' });
+        expect(insertEntries).not.toHaveBeenCalled();
+        expect(logs.warn).toHaveBeenCalledWith(expect.stringContaining(`at most ${MAX_LEARNED_TOKEN_TYPES_PER_GRANT} per grant`));
+
+        // A type minted without a grant is held back by the platform-wide ceiling only.
+        dbRun.mockReset();
+        dbRun.mockResolvedValueOnce([]).mockResolvedValueOnce([{ count: 40 }]).mockResolvedValueOnce(undefined);
+        expect(await recordLearnedTokenTypes(db, [T2])).toEqual([T2]);
+        expect(dbRun).toHaveBeenCalledTimes(3);
     });
 
     it('inserts only the types the platform has not seen, with their origin', async () => {

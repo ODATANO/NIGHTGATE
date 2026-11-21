@@ -6,12 +6,19 @@ export interface RuntimeState {
     /** 'idle': not started yet. 'active': running. 'offline': startup failed. */
     mode: 'idle' | 'active' | 'offline';
     lastError?: string;
+    /** True when the crawler's start was the only thing that failed. Starting the crawler later then ends the offline state. */
+    crawlerOnly?: boolean;
 }
 
 let current: RuntimeState = { initialized: false, mode: 'idle' };
 
 export function publishRuntimeState(state: RuntimeState): void {
-    current = { initialized: state.initialized, mode: state.mode, lastError: state.lastError };
+    current = { initialized: state.initialized, mode: state.mode, lastError: state.lastError, crawlerOnly: state.crawlerOnly === true };
+}
+
+/** Called once the crawler runs. Ends an offline state that only the crawler caused; any other startup failure stays. */
+export function noteCrawlerRunning(): void {
+    if (current.mode === 'offline' && current.crawlerOnly) current = { initialized: current.initialized, mode: 'active' };
 }
 
 export function readRuntimeState(): RuntimeState {

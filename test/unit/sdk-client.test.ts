@@ -486,6 +486,93 @@ describe('isRetryable', () => {
     });
 });
 
+describe('a write that failed to start', () => {
+    const timedOut = () => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+
+    test('names the key this client made, and is not to be repeated unchanged', async () => {
+        const { connect, isRetryable } = await importClient();
+        const fn = vi.fn().mockRejectedValue(timedOut());
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        const failure = await ng.sponsorUnbound({ unboundTxB64: 'AA==' }).catch((e: unknown) => e) as any;
+        const sent = JSON.parse(fn.mock.calls[0][1].body);
+        expect(failure.name).toBe('TimeoutError');
+        expect(failure.idempotencyKey).toBe(sent.idempotencyKey);
+        // The client tried once more under the same key before it gave up.
+        expect(fn).toHaveBeenCalledTimes(2);
+        expect(JSON.parse(fn.mock.calls[1][1].body).idempotencyKey).toBe(sent.idempotencyKey);
+        // The server may have started the job. A repeat without the key would start a second one.
+        expect(isRetryable(failure)).toBe(false);
+
+        // Repeated with the key, the server answers with the first job.
+        const again = vi.fn(async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ txHash: '0xabc' }) }));
+        const retry = connect({ baseUrl: 'https://ng.example', fetchFn: again as any });
+        await retry.sponsorUnbound({ unboundTxB64: 'AA==', idempotencyKey: failure.idempotencyKey });
+        expect(JSON.parse((again.mock.calls as any)[0][1].body).idempotencyKey).toBe(sent.idempotencyKey);
+    });
+
+    test('a start that got no answer goes out once more under the same key, and the caller notices nothing', async () => {
+        const { connect } = await importClient();
+        const answer = { ok: true, status: 200, text: async () => JSON.stringify({ txHash: '0xabc' }) };
+        const gateway = { ok: false, status: 504, headers: { get: () => null }, text: async () => JSON.stringify({ error: { code: '504', message: 'Gateway Timeout' } }) };
+        for (const first of [() => Promise.reject(timedOut()), () => Promise.resolve(gateway)]) {
+            const fn = vi.fn().mockImplementationOnce(first).mockResolvedValueOnce(answer);
+            const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+            await expect(ng.sponsorUnbound({ unboundTxB64: 'AA==' })).resolves.toMatchObject({ txHash: '0xabc' });
+            expect(fn).toHaveBeenCalledTimes(2);
+            const [one, two] = fn.mock.calls.map(([, init]) => JSON.parse(init.body).idempotencyKey);
+            expect(two).toBe(one);
+        }
+    });
+
+    test('a refusal of the server itself is not repeated by the client', async () => {
+        const { connect } = await importClient();
+        const fn = vi.fn(async () => ({ ok: false, status: 503, headers: { get: () => '15' }, text: async () => JSON.stringify({ error: { code: 'WALLET_SYNCING', message: 'wallet is still syncing' } }) }));
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        await expect(ng.sponsorUnbound({ unboundTxB64: 'AA==' })).rejects.toMatchObject({ code: 'WALLET_SYNCING', retryAfterSeconds: 15 });
+        expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    test('with a key from the caller nothing is added, and a repeat unchanged is safe', async () => {
+        const { connect, isRetryable } = await importClient();
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: vi.fn().mockRejectedValue(timedOut()) as any });
+        const failure = await ng.sponsorUnbound({ unboundTxB64: 'AA==', idempotencyKey: 'mine' }).catch((e: unknown) => e) as any;
+        expect(failure.idempotencyKey).toBeUndefined();
+        expect(isRetryable(failure)).toBe(true);
+    });
+
+    test('a refusal of the server itself started no job and stays retryable; an answer from in between does not', async () => {
+        const { connect, isRetryable } = await importClient();
+        const refuse = (status: number, error: unknown) => connect({
+            baseUrl: 'https://ng.example',
+            fetchFn: vi.fn(async () => ({ ok: false, status, headers: { get: () => null }, text: async () => JSON.stringify({ error }) })) as any
+        }).sponsorUnbound({ unboundTxB64: 'AA==' }).catch((e: unknown) => e) as Promise<any>;
+
+        const syncing = await refuse(503, { code: 'WALLET_SYNCING', message: 'wallet is still syncing' });
+        expect(syncing.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/);
+        expect(isRetryable(syncing)).toBe(true);
+
+        // A gateway timeout carries no server code. The request may have gone through.
+        const gateway = await refuse(504, { code: '504', message: 'Gateway Timeout' });
+        expect(isRetryable(gateway)).toBe(false);
+        expect(isRetryable(await refuse(429, { code: '429', message: 'Too Many Requests' }))).toBe(true);
+    });
+
+    test('a wait that ran out of time names the job, so it can be picked up again', async () => {
+        const { connect } = await importClient();
+        const { fn } = fakeFetch([{ body: { status: 'processing' } }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
+        const failure = await ng.waitForJob({ jobId: 'j9', sessionId: 's9', timeoutMs: 5 }).catch((e: unknown) => e) as any;
+        expect(failure).toMatchObject({ jobId: 'j9', sessionId: 's9' });
+    });
+
+    test('verifyReceipt comes from the client entry too, as its types say', async () => {
+        const client = await importClient();
+        const index = await import('../../src/sdk/index.mjs' as string);
+        expect(typeof client.verifyReceipt).toBe('function');
+        expect(client.verifyReceipt).toBe(index.verifyReceipt);
+    });
+});
+
 describe('connect: the chain reads a transaction builder needs', () => {
     test('contractStateAt asks stateAt with a null height, lowercases the address and drops a 0x prefix', async () => {
         const { connect } = await importClient();

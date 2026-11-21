@@ -258,26 +258,26 @@ const migrate = () => {
         console.warn(`[delta] ! indexes skipped (${err.message}); the server creates them at startup`);
     }
 
-    // A Transactions.raw stored as "0x..." text is lossy and cannot be re-encoded.
-    // Clear it and the ContractActions.state copy; reindexFromHeight(0) restores both from the chain.
+    // A Transactions.raw stored as "0x..." text is lossy and cannot be re-encoded. Only a database that holds such
+    // rows gets this cleanup; on any other one it changes nothing. reindexFromHeight(0) restores the cleared values.
     try {
-        if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='midnight_Transactions'").get()) {
-            const lossy = db.prepare("SELECT count(*) AS n FROM midnight_Transactions WHERE typeof(raw) = 'text' AND raw LIKE '0x%'").get()?.n ?? 0;
-            if (lossy > 0) db.exec("UPDATE midnight_Transactions SET raw = NULL WHERE typeof(raw) = 'text' AND raw LIKE '0x%';");
-            let stateCleared = 0;
-            if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='midnight_ContractActions'").get()) {
-                stateCleared = db.prepare("UPDATE midnight_ContractActions SET state = NULL WHERE state IS NOT NULL").run()?.changes ?? 0;
-            }
-            if (lossy > 0 || stateCleared > 0) {
-                console.log(`[delta] ~ cleared ${lossy} lossy Transactions.raw value(s) written before 0.23.0 and ${stateCleared} ContractActions.state copy(ies); run reindexFromHeight(0) on the indexer service to restore the extrinsic bytes`);
-            // Values derived from the extrinsic envelope are wrong; the crawler now reads them from chain events.
-            // Clear them; a re-index writes the real ones. Only a database with lossy raw values reaches this.
+        const hasTable = (name) => Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name));
+        const lossy = hasTable('midnight_Transactions')
+            ? db.prepare("SELECT count(*) AS n FROM midnight_Transactions WHERE typeof(raw) = 'text' AND raw LIKE '0x%'").get()?.n ?? 0
+            : 0;
+        if (lossy > 0) {
+            db.exec("UPDATE midnight_Transactions SET raw = NULL WHERE typeof(raw) = 'text' AND raw LIKE '0x%';");
+            const stateCleared = hasTable('midnight_ContractActions')
+                ? db.prepare("UPDATE midnight_ContractActions SET state = NULL WHERE state IS NOT NULL").run()?.changes ?? 0
+                : 0;
+            console.log(`[delta] ~ cleared ${lossy} lossy Transactions.raw value(s) written before 0.23.0 and ${stateCleared} ContractActions.state copy(ies); run reindexFromHeight(0) on the indexer service to restore the extrinsic bytes`);
+            // The same old versions derived these values from the extrinsic envelope. The crawler reads them from chain events now.
             const addrCleared = db.prepare("UPDATE midnight_ContractActions SET address = NULL WHERE address IS NOT NULL").run()?.changes ?? 0;
             const txCleared = db.prepare("UPDATE midnight_Transactions SET contractAddress = NULL, senderAddress = NULL, receiverAddress = NULL, nightAmount = NULL WHERE contractAddress IS NOT NULL OR senderAddress IS NOT NULL OR receiverAddress IS NOT NULL OR nightAmount IS NOT NULL").run()?.changes ?? 0;
             let utxoCleared = 0, balanceCleared = 0;
-            if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='midnight_UnshieldedUtxos'").get()) utxoCleared = db.prepare("DELETE FROM midnight_UnshieldedUtxos").run()?.changes ?? 0;
-            if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='midnight_NightBalances'").get()) balanceCleared = db.prepare("DELETE FROM midnight_NightBalances").run()?.changes ?? 0;
-            if (addrCleared || txCleared || utxoCleared || balanceCleared)
+            if (hasTable('midnight_UnshieldedUtxos')) utxoCleared = db.prepare("DELETE FROM midnight_UnshieldedUtxos").run()?.changes ?? 0;
+            if (hasTable('midnight_NightBalances')) balanceCleared = db.prepare("DELETE FROM midnight_NightBalances").run()?.changes ?? 0;
+            if (addrCleared || txCleared || utxoCleared || balanceCleared) {
                 console.log(`[delta] ~ cleared envelope-derived values written before 0.23.0: ${addrCleared} ContractActions.address, ${txCleared} Transactions sender/receiver/amount/contractAddress, ${utxoCleared} UnshieldedUtxos row(s), ${balanceCleared} NightBalances row(s)`);
             }
         }

@@ -10,7 +10,7 @@ import { walletSponsorFinalizedTx, walletSponsorUnboundTx } from '../../midnight
 import { PLATFORM_POOL_SENTINEL, acquireSponsor, releaseSponsor, benchSponsor, decideSponsorFailure, sponsorCandidatesNonExclusive, touchSponsor } from '../sponsor-pool';
 import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget } from '../../sessions/agent-grants';
 import { recordPlatformMint } from '../platform-mints';
-import { closeSwapOffer, closeSwapOffersByNullifiers } from '../swap-offers';
+import { fillSwapOffer, closeSwapOffersByNullifiers, requireOpenSwapOffer } from '../swap-offers';
 import { sponsorAtSyncGate } from '../sponsor-sync-gate';
 import { configMs, configNumber } from '../../utils/config';
 import type { DbRunner } from '../../utils/db-types';
@@ -23,6 +23,14 @@ import { withLockContentionRetry } from '../db-write-retry';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const { INSERT, UPDATE } = cds.ql;
+
+/** The transaction landed and only the bookkeeping after it failed. It must not be handled like a failed attempt. */
+class LandedBookkeepingError extends Error {
+    constructor(cause: unknown) {
+        super(`bookkeeping after a landed transaction failed: ${errorMessage(cause)}`, { cause });
+        this.name = 'LandedBookkeepingError';
+    }
+}
 
 export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     const { db } = ctx;
@@ -98,7 +106,12 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
             // The job's status change is in the same transaction. After a crash the job is
             // either still running with nothing reserved, or submitted with all of it saved.
             let budgetExhausted: Error | null = null;
+            // The last moment a retired offer can still stop its take. A refusal here means nothing is sent.
+            let offerClosed: Error | null = null;
             await withLockContentionRetry(`sponsorAttempt(${job.ID})`, () => runInOneTransaction(db, async (tx) => {
+                if (command?.swap?.offerId) {
+                    await requireOpenSwapOffer(tx, String(command.swap.offerId)).catch((e: Error) => { offerClosed = e; throw e; });
+                }
                 await tx.run(INSERT.into(PendingSubmissions).entries(row));
                 if (need > 0) {
                     const ok = await reserveDeployBudget(tx, grantId!, need);
@@ -108,7 +121,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                     }
                 }
                 await reportBroadcastOn(tx, { submissionId, txHash, firstBoundary: !boundaryCrossed });
-            })).catch((e) => { throw budgetExhausted ?? e; });
+            })).catch((e) => { throw offerClosed ?? budgetExhausted ?? e; });
             boundaryCrossed = true;
             if (grantId && deployed.length) reservedDeploys = deployed.length;
             currentSubmissionId = submissionId; currentTxHash = txHash;
@@ -158,6 +171,15 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         allowedUnshieldedTokenTypes: policy.allowedUnshieldedTokenTypes
     });
 
+    /** Runs the bookkeeping of a landed transaction. A failure leaves the attempt as it is: the job is settled from the chain, and the finalizer repeats the bookkeeping. */
+    const recordAfterLanding = async (command: SponsorJobCommand, out: Parameters<typeof recordOnGrant>[1]): Promise<void> => {
+        try {
+            await recordOnGrant(command, out);
+        } catch (e) {
+            throw new LandedBookkeepingError(e);
+        }
+    };
+
     /** Records what a landed job produced: minted token types, closed offers and deployed contracts. */
     const recordOnGrant = async (command: SponsorJobCommand, out: { deployed?: string[]; minted?: string[]; txHash?: string; nullifiers?: string[] }): Promise<void> => {
         if (out.minted?.length) await recordPlatformMint(db, out.minted, { grantId: command.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: out.txHash ?? null });
@@ -171,7 +193,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     const closeSwapOffersOf = async (command: SponsorJobCommand, nullifiers: string[], txHash: string | null): Promise<void> => {
         // The swap is already on chain, so a failed write here must not fail the job.
         try {
-            if (command?.swap?.offerId) await closeSwapOffer(db, String(command.swap.offerId), 'filled', txHash);
+            if (command?.swap?.offerId) await fillSwapOffer(db, String(command.swap.offerId), txHash);
             if (nullifiers.length) await closeSwapOffersByNullifiers(db, nullifiers, txHash);
         } catch (e) {
             cds.log('nightgate').warn(`swap offers of ${txHash ?? 'the landed swap'} not closed: ${errorMessage(e)}`);
@@ -215,9 +237,10 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                             ...policyArgs(policy)
                         }, ledger.onSubmitIntent()));
                     releaseSponsor(sessionId);
-                    await recordOnGrant(command, out);
+                    await recordAfterLanding(command, out);
                     return { ...out, feeSponsor: sponsorSessionId };
                 } catch (e) {
+                    if (e instanceof LandedBookkeepingError) throw e;
                     lastErr = e;
                     const verdict = decideSponsorFailure(e);
                     // The tx may be on chain. The job runner checks the chain and settles the job.
@@ -263,6 +286,8 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         if (command?.op !== 'sponsorUnbound') throw new Error(`Invalid persisted sponsor command for job ${job.ID}`);
         const facadeCfg = facadeConfigFromEnv();
 
+        // Checked before any proof is computed, and again right before the send.
+        if (command.swap?.offerId) await requireOpenSwapOffer(db, String(command.swap.offerId));
         const candidates = sponsorCandidates(command, pool => sponsorCandidatesNonExclusive(pool, Date.now(), sponsorAtSyncGate));
         const cooldownMs = configMs('NIGHTGATE_SPONSOR_COOLDOWN_MS');
         // A dust race says nothing about the sponsor's health. Wait, then rebuild with
@@ -297,9 +322,10 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                             networkId: facadeCfg.networkId,
                             ...policyArgs(policy)
                         }, onSubmitIntent()));
-                    await recordOnGrant(command, out);
+                    await recordAfterLanding(command, out);
                     return { ...out, feeSponsor: sponsorSessionId };
                 } catch (e) {
+                    if (e instanceof LandedBookkeepingError) throw e;
                     lastErr = e;
                     const verdict = decideSponsorFailure(e);
                     const attemptHash = (ledger.lastTxHash() ?? '?').slice(0, 16);

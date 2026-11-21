@@ -4,7 +4,7 @@
 import { holderClaimKey, holderEntry as kitHolderEntry, hexToBytes32 } from '@odatano/contract-kit';
 import { importArtifact } from './artifact-import';
 import { buildPublicDataProvider, queryLedger9ContractState } from '../midnight/public-data-provider';
-import type { ContractArtifact } from './predicate-state';
+import { refusedByRuntime, type ContractArtifact } from './predicate-state';
 
 export const HOLDER_REGISTRY_REF = 'holder-registry';
 export { holderClaimKey };
@@ -33,13 +33,18 @@ export interface HolderRegistration {
     entry: string;
 }
 
-/** Null when the contract has no state yet. */
+/** Null when the contract has no state yet, or when the address holds another contract than a holder registry. */
 export async function readHolderRegistration(q: HolderRegistrationQuery): Promise<HolderRegistration | null> {
     const publicData = await buildPublicDataProvider(q.contractProvidersConfig);
-    const artifact = await importArtifact(q.artifactPath, q.artifactDigest) as ContractArtifact<HolderRegistryLedger>;
+    const artifact = await importArtifact(q.artifactPath, q.artifactDigest) as ContractArtifact<Partial<HolderRegistryLedger>>;
     const state = await queryLedger9ContractState(publicData, q.contractAddress);
     if (!state) return null;
     const entry = holderEntry(artifact, q.tokenType, q.claimKey);
-    const led = artifact.ledger(state.data);
-    return { registered: led.holders.member(hexToBytes32(entry)) === true, entry };
+    try {
+        const { holders } = artifact.ledger(state.data);
+        return holders ? { registered: holders.member(hexToBytes32(entry)) === true, entry } : null;
+    } catch (err) {
+        if (await refusedByRuntime(err)) return null;
+        throw err;
+    }
 }

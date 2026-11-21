@@ -11,7 +11,7 @@ import { isCallNotAppliedFailure } from './sponsor-pool';
 import { configMs } from '../utils/config';
 import { affectedRows, type DbRunner } from '../utils/db-types';
 import { jobKindTraits, executePersistedCommand, undeclaredOrUnregisteredJobKinds, processors, processorKey } from './job-registry';
-import { WorkflowReconciliationRequiredError, runWithoutAmbientTx, getJobById, markRunning, markSucceeded, markFailed, markReconciliationRequired, startLeaseHeartbeat, markJobExternalExecution, markJobBroadcastOn, markJobSubmissionRejectedOn, markJobSubmitted } from './job-store';
+import { WorkflowReconciliationRequiredError, MAX_REQUEUES, hasCompletedChild, runWithoutAmbientTx, getJobById, markRunning, markSucceeded, markFailed, markReconciliationRequired, startLeaseHeartbeat, markJobExternalExecution, markJobBroadcastOn, markJobSubmissionRejectedOn, markJobSubmitted } from './job-store';
 import { BROADCAST_UNCONFIRMED, BROADCAST_NOT_INCLUDED, markChainFailureAfterBroadcast, settleRejectedSponsorAttempts, triggerChainConfirmPass, reconcileBackgroundJobs, refreshSucceededChainOutcomes, SCAN_PAGE_SIZE } from './job-reconciliation';
 import { errorMessage } from '../utils/errors';
 import { LOCK_CONTENTION_ATTEMPTS, withLockContentionRetry } from './db-write-retry';
@@ -157,14 +157,18 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                         cds.log('nightgate').info(`markSucceeded(${jobId}): job was superseded mid-run; discarding its result`);
                     } else {
                         cds.log('nightgate').error(
-                            `markSucceeded(${jobId}): could not persist the result after ${LOCK_CONTENTION_ATTEMPTS} attempts; marking failed:RESULT_PERSIST_FAILED`,
+                            `markSucceeded(${jobId}): could not persist the result after ${LOCK_CONTENTION_ATTEMPTS} attempts (RESULT_PERSIST_FAILED)`,
                             persistErr
                         );
-                        await markFailed(jobId, {
-                            code: 'RESULT_PERSIST_FAILED',
-                            retryable: false,
-                            message: 'The job work completed but its result could not be persisted (database lock contention or a lost worker lease). On-chain effects may exist; verify chain state before retrying.'
-                        });
+                        const lost = 'The job work completed but its result could not be persisted (database lock contention or a lost worker lease).';
+                        // A failed job frees its idempotency key. A job with something on chain must keep it, so it is parked and settled from the chain.
+                        if (current?.txHash) {
+                            await markReconciliationRequired(jobId, { code: 'RESULT_PERSIST_FAILED', message: `${lost} The reconciler settles it from the indexer by ${current.txHash}.` });
+                        } else if (await hasCompletedChild(jobId)) {
+                            await markReconciliationRequired(jobId, { code: 'CHILD_RECONCILIATION_REQUIRED', message: `${lost} Its steps are done; the workflow finishes from them.` });
+                        } else {
+                            await markFailed(jobId, { code: 'RESULT_PERSIST_FAILED', retryable: false, message: `${lost} On-chain effects may exist; verify chain state before retrying.` });
+                        }
                     }
                 }
             } finally {
@@ -247,9 +251,6 @@ export function stopBackgroundJobProcessor(): void {
  */
 const JOB_LEASE_TTL_MS = configMs('NIGHTGATE_JOB_LEASE_TTL_MS');
 
-/** After this many re-queues the job fails, so a crash loop ends. */
-const MAX_LEASE_RECLAIMS = 3;
-
 /** Re-queues `running` jobs without a recent heartbeat. A heartbeat that arrives meanwhile keeps the job. */
 export async function reclaimExpiredLeases(existingDb?: DbRunner): Promise<number> {
     const db = existingDb ?? await cds.connect.to('db');
@@ -267,7 +268,7 @@ export async function reclaimExpiredLeases(existingDb?: DbRunner): Promise<numbe
         const attempt = (row.attempt ?? 1) + 1;
         const terminal = !row.commandVersion
             ? 'its work was an in-process closure that died with the lease owner'
-            : attempt > MAX_LEASE_RECLAIMS + 1
+            : attempt > MAX_REQUEUES + 1
                 ? `its lease expired ${attempt - 1} times`
                 : null;
         const patch: Record<string, unknown> = terminal
@@ -286,7 +287,31 @@ export async function reclaimExpiredLeases(existingDb?: DbRunner): Promise<numbe
             `lease of ${row.kind} job ${row.ID} held by ${row.leaseOwner ?? 'unknown'} expired (no heartbeat since ${row.heartbeatAt ?? row.startedAt}): ` +
             (terminal ? `failed LEASE_EXPIRED, ${terminal}` : `re-queued as attempt ${attempt}`));
     }
-    return reclaimed;
+    return reclaimed + await settleSilentJobsPastRunning(db, cutoff);
+}
+
+/** Ends jobs past `running` whose owner went silent. They never run again: without an announced hash nothing was sent, with one the reconciler settles the job from the indexer. */
+async function settleSilentJobsPastRunning(db: DbRunner, cutoff: string): Promise<number> {
+    const silent = await db.run(
+        SELECT.from(BackgroundJobs).columns('ID', 'kind', 'status', 'txHash', 'leaseOwner', 'heartbeatAt')
+            .where({ status: { in: ['external_execution', 'submitted'] }, heartbeatAt: { '<': cutoff } }).limit(SCAN_PAGE_SIZE)
+    ) as BackgroundJob[];
+    let settled = 0;
+    for (const row of silent ?? []) {
+        const guard = { ID: row.ID, status: row.status, leaseOwner: row.leaseOwner ?? null, heartbeatAt: row.heartbeatAt ?? null };
+        const since = `no heartbeat from ${row.leaseOwner ?? 'unknown owner'} for more than ${JOB_LEASE_TTL_MS} ms`;
+        const released = { leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null };
+        const patch: Record<string, unknown> = row.txHash
+            ? { status: 'reconciliation_required', errorCode: 'LEASE_EXPIRED', errorMessage: `${since} after announcing ${row.txHash}; the reconciler settles the job from the indexer`, ...released }
+            : { status: 'failed', errorCode: 'LEASE_EXPIRED', errorMessage: `${since} before a transaction was announced; nothing of it is on chain`, finishedAt: new Date().toISOString(), ...released };
+        const affected = await withLockContentionRetry(`settleSilentJob(${row.ID})`, () => db.run(
+            UPDATE.entity(BackgroundJobs).set(patch).where(guard)
+        ));
+        if (affectedRows(affected) !== 1) continue;
+        settled++;
+        cds.log('nightgate').error(`${row.kind} job ${row.ID} went silent in ${row.status} (${since}): ${row.txHash ? 'parked for reconciliation' : 'failed LEASE_EXPIRED'}`);
+    }
+    return settled;
 }
 
 async function pollPersistedCommands(): Promise<void> {

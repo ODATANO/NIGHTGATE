@@ -3,6 +3,7 @@
 
 const BLOCK_QUERY = `query($height: Int!) {
   block(offset: { height: $height }) {
+    hash
     height
     ledgerParameters
     transactions {
@@ -73,6 +74,8 @@ export interface SupplementTransaction {
 }
 
 export interface SupplementBlock {
+    /** Bare lowercase hex. The crawler writes nothing when it differs from the hash of its own block at this height. */
+    hash: string;
     height: number;
     /** Base64. The node does not provide these parameters. */
     ledgerParameters: string | null;
@@ -105,7 +108,7 @@ interface TransactionAnswer {
 }
 
 export interface BlockAnswer {
-    block?: { height?: unknown; ledgerParameters?: unknown; transactions?: Array<TransactionAnswer | null> | null } | null;
+    block?: { hash?: unknown; height?: unknown; ledgerParameters?: unknown; transactions?: Array<TransactionAnswer | null> | null } | null;
 }
 
 const ACTION_TYPE: Record<string, SupplementContractAction['actionType']> = {
@@ -190,6 +193,7 @@ export function readSupplementBlock(payload: BlockAnswer | null | undefined): Su
     }
 
     return {
+        hash: bareHex(block.hash),
         height: toInt(block.height),
         ledgerParameters: hexToBase64(block.ledgerParameters),
         transactions

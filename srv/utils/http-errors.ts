@@ -48,6 +48,16 @@ function normalizeOne(err: HttpErrorLike): void {
     }
 }
 
+/** Express error middleware. Node's message for a body that is not JSON quotes part of the input, which may be a secret, so it is replaced. */
+export function redactInvalidJson(err: unknown, _req: unknown, _res: unknown, next: (err?: unknown) => void): void {
+    const e = err as { name?: unknown; message?: unknown; stack?: unknown } | null;
+    if (e && typeof e === 'object' && e.name === 'Invalid JSON body') {
+        e.message = 'The request body is not valid JSON';
+        e.stack = `${e.name}: ${e.message}`;
+    }
+    next(err);
+}
+
 export function normalizeHttpError(err: unknown): void {
     if (!err || typeof err !== 'object') return;
     // Sub-errors first, so a combined error takes its status from theirs.

@@ -1,19 +1,19 @@
 // Shared helpers, command types and rate limits for the submission handlers.
 // SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
-import { Documents, PredicateAttestations, Transactions, TransactionResults, type Transaction, type TransactionResult } from '#cds-models/midnight';
+import { Documents, PredicateAttestations, Transactions, TransactionIdentifiers, TransactionResults, type Transaction, type TransactionResult } from '#cds-models/midnight';
 import { getArtifactGenerationDigest } from '../contract-registry';
 import { resolveNightgateRuntimeConfig, getNightgateConfig, mainnetSubmissionBlockReason } from '../../utils/nightgate-config';
 import { WorkflowReconciliationRequiredError, type StartJobResult } from '../background-jobs';
 import { UINT64_MAX } from '../verify-state';
 import { effectiveSponsorPolicy, getGlobalSponsorPolicy, type SponsorPolicy } from '../sponsor-policy';
-import { currentGrantPolicy, consumeValueBudget } from '../../sessions/agent-grants';
+import { currentGrantPolicy, consumeValueBudget, refundValueBudget } from '../../sessions/agent-grants';
 
 import { configInt } from '../../utils/config';
 import type { DbRunner, TxCapableDb } from '../../utils/db-types';
 import type { ActionRequest, Request } from '@sap/cds';
 import { isNightgateError, NightgateError, errorMessage } from '../../utils/errors';
-import { HEX64_ANY_CASE_RE, bareHex } from '../../utils/hex-patterns';
+import { bareHex, HEX64_RE } from '../../utils/hex-patterns';
 import { withLockContentionRetry } from '../db-write-retry';
 const { DELETE, SELECT } = cds.ql;
 
@@ -45,8 +45,13 @@ export function claimDefaultLifetimeS(): number {
     const configured = configInt('NIGHTGATE_CLAIM_LIFETIME_S') ?? 365 * 24 * 60 * 60;
     return Math.min(configured, CLAIM_MAX_LIFETIME_S - 60);
 }
+/** The expiry of a claim as UNIX seconds: the caller's value, else now plus the default lifetime.
+ *  A job stores this value in its command, so every run of the job proves the same expiry. */
+export function resolveClaimValidUntil(requested?: number): number {
+    return requested ?? Math.floor(Date.now() / 1000) + claimDefaultLifetimeS();
+}
 export function claimValidUntil(requested?: number): bigint {
-    return BigInt(requested ?? Math.floor(Date.now() / 1000) + claimDefaultLifetimeS());
+    return BigInt(resolveClaimValidUntil(requested));
 }
 /** Parses an optional caller `validUntil`. On bad input it returns the error text for a 400. */
 export function parseValidUntil(raw: unknown): { validUntil?: number; error?: string } {
@@ -157,6 +162,13 @@ export const THRESHOLD_EXCEEDS = 'exceeds the recorded range (at most 9223372036
 
 export interface InclusionPath { siblings: string[]; dirs: boolean[] }
 
+/** A 32-byte hash as bare lowercase hex, or undefined when `value` is none. A caller may write it with `0x` and in either case. */
+export function readHash32(value: unknown): string | undefined {
+    if (typeof value !== 'string') return undefined;
+    const bare = bareHex(value);
+    return HEX64_RE.test(bare) ? bare : undefined;
+}
+
 /**
  * Checks a fixed-depth Merkle path and returns it with lowercase hashes, or what is wrong. CAP does not check the hex format of `array of Hex64`.
  */
@@ -165,10 +177,11 @@ export function readInclusionPath(siblings: unknown, dirs: unknown, depth: numbe
     const ds = dirs ?? [];
     if (!Array.isArray(sibs) || sibs.length !== depth) return `${names.siblings} must be an array of ${depth} hashes`;
     if (!Array.isArray(ds) || ds.length !== depth) return `${names.dirs} must be an array of ${depth} booleans`;
-    if (sibs.some(s => typeof s !== 'string' || !HEX64_ANY_CASE_RE.test(s))) return `${names.siblings} entries must be 64 hex chars (32 bytes)`;
+    const hashes = sibs.map(readHash32);
+    if (hashes.some(h => h === undefined)) return `${names.siblings} entries must be 64 hex chars (32 bytes)`;
     // Only real booleans. Boolean("false") is true and would give a wrong path.
     if (ds.some(d => typeof d !== 'boolean')) return `${names.dirs} entries must be booleans`;
-    return { siblings: (sibs as string[]).map(s => s.toLowerCase()), dirs: ds as boolean[] };
+    return { siblings: hashes as string[], dirs: ds as boolean[] };
 }
 
 /** `readInclusionPath` for a request: on bad input it rejects with 400 and returns null. */
@@ -194,25 +207,23 @@ export function validateSchemaSlots(schema: unknown, name: string, width = 16): 
     return schema.map((entry: unknown, i: number) => {
         if (!entry || typeof entry !== 'object') throw new Error(`${name}[${i}] must be an object`);
         const d = entry as Record<string, unknown>;
-        if (typeof d.fieldKey !== 'string' || !HEX64_ANY_CASE_RE.test(d.fieldKey)) {
-            throw new Error(`${name}[${i}].fieldKey must be 64 hex chars (32 bytes)`);
-        }
+        const fieldKey = readHash32(d.fieldKey);
+        if (!fieldKey) throw new Error(`${name}[${i}].fieldKey must be 64 hex chars (32 bytes)`);
         if (d.kind !== 0 && d.kind !== 1 && d.kind !== 2) {
             throw new Error(`${name}[${i}].kind must be 0 (uint), 1 (bytes) or 2 (padding)`);
         }
         let scaleBig: bigint;
         try { scaleBig = BigInt((d.scale ?? '0') as string | number | bigint); } catch { throw new Error(`${name}[${i}].scale must be an integer (decimal string)`); }
         if (scaleBig < 0n || scaleBig > UINT64_MAX) throw new Error(`${name}[${i}].scale must fit Uint<64>`);
-        return { fieldKey: d.fieldKey.toLowerCase(), kind: d.kind, scale: scaleBig.toString() };
+        return { fieldKey, kind: d.kind, scale: scaleBig.toString() };
     });
 }
 
 export function validateOpening(opening: unknown, name: string, width = 16): OpeningWire {
     if (!opening || typeof opening !== 'object') throw new Error(`${name} must be an object`);
     const o = opening as Record<string, unknown>;
-    if (typeof o.saltSeed !== 'string' || !HEX64_ANY_CASE_RE.test(o.saltSeed)) {
-        throw new Error(`${name}.saltSeed must be 64 hex chars (32 bytes)`);
-    }
+    const saltSeed = readHash32(o.saltSeed);
+    if (!saltSeed) throw new Error(`${name}.saltSeed must be 64 hex chars (32 bytes)`);
     if (!Array.isArray(o.slots) || o.slots.length !== width) {
         throw new Error(`${name}.slots must be an array of exactly ${width} slot openings`);
     }
@@ -228,17 +239,15 @@ export function validateOpening(opening: unknown, name: string, width = 16): Ope
             out.value = v.toString();
         }
         if (s.valueDigest !== undefined) {
-            if (typeof s.valueDigest !== 'string' || !HEX64_ANY_CASE_RE.test(s.valueDigest)) {
-                throw new Error(`${name}.slots[${i}].valueDigest must be 64 hex chars (32 bytes)`);
-            }
-            out.valueDigest = s.valueDigest.toLowerCase();
+            out.valueDigest = readHash32(s.valueDigest);
+            if (!out.valueDigest) throw new Error(`${name}.slots[${i}].valueDigest must be 64 hex chars (32 bytes)`);
         }
         if (s.present && out.value === undefined && out.valueDigest === undefined) {
             throw new Error(`${name}.slots[${i}]: a present slot needs value or valueDigest`);
         }
         return out;
     });
-    return { saltSeed: o.saltSeed.toLowerCase(), slots };
+    return { saltSeed, slots };
 }
 
 /** True when the mask lets every real field change, so the claim is empty. The circuit rejects that, so callers answer 400 before proving. */
@@ -315,7 +324,14 @@ export async function startJobWithRows<R extends StartJobResult>(
     insertRows: unknown, start: () => Promise<R>
 ): Promise<R> {
     await db.run(insertRows);
-    const drop = () => db.run(DELETE.from(entity).where({ ID: { in: ids } }));
+    // A failed cleanup leaves rows no job refers to. It must not replace the reason no job started, nor fail a repeated request.
+    const drop = async (): Promise<void> => {
+        try {
+            await db.run(DELETE.from(entity).where({ ID: { in: ids } }));
+        } catch (err) {
+            cds.log('nightgate').warn(`${ids.length} row(s) of a job that did not start were not removed: ${errorMessage(err)}`);
+        }
+    };
     let job: R;
     try {
         job = await start();
@@ -327,11 +343,29 @@ export async function startJobWithRows<R extends StartJobResult>(
     return job;
 }
 
+/** What a request took from its grant's value budget, so `runSubmission` can give it back when the request started no job. */
+const takenValueBudget = new WeakMap<object, Array<() => Promise<void>>>();
+
 /** A grant's value budget takes the amount a call moves out. Calls without a grant have no budget. Returns false after rejecting. */
 export async function takeValueBudget(req: Request, db: DbRunner, tokenType: string, amount: bigint): Promise<boolean> {
     const grantId = req.agentGrant?.ID;
     if (!grantId) return true;
-    return consumeValueBudget(db, req, String(grantId), tokenType, amount);
+    if (!await consumeValueBudget(db, req, String(grantId), tokenType, amount)) return false;
+    if (amount > 0n) {
+        const giveBack = (): Promise<void> => refundValueBudget(db, String(grantId), tokenType.toLowerCase(), amount);
+        takenValueBudget.set(req, [...(takenValueBudget.get(req) ?? []), giveBack]);
+    }
+    return true;
+}
+
+/** A request with a used idempotency key returns the earlier job and starts none, so its take goes back. */
+async function returnValueBudgetOfRepeat(req: object, result: unknown): Promise<void> {
+    if ((result as { deduplicated?: unknown } | null | undefined)?.deduplicated !== true) return;
+    const taken = takenValueBudget.get(req) ?? [];
+    takenValueBudget.delete(req);
+    for (const giveBack of taken) {
+        await giveBack().catch((err: unknown) => cds.log('nightgate').warn(`value budget not returned for a repeated request: ${errorMessage(err)}`));
+    }
 }
 
 /** Runs `fn` in one transaction of `db`, commit on return and rollback on throw. A test double without `tx` runs it directly. */
@@ -346,7 +380,9 @@ export function setRetryAfter(req: ActionRequest<unknown, unknown>, seconds: num
 
 export async function runSubmission<T>(req: ActionRequest<unknown, unknown>, op: () => Promise<T>): Promise<T> {
     try {
-        return await op();
+        const result = await op();
+        await returnValueBudgetOfRepeat(req, result);
+        return result;
     } catch (err) {
         if (isNightgateError(err)) {
             if (err.code === 'JOB_ADMISSION_BUSY') setRetryAfter(req, (err as { retryAfterSeconds?: number }).retryAfterSeconds ?? 2);
@@ -357,16 +393,26 @@ export async function runSubmission<T>(req: ActionRequest<unknown, unknown>, op:
     }
 }
 
-/** True when the indexed transaction of a job's txHash landed with a success outcome. Matches the ledger hash or the extrinsic hash. */
+/** The indexed transaction a job's txHash names. A job holds the ledger hash, the extrinsic hash or one of the transaction's identifiers. */
+async function indexedTransactionId(db: DbRunner, bare: string): Promise<string | undefined> {
+    const byHash: Pick<Transaction, 'ID'> | undefined = await db.run(
+        SELECT.one.from(Transactions).columns('ID').where`ledgerTxHash = ${bare} or hash = ${bare}`
+    );
+    if (byHash?.ID) return byHash.ID;
+    const byIdentifier: { transaction_ID?: string | null } | undefined = await db.run(
+        SELECT.one.from(TransactionIdentifiers).columns('transaction_ID').where({ identifier: bare })
+    );
+    return byIdentifier?.transaction_ID ?? undefined;
+}
+
+/** True when the indexed transaction of a job's txHash landed with a success outcome. */
 export async function landedOnChain(db: DbRunner, txHash: string | null | undefined): Promise<boolean> {
     const bare = bareHex(txHash);
     if (!bare) return false;
-    const tx: Pick<Transaction, 'ID'> | undefined = await db.run(
-        SELECT.one.from(Transactions).columns('ID').where`ledgerTxHash = ${bare} or hash = ${bare}`
-    );
-    if (!tx?.ID) return false;
+    const transactionId = await indexedTransactionId(db, bare);
+    if (!transactionId) return false;
     const result: Pick<TransactionResult, 'status' | 'outcomeSource'> | undefined = await db.run(
-        SELECT.one.from(TransactionResults).columns('status', 'outcomeSource').where({ transaction_ID: tx.ID })
+        SELECT.one.from(TransactionResults).columns('status', 'outcomeSource').where({ transaction_ID: transactionId })
     );
     return result?.status === 'SUCCESS' && result?.outcomeSource === 'substrate-system-events';
 }

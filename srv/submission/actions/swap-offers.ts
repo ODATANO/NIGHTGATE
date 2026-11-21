@@ -162,12 +162,13 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         const load = async (now: Date): Promise<SwapOffer[]> => {
             const nowIso = now.toISOString();
             if (!wantTag) return (await db.run(offers(nowIso).limit(n)) as SwapOffer[] | undefined) ?? [];
-            // Tags are stored as JSON, so the query cannot filter them.
+            // Tags are stored as JSON text. The database keeps the rows whose text holds the quoted tag, the exact check follows per row.
             // Page through IDs and tags until enough offers match, then load only those offers.
+            const tagged = (): ReturnType<typeof offers> => offers(nowIso).where`contains(tags, ${JSON.stringify(wantTag)})`;
             const ids: string[] = [];
             const page = MAX_LIST_LIMIT * 4;
             for (let offset = 0; ids.length < n; offset += page) {
-                const heads = (await db.run(offers(nowIso).columns('ID', 'tags').limit(page, offset)) as Array<Pick<SwapOffer, 'ID' | 'tags'>> | undefined) ?? [];
+                const heads = (await db.run(tagged().columns('ID', 'tags').limit(page, offset)) as Array<Pick<SwapOffer, 'ID' | 'tags'>> | undefined) ?? [];
                 for (const h of heads) {
                     if (parseJsonStringList(h.tags).includes(wantTag)) ids.push(h.ID);
                     if (ids.length >= n) break;

@@ -7,7 +7,7 @@
  * the outage case is driven by publishing the offline state.
  */
 import cds from '@sap/cds';
-import { __resetRuntimeStateForTests } from '../../srv/utils/runtime-state';
+import { __resetRuntimeStateForTests, publishRuntimeState, readRuntimeState, noteCrawlerRunning } from '../../srv/utils/runtime-state';
 import { isRuntimeWriteEvent, runtimeUnavailableReason, RUNTIME_FREE_ACTIONS } from '../../srv/utils/runtime-gate';
 
 (cds as any).env.requires.auth = {
@@ -79,6 +79,27 @@ describe('isRuntimeWriteEvent', () => {
         expect(isRuntimeWriteEvent(srv, 'getWalletBalance')).toBe(false);
         expect(isRuntimeWriteEvent(srv, 'prepareDocumentProof')).toBe(false);
         for (const action of RUNTIME_FREE_ACTIONS) expect(isRuntimeWriteEvent(srv, action)).toBe(false);
+        // The whole grant administration only uses the database, so it works while the runtime starts.
+        for (const action of ['createAgentGrant', 'createAgentGrants', 'updateAgentGrant', 'rotateAgentGrantToken', 'revokeAgentGrant']) {
+            expect(RUNTIME_FREE_ACTIONS.has(action)).toBe(true);
+        }
+    });
+});
+
+describe('an offline state caused by the crawler alone', () => {
+    test('ends once the crawler runs, so write actions are served again', () => {
+        publishRuntimeState({ initialized: true, mode: 'offline', lastError: 'node unreachable', crawlerOnly: true });
+        expect(runtimeUnavailableReason()).toMatch(/offline/);
+        noteCrawlerRunning();
+        expect(readRuntimeState()).toEqual({ initialized: true, mode: 'active' });
+        expect(runtimeUnavailableReason()).toBeNull();
+    });
+
+    test('a failed submission start stays offline when the crawler starts', () => {
+        publishRuntimeState({ initialized: true, mode: 'offline', lastError: 'submission pipeline did not start' });
+        noteCrawlerRunning();
+        expect(readRuntimeState().mode).toBe('offline');
+        expect(runtimeUnavailableReason()).toMatch(/offline/);
     });
 });
 

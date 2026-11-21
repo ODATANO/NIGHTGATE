@@ -82,7 +82,11 @@ vi.mock('../../srv/submission/swap-offers', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
     expireSwapOffers: vi.fn(async () => 0),
     loadSwapOffer: vi.fn(async (_db: any, id: string) => (board.row && board.row.ID === id ? board.row : null)),
-    closeSwapOffer: vi.fn(async (_db: any, id: string, status: string, txHash: string | null) => { board.closed.push({ id, status, txHash }); return true; }),
+    fillSwapOffer: vi.fn(async (_db: any, id: string, txHash: string | null) => { board.closed.push({ id, status: 'filled', txHash }); return true; }),
+    requireOpenSwapOffer: vi.fn(async (_runner: any, id: string) => {
+        const status = board.row && board.row.ID === id ? board.row.status : 'unknown';
+        if (status !== 'open') throw Object.assign(new Error(`swap offer ${id} is ${status}, so the swap was not sent`), { code: 'GONE' });
+    }),
     closeSwapOffersByNullifiers: vi.fn(async (_db: any, nullifiers: string[], txHash: string | null) => { board.byNullifier.push({ nullifiers, txHash }); return []; })
 }));
 vi.mock('../../srv/submission/learned-token-types', () => ({
@@ -773,6 +777,19 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
         expect(coords.deployReservation).toEqual({ grantId: 'grant-1', count: 1 });
     });
 
+    // The deploy is on chain. Closing its attempt row or building again would lose it or pay twice.
+    test('a failure of the bookkeeping after a landed deploy is not handled as a failed attempt', async () => {
+        setup();
+        const proc = processors.get('sponsorUnboundTransaction')!;
+        const worker = vi.fn(withDeployIntent(1));
+        unboundWorkerImpl.fn = worker;
+        grantBudget.record.mockRejectedValueOnce(new Error('database is locked'));
+        await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any))
+            .rejects.toThrow(/bookkeeping after a landed transaction failed: database is locked/);
+        expect(worker).toHaveBeenCalledTimes(1);
+        expect(JSON.stringify(dbWrites.filter((q: any) => q?.UPDATE))).not.toMatch(/REJECTED|REBUILT/);
+    });
+
     test('the reconciliation finalizer records the deployed address from the attempt row (no process memory needed)', async () => {
         setup();
         const finalize = finalizers.get('sponsorUnboundTransaction')!;
@@ -1068,6 +1085,7 @@ describe('sponsorSwap', () => {
     test('a landed swap closes the offer it filled and the halves sharing its nullifiers', async () => {
         setup();
         board.closed.length = 0; board.byNullifier.length = 0;
+        board.row = { ID: 'offer-1', status: 'open' };
         const N = ['11'.repeat(32), '22'.repeat(32)];
         unboundWorkerImpl.fn = async () => ({ txHash: '00ee', circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms, nullifiers: N });
         const proc = processors.get('sponsorSwap')!;
@@ -1080,6 +1098,40 @@ describe('sponsorSwap', () => {
         await intentCall('00ee', { circuits: ['<swap>'], nullifiers: N });
         const row = dbWrites.find((q: any) => q?.INSERT)?.INSERT?.entries?.[0];
         expect(JSON.parse(row.submitIntentData)).toMatchObject({ nullifiers: N, offerId: 'offer-1' });
+        board.row = null;
+    });
+
+    test('a take waiting in the queue is stopped when its offer was retired: nothing is proven, nothing is sent', async () => {
+        setup();
+        board.row = { ID: 'offer-1', status: 'retired' };
+        const before = unboundWorkerCalls.length;
+        const proc = processors.get('sponsorSwap')!;
+        await expect(proc({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B, offerId: 'offer-1' }, sponsorSessionId: 'sponsor-1' }, { ID: 'j-r', kind: 'sponsorSwap', requestedBy: 'u' } as any))
+            .rejects.toThrow('swap offer offer-1 is retired, so the swap was not sent');
+        expect(unboundWorkerCalls).toHaveLength(before);
+        board.row = null;
+    });
+
+    test('an offer retired while the swap is being built stops it at the last moment before the send', async () => {
+        setup();
+        board.row = { ID: 'offer-1', status: 'open' };
+        const proc = processors.get('sponsorSwap')!;
+        // The worker asks to send. The poster retired in the meantime, so the server refuses and no attempt is recorded.
+        const worker = unboundWorkerImpl.fn;
+        unboundWorkerImpl.fn = async () => {
+            board.row = { ID: 'offer-1', status: 'retired' };
+            dbWrites.length = 0;
+            await unboundIntentHooks.at(-1)('00ff', { circuits: ['<swap>'] });
+            return { txHash: '00ff', circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms };
+        };
+        try {
+            await expect(proc({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B, offerId: 'offer-1' }, sponsorSessionId: 'sponsor-1' }, { ID: 'j-l', kind: 'sponsorSwap', requestedBy: 'u' } as any))
+                .rejects.toThrow('swap offer offer-1 is retired, so the swap was not sent');
+            expect(dbWrites.some((q: any) => q?.INSERT)).toBe(false);
+        } finally {
+            unboundWorkerImpl.fn = worker;
+            board.row = null;
+        }
     });
 
     test('the executor hands the worker the halves under the policy in force when the job runs', async () => {

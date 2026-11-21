@@ -28,10 +28,15 @@ let defaultCodec: Promise<UnprovenTxCodec> | undefined;
 /** The codec for ledger 9 handles. Loaded on first use, because both packages are ESM only. */
 export function unprovenTxCodec(): Promise<UnprovenTxCodec> {
     if (codecOverride) return Promise.resolve(codecOverride);
-    defaultCodec ??= Promise.all([import('@midnightntwrk/ledger-v9'), import('@midnight-ntwrk/midnight-js-types')]).then(([ledger, types]) => ({
-        open: (handle) => handle.deserialize({ v9: ledger.Transaction }),
-        seal: (tx) => types.LedgerTransaction.seal('v9', 'Unproven', tx)
-    }));
+    if (!defaultCodec) {
+        const loading: Promise<UnprovenTxCodec> = Promise.all([import('@midnightntwrk/ledger-v9'), import('@midnight-ntwrk/midnight-js-types')]).then(([ledger, types]) => ({
+            open: (handle) => handle.deserialize({ v9: ledger.Transaction }),
+            seal: (tx) => types.LedgerTransaction.seal('v9', 'Unproven', tx)
+        }));
+        defaultCodec = loading;
+        // A failed load is not kept: in a browser one lost chunk would otherwise break every batch until a reload.
+        loading.catch(() => { if (defaultCodec === loading) defaultCodec = undefined; });
+    }
     return defaultCodec;
 }
 

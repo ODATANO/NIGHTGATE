@@ -261,6 +261,12 @@ describe('contract events drive ContractActions and the transaction type', () =>
         expect(actions[0].address).toBeNull();
         expect(await db.run(cds.ql.SELECT.from(TX_RESULTS))).toHaveLength(0);
     });
+
+    it('gives a failed extrinsic no contract action: it has events, and they name no contract', async () => {
+        await processBlock({ hash: '0xc4', height: 33, events: new Map([[0, events({ outcome: 'FAILURE', applied: false })]]) });
+        expect(await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS))).toHaveLength(0);
+        expect((await db.run(cds.ql.SELECT.from(TX_RESULTS))).map((r: any) => r.status)).toEqual(['FAILURE']);
+    });
 });
 
 describe('transaction results', () => {

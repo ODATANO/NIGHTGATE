@@ -40,7 +40,7 @@ export { holderClaimKey, HOLDER_REGISTRY_CIRCUITS } from './holder.mjs';
 export { apiPublicDataProvider, apiClientFor, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
 import { apiPublicDataProvider, apiClientFor, assertIndexerAnswers, buildOnlySubmissionService, gatewayIndexerUrls } from './api-provider.mjs';
 import { decodeOffer } from './swap.mjs';
-import { sealTx, openTx, shieldedKeysByEpoch, syncedAtLedger9 } from './wallet-tx.mjs';
+import { sealTx, openTx, shieldedKeysByEpoch, startOrStop, syncedAtLedger9 } from './wallet-tx.mjs';
 export { sealTx, openTx };
 import { createProverMaterialProvider, defaultProverMaterialDir, writeAtomically, sha256Hex } from './prover-material.mjs';
 export { createProverMaterialProvider, defaultProverMaterialDir };
@@ -758,27 +758,8 @@ export async function createTxBuilder(opts) {
         costParameters: { additionalFeeOverhead: 1n, feeBlocksMargin: 5 }
     });
     const configurationOf = (wallet) => walletConfiguration(wallet, synced, configuration, abstractions.ProtocolVersion.V9NativeForkVersion);
-    const facade = await facadeSdk.WalletFacade.init({
-        configuration,
-        // Without a node the SDK's default service would dial the relay at init.
-        ...(nodeUrl ? {} : { submissionService: buildOnlySubmissionService() }),
-        shielded: () => (shared ? sharedShieldedWallet(shared)
-            : saved?.shielded ? shielded.ShieldedWallet(configurationOf('shielded')).restore(saved.shielded)
-                : shielded.ShieldedWallet(configurationOf('shielded')).startWithSeed(walletSeeds.shielded)),
-        unshielded: () => (saved?.unshielded
-            ? unshielded.UnshieldedWallet(configurationOf('unshielded')).restore(saved.unshielded)
-            : unshielded.UnshieldedWallet(configurationOf('unshielded')).startWithPublicKey(unshielded.PublicKey.fromKeyStore(keystore))),
-        dust: () => (saved?.dust
-            ? dust.DustWallet(configurationOf('dust')).restore(saved.dust)
-            : dust.DustWallet(configurationOf('dust')).startWithSeed(walletSeeds.dust, ledger.LedgerParameters.initialParameters().dust))
-    });
-    // Syncing a wallet reads the whole chain and keeps this thread busy; a call that moves no
-    // tokens needs none. A sponsor pays the fee, so 'shielded' and 'coins' leave the dust wallet out.
-    const stopWatching = onProgress ? watchSync(facade, synced, onProgress) : () => {};
-    if (syncMode === 'all') await facade.start(walletSeeds);
-    else if (syncMode === 'coins') await Promise.all([facade.shielded.start(await shieldedKeysByEpoch(roleSeeds.zswap)), facade.unshielded.start()]);
-    else if (syncMode === 'shielded') await facade.shielded.start(await shieldedKeysByEpoch(roleSeeds.zswap));
 
+    // Everything that can fail without the wallet comes before it: the caller gets no builder to close a started wallet with.
     const CompiledContract = compactJs.CompiledContract ?? compactJs.effect?.CompiledContract;
     if (!CompiledContract?.make) throw new Error('compact-js: CompiledContract.make not found');
     // The ledger 8 compiler writes no artifact manifest. The SDK still compares each verifier key with the chain's.
@@ -815,6 +796,35 @@ export async function createTxBuilder(opts) {
         ? apiPublicDataProvider({ client: apiClient, mjTypes, mjUtils, mjProtocol, protocolVersion: Number(configuration.forks?.v9 ?? abstractions.ProtocolVersion.V9NativeForkVersion), ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
         : indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, sockets.WebSocket);
 
+    const facade = await facadeSdk.WalletFacade.init({
+        configuration,
+        // Without a node the SDK's default service would dial the relay at init.
+        ...(nodeUrl ? {} : { submissionService: buildOnlySubmissionService() }),
+        shielded: () => (shared ? sharedShieldedWallet(shared)
+            : saved?.shielded ? shielded.ShieldedWallet(configurationOf('shielded')).restore(saved.shielded)
+                : shielded.ShieldedWallet(configurationOf('shielded')).startWithSeed(walletSeeds.shielded)),
+        unshielded: () => (saved?.unshielded
+            ? unshielded.UnshieldedWallet(configurationOf('unshielded')).restore(saved.unshielded)
+            : unshielded.UnshieldedWallet(configurationOf('unshielded')).startWithPublicKey(unshielded.PublicKey.fromKeyStore(keystore))),
+        dust: () => (saved?.dust
+            ? dust.DustWallet(configurationOf('dust')).restore(saved.dust)
+            : dust.DustWallet(configurationOf('dust')).startWithSeed(walletSeeds.dust, ledger.LedgerParameters.initialParameters().dust))
+    });
+    // Syncing a wallet reads the whole chain and keeps this thread busy; a call that moves no
+    // tokens needs none. A sponsor pays the fee, so 'shielded' and 'coins' leave the dust wallet out.
+    const stopWatching = onProgress ? watchSync(facade, synced, onProgress) : () => {};
+    const stopAll = async () => {
+        stopWatching();
+        try { await facade.stop(); } catch { /* best effort */ }
+        sockets?.closeAll();
+    };
+    await startOrStop(async () => {
+        if (syncMode === 'all') await facade.start(walletSeeds);
+        else if (syncMode === 'coins') await Promise.all([facade.shielded.start(await shieldedKeysByEpoch(roleSeeds.zswap)), facade.unshielded.start()]);
+        else if (syncMode === 'shielded') await facade.shielded.start(await shieldedKeysByEpoch(roleSeeds.zswap));
+    }, stopAll);
+
+
     return {
         provingMode,
         /** Your attestation secret. Pass it to the prepare* helpers. */
@@ -830,10 +840,11 @@ export async function createTxBuilder(opts) {
             await Promise.all(synced.map(w => syncedAtLedger9(facade[w], configuration.forks)));
         },
 
-        /** Saves the wallet state. Pass it to `createTxBuilder({ walletState })` to skip a full sync next time. */
+        /** Saves the wallet state. Pass it to `createTxBuilder({ walletState })` to skip a full sync next time.
+         *  A shared shielded wallet is left out: its owner saves it. */
         async serializeWalletState() {
             const out = {};
-            for (const w of synced) out[w] = await facade[w].serializeState();
+            for (const w of ownWallets) out[w] = await facade[w].serializeState();
             return out;
         },
 
@@ -1014,9 +1025,7 @@ export async function createTxBuilder(opts) {
 
         /** Stops the wallet sync and closes the indexer connections. */
         async close() {
-            stopWatching();
-            try { await facade.stop(); } catch { /* best effort */ }
-            sockets?.closeAll();
+            await stopAll();
         }
     };
 }

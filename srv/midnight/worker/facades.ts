@@ -794,6 +794,9 @@ export function saveIntervalMs(): number {
 // dust state at a time and the helper thread checks one at a time.
 let saveLane: Promise<void> = Promise.resolve();
 
+/** How long one tick may hold the lane. A tick that hangs keeps running, but the other wallets get their saves. */
+const saveLaneHoldMs = (intervalMs: number): number => Math.max(5 * 60_000, 2 * intervalMs);
+
 export function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
     if (entry.saveTimer) return;
     let tickCount = 0;
@@ -807,9 +810,23 @@ export function startPeriodicSave(sessionId: string, entry: FacadeEntry): void {
         }
         entry.saveTickInFlight = true;
         const tick = tickCount;
-        saveLane = saveLane
-            .then(() => (facades.get(sessionId) === entry ? saveTick(sessionId, entry, tick) : undefined))
-            .finally(() => { entry.saveTickInFlight = false; });
+        saveLane = saveLane.then(() => {
+            if (facades.get(sessionId) !== entry) {
+                entry.saveTickInFlight = false;
+                return undefined;
+            }
+            // The wallet takes no new tick until this one settles, however long that is.
+            const run = saveTick(sessionId, entry, tick).catch(() => undefined).finally(() => { entry.saveTickInFlight = false; });
+            let held: ReturnType<typeof setTimeout>;
+            const released = new Promise<void>((resolve) => {
+                held = setTimeout(() => {
+                    log('warn', `save-tick #${tick} of ${sessionId.slice(0, 16)} still runs after ${Math.round(saveLaneHoldMs(intervalMs) / 1000)}s; the other wallets are saved meanwhile`);
+                    resolve();
+                }, saveLaneHoldMs(intervalMs));
+                held.unref?.();
+            });
+            return Promise.race([run.finally(() => clearTimeout(held)), released]);
+        });
     }, intervalMs);
     entry.saveTimer.unref();
 }
@@ -824,6 +841,9 @@ async function saveTick(sessionId: string, entry: FacadeEntry, tickCount: number
         const shieldedEpochAtCollect = entry.shieldedEpoch ?? 0;
         const { blobs, dustKey, dustCollapse } = await collectSerializedStates(entry.facade, entry);
         if (dustCollapse) parentPort?.postMessage({ kind: 'save-stats', sessionId, dust: dustCollapse });
+        if (dustCollapse?.verifyMs != null) entry.lastDustVerifyMs = dustCollapse.verifyMs;
+        // An unloaded wallet has made its final save. A push from this older collect would overwrite it.
+        if (facades.get(sessionId) !== entry) return;
         if ((entry.dustEpoch ?? 0) !== epochAtCollect && blobs.dust) {
             // The dust wallet was replaced meanwhile, so this blob may be the old one's. The replacement saved its own.
             delete blobs.dust;
@@ -865,9 +885,10 @@ export interface CollectedStates {
 }
 
 /** The last confirmed dust save, so an unchanged dust state is not serialized again. */
-export type SaveSkipContext = Pick<FacadeEntry, 'dustEpoch' | 'lastSavedDustKey'>;
+export type SaveSkipContext = Pick<FacadeEntry, 'dustEpoch' | 'lastSavedDustKey' | 'lastDustVerifyMs'>;
 
-export async function collectSerializedStates(facade: Pick<WalletFacade, 'shielded' | 'unshielded' | 'dust'>, skip?: SaveSkipContext): Promise<CollectedStates> {
+/** `deadline` is when the thread ends. A dust check that cannot finish by then is left out, and the last confirmed dust save stands. */
+export async function collectSerializedStates(facade: Pick<WalletFacade, 'shielded' | 'unshielded' | 'dust'>, skip?: SaveSkipContext, deadline?: number): Promise<CollectedStates> {
     const blobs: SerializedBlobs = {};
     const out: CollectedStates = { blobs };
     const tryOne = async (key: 'shielded' | 'unshielded' | 'dust') => {
@@ -876,7 +897,7 @@ export async function collectSerializedStates(facade: Pick<WalletFacade, 'shield
             if (key === 'dust' && sub?.state && configFlag('NIGHTGATE_DUST_SNAPSHOT_COLLAPSE')) {
                 const started = Date.now();
                 try {
-                    const collapsed = await collapsedDustSave(facade.dust, skip);
+                    const collapsed = await collapsedDustSave(facade.dust, skip, deadline);
                     out.dustCollapse = collapsed.sample;
                     if (collapsed.skipped) return;
                     blobs.dust = collapsed.blob;
@@ -911,23 +932,33 @@ type CollapsedDustSave =
     | { skipped: true; sample: DustCollapseSample }
     | { skipped: false; blob: string; dustKey: string | null; sample: DustCollapseSample };
 
+/** Time a stop keeps after the dust check, for the push and its confirmation. */
+const STOP_PUSH_RESERVE_MS = 3_000;
+
 /** Like `serializeState()` with the dust tree shrunk. Skips an unchanged state. Saves the full blob if the restore check fails or times out. */
-async function collapsedDustSave(dust: WalletFacade['dust'], skip?: SaveSkipContext): Promise<CollapsedDustSave> {
+async function collapsedDustSave(dust: WalletFacade['dust'], skip?: SaveSkipContext, deadline?: number): Promise<CollapsedDustSave> {
     const started = Date.now();
+    const skipped = (): CollapsedDustSave => ({ skipped: true, sample: { outcome: 'skipped', ms: Date.now() - started, verifyMs: null, fullBytes: null, bytes: null, at: new Date().toISOString() } });
     const walletState = await firstEmission<DustWalletState>(dust.state, 30_000, 'dust state');
     const dustKey = dustSaveKey(walletState);
     const last = skip?.lastSavedDustKey;
     if (dustKey !== null && last && last.key === dustKey && last.epoch === (skip?.dustEpoch ?? 0)) {
         log('debug', `dust snapshot unchanged (key ${dustKey}), collapse skipped`);
-        return { skipped: true, sample: { outcome: 'skipped', ms: Date.now() - started, verifyMs: null, fullBytes: null, bytes: null, at: new Date().toISOString() } };
+        return skipped();
     }
+    // A full blob takes minutes to restore, so a stop that cannot fit the check saves no dust part at all.
+    const checkBy = deadline === undefined ? undefined : deadline - STOP_PUSH_RESERVE_MS;
+    if (checkBy !== undefined && Date.now() + (skip?.lastDustVerifyMs ?? 0) >= checkBy) return skipped();
     const core = (await loadDustV2Sdk()).coreStateOf(walletState);
     if (core._tag === 'None') throw new Error('the dust state is not a ledger 9 state, so it is not collapsed');
     const collapsed = collapseDustState(walletState, core.value.state);
     const verifyStarted = Date.now();
     let verdict: { ok: true } | { ok: false; reason: string };
     try {
-        verdict = await verifyCollapsedDustInHelper(collapsed.bytes, collapsed.expect);
+        const check = verifyCollapsedDustInHelper(collapsed.bytes, collapsed.expect);
+        const inTime = checkBy === undefined ? await check : await Promise.race([check, sleep(Math.max(0, checkBy - Date.now()), null, { ref: false })]);
+        if (inTime === null) return skipped();
+        verdict = inTime;
     } catch (err) {
         verdict = { ok: false, reason: errorMessage(err) };
     }
@@ -1058,8 +1089,18 @@ export async function waitForSyncedState({ sessionId, timeoutMs, stallMs }: { se
     return { synced: true };
 }
 
-/** With `awaitSaveAck`, replies only after the final save was confirmed. */
-export async function evict({ sessionId, awaitSaveAck }: { sessionId: string; awaitSaveAck?: boolean }) {
+/** Time a stop keeps for the final save when a submit still holds the wallet's lock. */
+const STOP_SAVE_RESERVE_MS = 10_000;
+
+/** Whether the wallet's submit lock is free, waiting until `until` at most. */
+async function lockFreeBy(sessionId: string, until: number): Promise<boolean> {
+    const held = sessionChains.get(sessionId);
+    if (!held) return true;
+    return Promise.race([held.then(() => true, () => true), sleep(Math.max(0, until - Date.now()), false, { ref: false })]);
+}
+
+/** With `awaitSaveAck`, replies only after the final save was confirmed. `deadline` is when the thread ends, and every wait is cut to it. */
+export async function evict({ sessionId, awaitSaveAck, deadline }: { sessionId: string; awaitSaveAck?: boolean; deadline?: number }) {
     const entry = facades.get(sessionId);
     if (!entry) {
         if (!buildsInFlight.has(sessionId)) return { evicted: false };
@@ -1072,24 +1113,33 @@ export async function evict({ sessionId, awaitSaveAck }: { sessionId: string; aw
     syncProgress.delete(sessionId);
     if (entry.saveTimer) clearInterval(entry.saveTimer);
     if (entry.progressTimer) clearInterval(entry.progressTimer);
-    // A periodic save already running must land before the final one, or it would overwrite it.
-    // The wait is bounded, because a serialize can hang.
-    await withTimeout(saveLane, restoreSaveAckTimeoutMs()).catch(() => undefined);
-    // Runs under the submit lock so the keys are not wiped during a running submit.
-    await withSessionLocks([sessionId], async () => {
-        // Wait for the confirmation before replying, because after the reply the main thread
-        // no longer stores saves for this session. On timeout the unload continues.
+    const ackWaitMs = (): number => (deadline === undefined ? restoreSaveAckTimeoutMs() : Math.max(1, Math.min(restoreSaveAckTimeoutMs(), deadline - Date.now())));
+    // Wait for the confirmation before replying, because after the reply the main thread
+    // no longer stores saves for this session. On timeout the unload continues.
+    const finalSave = async (): Promise<void> => {
         try {
-            const { blobs, dustKey } = await collectSerializedStates(entry.facade, entry);
+            const { blobs, dustKey } = await collectSerializedStates(entry.facade, entry, deadline);
             const changed = diffAgainstConfirmed(entry, blobs);
             if (hasAnyBlob(changed)) {
-                if (awaitSaveAck) await pushStateSaveAcked(sessionId, entry, changed, restoreSaveAckTimeoutMs(), dustKey);
+                if (awaitSaveAck) await pushStateSaveAcked(sessionId, entry, changed, ackWaitMs(), dustKey);
                 else pushStateSave(sessionId, entry, changed, { dustKey });
             }
         } catch (err) {
             saved = false;
             log('warn', `evict final-save failed for ${sessionId.slice(0, 16)}: ${errorMessage(err)}`);
         }
+    };
+    if (deadline === undefined) {
+        // A periodic save already running lands first. The wait is bounded, because a serialize can hang.
+        await withTimeout(saveLane, restoreSaveAckTimeoutMs()).catch(() => undefined);
+    } else if (!(await lockFreeBy(sessionId, deadline - STOP_SAVE_RESERVE_MS))) {
+        // A submit still holds the lock and its keys. The wallet is saved like a periodic save, and the thread's end wipes it.
+        await finalSave();
+        return { evicted: true, saved };
+    }
+    // Runs under the submit lock so the keys are not wiped during a running submit.
+    await withSessionLocks([sessionId], async () => {
+        await finalSave();
         await zeroEntry(entry, sessionId);
     });
     return { evicted: true, saved };

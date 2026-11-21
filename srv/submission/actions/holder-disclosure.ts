@@ -132,12 +132,14 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
             const claimKey = holderClaimKey(claimSecret);
             const resolved = await contractResolver(HOLDER_REGISTRY_REF);
             const registries = [...new Set(live.map(g => String(g.registryAddress)))];
+            // Any caller may name a registry in a grant. One that cannot be read must not hide a holding on another.
+            let unreadable: unknown;
             for (const registryAddress of registries) {
                 const reading = await readHolderRegistrationInWorker({
                     contractAddress: registryAddress, tokenType, claimKey,
                     artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest,
                     contractProvidersConfig: contractProvidersConfigFromEnv(resolved.zkConfigPath)
-                });
+                }).catch((err: unknown) => { unreadable ??= err; return null; });
                 if (!reading?.registered) continue;
                 const grant = preferredGrant(live.filter(g => String(g.registryAddress) === registryAddress));
                 const content = grant.content ? decrypt(String(grant.content), getEncryptionKey(), contentBinding(String(grant.ID))) : null;
@@ -147,6 +149,8 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
                     expiresAt: grant.expiresAt ?? null
                 });
             }
+            // "Not a holder" is only true when every registry was read.
+            if (unreadable) throw unreadable;
             return claimAnswer({ entitled: false, reason: 'the claim key is not registered as a holder of this token type', payloadHash, tokenType, registries });
         });
     });

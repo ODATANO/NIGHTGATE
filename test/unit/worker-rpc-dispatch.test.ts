@@ -23,6 +23,7 @@ describe('createDispatcher', () => {
     const dispatch = createDispatcher({
         echo: async (args) => ({ got: args }),
         fail: async () => { throw new Error('outer', { cause: new Error('inner') }); },
+        uncloneable: async () => ({ callback: () => 1 }),
         coded: async () => { throw new NightgateError('NOT_FOUND', 'no such contract'); }
     }, warn);
 
@@ -44,6 +45,13 @@ describe('createDispatcher', () => {
             expect(reply.error.message).toContain('inner');
             expect(reply.error.causes).toEqual(['inner']);
         }
+    });
+
+    it('answers with an error when the result cannot be sent to the other thread, and keeps serving', async () => {
+        const reply = await call(dispatch, 'uncloneable', {});
+        expect(reply.ok).toBe(false);
+        if (!reply.ok) expect(reply.error.message).toMatch(/the result of 'uncloneable' could not be sent: .*could not be cloned/);
+        await expect(call(dispatch, 'echo', 1)).resolves.toEqual({ ok: true, result: { got: 1 } });
     });
 
     it('carries a coded error so the main thread rebuilds it', async () => {

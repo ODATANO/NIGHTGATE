@@ -100,6 +100,23 @@ describe('holder disclosure over HTTP', () => {
         expect((await post('claimDisclosure', { payloadHash: PAYLOAD, tokenType: T, claimSecret: 'short' }, asX)).status).toBe(400);
     });
 
+    it('a registry that cannot be read does not hide a holding on another, and never turns into "not a holder"', async () => {
+        const FOREIGN = 'f0'.repeat(32);
+        const granted = await post('grantDisclosureToHolders', { payloadHash: PAYLOAD, tokenType: T, registryAddress: FOREIGN }, asX);
+        expect(granted.status).toBe(200);
+        readSpy.mockImplementation(async (q: any) => {
+            if (q.contractAddress === FOREIGN) throw new Error('indexer unreachable');
+            return { registered: q.claimKey === registryModule.holderClaimKey(SECRET), entry: '00'.repeat(32) };
+        });
+        const holder = await post('claimDisclosure', { payloadHash: PAYLOAD, tokenType: T, claimSecret: SECRET }, asX);
+        expect(holder.status).toBe(200);
+        expect(holder.data).toMatchObject({ entitled: true, registryAddress: REGISTRY });
+
+        const stranger = await post('claimDisclosure', { payloadHash: PAYLOAD, tokenType: T, claimSecret: '22'.repeat(32) }, asX);
+        expect(stranger.status).toBe(500);
+        expect((await post('revokeHolderDisclosure', { holderGrantId: granted.data.holderGrantId }, asX)).status).toBe(200);
+    });
+
     it('without a live indexer a claim is 503, not a false negative', async () => {
         liveSpy.mockReturnValue(false);
         expect((await post('claimDisclosure', { payloadHash: PAYLOAD, tokenType: T, claimSecret: SECRET }, asX)).status).toBe(503);

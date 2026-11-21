@@ -2,6 +2,7 @@ import cds from '@sap/cds';
 import {
     assertSupportedRuntimeTopology,
     getRuntimeTopology,
+    openAuthRefusal,
     UnsupportedRuntimeTopologyError
 } from '../../srv/utils/runtime-topology';
 
@@ -102,6 +103,36 @@ describe('runtime topology guard', () => {
         const topology = getRuntimeTopology({ replicaCount: 1 });
         expect(topology.valid).toBe(true);
         expect(topology.warnings.join(' ')).toMatch(/NIGHTGATE_ALLOW_UNAUTHENTICATED=true is active/);
+    });
+
+    it('treats mocked auth like dummy: refused in production, allowed only through the override', () => {
+        process.env.NODE_ENV = 'production';
+        (cds.env as any).requires.db = { kind: 'postgres' };
+        (cds.env as any).requires.auth = { kind: 'mocked' };
+        const refused = getRuntimeTopology({ replicaCount: 1 });
+        expect(refused.valid).toBe(false);
+        expect(refused.errors.join(' ')).toMatch(/'mocked'.*refused in production/);
+
+        process.env.NIGHTGATE_ALLOW_UNAUTHENTICATED = 'true';
+        const allowed = getRuntimeTopology({ replicaCount: 1 });
+        expect(allowed.valid).toBe(true);
+        expect(allowed.warnings.join(' ')).toMatch(/'mocked'.*NIGHTGATE_ALLOW_UNAUTHENTICATED=true is active/);
+    });
+
+    it('names the reason a server must not listen only for an open auth kind in production without the override', () => {
+        (cds.env as any).requires.auth = { kind: 'dummy' };
+        expect(openAuthRefusal()).toBeNull();
+
+        process.env.NODE_ENV = 'production';
+        expect(openAuthRefusal()).toMatch(/'dummy' serves every request unauthenticated and privileged.*refused in production/);
+        (cds.env as any).requires.auth = { kind: 'mocked' };
+        expect(openAuthRefusal()).toMatch(/'mocked'/);
+        (cds.env as any).requires.auth = { kind: 'basic' };
+        expect(openAuthRefusal()).toBeNull();
+
+        (cds.env as any).requires.auth = { kind: 'dummy' };
+        process.env.NIGHTGATE_ALLOW_UNAUTHENTICATED = 'true';
+        expect(openAuthRefusal()).toBeNull();
     });
 
     it('leaves dummy auth alone outside production', () => {

@@ -76,6 +76,13 @@ describe('connectContract', () => {
         await expect(connect({ ttlMinutes: 0 })).rejects.toThrow(/ttlMinutes must be a positive whole number/);
     });
 
+    it('refuses at once when nothing can prove, and names both ways out', async () => {
+        // No proof server named, and a wallet that reports none and does not prove itself.
+        const mute = connector({ getConfiguration: async () => ({ indexerUri: 'http://idx', indexerWsUri: 'ws://idx', substrateNodeUri: 'ws://node', networkId: 'preprod' }) });
+        await expect(connect({ connector: mute })).rejects.toThrow(/nothing can prove for this contract\. Pass proofServerUrl, or proving: 'wallet'/);
+        expect(sdk.findDeployedContract).not.toHaveBeenCalled();
+    });
+
     it('fetches the manifest from manifestUrl and reports network and proving', async () => {
         const fetchFn = vi.fn(async () => ({ ok: true, status: 200, json: async () => MANIFEST }));
         const counter = await connect({ manifest: undefined, manifestUrl: 'http://api/contract-manifest', fetchFn });

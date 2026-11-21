@@ -11,6 +11,7 @@
  * don't know about the worker at all.
  */
 
+import { PLATFORM_POOL_SENTINEL } from '../../srv/submission/sponsor-pool';
 import { resolveContractPackage } from '@odatano/contract-kit/node';
 import type { Mock } from 'vitest';
 // Handlers wrap the submitter call in startJob and return `{ jobId, status }`
@@ -325,6 +326,7 @@ describe('submitContractCallBatch: argument validation', () => {
         [{ merkleProof: 'nope' }, /calls\[0\]\.merkleProof must be an object/],
         [{ merkleProof: { fieldValue: '4.2', siblings: SIBS4, dirs: [true, false, true, false] } }, /merkleProof\.fieldValue must be an integer/],
         [{ merkleProof: { fieldValue: '-1', siblings: SIBS4, dirs: [true, false, true, false] } }, /merkleProof\.fieldValue must be a non-negative integer/],
+        [{ merkleProof: { fieldValue: (2n ** 64n).toString(), siblings: SIBS4, dirs: [true, false, true, false] } }, /merkleProof\.fieldValue exceeds Uint<64>/],
         [{ merkleProof: { fieldValue: '1', siblings: SIBS4.slice(0, 2), dirs: [true, false, true, false] } }, /merkleProof\.siblings must be an array of 4 hashes/],
         [{ merkleProof: { fieldValue: '1', siblings: [...SIBS4.slice(0, 3), 'short'], dirs: [true, false, true, false] } }, /merkleProof\.siblings entries must be 64 hex/],
         [{ merkleProof: { fieldValue: '1', siblings: SIBS4, dirs: [true] } }, /merkleProof\.dirs must be an array of 4 booleans/],
@@ -424,23 +426,63 @@ describe('mintFactoryToken', () => {
         expect(JSON.stringify(call.request)).not.toMatch(/issuerSecret/);
     });
 
-    test('a token caller without sessionId mints from the pool wallet without owning it, but never names a pool wallet itself', async () => {
+    test('the pool never issues a token: a pool grant is refused, and no session is taken from the pool', async () => {
         const { srv, tokenFactory } = setup();
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
         try {
-            const viaGrant = makeReq({ ...valid, sessionId: undefined });
-            // No grant ID, so the value budget that needs the real job store is not touched here.
-            (viaGrant as any).agentGrant = { sponsorSessionId: null };
-            await srv.handlers['mintFactoryToken'](viaGrant);
-            expect(viaGrant.reject).not.toHaveBeenCalled();
-            expect(tokenFactory.issuerKeyForSession).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'pool-1', expectedUserId: undefined }));
+            // As the grant hook leaves it: the grant's session filled in, the pool placeholder as the sponsor.
+            const poolGrant = makeReq({ ...valid, sponsorSessionId: PLATFORM_POOL_SENTINEL });
+            (poolGrant as any).agentGrant = { sponsorSessionId: PLATFORM_POOL_SENTINEL };
+            await srv.handlers['mintFactoryToken'](poolGrant);
+            expect(poolGrant.reject).toHaveBeenCalledWith(403, expect.stringMatching(/the pool pays fees and never issues a token\. Build the mint with @odatano\/nightgate-tx/));
 
-            const named = makeReq({ ...valid, sessionId: 'pool-1' });
-            await srv.handlers['mintFactoryToken'](named);
-            expect(tokenFactory.issuerKeyForSession).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'pool-1', expectedUserId: 'test-user' }));
+            // Without a session there is none to sign with. The pool is not asked.
+            const sessionless = makeReq({ ...valid, sessionId: undefined });
+            (sessionless as any).agentGrant = { sponsorSessionId: null };
+            await srv.handlers['mintFactoryToken'](sessionless);
+            expect(sessionless.reject).toHaveBeenCalledWith(400, 'sessionId is required');
+            expect(tokenFactory.issuerKeyForSession).not.toHaveBeenCalled();
         } finally {
             delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
         }
+    });
+
+    test('a fee sponsor wallet is never the wallet an action acts as, for its owner too and for a job that is already queued', async () => {
+        const walletMaterialFactory = vi.fn(async () => ({
+            accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' },
+            ensureFacade: vi.fn(async () => undefined)
+        }));
+        const { srv, tokenFactory } = setup({ walletMaterialFactory });
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        try {
+            const asSponsor = makeReq({ ...valid, sessionId: 'pool-2' });
+            await srv.handlers['mintFactoryToken'](asSponsor);
+            expect(asSponsor.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 403, message: expect.stringMatching(/is a fee sponsor: it pays fees and does nothing else/) }));
+            expect(walletMaterialFactory).not.toHaveBeenCalled();
+            expect(tokenFactory.issuerKeyForSession).not.toHaveBeenCalled();
+
+            // A job that was queued while the wallet was no sponsor yet is refused when it runs.
+            const queued = registeredProcessors.get(`mintFactoryToken\0${1}`)!;
+            const command = {
+                op: 'call', contractAddress: FACTORY, circuit: 'mint', compiledArtifactRef: 'token-factory',
+                args: [{ $bytes: '00'.repeat(32) }, { $uint: '1' }, { bytes: { $bytes: RECIPIENT } }],
+                mintedTokenType: TOKEN.tokenType, artifactDigest: getArtifactGenerationDigest('token-factory')
+            };
+            await expect(queued(command, { ID: 'job-s', kind: 'mintFactoryToken', sessionId: 'pool-1', requestedBy: 'test-user', commandVersion: 1, command: JSON.stringify(command) }))
+                .rejects.toThrow(/is a fee sponsor: it pays fees and does nothing else/);
+            expect(walletMaterialFactory).not.toHaveBeenCalled();
+        } finally {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        }
+    });
+
+    test('a grant on a wallet of its own mints as that wallet, whoever pays the fee', async () => {
+        const { srv, tokenFactory } = setup();
+        const own = makeReq({ ...valid });
+        (own as any).agentGrant = { sponsorSessionId: null };
+        await srv.handlers['mintFactoryToken'](own);
+        expect(own.reject).not.toHaveBeenCalled();
+        expect(tokenFactory.issuerKeyForSession).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'mint-f1', expectedUserId: 'test-user' }));
     });
 
     test('the executor records the landed type as learned and on the grant, and returns it with the call result', async () => {
@@ -2032,8 +2074,8 @@ describe('arg-coercion: loadCircuitArgTypes (real attestation-vault artifact)', 
         expect(types?.[2].maxval).toBe(255);
     });
 
-    test('unknown circuit → undefined', () => {
-        expect(loadCircuitArgTypes(VAULT_ZK, 'noSuchCircuit')).toBeUndefined();
+    test('unknown circuit is refused and the message names the real ones', () => {
+        expect(() => loadCircuitArgTypes(VAULT_ZK, 'noSuchCircuit')).toThrow(/"noSuchCircuit" is not a circuit of this contract; it has: .*\battest\b/);
     });
 
     test('missing contract-info.json → undefined (no throw)', () => {
@@ -2241,6 +2283,36 @@ describe('issueFieldPredicateAttestation', () => {
         } finally {
             if (prev === undefined) delete process.env.NIGHTGATE_NETWORK;
             else process.env.NIGHTGATE_NETWORK = prev;
+        }
+    });
+
+    // A parent that runs a second time must find its step by the same command. A default expiry computed per run would differ.
+    test('without validUntil the command carries a fixed expiry, so a second run builds the same steps', async () => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        try {
+            vi.setSystemTime(new Date('2026-11-20T12:00:00Z'));
+            const { srv } = setupHandlersWithDb({ submitterFactory: () => makeSuccessfulSubmitter() });
+            await srv.handlers['issueFieldPredicateAttestation'](makeReq(VALID_ARGS()));
+            const started = mockStartJob.mock.calls.at(-1)?.[0];
+            const expected = Math.floor(Date.parse('2026-11-20T12:00:00Z') / 1000) + 365 * 24 * 60 * 60;
+            expect(started.command.validUntil).toBe(expected);
+
+            const stepsOfRun = async () => {
+                childCommandLog.length = 0;
+                const processor = registeredProcessors.get(`issueFieldPredicateAttestation\0${started.commandVersion}`);
+                await processor!({ ...started.command, artifactDigest: getArtifactGenerationDigest('attestation-vault') }, {
+                    ID: 'job-rerun', kind: 'issueFieldPredicateAttestation', sessionId: started.sessionId, requestedBy: 'test-user', commandVersion: 1
+                } as any);
+                return childCommandLog.map(c => c.command);
+            };
+            const first = await stepsOfRun();
+            vi.setSystemTime(new Date('2026-11-20T13:00:00Z'));
+            const second = await stepsOfRun();
+            expect(first).toHaveLength(2);
+            expect(second).toEqual(first);
+            expect(first.at(-1).args.at(-1)).toBe(String(expected));
+        } finally {
+            vi.useRealTimers();
         }
     });
 
@@ -3253,6 +3325,31 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
             'proveDocumentComparison', 'proveDocumentComparison', 'proveDocumentComparison'
         ]);
         expect(batch.calls.map((c: any) => c.args[2])).toEqual([0n, 1n, 1n]);
+    });
+
+    test('a comparison that names the batch attester as attesterIdB equals one that leaves it out', async () => {
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS([integrityClaim, { ...integrityClaim, attesterIdB: ATTESTER_ID.toUpperCase() }]));
+        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.droppedDuplicates).toBe(1);
+        expect((submitter.callBatch as Mock).mock.calls[0][0].calls).toHaveLength(1);
+        // The row names the attester of document B, like the single actions do.
+        const row = (db.run as Mock).mock.calls[0][0].INSERT.entries[0];
+        expect(row).toMatchObject({ predicate: 'documentIntegrity', attesterIdB: ATTESTER_ID });
+    });
+
+    test('a comparison against another attester keeps that attester and stays a claim of its own', async () => {
+        const OTHER = 'c7'.repeat(32);
+        const submitter = makeSuccessfulSubmitter();
+        const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
+        const req = makeReq(VALID_ARGS([integrityClaim, { ...integrityClaim, attesterIdB: OTHER }]));
+        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(result.droppedDuplicates).toBe(0);
+        const rows = (db.run as Mock).mock.calls[0][0].INSERT.entries;
+        expect(rows.map((r: any) => r.attesterIdB)).toEqual([ATTESTER_ID, OTHER]);
     });
 });
 

@@ -24,7 +24,7 @@ npm ci
 npm run dev
 ```
 
-The crawler catches up from genesis on the first run and resumes afterwards. Once the log shows `Live subscription active`:
+The crawler catches up from block 1 on the first run and resumes afterwards. Block 0 has no events and is not indexed. Once the log shows `Live subscription active`:
 
 ```bash
 curl "http://localhost:4004/odata/v4/midnight-indexer/getSyncStatus()"

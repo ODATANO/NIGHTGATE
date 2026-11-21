@@ -6,7 +6,7 @@ import { Documents, DisclosureGrants, PendingSubmissions, type PendingSubmission
 import { parseSubmitIntent } from '../submit-intent';
 import { recordDeployedContracts } from '../../sessions/agent-grants';
 import { recordPlatformMint } from '../platform-mints';
-import { closeSwapOffer, closeSwapOffersByNullifiers } from '../swap-offers';
+import { fillSwapOffer, closeSwapOffersByNullifiers } from '../swap-offers';
 import { ContractCommandV1, ContractCommandV1WithProvenance } from '../actions/common';
 import type { SubmissionContext } from '../actions/context';
 import { errorMessage } from '../../utils/errors';
@@ -33,7 +33,7 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         // The swap is already on chain. A failed write to the offer board must not fail the job.
         afterCommit(async () => {
             try {
-                if (coordinates.offerId) await closeSwapOffer(db, String(coordinates.offerId), 'filled', evidence.txHash);
+                if (coordinates.offerId) await fillSwapOffer(db, String(coordinates.offerId), evidence.txHash);
                 if (nullifiers.length) await closeSwapOffersByNullifiers(db, nullifiers, evidence.txHash);
             } catch (e) {
                 cds.log('nightgate').warn(`swap offers of ${evidence.txHash} not closed: ${errorMessage(e)}`);

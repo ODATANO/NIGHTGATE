@@ -194,6 +194,17 @@ describe('getGlobalSponsorPolicy', () => {
         expect(getGlobalSponsorPolicy().allowedCircuits).toMatchObject([]);
     });
 
+    it('takes a contract address with 0x or capitals and lists it once in the ledger spelling', () => {
+        const bare = 'ab'.repeat(32);
+        process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS = `0x${bare.toUpperCase()}, ${bare}, 0X${bare}`;
+        expect(getGlobalSponsorPolicy().allowedContracts).toEqual([bare]);
+
+        const file = path.join(tmpDir, 'sponsor-policy-spelling.json');
+        fs.writeFileSync(file, JSON.stringify({ allowedContracts: [`0x${bare.toUpperCase()}`], allowedCircuits: [] }));
+        process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
+        expect(getGlobalSponsorPolicy().allowedContracts).toEqual([bare]);
+    });
+
     it('reads the file, and picks up an edit without a restart (mtime cache)', () => {
         const file = path.join(tmpDir, 'sponsor-policy.json');
         fs.writeFileSync(file, JSON.stringify({ allowedContracts: ['A'], allowedCircuits: ['attest'] }));

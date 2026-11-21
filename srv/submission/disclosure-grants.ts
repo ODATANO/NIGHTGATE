@@ -49,6 +49,9 @@ export function enumerateGrants(led: DisclosureLedger): DisclosureGrantRecord[] 
     return rows;
 }
 
+/** The circuit every vault lineage deploys and no other registered contract has. */
+const GRANT_ENTRY_POINT = 'grantDisclosure';
+
 export interface ReadDisclosureGrantsArgs extends IndexerEndpoints {
     contractAddress: string;
     /** Block height to read the state at. Without it the latest state is read. */
@@ -58,13 +61,15 @@ export interface ReadDisclosureGrantsArgs extends IndexerEndpoints {
     artifactDigest?: string;
 }
 
-/** The grants on chain, or null when the contract has no state. */
+/** The grants on chain, or null when the contract has no state or is not a vault. */
 export async function readDisclosureGrants(args: ReadDisclosureGrantsArgs): Promise<DisclosureGrantRecord[] | null> {
     const publicData = await buildPublicDataProvider(args);
     const artifact = await importArtifact(args.artifactPath, args.artifactDigest) as ContractArtifact<DisclosureLedger>;
     const at = args.atHeight === undefined || args.atHeight === null ? undefined : { type: 'blockHeight' as const, blockHeight: args.atHeight };
     const state = await queryLedger9ContractState(publicData, args.contractAddress.toLowerCase(), at);
     if (!state) return null;
+    // Walking the maps of another contract's state fails with an error the runtime does not name, so the kind is checked first.
+    if (state.operation(GRANT_ENTRY_POINT) === undefined) return null;
     return enumerateGrants(artifact.ledger(state.data));
 }
 

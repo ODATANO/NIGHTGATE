@@ -27,6 +27,7 @@ import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
 import { registerVerifyStateHandlers } from '../../srv/submission/verify-state';
 import { principalRateKey } from '../../srv/utils/rate-limiter';
 import { __resetConfigForTests } from '../../srv/utils/config';
+import { NightgateError } from '../../srv/utils/errors';
 import { PUBLIC_VERIFY_TRANSPORT_USER, AGENT_TOKEN_TRANSPORT_USER } from '../../srv/utils/agent-token-transport';
 
 function makeReq(data: Record<string, unknown> = {}, ip = '203.0.113.7', user: any = { id: PUBLIC_VERIFY_TRANSPORT_USER }) {
@@ -121,6 +122,36 @@ describe('registerVerifyStateHandlers: one implementation behind both services',
             expect(a).toEqual(b);
             expect(a).toEqual({ verified: true, attested: true, contentRootOk: false, schemaOk: false, attesterId: 'att' });
             expect(attestationStateReader).toHaveBeenCalledTimes(2);
+        } finally {
+            delete process.env.NIGHTGATE_INDEXER_HTTP_URL;
+            __resetConfigForTests();
+        }
+    });
+
+    test('an indexer failure answers 502 with Retry-After and its message, a ledger 8 state 409, anything else 500', async () => {
+        process.env.NIGHTGATE_INDEXER_HTTP_URL = 'http://indexer.local/api/v1/graphql';
+        __resetConfigForTests();
+        try {
+            const failing = vi.fn();
+            const { srv, handlers } = stubService();
+            registerVerifyStateHandlers(srv, { attestationStateReader: failing as any, contractResolver, gate: async () => true });
+
+            failing.mockRejectedValueOnce(new NightgateError('BAD_GATEWAY', 'indexer could not serve the state of contract aa: fetch failed'));
+            const down = makeReq(args);
+            await handlers.verifyAttestationState(down);
+            expect(down.reject).toHaveBeenCalledWith({ status: 502, code: 'BAD_GATEWAY', message: expect.stringContaining('indexer could not serve'), $sanitize: false });
+            expect(down.http.res.set).toHaveBeenCalledWith('Retry-After', '10');
+
+            failing.mockRejectedValueOnce(new NightgateError('CONFLICT', 'contract state written by ledger v8: this server reads ledger 9 states only'));
+            const old = makeReq(args);
+            await handlers.verifyAttestationState(old);
+            expect(old.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 409, code: 'CONFLICT', message: expect.stringContaining('ledger v8') }));
+            expect(old.http.res.set).not.toHaveBeenCalledWith('Retry-After', expect.anything());
+
+            failing.mockRejectedValueOnce(new Error('boom'));
+            const other = makeReq(args);
+            await handlers.verifyAttestationState(other);
+            expect(other.reject).toHaveBeenCalledWith(500, 'boom');
         } finally {
             delete process.env.NIGHTGATE_INDEXER_HTTP_URL;
             __resetConfigForTests();

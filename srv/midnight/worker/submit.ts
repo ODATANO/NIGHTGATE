@@ -8,12 +8,12 @@ import { classifySubmitFailure, isPreMempoolFailure } from '../submit-error-clas
 import { classificationHaystack, formatErrWithCauses, safeDeepInspect } from '../../utils/format-error';
 import { NightgateError, errorMessage } from '../../utils/errors';
 import { type MessagePort } from 'node:worker_threads';
-import { FacadeEntry, loadSdk, loadNodeClientSdk, log, loadLedger, replaceSubWallet } from './context';
+import { FacadeEntry, facades, loadSdk, loadNodeClientSdk, log, loadLedger, replaceSubWallet } from './context';
 import type { Bindingish, Proofish, Signaturish, Transaction } from '@midnightntwrk/ledger-v9';
 import { asRevertible, dustKeysByEpoch, openTx, sealTx, type FinalizedLedgerTx, type Revertible, type UnboundLedgerTx } from './wallet-tx';
 import type { BalancingRecipe } from '@midnightntwrk/wallet-sdk-facade';
 import { createPhasedSubmitService, createSdkNodeAdapter, submitPhaseOf, type PhasedSubmitService } from './phased-submit';
-import { BALANCE_SYNC_TIMEOUT_MS, pushStateSaveAcked, restoreSaveAckTimeoutMs, waitForGenuineSync } from './facades';
+import { BALANCE_SYNC_TIMEOUT_MS, getIndexerTip, pushStateSaveAcked, restoreSaveAckTimeoutMs, waitForGenuineSync, withSessionLocks } from './facades';
 import { indexerQuery } from '../../utils/indexer-graphql';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { withTimeout } from '../../utils/timeout';
@@ -112,6 +112,13 @@ export function isNothingSent(err: unknown): boolean {
     return false;
 }
 
+/** True when the failure proves the tx is in no block: nothing was sent, or the node refused the only send. */
+export function provesNotIncluded(err: unknown): boolean {
+    if (isNothingSent(err)) return true;
+    const { code } = classifySubmitFailure(err);
+    return code === 'pre-mempool-reject' || code === 'dust-race';
+}
+
 /** Saves the dust state before a build. If saving fails, only this tx goes without the protection. */
 export async function captureDustSnapshot(entry: FacadeEntry, site: string): Promise<void> {
     try {
@@ -208,6 +215,19 @@ export interface BoundSubmitIntent {
     ttl?: string;
 }
 
+/** The address of the contract this tx deploys, if it deploys one. A deploy action has an initial state and no entry point. */
+function deployedAddress(tx: FinalizedLedgerTx): string | undefined {
+    const intents = (tx as { intents?: ReadonlyMap<unknown, { actions?: unknown[] } | undefined> }).intents;
+    if (!intents || typeof intents.values !== 'function') return undefined;
+    for (const intent of intents.values()) {
+        for (const action of intent?.actions ?? []) {
+            const deploy = action as { address?: unknown; initialState?: unknown; entryPoint?: unknown } | null;
+            if (deploy?.initialState !== undefined && deploy.entryPoint === undefined && deploy.address) return String(deploy.address);
+        }
+    }
+    return undefined;
+}
+
 /** Restores the saved dust state only when the tx surely never reached the mempool, because a tx that may have reached it spent its fee. */
 export async function submitWithDustGuard(entry: FacadeEntry, tx: FinalizedLedgerTx, site: string, intent?: BoundSubmitIntent): Promise<string> {
     if (intent?.replyPort) {
@@ -215,7 +235,8 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: FinalizedLedge
             // A tx that was not announced could never be traced, so refuse to send it.
             await announceSubmitIntent(intent.replyPort, {
                 txHash: String(tx.identifiers().at(-1)),
-                contractAddress: intent.contractAddress, circuits: intent.circuits, note: intent.note, ttl: intent.ttl,
+                // A deploy learns its address from the tx. Without it a job settled later from the chain could not name its contract.
+                contractAddress: intent.contractAddress ?? deployedAddress(tx), circuits: intent.circuits, note: intent.note, ttl: intent.ttl,
                 segments: callSegments(tx)
             });
         } catch (e) {
@@ -364,15 +385,50 @@ interface TxBlockAnswer {
 const TX_BLOCK_QUERY = 'query($offset: TransactionOffset!) { transactions(offset: $offset) { block { height } ... on RegularTransaction { transactionResult { status segments { id success } } } } }';
 
 export async function indexerBlockOfIdentifier(indexerHttpUrl: string, identifier: string): Promise<{ height: string; status: string | null; failedSegments: number[] } | null> {
-    try {
-        const data = await indexerQuery<TxBlockAnswer | null>(indexerHttpUrl, TX_BLOCK_QUERY, { variables: { offset: { identifier } } });
-        const t = data?.transactions?.[0];
-        const h = t?.block?.height;
-        if (h == null) return null;
-        const res = t?.transactionResult;
-        const failed = Array.isArray(res?.segments) ? res.segments.filter((s) => s?.success === false).map((s) => Number(s.id)) : [];
-        return { height: String(h), status: res?.status ?? null, failedSegments: failed };
-    } catch { return null; }
+    try { return await readTxBlock(indexerHttpUrl, identifier); } catch { return null; }
+}
+
+/** Like `indexerBlockOfIdentifier`, but throws when the indexer gave no answer. Null then means the indexer does not have the tx. */
+async function readTxBlock(indexerHttpUrl: string, identifier: string): Promise<{ height: string; status: string | null; failedSegments: number[] } | null> {
+    const data = await indexerQuery<TxBlockAnswer | null>(indexerHttpUrl, TX_BLOCK_QUERY, { variables: { offset: { identifier } } });
+    const t = data?.transactions?.[0];
+    const h = t?.block?.height;
+    if (h == null) return null;
+    const res = t?.transactionResult;
+    const failed = Array.isArray(res?.segments) ? res.segments.filter((s) => s?.success === false).map((s) => Number(s.id)) : [];
+    return { height: String(h), status: res?.status ?? null, failedSegments: failed };
+}
+
+/** The latest expiry among the tx's intents. Past it the tx can no longer land. */
+function lastTtlOf(tx: FinalizedLedgerTx): Date | undefined {
+    let last: Date | undefined;
+    for (const intent of tx.intents?.values() ?? []) {
+        if (intent.ttl instanceof Date && (!last || intent.ttl > last)) last = intent.ttl;
+    }
+    return last;
+}
+
+let expiredRecheckMs = 30_000;
+/** Test only. */
+export const __expiredReleaseForTests = { setRecheckMs: (ms: number) => { expiredRecheckMs = ms; } };
+
+/** Frees the coins of a send with an unknown outcome once the chain is past the tx's expiry and the indexer does not have it. */
+function releaseWhenExpired(entry: FacadeEntry, tx: FinalizedLedgerTx, identifier: string, site: string): void {
+    const ttl = lastTtlOf(tx);
+    if (!ttl) return;
+    const arm = (ms: number): void => { setTimeout(() => { check().catch(() => arm(expiredRecheckMs)); }, ms).unref(); };
+    const check = async (): Promise<void> => {
+        if (facades.get(entry.sessionId) !== entry) return;
+        const tip = await getIndexerTip(entry.indexerHttpUrl);
+        if (tip.error || tip.timestampMs == null || tip.timestampMs <= ttl.getTime()) return arm(expiredRecheckMs);
+        // In a block: the sync settles its coins.
+        if (await readTxBlock(entry.indexerHttpUrl, identifier)) return;
+        await withSessionLocks([entry.sessionId], async () => {
+            if (facades.get(entry.sessionId) === entry) await revertRecipeBestEffort(entry, tx, `${site} expired`);
+        });
+        log('info', `${site}: ${identifier.slice(0, 16)} expired without landing, its reserved coins are free again`);
+    };
+    arm(Math.max(0, ttl.getTime() - Date.now()) + expiredRecheckMs);
 }
 
 /** The tx is in a block but its call did not apply, and the fee is spent. Named like the SDK's error, so both are handled the same way. */
@@ -473,7 +529,7 @@ export function isClosingSocketReject(err: unknown): boolean {
 }
 
 /** Sends a tx on its own node connection. A connection failure resends, a timeout looks it up on the indexer, a node rejection is never resent.
- *  `book` names a tx the facade balanced. Its coins stay booked until the sync sees the spend, and a failed send releases them. */
+ *  `book` names a tx the facade balanced. Its coins stay booked until the sync sees the spend or the tx has expired. */
 export async function submitOnDedicatedClient(entry: FacadeEntry, tx: FinalizedLedgerTx, site: string, opts: { book?: boolean } = {}): Promise<string> {
     await logTxCost(tx, site);
     const relayURL: URL = entry.walletConfiguration.relayURL;
@@ -545,8 +601,9 @@ export async function submitOnDedicatedClient(entry: FacadeEntry, tx: FinalizedL
             }
         }
     } catch (e) {
-        // Free the reserved coins, like the SDK does after a failed submit.
-        if (opts.book) await revertRecipeBestEffort(entry, tx, `${site} pending`);
+        // A tx that may still land keeps its coins, or the next build would offer them again.
+        if (opts.book && provesNotIncluded(e)) await revertRecipeBestEffort(entry, tx, `${site} pending`);
+        else if (opts.book && classifySubmitFailure(e).code !== 'landed-not-applied') releaseWhenExpired(entry, tx, identifier, site);
         throw e;
     }
 }
@@ -649,7 +706,8 @@ export function buildSponsoredWalletProvider(caller: FacadeEntry, sponsor: Facad
                 lastCallerFinalized = undefined;
                 return result;
             } catch (e) {
-                await revertRecipeBestEffort(caller, lastCallerFinalized ?? tx, 'sponsored-submit caller');
+                // Kept when the tx may still land. The caller's wallet then frees them itself once the tx has expired.
+                if (provesNotIncluded(e)) await revertRecipeBestEffort(caller, lastCallerFinalized ?? tx, 'sponsored-submit caller');
                 lastCallerFinalized = undefined;
                 throw e;
             }

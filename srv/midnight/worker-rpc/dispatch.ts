@@ -58,6 +58,10 @@ export function createDispatcher(handlers: WorkerRpcHandlers, log: (level: 'warn
         }
         try {
             port.postMessage(reply);
+        } catch (err) {
+            // A result that cannot be copied to the other thread. The caller gets that as its error, and the worker goes on.
+            const error: WorkerRpcErrorPayload = { name: errorName(err), message: `the result of '${method}' could not be sent: ${formatErrWithCauses(err)}`, causes: [] };
+            port.postMessage({ ok: false, error } satisfies WorkerRpcReply);
         } finally {
             port.close();
         }

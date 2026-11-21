@@ -5,7 +5,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.46.2}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.46.3}
     container_name: odatano-nightgate
     # Loopback only by default: basic auth is plain text without TLS, so put a
     # TLS reverse proxy in front. NIGHTGATE_BIND_ADDRESS=0.0.0.0 publishes it.
@@ -25,7 +25,7 @@ services:
       NIGHTGATE_HTTP_PASSWORD: "${NIGHTGATE_HTTP_PASSWORD:-}"   # refused by cds-config.mjs when empty
       NIGHTGATE_NETWORK: "${NIGHTGATE_NETWORK:-mainnet}"
       NIGHTGATE_CRAWLER_ENABLED: "${NIGHTGATE_CRAWLER_ENABLED:-false}"
-      # First height to index while the index is empty (unset = genesis) and the
+      # First height to index while the index is empty (unset = 2, block 1 is the anchor) and the
       # catch-up rate cap that keeps the crawler off the submission side's CPU.
       NIGHTGATE_CRAWLER_START_HEIGHT: "${NIGHTGATE_CRAWLER_START_HEIGHT:-}"
       NIGHTGATE_CRAWLER_MAX_BPS: "${NIGHTGATE_CRAWLER_MAX_BPS:-}"

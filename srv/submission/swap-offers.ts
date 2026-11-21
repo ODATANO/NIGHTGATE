@@ -7,7 +7,7 @@ import { SwapOffers, type SwapOffer } from '#cds-models/midnight';
 import { runWithoutAmbientTx } from './background-jobs';
 import { HEX64_RE } from '../utils/hex';
 import { parseJsonStringList } from '../utils/json-list';
-import { errorMessage } from '../utils/errors';
+import { NightgateError, errorMessage } from '../utils/errors';
 import type { DbRunner } from '../utils/db-types';
 
 const log = cds.log('nightgate:swap-offers');
@@ -41,6 +41,13 @@ export function isSwapOfferOpen(row: SwapOffer | null, now: Date = new Date()): 
     return !row.expiresAt || Date.parse(row.expiresAt) > now.getTime();
 }
 
+/** Throws unless the offer is open. A take is carried out only while its offer is open, so the poster can retire it until the swap is sent. */
+export async function requireOpenSwapOffer(runner: DbRunner, offerId: string): Promise<void> {
+    const row: SwapOffer | null = (await runner.run(SELECT.one.from(SwapOffers).where({ ID: offerId }))) ?? null;
+    if (isSwapOfferOpen(row)) return;
+    throw new NightgateError('GONE', `swap offer ${offerId} is ${row ? effectiveSwapOfferStatus(row) : 'unknown'}, so the swap was not sent`);
+}
+
 /** The hash a directed offer stores: sha256 of the secret's UTF-8 text, as hex. */
 export function hashTakerSecret(secret: string): string {
     return crypto.createHash('sha256').update(secret, 'utf8').digest('hex');
@@ -55,14 +62,23 @@ export function takerSecretMatches(row: Pick<SwapOffer, 'takerSecretHash'>, secr
     return given.length === stored.length && crypto.timingSafeEqual(given, stored);
 }
 
-/** Close one offer. Does nothing if it is no longer open. */
-export async function closeSwapOffer(db: DbRunner, offerId: string, status: Exclude<SwapOfferStatus, 'open'>, txHash?: string | null): Promise<boolean> {
+async function moveSwapOffer(db: DbRunner, offerId: string, from: SwapOfferStatus[], status: Exclude<SwapOfferStatus, 'open'>, txHash?: string | null): Promise<boolean> {
     const n = await runWithoutAmbientTx(() => db.run(
         UPDATE.entity(SwapOffers)
             .set({ status, closedAt: new Date().toISOString(), ...(txHash ? { filledTxHash: txHash } : {}) })
-            .where({ ID: offerId, status: 'open' })
+            .where({ ID: offerId, status: { in: from } })
     ));
     return typeof n === 'number' ? n > 0 : !!n;
+}
+
+/** Close one offer. Does nothing if it is no longer open. */
+export async function closeSwapOffer(db: DbRunner, offerId: string, status: Exclude<SwapOfferStatus, 'open'>, txHash?: string | null): Promise<boolean> {
+    return moveSwapOffer(db, offerId, ['open'], status, txHash);
+}
+
+/** Records the swap that took this offer. A take accepted while the offer was open may land after it was retired or expired, and the board then says filled. */
+export async function fillSwapOffer(db: DbRunner, offerId: string, txHash?: string | null): Promise<boolean> {
+    return moveSwapOffer(db, offerId, ['open', 'retired', 'expired'], 'filled', txHash);
 }
 
 /** Closes every open offer that uses an input spent by a confirmed transaction, because such an offer can never be filled. */

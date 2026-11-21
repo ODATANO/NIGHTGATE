@@ -22,7 +22,7 @@ import { configNumber } from './utils/config';
 import { rejectRateLimited } from './utils/rate-classes';
 import { Blocks, Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions, type WalletSession, type TransactionResult, type TransactionSegment, type Transaction as IndexedTransaction, type BackgroundJob } from '#cds-models/midnight';
 import { normalizeHttpError } from './utils/http-errors';
-import { errorMessage } from './utils/errors';
+import { messageWithoutUrls } from './utils/errors';
 import { getJobStatus, Block, ContractAction, ContractState, NightBalance, Transaction, UnshieldedUtxo } from '#cds-models/NightgateService';
 import { narrowRead } from './utils/request-types';
 
@@ -326,7 +326,7 @@ export default class NightgateService extends cds.ApplicationService {
                 }
                 if (!(err instanceof IndexerUnavailable)) throw err;
                 // CAP hides 5xx messages in production. The indexer's error stays visible, with URLs removed because they can carry keys.
-                const cause = errorMessage(err).replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<indexer>');
+                const cause = messageWithoutUrls(err, '<indexer>');
                 const at = height == null ? 'its newest state' : `height ${height}`;
                 const upstream = { status: 502, code: 'BAD_GATEWAY', message: `indexer could not serve the contract state at ${at}: ${cause}`, $sanitize: false };
                 return req.reject(upstream);
@@ -388,12 +388,8 @@ export default class NightgateService extends cds.ApplicationService {
             if (!user?.is?.('admin')) {
                 const userId = user?.id;
                 if (!userId) return req.reject(401, 'authentication required');
-                const sessions: WalletSession[] = await this.db.run(
-                    cds.ql.SELECT.from(WalletSessions).columns('sessionId').where({ userId })
-                ) || [];
-                const sessionIds = sessions.map(s => s.sessionId).filter(Boolean);
-                if (sessionIds.length === 0) return [];
-                narrowRead(req, { sessionId: { in: sessionIds } });
+                // As a subquery: a user may have had any number of sessions, and a value list would hit the driver's parameter limit.
+                narrowRead(req, { sessionId: { in: cds.ql.SELECT.from(WalletSessions).columns('sessionId').where({ userId }) } });
             }
             return await this.db.run(req.query) || [];
         });

@@ -211,13 +211,15 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
         dbgSync(`${callId} SELECT done in ${Date.now() - t1}ms, existing=${!!existing}`);
 
         if (existing) {
-            // A null sub-state keeps the stored blob.
+            // A null sub-state keeps the stored blob, unless the row was written for another SDK, network or seed.
+            const foreign = labelMismatch(existing, sdkVersion, networkId, seedFingerprint) !== null;
+            const kept = async (blob: string | null | undefined): Promise<string | null> => (foreign ? null : carry(blob));
             await db.run(
                 UPDATE.entity(WalletSyncStates)
                     .set({
-                        shieldedStateBlob: shieldedCipher ?? await carry(existing.shieldedStateBlob),
-                        unshieldedStateBlob: unshieldedCipher ?? await carry(existing.unshieldedStateBlob),
-                        dustStateBlob: dustCipher ?? await carry(existing.dustStateBlob),
+                        shieldedStateBlob: shieldedCipher ?? await kept(existing.shieldedStateBlob),
+                        unshieldedStateBlob: unshieldedCipher ?? await kept(existing.unshieldedStateBlob),
+                        dustStateBlob: dustCipher ?? await kept(existing.dustStateBlob),
                         keyScheme: DEK_SCHEME,
                         sdkVersion,
                         networkId: networkId ?? existing.networkId,
@@ -267,6 +269,19 @@ export function isRestorableEarlierSdk(stored: string, running: string): boolean
     return RESTORABLE_EARLIER_SDK[running]?.includes(stored) ?? false;
 }
 
+type SnapshotLabels = { sdkVersion?: string | null; networkId?: string | null; seedFingerprint?: string | null };
+
+/** Why a stored snapshot row must not be used under these labels, or null. Loading refuses such a row, saving carries none of its blobs. */
+function labelMismatch(row: SnapshotLabels, sdkVersion: string, networkId?: string | null, seedFingerprint?: string | null): string | null {
+    const stored = String(row.sdkVersion ?? '');
+    // An unknown version says nothing about the format of the blobs, so it matches nothing, not even itself.
+    if (stored.endsWith('@unknown') || sdkVersion.endsWith('@unknown')) return `sdkVersion is unknown (stored '${stored}', running '${sdkVersion}')`;
+    if (stored !== sdkVersion && !isRestorableEarlierSdk(stored, sdkVersion)) return `stored sdkVersion '${stored}' != expected '${sdkVersion}'`;
+    if (networkId && row.networkId && row.networkId !== networkId) return `stored networkId '${row.networkId}' != expected '${networkId}'`;
+    if (seedFingerprint && row.seedFingerprint && row.seedFingerprint !== seedFingerprint) return "stored seed fingerprint does not match the session's seed";
+    return null;
+}
+
 /** Loads and decrypts an account's snapshots. Returns null on any mismatch, and the wallet syncs from scratch. */
 export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSyncState | null> {
     const { accountId, passphrase, expectedSdkVersion, expectedNetworkId, expectedSeedFingerprint } = args;
@@ -280,26 +295,9 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
     );
     if (!row) return null;
 
-    if (row.sdkVersion !== expectedSdkVersion && !isRestorableEarlierSdk(row.sdkVersion, expectedSdkVersion)) {
-        log.warn(
-            `refusing restore for ${accountId.slice(0, 16)}: ` +
-            `stored sdkVersion '${row.sdkVersion}' != expected '${expectedSdkVersion}' (cold start)`
-        );
-        return null;
-    }
-
-    if (expectedNetworkId && row.networkId && row.networkId !== expectedNetworkId) {
-        log.warn(
-            `refusing restore for ${accountId.slice(0, 16)}: ` +
-            `stored networkId '${row.networkId}' != expected '${expectedNetworkId}' (cold start)`
-        );
-        return null;
-    }
-    if (expectedSeedFingerprint && row.seedFingerprint && row.seedFingerprint !== expectedSeedFingerprint) {
-        log.warn(
-            `refusing restore for ${accountId.slice(0, 16)}: ` +
-            `stored seed fingerprint does not match the session's seed (cold start)`
-        );
+    const mismatch = labelMismatch(row, expectedSdkVersion, expectedNetworkId, expectedSeedFingerprint);
+    if (mismatch) {
+        log.warn(`refusing restore for ${accountId.slice(0, 16)}: ${mismatch} (cold start)`);
         return null;
     }
     if (row.sdkVersion !== expectedSdkVersion) {

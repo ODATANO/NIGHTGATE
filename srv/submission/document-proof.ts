@@ -205,7 +205,8 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
         if (allowed.length > 1024) {
             return req.reject(400, 'allowedValues exceeds 1024 raw entries');
         }
-        if (data.value !== undefined && data.valueDigest !== undefined) {
+        // An explicit null is a value left out.
+        if (data.value != null && data.valueDigest != null) {
             return req.reject(400, 'pass at most one of value / valueDigest');
         }
 
@@ -220,7 +221,7 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
 
         try {
             const values = allowed;
-            if (data.value === undefined && data.valueDigest === undefined) {
+            if (data.value == null && data.valueDigest == null) {
                 const { setRoot, digests } = buildMembershipSet(values, pure);
                 return { setRoot, memberCount: digests.length, setSiblings: [], setDirs: [] };
             }

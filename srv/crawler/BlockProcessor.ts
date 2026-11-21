@@ -720,7 +720,8 @@ export class BlockProcessor {
         classification: ExtrinsicClassification
     ): Array<{ actionType: 'DEPLOY' | 'CALL' | 'UPDATE'; address: string | null }> {
         if (events?.contracts.length) return events.contracts;
-        if (events?.applied) return [];
+        // An applied transaction names its contracts in its events. A failed one changed no contract.
+        if (events?.applied || events?.outcome === 'FAILURE') return [];
         const fallback = this.toContractActionType(classification.txType);
         return fallback ? [{ actionType: fallback, address: null }] : [];
     }
@@ -1027,7 +1028,8 @@ export class BlockProcessor {
         }
     }
 
-    /** The expensive call. Used only for the first block of each runtime. */
+    /** The expensive call. Used only for the first block of each runtime.
+     *  Asked at the block's own hash, never its parent's: the node applies an upgrade at the start of a block, so that block's own state names the runtime that wrote its events. */
     private async getProtocolVersion(blockHash: string, where: string = `block ${blockHash}`): Promise<number> {
         let rv: { specVersion?: number } | null | undefined;
         try {

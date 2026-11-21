@@ -19,6 +19,7 @@ With `docker run`, pass the same variables with `-e`, plus `-p 4004:4004 -v nigh
 - On mainnet and preprod the entrypoint refuses to start without `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL`. See [self-hosted.md](self-hosted.md).
 - The container runs as uid 1000. A bind-mounted `/data` must be writable by it.
 - Compose publishes port 4004 on `127.0.0.1`. `NIGHTGATE_BIND_ADDRESS=0.0.0.0` publishes it on all addresses. Basic auth is plain text without TLS, so put a TLS reverse proxy in front.
+- Behind a reverse proxy set `NIGHTGATE_TRUST_PROXY` to the number of proxies. Without it every caller has the proxy's address, so the rate limits per address and the login throttle count all callers as one: 20 wrong passwords lock everyone out for 15 minutes. Set it only when no caller can reach the server directly.
 
 ## Authentication
 
@@ -36,7 +37,8 @@ With `docker run`, pass the same variables with `-e`, plus `-p 4004:4004 -v nigh
 | `NIGHTGATE_HTTP_PASSWORD` | required | Basic-auth password |
 | `NIGHTGATE_HTTP_USER` | `nightgate` | Basic-auth user |
 | `NIGHTGATE_HTTP_ROLES` | none | Comma-separated roles of that user. `admin` opens the admin service |
-| `NIGHTGATE_AUTH` | `basic` | `dummy` serves unauthenticated and privileged. Refused unless `NIGHTGATE_ALLOW_UNAUTHENTICATED=true` |
+| `NIGHTGATE_AUTH` | `basic` | `dummy` serves unauthenticated and privileged. In production the server does not start with it unless `NIGHTGATE_ALLOW_UNAUTHENTICATED=true` |
+| `NIGHTGATE_TRUST_PROXY` | `0` | Number of reverse proxies in front of the server, see the note above |
 | `NIGHTGATE_NETWORK` | `mainnet` | Target network |
 | `NIGHTGATE_NODE_URL` | built in on preview only | Node RPC |
 | `NIGHTGATE_INDEXER_HTTP_URL` | built in on preview only | Indexer GraphQL |
@@ -88,14 +90,15 @@ Docker does not restart an unhealthy container. Run `docker/watchdog.sh` from cr
 crontab -l | { cat; echo '* * * * * /root/nightgate-api/watchdog.sh'; } | crontab -
 ```
 
-- After three unhealthy checks with only the crawler down, it pauses and resumes the crawler.
+- After three unhealthy checks with only the crawler down, it pauses and resumes the crawler. Both calls need the `admin` role, so set `NIGHTGATE_HTTP_ROLES=admin`. Without it the cycle is refused, the log says so, and the container is restarted instead.
 - Otherwise, or still unhealthy three checks later, it restarts the container.
+- A server that still answers `getLiveness()` gets `NIGHTGATE_WATCHDOG_STOP_WAIT` seconds to save its wallet states before the restart, default 90. One that does not answer is stopped after 5.
 - No restart within `NIGHTGATE_WATCHDOG_START_GRACE` seconds of the start, default 900.
 - `NIGHTGATE_CONTAINER` names the container, default `odatano-nightgate`. `NIGHTGATE_WATCHDOG_LOG` sets the log file. `NIGHTGATE_HOST_GUARD` names a command that can veto a restart.
 
 ## Notes
 
-- On SIGTERM every wallet state is saved, up to 60 s. Compose sets `stop_grace_period: 90s`. With `docker stop` pass `-t 90`.
+- On SIGTERM every wallet state is saved, up to 60 s. Running submits get up to 40 s of that, the saves the rest. A dust snapshot whose check does not fit is left at its last periodic save. Compose sets `stop_grace_period: 90s`. With `docker stop` pass `-t 90`.
 - Compose sets `init: true` so zombie processes are reaped. With `docker run` pass `--init`.
 - One instance per database. A second process on the same database refuses to start.
 - Without `NIGHTGATE_DB_URL` the entrypoint allows SQLite under the production profile. Use PostgreSQL in production.

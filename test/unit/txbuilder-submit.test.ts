@@ -325,6 +325,18 @@ describe('txbuilder submit: probeLanded confirms by identifier', () => {
         await expect(probeLanded('id1', { indexerHttpUrl: 'http://i', fetchFn: gqlError })).resolves.toBeNull();
     });
 
+    it('an indexer that refuses, is gone or does not exist is an error, not "not known yet"', async () => {
+        const { probeLanded } = await importSubmit();
+        const answering = (status: number) => (async () => ({ ok: false, status, json: async () => ({}), text: async () => '' })) as unknown as typeof fetch;
+        for (const status of [400, 401, 403, 404, 410]) {
+            await expect(probeLanded('id1', { indexerHttpUrl: 'http://i', fetchFn: answering(status) }), String(status)).rejects.toMatchObject({ status });
+        }
+        // An outage or a busy indexer can pass, so it still reads as unknown.
+        for (const status of [429, 500, 502, 503]) {
+            await expect(probeLanded('id1', { indexerHttpUrl: 'http://i', fetchFn: answering(status) }), String(status)).resolves.toBeNull();
+        }
+    });
+
     it('waitLanded probes at least once and polls until the deadline', async () => {
         const { waitLanded } = await importSubmit();
         // timeoutMs 0: exactly one probe, then unknown.

@@ -90,7 +90,9 @@ export class BlockAuthorResolver {
         const authorities = this.next?.parentHash === header.parentHash
             ? this.next.authorities
             : await this.readAuthorities(header.parentHash);
-        this.next = { parentHash: blockHash, authorities: facts.nextAuthorities ?? authorities };
+        const carried = facts.nextAuthorities ?? authorities;
+        // An empty list means the node had no state for the parent. The next block asks for itself.
+        this.next = carried.length ? { parentHash: blockHash, authorities: carried } : null;
         if (authorities.length === 0) return { author: null, slot };
 
         const author = authorities[Number(facts.slot % BigInt(authorities.length))];

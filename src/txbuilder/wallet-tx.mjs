@@ -51,3 +51,13 @@ export async function shieldedKeysByEpoch(seed) {
     const [ledgerV8, ledger] = await Promise.all([import('@midnightntwrk/ledger-v8'), loadLedger()]);
     return { v8: ledgerV8.ZswapSecretKeys.fromSeed(seed), v9: ledger.ZswapSecretKeys.fromSeed(seed) };
 }
+
+/** Runs `start`. When it fails, `stop` runs before the error goes on, so a wallet that did start does not keep syncing. */
+export async function startOrStop(start, stop) {
+    try {
+        await start();
+    } catch (err) {
+        await stop().catch(() => undefined);
+        throw err;
+    }
+}

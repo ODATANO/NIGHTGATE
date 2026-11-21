@@ -270,6 +270,30 @@ try {
     await a.query('DROP TABLE ng_lane_lock');
     await a.end();
     await b.end();
+
+    // ---- Queries the services send -----------------------------------------
+    const { SELECT, INSERT } = cds.ql;
+    const offer = (n, tags) => ({
+        ID: `11111111-0000-4000-8000-00000000000${n}`, offer: 'AA==', givesType: 'ab'.repeat(32), givesAmount: '1',
+        wantsType: 'cd'.repeat(32), wantsAmount: '2', bound: false, nullifiers: '[]', status: 'open', posterUserId: 'lane-user', tags: JSON.stringify(tags)
+    });
+    await db.run(INSERT.into('midnight.SwapOffers').entries([offer(1, ['carbon', 'eu']), offer(2, ['car']), offer(3, ['100%_wind'])]));
+    // The same filter as listSwapOffers with `tag`: the quoted tag inside the JSON text.
+    const tagged = async (tag) => (await db.run(SELECT.from('midnight.SwapOffers').columns('ID').where`contains(tags, ${JSON.stringify(tag)})`))
+        .map(r => String(r.ID).slice(-1)).sort().join(',');
+    const byTag = { carbon: await tagged('carbon'), car: await tagged('car'), wind: await tagged('100%_wind'), wildcard: await tagged('1_0%_wind') };
+    ok('postgres: the tag filter of the offer board keeps the rows that hold the quoted tag', byTag.carbon === '1' && byTag.car === '2', JSON.stringify(byTag));
+    ok('postgres: % and _ in a tag are plain characters, not wildcards', byTag.wind === '3' && byTag.wildcard === '', JSON.stringify(byTag));
+
+    // The same filter as a READ of PendingSubmissions by a user: the user's sessions as a subquery.
+    const session = (n, userId) => ({ ID: `22222222-0000-4000-8000-00000000000${n}`, sessionId: `33333333-0000-4000-8000-00000000000${n}`, userId, connectedAt: new Date().toISOString() });
+    await db.run(INSERT.into('midnight.WalletSessions').entries([session(1, 'lane-user'), session(2, 'lane-user'), session(3, 'someone-else')]));
+    const pending = (n) => ({ ID: `44444444-0000-4000-8000-00000000000${n}`, sessionId: `33333333-0000-4000-8000-00000000000${n}`, actionType: 'CALL', submittedAt: new Date().toISOString() });
+    await db.run(INSERT.into('midnight.PendingSubmissions').entries([pending(1), pending(2), pending(3)]));
+    const own = await db.run(SELECT.from('midnight.PendingSubmissions').columns('ID')
+        .where({ sessionId: { in: SELECT.from('midnight.WalletSessions').columns('sessionId').where({ userId: 'lane-user' }) } }));
+    const ownIds = own.map(r => String(r.ID).slice(-1)).sort().join(',');
+    ok('postgres: pending submissions are narrowed to the sessions of one user by a subquery', ownIds === '1,2', ownIds);
 } catch (err) {
     console.error(`FAIL lane aborted: ${err?.stack ?? err}`);
     failures++;

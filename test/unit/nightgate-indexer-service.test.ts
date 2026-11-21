@@ -464,6 +464,21 @@ describe('pauseCrawler', () => {
         expect(mockStopCrawler).not.toHaveBeenCalled();
     });
 
+    it('answers 409 while a crawler start is under way, so the start cannot outlive the pause', async () => {
+        mockIsCrawlerRunning.mockReturnValue(false);
+        let finishStart: () => void = () => undefined;
+        mockStartCrawler.mockImplementationOnce(() => new Promise<void>((resolve) => { finishStart = resolve; }));
+        const resuming = srv.send('resumeCrawler');
+        await new Promise((r) => setTimeout(r, 20));
+        try {
+            await expect(srv.send('pauseCrawler')).rejects.toThrow('the crawler is starting, call again once it runs');
+            expect(mockStopCrawler).not.toHaveBeenCalled();
+        } finally {
+            finishStart();
+            await resuming;
+        }
+    });
+
     it('stops the crawler and marks sync state as stopped', async () => {
         await setSyncState({ syncStatus: 'syncing', lastIndexedHeight: 5, chainHeight: 5 });
         mockIsCrawlerRunning.mockReturnValue(true);

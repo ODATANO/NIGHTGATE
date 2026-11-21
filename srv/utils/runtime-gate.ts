@@ -13,6 +13,9 @@ export const RUNTIME_FREE_ACTIONS: ReadonlySet<string> = new Set([
     'getJobStatus',
     'registerGranteeIdentity',
     'createAgentGrant',
+    'createAgentGrants',
+    'updateAgentGrant',
+    'rotateAgentGrantToken',
     'revokeAgentGrant',
     'disconnectWallet'
 ]);

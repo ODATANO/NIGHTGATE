@@ -7,6 +7,7 @@ import { test, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import cds from '@sap/cds';
 import {
     registerBackgroundJobProcessor, reclaimExpiredLeases, getJobById,
+    recoverInterruptedJobs, dropPendingJobsForClosedSessions,
     __pollOnceForTests, __resetForTests
 } from '../../srv/submission/background-jobs';
 import { declaredJobKindTraits } from '../../srv/submission/job-kinds';
@@ -55,15 +56,20 @@ test('a running job without a heartbeat for longer than the TTL is re-queued wit
         row('fresh', { heartbeatAt: minutesAgo(1) }),
         row('never-beat', { heartbeatAt: null }),
         row('past-boundary', { status: 'submitted', txHash: 'id-1' }),
+        row('silent-before-send', { status: 'external_execution', txHash: null }),
+        row('fresh-submitted', { status: 'submitted', txHash: 'id-2', heartbeatAt: minutesAgo(1) }),
         row('legacy-closure', { commandVersion: null, command: null }),
         row('worn-out', { attempt: 4 })
     ));
     const reclaimed = await reclaimExpiredLeases(db);
-    expect(reclaimed).toBe(4);
+    expect(reclaimed).toBe(6);
     expect(await statusOf('stale')).toEqual({ status: 'pending', attempt: 2, errorCode: null, leaseOwner: null });
     expect(await statusOf('never-beat')).toEqual({ status: 'pending', attempt: 2, errorCode: null, leaseOwner: null });
     expect((await statusOf('fresh')).status).toBe('running');
-    expect((await statusOf('past-boundary')).status).toBe('submitted');
+    // Past `running` a job is never run again. With an announced hash the reconciler settles it, without one nothing was sent.
+    expect(await statusOf('past-boundary')).toEqual({ status: 'reconciliation_required', attempt: 1, errorCode: 'LEASE_EXPIRED', leaseOwner: null });
+    expect(await statusOf('silent-before-send')).toEqual({ status: 'failed', attempt: 1, errorCode: 'LEASE_EXPIRED', leaseOwner: null });
+    expect((await statusOf('fresh-submitted')).status).toBe('submitted');
     expect(await statusOf('legacy-closure')).toMatchObject({ status: 'failed', errorCode: 'LEASE_EXPIRED' });
     expect(await statusOf('worn-out')).toMatchObject({ status: 'failed', errorCode: 'LEASE_EXPIRED' });
     // idempotent: nothing left to reclaim
@@ -129,4 +135,38 @@ test('a fenced process dispatches nothing: the pending row waits for the lease h
     } finally {
         __resetInstanceLeaseForTests();
     }
+});
+
+test('a restart counts as an attempt: a running job is queued again, and after three restarts it fails', async () => {
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        row('first-restart', {}),
+        row('fourth-restart', { attempt: 4 }),
+        row('queued', { status: 'pending', leaseOwner: null, startedAt: null, heartbeatAt: null })
+    ));
+    await recoverInterruptedJobs();
+    expect(await statusOf('first-restart')).toEqual({ status: 'pending', attempt: 2, errorCode: null, leaseOwner: null });
+    expect(await statusOf('fourth-restart')).toEqual({ status: 'failed', attempt: 4, errorCode: 'LEASE_EXPIRED', leaseOwner: null });
+    expect(await statusOf('queued')).toEqual({ status: 'pending', attempt: 1, errorCode: null, leaseOwner: null });
+});
+
+test('the cleanup after a restart parks a workflow whose step is done or on chain, and fails the rest', async () => {
+    const queued = { status: 'pending', leaseOwner: null, startedAt: null, heartbeatAt: null, sessionId: 'closed' };
+    await db.run(cds.ql.INSERT.into(BG).entries(
+        row('parent-step-done', { ...queued, kind: 'issueFieldPredicateAttestation' }),
+        row('step-done', { ...queued, status: 'succeeded', parentJobId: 'parent-step-done' }),
+        row('parent-step-on-chain', { ...queued, kind: 'issueFieldPredicateAttestation' }),
+        row('step-on-chain', { ...queued, status: 'reconciliation_required', txHash: 'id-3', parentJobId: 'parent-step-on-chain' }),
+        row('parent-nothing-ran', { ...queued, kind: 'issueFieldPredicateAttestation' }),
+        row('step-not-started', { ...queued, parentJobId: 'parent-nothing-ran' }),
+        row('other-session', { ...queued, sessionId: 'open' })
+    ));
+    expect(await dropPendingJobsForClosedSessions(['closed'])).toBe(2);
+    for (const id of ['parent-step-done', 'parent-step-on-chain']) {
+        expect(await statusOf(id)).toEqual({ status: 'reconciliation_required', attempt: 1, errorCode: 'CHILD_RECONCILIATION_REQUIRED', leaseOwner: null });
+    }
+    for (const id of ['parent-nothing-ran', 'step-not-started']) {
+        expect(await statusOf(id)).toMatchObject({ status: 'failed', errorCode: 'PROCESS_RESTART_SESSION_CLOSED' });
+    }
+    expect((await statusOf('step-done')).status).toBe('succeeded');
+    expect((await statusOf('other-session')).status).toBe('pending');
 });

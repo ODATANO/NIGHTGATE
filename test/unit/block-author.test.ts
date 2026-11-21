@@ -111,6 +111,21 @@ describe('BlockAuthorResolver', () => {
         expect(await new BlockAuthorResolver(node).resolve(plain.hash, plain.header)).toEqual({ author: null, slot: plain.slot });
     });
 
+    it('does not hand an empty list on: the next block asks the node for itself', async () => {
+        const child = { ...afterChange.header, parentHash: plain.hash };
+        const node = { getStorage: vi.fn().mockResolvedValueOnce(null).mockResolvedValue(encodeAuthorities(afterChange.parentAuthorities)) };
+        const resolver = new BlockAuthorResolver(node);
+        expect((await resolver.resolve(plain.hash, plain.header)).author).toBeNull();
+        const warn = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+        try {
+            await resolver.resolve('0xchild', child);
+        } finally {
+            warn.mockRestore();
+        }
+        expect(node.getStorage).toHaveBeenCalledTimes(2);
+        expect(node.getStorage).toHaveBeenLastCalledWith(AURA_AUTHORITIES_STORAGE_KEY, plain.hash);
+    });
+
     it('passes a failed storage read on, so the block is retried and not stored with a guess', async () => {
         const node = { getStorage: vi.fn().mockRejectedValue(new Error('RPC timeout: state_getStorage (30000ms)')) };
         await expect(new BlockAuthorResolver(node).resolve(plain.hash, plain.header)).rejects.toThrow(/RPC timeout/);

@@ -469,6 +469,32 @@ after.close();
     rw.close();
 }
 
+// A second run on the migrated database must change nothing. The cleanup above is only for rows in the old binary format.
+{
+    const rw = new DatabaseSync(dbPath);
+    rw.exec(`
+        INSERT INTO midnight_Transactions (ID, transactionId, hash, protocolVersion, transactionType, raw, contractAddress, senderAddress, receiverAddress, nightAmount)
+        VALUES ('tx-current', 7, 'c0ffee', 1, 'REGULAR', x'0c040a00', 'c1c1', 'mn_addr_preprod1sender', 'mn_addr_preprod1receiver', '5');
+        INSERT INTO midnight_ContractActions (ID, actionIndex, address, actionType, state, transaction_ID)
+        VALUES ('ca-current', 0, 'c1c1', 'CALL', x'6d69646e69676874', 'tx-current');
+        INSERT INTO midnight_UnshieldedUtxos (ID, owner, tokenType, value, intentHash, outputIndex, initialNonce, createdAtTransaction_ID)
+        VALUES ('utxo-current', 'mn_addr_preprod1current', '00', '100', 'intent-current', 0, 'nonce-current', 'tx-current');
+        INSERT INTO midnight_NightBalances (address, balance) VALUES ('mn_addr_preprod1current', 100);
+    `);
+    rw.close();
+    execFileSync(process.execPath, [path.join(repoRoot, 'scripts/apply-schema-delta.mjs'), dbPath], { cwd: repoRoot, stdio: 'inherit' });
+    const again = new DatabaseSync(dbPath, { readOnly: true });
+    const action = again.prepare("SELECT hex(state) AS state, address FROM midnight_ContractActions WHERE ID = 'ca-current'").get();
+    ok('second run: a stored contract state and its address stay', action?.state === '6D69646E69676874' && action?.address === 'c1c1', JSON.stringify(action));
+    const tx = again.prepare("SELECT hex(raw) AS raw, contractAddress, senderAddress, receiverAddress, nightAmount FROM midnight_Transactions WHERE ID = 'tx-current'").get();
+    ok('second run: a transaction keeps its bytes, addresses and amount',
+        tx?.raw === '0C040A00' && tx?.contractAddress === 'c1c1' && tx?.senderAddress === 'mn_addr_preprod1sender'
+            && tx?.receiverAddress === 'mn_addr_preprod1receiver' && String(tx?.nightAmount) === '5', JSON.stringify(tx));
+    ok('second run: the UTXO stays', again.prepare("SELECT count(*) AS n FROM midnight_UnshieldedUtxos WHERE ID = 'utxo-current'").get()?.n === 1);
+    ok('second run: the NIGHT balance stays', again.prepare("SELECT count(*) AS n FROM midnight_NightBalances").get()?.n === 1);
+    again.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 
 console.log();

@@ -20,6 +20,29 @@ function sdkWrapped(inner: string): Error {
     return fiber;
 }
 
+describe('a missing reply before anything was announced', () => {
+    const proofTimeout = () => {
+        const err = new Error('The operation was aborted due to timeout');
+        err.name = 'TimeoutError';
+        return new Error('proof request failed', { cause: err });
+    };
+
+    it('is not ambiguous: the call had sent nothing, so the job may simply fail and be retried', () => {
+        expect(classifySubmitFailure(proofTimeout(), { announced: false })).toEqual({ code: 'internal', retryable: false });
+    });
+
+    it('stays ambiguous once the tx was announced, and for a caller that does not know', () => {
+        expect(classifySubmitFailure(proofTimeout(), { announced: true })).toEqual({ code: 'ambiguous', ledgerCode: 'no-reply', retryable: false });
+        expect(classifySubmitFailure(proofTimeout())).toEqual({ code: 'ambiguous', ledgerCode: 'no-reply', retryable: false });
+    });
+
+    it('does not weaken an explicit outcome: a watch timeout is thrown after the send', () => {
+        const named = new Error('submit watch timed out after 60000ms without a Finalized status');
+        named.name = 'SubmitWatchTimeoutError';
+        expect(classifySubmitFailure(named, { announced: false }).code).toBe('ambiguous');
+    });
+});
+
 describe('landed-not-applied carries the block height', () => {
     it('takes the height from the worker error so the main thread has a rollback coordinate', () => {
         const err: any = new Error('sponsored transaction 00ab is in block 2415919 but its contract call did NOT apply');

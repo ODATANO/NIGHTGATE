@@ -38,6 +38,7 @@ vi.mock('../../srv/utils/sync-state', () => ({
     ensureSyncStateSingleton: vi.fn().mockResolvedValue(undefined)
 }));
 
+import { RpcBatchRefusedError } from '../../srv/providers/MidnightNodeProvider';
 import cds from '@sap/cds';
 import { MidnightCrawler } from '../../srv/crawler/Crawler';
 
@@ -404,7 +405,7 @@ describe('MidnightCrawler orchestration', () => {
             // so we drive it via a spy returning 11.
             const getSyncStateSpy = vi.spyOn(crawler as any, 'getSyncState');
             getSyncStateSpy
-                .mockResolvedValueOnce({ lastIndexedHeight: 0, lastIndexedHash: null })
+                .mockResolvedValueOnce({ lastIndexedHeight: 0, lastIndexedHash: 'aa' })
                 .mockResolvedValueOnce({ consecutiveErrors: 11 });
             vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry').mockRejectedValue(new Error('Request timeout'));
             const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
@@ -435,7 +436,7 @@ describe('MidnightCrawler orchestration', () => {
 
             const getSyncStateSpy = vi.spyOn(crawler as any, 'getSyncState');
             getSyncStateSpy
-                .mockResolvedValueOnce({ lastIndexedHeight: 0, lastIndexedHash: null })
+                .mockResolvedValueOnce({ lastIndexedHeight: 0, lastIndexedHash: 'aa' })
                 .mockResolvedValueOnce({ consecutiveErrors: 2 });
             vi.spyOn(crawler as any, 'fetchBlockBatchWithRetry').mockRejectedValue(new Error('Request timeout'));
             const recordErrorSpy = vi.spyOn(crawler as any, 'recordError').mockResolvedValue(undefined);
@@ -776,6 +777,63 @@ describe('MidnightCrawler orchestration', () => {
             expect(fetchSpy).toHaveBeenCalledWith([500, 501, 502]);
         });
 
+        it.each([
+            ['no start height', {}],
+            ['start height 0', { startHeight: 0 }],
+            ['start height 1', { startHeight: 1 }]
+        ])('an empty index with %s anchors at block 1 and catches up from block 2, never from genesis', async (_name, config) => {
+            const provider = {
+                getFinalizedHead: vi.fn().mockResolvedValue('0x4'),
+                getHeader: vi.fn().mockResolvedValue({ number: '0x4' }),
+                getBlockHash: vi.fn().mockResolvedValue('0xone')
+            };
+            const { crawler, processBlockByHash, fetchSpy } = makeCrawler(
+                { ...config, rpcBatchSize: 10, fetchConcurrency: 1 }, provider
+            );
+            await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, lastIndexedHash: null });
+
+            await expect(crawler.catchUp()).resolves.toBe(3);
+
+            expect(provider.getBlockHash).toHaveBeenCalledWith(1);
+            expect(processBlockByHash).toHaveBeenCalledWith('0xone');
+            expect(fetchSpy).toHaveBeenCalledWith([2, 3, 4]);
+        });
+
+        it('a block batch the node refuses as a whole is fetched in halves, never again at the same size', async () => {
+            const crawler = new MidnightCrawler({} as any, { enabled: true });
+            const asked: number[][] = [];
+            (crawler as any).processor = {
+                fetchBlockBatch: vi.fn(async (heights: number[]) => {
+                    asked.push(heights);
+                    // The node's limit lets two blocks through per frame.
+                    if (heights.length > 2) throw new RpcBatchRefusedError(-32011, 'RPC batch refused -32011: The batch response was too large');
+                    return heights.map(height => ({ height }));
+                })
+            };
+            const warn = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+            try {
+                const blocks = await (crawler as any).fetchBlockBatchWithRetry([10, 11, 12, 13, 14]);
+                expect(blocks.map((b: any) => b.height)).toEqual([10, 11, 12, 13, 14]);
+                expect(asked).toEqual([[10, 11, 12, 13, 14], [10, 11, 12], [10, 11], [12], [13, 14]]);
+            } finally {
+                warn.mockRestore();
+            }
+        });
+
+        it('a single block the node refuses fails as it is: there is nothing left to halve', async () => {
+            const crawler = new MidnightCrawler({} as any, { enabled: true });
+            (crawler as any).processor = {
+                fetchBlockBatch: vi.fn(async () => { throw new RpcBatchRefusedError(-32011, 'RPC batch refused -32011: The batch response was too large'); })
+            };
+            const error = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
+            try {
+                await expect((crawler as any).fetchBlockBatchWithRetry([10])).rejects.toBeInstanceOf(RpcBatchRefusedError);
+                expect((crawler as any).processor.fetchBlockBatch).toHaveBeenCalledTimes(1);
+            } finally {
+                error.mockRestore();
+            }
+        });
+
         it('refuses to anchor above the finalized head', async () => {
             const provider = {
                 getFinalizedHead: vi.fn().mockResolvedValue('0x64'),
@@ -1050,6 +1108,31 @@ describe('MidnightCrawler orchestration', () => {
             expect(checkForReorgSpy).toHaveBeenCalled();
             expect(processSpy).toHaveBeenCalledWith(2);
             expect((crawler as any).processing).toBe(false);
+        });
+
+        it('a head announced again below the known finalized one does not move the finalized height back', async () => {
+            let liveCallback: ((header: any) => Promise<void>) | undefined;
+            const provider = {
+                subscribeFinalizedHeads: vi.fn().mockImplementation(async (callback: (header: any) => Promise<void>) => { liveCallback = callback; return 'sub-1'; }),
+                getBlockHash: vi.fn()
+            };
+            const crawler = new MidnightCrawler(provider as any, { enabled: true });
+            (crawler as any).db = db;
+            (crawler as any).isRunning = true;
+            (crawler as any).startTime = Date.now() - 1000;
+            await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 9, lastIndexedHash: 'nine', lastFinalizedHeight: 9, lastFinalizedHash: 'nine' });
+            vi.spyOn(crawler as any, 'checkForReorg').mockResolvedValue(null);
+            vi.spyOn(crawler as any, 'processBlockWithRetry').mockImplementation(async (height: any) => ({
+                blockHeight: height, blockHash: `0x${height}`, transactionCount: 0, contractActionCount: 0, processingTimeMs: 0
+            }));
+            await (crawler as any).subscribeLive();
+
+            await liveCallback!({ number: '0x7', parentHash: '0x6', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
+            expect(await getSyncState()).toMatchObject({ lastFinalizedHash: 'nine' });
+            expect(Number((await getSyncState()).lastFinalizedHeight)).toBe(9);
+
+            await liveCallback!({ number: '0xa', parentHash: '0x9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
+            expect(Number((await getSyncState()).lastFinalizedHeight)).toBe(10);
         });
 
         it('start() registers a reconnect handler that re-drives ingestion', async () => {
@@ -1334,6 +1417,22 @@ describe('MidnightCrawler orchestration', () => {
             const row = await db.run(cds.ql.SELECT.one.from(REORG_LOG).where({ ID: reorgLogId }));
             expect(row.status).toBe('completed');
             expect(Number(row.blocksReIndexed)).toBe(4);
+
+            // A second reorg whose new branch cannot be indexed in this run closes its log as failed.
+            const failedId = cds.utils.uuid();
+            await db.run(cds.ql.INSERT.into(REORG_LOG).entries({
+                ID: failedId, detectedAt: new Date().toISOString(), forkHeight: 9, oldTipHash: 'old', newTipHash: 'new',
+                blocksRolledBack: 1, blocksReIndexed: 0, status: 'in_progress'
+            }));
+            handleReorgSpy.mockResolvedValue(failedId);
+            catchUpSpy.mockRejectedValueOnce(new Error('node went away'));
+            const errorSpy = vi.spyOn(cds.log('nightgate:crawler'), 'error').mockImplementation(() => {});
+            try {
+                await liveCallback!({ number: '0xa', parentHash: '0x9', stateRoot: '', extrinsicsRoot: '', digest: { logs: [] } });
+            } finally {
+                errorSpy.mockRestore();
+            }
+            expect((await db.run(cds.ql.SELECT.one.from(REORG_LOG).where({ ID: failedId }))).status).toBe('failed');
         });
     });
 

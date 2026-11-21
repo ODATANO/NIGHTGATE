@@ -769,6 +769,18 @@ describe('wallet session handlers', () => {
             expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
         });
 
+        // The derivation between the read and the write is slow. A seed must not land on a session closed meanwhile.
+        it('a session closed during the derivation answers 404 and starts no job', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow()).mockResolvedValueOnce(0);
+            (cds.env as any).requires = { nightgate: { network: 'preprod', nodeUrl: 'wss://node' } };
+
+            const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
+            await registeredHandlers['connectWalletForSigning'](req);
+
+            expect(req.reject).toHaveBeenCalledWith(404, 'Session not found or inactive');
+            expect(mockStartJob).not.toHaveBeenCalled();
+        });
+
         it('persists encryptedSeedKey, schedules the pre-warm job, and returns its jobId', async () => {
             const session = activeSessionRow();
             mockDbRun.mockResolvedValueOnce(session).mockResolvedValueOnce(1);
@@ -778,7 +790,7 @@ describe('wallet session handlers', () => {
             const result = await registeredHandlers['connectWalletForSigning'](req);
 
             expect(req.reject).not.toHaveBeenCalled();
-            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
+            expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID, isActive: true });
             // The pre-warm call moves into startJob's `work` closure, not
             // called synchronously by the handler.
             expect(mockGetOrBuildWalletFacade).not.toHaveBeenCalled();
@@ -848,7 +860,7 @@ describe('wallet session handlers', () => {
                     prewarmStatus:  null
                 });
                 // The session UPDATE still committed; signing is enabled.
-                expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID });
+                expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID, isActive: true });
             } finally {
                 warn.mockRestore();
             }
@@ -1251,6 +1263,30 @@ describe('wallet session handlers', () => {
             expect(req.reject).toHaveBeenCalledWith(500, expect.stringContaining('getWalletBalance failed'));
         });
 
+        it('a fee sponsor wallet moves no coin and registers nothing: it only pays fees', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-1';
+            try {
+                const receiverAddress = 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+                const calls: Array<[string, Record<string, unknown>]> = [
+                    ['sendNight', { sessionId: 'sponsor-1', receiverAddress, amount: '1' }],
+                    ['estimateSendNightFee', { sessionId: 'sponsor-1', receiverAddress, amount: '1' }],
+                    ['registerForDustGeneration', { sessionId: 'sponsor-1' }],
+                    ['deregisterFromDustGeneration', { sessionId: 'sponsor-1' }]
+                ];
+                const jobsBefore = mockStartJob.mock.calls.length;
+                for (const [action, data] of calls) {
+                    const req = createMockRequest(data);
+                    await registeredHandlers[action](req);
+                    expect(req.reject, action).toHaveBeenCalledWith(403, expect.stringMatching(/is a fee sponsor: it pays fees and does nothing else/));
+                }
+                expect(mockStartJob.mock.calls.length).toBe(jobsBefore);
+                expect(mockSendNight).not.toHaveBeenCalled();
+                expect(mockEstimateSendNightFee).not.toHaveBeenCalled();
+            } finally {
+                delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            }
+        });
+
         it('estimateSendNightFee happy path forwards to the inner helper', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             mockEstimateSendNightFee.mockResolvedValueOnce({ fee: '123', toLedger: 'shielded' });
@@ -1261,6 +1297,20 @@ describe('wallet session handlers', () => {
             });
             const result = await registeredHandlers['estimateSendNightFee'](req);
             expect(result).toEqual({ fee: '123', toLedger: 'shielded' });
+        });
+
+        it('estimateSendNightFee prices the token it is asked about, with the amount bound of that token', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockEstimateSendNightFee.mockResolvedValueOnce({ fee: '7', toLedger: 'shielded' });
+            const req = createMockRequest({
+                sessionId: 's1',
+                receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                amount: '2000000000000000000',
+                tokenTypeHex: 'AB'.repeat(32)
+            });
+            await registeredHandlers['estimateSendNightFee'](req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(mockEstimateSendNightFee).toHaveBeenCalledWith(expect.objectContaining({ tokenTypeHex: 'ab'.repeat(32), amount: '2000000000000000000' }));
         });
 
         it('estimateSendNightFee rejects bad amount before any inner call', async () => {

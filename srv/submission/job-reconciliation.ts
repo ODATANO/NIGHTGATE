@@ -10,7 +10,8 @@ import { carriedSubmitFailure } from '../midnight/wallet-worker-protocol';
 import { readReorgGeneration, lockReorgGeneration } from './reorg-generation';
 import { affectedRows, type DbRunner, type DbService } from '../utils/db-types';
 import { kindsWithTrait, jobKindTraits, runReconciliationFinalizer } from './job-registry';
-import { attemptRowOf, childFailedMessage, safeStringify, ReconciliationEvidence, getRuntimeWorkerId, markReconciliationRequired } from './job-store';
+import { JOB_KINDS } from './job-kinds';
+import { attemptRowOf, childFailedMessage, safeStringify, ReconciliationEvidence, getRuntimeWorkerId, markReconciliationRequired, MAX_REQUEUES } from './job-store';
 import { errorMessage } from '../utils/errors';
 import { withLockContentionRetry, LOCK_CONTENTION_ATTEMPTS } from './db-write-retry';
 import { deployRefund } from '../sessions/deploy-refund';
@@ -22,7 +23,7 @@ export async function recoverInterruptedJobs(): Promise<number> {
     const db = await cds.connect.to('db');
     const stuck = await db.run(
         SELECT.from(BackgroundJobs)
-            .columns('ID', 'status', 'commandVersion')
+            .columns('ID', 'status', 'commandVersion', 'attempt')
             .where({ status: { in: ['pending', 'running', 'external_execution', 'submitted'] } })
     );
     const count = Array.isArray(stuck) ? stuck.length : 0;
@@ -43,20 +44,19 @@ export async function recoverInterruptedJobs(): Promise<number> {
                 })
                 .where({ status: { in: ['pending', 'running'] }, kind: { in: kindsWithTrait('sessionBound') } })
         );
-        // A `running` job has not sent anything yet, so it can run again.
-        await db.run(
-            UPDATE.entity(BackgroundJobs)
-                .set({
-                    status: 'pending',
-                    errorCode: null,
-                    errorMessage: null,
-                    startedAt: null,
-                    leaseOwner: null,
-                    leaseExpiresAt: null,
-                    heartbeatAt: null
-                })
-                .where({ status: 'running', commandVersion: { '!=': null } })
-        );
+        // A `running` job has not sent anything yet, so it can run again. Each restart counts as an attempt:
+        // a job that takes the process down every time ends after MAX_REQUEUES.
+        const released = { startedAt: null, leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null };
+        for (const row of (stuck as BackgroundJob[]).filter(j => j.status === 'running' && j.commandVersion != null)) {
+            const attempt = (row.attempt ?? 1) + 1;
+            const patch = attempt > MAX_REQUEUES + 1
+                ? {
+                    status: 'failed' as const, errorCode: 'LEASE_EXPIRED', finishedAt: new Date().toISOString(), ...released,
+                    errorMessage: `Interrupted by a restart ${attempt - 1} times while running; it is not started again.`
+                }
+                : { status: 'pending' as const, attempt, errorCode: null, errorMessage: null, ...released };
+            await db.run(UPDATE.entity(BackgroundJobs).set(patch).where({ ID: row.ID, status: 'running' }));
+        }
         // Jobs without a stored command cannot be rebuilt.
         await db.run(
             UPDATE.entity(BackgroundJobs)
@@ -263,12 +263,15 @@ async function finalizeIdentifierKeyedJob(
     const now = new Date().toISOString();
     const submission: PendingSubmission | undefined = await db.run(SELECT.one.from(PendingSubmissions).where(attemptRowOf(job)));
     const coordinates = parseSubmitIntent(submission?.submitIntentData);
+    // A sponsor job runs under the sponsor's session. Any other job without a recorded sponsor paid for itself and names none.
+    const sponsorJob = ['sponsorFinalized', 'sponsorUnbound'].includes(JOB_KINDS[job.kind ?? '']?.executor ?? '');
+    const feeSponsor = coordinates.feeSponsor ?? (sponsorJob ? job.sessionId : undefined);
     const canonicalResult = {
         txHash: job.txHash,
         circuits: Array.isArray(coordinates.circuits) && coordinates.circuits.length ? coordinates.circuits : (submission?.circuitName ? [submission.circuitName] : []),
         contractAddress: coordinates.contractAddress ?? submission?.contractAddress ?? '',
         ...(coordinates.note ? { note: coordinates.note } : {}),
-        feeSponsor: coordinates.feeSponsor ?? job.sessionId,
+        ...(feeSponsor ? { feeSponsor } : {}),
         reconciled: true
     };
     const terminal = opts.fromStatus === 'reconciliation_required' || opts.fromStatus === 'in_flight';

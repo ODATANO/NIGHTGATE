@@ -7,7 +7,7 @@ import { vaultRef, UINT64_MAX, vaultDims, parsePredicate, coerceMask, liveProvid
 import { blake2b256Hex, PureCircuitsUnavailableError } from '../document-proof';
 import { membershipPathFor, SET_DEPTH } from '../set-root';
 import { PredicateAttestations, type PredicateAttestation } from '#cds-models/midnight';
-import { startJobWithRows, readUnsignedArg, VALUE_EXCEEDS, THRESHOLD_EXCEEDS, parseValidUntil, SchemaSlotWire, OpeningWire, parseInclusionPath, inclusionPathOrThrow, type InclusionPath, validateSchemaSlots, validateOpening, isVacuousMask, INT64_MAX, parseDocPairInputs, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, runSubmission, landedOnChain } from './common';
+import { startJobWithRows, readUnsignedArg, VALUE_EXCEEDS, THRESHOLD_EXCEEDS, parseValidUntil, resolveClaimValidUntil, SchemaSlotWire, OpeningWire, parseInclusionPath, inclusionPathOrThrow, type InclusionPath, validateSchemaSlots, validateOpening, isVacuousMask, INT64_MAX, parseDocPairInputs, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, runSubmission, landedOnChain } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
 import { issueDocumentDiffAttestation, issueDocumentIntegrityAttestation, issueFieldEqualityAttestation, issueFieldMembershipAttestation, issueFieldPredicateAttestation, issueFieldPredicateAttestationBatch, verifyPredicateAttestation, type IssuedClaim } from '#cds-models/NightgateService';
@@ -115,7 +115,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'fieldPredicateWorkflow', predicateAttestationId, validUntil: validUntilArg,
+                    op: 'fieldPredicateWorkflow', predicateAttestationId, validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     predicate: data.predicate!, threshold: thresholdBig.toString(), opCode: op,
@@ -220,7 +220,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'fieldEqualityWorkflow', predicateAttestationId, validUntil: validUntilArg,
+                    op: 'fieldEqualityWorkflow', predicateAttestationId, validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     expectedDigest, salt: data.fieldSalt!.toLowerCase(), siblings: path.siblings, dirs: path.dirs,
@@ -369,7 +369,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'fieldMembershipWorkflow', predicateAttestationId, validUntil: validUntilArg,
+                    op: 'fieldMembershipWorkflow', predicateAttestationId, validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     setRoot, valueDigest, salt: data.fieldSalt!.toLowerCase(),
@@ -487,7 +487,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'documentIntegrityWorkflow', predicateAttestationId, validUntil: validUntilArg,
+                    op: 'documentIntegrityWorkflow', predicateAttestationId, validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(), attesterIdA, attesterIdB,
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     allowedMask,
@@ -599,7 +599,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'documentDiffWorkflow', predicateAttestationId, validUntil: validUntilArg,
+                    op: 'documentDiffWorkflow', predicateAttestationId, validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(), attesterIdA, attesterIdB,
                     contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
                     k: data.k!,
@@ -791,6 +791,14 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             }
         }
 
+        if (rejectIfMainnetBlocked(req)) return;
+        const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
+        if (!attesterId) return;
+        // A comparison without `attesterIdB` reads document B under the batch attester. Naming it makes equal claims equal.
+        for (const c of claims) {
+            if (c.predicate === 'documentIntegrity' || c.predicate === 'documentDiff') c.attesterIdB ??= attesterId;
+        }
+
         // Drop duplicate claims. Proving one twice only costs time.
         // The tuple has the same fields as the claim stored on-chain.
         const seenTuples = new Set<string>();
@@ -798,8 +806,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         for (const c of claims) {
             const tuple = c.predicate === 'bytesEquality' ? `${c.fieldKey}|eq|${c.expectedDigest}`
                 : c.predicate === 'setMembership' ? `${c.fieldKey}|set|${c.setRoot}`
-                : c.predicate === 'documentIntegrity' ? `${c.attesterIdB ?? ''}|${c.payloadHashB}|integ|${c.allowedMask}`
-                : c.predicate === 'documentDiff' ? `${c.attesterIdB ?? ''}|${c.payloadHashB}|diff|${c.k}`
+                : c.predicate === 'documentIntegrity' ? `${c.attesterIdB}|${c.payloadHashB}|integ|${c.allowedMask}`
+                : c.predicate === 'documentDiff' ? `${c.attesterIdB}|${c.payloadHashB}|diff|${c.k}`
                 : `${c.fieldKey}|${c.threshold}|${c.opCode}`;
             if (seenTuples.has(tuple)) continue;
             seenTuples.add(tuple);
@@ -807,12 +815,9 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         }
         const droppedDuplicates = claims.length - uniqueClaims.length;
 
-        if (rejectIfMainnetBlocked(req)) return;
         // Each claim counts against the rate limit, so a batch cannot bypass it.
         if (!checkRateClass('prove', data.sessionId, req, uniqueClaims.length)) return;
 
-        const attesterId = await resolveAttester(req, data.sessionId, data.attesterId, Boolean(data.contentRoot));
-        if (!attesterId) return;
         const insertedAt = new Date().toISOString();
         const rowedClaims = uniqueClaims.map(c => ({ ...c, predicateAttestationId: cds.utils.uuid() }));
         const insertRows = INSERT.into(PredicateAttestations).entries(rowedClaims.map(c => ({
@@ -881,7 +886,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                         value: c.value, expectedDigest: c.expectedDigest,
                         setRoot: c.setRoot, valueDigest: c.valueDigest,
                         salt: c.salt, siblings: c.siblings, dirs: c.dirs,
-                        payloadHashB: c.payloadHashB, attesterIdB: c.attesterIdB, allowedMask: c.allowedMask, k: c.k,
+                        payloadHashB: c.payloadHashB, attesterIdB: c.attesterIdB === attesterId ? undefined : c.attesterIdB, allowedMask: c.allowedMask, k: c.k,
                         schema: c.schema, openingA: c.openingA, openingB: c.openingB
                     })),
                     feeSponsor: sponsor?.sponsorSessionId ?? null
@@ -891,7 +896,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 commandVersion: 1,
                 encryptCommand: true,
                 command: {
-                    op: 'fieldPredicateBatchWorkflow', validUntil: validUntilArg,
+                    op: 'fieldPredicateBatchWorkflow', validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHash: data.payloadHash!.toLowerCase(),
                     attesterId,
                     contractAddress: data.contractAddress!,

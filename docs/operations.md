@@ -184,11 +184,11 @@ The crawler runs on the main thread and catches up unthrottled. The image ships 
 3. Start with admin `resumeCrawler`, stop with `pauseCrawler`. Neither survives a restart. `NIGHTGATE_CRAWLER_ENABLED` decides at boot.
 4. Watch the `Catch-up:` log line and `SyncState.blocksPerSecond`.
 
-`startHeight` applies only while the index is empty. Once blocks exist, a restart resumes at the cursor.
+`startHeight` applies only while the index is empty. Once blocks exist, a restart resumes at the cursor. Unset, the index starts at block 2 with block 1 as its anchor. A value below 2 is raised to 2, because block 0 has no events and cannot be stored.
 
 ### Removing a fee sponsor
 
-A session in `NIGHTGATE_FEE_SPONSOR_SESSION` never expires. Taken out of the list, it expires one session lifetime later (`sessionTtlMs`, default 24 h), and the cleanup then deletes its encrypted seed. Using that wallet again needs its mnemonic, so keep the mnemonic before you remove a sponsor. The boot log names each key-holding session with its expiry.
+A session in `NIGHTGATE_FEE_SPONSOR_SESSION` never expires, and while it is listed it only pays fees: it cannot send NIGHT, register for dust generation or act in any contract call. Take it out of the list to use it as a wallet again. Taken out of the list, it expires one session lifetime later (`sessionTtlMs`, default 24 h), and the cleanup then deletes its encrypted seed. Using that wallet again needs its mnemonic, so keep the mnemonic before you remove a sponsor. The boot log names each key-holding session with its expiry.
 
 ### Reorgs and reindexing
 
@@ -224,6 +224,7 @@ The restored snapshot is behind its own state, so every replayed event is reject
 The wallet has less DUST than the fee. Compare `getWalletBalance(sessionId).dustBalance` with the fee estimate.
 
 - No NIGHT registered for dust: run `registerForDustGeneration`. Dust arrives after about two minutes.
+- Coins or dust stay reserved after a failed send: the outcome was unknown, so the transaction may still land. They are free again once it landed and the wallet synced, or once the chain is past its expiry. A send the node refused frees them at once.
 - Wallet at its dust cap: wait, or hold more NIGHT.
 - Wedged wallet: `registeredNightUtxoCount > 0` with `dustUtxoCount`, `dustPendingCount` and `dustBalance` at 0 across restarts. Stop the server, delete the wallet's `WalletSyncStates` row and reconnect.
 

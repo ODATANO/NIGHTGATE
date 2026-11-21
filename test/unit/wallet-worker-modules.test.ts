@@ -151,6 +151,76 @@ describe('rotation drain', () => {
             vi.useRealTimers();
         }
     });
+
+    /** The main thread confirms every save it is pushed. */
+    function ackEverySave() {
+        const base = fakeParentPort.postMessage.getMockImplementation()!;
+        fakeParentPort.postMessage.mockImplementation((m: any) => {
+            base(m);
+            if (m?.kind === 'state-save') void handleMessage({ kind: 'state-save-ack', sessionId: m.sessionId, seq: m.seq });
+        });
+    }
+
+    it('shutdown with a budget ends the drain early enough to leave time for the saves', async () => {
+        vi.useFakeTimers();
+        try {
+            facades.set('s-budget', entryFor('s-budget'));
+            ackEverySave();
+            rotationState.inflight = 1;
+            // 30 s in all: the drain may take 15 s, the rest is for the saves.
+            const done = shutdown({ budgetMs: 30_000 });
+            await vi.advanceTimersByTimeAsync(14_000);
+            expect(facades.has('s-budget')).toBe(true);
+            await vi.advanceTimersByTimeAsync(2_000);
+            expect(await done).toEqual({ evicted: 1, failed: 0 });
+            expect(fakeParentPort.posted.some(m => m.kind === 'state-save' && m.sessionId === 's-budget')).toBe(true);
+        } finally {
+            rotationState.inflight = 0;
+            vi.useRealTimers();
+        }
+    });
+
+    it('shutdown saves a wallet whose lock a submit still holds, and leaves its keys alone', async () => {
+        vi.useFakeTimers();
+        let release!: () => void;
+        try {
+            const entry = entryFor('s-held');
+            facades.set('s-held', entry);
+            ackEverySave();
+            const submit = withSessionLocks(['s-held'], () => new Promise<void>(resolve => { release = resolve; }));
+            rotationState.inflight = 1;
+            const done = shutdown({ budgetMs: 30_000 });
+            // Drain until 15 s, then the lock is waited for until 10 s before the end.
+            await vi.advanceTimersByTimeAsync(19_000);
+            expect(fakeParentPort.posted.some(m => m.kind === 'state-save')).toBe(false);
+            await vi.advanceTimersByTimeAsync(2_000);
+            expect(await done).toEqual({ evicted: 1, failed: 0 });
+            expect(fakeParentPort.posted.find(m => m.kind === 'state-save')).toMatchObject({ sessionId: 's-held', blobs: { shielded: 'sh-s-held', unshielded: 'un-s-held', dust: 'du-s-held' } });
+            expect(entry.zswapKeys.clear).not.toHaveBeenCalled();
+            expect(entry.facade.stop).not.toHaveBeenCalled();
+            release();
+            await submit;
+        } finally {
+            release?.();
+            rotationState.inflight = 0;
+            vi.useRealTimers();
+        }
+    });
+
+    it('shutdown without a budget waits for the lock, as a single unload does', async () => {
+        let release!: () => void;
+        const entry = entryFor('s-wait');
+        facades.set('s-wait', entry);
+        ackEverySave();
+        const submit = withSessionLocks(['s-wait'], () => new Promise<void>(resolve => { release = resolve; }));
+        const done = shutdown();
+        await new Promise(resolve => setTimeout(resolve, 150));
+        expect(fakeParentPort.posted.some(m => m.kind === 'state-save')).toBe(false);
+        release();
+        await submit;
+        expect(await done).toEqual({ evicted: 1, failed: 0 });
+        expect(entry.zswapKeys.clear).toHaveBeenCalled();
+    });
 });
 
 describe('evict during an in-flight submit', () => {

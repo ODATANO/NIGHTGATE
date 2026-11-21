@@ -1,5 +1,6 @@
 import cds from '@sap/cds';
 import { errorMessage } from './utils/errors';
+import { noteCrawlerRunning } from './utils/runtime-state';
 const { SELECT, UPDATE } = cds.ql;
 
 import { ensureNightgateModelLoaded } from './utils/cds-model';
@@ -108,6 +109,8 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
         this.on('pauseCrawler', async (req: Request) => {
             if (reindexInProgress()) return req.reject(409, REINDEX_RUNNING);
+            // A start under way would finish after this answer and leave the crawler running.
+            if (crawlerStarting) return req.reject(409, CRAWLER_STARTING);
             if (!isCrawlerRunning()) {
                 return {
                     status: 'ok',
@@ -155,6 +158,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
                     };
                 }
                 await startCrawler(this.resolveCrawlerStartConfig());
+                noteCrawlerRunning();
                 return {
                     status: 'ok',
                     running: true,

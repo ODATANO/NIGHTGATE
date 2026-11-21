@@ -84,6 +84,19 @@ describe('buildProofProvider', () => {
         expect(withoutWallet.provingModality).toBe('server');
     });
 
+    it("'auto' goes on to the proof server when the wallet has the method and refuses; 'wallet' fails with the wallet's reason", async () => {
+        // The SDK asks the wallet for its prover while it builds the provider, and passes a refusal on.
+        const refusing = { getProvingProvider: async () => { throw new Error('the user declined to prove'); } };
+        const asking = async (connector: any) => { await connector.getProvingProvider(); return { marker: 'wallet-proof-provider' } as any; };
+        dappConnectorProofProvider.mockImplementationOnce(asking).mockImplementationOnce(asking).mockImplementationOnce(asking);
+        const auto = await buildProofProvider({ proving: 'auto', connector: refusing, zkConfigProvider, proverServerUri: 'http://localhost:6300', proofMod });
+        expect(auto.provingModality).toBe('server');
+        await expect(buildProofProvider({ proving: 'wallet', connector: refusing, zkConfigProvider, proverServerUri: 'http://localhost:6300', proofMod }))
+            .rejects.toThrow('the user declined to prove');
+        // Without a proof server either, nothing can prove.
+        expect((await buildProofProvider({ proving: 'auto', connector: refusing, zkConfigProvider, proofMod })).provingModality).toBe('none');
+    });
+
     it("reports 'none' when neither modality is available, instead of throwing at assembly time", async () => {
         const res = await buildProofProvider({ connector: {}, zkConfigProvider, proofMod });
         expect(res.provingModality).toBe('none');

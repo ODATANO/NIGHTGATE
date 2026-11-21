@@ -10,6 +10,7 @@ LOG=${NIGHTGATE_WATCHDOG_LOG:-/root/nightgate-api/watchdog.log}
 GUARD=${NIGHTGATE_HOST_GUARD:-/root/host-guard.sh}
 CYCLE_GRACE=${NIGHTGATE_WATCHDOG_CYCLE_GRACE:-900}   # seconds a cycle counts as tried
 START_GRACE=${NIGHTGATE_WATCHDOG_START_GRACE:-900}   # seconds after a start in which no restart happens
+STOP_WAIT=${NIGHTGATE_WATCHDOG_STOP_WAIT:-90}       # seconds a server that still answers gets to save its wallet states
 
 now() { date -u +%FT%TZ; }
 
@@ -51,9 +52,22 @@ cycle_crawler() {
     sleep 3
     r=$(api POST "/odata/v4/midnight-indexer/resumeCrawler")
     echo "$(now) crawler cycle: pause -> $p | resume -> $r" >> "$LOG"
+    for answer in "$p" "$r"; do
+        case "$answer" in
+            403*) echo "$(now) crawler cycle refused: the server user needs the admin role, set NIGHTGATE_HTTP_ROLES=admin" >> "$LOG"; break ;;
+        esac
+    done
     case "$r" in
         200*) return 0 ;;
         *) return 1 ;;
+    esac
+}
+
+# A server that answers can handle the stop signal and saves its wallet states. One that does not answer cannot, so waiting helps nothing.
+stop_wait() {
+    case "$(api GET "/odata/v4/midnight-indexer/getLiveness()")" in
+        200*) echo "$STOP_WAIT" ;;
+        *) echo 5 ;;
     esac
 }
 
@@ -97,9 +111,10 @@ if [ -x "$GUARD" ] && ! msg=$("$GUARD"); then
     exit 0
 fi
 
-echo "$(now) unhealthy for $n checks, docker restart -t 5 $C" >> "$LOG"
+wait=$(stop_wait)
+echo "$(now) unhealthy for $n checks, docker restart -t $wait $C" >> "$LOG"
 logger -t nightgate-watchdog "unhealthy for $n checks, restarting $C"
-docker restart -t 5 "$C" >> "$LOG" 2>&1
+docker restart -t "$wait" "$C" >> "$LOG" 2>&1
 echo 0 > "$STATE"
 rm -f "$CYCLED"
 exit 0

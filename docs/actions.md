@@ -54,6 +54,8 @@ Every submit path persists the identifier as `txHash` before the broadcast. A `f
 | `PROCESS_RESTART_RECONCILE` | restart after the broadcast |
 | `CHILD_RECONCILIATION_REQUIRED` | a workflow step is on chain but a later step did not complete. Once every step succeeded the workflow runs again and reuses them |
 | `CHAIN_EXECUTION_FAILED_UNCONFIRMED` | on-chain failure whose block height the confirmer has not recorded yet |
+| `RESULT_PERSIST_FAILED` | the transaction was sent, but the job's result could not be stored |
+| `LEASE_EXPIRED` | the process that ran the job stopped reporting after the broadcast. A job in that state without `txHash` ends `failed` with the same code, as does one that was interrupted by more than three restarts |
 
 ### Receipts
 
@@ -108,6 +110,8 @@ Derives the session inputs without a session. Nothing is stored or logged. `dust
 
 Sends NIGHT, or the token `tokenTypeHex`. The address prefix picks the ledger: `mn_shield-addr_` pays from the shielded balance, `mn_addr_` from the unshielded one. `amount` is at most `10^18` atoms. `ttlIso` must lie in the future. Job result `{ txId, toLedger, amount, receiverAddress }`. Errors: 400 bad address, amount or ttl, 404 no session, 412 not signing. A job without funds fails with `Wallet.InsufficientFunds`. Rate class `wallet`.
 
+`sendNight`, `registerForDustGeneration` and `deregisterFromDustGeneration` wait until the wallet is at the tip of a fresh indexer, at most `NIGHTGATE_BALANCE_SYNC_TIMEOUT_MS`. A wallet that is still behind fails the job with `WALLET_NOT_SYNCED`, and nothing is built. Retry once `getWalletSyncProgress` says the wallet caught up.
+
 ### `estimateSendNightFee(sessionId, receiverAddress, amount, ttlIso?, tokenTypeHex?) → { fee, toLedger }`
 
 DUST fee in atoms for a `sendNight`. Builds the recipe in the worker without proof or submit. Rate class `read`.
@@ -136,8 +140,9 @@ Mints 100000000 atoms of the `shielded-token` test token (`@odatano/contract-shi
 Mints on the `token-factory` lineage (`@odatano/contract-token-factory`). The session is the issuer. Its issuer key derives from the session's seed, and the caller never sees the issuer secret. `domain` and `tokenType` follow from issuer key, name and factory address, so the same name from another session is another token. `recipientCoinPublicKey` is a zswap coin public key.
 
 - `contractAddress` defaults to `NIGHTGATE_TOKEN_FACTORY_CONTRACT`, which `getBoardStatus.factoryContract` names.
-- A token caller may leave out `sessionId`. The session that pays its sponsored jobs then mints and is the issuer.
-- A landed mint records the type in `LearnedTokenTypes` (at most 256) and, under a grant, in the grant's `mintedTokenTypes`.
+- The session that mints signs the mint and is the issuer. A token caller may leave out `sessionId` and mints as the wallet session of its grant.
+- A sponsor wallet pays the fee and never issues a token. A grant the platform pool pays for answers 403 and cannot list this action: build the mint with `@odatano/nightgate-tx` (`prepareMint`) and hand it to `sponsorUnboundTransaction`, then the caller's own key is the issuer.
+- A landed mint records the type in `LearnedTokenTypes` (at most 256, of which one grant holds at most 32) and, under a grant, in the grant's `mintedTokenTypes`.
 - Job result `{ submissionId, txHash, contractAddress, tokenType }`. 404 `TOKEN_FACTORY_UNAVAILABLE` without the lineage. Grantable, circuit `mint`. Rate class `sponsor`.
 
 ### `burnFactoryToken(contractAddress?, name, amount, issuerKey?, sessionId, idempotencyKey?, sponsorSessionId?) → { jobId, status, name, amount, issuerKey, domain, tokenType }`
@@ -165,7 +170,7 @@ Runs up to 8 circuit calls on one contract as one transaction. `calls` is a JSON
 - Segment ids are rewritten ascending in call order before proving. If that fails, the job aborts. `NIGHTGATE_BATCH_SEGMENT_MODE=observe` only logs.
 - Same-name circuits have no fixed order among themselves.
 - `independentCalls: true` orders calls by execution stage instead of call order. Use it only for calls that share no state.
-- Proof witnesses ride per call in `merkleProof`. Single-field circuits take `fieldValue` or `fieldDigest`, `fieldSalt`, `siblings` and `dirs`; membership adds `setProof`. The comparison circuit takes `docPair: { schema, openingA, openingB }`. A malformed bundle is 400.
+- Proof witnesses ride per call in `merkleProof`. Single-field circuits take `fieldValue` or `fieldDigest`, `fieldSalt`, `siblings` and `dirs`; membership adds `setProof`. The comparison circuit takes `docPair: { schema, openingA, openingB }`. Hashes in a bundle take `0x` and either letter case, like hex parameters. A malformed bundle is 400.
 
 **Ledger causality.** The SDK splits each call into a guaranteed and a fallible part by gas cost. The ledger applies all guaranteed parts first and rejects a fallible call followed by a guaranteed one (`1010/188`). Cost grows with contract state, so a call's stage can move. On the vault `attest` and `anchorContentRoot` stay guaranteed and `bindDocument` is fallible, so put `bindDocument` last. Both rules are checked before proving, and nothing is submitted on a refusal:
 
@@ -187,10 +192,12 @@ Each element of `args` is coerced by the circuit's parameter types from the arti
 | `Bytes<N>` | hex string, `0x` optional, or a `number[]` of bytes | `Uint8Array(N)`, length checked |
 | `Uint<N>` | number or decimal string | `BigInt` |
 | `Boolean` | `true` or `false` | boolean |
+| `Field` | number or decimal string | `BigInt` |
 | struct | object with every declared field, each encoded by its own type | object with coerced fields |
-| other (`Vector`, `Maybe`, `Either`) | the JSON value | unchanged |
+| `Vector<N, T>` | array of N values, each encoded by `T` | array with coerced entries, length checked |
+| other (`Maybe`, `Either`, `Opaque`) | the JSON value | unchanged |
 
-Without `contract-info.json`, untagged arguments are 400. Tagged values always work: `{ "$bytes": "<hex>" }` and `{ "$uint": "<decimal>" }`. Invalid hex, a wrong length, a negative or non-integer `Uint` or a missing struct field is 400 naming `args[i]`.
+Without `contract-info.json`, untagged arguments are 400. Tagged values work there: `{ "$bytes": "<hex>" }` and `{ "$uint": "<decimal>" }`. With it, a tag must fit the parameter: `$bytes` on a `Uint` is 400. Also 400, naming `args[i]` where one argument is at fault: invalid hex, a wrong length, a negative or non-integer `Uint`, a missing struct field, a wrong number of arguments, and a circuit the contract does not have (the message lists its circuits).
 
 ```jsonc
 "args": "[\"<64-hex document_id>\", {\"$bytes\":\"<64-hex payload_hash>\"}]"
@@ -221,7 +228,7 @@ Takes the proven and signed transaction from txbuilder `buildSponsorable({ bind:
 
 ### `sponsorSwap(makerHalfB64 | offerId, takerHalfB64, idempotencyKey?, takerSecret?) → { jobId, status, sessionId }`
 
-Sponsors a shielded swap without a contract. Each half is a proven transaction, for example from the wallet SDK's `initSwap(..., { payFees: false })`, given as an offer file (`swapoffer1...`, bech32m) or base64. A bound half binds the other one. The worker checks both, merges them, adds dust and submits. Job result `{ txHash, circuits: ["<swap>"], note, swap: { gives, wants } }` from the maker's side, each `{ tokenType, amount }`. Rate class `sponsor`.
+Sponsors a shielded swap without a contract. Each half is a proven transaction, for example from the wallet SDK's `initSwap(..., { payFees: false })`, given as an offer file (`swapoffer1...`, bech32m) or base64. A bound half binds the other one. The worker checks both, merges them, adds dust and submits. With `offerId` the offer must still be open when the swap is sent, see `retireSwapOffer`. Job result `{ txHash, circuits: ["<swap>"], note, swap: { gives, wants } }` from the maker's side, each `{ tokenType, amount }`. Rate class `sponsor`.
 
 Off unless `NIGHTGATE_SPONSOR_ALLOW_SWAPS` (policy file `allowSwaps`) is set, and a token needs `sponsorSwap` in `allowedActions`. Refused unless:
 
@@ -260,8 +267,10 @@ An empty list means no restriction. Whoever reaches the endpoint can then make y
 - **Contract mints.** With `NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS` a type needs no list entry while a call of the same transaction mints it. A landed mint lists the type for its grant, or for every grant with `NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES`.
 - **Sponsored deploys.** Grant `allowDeploy` with `maxDeploys` (default 1, lifetime) and `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` let the sponsor pay a deploy the caller built. Ceiling `NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES` (default 40960). A node reject refunds the budget. The landed address joins the grant's `deployedContracts`. Maintenance updates are never sponsored.
 - **Unshielded offers.** Grant `allowUnshieldedOffers` and `NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS` let a call move the caller's own NIGHT or `allowedUnshieldedTokenTypes` into the called contract, and pay out what the contract's proven result requires. The sponsor adds dust only. The job result lists `unshielded: [{ type, amount, to }]`. A grant that also holds `sponsorTransfer` may send these types to any address, see `sponsorTransfer` above.
-- **Value budgets.** Grant `maxValuePerDay` caps the atoms moved per UTC day and type by swaps, transfers, mints and burns. Over it is 429 `grant-value`.
+- **Value budgets.** Grant `maxValuePerDay` caps the atoms moved per UTC day and type by swaps, transfers, mints and burns. Over it is 429 `grant-value`. For a shielded transfer the budget counts the amount the caller declares, because the transaction does not show it. Tokens that a sponsored contract call moves through an unshielded offer are not counted.
 - **Cost.** The sponsor asks the ledger for the cost of the finished transaction before it sends it. One the node would refuse fails with `SPONSOR_REFUSED` and the ledger's reason: over the time to dismiss for its size, or over a block limit. `sponsorUnboundTransaction`, `sponsorSwap` and `sponsorTransfer` check before the dust spend is proven.
+
+**A sponsor only pays.** A session listed in `NIGHTGATE_FEE_SPONSOR_SESSION` pays fees and does nothing else. As `sessionId` it is accepted by `connectWalletForSigning`, `disconnectWallet`, `getWalletBalance`, `getWalletSyncProgress` and `getJobStatus`. Every action that signs, moves coins or registers answers 403, for the owner of the wallet too. A grant bound to it can list only the sponsor actions and the offer board actions. A sponsor holds no NIGHT of its own: another wallet delegates its dust with `registerForDustGeneration` and the sponsor's dust address as `dustReceiverAddress`.
 
 **Pool.** `NIGHTGATE_FEE_SPONSOR_SESSION` sessions form a pool with one in-flight dust spend per wallet. Callers wait up to `NIGHTGATE_SPONSOR_LEASE_WAIT_MS` (default 120 s). A failing sponsor is benched for `NIGHTGATE_SPONSOR_COOLDOWN_MS` and the job tries the next. Pool jobs run under the session id `00000000-0000-0000-0000-706f6f6c0000`.
 
@@ -318,6 +327,8 @@ One offer in the board's shape, open or closed. 404 when unknown. Rate class `re
 ### `retireSwapOffer(offerId) → { offerId, status }`
 
 Only the poster, the same user or grant. A closed offer answers 200 with its status. The poster's wallet keeps the coins reserved until it reverts the half. Rate class `compute`.
+
+Retiring also stops a take that was accepted and is not sent yet. The take's job checks the offer when it starts and again right before the send, and fails with `swap offer <id> is retired, so the swap was not sent`. A swap that was already sent cannot be stopped: it lands, and the offer then reads `filled`. An offer that expires while its take waits stops the take the same way.
 
 ## Documents
 
@@ -404,6 +415,8 @@ Everything checked here is recomputable from public data: the claim key is a `pe
 
 Checks the attester's record of `payloadHash` and, when given, its content root and schema id. A bound `documentId` replaces `attesterId` and `payloadHash`, and the answer names the attester. An anchor is the attester's own statement, so check `attesterId` against identities you trust. An unregistered document id is first come, first served. `bindingRegistered: true` says the registrar assigned the id to this attester.
 
+All three verify functions read the contract from the indexer. When it cannot serve the state they answer 502 `BAD_GATEWAY` with `Retry-After` and the indexer's reason, never `verified: false`. A contract whose state was last written under ledger 8 answers 409 `CONFLICT`.
+
 ### `verifyPredicateState(contractAddress, attesterId, payloadHash, fieldKey?, predicate, threshold?, expectedDigest?, setRoot?, payloadHashB?, attesterIdB?, allowedMask?, k?, compiledArtifactRef?, network?) → { verified, proven }` (function)
 
 Recomputes the claim key from the given coordinates and checks `claims` for an unexpired entry. The inputs must be exactly those of the proof, including the A and B order. The key embeds the record's current anchor, so a claim under a former anchor verifies false. Anyone holding the opening may prove the same claim again and extend its expiry. The attester withdraws claims by retracting the record.
@@ -426,7 +439,7 @@ Removes the grantee's entry. Attester only. Job result `{ payloadHash, grantee, 
 
 ### `reindexDisclosures(contractAddress, compiledArtifactRef?) → { contractAddress, active, deactivated, reconciledAt }`
 
-Updates `DisclosureGrants` from live state, for example after a grant submitted outside this server. Without a live provider `active` is zero. Rate class `compute`, per contract.
+Updates `DisclosureGrants` from live state, for example after a grant submitted outside this server. Without a live provider, and for a contract that is no vault, `active` is zero. Rate class `compute`, per contract.
 
 ### `registerPassport(documentId, passportId?, ownerId, mode?, sessionId, contractAddress, compiledArtifactRef?, idempotencyKey?, sponsorSessionId?) → { jobId, status }`
 
@@ -452,7 +465,7 @@ Removes an expired claim (`kind: 'claim'`, `key` the claim key). Any session may
 
 ### `registerGranteeIdentity(bindingInput, scope?) → { ID, granteeId, bindingKind }`
 
-Links the caller to the grantee id that grants name. `granteeBinding` (default `wallet`) sets the input: a coin public key, a DID for `did`, or the 64-hex id for `custom`. `scope` narrows the link to one contract or attestation. Idempotent per user and scope. Proving ownership of the input is the consumer's policy.
+Links the caller to the grantee id that grants name. `granteeBinding` (default `wallet`) sets the input: a coin public key, a DID for `did`, or the 64-hex id for `custom`. A key or an id takes `0x` and either letter case. A DID is hashed as the text it is, so its spelling is part of the id. `scope` narrows the link to one contract or attestation. Idempotent per user and scope. Proving ownership of the input is the consumer's policy.
 
 ## Disclosure to token holders
 
@@ -468,7 +481,7 @@ Grantor only. Rate class `compute`.
 
 ### `claimDisclosure(payloadHash, tokenType, claimSecret) → { entitled, reason, payloadHash, tokenType, registryAddress, holderGrantId, contentType, contentHashKind, content, expiresAt, registries }`
 
-Computes the claim key from `claimSecret`, reads the registry live and returns the stored text, or `entitled: false` with a `reason` and the `registries` checked. 503 without a live indexer. Every token may call it. Rate class `compute`.
+Computes the claim key from `claimSecret`, reads the registry live and returns the stored text, or `entitled: false` with a `reason` and the `registries` checked. A registry that holds another contract counts as not registered. `entitled: false` is answered only when every registry was read; otherwise the read error is returned, 502 `BAD_GATEWAY` for an indexer that cannot serve the state. 503 without a live indexer. Every token may call it. Rate class `compute`.
 
 ## Diagnostics
 
@@ -545,7 +558,7 @@ The last `limit` reorgs (default 10, at most 100).
 
 ### `pauseCrawler()`, `resumeCrawler() → { status, running, message }`
 
-`resumeCrawler` starts the crawler whatever `NIGHTGATE_CRAWLER_ENABLED` says and retries a block latched as unindexable. Neither survives a restart.
+`resumeCrawler` starts the crawler whatever `NIGHTGATE_CRAWLER_ENABLED` says and retries a block latched as unindexable. Neither survives a restart. `pauseCrawler` answers 409 while a crawler start is running. When the crawler could not start at boot because the node did not answer, the server refuses write actions with 503 until a `resumeCrawler` succeeds.
 
 ### `reindexFromHeight(height) → { status, message, requestedHeight, effectiveStartHeight, blocksRolledBack, transactionsRolledBack, crawlerResumed }`
 

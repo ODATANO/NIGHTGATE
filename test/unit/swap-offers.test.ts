@@ -115,6 +115,22 @@ describe('offer board over HTTP', () => {
         expect((await list({ limit: 0 }, asA)).status).toBe(400);
     });
 
+    it('a tag matches whole tags only, also with characters a pattern would read as wildcards', async () => {
+        const T_ODD = 'e1'.repeat(32);
+        describeAs({ gives: [T_ODD, '1'], wants: [T_CERT, '1'], nullifiers: [nullifier(23)] });
+        const fish = await post('postSwapOffer', { offer: halfText(31), tags: ['goldfish', '50%_off'] }, asA);
+        describeAs({ gives: [T_ODD, '2'], wants: [T_CERT, '1'], nullifiers: [nullifier(24)] });
+        const gold = await post('postSwapOffer', { offer: halfText(32), tags: ['gold', '50x_off'] }, asA);
+        expect(fish.status).toBe(200); expect(gold.status).toBe(200);
+        const ids = async (tag: string) => (await list({ givesType: T_ODD, tag: encodeURIComponent(tag) }, asA)).data.value.map((o: any) => o.offerId);
+
+        expect(await ids('gold')).toEqual([gold.data.offerId]);
+        expect(await ids('goldfish')).toEqual([fish.data.offerId]);
+        expect(await ids('50%_off')).toEqual([fish.data.offerId]);
+        expect(await ids('fish')).toEqual([]);
+        expect(await ids('GOLD')).toEqual([]);
+    });
+
     it('only the poster retires; a token retires its own grant\'s offers and reads the board without an allow-list entry', async () => {
         describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '10'], nullifiers: [nullifier(31)] });
         const byToken = await post('postSwapOffer', { offer: halfText(5) }, asToken);
@@ -167,6 +183,46 @@ describe('offer board over HTTP', () => {
         await new Promise(r => setTimeout(r, 1600));
         expect((await list({ givesType: type, limit: 1 }, asA)).data.value.map((o: any) => o.offerId)).toEqual([open.data.offerId]);
         expect((await list({ givesType: type, tag: 'scarce', limit: 1 }, asA)).data.value.map((o: any) => o.offerId)).toEqual([open.data.offerId]);
+    });
+
+    it('a landed take says filled with its hash, also when the offer was retired or expired in between', async () => {
+        const db = await cds.connect.to('db');
+        const status = async (id: string) => db.run(cds.ql.SELECT.one.from('midnight.SwapOffers').columns('status', 'filledTxHash').where({ ID: id }));
+
+        describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '31'], nullifiers: [nullifier(61)] });
+        const retired = await post('postSwapOffer', { offer: halfText(21) }, asA);
+        expect((await post('retireSwapOffer', { offerId: retired.data.offerId }, asA)).data.status).toBe('retired');
+        expect(await offersModule.fillSwapOffer(db, retired.data.offerId, 'a1'.repeat(32))).toBe(true);
+        expect(await status(retired.data.offerId)).toMatchObject({ status: 'filled', filledTxHash: 'a1'.repeat(32) });
+
+        describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '32'], nullifiers: [nullifier(62)] });
+        const expired = await post('postSwapOffer', { offer: halfText(22), expiresAt: new Date(Date.now() + 1200).toISOString() }, asA);
+        await new Promise(r => setTimeout(r, 1300));
+        expect((await post('retireSwapOffer', { offerId: expired.data.offerId }, asA)).data.status).toBe('expired');
+        expect(await offersModule.fillSwapOffer(db, expired.data.offerId, 'a2'.repeat(32))).toBe(true);
+        expect(await status(expired.data.offerId)).toMatchObject({ status: 'filled', filledTxHash: 'a2'.repeat(32) });
+
+        // A second landing report changes nothing, and retiring still only closes an open offer.
+        expect(await offersModule.fillSwapOffer(db, expired.data.offerId, 'a3'.repeat(32))).toBe(false);
+        expect(await offersModule.closeSwapOffer(db, retired.data.offerId, 'retired')).toBe(false);
+        expect(await status(expired.data.offerId)).toMatchObject({ status: 'filled', filledTxHash: 'a2'.repeat(32) });
+    });
+
+    it('a take is carried out only while its offer is open: retired, expired and unknown offers refuse it', async () => {
+        const db = await cds.connect.to('db');
+        describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '41'], nullifiers: [nullifier(63)] });
+        const open = await post('postSwapOffer', { offer: halfText(23) }, asA);
+        await expect(offersModule.requireOpenSwapOffer(db, open.data.offerId)).resolves.toBeUndefined();
+
+        await post('retireSwapOffer', { offerId: open.data.offerId }, asA);
+        await expect(offersModule.requireOpenSwapOffer(db, open.data.offerId))
+            .rejects.toMatchObject({ code: 'GONE', message: `swap offer ${open.data.offerId} is retired, so the swap was not sent` });
+
+        describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '42'], nullifiers: [nullifier(64)] });
+        const brief = await post('postSwapOffer', { offer: halfText(24), expiresAt: new Date(Date.now() + 1200).toISOString() }, asA);
+        await new Promise(r => setTimeout(r, 1300));
+        await expect(offersModule.requireOpenSwapOffer(db, brief.data.offerId)).rejects.toThrow(/is expired, so the swap was not sent/);
+        await expect(offersModule.requireOpenSwapOffer(db, '00000000-0000-4000-8000-00000000dead')).rejects.toThrow(/is unknown, so the swap was not sent/);
     });
 
     it('a landed nullifier closes every open half that spent it', async () => {
@@ -321,5 +377,17 @@ describe('offer board over HTTP', () => {
         expect(after.data).toMatchObject({ swapsToday: 0, sponsorsConfigured: 0, sponsorsReady: 0 });
         expect(Object.keys(after.data).sort()).toEqual(['@odata.context', 'asOf', 'factoryContract', 'offersFilledToday', 'openOffers', 'sponsorsConfigured', 'sponsorsReady', 'swapsToday', 'version']);
         expect(a.status).toBe(200);
+    });
+
+    it('getBoardStatus names the configured factory as bare lowercase hex, whatever the setting spells', async () => {
+        process.env.NIGHTGATE_TOKEN_FACTORY_CONTRACT = ` 0x${'AB'.repeat(32)} `;
+        try {
+            boardStatusModule.__resetBoardStatusForTests();
+            const res = await cap.axios.get('/odata/v4/midnight-indexer/getBoardStatus()', { validateStatus: () => true });
+            expect(res.data.factoryContract).toBe('ab'.repeat(32));
+        } finally {
+            delete process.env.NIGHTGATE_TOKEN_FACTORY_CONTRACT;
+            boardStatusModule.__resetBoardStatusForTests();
+        }
     });
 });

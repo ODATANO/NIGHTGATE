@@ -7,7 +7,8 @@ import { parseExtrinsicCall } from '../utils/scale';
 import { extractLedgerPayload, carriesShieldedCoins, carriesProof, callFreeTxType, type LedgerPayloadFacts } from './ledger-payload';
 import { readCapBinary } from './cap-binary';
 import { replaceTransactionIdentifiers } from './transaction-identifiers';
-import { advancePassCursor, blocksInRange, readPassWindow, windowIsEmpty, PassPause, type PassPosition } from './cursor-pass';
+import { advancePassCursor, blocksInRange, readPassWindow, windowIsEmpty, writeInGeneration, PassPause, type PassPosition } from './cursor-pass';
+import { WorkerRpcUnansweredError } from '../midnight/worker-rpc/client';
 import { Transactions, ContractActions, type Transaction, type ContractAction } from '#cds-models/midnight';
 import type { DbRunner, Row } from '../utils/db-types';
 
@@ -38,11 +39,15 @@ const EMPTY_RUN: DecodeRunResult = { blocks: 0, transactions: 0, decoded: 0, abs
 /** Mirrors the PayloadDecodeState enum in db/types.cds. */
 type DecodeState = 'decoded' | 'absent' | 'failed';
 
+/** How often one transaction may leave the worker without an answer before it is stored as failed. */
+const MAX_UNANSWERED_TRIES = 3;
+
 export class LedgerPayloadDecoder {
     private db!: cds.DatabaseService;
     private running = false;
     private loop: Promise<void> | null = null;
     private readonly pause = new PassPause();
+    private readonly unansweredTries = new Map<string, number>();
 
     constructor(private readonly config: LedgerDecoderConfig) {}
 
@@ -75,6 +80,17 @@ export class LedgerPayloadDecoder {
         }
     }
 
+    /** False once the worker left this transaction unanswered too often. Then it is stored as failed, so one payload cannot hold up the pass. */
+    private mayTryAgain(transactionId: string): boolean {
+        const tries = (this.unansweredTries.get(transactionId) ?? 0) + 1;
+        if (tries >= MAX_UNANSWERED_TRIES) {
+            this.unansweredTries.delete(transactionId);
+            return false;
+        }
+        this.unansweredTries.set(transactionId, tries);
+        return true;
+    }
+
     async runOnce(): Promise<DecodeRunResult> {
         const window = await readPassWindow(this.db, 'lastDecodedHeight', this.config.lagBlocks);
         if (!window || windowIsEmpty(window)) return EMPTY_RUN;
@@ -89,7 +105,8 @@ export class LedgerPayloadDecoder {
 
         const result: DecodeRunResult = { ...EMPTY_RUN, blocks: blocks.length };
         for (const block of blocks) {
-            const perBlock = await this.decodeBlock(block.ID);
+            const perBlock = await this.decodeBlock(block.ID, start);
+            if (!perBlock) return EMPTY_RUN;
             result.transactions += perBlock.transactions;
             result.decoded += perBlock.decoded;
             result.absent += perBlock.absent;
@@ -106,7 +123,8 @@ export class LedgerPayloadDecoder {
         return result;
     }
 
-    private async decodeBlock(blockId: string): Promise<DecodeRunResult> {
+    /** Null when a rollback ran since the pass started and the block's results were dropped. */
+    private async decodeBlock(blockId: string, start: PassPosition): Promise<DecodeRunResult | null> {
         // All transactions of the block are decoded, even ones decoded before.
         // Only the cursor decides what is decoded, so resetting it decodes the range again.
         const rows: Row<Transaction, 'ID'>[] = await this.db.run(
@@ -140,20 +158,23 @@ export class LedgerPayloadDecoder {
             }
             try {
                 updates.push({ id: row.ID, facts: await this.config.decode(payload, row.protocolVersion ?? null), state: 'decoded', txType: (row as { txType?: string | null }).txType });
+                this.unansweredTries.delete(row.ID);
                 result.decoded++;
             } catch (err) {
+                // A worker that gave no answer says nothing about the payload. The pass ends and tries this block again.
+                if (err instanceof WorkerRpcUnansweredError && this.mayTryAgain(row.ID)) throw err;
                 log.warn(`transaction ${row.ID}: ledger payload did not decode: ${(err as Error).message}`);
                 updates.push({ id: row.ID, facts: null, state: 'failed', unknownFlags });
                 result.failed++;
             }
         }
 
-        await this.db.tx(async (tx) => {
+        const written = await writeInGeneration(this.db, start, 'ledger payload decode', async (tx) => {
             for (const update of updates) {
                 await this.applyFacts(tx, update.id, update.facts, update.state, update.txType, update.unknownFlags);
             }
         });
-        return result;
+        return written ? result : null;
     }
 
     private async applyFacts(tx: DbRunner, transactionId: string, facts: LedgerPayloadFacts | null, state: DecodeState, storedTxType?: string | null, unknownFlags = false): Promise<void> {

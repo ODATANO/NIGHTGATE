@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { coerceCircuitArgs } from '../arg-coercion';
 import { startJob } from '../background-jobs';
-import { vaultDims } from '../verify-state';
+import { UINT64_MAX, vaultDims } from '../verify-state';
 import { SET_DEPTH } from '../set-root';
-import { MerkleProofBundle, inclusionPathOrThrow, readArgsJson, type InclusionPath, validateSchemaSlots, validateOpening, facadeConfigFromEnv, rejectIfMainnetBlocked, runSubmission } from './common';
+import { MerkleProofBundle, inclusionPathOrThrow, readArgsJson, type InclusionPath, validateSchemaSlots, validateOpening, facadeConfigFromEnv, rejectIfMainnetBlocked, runSubmission, readUnsignedArg, VALUE_EXCEEDS, readHash32 } from './common';
 import type { SubmissionContext } from './context';
-import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
 import { buildSponsorable, deployContract, submitContractCall, submitContractCallBatch } from '#cds-models/NightgateService';
 import { checkRateClass } from '../../utils/rate-classes';
 
@@ -185,24 +184,19 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                     if (!mp || typeof mp !== 'object') throw new Error(`calls[${i}].merkleProof must be an object`);
                     let fieldValueStr: string | undefined;
                     if (mp.fieldValue !== undefined) {
-                        let fieldValueBig: bigint;
-                        try { fieldValueBig = BigInt(mp.fieldValue as string | number | bigint); } catch { throw new Error(`calls[${i}].merkleProof.fieldValue must be an integer (decimal string)`); }
-                        if (fieldValueBig < 0n) throw new Error(`calls[${i}].merkleProof.fieldValue must be a non-negative integer`);
+                        const fieldValueBig = readUnsignedArg(mp.fieldValue, `calls[${i}].merkleProof.fieldValue`, UINT64_MAX, VALUE_EXCEEDS);
+                        if (typeof fieldValueBig === 'string') throw new Error(fieldValueBig);
                         fieldValueStr = fieldValueBig.toString();
                     }
                     let fieldDigest: string | undefined;
                     if (mp.fieldDigest !== undefined) {
-                        if (typeof mp.fieldDigest !== 'string' || !HEX64_ANY_CASE_RE.test(mp.fieldDigest)) {
-                            throw new Error(`calls[${i}].merkleProof.fieldDigest must be 64 hex chars (32 bytes)`);
-                        }
-                        fieldDigest = mp.fieldDigest.toLowerCase();
+                        fieldDigest = readHash32(mp.fieldDigest);
+                        if (!fieldDigest) throw new Error(`calls[${i}].merkleProof.fieldDigest must be 64 hex chars (32 bytes)`);
                     }
                     let fieldSalt: string | undefined;
                     if (mp.fieldSalt !== undefined) {
-                        if (typeof mp.fieldSalt !== 'string' || !HEX64_ANY_CASE_RE.test(mp.fieldSalt)) {
-                            throw new Error(`calls[${i}].merkleProof.fieldSalt must be 64 hex chars (32 bytes)`);
-                        }
-                        fieldSalt = mp.fieldSalt.toLowerCase();
+                        fieldSalt = readHash32(mp.fieldSalt);
+                        if (!fieldSalt) throw new Error(`calls[${i}].merkleProof.fieldSalt must be 64 hex chars (32 bytes)`);
                     }
                     const path = inclusionPathOrThrow(mp.siblings, mp.dirs, rawBatchDepth,
                         { siblings: `calls[${i}].merkleProof.siblings`, dirs: `calls[${i}].merkleProof.dirs` });

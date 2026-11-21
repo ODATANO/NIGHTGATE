@@ -3,12 +3,15 @@ export declare class NightgateApiError extends Error {
     code: string | undefined;
     /** Seconds the server asked to wait, from `Retry-After`; set on 429 and on retryable 503s. */
     retryAfterSeconds: number | undefined;
+    /** The key this client made for a write that failed to start, also after its one repeat. Repeat the call with it, so a job the server did start is not started twice. */
+    idempotencyKey?: string;
 }
 
 /** Server error codes a client may retry unchanged. */
 export declare const RETRYABLE_ERROR_CODES: ReadonlySet<string>;
 
-/** Whether a failed call may be retried unchanged. Checks the error code, then the HTTP status, then network errors. */
+/** Whether a failed call may be retried unchanged. Checks the error code, then the HTTP status, then network errors.
+ *  False for a write that got no answer of the server itself and carries `idempotencyKey`: repeat that one with the key. */
 export declare function isRetryable(err: unknown): boolean;
 
 export declare class NightgateJobError extends Error {

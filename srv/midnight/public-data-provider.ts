@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import WebSocket from 'ws';
 import { loadMidnightSdk } from './sdk-loader';
 import { configNumber } from '../utils/config';
+import { NightgateError, messageWithoutUrls } from '../utils/errors';
 import type { ContractState } from '@midnight-ntwrk/compact-runtime';
 import type { PublicDataProvider } from '@midnight-ntwrk/midnight-js-types';
 
@@ -20,7 +21,7 @@ type ContractStateRead = NonNullable<Awaited<ReturnType<ContractStateReader['que
 
 function ledger9State(read: ContractStateRead): ContractStateRead['contractState'] {
     const serialized = read.contractState;
-    if (serialized.era !== 'v9') throw new Error(`contract state written by ledger ${String(serialized.era)}: this server reads ledger 9 states only`);
+    if (serialized.era !== 'v9') throw new NightgateError('CONFLICT', `contract state written by ledger ${String(serialized.era)}: this server reads ledger 9 states only`);
     return serialized;
 }
 
@@ -85,7 +86,9 @@ export function queryLedger9ContractState(reader: ContractStateReader, contractA
     const running = pending.get(key);
     if (running) return running;
     const started = (async () => {
-        const read = await reader.queryContractState(contractAddress, at);
+        const read = await reader.queryContractState(contractAddress, at).catch((err: unknown) => {
+            throw new NightgateError('BAD_GATEWAY', `indexer could not serve the state of contract ${contractAddress.toLowerCase()}: ${messageWithoutUrls(err, '<indexer>')}`, { cause: err });
+        });
         return read ? decodedStateOf(contractAddress.toLowerCase(), read, at === undefined) : null;
     })().finally(() => pending.delete(key));
     pending.set(key, started);

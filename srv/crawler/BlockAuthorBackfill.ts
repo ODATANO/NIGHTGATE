@@ -27,6 +27,8 @@ export interface AuthorBackfillConfig {
 const YIELD_EVERY = 20;
 const PROGRESS_LOG_EVERY = 50_000;
 
+const MAX_RETRY_MS = 3_600_000;
+
 export class BlockAuthorBackfill {
     private db!: cds.DatabaseService;
     private running = false;
@@ -51,14 +53,18 @@ export class BlockAuthorBackfill {
         if (this.running) return;
         this.running = true;
         this.loop = (async () => {
+            let failures = 0;
             while (this.running) {
                 try {
                     const rewrote = await this.runOnce();
+                    failures = 0;
                     if (rewrote === 'done') break;
                     if (rewrote > 0) await this.pause.sleep(this.config.intervalMs);
                 } catch (err) {
-                    log.warn(`block author backfill pass failed: ${errorMessage(err)}`);
-                    await this.pause.sleep(this.config.retryMs);
+                    // A node that pruned the old state fails every pass. The wait doubles, so the log is not filled.
+                    const wait = Math.min(this.config.retryMs * 2 ** failures++, MAX_RETRY_MS);
+                    log.warn(`block author backfill pass failed, next try in ${Math.round(wait / 1000)} s: ${errorMessage(err)}`);
+                    await this.pause.sleep(wait);
                 }
             }
             this.running = false;

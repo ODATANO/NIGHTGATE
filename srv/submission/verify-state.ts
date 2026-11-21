@@ -19,7 +19,7 @@ import {
     resolveOverrideIndexerEndpoints,
     getNightgateConfig
 } from '../utils/nightgate-config';
-import { errorMessage } from '../utils/errors';
+import { errorMessage, isNightgateError } from '../utils/errors';
 
 
 export const DEFAULT_ATTESTATION_VAULT_REF = 'attestation-vault';
@@ -116,12 +116,20 @@ export interface VerifyStateDeps {
     gate?: (req: ActionRequest<unknown, unknown>) => Promise<boolean> | boolean;
 }
 
+const VERIFY_RETRY_AFTER_S = 10;
+
 async function runVerify<T>(req: ActionRequest<unknown, unknown>, op: () => Promise<T>): Promise<T> {
     try {
         return await op();
     } catch (err) {
         if (err instanceof CoercionError) return req.reject(400, err.message);
         if (err instanceof ContractNotRegisteredError) return req.reject(404, err.message);
+        if (isNightgateError(err)) {
+            if (err.retryable) req.http?.res?.set?.('Retry-After', String(VERIFY_RETRY_AFTER_S));
+            // CAP hides 5xx messages in production. This one says whether a retry helps, so it stays.
+            const upstream = { status: err.status, code: err.code, message: err.message, $sanitize: false };
+            return req.reject(upstream);
+        }
         return req.reject(500, errorMessage(err));
     }
 }

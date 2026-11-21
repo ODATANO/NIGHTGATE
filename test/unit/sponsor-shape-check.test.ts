@@ -38,6 +38,13 @@ function check(t: any, bytes = 5000, contracts?: string[], circuits?: string[]) 
     return workerExports.checkSponsorableShape(t, bytes, contracts, circuits);
 }
 
+describe('offerNonEmpty', () => {
+    it('counts transient coins: an offer that holds only those is checked like any other', () => {
+        expect(workerExports.offerNonEmpty({ inputs: [], outputs: [], transients: [{}], deltas: new Map() })).toBe(true);
+        expect(workerExports.offerNonEmpty({ inputs: [], outputs: [], transients: [], deltas: new Map() })).toBe(false);
+    });
+});
+
 describe('swapHalfNullifiers', () => {
     it('reads the input nullifiers of the guaranteed offer, normalized and de-duplicated', () => {
         const n1 = 'ab'.repeat(32);

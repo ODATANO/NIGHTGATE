@@ -14,12 +14,12 @@ import { declaredJobKindTraits } from '../submission/job-kinds';
 import { mnemonicToBip39SeedHex } from '../utils/wallet-hd';
 import { deriveWalletInfo, resolveBip39SeedHex, deriveViewingKeyForAccount } from '../utils/wallet-info';
 import { resolveFeeSponsor, FeeSponsorError, getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
-import { isSessionExpired } from '../utils/session-expiry';
+import { isSessionExpired, isConfiguredPlatformSponsor, SPONSOR_ONLY_PAYS } from '../utils/session-expiry';
 import { checkRateClass } from '../utils/rate-classes';
 import { configMs, configNumber } from '../utils/config';
 import { syncGateReading } from '../submission/sponsor-sync-gate';
 
-import type { DbRunner, Row } from '../utils/db-types';
+import { affectedRows, type DbRunner, type Row } from '../utils/db-types';
 import { WALLET_COMMAND_KINDS, executeWalletCommand, checkSigningSession, loadSigningSessionAccountId, evictFacadeUnlessShared } from './wallet-session-lifecycle';
 import { errorMessage } from '../utils/errors';
 import { connectWallet, connectWalletForSigning, deregisterFromDustGeneration, disconnectWallet, getSponsorPoolStatus, getWalletSyncProgress, registerForDustGeneration, sendNight, deriveWalletInfo as deriveWalletInfoAction, getWalletBalance as getWalletBalanceAction, estimateSendNightFee as estimateSendNightFeeAction } from '#cds-models/NightgateService';
@@ -247,11 +247,13 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
 
         const encryptedSeedKey = encrypt(bip39SeedHex, encKey, walletSessionSeedBinding(session.sessionId));
 
-        await db.run(
+        // The session may have been closed during the derivation above. A closed row must not receive the seed, nothing would ever wipe it.
+        const stored = await db.run(
             UPDATE.entity(WalletSessions)
                 .set({ encryptedSeedKey, accountIndex: account })
-                .where({ sessionId, userId })
+                .where({ sessionId, userId, isActive: true })
         );
+        if (affectedRows(stored) !== 1) return req.reject(404, 'Session not found or inactive');
 
         if (prewarm === false) {
             return { sessionId, signingEnabled: true, prewarmJobId: null, prewarmStatus: null };
@@ -346,6 +348,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
 
         const { sessionId, dustReceiverAddress, idempotencyKey } = req.data;
         if (!sessionId) return req.reject(400, 'sessionId is required');
+        // A sponsor holds no NIGHT of its own. Other wallets name its dust address as their receiver.
+        if (isConfiguredPlatformSponsor(sessionId)) return req.reject(403, SPONSOR_ONLY_PAYS);
 
         const signing = await checkSigningSession(db, sessionId, userId);
         if (!signing.ok) return req.reject(signing.status, signing.msg);
@@ -370,6 +374,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
 
         const { sessionId, idempotencyKey, sponsorSessionId } = req.data;
         if (!sessionId) return req.reject(400, 'sessionId is required');
+        if (isConfiguredPlatformSponsor(sessionId)) return req.reject(403, SPONSOR_ONLY_PAYS);
 
         const signing = await checkSigningSession(db, sessionId, userId);
         if (!signing.ok) return req.reject(signing.status, signing.msg);
@@ -410,6 +415,7 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         const { sessionId, receiverAddress, amount, ttlIso, idempotencyKey, tokenTypeHex } = req.data;
 
         if (!sessionId) return req.reject(400, 'sessionId is required');
+        if (isConfiguredPlatformSponsor(sessionId)) return req.reject(403, SPONSOR_ONLY_PAYS);
         if (!receiverAddress) return req.reject(400, 'receiverAddress is required');
         if (!amount) return req.reject(400, 'amount is required');
         // The SDK compares token types as exact strings, and raw token types are lowercase.
@@ -670,15 +676,17 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
         if (!userId) return;
         if (!checkRateClass('read', 'read', req)) return;
 
-        const { sessionId, receiverAddress, amount, ttlIso } = req.data;
+        const { sessionId, receiverAddress, amount, ttlIso, tokenTypeHex } = req.data;
+        const tokenType = tokenTypeHex ? tokenTypeHex.toLowerCase() : undefined;
 
         if (!sessionId) return req.reject(400, 'sessionId is required');
+        if (isConfiguredPlatformSponsor(sessionId)) return req.reject(403, SPONSOR_ONLY_PAYS);
         if (!receiverAddress) return req.reject(400, 'receiverAddress is required');
         if (!receiverKind(receiverAddress)) {
             return req.reject(400, `receiverAddress must start with ${RECEIVER_PREFIXES}, got '${receiverAddress.slice(0, 24)}...'`);
         }
         if (!amount) return req.reject(400, 'amount is required');
-        const amountCheck = parseNightAmount(amount);
+        const amountCheck = parseNightAmount(amount, !!tokenType);
         if (!amountCheck.ok) return req.reject(400, amountCheck.msg);
         const ttlErr = futureTimeProblem(ttlIso, 'ttlIso');
         if (ttlErr) return req.reject(400, ttlErr);
@@ -692,7 +700,8 @@ export function registerWalletSessionHandlers(srv: cds.ApplicationService, db: D
                 receiverAddress,
                 amount,
                 ttlIso: ttlIso ?? undefined,
-                syncTimeoutMs: readSyncTimeoutMs()
+                syncTimeoutMs: readSyncTimeoutMs(),
+                tokenTypeHex: tokenType
             });
         } catch (err) {
             return rejectWorkerReadError(req, 'estimateSendNightFee', err);

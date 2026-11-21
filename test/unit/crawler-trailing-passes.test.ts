@@ -15,12 +15,13 @@ const decodeLedgerPayload = vi.fn();
 
 import { LedgerPayloadDecoder } from '../../srv/crawler/LedgerPayloadDecoder';
 import { IndexerSupplement, RATE_LIMIT_BACKOFF_MS } from '../../srv/crawler/IndexerSupplement';
-import { createIndexerClient } from '../../srv/crawler/indexer-supplement';
+import { createIndexerClient, type IndexerClient } from '../../srv/crawler/indexer-supplement';
 import { IndexerHttpError, isIndexerRateLimit } from '../../srv/utils/indexer-graphql';
 import { rollbackIndexedDataFromHeight } from '../../srv/crawler/rollback';
 import { redecodeFromHeight } from '../../srv/crawler/redecode';
 import { readCapBinary } from '../../srv/crawler/cap-binary';
 import { backfillTransactionIdentifiers } from '../../srv/crawler/transaction-identifiers';
+import { WorkerRpcUnansweredError } from '../../srv/midnight/worker-rpc/client';
 import {
     compactStoredContractState, contractStateAt, contractStatePolicy, IndexerBudgetExhausted, IndexerBehind, type ContractStatePolicy
 } from '../../srv/crawler/contract-state';
@@ -63,6 +64,18 @@ function midnightExtrinsicBase64(payloadLength: number): string {
 /** An extrinsic with no ledger payload at all (a system inherent). */
 function inherentBase64(): string {
     return Buffer.from([0x0c, 0x04, 1, 0]).toString('base64');
+}
+
+/** A fake indexer whose blocks carry the hash of the indexed block at that height, unless an answer names its own. */
+function agreeing(client: { fetchBlock: (height: number) => Promise<any> }): IndexerClient {
+    return {
+        fetchBlock: async (height: number) => {
+            // Read first: a fake may roll the index back while it answers.
+            const row = await db.run(cds.ql.SELECT.one.from(BLOCKS).columns('hash').where({ height }));
+            const answer = await client.fetchBlock(height);
+            return !answer || answer.hash !== undefined ? answer : { ...answer, hash: String(row?.hash ?? '').toLowerCase() };
+        }
+    };
 }
 
 /** `hash` in the node's spelling. The row holds it as the crawler stores it, without `0x`. */
@@ -390,14 +403,69 @@ describe('LedgerPayloadDecoder', () => {
     });
 });
 
+describe('a decode worker that gives no answer', () => {
+    const unanswered = () => new WorkerRpcUnansweredError("decode worker rpc 'decodeLedgerPayload' timed out after 60000ms");
+    // One decoder for all passes of a test: it counts the unanswered tries per transaction.
+    let decoder: LedgerPayloadDecoder;
+    const runDecoder = (): Promise<any> => decoder.runOnce();
+    beforeEach(async () => {
+        decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2, decode: (bytes: Uint8Array) => decodeLedgerPayload(bytes) });
+        await decoder.init(db);
+    });
+
+    it('ends the pass and tries the block again; the transaction is decoded once the worker answers', async () => {
+        const blockId = await seedBlock(10, '0xda1');
+        const txId = await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });
+        await setSync({ lastIndexedHeight: 30, lastDecodedHeight: 9 });
+        decodeLedgerPayload.mockRejectedValueOnce(unanswered()).mockRejectedValueOnce(unanswered()).mockResolvedValue(facts());
+
+        await expect(runDecoder()).rejects.toBeInstanceOf(WorkerRpcUnansweredError);
+        await expect(runDecoder()).rejects.toBeInstanceOf(WorkerRpcUnansweredError);
+        expect(Number((await readSync()).lastDecodedHeight)).toBe(9);
+        expect((await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).columns('payloadDecode').where({ ID: txId }))).payloadDecode ?? null).toBeNull();
+
+        expect((await runDecoder()).decoded).toBe(1);
+        expect((await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).columns('payloadDecode').where({ ID: txId }))).payloadDecode).toBe('decoded');
+    });
+
+    it('stores the transaction as failed after three tries, so one payload cannot hold up the pass', async () => {
+        const blockId = await seedBlock(10, '0xda2');
+        const txId = await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });
+        await setSync({ lastIndexedHeight: 30, lastDecodedHeight: 9 });
+        decodeLedgerPayload.mockRejectedValue(unanswered());
+        const warn = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+        try {
+            await expect(runDecoder()).rejects.toBeInstanceOf(WorkerRpcUnansweredError);
+            await expect(runDecoder()).rejects.toBeInstanceOf(WorkerRpcUnansweredError);
+            expect(await runDecoder()).toEqual(expect.objectContaining({ failed: 1 }));
+        } finally {
+            warn.mockRestore();
+        }
+        expect((await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).columns('payloadDecode').where({ ID: txId }))).payloadDecode).toBe('failed');
+        expect(Number((await readSync()).lastDecodedHeight)).toBe(10);
+    });
+
+    it('a payload the worker cannot decode is stored as failed at once', async () => {
+        const blockId = await seedBlock(10, '0xda3');
+        await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });
+        await setSync({ lastIndexedHeight: 30, lastDecodedHeight: 9 });
+        decodeLedgerPayload.mockRejectedValue(new Error('unknown transaction version'));
+        const warn = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+        try {
+            expect(await runDecoder()).toEqual(expect.objectContaining({ failed: 1 }));
+        } finally {
+            warn.mockRestore();
+        }
+    });
+});
+
 describe('IndexerSupplement', () => {
     function supplementWith(answers: Record<number, any>, contractState?: ContractStatePolicy): IndexerSupplement {
         const client = { fetchBlock: vi.fn(async (height: number) => answers[height] ?? null) };
         const pass = new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100, contractState },
-            client
+            agreeing(client)
         );
-        (pass as any).client = client;
         return pass;
     }
 
@@ -684,7 +752,7 @@ describe('cursor against a reorg', () => {
         };
         const pass = new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100 },
-            client
+            agreeing(client)
         );
         await pass.init(db);
         const info = vi.spyOn(cds.log('nightgate:crawler'), 'info').mockImplementation(() => {});
@@ -702,7 +770,7 @@ describe('cursor against a reorg', () => {
         const client = { fetchBlock: vi.fn(async (height: number) => ({ height, ledgerParameters: null, transactions: [] })) };
         const pass = new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100, maxBlocksPerSecond: 2 },
-            client
+            agreeing(client)
         );
         await pass.init(db);
         let clock = 1_000_000;
@@ -729,7 +797,7 @@ describe('cursor against a reorg', () => {
         };
         const pass = new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1000, lagBlocks: 2, requestTimeoutMs: 100 },
-            client
+            agreeing(client)
         );
         await pass.init(db);
         const waits: number[] = [];
@@ -758,7 +826,7 @@ describe('cursor against a reorg', () => {
         const client = { fetchBlock: vi.fn().mockRejectedValue(new IndexerHttpError(403)) };
         const pass = new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1000, lagBlocks: 2, requestTimeoutMs: 100 },
-            client
+            agreeing(client)
         );
         await pass.init(db);
         const warn = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
@@ -789,7 +857,7 @@ describe('cursor against a reorg', () => {
         };
         pass = new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100 },
-            client
+            agreeing(client)
         );
         await pass.init(db);
 
@@ -824,7 +892,7 @@ describe('a rollback that leaves the cursor where it was', () => {
         // Block 5 survives, so the fork lands exactly on the cursor.
         for (const h of [5, 6, 10]) await seedBlock(h, `0xg${h}`);
         const blockId = await seedBlock(11, '0xg11');
-        await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });
+        const txId = await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });
         await setSync({ lastIndexedHeight: 30, lastDecodedHeight: 5, reorgGeneration: 1 });
 
         const decoder = new LedgerPayloadDecoder({ batchSize: 10, intervalMs: 1, lagBlocks: 2, decode: (bytes: Uint8Array) => decodeLedgerPayload(bytes) });
@@ -848,6 +916,100 @@ describe('a rollback that leaves the cursor where it was', () => {
         expect(Number(sync.reorgGeneration)).toBe(2);
         // Still 5: blocks 6 upward are re-indexed and must be decoded again.
         expect(Number(sync.lastDecodedHeight)).toBe(5);
+        // The rollback removed the transaction. Its decoded identifiers are not written for a row that is gone.
+        expect(await identifierRowsOf(txId)).toEqual([]);
+    });
+
+    it('the supplement writes nothing for a transaction a rollback removed while the indexer answered', async () => {
+        for (const h of [5, 6]) await seedBlock(h, `0xk${h}`);
+        const blockId = await seedBlock(10, '0xk10');
+        const txId = await seedTransaction(blockId, { ledgerTxHash: 'f1' });
+        await setSync({ lastIndexedHeight: 30, lastSupplementedHeight: 5, reorgGeneration: 1 });
+
+        let rolledBack = false;
+        const client = {
+            fetchBlock: vi.fn(async (height: number) => {
+                if (height === 10 && !rolledBack) {
+                    rolledBack = true;
+                    // Only the counter moves here. The rows stay, so a write that came through would be visible.
+                    await db.run(cds.ql.UPDATE.entity(SYNC_STATE).set({ reorgGeneration: 2 }).where({ ID: 'SINGLETON' }));
+                }
+                return {
+                    height, ledgerParameters: height === 10 ? 'cGFyYW1z' : null,
+                    transactions: height === 10 ? [{
+                        ledgerTxHash: 'f1', status: 'SUCCESS', fee: '7', estimatedFee: '6', segments: [], contractActions: [],
+                        zswapEvents: [{ eventId: 3, maxId: 9, raw: null }], dustEvents: [], dustRegisteredOutputs: []
+                    }] : []
+                };
+            })
+        };
+        const pass = new IndexerSupplement(
+            { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100 },
+            agreeing(client)
+        );
+        await pass.init(db);
+        const info = vi.spyOn(cds.log('nightgate:crawler'), 'info').mockImplementation(() => {});
+        try {
+            expect(await pass.runOnce()).toEqual(expect.objectContaining({ blocks: 0 }));
+            expect(info).toHaveBeenCalledWith(expect.stringContaining('indexer supplement pass dropped a write'));
+        } finally {
+            info.mockRestore();
+        }
+
+        expect(await db.run(cds.ql.SELECT.from(ZSWAP_EVENTS).where({ transaction_ID: txId }))).toHaveLength(0);
+        const block = await db.run(cds.ql.SELECT.one.from(BLOCKS).columns('ledgerParameters').where({ ID: blockId }));
+        expect(block.ledgerParameters ?? null).toBeNull();
+        expect(Number((await readSync()).lastSupplementedHeight)).toBe(5);
+    });
+
+    it('the supplement stops at a block whose hash the indexer names differently, and goes on once they agree', async () => {
+        const first = await seedBlock(10, '0xaa10');
+        const second = await seedBlock(11, '0xaa11');
+        const txId = await seedTransaction(second, { ledgerTxHash: 'f2' });
+        await setSync({ lastIndexedHeight: 30, lastSupplementedHeight: 9 });
+
+        const foreign = { hash: 'ee11' };
+        const answers: Record<number, any> = {
+            10: { height: 10, ledgerParameters: 'cGFyYW1zLTEw', transactions: [] },
+            11: {
+                height: 11, ledgerParameters: 'cGFyYW1zLTEx', ...foreign,
+                transactions: [{
+                    ledgerTxHash: 'f2', status: 'SUCCESS', fee: null, estimatedFee: null, segments: [], contractActions: [],
+                    zswapEvents: [{ eventId: 1, maxId: 1, raw: null }], dustEvents: [], dustRegisteredOutputs: []
+                }]
+            }
+        };
+        const client = { fetchBlock: vi.fn(async (h: number) => answers[h] ?? null) };
+        const pass = new IndexerSupplement(
+            { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100 },
+            agreeing(client)
+        );
+        await pass.init(db);
+        const warn = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
+        try {
+            expect(await pass.runOnce()).toEqual(expect.objectContaining({ blocks: 1 }));
+            await pass.runOnce();
+            // Named once, however often the pass comes back to the same height within the hour.
+            const named = () => warn.mock.calls.filter(([m]) => String(m).includes('stopped at height 11'));
+            expect(named()).toHaveLength(1);
+            expect(String(named()[0][0])).toContain("the indexer's block is ee11, the indexed one is aa11");
+            // A pass that still stands an hour later says so again.
+            const clock = vi.spyOn(pass as any, 'now').mockReturnValue(Date.now() + 3_600_001);
+            await pass.runOnce();
+            await pass.runOnce();
+            clock.mockRestore();
+            expect(named()).toHaveLength(2);
+        } finally {
+            warn.mockRestore();
+        }
+        expect(Number((await readSync()).lastSupplementedHeight)).toBe(10);
+        expect(await db.run(cds.ql.SELECT.from(ZSWAP_EVENTS).where({ transaction_ID: txId }))).toHaveLength(0);
+        expect((await db.run(cds.ql.SELECT.one.from(BLOCKS).columns('ledgerParameters').where({ ID: first }))).ledgerParameters).toBeTruthy();
+        expect((await db.run(cds.ql.SELECT.one.from(BLOCKS).columns('ledgerParameters').where({ ID: second }))).ledgerParameters ?? null).toBeNull();
+
+        delete answers[11].hash;
+        expect(await pass.runOnce()).toEqual(expect.objectContaining({ blocks: 1, zswapEvents: 1 }));
+        expect(Number((await readSync()).lastSupplementedHeight)).toBe(11);
     });
 
     it('the supplement drops its pass on the same shape', async () => {
@@ -864,7 +1026,7 @@ describe('a rollback that leaves the cursor where it was', () => {
         };
         const pass = new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100 },
-            client
+            agreeing(client)
         );
         await pass.init(db);
         const info = vi.spyOn(cds.log('nightgate:crawler'), 'info').mockImplementation(() => {});
@@ -887,7 +1049,7 @@ describe('a rollback that leaves the cursor where it was', () => {
         const client = { fetchBlock: vi.fn(async (h: number) => answers[h] ?? null) };
         const pass = new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100 },
-            client
+            agreeing(client)
         );
         await pass.init(db);
         await pass.runOnce();
@@ -907,7 +1069,7 @@ describe('a rollback that leaves the cursor where it was', () => {
 
         const second = new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100 },
-            client
+            agreeing(client)
         );
         await second.init(db);
         // Same instance state would say "unchanged"; the generation moved.
@@ -978,7 +1140,7 @@ describe('a rollback between reading the cursor and the generation', () => {
         };
         const pass = new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 25, intervalMs: 1, lagBlocks: 10, requestTimeoutMs: 100 },
-            client
+            agreeing(client)
         );
         await pass.init(db);
 
@@ -1065,6 +1227,32 @@ describe('backfillTransactionIdentifiers', () => {
         expect(await identifierRowsOf(later)).toEqual([]);
     });
 
+    it('rows that disappear during the run do not make it skip others', async () => {
+        await setSync({ lastIndexedHeight: 10, identifiersBackfilledAt: null });
+        const blockId = await seedBlock(10, '0xbf3');
+        const ids: string[] = [];
+        for (let i = 0; i < 6; i++) ids.push(await seedTransaction(blockId, { transactionId: i, identifiers: JSON.stringify([`k${i}`]) }));
+        ids.sort();
+
+        // After the first page of two, a rollback removes the first row. With an offset the third row would be skipped.
+        const run = db.run.bind(db);
+        let pages = 0;
+        const spy = vi.spyOn(db, 'run').mockImplementation(async (query: any, ...rest: any[]) => {
+            const result = await run(query, ...rest);
+            if (query?.SELECT?.from?.ref?.[0] === TRANSACTIONS && query.SELECT.limit && ++pages === 1) {
+                await run(cds.ql.DELETE.from(TRANSACTIONS).where({ ID: ids[0] }));
+            }
+            return result;
+        });
+        try {
+            await backfillTransactionIdentifiers(db, 2);
+        } finally {
+            spy.mockRestore();
+        }
+        expect(await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).columns('ID').where({ ID: ids[0] }))).toBeFalsy();
+        for (const id of ids.slice(1)) expect(await identifierRowsOf(id), id).toHaveLength(1);
+    });
+
     it('an interrupted run resumes: without the marker the rows that exist are kept and the rest filled', async () => {
         await setSync({ lastIndexedHeight: 10, identifiersBackfilledAt: null });
         const blockId = await seedBlock(10, '0xbf2');
@@ -1084,7 +1272,7 @@ describe('contract state storage', () => {
         const client = { fetchBlock: vi.fn(async (height: number) => answers[height] ?? null) };
         return new IndexerSupplement(
             { url: 'http://indexer.invalid', batchSize: 10, intervalMs: 1, lagBlocks: 2, requestTimeoutMs: 100, contractState },
-            client
+            agreeing(client)
         );
     }
 

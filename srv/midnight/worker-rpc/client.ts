@@ -54,6 +54,14 @@ interface PendingRpc {
     settle: (outcome: () => void) => void;
 }
 
+/** The worker gave no answer: it ran out of time or went away. This says nothing about the call's input, so asking again can succeed. */
+export class WorkerRpcUnansweredError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'WorkerRpcUnansweredError';
+    }
+}
+
 export class WorkerRpcClient {
     private client: ClientState | null = null;
     private stoppingWorker: Worker | null = null;
@@ -155,7 +163,7 @@ export class WorkerRpcClient {
                 void this.send(p);
                 continue;
             }
-            p.settle(() => { throw new Error(reason); });
+            p.settle(() => { throw new WorkerRpcUnansweredError(reason); });
         }
     }
 
@@ -214,7 +222,7 @@ export class WorkerRpcClient {
 
         const armTimer = (): void => {
             pending.timer = setTimeout(() => {
-                pending.settle(() => { throw new Error(`${name} rpc '${method}' timed out after ${timeoutMs}ms`); });
+                pending.settle(() => { throw new WorkerRpcUnansweredError(`${name} rpc '${method}' timed out after ${timeoutMs}ms`); });
                 if (this.options.terminateOnTimeout && this.client === state) {
                     log('warn', `${name} rpc '${method}' ran past ${timeoutMs}ms; ending the thread, it restarts on the next call`);
                     this.restartingWorker = state.worker;

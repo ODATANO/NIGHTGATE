@@ -353,7 +353,10 @@ export class TransactionSubmitter {
             await reportExternalExecution({ submissionId });
             result = await this.withRebuildRetry(o.label, ledger, () => o.send(proxy.proxyId, ledger.onSubmitIntent));
         } catch (err) {
-            release?.();
+            // A call that announced its tx cannot be cancelled. If this side gave up first, the worker may still land the tx
+            // and then store the contract's private state and signing key through this proxy. So the proxy stays for a while.
+            if (release && ledger.current().txHash) setTimeout(release, configMs('NIGHTGATE_WORKER_RPC_TIMEOUT_MS')).unref?.();
+            else release?.();
             if (err instanceof SponsorAttemptBookkeepingPendingError) throw err;
             const classification = classifySubmissionError(err, this.deps.network);
             const named = await this.settleFailedAttempt(ledger, submissionId, err, classification);

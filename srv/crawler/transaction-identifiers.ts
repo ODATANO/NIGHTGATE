@@ -35,14 +35,14 @@ export async function backfillTransactionIdentifiers(db: DbRunner, batchSize = 5
     );
     if (sync?.identifiersBackfilledAt) return report;
 
-    let offset = 0;
+    // Pages by the last ID seen. An offset would skip rows when a rollback or the decode pass changes the set meanwhile.
+    let last: string | null = null;
     for (;;) {
-        const batch: Array<{ ID: string; identifiers: string | null }> = await db.run(
-            SELECT.from(Transactions).columns('ID', 'identifiers').where({ identifiers: { '!=': null } })
-                .orderBy('ID').limit(batchSize, offset)
-        ) || [];
+        const page = SELECT.from(Transactions).columns('ID', 'identifiers').where({ identifiers: { '!=': null } });
+        if (last !== null) page.and({ ID: { '>': last } });
+        const batch: Array<{ ID: string; identifiers: string | null }> = await db.run(page.orderBy('ID').limit(batchSize)) || [];
         if (!batch.length) break;
-        offset += batch.length;
+        last = batch[batch.length - 1].ID;
         const done = new Set<string>(((await db.run(
             SELECT.from(TransactionIdentifiers).columns('transaction_ID').where({ transaction_ID: { in: batch.map(r => r.ID) } })
         )) || []).map((r: { transaction_ID: string }) => r.transaction_ID));

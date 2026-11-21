@@ -7,6 +7,7 @@
  * suite hermetic and fast, no SQLite spin-up needed.
  */
 
+import crypto from 'node:crypto';
 import { extractEncryptedComponents, StorageEncryption } from '../../srv/utils/storage-encryption';
 import {
     CapDbPrivateStateProvider,
@@ -190,6 +191,19 @@ describe('CapDbPrivateStateProvider: CRUD', () => {
         await provider.forContract(CONTRACT).set('counter', { value: 42 });
         const got = await provider.forContract(CONTRACT).get('counter');
         expect(got).toEqual({ value: 42 });
+    });
+
+    // The provider runs on the server thread, once per submission. A synchronous key derivation there stalls every request.
+    test('the storage key is derived off the event loop', async () => {
+        const sync = vi.spyOn(crypto, 'pbkdf2Sync');
+        try {
+            const { provider } = newProvider();
+            await provider.forContract(CONTRACT).set('counter', { value: 1 });
+            expect(await provider.forContract(CONTRACT).get('counter')).toEqual({ value: 1 });
+            expect(sync).not.toHaveBeenCalled();
+        } finally {
+            sync.mockRestore();
+        }
     });
 
     test('get returns null for unknown id', async () => {

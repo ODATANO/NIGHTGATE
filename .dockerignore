@@ -20,6 +20,8 @@ db/walletstate-*.json
 coverage
 docs
 test
+# packed tarballs of this package, left by a local `npm pack`
+**/*.tgz
 @cds-models
 # .dockerignore patterns are rooted (unlike .gitignore): **/ is needed to
 # catch logs in subdirectories, e.g. local serve logs under db/

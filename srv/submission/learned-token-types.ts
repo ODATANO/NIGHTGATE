@@ -52,6 +52,9 @@ export function sharedLearnedTokenTypes(): string[] {
 /** Upper limit of the list. It is loaded for every policy check, and minting a new type is cheap. */
 export const MAX_LEARNED_TOKEN_TYPES = 256;
 
+/** Upper limit of one grant's share, so a single grant cannot use up the list for all others. */
+export const MAX_LEARNED_TOKEN_TYPES_PER_GRANT = 32;
+
 /** Save the types created by a confirmed sponsored mint. Returns the types not seen before. */
 export async function recordLearnedTokenTypes(db: DbRunner, types: unknown[], origin: LearnedTokenTypeOrigin = {}): Promise<string[]> {
     const fresh = normalizeTokenTypes(types);
@@ -71,6 +74,16 @@ export async function recordLearnedTokenTypes(db: DbRunner, types: unknown[], or
             if (total + added.length > MAX_LEARNED_TOKEN_TYPES) {
                 log.warn(`learned token types hold ${total}; ${added.map(t => t.slice(0, 12)).join(', ')} not recorded (at most ${MAX_LEARNED_TOKEN_TYPES})`);
                 return [];
+            }
+            if (origin.grantId) {
+                const ofGrant: Array<{ count?: number | string }> = await runWithoutAmbientTx(() => db.run(
+                    SELECT.from(LearnedTokenTypes).columns('count(*) as count').where({ grantId: origin.grantId })
+                ));
+                const held = Number(ofGrant?.[0]?.count ?? 0);
+                if (held + added.length > MAX_LEARNED_TOKEN_TYPES_PER_GRANT) {
+                    log.warn(`grant ${String(origin.grantId).slice(0, 8)}… holds ${held} learned token types; ${added.map(t => t.slice(0, 12)).join(', ')} not recorded (at most ${MAX_LEARNED_TOKEN_TYPES_PER_GRANT} per grant)`);
+                    return [];
+                }
             }
             await runWithoutAmbientTx(() => db.run(INSERT.into(LearnedTokenTypes).entries(added.map(tokenType => ({
                 tokenType,

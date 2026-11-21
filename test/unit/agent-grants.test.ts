@@ -949,10 +949,21 @@ describe('agent grants', () => {
             expect(req.user).toEqual({ id: TEST_USER_ID });
         });
 
+        it('takes no budget unit for a call the runtime refuses anyway', async () => {
+            const today = new Date().toISOString().slice(0, 10);
+            mockDbRun.mockReset();
+            mockDbRun.mockResolvedValueOnce(grantRow({ maxJobsPerDay: 5, jobsUsedToday: 1, budgetWindow: today }));
+            const req = tokenReq('anchorDocument', { sessionId: 'sess-1' });
+            await enforceAgentGrant(req, db, () => true);
+            expect(req.reject).not.toHaveBeenCalled();
+            // only the grant lookup ran: no consume
+            expect(mockDbRun).toHaveBeenCalledTimes(1);
+        });
+
         it('refunds the daily budget unit when the handler refuses the request with a 4xx (a rate class included), keeps it on 5xx', async () => {
             const today = new Date().toISOString().slice(0, 10);
             const handlers: Record<string, (err: unknown) => void> = {};
-            const run = async (status: number) => {
+            const run = async (status: number, code?: string) => {
                 mockDbRun.mockReset();
                 updateWhereSpy.mockClear();
                 mockDbRun
@@ -965,7 +976,7 @@ describe('agent grants', () => {
                 expect(req.reject).not.toHaveBeenCalled();
                 expect(handlers.failed).toBeDefined();
                 const before = mockDbRun.mock.calls.length;
-                handlers.failed({ status });
+                handlers.failed({ status, ...(code ? { code } : {}) });
                 await new Promise(r => setImmediate(r));
                 return mockDbRun.mock.calls.length - before;
             };
@@ -975,6 +986,11 @@ describe('agent grants', () => {
                 expect(await run(404)).toBe(1);
                 expect(await run(429)).toBe(1);   // a rate class refused after the take: nothing ran
                 expect(await run(503)).toBe(0);   // a server-side failure after admission keeps the unit
+                // A 503 that says "retry later" started nothing either: the runtime is not up, admission is busy, the wallet syncs.
+                for (const refusal of ['RUNTIME_UNAVAILABLE', 'JOB_ADMISSION_BUSY', 'WALLET_SYNCING', 'SPONSOR_POLICY_UNAVAILABLE']) {
+                    expect(await run(503, refusal)).toBe(1);
+                }
+                expect(await run(500, 'INTERNAL')).toBe(0);
             } finally {
                 // unconsumed mockResolvedValueOnce values must not leak into the next test
                 mockDbRun.mockReset();
@@ -1397,6 +1413,13 @@ describe('agent grant circuit scope follows the action, not the request fields',
         expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/revokeDisclosure.*allowedCircuits/));
     });
 
+    it('an action that runs no circuit passes a grant with a circuit list', () => {
+        const mintOnly = { allowedContracts: null, allowedCircuits: JSON.stringify(['mint']) };
+        for (const action of ['postSwapOffer', 'retireSwapOffer', 'grantDisclosureToHolders', 'revokeHolderDisclosure', 'reindexDisclosures']) {
+            expect(grantScopeViolation(mintOnly, {}, action)).toBeNull();
+        }
+    });
+
     it('anchorDocument and attestAgentOutput need exactly the attest circuit', () => {
         const plainOnly = { allowedContracts: null, allowedCircuits: JSON.stringify(['attest']) };
         expect(grantScopeViolation(plainOnly, { contractAddress: 'abcdef01' }, 'anchorDocument')).toBeNull();
@@ -1506,14 +1529,41 @@ describe('agent grants: unshielded offers and value budgets', () => {
         expect(req.agentGrant).toMatchObject({ allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1], allowTransfers: true, allowSwaps: false });
     });
 
-    it('sponsorTransfer, burnFactoryToken and mintFactoryToken are grantable; the pool grant takes mints and transfers', async () => {
+    it('sponsorTransfer, burnFactoryToken and mintFactoryToken are grantable; a pool grant takes transfers but no mint', async () => {
         expect(AGENT_ALLOWLISTABLE_ACTIONS).toEqual(expect.arrayContaining(['sponsorTransfer', 'burnFactoryToken', 'mintFactoryToken']));
+        const PLATFORM_POOL_SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
         process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
-        mockDbRun.mockResolvedValueOnce(activeSessionRow());
-        const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorTransfer', 'mintFactoryToken'], sponsorSessionId: '__platform_pool__' });
-        await handlers.createAgentGrant(req);
-        expect(req.reject).not.toHaveBeenCalled();
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        try {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorTransfer'], sponsorSessionId: PLATFORM_POOL_SENTINEL });
+            await handlers.createAgentGrant(req);
+            expect(req.reject).not.toHaveBeenCalled();
+
+            // The pool pays fees and never signs for a caller, so a pool grant holds no action that signs with a platform wallet.
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const mint = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorTransfer', 'mintFactoryToken'], sponsorSessionId: PLATFORM_POOL_SENTINEL });
+            await handlers.createAgentGrant(mint);
+            expect(mint.reject).toHaveBeenCalledWith(400, expect.stringMatching(/cannot use the pool: mintFactoryToken$/));
+        } finally {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        }
+    });
+
+    it('a grant bound to a fee sponsor wallet holds only actions the sponsor pays for, none that act as that wallet', async () => {
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sess-1';
+        try {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const acting = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction', 'anchorDocument', 'mintFactoryToken'] });
+            await handlers.createAgentGrant(acting);
+            expect(acting.reject).toHaveBeenCalledWith(400, 'sessionId is a fee sponsor wallet, which only pays fees; a grant bound to it cannot allow: anchorDocument, mintFactoryToken');
+
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const paying = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction', 'sponsorSwap', 'postSwapOffer'] });
+            await handlers.createAgentGrant(paying);
+            expect(paying.reject).not.toHaveBeenCalled();
+        } finally {
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        }
     });
 
     it('maxValuePerDay is validated and stored as a map; the usage view lists it', async () => {

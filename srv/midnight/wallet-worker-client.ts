@@ -369,6 +369,8 @@ function forgetSession(sessionId: string): void {
     forgetDustCollapseStats(sessionId);
 }
 
+const SHUTDOWN_REPLY_MARGIN_MS = 5_000;
+
 /** Unloads every wallet after its final save, then stops every worker. Call it before dropping the encryption keys. */
 export async function stopWalletWorker(timeoutMs = 60_000): Promise<void> {
     // A later call must not restart a worker that was stopped on purpose.
@@ -390,7 +392,8 @@ async function shutDownWorker(slot: WorkerSlot, w: Worker, timeoutMs: number): P
     slot.everStarted = false;
     const tag = slots.size > 1 || slot.id !== DEFAULT_SLOT ? `worker ${slot.id}` : 'worker';
     try {
-        const r = await rpcOnce<{ evicted: number; failed: number }>(slot, 'shutdown', {}, timeoutMs);
+        // The worker ends its saves before this call times out, so its reply still arrives.
+        const r = await rpcOnce<{ evicted: number; failed: number }>(slot, 'shutdown', { budgetMs: Math.max(1_000, timeoutMs - SHUTDOWN_REPLY_MARGIN_MS) }, timeoutMs);
         if (r.failed > 0) log.error(`${tag} shutdown: ${r.evicted} facade(s) evicted, ${r.failed} WITHOUT a confirmed final save`);
         else log.info(`${tag} shutdown: ${r.evicted} facade(s) evicted, all saves confirmed`);
     } catch (err) {

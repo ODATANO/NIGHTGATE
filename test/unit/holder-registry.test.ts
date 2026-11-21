@@ -51,6 +51,15 @@ describe('readHolderRegistration', () => {
         expect(providerState.queried).toEqual(['cc'.repeat(32)]);
     });
 
+    it('answers null for an address that holds another contract', async () => {
+        const counterPath = resolveContractPackage('@odatano/contract-counter', path.resolve(__dirname, '../..')).artifactPath;
+        const counter: any = await import(pathToFileURL(counterPath).href);
+        const rt: any = await import('@midnight-ntwrk/compact-runtime');
+        const initial = await new counter.Contract({}).initialState(rt.createConstructorContext({}, '00'.repeat(32)));
+        providerState.state = { contractState: { era: 'v9', serialize: () => initial.currentContractState.serialize(), deserialize: () => ({ data: initial.currentContractState.data }) } };
+        expect(await readHolderRegistration({ contractAddress: 'dd'.repeat(32), tokenType: T, claimKey: holderClaimKey(SECRET), artifactPath: ARTIFACT, contractProvidersConfig: {} as any })).toBeNull();
+    });
+
     it('refuses a state written by ledger 8', async () => {
         providerState.state = { contractState: { era: 'v8' } };
         await expect(readHolderRegistration({ contractAddress: 'cc'.repeat(32), tokenType: T, claimKey: holderClaimKey(SECRET), artifactPath: ARTIFACT, contractProvidersConfig: {} as any }))

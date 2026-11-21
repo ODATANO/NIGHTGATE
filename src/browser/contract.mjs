@@ -55,6 +55,9 @@ export async function connectContract(opts = {}) {
         import('@midnight-ntwrk/compact-js'),
         import('@midnight-ntwrk/midnight-js-dapp-connector-proof-provider')
     ]);
+    if (assembled.provingModality === 'none') {
+        throw new Error("connectContract: nothing can prove for this contract. Pass proofServerUrl, or proving: 'wallet' for a wallet that proves itself");
+    }
     const [network, walletProviders] = await Promise.all([
         walletMod.dappConnectorNetwork(connector),
         walletMod.dappConnectorWalletProviders(connector)

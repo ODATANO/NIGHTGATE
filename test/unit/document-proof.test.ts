@@ -190,6 +190,18 @@ describe('prepareMembershipSet handler', () => {
         expect(byDigest.setRoot).toBe(byValue.setRoot);
     });
 
+    it('an explicit null counts as a value left out', async () => {
+        const rootOnly = await handlers.prepareMembershipSet(makeReq({ allowedValues: LIST }));
+        const nulls = makeReq({ allowedValues: LIST, value: null, valueDigest: null });
+        expect(await handlers.prepareMembershipSet(nulls)).toEqual(rootOnly);
+        expect(nulls.reject).not.toHaveBeenCalled();
+
+        const byValue = await handlers.prepareMembershipSet(makeReq({ allowedValues: LIST, value: 'CH' }));
+        const withNullDigest = makeReq({ allowedValues: LIST, value: 'CH', valueDigest: null });
+        expect(await handlers.prepareMembershipSet(withNullDigest)).toEqual(byValue);
+        expect(withNullDigest.reject).not.toHaveBeenCalled();
+    });
+
     it('rejects 404 when the artifact is unavailable', async () => {
         loadPure.mockRejectedValueOnce(new PureCircuitsUnavailableError("contract 'nope' is not registered"));
         const req = makeReq({ allowedValues: LIST, compiledArtifactRef: 'nope' });

@@ -62,7 +62,55 @@ export async function getJobById(jobId: string): Promise<BackgroundJob | null> {
     return (row as BackgroundJob | undefined) || null;
 }
 
-/** Fails pending jobs whose wallet session was closed at restart. Must run before jobs start, since such a job can no longer decrypt its keys. */
+/** After this many re-queues a job fails, so a job that stops its owner every time does not run forever. */
+export const MAX_REQUEUES = 3;
+
+/** True when a step of this workflow succeeded or may have reached the chain. */
+export async function hasCompletedChild(parentJobId: string): Promise<boolean> {
+    try {
+        const db = await cds.connect.to('db');
+        if (!db) return true;
+        const children = await db.run(
+            SELECT.from(BackgroundJobs).columns('status', 'txHash').where({ parentJobId })
+        ) as Array<{ status?: string; txHash?: string | null }>;
+        if (!Array.isArray(children)) return true;
+        return children.some(c => c.status === 'succeeded' || c.status === 'reconciliation_required' || !!c.txHash);
+    } catch (err) {
+        // When unsure, assume a step ran. Otherwise a retry could pay for a step that is already on chain.
+        cds.log('nightgate').warn(
+            `hasCompletedChild(${parentJobId}) could not read child state (${errorMessage(err)}); ` +
+            'assuming the workflow is partially executed'
+        );
+        return true;
+    }
+}
+
+/** Parks the pending workflows of these sessions that have a step done or on chain. The reconciler finishes them from their steps. */
+async function parkWorkflowsWithCompletedStep(db: DbRunner, sessionIds: string[]): Promise<void> {
+    const pending: Array<Pick<BackgroundJob, 'ID'>> = await db.run(
+        SELECT.from(BackgroundJobs).columns('ID').where({ status: 'pending', sessionId: { in: sessionIds } })
+    ) ?? [];
+    const withStep: string[] = [];
+    for (const job of pending) {
+        if (job.ID && await hasCompletedChild(job.ID)) withStep.push(job.ID);
+    }
+    if (withStep.length === 0) return;
+    await db.run(
+        UPDATE.entity(BackgroundJobs)
+            .set({
+                status: 'reconciliation_required',
+                errorCode: 'CHILD_RECONCILIATION_REQUIRED',
+                errorMessage: 'The server restarted while a step of this workflow was done or on chain. The workflow finishes from its steps once they are settled; do not submit it again.',
+                leaseOwner: null,
+                leaseExpiresAt: null,
+                heartbeatAt: null
+            })
+            .where({ ID: { in: withStep }, status: 'pending' })
+    );
+}
+
+/** Fails pending jobs whose wallet session was closed at restart. Must run before jobs start, since such a job can no longer decrypt its keys.
+ *  A workflow with a step done or on chain is parked instead: it needs no keys to finish, and failing it would invite a second, paid run. */
 export async function dropPendingJobsForClosedSessions(sessionIds: string[]): Promise<number> {
     if (sessionIds.length === 0) return 0;
     const db = await cds.connect.to('db');
@@ -71,6 +119,7 @@ export async function dropPendingJobsForClosedSessions(sessionIds: string[]): Pr
         dropped = 0;
         // In chunks, to stay within the driver's parameter limit.
         for (let i = 0; i < sessionIds.length; i += 200) {
+            await parkWorkflowsWithCompletedStep(db, sessionIds.slice(i, i + 200));
             const affected = await db.run(
                 UPDATE.entity(BackgroundJobs)
                     .set({

@@ -7,7 +7,7 @@ import { GranteeIdentities, type GranteeIdentity } from '#cds-models/midnight';
 import { type GranteeBinding } from '../utils/nightgate-config';
 import { hexToBytes } from '../utils/hex';
 import type { DbRunner } from '../utils/db-types';
-import { HEX64_ANY_CASE_RE } from '../utils/hex-patterns';
+import { HEX64_RE, bareHex } from '../utils/hex-patterns';
 
 const { SELECT } = cds.ql;
 
@@ -18,17 +18,20 @@ export function deriveGranteeId(kind: GranteeBinding, input: string): string {
     if (input == null || input === '') {
         throw new Error('grantee-identity: input is required');
     }
+    // `custom` and `wallet` name bytes, so `0x` and the letter case do not matter. A DID is hashed as the text it is.
     if (kind === 'custom') {
-        if (!HEX64_ANY_CASE_RE.test(input)) {
+        const id = bareHex(input);
+        if (!HEX64_RE.test(id)) {
             throw new Error('grantee-identity: custom granteeId must be 64 hex chars (32 bytes)');
         }
-        return input.toLowerCase();
+        return id;
     }
     if (kind === 'wallet') {
-        if (!/^[0-9a-fA-F]+$/.test(input) || input.length % 2 !== 0) {
+        const key = bareHex(input);
+        if (!/^[0-9a-f]+$/.test(key) || key.length % 2 !== 0) {
             throw new Error('grantee-identity: wallet coin public key must be hex');
         }
-        return bytesToHex(sha256(hexToBytes(input)));
+        return bytesToHex(sha256(hexToBytes(key)));
     }
     return bytesToHex(sha256(new TextEncoder().encode(input)));
 }

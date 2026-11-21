@@ -477,6 +477,16 @@ describe('runtime initialize', () => {
         expect(mockStartJobProcessor).not.toHaveBeenCalled();
         expect(mockStartCrawler).not.toHaveBeenCalled();
         expect(getStatus()).toEqual(expect.objectContaining({ initialized: false, mode: 'offline' }));
+        // A process that does not hold the lease only reads: no index is created, no row deleted.
+        const writes = mockDbRun.mock.calls.map(([q]) => q).filter((q) => (typeof q === 'string' && /^\s*(CREATE|DROP)/i.test(q)) || q?.DELETE || q?.INSERT || q?.UPDATE);
+        expect(writes).toEqual([]);
+    });
+
+    it('creates the indexes only after it holds the lease', async () => {
+        await initialize();
+        const firstIndex = mockDbRun.mock.calls.findIndex(([q]) => typeof q === 'string' && /^\s*CREATE (UNIQUE )?INDEX/i.test(q));
+        expect(firstIndex).toBeGreaterThanOrEqual(0);
+        expect(mockAcquireLease.mock.invocationCallOrder[0]).toBeLessThan(mockDbRun.mock.invocationCallOrder[firstIndex]);
     });
 
     it('rewrites stored hashes under the lease, before job recovery and the crawler', async () => {

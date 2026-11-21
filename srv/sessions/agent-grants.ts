@@ -20,11 +20,12 @@ import { resolveFeeSponsor, FeeSponsorError } from '../submission/fee-sponsor';
 import { getNightgateConfig, resolveNightgateRuntimeConfig } from '../utils/nightgate-config';
 import { configInt } from '../utils/config';
 import { checkRateClass, peekRateClassForGrant, rejectRateLimited, noteRateLimitHeaders, RATE_CLASSES, RATE_CLASS_NAMES, type RateLimitState } from '../utils/rate-classes';
-import { isSessionExpired } from '../utils/session-expiry';
+import { isSessionExpired, isConfiguredPlatformSponsor } from '../utils/session-expiry';
 import { AGENT_TOKEN_HEADER, AGENT_TOKEN_TRANSPORT_USER, PUBLIC_VERIFY_TRANSPORT_USER } from '../utils/agent-token-transport';
 import type { DbRunner } from '../utils/db-types';
 import type { RequestAgentGrant } from '../utils/request-types';
-import { errorMessage } from '../utils/errors';
+import { ERROR_CODES, errorMessage } from '../utils/errors';
+import { isRuntimeWriteEvent, runtimeUnavailableReason } from '../utils/runtime-gate';
 import { HEX64_RE, bareHex } from '../utils/hex-patterns';
 import { createAgentGrant, createAgentGrants, getGrantUsage, revokeAgentGrant, rotateAgentGrantToken, updateAgentGrant } from '#cds-models/NightgateService';
 import type { getSponsorPolicy } from '#cds-models/NightgateAdminService';
@@ -71,9 +72,6 @@ export const AGENT_ALLOWLISTABLE_ACTIONS: readonly string[] = [
 
 /** Actions that use no sponsor. A grant on the platform sponsor pool may allow them as well. */
 const POOL_NEUTRAL_ACTIONS: ReadonlySet<string> = new Set(['postSwapOffer', 'retireSwapOffer']);
-
-/** The pool pays these without a wallet session of the caller: the mint's issuer is the paying session. */
-const POOL_PAID_SESSION_ACTIONS: ReadonlySet<string> = new Set(['mintFactoryToken']);
 
 const SPONSOR_TRANSACTION_ACTIONS: ReadonlySet<string> = new Set([
     'sponsorFinalizedTransaction',
@@ -319,6 +317,10 @@ const ACTION_CIRCUITS: Readonly<Record<string, readonly string[]>> = {
     grantDisclosure: ['grantDisclosure'],
     revokeDisclosure: ['revokeDisclosure'],
     reindexDisclosures: [],
+    grantDisclosureToHolders: [],
+    revokeHolderDisclosure: [],
+    postSwapOffer: [],
+    retireSwapOffer: [],
     mintFactoryToken: ['mint'],
     burnFactoryToken: ['burn']
 };
@@ -692,6 +694,14 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
         ));
         if (!session) { req.reject(404, 'Session not found or inactive'); return undefined; }
         if (isSessionExpired(data.sessionId, session.expiresAt)) { req.reject(410, 'Session expired'); return undefined; }
+        // A fee sponsor pays fees and does nothing else, so a grant bound to one holds no action that acts as that wallet.
+        if (isConfiguredPlatformSponsor(data.sessionId)) {
+            const acting = actions.filter(a => !SPONSOR_PHASE2_ACTIONS.has(a) && !POOL_NEUTRAL_ACTIONS.has(a));
+            if (acting.length > 0) {
+                req.reject(400, `sessionId is a fee sponsor wallet, which only pays fees; a grant bound to it cannot allow: ${acting.join(', ')}`);
+                return undefined;
+            }
+        }
 
         // Check the sponsor now. It is used on every write of the grant, and a broken one
         // would only fail after budget was spent. It is checked again on each use.
@@ -702,10 +712,10 @@ export function registerAgentGrantHandlers(srv: cds.ApplicationService, db: DbRu
                 req.reject(412, `sponsorSessionId: '${PLATFORM_POOL_SENTINEL}' requires a configured NIGHTGATE_FEE_SPONSOR_SESSION pool`);
                 return undefined;
             }
-            const incompatible = actions.filter(a => !SPONSOR_PHASE2_ACTIONS.has(a) && !POOL_NEUTRAL_ACTIONS.has(a) && !POOL_PAID_SESSION_ACTIONS.has(a));
+            const incompatible = actions.filter(a => !SPONSOR_PHASE2_ACTIONS.has(a) && !POOL_NEUTRAL_ACTIONS.has(a));
             if (incompatible.length > 0) {
                 req.reject(400,
-                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction' / 'sponsorUnboundTransaction' / 'sponsorSwap' / 'sponsorTransfer' / 'mintFactoryToken' / 'postSwapOffer' / 'retireSwapOffer'; `
+                    `a platform-pool grant may only allow 'sponsorFinalizedTransaction' / 'sponsorUnboundTransaction' / 'sponsorSwap' / 'sponsorTransfer' / 'postSwapOffer' / 'retireSwapOffer'; `
                     + `these actions resolve the sponsor directly and cannot use the pool: ${incompatible.join(', ')}`);
                 return undefined;
             }
@@ -1043,7 +1053,9 @@ export function attachAgentGrantEnforcement(srv: cds.Service, db: DbRunner): voi
     srv.before('*', (req: Request) => {
         // CAP runs before-handlers in parallel. Other hooks that check the user
         // must wait for this one to set it, so the promise is stored on the request.
-        const resolution = enforceAgentGrant(req, db);
+        // The runtime gate refuses in parallel and before this hook reaches the budgets. A call it refuses must not cost a unit.
+        const refusedByRuntime = (): boolean => isRuntimeWriteEvent(srv as cds.ApplicationService, String(req.event ?? '')) && runtimeUnavailableReason() !== null;
+        const resolution = enforceAgentGrant(req, db, refusedByRuntime);
         req.agentPrincipalReady = resolution.then(() => undefined, () => undefined);
         return resolution;
     });
@@ -1057,7 +1069,7 @@ export async function awaitAgentPrincipal(req: Request): Promise<void> {
 /** CAP's per-request HTTP context. In a $batch it holds the headers of the single part. */
 type BatchPartRequest = Request & { _?: { req?: { headers?: Record<string, string | string[] | undefined> } } };
 
-export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Promise<unknown> {
+export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner, refusedByRuntime?: () => boolean): Promise<unknown> {
     // In a $batch request, `req.headers` also contains the outer request's headers.
     // `_.req.headers` only has the headers of the single part.
     const token = req?.headers?.[AGENT_TOKEN_HEADER] ?? req?._?.req?.headers?.[AGENT_TOKEN_HEADER];
@@ -1158,7 +1170,7 @@ export async function enforceAgentGrant(req: BatchPartRequest, db: DbRunner): Pr
 
     // Runs outside the request transaction, so the count stays even if the request fails later.
     // Counting a failure is better than missing abuse.
-    if (allowlisted) {
+    if (allowlisted && !refusedByRuntime?.()) {
         const taken: GrantBudget[] = [];
         for (const budget of GRANT_BUDGETS) {
             const max = grant[budget.maxField];
@@ -1231,16 +1243,23 @@ interface FailureEvents {
     on?(event: 'failed', fn: (err: { status?: unknown; statusCode?: unknown; code?: unknown } | undefined) => void): void;
 }
 
-/** Gives a taken budget back when the request ends with a 4xx, which started no job. A 5xx keeps it. */
+/** True for a refusal that started no job: any 4xx, and a 503 whose code says "retry later". Any other 5xx may follow a started job. */
+function startedNoJob(err: { status?: unknown; statusCode?: unknown; code?: unknown } | undefined): boolean {
+    const status = Number(err?.status ?? err?.statusCode ?? err?.code);
+    if (Number.isInteger(status) && status >= 400 && status < 500) return true;
+    const known: { status: number; retryable?: boolean } | undefined = (ERROR_CODES as Record<string, { status: number; retryable?: boolean }>)[String(err?.code ?? '')];
+    return known?.status === 503 && known.retryable === true;
+}
+
+/** Gives a taken budget back when the request ends with a refusal that started no job. */
 function refundOnClientError(req: Request, refund: () => Promise<void>, what: string): void {
     (req as unknown as FailureEvents).on?.('failed', (err) => {
-        const status = Number(err?.status ?? err?.statusCode ?? err?.code);
-        if (!Number.isInteger(status) || status < 400 || status >= 500) return;
+        if (!startedNoJob(err)) return;
         void refund().catch((e: unknown) => log.warn(`${what} failed: ${errorMessage(e)}`));
     });
 }
 
-async function refundValueBudget(db: DbRunner, grantId: string, type: string, amount: bigint): Promise<void> {
+export async function refundValueBudget(db: DbRunner, grantId: string, type: string, amount: bigint): Promise<void> {
     await withKeyedLock(`grant-value:${grantId}`, async () => {
         const grant = await runWithoutAmbientTx(() => currentGrantRow(db, grantId));
         if (!grant || grant.valueWindow !== utcDay()) return;

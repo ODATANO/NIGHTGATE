@@ -202,6 +202,46 @@ describe('saveSyncState / loadSyncState round-trip', () => {
         expect(loaded).toBeNull();
     });
 
+    test('a partial save drops the parts stored for another SDK, network or seed', async () => {
+        const full = { shielded: 'sh-old', unshielded: 'un-old', dust: 'du-old' };
+        const cases = [
+            { id: 'acct-relabel-sdk', before: { sdkVersion: 'wallet-sdk-facade@1.0.0' }, after: { sdkVersion: SDK } },
+            { id: 'acct-relabel-net', before: { sdkVersion: SDK, networkId: 'preview' }, after: { sdkVersion: SDK, networkId: 'preprod' } },
+            { id: 'acct-relabel-seed', before: { sdkVersion: SDK, seedFingerprint: 'fp-A' }, after: { sdkVersion: SDK, seedFingerprint: 'fp-B' } }
+        ];
+        for (const { id, before, after } of cases) {
+            await saveSyncState({ accountId: id, passphrase: PASS, states: full, ...before });
+            await saveSyncState({ accountId: id, passphrase: PASS, states: { shielded: 'sh-new' }, ...after });
+            const loaded = await loadSyncState({
+                accountId: id, passphrase: PASS, expectedSdkVersion: after.sdkVersion,
+                expectedNetworkId: after.networkId, expectedSeedFingerprint: after.seedFingerprint
+            });
+            expect(loaded, id).toMatchObject({ shielded: 'sh-new' });
+            expect(loaded!.unshielded ?? null, id).toBeNull();
+            expect(loaded!.dust ?? null, id).toBeNull();
+        }
+    });
+
+    test('a partial save keeps the parts of the same labels and of a restorable earlier SDK', async () => {
+        const full = { shielded: 'sh-old', unshielded: 'un-old', dust: 'du-old' };
+        await saveSyncState({ accountId: 'acct-keep-same', passphrase: PASS, sdkVersion: SDK, states: full, networkId: 'preview', seedFingerprint: 'fp-A' });
+        await saveSyncState({ accountId: 'acct-keep-same', passphrase: PASS, sdkVersion: SDK, states: { dust: 'du-new' }, networkId: 'preview', seedFingerprint: 'fp-A' });
+        expect(await loadSyncState({ accountId: 'acct-keep-same', passphrase: PASS, expectedSdkVersion: SDK }))
+            .toMatchObject({ shielded: 'sh-old', unshielded: 'un-old', dust: 'du-new' });
+
+        await saveSyncState({ accountId: 'acct-keep-earlier', passphrase: PASS, sdkVersion: 'wallet-sdk-facade@5.0.0', states: full });
+        await saveSyncState({ accountId: 'acct-keep-earlier', passphrase: PASS, sdkVersion: 'wallet-sdk-facade@5.0.1', states: { dust: 'du-new' } });
+        expect(await loadSyncState({ accountId: 'acct-keep-earlier', passphrase: PASS, expectedSdkVersion: 'wallet-sdk-facade@5.0.1' }))
+            .toMatchObject({ shielded: 'sh-old', unshielded: 'un-old', dust: 'du-new' });
+    });
+
+    test('a snapshot under an unknown SDK version is never restored, not even under the same label', async () => {
+        const unknown = 'wallet-sdk-facade@unknown';
+        await saveSyncState({ accountId: 'acct-unknown', passphrase: PASS, sdkVersion: unknown, states: { dust: 'du-u' } });
+        expect(await loadSyncState({ accountId: 'acct-unknown', passphrase: PASS, expectedSdkVersion: unknown })).toBeNull();
+        expect(await loadSyncState({ accountId: 'acct-unknown', passphrase: PASS, expectedSdkVersion: SDK })).toBeNull();
+    });
+
     test('refuses restore when the stored networkId differs (cold start)', async () => {
         await saveSyncState({
             accountId: 'acct-net', passphrase: PASS, sdkVersion: SDK,

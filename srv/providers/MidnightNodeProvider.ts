@@ -49,7 +49,7 @@ interface JsonRpcRequest {
 
 interface JsonRpcResponse {
     jsonrpc: '2.0';
-    id?: number;
+    id?: number | null; // null on the one error a node sends for a whole batch frame
     result?: unknown;
     error?: { code: number; message: string; data?: unknown };
     method?: string;     // for subscription notifications
@@ -63,6 +63,16 @@ interface PendingRequest {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
     timeout: ReturnType<typeof setTimeout>;
+    /** True for a call sent inside a batch frame. */
+    batch?: boolean;
+}
+
+/** The node refused a batch frame as a whole, for example because its answer is over the node's size limit. A smaller frame can pass. */
+export class RpcBatchRefusedError extends Error {
+    constructor(readonly code: number, message: string) {
+        super(message);
+        this.name = 'RpcBatchRefusedError';
+    }
 }
 
 type SubscriptionCallback = (result: unknown) => void | Promise<void>;
@@ -79,6 +89,8 @@ export class MidnightNodeProvider {
     private subscriptions: Map<string, SubscriptionCallback> = new Map();
     private connected: boolean = false;
     private reconnecting: boolean = false;
+    /** Set by `disconnect()`. A reconnect that was already under way then stops instead of opening a socket nobody uses. */
+    private closed: boolean = false;
     private reconnectAttempts: number = 0;
     private config: Required<NodeProviderConfig>;
     private onReconnectCallback: (() => Promise<void>) | null = null;
@@ -99,9 +111,10 @@ export class MidnightNodeProvider {
     }
 
     async connect(): Promise<void> {
+        this.closed = false;
         return new Promise((resolve, reject) => {
             try {
-                const ws = new WebSocket(this.config.nodeUrl);
+                const ws = new WebSocket(this.config.nodeUrl, { handshakeTimeout: this.config.requestTimeout });
                 this.ws = ws;
 
                 this.ws.on('open', () => {
@@ -178,6 +191,7 @@ export class MidnightNodeProvider {
     }
 
     async disconnect(): Promise<void> {
+        this.closed = true;
         this.reconnecting = false;
         this.stopHeartbeat();
 
@@ -214,7 +228,7 @@ export class MidnightNodeProvider {
     private reconnectAbandonSignalled = false;
 
     private attemptReconnect(): void {
-        if (this.reconnecting) return;
+        if (this.closed || this.reconnecting) return;
         // Never give up on the node. After maxReconnectAttempts, report the failure once
         // and keep retrying. Stopping would freeze the index while the crawler still looks running.
         if (this.reconnectAttempts >= this.config.maxReconnectAttempts && !this.reconnectAbandonSignalled) {
@@ -236,6 +250,10 @@ export class MidnightNodeProvider {
             this.reconnectTimer = null;
             try {
                 await this.connect();
+                if (this.closed) {
+                    await this.disconnect();
+                    return;
+                }
                 log.info('Reconnected successfully');
                 if (this.onReconnectCallback) {
                     try {
@@ -245,6 +263,7 @@ export class MidnightNodeProvider {
                     }
                 }
             } catch (err) {
+                if (this.closed) return;
                 log.error('Reconnect failed:', (err as Error).message);
                 this.reconnecting = false;
                 this.attemptReconnect();
@@ -297,7 +316,7 @@ export class MidnightNodeProvider {
                     this.pendingRequests.delete(id);
                     reject(new Error(`RPC timeout: ${req.method} (${this.config.requestTimeout}ms) in a batch frame of ${requests.length} calls`));
                 }, this.config.requestTimeout);
-                this.pendingRequests.set(id, { resolve, reject, timeout });
+                this.pendingRequests.set(id, { resolve, reject, timeout, batch: true });
             }));
         }
 
@@ -343,6 +362,11 @@ export class MidnightNodeProvider {
             return;
         }
 
+        if (message.id === null) {
+            this.rejectBatchFrames(message.error);
+            return;
+        }
+
         if (message.id !== undefined) {
             const pending = this.pendingRequests.get(message.id);
             if (pending) {
@@ -358,6 +382,22 @@ export class MidnightNodeProvider {
                 }
             }
         }
+    }
+
+    // An error without an id answers a whole batch frame and does not say which one. Every frame in flight is rejected,
+    // because waiting would end each of their calls in a timeout that looks like a slow node.
+    private rejectBatchFrames(error: JsonRpcResponse['error']): void {
+        const detail = typeof error?.data === 'string' ? ` (${error.data})` : '';
+        const refused = new RpcBatchRefusedError(error?.code ?? 0, `RPC batch refused ${error?.code ?? '?'}: ${error?.message ?? 'no reason given'}${detail}`);
+        let rejected = 0;
+        for (const [id, pending] of this.pendingRequests) {
+            if (!pending.batch) continue;
+            clearTimeout(pending.timeout);
+            this.pendingRequests.delete(id);
+            pending.reject(refused);
+            rejected++;
+        }
+        if (rejected === 0) log.warn(`${refused.message}, with no batch frame in flight`);
     }
 
     private rejectAllPending(reason: string): void {

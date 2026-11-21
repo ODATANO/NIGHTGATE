@@ -131,6 +131,22 @@ describe('queryLedger9ContractState', () => {
     });
 });
 
+describe('an indexer that cannot serve the state', () => {
+    test('is reported as a retryable upstream failure, without the indexer URL', async () => {
+        const { reader } = readerOf(() => { throw new Error('fetch failed: https://user:key@indexer.example/api/v3/graphql ECONNREFUSED'); });
+        const failure = await queryLedger9ContractState(reader, VAULT).catch((e: unknown) => e) as any;
+        expect(failure).toMatchObject({ code: 'BAD_GATEWAY', status: 502, retryable: true });
+        expect(failure.message).toMatch(new RegExp(`indexer could not serve the state of contract ${VAULT}: fetch failed: <indexer> ECONNREFUSED`));
+        expect(failure.message).not.toMatch(/user:key|indexer\.example/);
+    });
+
+    test('a ledger 8 state is a conflict, never a retryable failure', async () => {
+        const { reader } = readerOf(() => serializedState(bytesOf(2), 'v8').read);
+        const failure = await queryLedger9ContractState(reader, VAULT).catch((e: unknown) => e) as any;
+        expect(failure).toMatchObject({ code: 'CONFLICT', status: 409, retryable: false });
+    });
+});
+
 describe('NIGHTGATE_STATE_DECODE_CACHE_MB', () => {
     const MB = 1024 * 1024;
 

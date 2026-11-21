@@ -36,6 +36,18 @@ describe('deriveGranteeId', () => {
         expect(deriveGranteeId('did', did)).toMatch(HEX64_RE);
     });
 
+    test('custom and wallet name bytes: 0x and the letter case give the same id', () => {
+        const hex = 'ab'.repeat(32);
+        expect(deriveGranteeId('custom', `0x${hex.toUpperCase()}`)).toBe(hex);
+        expect(deriveGranteeId('wallet', `0X${hex.toUpperCase()}`)).toBe(deriveGranteeId('wallet', hex));
+        expect(() => deriveGranteeId('custom', `0x${'ab'.repeat(31)}`)).toThrow(/64 hex/);
+    });
+
+    test('did: the text is hashed as sent, so another spelling is another id', () => {
+        expect(deriveGranteeId('did', 'did:web:X')).not.toBe(deriveGranteeId('did', 'did:web:x'));
+        expect(deriveGranteeId('did', '0xab')).toBe(bytesToHex(sha256(new TextEncoder().encode('0xab'))));
+    });
+
     test('different kinds/inputs yield different ids', () => {
         const a = deriveGranteeId('wallet', '22'.repeat(32));
         const b = deriveGranteeId('did', 'did:web:x');

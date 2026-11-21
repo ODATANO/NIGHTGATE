@@ -129,7 +129,8 @@ export class NightgateError extends Error {
     }
 }
 
-export { errorMessage } from '../../src/shared/error-message.mjs';
+import { errorMessage } from '../../src/shared/error-message.mjs';
+export { errorMessage };
 
 export function isNightgateError(err: unknown): err is NightgateError {
     return !!err && typeof err === 'object' && (err as { isNightgateError?: unknown }).isNightgateError === true
@@ -149,6 +150,11 @@ export function findNightgateError(err: unknown, depth = 8): NightgateError | un
 }
 
 /** Rebuilds an error that was sent from another thread. Keeps the original `name`. */
+/** The error's text with every URL replaced. An upstream URL can carry a key. */
+export function messageWithoutUrls(err: unknown, placeholder = '<url>'): string {
+    return errorMessage(err).replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, placeholder);
+}
+
 export function nightgateErrorFromPayload(p: NightgateErrorPayload): NightgateError {
     const code = (p.code in ERROR_CODES ? p.code : statusClassCode(p.status)) as ErrorCode;
     const err = new NightgateError(code, p.message, { status: p.status, retryable: p.retryable, info: p.info });

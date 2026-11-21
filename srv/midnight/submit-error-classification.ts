@@ -66,7 +66,8 @@ function codedSubmitFailure(err: NightgateError | undefined): SubmitFailureInfo 
 }
 
 /** First match wins. The "no reply" check is last because other errors also say "timed out". */
-export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
+/** `announced: false` says the failed call had not announced a tx yet, so a missing reply cannot mean "sent but unknown". */
+export function classifySubmitFailure(err: unknown, sent: { announced?: boolean } = {}): SubmitFailureInfo {
     const carried = carriedSubmitFailure(err);
     if (carried) return carried;
 
@@ -135,7 +136,7 @@ export function classifySubmitFailure(err: unknown): SubmitFailureInfo {
         return { code: 'pre-mempool-reject', ledgerCode: custom ? `1010/${custom}` : '1010', retryable: false };
     }
     if (TRANSPORT_RE.test(haystack)) return { code: 'transport', retryable: true };
-    if (NO_REPLY_RE.test(haystack)) return { code: 'ambiguous', ledgerCode: 'no-reply', retryable: false };
+    if (NO_REPLY_RE.test(haystack) && sent.announced !== false) return { code: 'ambiguous', ledgerCode: 'no-reply', retryable: false };
     return { code: 'internal', retryable: false };
 }
 

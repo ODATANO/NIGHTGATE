@@ -20,6 +20,16 @@ describe('landedOnChain', () => {
         expect(where).not.toContain('0x');
     });
 
+    it('finds the transaction by one of its identifiers when no hash matches', async () => {
+        const answers: unknown[] = [undefined, { transaction_ID: 't7' }, { status: 'SUCCESS', outcomeSource: 'substrate-system-events' }];
+        const queries: Array<{ SELECT: { from: { ref: string[] }; where: unknown } }> = [];
+        const db = { run: vi.fn(async (q: unknown) => { queries.push(q as typeof queries[number]); return answers[queries.length - 1]; }) };
+        expect(await landedOnChain(db, H)).toBe(true);
+        expect(queries[1].SELECT.from.ref[0]).toMatch(/TransactionIdentifiers$/);
+        expect(JSON.stringify(queries[1].SELECT.where)).toContain(`"${H}"`);
+        expect(JSON.stringify(queries[2].SELECT.where)).toContain('"t7"');
+    });
+
     it('is false without a hash, without a row, or without a success from system events', async () => {
         expect(await landedOnChain(fakeDb(undefined, undefined).db, null)).toBe(false);
         expect(await landedOnChain(fakeDb(undefined, undefined).db, H)).toBe(false);

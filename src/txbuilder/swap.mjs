@@ -135,12 +135,16 @@ export async function decodeOffer(input) {
 
 export const latest = (observable, what, timeoutMs = 10_000) => new Promise((resolve, reject) => {
     let done = false;
+    let timer;
+    // The timer ends with the read. A pending one would keep the process alive after `close()`.
+    const settle = () => { done = true; clearTimeout(timer); };
     const sub = observable?.subscribe?.({
-        next: (v) => { if (!done) { done = true; setImmediate(() => sub?.unsubscribe?.()); resolve(v); } },
-        error: (e) => { if (!done) { done = true; reject(e); } }
+        next: (v) => { if (!done) { settle(); setImmediate(() => sub?.unsubscribe?.()); resolve(v); } },
+        error: (e) => { if (!done) { settle(); reject(e); } }
     });
     if (!sub) { reject(new Error(`${what} is not observable`)); return; }
-    setTimeout(() => { if (!done) { done = true; try { sub.unsubscribe?.(); } catch { /* gone */ } reject(new Error(`no ${what} within ${timeoutMs} ms`)); } }, timeoutMs);
+    if (done) return;
+    timer = setTimeout(() => { if (!done) { done = true; try { sub.unsubscribe?.(); } catch { /* gone */ } reject(new Error(`no ${what} within ${timeoutMs} ms`)); } }, timeoutMs);
 });
 
 /** Returns the proving service. In `server` mode the proof server sees the coins you spend. */

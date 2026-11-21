@@ -661,6 +661,8 @@ describe('NightgateAdminService', () => {
             const result: any = await registeredHandlers['getJobStats'](createMockRequest({}, 'admin-1'));
             expect(result.oldestQueuedSeconds).toBeGreaterThanOrEqual(290);
             expect(result.oldestQueuedSeconds).toBeLessThan(320);
+            // A job queued before the window is the one that matters, so this read has no window.
+            expect(selectWhereSpy).toHaveBeenCalledWith({ status: 'pending' });
         });
 
         it('reports zero queue age when nothing is pending', async () => {

@@ -101,7 +101,8 @@ export default class NightgateAdminService extends cds.ApplicationService {
                 this.db.run(
                     SELECT.from(BackgroundJobs)
                         .columns('min(createdAt) as oldest')
-                        .where({ createdAt: { '>=': since }, and: { status: 'pending' } })
+                        // Not limited to the window: a job stuck for days is the one this number exists for.
+                        .where({ status: 'pending' })
                 )
             ]);
 

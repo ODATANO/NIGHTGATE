@@ -1,5 +1,182 @@
 # Changelog
 
+## 0.46.3 - 2026-11-20
+
+### Changes
+
+- A fresh index starts at block 2, with block 1 as its anchor. Block 0 has no
+  events and cannot be stored, so with the former default the crawler never
+  got past it. `NIGHTGATE_CRAWLER_START_HEIGHT` has a minimum of 2.
+- `submitContractCall`, `submitContractCallBatch` and `buildSponsorable`
+  answer 400 for a circuit the contract does not have, for a wrong number of
+  arguments and for a `$bytes` or `$uint` tag that contradicts the parameter
+  type. A `Vector` argument is checked by length and entry type, a `Field`
+  takes a number or a decimal string.
+- `anchorDocument.contentType` (100 characters), `anchorDocument.storageRef`
+  and `attestAgentOutput.storageRef` (500) and `unit` of the predicate
+  actions (50) carry the length of their column. A longer value answers 400.
+  Before, PostgreSQL answered 500 and SQLite stored it.
+- The verify functions and `claimDisclosure` answer 502 `BAD_GATEWAY` with
+  `Retry-After` and the indexer's reason when the indexer cannot serve the
+  contract state, and 409 `CONFLICT` for a state last written under ledger 8.
+  Both answered 500 before.
+- `mintFactoryToken` answers 403 for a grant the platform pool pays for, and
+  such a grant can no longer list the action. A sponsor wallet pays the fee
+  and never issues a token: build the mint with `@odatano/nightgate-tx` and
+  hand it to `sponsorUnboundTransaction`, then the caller's own key is the
+  issuer. The call answered 404 before.
+- A wallet listed in `NIGHTGATE_FEE_SPONSOR_SESSION` only pays fees. As
+  `sessionId` it answers 403 for every action that signs, moves coins or
+  registers, for its owner too: the contract, document, proof, disclosure
+  and token actions, `sendNight`, `estimateSendNightFee`,
+  `registerForDustGeneration` and `deregisterFromDustGeneration`. A grant
+  bound to it can list only the sponsor and offer board actions. A sponsor
+  gets its dust by delegation: another wallet registers with the sponsor's
+  dust address as `dustReceiverAddress`.
+- `retireSwapOffer` stops a take that was accepted and is not sent yet. The
+  `sponsorSwap` job checks its offer when it starts and again right before
+  the send, and fails without sending when the offer is retired or expired.
+  Before, the swap went through. A swap that was already sent still lands.
+- A send with an unknown outcome keeps its coins and its dust reserved. They
+  are freed at once only when the transaction is surely in no block: nothing
+  was sent, or the node refused it. Otherwise the wallet's sync settles them,
+  or they are freed once the chain is past the transaction's expiry and the
+  indexer does not have it. Before, every failed send freed them, and the
+  next call could offer coins a landed transaction had spent.
+- `sendNight`, `registerForDustGeneration` and `deregisterFromDustGeneration`
+  wait for the strict sync check, like every contract call. A wallet behind
+  the tip answers `WALLET_NOT_SYNCED` instead of building a transaction the
+  node refuses.
+- In production a server with `auth.kind` `dummy` or `mocked` does not start
+  unless `NIGHTGATE_ALLOW_UNAUTHENTICATED=true`. Before, it logged the
+  refusal and went on serving every request as a privileged user.
+- `NIGHTGATE_TRUST_PROXY` (default `0`) names the number of reverse proxies in
+  front of the server. With it the rate limits per address and the login
+  throttle see the caller's address instead of the proxy's.
+- The main service takes request bodies up to 2 MB. The limit was 100 KB, so
+  the documented 1 MiB of disclosure content could not be sent.
+- A request body that is not JSON answers 400 `The request body is not valid
+  JSON`. The former message and the log line quoted part of the body.
+- Two more parked job codes: `RESULT_PERSIST_FAILED` and `LEASE_EXPIRED`.
+- One grant holds at most 32 of the 256 entries of `LearnedTokenTypes`.
+- `docker/watchdog.sh` gives a server that still answers 90 seconds
+  (`NIGHTGATE_WATCHDOG_STOP_WAIT`) to save its wallet states before a
+  restart, and 5 only when it does not answer. Its crawler cycle needs
+  `NIGHTGATE_HTTP_ROLES=admin`, and the log names a refusal.
+- The release workflow moves the image tag `latest` only for a version
+  without a suffix.
+
+### Fixes
+
+Jobs:
+
+- A second run of `nightgate-schema-delta` on a migrated SQLite database
+  cleared indexed data: `UnshieldedUtxos`, `NightBalances` and the addresses
+  and amounts on transactions. The cleanup runs only where it finds rows in
+  the old format.
+- A claim's expiry is fixed when the action is called. A proof workflow that
+  ran a second time took a later default and built other steps.
+- A job whose transaction was sent keeps that fact: a result that cannot be
+  stored, a process that stops reporting and a restart park it for
+  reconciliation instead of failing it or leaving it running. A job that more
+  than three restarts interrupted fails with `LEASE_EXPIRED`.
+- At start, a workflow with a finished step is parked instead of failed.
+- A sponsored transaction that landed and whose bookkeeping then failed is
+  settled from the chain. It was marked failed and built again before.
+- A reconciled deploy names its contract address, and `feeSponsor` appears
+  only where a sponsor paid.
+- A timeout before a send was announced no longer counts as "may have been
+  sent". After a send, the private state and the signing key of a deploy stay
+  reachable until the worker answered.
+
+Wallets and grants:
+
+- `connectWalletForSigning` on a session that was just closed answers 404.
+- `estimateSendNightFee` uses the given token type and its amount limit, and
+  waits for a submit of the same wallet instead of reserving its coins.
+- One save that hangs no longer stops the periodic saves of every wallet.
+- A partial save drops snapshot parts stored for another SDK version, network
+  or seed. A snapshot under an unknown SDK version is never restored.
+- A grant gets its job unit back for a 503 that says "retry later", and pays
+  none for a call the starting server refuses. A repeated request under a
+  used idempotency key gets its value budget back.
+- A grant with a circuit list can use `postSwapOffer`, `retireSwapOffer`,
+  `grantDisclosureToHolders` and `revokeHolderDisclosure`. They answered 403.
+- `createAgentGrants`, `updateAgentGrant` and `rotateAgentGrantToken` work
+  while the server starts.
+- Contract addresses in `NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS` and in the
+  policy file match with `0x` and in either letter case, as does
+  `NIGHTGATE_TOKEN_FACTORY_CONTRACT`.
+- The sponsor's coin check also runs on an offer that holds only transient
+  coins.
+- `sponsorUnboundTransaction`, `sponsorSwap` and `sponsorTransfer` price the
+  fee again when the wait for a free dust backing took longer than a block.
+- A stop saves every wallet inside the time the server gives it. The wait
+  for running submits and the final saves share one deadline, a wallet whose
+  submit still runs is saved without waiting for it, and a dust check that
+  cannot finish in time leaves the last confirmed dust save in place.
+
+Offer board:
+
+- A swap that lands marks its offer `filled` with the transaction hash, also
+  when the offer was retired or expired after the swap was sent.
+- `listSwapOffers` with `tag` lets the database narrow the rows.
+
+Proofs and disclosure:
+
+- A registry address that holds another contract, or one the indexer cannot
+  serve, no longer fails every `claimDisclosure` for that payload.
+- `reindexDisclosures` on a contract that is no vault answers zero counts.
+- A batch comparison claim that names the batch attester as `attesterIdB`
+  equals one that leaves it out, and its row stores that attester.
+- `prepareMembershipSet` treats an explicit `null` as a value left out.
+- In `submitContractCallBatch`, `merkleProof.fieldValue` is bounded to
+  `Uint<64>`, and the hashes of a proof bundle take `0x` and either letter
+  case. `registerGranteeIdentity` takes a key or an id the same way.
+
+Crawler and start:
+
+- A database error while a block is stored is retried. It halted the crawler
+  at that block before.
+- A block batch the node refuses as too large is fetched in halves. Before,
+  every call in it ran into its timeout and the same batch was asked again.
+- The decode pass and the indexer supplement write nothing for rows a
+  rollback removed. The supplement stores indexer data only for a block
+  whose hash matches the indexed one. At a block that differs it stops,
+  warns once an hour and goes on as soon as both agree.
+- A failed extrinsic gets no contract action row.
+- A transaction whose decode got no answer from the worker is tried again,
+  up to three times, instead of being stored as failed at once.
+- The identifier backfill pages by key and skips no row. The start-up writes
+  run only once the process holds the instance lease.
+- When the crawler could not start at boot because the node did not answer,
+  a successful `resumeCrawler` ends the offline state. `pauseCrawler`
+  answers 409 while a start is running.
+- A disconnected node provider stays disconnected, and a node that never
+  answers the opening handshake fails the connect.
+- `getJobStats.oldestQueuedSeconds` counts jobs older than the window.
+
+`@odatano/nightgate-tx` 0.24.2:
+
+- `verifyReceipt` is exported from `./client`, as its types said.
+- A write that got no answer is sent once more under the same key, so a job
+  the server did start is not started twice. When the repeat gets no answer
+  either, the error carries `idempotencyKey`, the key the client made for the
+  call. `isRetryable` is false for such an error: repeat the call with the
+  key.
+- `serializeWalletState()` leaves out a shared `shieldedWallet`, so its
+  output can go back into `createTxBuilder`.
+- `createTxBuilder` that fails leaves no wallet syncing: everything that can
+  fail is checked before the wallet starts, and a start that fails stops it.
+- `probeLanded` throws for an indexer that answers 400, 401, 403, 404 or
+  410. A state read of a swap or unshielded wallet leaves no timer behind.
+- `connectContract` throws at once when nothing can prove. `proving: 'auto'`
+  goes on to the proof server when the wallet refuses to prove.
+
+No schema change. Docs: `docs/actions.md`, `docs/txbuilder.md`,
+`docs/browser.md`, `docs/docker.md`, `docs/operations.md`,
+`docs/quickstart.md`, `docs/reference.md`.
+
 ## 0.46.2 - 2026-11-20
 
 ### Fixes

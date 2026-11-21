@@ -9,11 +9,14 @@ import { type MessagePort } from 'node:worker_threads';
 import { encodeAddressString, facades, loadAddressFormat, loadSdk, log, parseReceiverAddress, type ReceiverParsed, type WalletSdk } from './context';
 import type { CombinedTokenTransfer, UnprovenTransactionRecipe } from '@midnightntwrk/wallet-sdk-facade';
 import { parseMidnightAddress } from '../../utils/midnight-address';
-import { BALANCE_SYNC_TIMEOUT_MS, SYNC_POLL_MS, countAllNightUtxos, countRegisteredNightUtxos, peekFacadeState, waitForGenuineSync, waitForSyncedStateBounded } from './facades';
+import { BALANCE_SYNC_TIMEOUT_MS, SYNC_POLL_MS, countAllNightUtxos, countRegisteredNightUtxos, peekFacadeState, waitForGenuineSync, waitForSyncedStateBounded, withSessionLocks } from './facades';
 import { captureDustSnapshot, feeOfDiscardedRecipe, revertRecipeBestEffort, submitWithDustGuard } from './submit';
 import { openTx, type FinalizedLedgerTx } from './wallet-tx';
 import { resolveSponsorEntry } from './sponsor';
 import { setTimeout as sleep } from 'node:timers/promises';
+
+/** A build that spends dust needs the strict sync check. A wallet behind the tip spends against roots the node no longer knows. */
+const strictSyncMs = (timeoutMs?: number): number => (timeoutMs && timeoutMs > 0 ? timeoutMs : BALANCE_SYNC_TIMEOUT_MS);
 
 /** The SDK outputs of one payment, to a shielded or an unshielded address. The ttl defaults to ten minutes. */
 async function transferOutputs(
@@ -41,6 +44,7 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
     if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
 
     log('info', `dust-register: waiting for synced state...`);
+    await waitForGenuineSync(entry, strictSyncMs(syncTimeoutMs), 'dust-register');
     const synced = await waitForSyncedStateBounded(entry, 'dust-register', syncTimeoutMs);
     log('info', `dust-register: synced.`);
 
@@ -182,6 +186,10 @@ export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, spons
         };
     }
 
+    const payer = sponsorEntry ?? entry;
+    if (sponsorEntry) log('info', `dust-deregister: fee sponsored by ${sponsorEntry === entry ? 'self' : String(sponsorSessionId).slice(0, 16)}`);
+    await waitForGenuineSync(payer, strictSyncMs(sponsorEntry ? undefined : syncTimeoutMs), sponsorEntry ? 'deregister sponsor' : 'dust-deregister');
+
     const verifyingKey = entry.unshieldedKeystore.getPublicKey();
     const signFn = async (payload: Uint8Array) => entry.unshieldedKeystore.signData(payload);
 
@@ -191,11 +199,6 @@ export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, spons
         signFn
     );
 
-    const payer = sponsorEntry ?? entry;
-    if (sponsorEntry) {
-        log('info', `dust-deregister: fee sponsored by ${sponsorEntry === entry ? 'self' : String(sponsorSessionId).slice(0, 16)}`);
-        await waitForGenuineSync(sponsorEntry, BALANCE_SYNC_TIMEOUT_MS, 'deregister sponsor');
-    }
     await captureDustSnapshot(payer, 'dust-deregister');
     let balanced: UnprovenTransactionRecipe | undefined;
     let finalized: FinalizedLedgerTx;
@@ -237,6 +240,7 @@ export async function transferNight({ sessionId, receiverAddress, amount, ttlIso
     const sdk = await loadSdk();
 
     log('info', `transfer: waiting for synced state...`);
+    await waitForGenuineSync(entry, strictSyncMs(syncTimeoutMs), 'transfer');
     await waitForSyncedStateBounded(entry, 'transfer', syncTimeoutMs);
     log('info', `transfer: synced.`);
 
@@ -343,11 +347,12 @@ export async function estimateTransferFee({ sessionId, receiverAddress, amount, 
 
     const { receiver, outputs, ttl } = await transferOutputs(sdk, entry.networkId, { receiverAddress, amount, tokenTypeHex, ttlIso });
 
-    const recipe = await entry.facade.transferTransaction(
-        outputs,
-        { ttl }
-    );
-    const fee = await feeOfDiscardedRecipe(entry, recipe, 'estimateTransferFee');
+    // Building reserves coins and dust until the recipe is discarded. Under the session lock no submit of this wallet
+    // picks coins or saves its dust state in between.
+    const fee = await withSessionLocks([sessionId], async () => {
+        const recipe = await entry.facade.transferTransaction(outputs, { ttl });
+        return feeOfDiscardedRecipe(entry, recipe, 'estimateTransferFee');
+    });
     return { fee: fee.toString(), toLedger: receiver.kind };
 }
 

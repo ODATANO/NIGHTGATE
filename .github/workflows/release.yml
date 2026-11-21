@@ -88,6 +88,8 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          # Only MAJOR.MINOR.PATCH is a full release. A suffix such as -rc.1 must not move `latest`.
+          if echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then echo "prerelease=false" >> $GITHUB_OUTPUT; else echo "prerelease=true" >> $GITHUB_OUTPUT; fi
           echo "git_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
 
@@ -113,7 +115,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ steps.repo.outputs.repository_owner_lowercase }}/nightgate:${{ steps.version.outputs.version }}
-            ghcr.io/${{ steps.repo.outputs.repository_owner_lowercase }}/nightgate:latest
+            ${{ steps.version.outputs.prerelease == 'false' && format('ghcr.io/{0}/nightgate:latest', steps.repo.outputs.repository_owner_lowercase) || '' }}
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
             BUILD_DATE=${{ steps.version.outputs.build_date }}
@@ -133,4 +135,4 @@ jobs:
           files: nightgate-${{ steps.version.outputs.version }}.tar.gz
           generate_release_notes: true
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}

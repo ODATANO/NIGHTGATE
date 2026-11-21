@@ -1166,7 +1166,10 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         if (n === 0) n = await confirmChainOutcomesViaIndexer();
         expect(n).toBe(1);
         expect(rows.get('job-recon-bound')).toMatchObject({ status: 'succeeded', chainStatus: 'success', errorCode: null });
-        expect(JSON.parse(rows.get('job-recon-bound')!.result as string)).toMatchObject({ txHash: '00bound'.padEnd(64, '0'), reconciled: true });
+        const result = JSON.parse(rows.get('job-recon-bound')!.result as string);
+        expect(result).toMatchObject({ txHash: '00bound'.padEnd(64, '0'), reconciled: true });
+        // The job paid for itself, so its result names no sponsor. Only a sponsor job falls back to its own session.
+        expect(result).not.toHaveProperty('feeSponsor');
     });
 
     // The crawler-free path resolves identifier-keyed sponsor jobs from reconciliation_required too;
@@ -2218,6 +2221,28 @@ describe('status-write contention hardening', () => {
         expect(row.status).toBe('failed');
         expect(row.errorCode).toBe('RESULT_PERSIST_FAILED');
         expect(row.errorMessage).toMatch(/On-chain effects may exist/);
+    });
+
+    // A failed job frees its idempotency key and is never looked up on the chain. After a broadcast neither may happen.
+    test('markSucceeded exhausted after a broadcast: the job is parked for reconciliation', async () => {
+        lockInjector.failUpdates = 5;
+        lockInjector.matchStatus = 'succeeded';
+
+        const ret = await startJob({
+            kind:      'sendNight',
+            sessionId: 'sess-1',
+            request:   {},
+            work:      async () => {
+                for (const running of rows.values()) if (running.status === 'running') running.txHash = '00announced';
+                return { txId: 'tx-landed-on-chain' };
+            }
+        });
+        await flushSpawn();
+
+        const row = rows.get(ret.jobId)!;
+        expect(row.status).toBe('reconciliation_required');
+        expect(row.errorCode).toBe('RESULT_PERSIST_FAILED');
+        expect(row.errorMessage).toMatch(/settles it from the indexer by 00announced/);
     });
 
     test('markFailed exhausted: logs and returns without throwing; row stays non-terminal', async () => {

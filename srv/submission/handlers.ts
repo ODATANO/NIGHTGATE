@@ -5,6 +5,7 @@ import cds from '@sap/cds';
 import { TransactionSubmitter, type TransactionSubmitterDeps } from './TransactionSubmitter';
 import { resolveContract } from './contract-registry';
 import { buildWalletMaterialForSession, attesterIdForSession, type WalletMaterialFactory } from './wallet-material-factory';
+import { refuseSponsorAsActor } from '../utils/session-expiry';
 import { loadCircuitArgTypes } from './arg-coercion';
 import { deriveRawTokenType, SHIELDED_TEST_TOKEN_AMOUNT } from './token-type';
 import { registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer } from './background-jobs';
@@ -56,7 +57,12 @@ export function registerSubmissionHandlers(
     db: DbRunner,
     options: SubmissionHandlersOptions = {}
 ): void {
-    const walletFactory = options.walletMaterialFactory ?? buildWalletMaterialForSession;
+    const buildWalletMaterial = options.walletMaterialFactory ?? buildWalletMaterialForSession;
+    // The wallet an action acts as. A fee sponsor is refused here, so no handler or job can sign with one.
+    const walletFactory: WalletMaterialFactory = async (opts) => {
+        refuseSponsorAsActor(opts.sessionId);
+        return buildWalletMaterial(opts);
+    };
     const attesterIdResolver = options.attesterIdResolver ?? attesterIdForSession;
     const contractResolver = options.resolveContractImpl ?? resolveContract;
     const submitterFactory = options.submitterFactory ?? ((deps: TransactionSubmitterDeps) => new TransactionSubmitter(deps));

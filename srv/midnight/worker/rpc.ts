@@ -3,7 +3,7 @@
  */
 
 import { type MessagePort } from 'node:worker_threads';
-import { runInRpcScope } from './cancellation';
+import { runInRpcScope, intentAnnounced } from './cancellation';
 import { SUBMIT_METHODS, isSubmittingMethod, WORKER_ROTATING, RpcErrorPayload } from '../wallet-worker-protocol';
 import { classifySubmitFailure, causeMessages } from '../submit-error-classification';
 import { errorName, formatErrWithCauses } from '../../utils/format-error';
@@ -49,6 +49,7 @@ async function dispatch(method: string, args: unknown, port: MessagePort): Promi
     }
     // Only a call that may send a tx delays a planned restart.
     const submitting = isSubmittingMethod(method);
+    let announced = false;
     try {
         const fn = handlers[method];
         if (!fn) throw new Error(`Unknown method: ${method}`);
@@ -62,9 +63,16 @@ async function dispatch(method: string, args: unknown, port: MessagePort): Promi
         port.on('message', onCancel);
         let result: unknown;
         try {
-            result = await runInRpcScope(method, cancel.signal, () => SUBMIT_METHODS.has(method)
-                ? withSessionLocks(submitLockKeys(args), () => fn(callArgs as never))
-                : fn(callArgs as never));
+            result = await runInRpcScope(method, cancel.signal, async () => {
+                try {
+                    return await (SUBMIT_METHODS.has(method)
+                        ? withSessionLocks(submitLockKeys(args), () => fn(callArgs as never))
+                        : fn(callArgs as never));
+                } catch (err) {
+                    announced = intentAnnounced();
+                    throw err;
+                }
+            });
         } finally {
             port.off('message', onCancel);
             if (submitting) rotationState.inflight--;
@@ -81,7 +89,7 @@ async function dispatch(method: string, args: unknown, port: MessagePort): Promi
         if (coded) payload.nightgate = coded.toPayload();
         // Classify here, where the original SDK error objects are still available.
         if (submitting) {
-            const info = classifySubmitFailure(err);
+            const info = classifySubmitFailure(err, { announced });
             payload.code = info.code;
             payload.retryable = info.retryable;
             if (info.ledgerCode) payload.ledgerCode = info.ledgerCode;

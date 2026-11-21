@@ -40,6 +40,18 @@ describe('typed action parameters are validated by CAP', () => {
         expect(r.data.error.target).toBe(target);
     });
 
+    test.each([
+        ['anchorDocument', { contentType: 'x'.repeat(101) }, 'contentType'],
+        ['anchorDocument', { storageRef: 's3://' + 'x'.repeat(500) }, 'storageRef'],
+        ['attestAgentOutput', { storageRef: 's3://' + 'x'.repeat(500) }, 'storageRef'],
+        ['issueFieldPredicateAttestation', { unit: 'u'.repeat(51) }, 'unit'],
+        ['issueFieldPredicateAttestationBatch', { claims: [{ predicate: 'lessOrEqual', unit: 'u'.repeat(51) }] }, 'claims[0]/unit']
+    ])('%s refuses a text longer than its column with 400 on %s', async (action, body, target) => {
+        const r = await cap.axios.post(`${API}/${action}`, body, AUTH);
+        expect(r.status).toBe(400);
+        expect(r.data.error.target).toBe(target);
+    });
+
     test('a function parameter outside its enum is refused', async () => {
         const r = await cap.axios.get(`${API}/verifyPredicateState(contractAddress='${H('d')}',attesterId='${H('a')}',payloadHash='${H('b')}',predicate='between')`, AUTH);
         expect(r.status).toBe(400);

@@ -24,6 +24,11 @@ export function markIntentAnnounced(): void {
     if (s) s.announced = true;
 }
 
+/** True once the running call announced its tx. Before that nothing of it can be on its way. */
+export function intentAnnounced(): boolean {
+    return scope.getStore()?.announced === true;
+}
+
 export function throwIfRpcCancelled(where: string): void {
     const s = scope.getStore();
     if (s && !s.announced && s.signal.aborted) throw new RpcCancelledError(s.method, where);

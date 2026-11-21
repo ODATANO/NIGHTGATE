@@ -159,6 +159,8 @@ describe('key ring parsing', () => {
 
     it('rejects malformed entries, bad ids and an unknown active id', () => {
         expect(() => parseKeyRingSpec({ ENCRYPTION_KEYS: 'nosecret' })).toThrow(/id=secret/);
+        // Such an entry is most likely a bare secret: the message names its position and none of its characters.
+        expect(() => parseKeyRingSpec({ ENCRYPTION_KEYS: 'a=1, supersecretvalue' })).toThrow('ENCRYPTION_KEYS entry 2 is not id=secret');
         expect(() => new KeyRing({ activeId: 'x', keys: [{ id: 'bad id', secret: 's' }] })).toThrow(/invalid encryption key id/);
         expect(() => new KeyRing({ activeId: 'x', keys: [{ id: 'a', secret: 's' }, { id: 'a', secret: 't' }] })).toThrow(/duplicate/);
         expect(() => new KeyRing({ activeId: 'x', keys: [{ id: 'a', secret: 's' }] })).toThrow(/not in the encryption key ring/);

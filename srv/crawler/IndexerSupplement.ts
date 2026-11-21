@@ -12,13 +12,17 @@ import {
     DEFAULT_CONTRACT_STATE_POLICY, digestOfBase64, keepsStateHistory, upsertCurrentState,
     type ContractStatePolicy
 } from './contract-state';
-import { advancePassCursor, blocksInRange, readPassWindow, windowIsEmpty, PassPause, type PassPosition } from './cursor-pass';
+import { advancePassCursor, blocksInRange, readPassWindow, windowIsEmpty, writeInGeneration, PassPause, type PassPosition } from './cursor-pass';
 import { affectedRows, type DbRunner, type Row } from '../utils/db-types';
 import { isIndexerRateLimit } from '../utils/indexer-graphql';
 import { Blocks, Transactions, TransactionResults, TransactionSegments, TransactionFees, ContractActions, ContractBalances, UnshieldedUtxos, ZswapLedgerEvents, DustLedgerEvents, type Block, type Transaction, type ContractAction, type TransactionResult } from '#cds-models/midnight';
 
+import { bareHex } from '../utils/hex-patterns';
+
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 const log = cds.log('nightgate:crawler');
+const PASS = 'indexer supplement';
+const MISMATCH_LOG_EVERY_MS = 3_600_000;
 
 export interface IndexerSupplementConfig {
     url: string;
@@ -63,6 +67,9 @@ export class IndexerSupplement {
     private cachedGeneration: number | null = null;
     private lastRequestAt = 0;
     private refusals = 0;
+    /** The height whose hash the indexer last disagreed on, and when that was last logged. */
+    private mismatchAt: number | null = null;
+    private mismatchLoggedAt = 0;
 
     constructor(private readonly config: IndexerSupplementConfig, client?: IndexerClient) {
         if (client) this.client = client;
@@ -137,8 +144,21 @@ export class IndexerSupplement {
                 // The indexer has not reached this height yet. Retry this block next time instead of skipping it.
                 return this.endBefore(start, blocks, index, result);
             }
-            await this.applyBlockFields(block.ID, height, answer);
-            const perBlock = await this.applyBlock(height, answer.transactions);
+            if (answer.hash !== bareHex(block.hash)) {
+                // The indexer follows another chain or a fork at this height. Nothing of it is stored, and the block is asked again.
+                // Named once per height and again every hour, so a pass that stands for days is not one lost log line.
+                if (this.mismatchAt !== height || this.now() - this.mismatchLoggedAt >= MISMATCH_LOG_EVERY_MS) {
+                    log.warn(`indexer supplement stopped at height ${height}: the indexer's block is ${answer.hash || 'unnamed'}, the indexed one is ${bareHex(block.hash)}`);
+                    this.mismatchAt = height;
+                    this.mismatchLoggedAt = this.now();
+                }
+                return this.endBefore(start, blocks, index, result);
+            }
+            this.mismatchAt = null;
+            // A rollback since the pass started removed the rows this block's data belongs to.
+            if (!await this.applyBlockFields(block.ID, height, answer, start)) return EMPTY_RUN;
+            const perBlock = await this.applyBlock(height, answer.transactions, start);
+            if (!perBlock) return EMPTY_RUN;
             result.transactions += perBlock.transactions;
             result.fees += perBlock.fees;
             result.segments += perBlock.segments;
@@ -160,16 +180,18 @@ export class IndexerSupplement {
     }
 
     /** Ledger parameters rarely change, so they are stored only on blocks where they differ from the previous ones. */
-    private async applyBlockFields(blockId: string, height: number, answer: SupplementBlock): Promise<void> {
-        if (!answer.ledgerParameters) return;
+    private async applyBlockFields(blockId: string, height: number, answer: SupplementBlock, start: PassPosition): Promise<boolean> {
+        if (!answer.ledgerParameters) return true;
         if (this.lastLedgerParameters === null) {
             this.lastLedgerParameters = await this.readParametersBelow(height);
         }
-        if (this.lastLedgerParameters === answer.ledgerParameters) return;
-        await this.db.run(
-            UPDATE.entity(Blocks).set({ ledgerParameters: capBinaryInput(answer.ledgerParameters) }).where({ ID: blockId })
-        );
-        this.lastLedgerParameters = answer.ledgerParameters;
+        if (this.lastLedgerParameters === answer.ledgerParameters) return true;
+        const ledgerParameters = answer.ledgerParameters;
+        const written = await writeInGeneration(this.db, start, PASS, async (tx) => {
+            await tx.run(UPDATE.entity(Blocks).set({ ledgerParameters: capBinaryInput(ledgerParameters) }).where({ ID: blockId }));
+        });
+        if (written) this.lastLedgerParameters = ledgerParameters;
+        return written;
     }
 
     private async readParametersBelow(height: number): Promise<string> {
@@ -182,7 +204,8 @@ export class IndexerSupplement {
         return stored ? stored.toString('base64') : '';
     }
 
-    private async applyBlock(height: number, transactions: SupplementTransaction[]): Promise<SupplementRunResult> {
+    /** Null when a rollback ran since the pass started and a transaction's data was dropped. */
+    private async applyBlock(height: number, transactions: SupplementTransaction[], start: PassPosition): Promise<SupplementRunResult | null> {
         const result: SupplementRunResult = { ...EMPTY_RUN };
         if (transactions.length === 0) return result;
 
@@ -196,7 +219,7 @@ export class IndexerSupplement {
             const transactionId = byHash.get(tx.ledgerTxHash);
             if (!transactionId) continue;
             result.transactions++;
-            await this.db.tx(async (dbTx) => {
+            const written = await writeInGeneration(this.db, start, PASS, async (dbTx) => {
                 result.fees += await this.applyFee(dbTx, transactionId, tx);
                 result.segments += await this.applySegments(dbTx, transactionId, tx);
                 result.balances += await this.applyContractState(dbTx, transactionId, height, tx);
@@ -204,6 +227,7 @@ export class IndexerSupplement {
                 result.dustEvents += await this.replaceDustEvents(dbTx, transactionId, tx.dustEvents);
                 result.dustFlags += await this.applyDustFlags(dbTx, tx);
             });
+            if (!written) return null;
         }
         return result;
     }
@@ -365,7 +389,7 @@ export class IndexerSupplement {
         return updated;
     }
 
-    private async endBefore(start: PassPosition, blocks: Row<Block, 'ID' | 'height'>[], index: number, result: SupplementRunResult): Promise<SupplementRunResult> {
+    private async endBefore(start: PassPosition, blocks: Row<Block, 'ID' | 'height' | 'hash'>[], index: number, result: SupplementRunResult): Promise<SupplementRunResult> {
         if (index === 0) return EMPTY_RUN;
         result.blocks = index;
         await this.setCursor(start, Number(blocks[index].height) - 1);
@@ -386,6 +410,6 @@ export class IndexerSupplement {
 
 
     private setCursor(expected: PassPosition, height: number): Promise<boolean> {
-        return advancePassCursor(this.db, 'lastSupplementedHeight', expected, height, 'indexer supplement');
+        return advancePassCursor(this.db, 'lastSupplementedHeight', expected, height, PASS);
     }
 }

@@ -57,6 +57,15 @@ A refused server call throws `NightgateApiError` with `status` and `code`. A
 429 and a retryable 503 also carry `retryAfterSeconds`. `isRetryable(err)`
 says whether the same call may be repeated.
 
+A write that got no answer may have started its job on the server. The client
+sends it once more under the same key, and the server answers with the first
+job. When the repeat gets no answer either, the error carries
+`idempotencyKey`, the key the client made for the call. Repeat the call with
+that key. `isRetryable` is false for such an error, because a repeat without
+the key would start a second job. A write that cannot reach the server
+therefore fails after two timeouts. A `waitForJob` that ran out of time
+carries `jobId` and `sessionId`.
+
 ## `createTxBuilder(opts) -> TxBuilder`
 
 | option | required | meaning |
@@ -112,7 +121,7 @@ buildSponsorable, buildDeploySponsorable, revert, close }`.
 - `attestationSecret` and `attesterId` belong to the attestation vault. The secret goes into the `prepare*` helpers, the id is the attester of every attestation built here. A builder for another contract carries both and uses neither.
 - `walletSync` is the resolved mode: `'all'`, `'coins'`, `'shielded'` or `'none'`.
 - `waitForSync()` resolves when every started sub-wallet reached the tip and reads the chain at ledger 9, a shared shielded wallet included. A wallet catches up a moment before it learns that the chain runs ledger 9. A build in that moment would be for the ledger before it.
-- `serializeWalletState()` returns `{ shielded?, unshielded?, dust? }` for the synced sub-wallets. It holds the coins, so store it like a key.
+- `serializeWalletState()` returns `{ shielded?, unshielded?, dust? }` for the sub-wallets this builder syncs. A shared `shieldedWallet` is left out, its owner saves it. It holds the coins, so store it like a key.
 - `revert(tx)` releases the coins a built transaction reserved, when it will not land. Takes an offer file, base64 or bytes, bound or not.
 - `close()` stops the wallet sync and the indexer sockets. Without it both run until the process exits.
 
@@ -451,4 +460,4 @@ runs the full flow with the resend loop the rules below describe.
 - `isPreMempoolReject(err)` is true for 1010, 1014 and 1016. No fee was spent, but the fee's coins stay reserved until `facade.revertTransaction(handle)`.
 - `isTransportFailure(err)` means the transaction may be in the mempool. Probe, then resend the same bytes. A rebuild can land a second transaction.
 - `isAlreadyImported(err)` (1013) on a resend means the first send is in the pool. Any other refused resend may mean it landed, so run a bounded `waitLanded` before you revert.
-- `probeLanded(identifier, opts)` and `waitLanded(identifier, opts)` ask an indexer (`indexerHttpUrl`) or a NIGHTGATE server (`api`). Confirm by identifier, never by the contract address. `applied: false` means in a block, call failed, fee spent.
+- `probeLanded(identifier, opts)` and `waitLanded(identifier, opts)` ask an indexer (`indexerHttpUrl`) or a NIGHTGATE server (`api`). Confirm by identifier, never by the contract address. An indexer that answers 400, 401, 403, 404 or 410 will never know the transaction, so the probe throws; an outage reads as `null`. `applied: false` means in a block, call failed, fee spent.

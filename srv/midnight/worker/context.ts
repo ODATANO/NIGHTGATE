@@ -83,6 +83,8 @@ export interface FacadeEntry {
     pendingSaves?: Map<number, PendingSave>; // by save number, until confirmed
     /** Key of the confirmed dust save (`dustSaveKey`) and the epoch of the wallet that produced it. */
     lastSavedDustKey?: { epoch: number; key: string };
+    /** Milliseconds the last restore check of a collapsed dust save took. A stop skips a check that does not fit its deadline. */
+    lastDustVerifyMs?: number;
     networkId: string;
     /** Used to read the indexer's latest block, which is the real sync target. */
     indexerHttpUrl: string;

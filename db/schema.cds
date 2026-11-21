@@ -330,7 +330,7 @@ entity ReorgLog : cuid, managed {
     newTipHash       : HexEncoded not null;
     blocksRolledBack : Integer default 0;
     blocksReIndexed  : Integer default 0;
-    status           : String(20); // 'completed' or 'failed'
+    status           : String(20); // 'in_progress', 'completed' or 'failed'; failed = the new branch was not indexed in that run
 }
 
 /** Transactions submitted through this server.

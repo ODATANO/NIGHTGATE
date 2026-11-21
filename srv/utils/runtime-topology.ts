@@ -78,6 +78,22 @@ function authKind(): string {
     return String(cds.env.requires?.auth?.kind ?? '');
 }
 
+/** Auth kinds that admit a request as a privileged user without checking a credential. */
+const OPEN_AUTH_KINDS = new Set(['dummy', 'mocked']);
+
+/** What an open auth kind means in production, or null when the auth kind checks credentials or this is no production run. */
+function openAuthInProduction(): string | null {
+    if (!isProduction() || !OPEN_AUTH_KINDS.has(authKind())) return null;
+    return `Authentication kind '${authKind()}' serves every request unauthenticated and privileged.`;
+}
+
+/** The reason this server must not listen: production with an open auth kind and no explicit override. Null otherwise. */
+export function openAuthRefusal(): string | null {
+    const open = openAuthInProduction();
+    if (!open || configFlag('NIGHTGATE_ALLOW_UNAUTHENTICATED')) return null;
+    return `${open} It is refused in production; configure basic or JWT auth, or set NIGHTGATE_ALLOW_UNAUTHENTICATED=true for a local test.`;
+}
+
 function allowProductionSqlite(config: NightgateConfig): boolean {
     return configFlag('NIGHTGATE_ALLOW_PRODUCTION_SQLITE')
         || config.allowProductionSqlite === true;
@@ -113,15 +129,11 @@ export function getRuntimeTopology(config: NightgateConfig = {}): RuntimeTopolog
         }
     }
 
-    // With `dummy` auth every request is a privileged user and could even export signing keys.
-    if (isProduction() && authKind() === 'dummy') {
-        const message = "Authentication kind 'dummy' serves every request unauthenticated and privileged.";
-        if (configFlag('NIGHTGATE_ALLOW_UNAUTHENTICATED')) {
-            warnings.push(`${message} NIGHTGATE_ALLOW_UNAUTHENTICATED=true is active; keep the port off any network.`);
-        } else {
-            errors.push(`${message} It is refused in production; configure basic or JWT auth, or set NIGHTGATE_ALLOW_UNAUTHENTICATED=true for a local test.`);
-        }
-    }
+    // With an open auth kind every request is a privileged user and could even export signing keys.
+    const openAuth = openAuthInProduction();
+    const refusal = openAuthRefusal();
+    if (refusal) errors.push(refusal);
+    else if (openAuth) warnings.push(`${openAuth} NIGHTGATE_ALLOW_UNAUTHENTICATED=true is active; keep the port off any network.`);
 
     return {
         instanceId,

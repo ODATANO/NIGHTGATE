@@ -5,7 +5,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { errorMessage } from '../utils/errors';
 import { bareHex } from '../utils/hex-patterns';
 const { SELECT, INSERT, UPDATE } = cds.ql;
-import { MidnightNodeProvider, BlockHeader } from '../providers/MidnightNodeProvider';
+import { MidnightNodeProvider, RpcBatchRefusedError, BlockHeader } from '../providers/MidnightNodeProvider';
 import { BlockProcessor, ProcessResult, type PreparedBlock } from './BlockProcessor';
 import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { isTransientError, calcBackoff } from '../utils/retry';
@@ -28,7 +28,7 @@ export interface CrawlerConfig {
     requestTimeout?: number;
     fetchConcurrency?: number;  // Number of block batches fetched at the same time
     rpcBatchSize?: number; // Number of heights fetched in one JSON-RPC batch request
-    startHeight?: number;  // First height to index. Used only when the index is empty.
+    startHeight?: number;  // First height to index, at least FIRST_START_HEIGHT. Used only when the index is empty.
     maxBlocksPerSecond?: number;  // 0 means no limit
     decodePayloads?: boolean;
     indexerSupplement?: boolean;  // Add data the blocks do not contain from the Midnight indexer
@@ -43,6 +43,9 @@ interface ReorgInfo {
     oldTipHash: string;
     newTipHash: string;
 }
+
+/** The lowest start of an empty index. Block 0 has no events and often no timestamp, so the first block that can be stored is block 1, the anchor. */
+export const FIRST_START_HEIGHT = 2;
 
 /** stop() waits this long for the in-flight batch or live block before unsubscribing. */
 const STOP_DRAIN_MS = 30_000;
@@ -95,7 +98,7 @@ export class MidnightCrawler {
             requestTimeout: config.requestTimeout || 30000,
             fetchConcurrency: config.fetchConcurrency ?? 8,
             rpcBatchSize: config.rpcBatchSize ?? 32,
-            startHeight: config.startHeight ?? 0,
+            startHeight: Math.max(config.startHeight ?? FIRST_START_HEIGHT, FIRST_START_HEIGHT),
             maxBlocksPerSecond: config.maxBlocksPerSecond ?? 0,
             decodePayloads: config.decodePayloads ?? false,
             indexerSupplement: config.indexerSupplement ?? false,
@@ -104,6 +107,9 @@ export class MidnightCrawler {
             contractStateHistory: config.contractStateHistory || 'none',
             contractStateWatch: config.contractStateWatch ?? []
         };
+        if (config.startHeight != null && config.startHeight < FIRST_START_HEIGHT) {
+            log.warn(`startHeight ${config.startHeight} raised to ${FIRST_START_HEIGHT}: block 0 cannot be indexed, block 1 is the first one stored`);
+        }
     }
 
     async start(): Promise<void> {
@@ -324,7 +330,7 @@ export class MidnightCrawler {
             const tipHeight = MidnightNodeProvider.parseBlockNumber(finalizedHeader.number);
 
             // Height 0 means nothing is indexed yet. Only then does startHeight apply.
-            if (startHeight === 0 && this.config.startHeight > 0) {
+            if (startHeight === 0) {
                 const seeded = await this.seedStartHeight(tipHeight);
                 if (seeded === 'unfinalized') return 0;
                 startHeight = seeded ?? startHeight;
@@ -548,8 +554,22 @@ export class MidnightCrawler {
     private async fetchBlockBatchWithRetry(heights: number[]): Promise<PreparedBlock[]> {
         return this.withRetry(
             `Batch ${heights[0]}-${heights[heights.length - 1]}`,
-            () => this.processor.fetchBlockBatch(heights)
+            () => this.fetchInAcceptedFrames(heights)
         );
+    }
+
+    /** A frame the node refuses as a whole is asked again in two halves. The same frame would be refused again. */
+    private async fetchInAcceptedFrames(heights: number[]): Promise<PreparedBlock[]> {
+        try {
+            return await this.processor.fetchBlockBatch(heights);
+        } catch (err) {
+            if (!(err instanceof RpcBatchRefusedError) || heights.length < 2) throw err;
+            log.warn(`Batch ${heights[0]}-${heights[heights.length - 1]}: ${err.message}; asking again in two halves`);
+            const half = Math.ceil(heights.length / 2);
+            const lower = await this.fetchInAcceptedFrames(heights.slice(0, half));
+            const upper = await this.fetchInAcceptedFrames(heights.slice(half));
+            return [...lower, ...upper];
+        }
     }
 
     private async withRetry<T>(label: string, run: () => Promise<T>): Promise<T> {
@@ -673,15 +693,18 @@ export class MidnightCrawler {
             const reorg = await this.checkForReorg(header);
             if (reorg) {
                 const reorgLogId = await this.handleReorg(reorg);
-                const reIndexedCount = await this.catchUp();
-                if (reorgLogId) {
-                    await this.db.run(
-                        UPDATE.entity(ReorgLog).set({
-                            blocksReIndexed: reIndexedCount,
-                            status: 'completed'
-                        }).where({ ID: reorgLogId })
-                    );
+                const closeReorgLog = async (fields: { blocksReIndexed?: number; status: 'completed' | 'failed' }): Promise<void> => {
+                    if (reorgLogId) await this.db.run(UPDATE.entity(ReorgLog).set(fields).where({ ID: reorgLogId }));
+                };
+                let reIndexedCount: number;
+                try {
+                    reIndexedCount = await this.catchUp();
+                } catch (err) {
+                    // The rollback is done. The log says that indexing the new branch did not finish in this run.
+                    await closeReorgLog({ status: 'failed' }).catch(() => { /* the catch-up error is the one to report */ });
+                    throw err;
                 }
+                await closeReorgLog({ blocksReIndexed: reIndexedCount, status: 'completed' });
                 return;
             }
 
@@ -690,14 +713,15 @@ export class MidnightCrawler {
 
             const elapsed = (Date.now() - this.startTime) / 1000;
             const syncState = await this.getSyncState();
+            // A head announced again below the known one must not move the finalized height back.
+            const isNewest = height >= Number(syncState?.lastFinalizedHeight ?? -1);
             await this.db.run(
                 UPDATE.entity(SyncState).set({
                     syncStatus: 'synced',
                     syncProgress: 100,
                     blocksPerSecond: this.blocksProcessed / elapsed,
                     consecutiveErrors: 0,
-                    lastFinalizedHeight: height,
-                    lastFinalizedHash: syncState?.lastIndexedHash || bareHex(result.blockHash)
+                    ...(isNewest ? { lastFinalizedHeight: height, lastFinalizedHash: syncState?.lastIndexedHash || bareHex(result.blockHash) } : {})
                 }).where({ ID: 'SINGLETON' })
             );
 

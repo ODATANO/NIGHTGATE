@@ -787,6 +787,30 @@ describe('bound channel submit-intent bookkeeping', () => {
         expect(order).toEqual(['sent']);
     });
 
+    // The worker cannot be stopped once it announced a tx. It may land it after this side gave up and then write through the proxy.
+    test('a failure after an announced hash keeps the private state proxy for the worker; a failure before one releases it at once', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        try {
+            walletDeployContract.mockImplementationOnce(async (_args: unknown, onSubmitIntent: any) => {
+                await onSubmitIntent('0xannounced', { circuits: ['<deploy>'], note: 'deploy' });
+                throw new Error("wallet-worker rpc 'deployContract' timed out after 1800000ms");
+            });
+            const announced = newSubmitter();
+            await expect(inJob([], () => announced.submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: {}, sessionId: 's' }))).rejects.toThrow();
+            expect(unregisterPrivateStateProvider).not.toHaveBeenCalled();
+            await vi.advanceTimersByTimeAsync(1_800_000);
+            expect(unregisterPrivateStateProvider).toHaveBeenCalledTimes(1);
+
+            unregisterPrivateStateProvider.mockClear();
+            walletDeployContract.mockImplementationOnce(async () => { throw new Error('proof failed'); });
+            const silent = newSubmitter();
+            await expect(inJob([], () => silent.submitter.deploy({ contractName: 'counter', registration: REGISTRATION, initialPrivateState: {}, sessionId: 's' }))).rejects.toThrow();
+            expect(unregisterPrivateStateProvider).toHaveBeenCalledTimes(1);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     test('a dust-race rebuild after an announced hash closes that attempt REJECTED, takes the hash off the job, and the rebuild opens a new row', async () => {
         walletDeployContract
             .mockImplementationOnce(async (_a: unknown, onSubmitIntent: any) => { await onSubmitIntent('0xfirst', { note: 'deploy' }); throw dustRace(); })

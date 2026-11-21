@@ -149,7 +149,7 @@ describe('BlockAuthorBackfill', () => {
             backfill.start();
             await vi.waitFor(async () => expect((await readSync()).authorsBackfilledAt).toBeTruthy(), { timeout: 5000 });
             await backfill.stop();
-            expect(warn).toHaveBeenCalledWith(expect.stringContaining('block author backfill pass failed: Not connected'));
+            expect(warn).toHaveBeenCalledWith(expect.stringMatching(/block author backfill pass failed, next try in \d+ s: Not connected/));
             expect(await readBlock(afterChange.hash)).toEqual({ author: stored(afterChange.author), slot: afterChange.slot });
         } finally {
             warn.mockRestore();

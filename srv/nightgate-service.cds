@@ -6,6 +6,8 @@ using { Hex64, Hex64List, HexEncoded, HexList, SeedHex, TxType } from '../db/typ
  * `sponsorSessionId` is a second session that pays the fee. Amounts are decimal strings in the smallest unit. */
 @path    : '/odata/v4/midnight'
 @requires: 'authenticated-user'
+// Disclosure content is up to 1 MiB of text, which JSON escaping can lengthen. Express allows 100 KB without this.
+@cds.server.body_parser.limit: '2mb'
 service NightgateService {
 
     @readonly
@@ -221,9 +223,9 @@ service NightgateService {
     /** Records a document hash and its public metadata on chain, signed by the session's wallet.
      * The server does not store the document itself. Keeping the bytes at `storageRef` is up to you. */
     action   anchorDocument(sha256: Hex64,
-                            contentType: String,
+                            contentType: String(100),
                             size: Integer64,
-                            storageRef: String,
+                            storageRef: String(500),
                             metadata: LargeString, // JSON
                             sessionId: UUID,
                             contractAddress: HexEncoded,
@@ -324,7 +326,7 @@ service NightgateService {
         salt           : Hex64; // all but the document kinds
         siblings       : Hex64List; // all but the document kinds
         dirs           : array of Boolean; // all but the document kinds
-        unit           : String; // optional
+        unit           : String(50); // optional
         value          : String; // numeric: decimal integer, scaled; setMembership: the exact string
         threshold      : Integer64; // numeric; scaled like the value
         expectedValue  : String; // bytesEquality; one of expectedValue, expectedDigest
@@ -373,7 +375,7 @@ service NightgateService {
                                                 greaterOrEqual;
                                             },
                                             threshold: Integer64, // scaled like the value
-                                            unit: String, // optional
+                                            unit: String(50), // optional
                                             sessionId: UUID,
                                             contractAddress: HexEncoded,
                                             compiledArtifactRef: String, // optional, default 'attestation-vault'
@@ -924,7 +926,7 @@ service NightgateService {
                               name: String, // UTF-8, at most 32 bytes
                               amount: String,
                               recipientCoinPublicKey: Hex64,
-                              sessionId: UUID, // optional for a token caller; default the session that pays its sponsored jobs
+                              sessionId: UUID, // optional for a token caller; default the session of its grant
                               idempotencyKey: String, // optional
                               sponsorSessionId: UUID)                         returns { // optional
         jobId     : UUID;
@@ -1176,7 +1178,7 @@ service NightgateService {
                                modelId: String, // at most 200 characters; optional
                                policyHash: Hex64, // optional
                                producedAt: Timestamp, // optional, default now
-                               storageRef: String, // optional, default 'agent-output://<agentId>'
+                               storageRef: String(500), // optional, default 'agent-output://<agentId>'
                                sessionId: UUID,
                                contractAddress: HexEncoded,
                                compiledArtifactRef: String, // optional, default 'attestation-vault'

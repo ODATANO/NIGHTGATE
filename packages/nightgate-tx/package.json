@@ -1,6 +1,6 @@
 {
     "name": "@odatano/nightgate-tx",
-    "version": "0.24.1",
+    "version": "0.24.2",
     "description": "NIGHTGATE client SDK: drive a hosted NIGHTGATE (ZK attestations, verification, disclosure, fee sponsoring) and build transactions locally with your own key.",
     "license": "Apache-2.0",
     "author": "ODATANO",
@@ -27,7 +27,7 @@
         "node": ">=20"
     },
     "scripts": {
-        "prepublishOnly": "node ../../scripts/build-slim-package.mjs && node ../../scripts/check-slim-package.mjs && git -C ../.. diff --quiet -- packages/nightgate-tx"
+        "prepublishOnly": "npm --prefix ../.. run build && node ../../scripts/build-slim-package.mjs && node ../../scripts/check-slim-package.mjs && git -C ../.. diff --quiet -- packages/nightgate-tx"
     },
     "publishConfig": {
         "access": "public"

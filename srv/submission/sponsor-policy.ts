@@ -5,6 +5,7 @@ import cds from '@sap/cds';
 import { configList, configFlag, configString, configIsSet } from '../utils/config';
 import { NightgateError, errorMessage } from '../utils/errors';
 import { HEX64_RE } from '../utils/hex';
+import { bareHex } from '../utils/hex-patterns';
 import { sharedLearnedTokenTypes } from './learned-token-types';
 import { isRateClass, RATE_CLASS_NAMES, type RateClass } from '../utils/rate-class-table';
 import { setRateLimitOverrideSource } from '../utils/rate-classes';
@@ -82,6 +83,14 @@ export function validatePolicyList(name: string, raw: unknown): string[] {
     return out;
 }
 
+const ADDRESS_IN_ANY_SPELLING = /^(0[xX])?[0-9a-fA-F]{64}$/;
+
+/** Brings each contract address into the spelling of the ledger and the grants: lowercase hex without `0x`, each once.
+ *  An operator who lists `0xAB…` would otherwise match no call. An entry that is no address stays as it is. */
+function contractAddresses(list: readonly string[]): string[] {
+    return [...new Set(list.map(entry => (ADDRESS_IN_ANY_SPELLING.test(entry.trim()) ? bareHex(entry) : entry)))];
+}
+
 /** Validates raw token types as they appear in offer `deltas`. Lowercase, no 0x, no duplicates. */
 export function validateTokenTypeList(name: string, raw: unknown): string[] {
     if (raw === undefined || raw === null) return [];
@@ -131,7 +140,7 @@ function envPolicy(): SponsorPolicy {
         throw new SponsorPolicyUnavailableError(`${(e as Error).message}; refusing to sponsor`);
     }
     return {
-        allowedContracts: configList('NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS'),
+        allowedContracts: contractAddresses(configList('NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS')),
         allowedCircuits: configList('NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS'),
         allowDeploy: configFlag('NIGHTGATE_SPONSOR_ALLOW_DEPLOY'),
         allowedTokenTypes,
@@ -181,7 +190,7 @@ function readPolicyFile(filePath: string): SponsorPolicy {
     }
     const rateLimits = readRateLimits(parsed.rateLimits);
     const contractCircuits = validateContractCircuits('contractCircuits', parsed.contractCircuits);
-    const allowedContracts = validatePolicyList('allowedContracts', parsed.allowedContracts);
+    const allowedContracts = contractAddresses(validatePolicyList('allowedContracts', parsed.allowedContracts));
     // A ruled contract is allowed without a second entry. An empty list means every contract and stays empty.
     const ruled = Object.keys(contractCircuits ?? {}).filter(a => !allowedContracts.includes(a));
     return {

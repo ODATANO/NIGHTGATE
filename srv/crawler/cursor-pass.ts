@@ -3,7 +3,7 @@
 import cds from '@sap/cds';
 import { Blocks, SyncState, type Block } from '#cds-models/midnight';
 import { lockReorgGeneration } from '../submission/reorg-generation';
-import type { Row } from '../utils/db-types';
+import type { DbRunner, Row } from '../utils/db-types';
 
 const { SELECT, UPDATE } = cds.ql;
 const log = cds.log('nightgate:crawler');
@@ -38,12 +38,28 @@ export function windowIsEmpty(w: { from: number; ceiling: number }): boolean {
 }
 
 /** Indexed blocks from `from` up to `ceiling`, at most `limit`, oldest first. */
-export async function blocksInRange(db: cds.DatabaseService, from: number, ceiling: number, limit: number): Promise<Row<Block, 'ID' | 'height'>[]> {
+export async function blocksInRange(db: cds.DatabaseService, from: number, ceiling: number, limit: number): Promise<Row<Block, 'ID' | 'height' | 'hash'>[]> {
     return await db.run(
-        SELECT.from(Blocks).columns('ID', 'height')
+        SELECT.from(Blocks).columns('ID', 'height', 'hash')
             .where({ height: { '>=': from } }).and({ height: { '<=': ceiling } })
             .orderBy('height asc').limit(limit)
     ) || [];
+}
+
+/** Runs a pass's write in one transaction, unless a rollback ran since the pass read `expected`. Then the rows it read are gone and nothing is written.
+ *  The lock makes the write wait for a rollback that is running. */
+export async function writeInGeneration(db: cds.DatabaseService, expected: PassPosition, pass: string, write: (tx: DbRunner) => Promise<void>): Promise<boolean> {
+    let written = false;
+    await db.tx(async (tx) => {
+        const generation = await lockReorgGeneration(tx);
+        if (generation !== expected.generation) {
+            log.info(`${pass} pass dropped a write: started at generation ${expected.generation}, found ${generation}`);
+            return;
+        }
+        await write(tx);
+        written = true;
+    });
+    return written;
 }
 
 // Saves the cursor only if cursor and rollback counter are unchanged since the pass started.

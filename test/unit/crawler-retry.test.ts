@@ -35,6 +35,29 @@ describe('isTransientError', () => {
   });
 });
 
+describe('isTransientError for the database', () => {
+  // A store that failed for one of these says nothing about the block, so the crawler must not halt at it.
+  it.each([
+    'ResourceRequest timed out',
+    'Connection terminated unexpectedly',
+    'terminating connection due to administrator command',
+    'the database system is starting up',
+    'sorry, too many clients already',
+    'SQLITE_BUSY: database is locked',
+    'canceling statement due to lock timeout'
+  ])('%s is transient', (message) => {
+    expect(isTransientError(new Error(message))).toBe(true);
+  });
+
+  it('a PostgreSQL contention code is transient whatever the text says', () => {
+    expect(isTransientError(Object.assign(new Error('x'), { code: '40P01' }))).toBe(true);
+  });
+
+  it('a constraint violation is not: the row itself is wrong', () => {
+    expect(isTransientError(new Error('UNIQUE constraint failed: midnight_Blocks.hash'))).toBe(false);
+  });
+});
+
 describe('isUniqueViolation', () => {
   it('recognises the unique-violation messages of PostgreSQL, SQLite and HANA', () => {
     expect(isUniqueViolation(new Error('duplicate key value violates unique constraint "midnight_blocks_hash"'))).toBe(true);

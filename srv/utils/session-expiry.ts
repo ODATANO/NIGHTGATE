@@ -3,6 +3,7 @@
 
 import { getNightgateConfig, type NightgateConfig } from './nightgate-config';
 import { configList } from './config';
+import { NightgateError } from './errors';
 
 /** Session ids any authenticated caller may use as fee sponsor. Env NIGHTGATE_FEE_SPONSOR_SESSION wins over cds config `feeSponsorSessions`. */
 export function getConfiguredFeeSponsorSessions(config?: NightgateConfig): string[] {
@@ -18,6 +19,14 @@ export function getConfiguredFeeSponsorSessions(config?: NightgateConfig): strin
 export function isConfiguredPlatformSponsor(sessionId: string | undefined | null, config?: NightgateConfig): boolean {
     if (!sessionId) return false;
     return getConfiguredFeeSponsorSessions(config ?? getNightgateConfig()).includes(sessionId);
+}
+
+export const SPONSOR_ONLY_PAYS = 'this wallet session is a fee sponsor: it pays fees and does nothing else. Use a wallet session of your own';
+
+/** Throws 403 when `sessionId` is a configured fee sponsor. Such a wallet pays fees and is never the wallet an action acts as:
+ *  it signs no call, moves no coin and issues nothing. */
+export function refuseSponsorAsActor(sessionId: string | undefined | null, config?: NightgateConfig): void {
+    if (isConfiguredPlatformSponsor(sessionId, config)) throw new NightgateError('FORBIDDEN', SPONSOR_ONLY_PAYS);
 }
 
 /** Expired when `expiresAt` is in the past, unless the session is a configured sponsor.

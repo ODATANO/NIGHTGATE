@@ -4,6 +4,8 @@
 
 import { randomUUID } from 'node:crypto';
 
+export { verifyReceipt } from './receipt.mjs';
+
 /** Error of a failed server call, with the server's status and error code. `retryAfterSeconds` comes from `Retry-After` when the server sent it. */
 export class NightgateApiError extends Error {
     constructor(status, code, message, retryAfterSeconds) {
@@ -22,14 +24,31 @@ export const RETRYABLE_ERROR_CODES = new Set([
     'WALLET_NOT_SYNCED', 'WALLET_SYNCING', 'WORKER_ROTATING'
 ]);
 
-/** Whether a failed call may be retried unchanged. Uses the server's error code, else the HTTP status. Network errors are retryable. */
+/** Whether a failed call may be retried unchanged. Uses the server's error code, else the HTTP status. Network errors are retryable.
+ *  A write that carries `idempotencyKey` got no answer of the server itself and may have started its job: repeat it with that key, never unchanged. */
 export function isRetryable(err) {
+    const mayHaveStarted = typeof err?.idempotencyKey === 'string';
     if (err instanceof NightgateApiError) {
         if (typeof err.code === 'string' && !/^\d+$/.test(err.code)) return RETRYABLE_ERROR_CODES.has(err.code);
-        return [429, 502, 503, 504].includes(err.status);
+        // An answer without a server code comes from something in between, which may have passed the request on.
+        return mayHaveStarted ? err.status === 429 : [429, 502, 503, 504].includes(err.status);
     }
     if (err instanceof NightgateJobError) return false;
+    if (mayHaveStarted) return false;
+    return gotNoAnswer(err);
+}
+
+/** True for a timeout or a network failure: the call got no answer, and the server may or may not have received it. */
+function gotNoAnswer(err) {
+    if (err instanceof NightgateApiError || err instanceof NightgateJobError) return false;
     return err?.name === 'TimeoutError' || err?.name === 'AbortError' || /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN/i.test(String(err?.message ?? err));
+}
+
+/** True for an answer that did not come from the server itself, such as a gateway timeout. The request may have gone through. */
+function answeredInBetween(err) {
+    if (!(err instanceof NightgateApiError)) return false;
+    const ownCode = typeof err.code === 'string' && !/^\d+$/.test(err.code);
+    return !ownCode && (err.status === 502 || err.status === 504);
 }
 
 /** Error thrown by waitForJob when the job itself failed. */
@@ -214,7 +233,7 @@ export function connect(opts) {
             if (job.status === 'failed' || job.status === 'reconciliation_required') {
                 throw new NightgateJobError({ ...job, jobId });
             }
-            if (Date.now() > deadline) throw new Error(`waitForJob: job ${jobId} still ${job.status} after ${waitTimeoutMs}ms`);
+            if (Date.now() > deadline) throw Object.assign(new Error(`waitForJob: job ${jobId} still ${job.status} after ${waitTimeoutMs}ms`), { jobId, sessionId });
             // A long poll that ran its time needs no pause; one the server answered at once does.
             if (waitMs === 0 || Date.now() - asked < Math.min(waitMs, 1000)) await new Promise(r => setTimeout(r, interval));
         }
@@ -259,9 +278,24 @@ export function connect(opts) {
         }
     }
 
-    /** Starts a job and waits for its result. A key from this client lets a request lost on a dead connection go out again without a second job. */
+    /** Starts a job and waits for its result. Every start carries a key, so a start that got no answer goes out once more without a second job. */
     async function act(name, params) {
-        const started = await callAction(name, { ...params, idempotencyKey: params?.idempotencyKey || randomUUID() });
+        const ownKey = params?.idempotencyKey ? undefined : randomUUID();
+        const body = { ...params, idempotencyKey: params?.idempotencyKey || ownKey };
+        // A key this client made is unknown to the caller. A failed start names it, so the caller can repeat the call too.
+        const named = (err) => {
+            if (ownKey && err && typeof err === 'object') err.idempotencyKey = ownKey;
+            return err;
+        };
+        let started;
+        try {
+            started = await callAction(name, body);
+        } catch (err) {
+            // The server may have started the job. Under the same key it answers the repeat with that job.
+            // A dead connection was already tried again by the request itself, so it is not repeated here.
+            if (isStaleSocketError(err) || (!gotNoAnswer(err) && !answeredInBetween(err))) throw named(err);
+            started = await callAction(name, body).catch((again) => { throw named(again); });
+        }
         if (!started?.jobId) return started;
         // Use the session id the server returns. Sponsored jobs run under a session the
         // server picks, so the caller cannot know it.

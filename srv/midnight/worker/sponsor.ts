@@ -88,7 +88,7 @@ export async function describeTransaction(args: { txB64: string }): Promise<{ by
 export function offerNonEmpty(offer: unknown): boolean {
     if (!offer) return false;
     let sawKnownKey = false;
-    for (const key of ['inputs', 'outputs', 'transient', 'spends', 'registrations', 'deltas']) {
+    for (const key of ['inputs', 'outputs', 'transients', 'transient', 'spends', 'registrations', 'deltas']) {
         const v = field(offer, key);
         if (v === undefined) continue;
         sawKnownKey = true;
@@ -188,6 +188,10 @@ export function checkOfferTokens(offer: unknown, key: string, tokenTypes: string
 
 /** Fee reserved when the transaction's own estimate fails, in specks. */
 const FALLBACK_FEE_SPECKS = 100_000_000n;
+// A price read older than one block is read again before the dust spend is built.
+let tipPriceMaxAgeMs = 6_000;
+/** Test only. */
+export const __tipPriceForTests = { setMaxAgeMs: (ms: number) => { tipPriceMaxAgeMs = ms; } };
 
 /** Stands for a sponsored swap in the returned call list. */
 export const SWAP_ENTRY_POINT = '<swap>';
@@ -1205,19 +1209,22 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
 
     await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, 'sponsor-unbound');
 
-    const tip = await getIndexerTip(sponsor.indexerHttpUrl);
-    const params = tipLedgerParameters(sdk, tip);
-    let needSpecks = FALLBACK_FEE_SPECKS;
-    try { needSpecks = callerTx.feesWithMargin(params, FEE_BLOCKS_MARGIN); }
-    catch (err) { log('warn', `fee estimate failed, reserving ${FALLBACK_FEE_SPECKS} specks instead: ${errorMessage(err).slice(0, 200)}`); }
-    if (needSpecks <= 0n) needSpecks = FALLBACK_FEE_SPECKS;
+    // The fee prices, the dust time and the expiry all come from the indexer's newest block.
+    const priceAtTip = async () => {
+        const tip = await getIndexerTip(sponsor.indexerHttpUrl);
+        const params = tipLedgerParameters(sdk, tip);
+        let fee = FALLBACK_FEE_SPECKS;
+        try { fee = callerTx.feesWithMargin(params, FEE_BLOCKS_MARGIN); }
+        catch (err) { log('warn', `fee estimate failed, reserving ${FALLBACK_FEE_SPECKS} specks instead: ${errorMessage(err).slice(0, 200)}`); }
+        const ctime = tip.timestampMs != null ? new Date(tip.timestampMs) : new Date();
+        return { params, fee: fee > 0n ? fee : FALLBACK_FEE_SPECKS, ctime, ttl: new Date(ctime.getTime() + 30 * 60 * 1000), readAt: Date.now() };
+    };
+    let priced = await priceAtTip();
+    let needSpecks = priced.fee;
 
     // Read `facade.dust` at each use and never cache it, because a dust restore replaces the object.
     const leaseTtlMs = noteLeaseTtlMs();
     const backingWaitMs = configMs('NIGHTGATE_BACKING_WAIT_MS');
-
-    const ctime = tip.timestampMs != null ? new Date(tip.timestampMs) : new Date();
-    const ttl = new Date(ctime.getTime() + 30 * 60 * 1000);
 
     const snapshotNotes = async (at: Date): Promise<readonly DustNote[]> => (await readDustNotes(sponsor.facade.dust, at)).notes;
     const maxNotes = configNumber('NIGHTGATE_SPONSOR_MAX_DUST_NOTES');
@@ -1226,10 +1233,15 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
     let built: { dustUnproven: UnprovenLedgerTx; spentNonces: string[] } | undefined;
     let stopRenewal: () => void = () => undefined;
     for (let attempt = 0; ; attempt++) {
-        leased = await acquireBacking(sponsor.sessionId, () => snapshotNotes(ctime), needSpecks, leaseTtlMs, backingWaitMs, shortBackings, maxNotes);
+        leased = await acquireBacking(sponsor.sessionId, () => snapshotNotes(priced.ctime), needSpecks, leaseTtlMs, backingWaitMs, shortBackings, maxNotes);
         stopRenewal = keepDustLeaseAlive(leased, leaseTtlMs);
         try {
-            built = await buildDustSpend(sponsor, args.networkId, sdk, leased, needSpecks, ctime, ttl, dustSegment, callerTx, params);
+            // The wait for a backing can take minutes, and the chain moves its fee prices every block.
+            if (Date.now() - priced.readAt > tipPriceMaxAgeMs) {
+                priced = await priceAtTip();
+                if (priced.fee > needSpecks) needSpecks = priced.fee;
+            }
+            built = await buildDustSpend(sponsor, args.networkId, sdk, leased, needSpecks, priced.ctime, priced.ttl, dustSegment, callerTx, priced.params);
             break;
         } catch (e) {
             stopRenewal(); releaseLease(leased);
@@ -1250,7 +1262,7 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
     let sent = false;
     try {
         // The dust spend is only mock-proven for this check, so a refusal costs no proof.
-        refuseOverCost(() => built!.dustUnproven.mockProve().merge(caller.bound ? caller.tx : caller.tx.bind()), params);
+        refuseOverCost(() => built!.dustUnproven.mockProve().merge(caller.bound ? caller.tx : caller.tx.bind()), priced.params);
         const tProve = Date.now();
         // The facade's prover picks its backend by the protocol version the chain is on.
         const version = (await peekFacadeState(sponsor.facade, 5_000))?.activeProtocolVersion;
@@ -1264,7 +1276,7 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
             txHash: String(bound.identifiers().at(-1)),
             contractAddress, circuits: calls.map(c => c.entryPoint), note: leased.backing, sponsorAccountId: sponsor.sessionId,
             deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address),
-            ttl: ttl.toISOString(),
+            ttl: priced.ttl.toISOString(),
             segments: callSegments(bound),
             ...(minted.length ? { minted } : {}),
             ...(nullifiers.length ? { nullifiers } : {}),

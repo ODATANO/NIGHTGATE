@@ -5,9 +5,8 @@ import { deriveRawTokenType, TokenTypeError, SHIELDED_TEST_TOKEN_REF, SHIELDED_T
 import { TOKEN_FACTORY_REF, TOKEN_FACTORY_MINT_CIRCUIT, TOKEN_FACTORY_BURN_CIRCUIT, parseFactoryTokenName, parseFactoryMintAmount } from '../token-factory';
 import { startJob } from '../background-jobs';
 import { HEX64_RE } from '../../utils/hex';
+import { bareHex } from '../../utils/hex-patterns';
 import { configString } from '../../utils/config';
-import { getConfiguredFeeSponsorSessions } from '../fee-sponsor';
-import { getNightgateConfig } from '../../utils/nightgate-config';
 import { PLATFORM_POOL_SENTINEL } from '../sponsor-pool';
 
 import { facadeConfigFromEnv, rejectIfMainnetBlocked, runSubmission, takeValueBudget } from './common';
@@ -18,22 +17,21 @@ import { checkRateClass } from '../../utils/rate-classes';
 
 /** The factory a call names, else the instance default. Rejects and returns undefined without either. */
 function factoryAddressFor(req: Request, raw: unknown): string | undefined {
-    const address = String(raw ?? configString('NIGHTGATE_TOKEN_FACTORY_CONTRACT') ?? '').trim().toLowerCase();
+    const address = bareHex(raw ?? configString('NIGHTGATE_TOKEN_FACTORY_CONTRACT'));
     if (!address) { req.reject(400, 'contractAddress is required (a token-factory deployment; NIGHTGATE_TOKEN_FACTORY_CONTRACT sets the default)'); return undefined; }
     if (!HEX64_RE.test(address)) { req.reject(400, 'contractAddress must be 64 hex characters'); return undefined; }
     return address;
 }
 
-// Without `sessionId`, a mint uses the session that pays the caller's jobs. That is the grant's pinned wallet, else the first pool wallet.
-// `ownerUserId` is the user who must own that session; undefined for a platform wallet the grant pays from.
-function mintSessionFor(req: Request, raw: unknown): { sessionId: string; ownerUserId: string | undefined } | undefined {
-    if (raw) return { sessionId: String(raw), ownerUserId: req.user?.id };
-    if (!req.agentGrant) { req.reject(400, 'sessionId is required'); return undefined; }
-    const pool = getConfiguredFeeSponsorSessions(getNightgateConfig());
-    const pinned = req.agentGrant.sponsorSessionId;
-    const sessionId = pinned && pinned !== PLATFORM_POOL_SENTINEL ? String(pinned) : pool[0];
-    if (!sessionId) { req.reject(503, 'no fee sponsor is configured on this server (NIGHTGATE_FEE_SPONSOR_SESSION), so there is no session to mint from'); return undefined; }
-    return { sessionId, ownerUserId: pool.includes(sessionId) ? undefined : req.user?.id };
+// The session that mints signs the mint and is the issuer. A sponsor wallet pays the fee and never signs for a caller,
+// so a grant the platform pool pays for has no session to mint from here.
+function mintSessionFor(req: Request, raw: unknown): string | undefined {
+    if (req.agentGrant?.sponsorSessionId === PLATFORM_POOL_SENTINEL) {
+        req.reject(403, 'a grant paid by the platform pool cannot call mintFactoryToken: the pool pays fees and never issues a token. Build the mint with @odatano/nightgate-tx and hand it to sponsorUnboundTransaction');
+        return undefined;
+    }
+    if (!raw) { req.reject(400, 'sessionId is required'); return undefined; }
+    return String(raw);
 }
 
 
@@ -52,9 +50,9 @@ export function registerTokenActions(ctx: Pick<SubmissionContext, 'srv' | 'db' |
         if (!parsedAmount.ok) return req.reject(400, parsedAmount.message);
         const recipient = String(recipientCoinPublicKey ?? '').trim().toLowerCase();
         if (!HEX64_RE.test(recipient)) return req.reject(400, 'recipientCoinPublicKey must be 64 hex characters (a Zswap coin public key)');
-        const mintSession = mintSessionFor(req, req.data.sessionId);
-        if (!mintSession) return;
-        const { sessionId, ownerUserId } = mintSession;
+        const sessionId = mintSessionFor(req, req.data.sessionId);
+        if (!sessionId) return;
+        const ownerUserId = req.user?.id;
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRateClass('sponsor', 'sponsor', req)) return;
 

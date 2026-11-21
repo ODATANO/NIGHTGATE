@@ -67,6 +67,8 @@ export interface NightgateIndexerStatus {
     nodeUrl?: string;
     mode: 'idle' | 'active' | 'offline';
     lastError?: string;
+    /** True when the crawler's start was the only thing that failed. */
+    crawlerOnly?: boolean;
     instanceId?: string;
     runtimeMode?: 'single-instance';
     replicaCount?: number;
@@ -86,7 +88,7 @@ let lastStatus: NightgateIndexerStatus = {
 // Always set the status here. It is also copied to srv/, which cannot import this module.
 function setLastStatus(next: NightgateIndexerStatus): void {
     lastStatus = next;
-    publishRuntimeState({ initialized: next.initialized, mode: next.mode, lastError: next.lastError });
+    publishRuntimeState({ initialized: next.initialized, mode: next.mode, lastError: next.lastError, crawlerOnly: next.crawlerOnly });
 }
 
 
@@ -157,14 +159,18 @@ async function ensureSchemaDeployed(): Promise<void> {
         }
     }
 
-    const dbKind = String(cds.env.requires?.db?.kind ?? '');
-    // Lets PostgreSQL use the indexes below for sorted queries. See srv/utils/pg-order-nulls.ts.
-    if (/postgres/i.test(dbKind)) installPostgresOrderNulls();
-    const created = await ensureIndexes(db, dbKind, msg => log.warn(msg));
-    log.debug(`ensured ${created} secondary index(es)`);
+    // Lets PostgreSQL use the secondary indexes for sorted queries. See srv/utils/pg-order-nulls.ts.
+    if (/postgres/i.test(String(cds.env.requires?.db?.kind ?? ''))) installPostgresOrderNulls();
 
     // Stop if a stored seed was encrypted with an unknown key, instead of treating it as missing.
     await assertStoredKeyIdsKnown(db);
+}
+
+/** The start-up steps that write. They run once this process holds the instance lease, so a second process that only waits changes nothing. */
+async function prepareDatabase(): Promise<void> {
+    const db = await cds.connect.to('db');
+    const created = await ensureIndexes(db, String(cds.env.requires?.db?.kind ?? ''), msg => log.warn(msg));
+    log.debug(`ensured ${created} secondary index(es)`);
 
     const removed = await db.run(
         cds.ql.DELETE.from(TransactionResults).where({ outcomeSource: null })
@@ -327,6 +333,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
 
     // The job reconciliation and the crawler find rows by hash, so the stored hashes get one spelling first.
     try {
+        await prepareDatabase();
         await dropStoredHexPrefix(await cds.connect.to('db'));
     } catch (err) {
         const message = errorMessage(err);
@@ -340,7 +347,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
             lastError: message,
             ...topologyStatus
         });
-        logStartupState('offline', 'stored hashes not rewritten');
+        logStartupState('offline', 'database not prepared');
         throw err;
     }
 
@@ -437,6 +444,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     let mode: NightgateIndexerStatus['mode'] = crawlerEnabled ? 'active' : 'idle';
     let lastError: string | undefined = submissionStartupError;
     if (submissionStartupError) mode = 'offline';
+    let crawlerOnly = false;
 
     if (crawlerEnabled) {
         try {
@@ -453,6 +461,8 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
                 logStartupState('syncing', 'crawler started');
             }
         } catch (err) {
+            // Offline for the crawler alone ends when an operator starts the crawler. A failed submission start does not.
+            crawlerOnly = !submissionStartupError;
             lastError = errorMessage(err);
             mode = 'offline';
             if (isNodeTransportError(err)) {
@@ -479,6 +489,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         nodeUrl,
         mode,
         lastError,
+        crawlerOnly,
         ...topologyStatus
     });
 

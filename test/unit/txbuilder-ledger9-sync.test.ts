@@ -1,7 +1,7 @@
 // `syncedAtLedger9`: a wallet counts as synced once it caught up and reads the chain at ledger 9.
 // A wallet catches up a moment before it learns which ledger the chain runs.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 const importWalletTx = () => import('../../src/txbuilder/wallet-tx.mjs' as string);
 const FORKS = { v9: 2_000_000n };
@@ -64,5 +64,25 @@ describe('syncedAtLedger9', () => {
         expect(readsLedger9({ protocolVersion: 2_000_000n }, 2_000_000n)).toBe(true);
         expect(readsLedger9({}, 2_000_000n)).toBe(false);
         expect(await ledger9Version({ v9: 2_500_000n })).toBe(2_500_000n);
+    });
+});
+
+describe('txbuilder: a wallet start that fails leaves nothing running', () => {
+    it('stops what was started and passes the start error on, also when the stop fails too', async () => {
+        const { startOrStop } = await importWalletTx();
+        const stop = vi.fn(async () => undefined);
+        await expect(startOrStop(async () => { throw new Error('unshielded start refused'); }, stop)).rejects.toThrow('unshielded start refused');
+        expect(stop).toHaveBeenCalledTimes(1);
+
+        const brokenStop = vi.fn(async () => { throw new Error('stop failed'); });
+        await expect(startOrStop(async () => { throw new Error('start refused'); }, brokenStop)).rejects.toThrow('start refused');
+        expect(brokenStop).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not stop a wallet that started', async () => {
+        const { startOrStop } = await importWalletTx();
+        const stop = vi.fn(async () => undefined);
+        await expect(startOrStop(async () => undefined, stop)).resolves.toBeUndefined();
+        expect(stop).not.toHaveBeenCalled();
     });
 });

@@ -44,6 +44,9 @@ import {
     readPredicateStateForContract
 } from '../../srv/submission/predicate-state';
 import { readAttestationStateForContract } from '../../srv/submission/attestation-state';
+import { readDisclosureGrants } from '../../srv/submission/disclosure-grants';
+import { resolveContractPackage } from '@odatano/contract-kit/node';
+import { pathToFileURL } from 'node:url';
 import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 const ARTIFACT = path.resolve(__dirname, '../fixtures/fake-vault-artifact.mjs');
@@ -179,6 +182,29 @@ describe('readAttestationStateForContract (production wrapper)', () => {
         await expect(readAttestationStateForContract({
             contractAddress: '0xvault', attesterId: ATTESTER, payloadHash: PAYLOAD, artifactPath: ARTIFACT, contractProvidersConfig: CFG
         })).rejects.toThrow(/written by ledger v8/);
+    });
+});
+
+describe('readDisclosureGrants against real contract states', () => {
+    const packageArtifact = (name: string) => resolveContractPackage(name, path.resolve(__dirname, '../..')).artifactPath;
+    const anyWitness = new Proxy({}, { get: () => () => { throw new Error('no witness in this test'); } });
+    const initialStateOf = async (name: string, ...constructorArgs: unknown[]) => {
+        const artifact: any = await import(pathToFileURL(packageArtifact(name)).href);
+        const rt: any = await import('@midnight-ntwrk/compact-runtime');
+        const initial = await new artifact.Contract(anyWitness).initialState(rt.createConstructorContext({}, '00'.repeat(32)), ...constructorArgs);
+        return initial.currentContractState;
+    };
+
+    it('answers null for a contract that is no vault, whichever artifact reads it', async () => {
+        queryContractState.mockResolvedValue(await initialStateOf('@odatano/contract-counter'));
+        for (const name of ['@odatano/contract-attestation-vault', '@odatano/contract-counter']) {
+            expect(await readDisclosureGrants({ ...CFG, contractAddress: 'c0'.repeat(32), artifactPath: packageArtifact(name) })).toBeNull();
+        }
+    });
+
+    it('answers the empty list for a fresh vault', async () => {
+        queryContractState.mockResolvedValue(await initialStateOf('@odatano/contract-attestation-vault', new Uint8Array(32), new Uint8Array(32)));
+        expect(await readDisclosureGrants({ ...CFG, contractAddress: 'c1'.repeat(32), artifactPath: packageArtifact('@odatano/contract-attestation-vault') })).toEqual([]);
     });
 });
 

@@ -479,3 +479,36 @@ describe('recipients and sync modes', () => {
         await expect(deriveRoleSeeds('abc')).rejects.toThrow(/128 hex chars/);
     });
 });
+
+describe('latest: one value of a wallet state', () => {
+    const importSwap = () => import('../../src/txbuilder/swap.mjs' as string);
+    const emitting = (value: unknown) => ({ subscribe: (o: any) => { queueMicrotask(() => o.next(value)); return { unsubscribe() { /* done */ } }; } });
+
+    it('leaves no timer behind once the value arrived, so a script ends after close()', async () => {
+        const { latest } = await importSwap();
+        // Only timeouts are counted: the read drops its subscription in a setImmediate of its own.
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        try {
+            await expect(latest(emitting('state'), 'the wallet state')).resolves.toBe('state');
+            expect(vi.getTimerCount()).toBe(0);
+            const failing = { subscribe: (o: any) => { queueMicrotask(() => o.error(new Error('gone'))); return { unsubscribe() { /* done */ } }; } };
+            await expect(latest(failing, 'the wallet state')).rejects.toThrow('gone');
+            expect(vi.getTimerCount()).toBe(0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('still gives up when nothing arrives', async () => {
+        const { latest } = await importSwap();
+        vi.useFakeTimers();
+        try {
+            const silent = { subscribe: () => ({ unsubscribe() { /* done */ } }) };
+            const outcome = latest(silent, 'the wallet state', 500).catch((e: Error) => e.message);
+            await vi.advanceTimersByTimeAsync(501);
+            expect(await outcome).toBe('no the wallet state within 500 ms');
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+});

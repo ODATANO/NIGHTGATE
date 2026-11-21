@@ -27,8 +27,11 @@ const mockWebSocket = vi.hoisted(() => (class {
         return this;
     });
 
-    constructor(url: string) {
+    public options: unknown;
+
+    constructor(url: string, options?: unknown) {
         this.url = url;
+        this.options = options;
         mockWebSocketInstances.push(this as any);
     }
 
@@ -44,7 +47,7 @@ vi.mock('ws', () => ({
     default: mockWebSocket
 }));
 
-import { MidnightNodeProvider } from '../../srv/providers/MidnightNodeProvider';
+import { MidnightNodeProvider, RpcBatchRefusedError } from '../../srv/providers/MidnightNodeProvider';
 
 function getLatestMockWebSocket() {
     expect(mockWebSocketInstances.length).toBeGreaterThan(0);
@@ -122,6 +125,16 @@ describe('MidnightNodeProvider connection management', () => {
         expect(socket.ping).toHaveBeenCalledTimes(3);
     });
 
+    it('gives the opening handshake the request timeout, so a node that never answers fails the connect', async () => {
+        const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944', requestTimeout: 4321 });
+        const connecting = provider.connect();
+        const socket = getLatestMockWebSocket() as unknown as { options: unknown; emit: (event: string, ...args: any[]) => void };
+        expect(socket.options).toEqual({ handshakeTimeout: 4321 });
+        // What the socket library reports once that time is over.
+        socket.emit('error', new Error('Opening handshake has timed out'));
+        await expect(connecting).rejects.toThrow(/Opening handshake has timed out/);
+    });
+
     it('rejects the initial connection when the websocket errors before opening', async () => {
         const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
         const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
@@ -188,6 +201,34 @@ describe('MidnightNodeProvider connection management', () => {
         expect(mockWebSocketInstances).toHaveLength(2);
         expect(callback).toHaveBeenCalledTimes(1);
         expect(provider.isConnected()).toBe(true);
+    });
+
+    it('a reconnect under way stops when the provider is disconnected: no further attempt, no open socket', async () => {
+        const provider = new MidnightNodeProvider({
+            nodeUrl: 'ws://localhost:9944',
+            reconnectInterval: 100,
+            maxReconnectAttempts: 2
+        });
+        const callback = vi.fn().mockResolvedValue(undefined);
+        provider.setOnReconnect(callback);
+
+        const initialConnect = provider.connect();
+        const firstSocket = getLatestMockWebSocket();
+        firstSocket.emit('open');
+        await initialConnect;
+
+        firstSocket.emit('close');
+        await vi.advanceTimersByTimeAsync(100);
+        // The second socket is being opened when the owner disconnects.
+        expect(mockWebSocketInstances).toHaveLength(2);
+        const secondSocket = getLatestMockWebSocket();
+        await provider.disconnect();
+        secondSocket.emit('close');
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(mockWebSocketInstances).toHaveLength(2);
+        expect(callback).not.toHaveBeenCalled();
+        expect(provider.isConnected()).toBe(false);
     });
 
     it('logs reconnect callback failures without breaking reconnect success', async () => {
@@ -510,6 +551,31 @@ describe('MidnightNodeProvider rpcBatch', () => {
             { jsonrpc: '2.0', id: frame[1].id, error: { code: -32000, message: 'unknown block' } }
         ]));
         await expect(batchPromise).rejects.toThrow(/unknown block/);
+    });
+
+    it('a frame the node refuses as a whole fails at once, with the node\'s reason, and leaves single calls alone', async () => {
+        const { provider, socket } = await connectedProvider({ requestTimeout: 60_000 });
+        const first = provider.rpcBatch([{ method: 'chain_getBlock', params: ['0xa'] }, { method: 'chain_getBlock', params: ['0xb'] }]);
+        const second = provider.rpcBatch([{ method: 'chain_getBlock', params: ['0xc'] }]);
+        const single = provider.getBlockHash(7);
+        const singleId = JSON.parse(socket.send.mock.calls[2][0]).id;
+
+        // What a node sends for a batch whose answer is over its size limit: one error, no id.
+        socket.emit('message', JSON.stringify({
+            jsonrpc: '2.0', id: null,
+            error: { code: -32011, message: 'The batch response was too large', data: 'Exceeded max limit of 15728640' }
+        }));
+
+        // It does not say which frame it answers, so every frame in flight is rejected.
+        for (const frame of [first, second]) {
+            const refused = await frame.catch((e: unknown) => e) as RpcBatchRefusedError;
+            expect(refused).toBeInstanceOf(RpcBatchRefusedError);
+            expect(refused.code).toBe(-32011);
+            expect(refused.message).toBe('RPC batch refused -32011: The batch response was too large (Exceeded max limit of 15728640)');
+        }
+        socket.emit('message', JSON.stringify({ jsonrpc: '2.0', id: singleId, result: '0xseven' }));
+        await expect(single).resolves.toBe('0xseven');
+        expect(provider.getPendingRequestCount()).toBe(0);
     });
 
     it('times out unanswered sub-requests', async () => {

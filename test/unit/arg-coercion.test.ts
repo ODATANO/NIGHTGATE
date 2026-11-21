@@ -155,6 +155,27 @@ describe('tagged values', () => {
     });
 });
 
+describe('the argument list as a whole', () => {
+    const BYTES2: CircuitArgType = { name: 'b', kind: 'Bytes', length: 2 };
+    const UINT: CircuitArgType = { name: 'u', kind: 'Uint', maxval: 255 };
+
+    it('refuses too few and too many arguments when the types are known', () => {
+        expect(() => coerceCircuitArgs(['aabb'], [BYTES2, UINT])).toThrow(/^the circuit takes 2 argument\(s\), got 1$/);
+        expect(() => coerceCircuitArgs(['aabb', 1, { $uint: 2 }], [BYTES2, UINT])).toThrow(/takes 2 argument\(s\), got 3/);
+        expect(() => coerceCircuitArgs([], [])).not.toThrow();
+        // Without type info the count is unknown, so tagged values pass in any number.
+        expect(coerceCircuitArgs([{ $uint: 1 }, { $uint: 2 }])).toEqual([1n, 2n]);
+    });
+
+    it('refuses a tag that contradicts the declared type, and takes it where the type is not known', () => {
+        expect(() => coerceCircuitArgs([{ $bytes: 'aabb' }], [UINT])).toThrow(/args\[0\]: \$bytes given, but the circuit takes Uint here/);
+        expect(() => coerceCircuitArgs([{ $uint: 1 }], [BYTES2])).toThrow(/args\[0\]: \$uint given, but the circuit takes Bytes here/);
+        expect(() => coerceCircuitArgs([{ $uint: 1 }], [{ name: 'f', kind: 'Boolean' }])).toThrow(/takes Boolean here/);
+        expect(coerceCircuitArgs([{ $bytes: 'aabb' }, { $uint: 7 }], [BYTES2, UINT])).toEqual([Uint8Array.from([0xaa, 0xbb]), 7n]);
+        expect(coerceCircuitArgs([{ $uint: 7 }], [{ name: 'o', kind: 'other' }])).toEqual([7n]);
+    });
+});
+
 describe('contract-info.json introspection', () => {
     let dir: string;
 
@@ -196,10 +217,40 @@ describe('contract-info.json introspection', () => {
         ]);
     });
 
-    it('skips circuits without a name and returns undefined for unknown circuits', () => {
-        writeInfo({ circuits: [{ arguments: [] }, { name: 'real', arguments: [] }] });
+    it('skips circuits without a name and refuses a circuit the info does not list, naming the ones it has', () => {
+        writeInfo({ circuits: [{ arguments: [] }, { name: 'real', arguments: [] }, { name: 'other', arguments: [] }] });
         expect(loadCircuitArgTypes(dir, 'real')).toEqual([]);
-        expect(loadCircuitArgTypes(dir, 'ghost')).toBeUndefined();
+        expect(() => loadCircuitArgTypes(dir, 'ghost')).toThrow(/"ghost" is not a circuit of this contract; it has: real, other/);
+        expect(() => loadCircuitArgTypes(dir, 'ghost')).toThrow(CoercionError);
+    });
+
+    it('an info file without a circuit list counts as no type info', () => {
+        writeInfo({ 'compiler-version': '0.0.0' });
+        expect(loadCircuitArgTypes(dir, 'any')).toBeUndefined();
+    });
+
+    it('maps a Field like a Uint without a limit, and a Vector with its entry type', () => {
+        writeInfo({
+            circuits: [{
+                name: 'c2',
+                arguments: [
+                    { name: 'f', type: { 'type-name': 'Field' } },
+                    { name: 'mask', type: { 'type-name': 'Vector', length: 3, type: { 'type-name': 'Boolean' } } },
+                    { name: 'keys', type: { 'type-name': 'Vector', length: 2, type: { 'type-name': 'Bytes', length: 2 } } }
+                ]
+            }]
+        });
+        const types = loadCircuitArgTypes(dir, 'c2')!;
+        expect(types).toEqual([
+            { name: 'f', kind: 'Uint' },
+            { name: 'mask', kind: 'Vector', length: 3, element: { name: 'mask', kind: 'Boolean' } },
+            { name: 'keys', kind: 'Vector', length: 2, element: { name: 'keys', kind: 'Bytes', length: 2 } }
+        ]);
+        expect(coerceCircuitArgs(['12', [true, false, true], ['aabb', [1, 2]]], types))
+            .toEqual([12n, [true, false, true], [Uint8Array.from([0xaa, 0xbb]), Uint8Array.from([1, 2])]]);
+        expect(() => coerceCircuitArgs([1, [true, false], ['aabb', 'ccdd']], types)).toThrow(/args\[1\]: expected 3 entries \(Vector<3>\), got 2/);
+        expect(() => coerceCircuitArgs([1, [true, 1, true], ['aabb', 'ccdd']], types)).toThrow(/args\[1\]: expected boolean, got number/);
+        expect(() => coerceCircuitArgs([1, 'nope', ['aabb', 'ccdd']], types)).toThrow(/args\[1\]: expected an array for Vector<3>, got string/);
     });
 
     it('returns undefined (not a throw) when contract-info.json is missing or unreadable', () => {

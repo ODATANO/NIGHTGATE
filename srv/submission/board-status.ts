@@ -11,6 +11,7 @@ import { walletGetSyncProgress } from '../midnight/wallet-worker-client';
 import { syncGateReading } from './sponsor-sync-gate';
 import { runWithoutAmbientTx } from './background-jobs';
 import { configString } from '../utils/config';
+import { bareHex } from '../utils/hex-patterns';
 import { packageVersion } from '../utils/package-version';
 
 const { SELECT } = cds.ql;
@@ -76,6 +77,6 @@ async function computeBoardStatus(db: DbRunner, now: Date): Promise<BoardStatus>
     ]);
     const sponsorIds = getConfiguredFeeSponsorSessions(getNightgateConfig());
     const sponsorsReady = sponsorIds.length ? await countReadySponsors(db, sponsorIds) : 0;
-    const factoryContract = String(configString('NIGHTGATE_TOKEN_FACTORY_CONTRACT') ?? '').trim().toLowerCase() || null;
+    const factoryContract = bareHex(configString('NIGHTGATE_TOKEN_FACTORY_CONTRACT')) || null;
     return { openOffers, offersFilledToday, swapsToday, sponsorsConfigured: sponsorIds.length, sponsorsReady, factoryContract, version: packageVersion(), asOf: nowIso };
 }

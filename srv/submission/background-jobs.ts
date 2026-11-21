@@ -11,11 +11,10 @@ import { jobCommandBinding } from '../utils/envelope-bindings';
 import { getArtifactGenerationDigest } from './contract-registry';
 import { configInt, configMs } from '../utils/config';
 import type { DbRunner } from '../utils/db-types';
-import { childFailedMessage, safeStringify, IDEMPOTENCY_KEY_MAX_LENGTH, IdempotencyKeyInvalidError, JobAdmissionBusyError, isUniqueViolation, WorkflowReconciliationRequiredError, getJobById, IdempotencyConflictError, __resetStoreForTests } from './job-store';
+import { childFailedMessage, hasCompletedChild, safeStringify, IDEMPOTENCY_KEY_MAX_LENGTH, IdempotencyKeyInvalidError, JobAdmissionBusyError, isUniqueViolation, WorkflowReconciliationRequiredError, getJobById, IdempotencyConflictError, __resetStoreForTests } from './job-store';
 import { processors, processorKey } from './job-registry';
 import { scheduleJob, __resetSchedulerForTests } from './job-scheduler';
 import { __resetReconciliationForTests } from './job-reconciliation';
-import { errorMessage } from '../utils/errors';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 export { declareJobKind, jobKindTraits, kindsWithTrait, __workflowParentKindsForTests, registerBackgroundJobProcessor, undeclaredOrUnregisteredJobKinds, registerBackgroundJobReconciliationFinalizer, type BackgroundJobProcessor, type BackgroundJobReconciliationFinalizer } from './job-registry';
@@ -198,26 +197,6 @@ function childWaitTimeoutMs(): number {
     const explicit = configInt('NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS');
     if (explicit !== undefined) return explicit;
     return configMs('NIGHTGATE_WORKER_RPC_TIMEOUT_MS') + 5 * 60_000;
-}
-
-/** True when a step of this workflow succeeded or may have reached the chain. */
-async function hasCompletedChild(parentJobId: string): Promise<boolean> {
-    try {
-        const db = await cds.connect.to('db');
-        if (!db) return true;
-        const children = await db.run(
-            SELECT.from(BackgroundJobs).columns('status', 'txHash').where({ parentJobId })
-        ) as Array<{ status?: string; txHash?: string | null }>;
-        if (!Array.isArray(children)) return true;
-        return children.some(c => c.status === 'succeeded' || c.status === 'reconciliation_required' || !!c.txHash);
-    } catch (err) {
-        // When unsure, assume a step ran. Otherwise a retry could pay for a step that is already on chain.
-        cds.log('nightgate').warn(
-            `hasCompletedChild(${parentJobId}) could not read child state (${errorMessage(err)}); ` +
-            'assuming the workflow is partially executed'
-        );
-        return true;
-    }
 }
 
 /** Runs one workflow step as its own job and waits for its result. A re-run parent finds the same step job by its fixed idempotency key. */

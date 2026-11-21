@@ -93,8 +93,13 @@ export async function buildProofProvider({ proving = 'server', connector, zkConf
             import('@midnight-ntwrk/midnight-js-dapp-connector-proof-provider'),
             import('@midnight-ntwrk/midnight-js-protocol/v9')
         ]);
-        const proofProvider = await dappConnectorProofProvider(connector, zkConfigProvider, CostModel.initialCostModel());
-        return { provingModality: 'wallet', proofProvider };
+        try {
+            const proofProvider = await dappConnectorProofProvider(connector, zkConfigProvider, CostModel.initialCostModel());
+            return { provingModality: 'wallet', proofProvider };
+        } catch (err) {
+            // A wallet can have the method and still refuse. 'auto' then goes on to the proof server, 'wallet' fails.
+            if (proving === 'wallet') throw err;
+        }
     }
 
     if (proverServerUri) {

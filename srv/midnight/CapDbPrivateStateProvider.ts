@@ -8,6 +8,7 @@ const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 import {
     StorageEncryption,
     decryptWithPassword,
+    decryptWithPasswordAsync,
     extractEncryptedComponents,
     SALT_LENGTH
 } from '../utils/storage-encryption';
@@ -359,11 +360,12 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         return pw;
     }
 
-    /** Fixed salt, because each submission has its own provider and must read what another wrote. Exports get a random salt. */
+    /** Fixed salt, because each submission has its own provider and must read what another wrote. Exports get a random salt.
+     *  The key is derived off the event loop: this runs on the server thread for every submission. */
     private getEncryption(): Promise<StorageEncryption> {
         if (!this.encryptionPromise) {
             this.encryptionPromise = this.getStoragePassword().then(pw =>
-                new StorageEncryption(pw, this.deriveStableSalt(pw)));
+                StorageEncryption.createAsync(pw, this.deriveStableSalt(pw)));
         }
         return this.encryptionPromise;
     }
@@ -383,7 +385,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             try { salt = extractEncryptedComponents(Buffer.from(ciphertext, 'base64')).salt; } catch { throw primary; }
             for (const password of fallbacks) {
                 if (!this.deriveStableSalt(password).equals(salt)) continue;
-                const plain = decryptWithPassword(ciphertext, password);
+                const plain = await decryptWithPasswordAsync(ciphertext, password);
                 try { await rewrite(enc.encrypt(plain)); } catch { /* the next read rewrites */ }
                 return plain;
             }
