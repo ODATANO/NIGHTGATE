@@ -65,15 +65,15 @@ try {
     const { unboundTxB64, serializedBytes } = await builder.buildSponsorable({ contractAddress: VAULT, call, bind: false });
     console.log(`built locally: ${serializedBytes} bytes (nothing submitted yet)`);
 
-    // 4: hand over the bytes; sponsorUnbound submits the job AND waits for the chain.
+    // 4: hand over the bytes; sponsorUnbound starts the job and waits for its result. `chainStatus` says whether the chain confirmed it.
     const job = await ng.sponsorUnbound({ unboundTxB64, idempotencyKey: `anchor-${payloadHash}` });
-    console.log(`anchored, identifier ${job.txHash}`);
+    console.log(`anchored, identifier ${job.txId}`);
 
     // 5: the hash explorers show.
-    const landed = await waitLanded(job.txHash, { api, timeoutMs: 120_000 });
-    console.log(`explorer hash: ${landed?.txHash ?? job.transactionHash ?? '(not indexed yet)'}`);
+    const landed = await waitLanded(job.txId, { api, timeoutMs: 120_000 });
+    console.log(`explorer hash: ${landed?.txHash ?? job.txHash ?? '(not indexed yet)'}`);
 } finally {
     await builder.close();
 }
 
-console.log(`\nverify, no key needed:\n  curl "${BASE}/odata/v4/midnight-verify/verifyAttestationState(contractAddress='${VAULT}',attesterId='${builder.attesterId}',payloadHash='${payloadHash}',compiledArtifactRef='attestation-vault-32')"`);
+console.log(`\nverify, no key needed:\n  curl "${BASE}/odata/v4/midnight-verify/verifyAttestation(contractAddress='${VAULT}',attesterId='${builder.attesterId}',payloadHash='${payloadHash}',contractName='attestation-vault-32')"`);

@@ -40,6 +40,14 @@ async function post(p, body, headers = {}, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
+
 async function get(p, headers = {}) {
     const r = await fetch(`${ENDPOINT}${p}`, { headers, signal: AbortSignal.timeout(120_000) });
     const text = await r.text();
@@ -58,12 +66,12 @@ async function pollJob(sessionId, jobId, label, { headers = {}, timeoutMs = PREW
     const deadline = Date.now() + timeoutMs;
     let last = null;
     while (Date.now() < deadline) {
-        const r = await post('/getJobStatus', { jobId, sessionId }, headers);
+        const r = await jobStatus(jobId, sessionId, headers);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) → HTTP ${r.status}: ${pretty(r.body)}`);
         const { status, result, errorCode, errorMessage } = r.body;
         if (status !== last) { process.stdout.write(`\n     [${label}] ${jobId.slice(0, 8)} status=${status}`); last = status; }
         else process.stdout.write('.');
-        if (status === 'succeeded') { process.stdout.write('\n'); return result ? JSON.parse(result) : {}; }
+        if (status === 'succeeded') { process.stdout.write('\n'); return result ?? {}; }
         if (status === 'failed' || status === 'reconciliation_required') {
             process.stdout.write('\n');
             fail(`[${label}] job ${status}: ${errorCode} - ${errorMessage}`);
@@ -117,10 +125,10 @@ function expectStatus(r, want, label) {
     step('2. connectWalletForSigning (+ await prewarm sync-to-tip)');
     r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
     if (r.status >= 400) fail(`connectWalletForSigning → ${r.status}: ${pretty(r.body)}`);
-    if (r.body?.prewarmJobId) { await pollJob(sessionId, r.body.prewarmJobId, 'prewarm'); console.log('OK   facade synced'); }
+    if (r.body?.jobId) { await pollJob(sessionId, r.body.jobId, 'prewarm'); console.log('OK   facade synced'); }
 
     step('3. deployContract(attestation-vault)');
-    r = await post('/deployContract', { compiledArtifactRef: 'attestation-vault', sessionId, initialPrivateState: '{}' });
+    r = await post('/deployContract', { contractName: 'attestation-vault', sessionId, initialPrivateState: '{}' });
     if (r.status >= 400) fail(`deployContract → ${r.status}: ${pretty(r.body)}`);
     const contractAddress = (await pollJob(sessionId, r.body.jobId, 'deploy')).contractAddress;
     if (!contractAddress) fail('deploy returned no contractAddress');
@@ -129,9 +137,9 @@ function expectStatus(r, want, label) {
     step('4. createAgentGrant (allowlist + budget 3/day)');
     r = await post('/createAgentGrant', {
         sessionId,
-        allowedActions: ['anchorDocument', 'issueFieldPredicateAttestationBatch', 'attestAgentOutput'],
+        allowedActions: ['anchorDocument', 'proveClaims', 'attestAgentOutput'],
         maxJobsPerDay: 3,
-        agentLabel: 'e2e-doc-bot'
+        label: 'e2e-doc-bot'
     });
     if (r.status >= 400) fail(`createAgentGrant → ${r.status}: ${pretty(r.body)}`);
     const { grantId, token } = r.body;
@@ -143,12 +151,12 @@ function expectStatus(r, want, label) {
     // ---- Agent lane: negatives before any spend ----------------------------
 
     step('5. NEGATIVE: never-grantable + non-allowlisted + foreign session');
-    expectStatus(await post('/sendNight', { sessionId, receiverAddress: 'x', amount: '1' }, agent),
-        403, 'sendNight with agent token');
-    expectStatus(await post('/issueFieldPredicateAttestation', { payloadHash: 'a'.repeat(64), sessionId }, agent),
-        403, 'issueFieldPredicateAttestation (not allowlisted)');
+    expectStatus(await post('/sendToken', { sessionId, receiverAddress: 'x', amount: '1' }, agent),
+        403, 'sendToken with agent token');
+    expectStatus(await post('/proveFieldPredicate', { payloadHash: 'a'.repeat(64), sessionId }, agent),
+        403, 'proveFieldPredicate (not allowlisted)');
     expectStatus(await post('/anchorDocument', {
-        sha256: randomBytes(32).toString('hex'), storageRef: 'file:///tmp/x',
+        payloadHash: randomBytes(32).toString('hex'), storageRef: 'file:///tmp/x',
         sessionId: '00000000-0000-0000-0000-000000000001', contractAddress
     }, agent), 403, 'anchorDocument with foreign sessionId');
 
@@ -176,7 +184,7 @@ function expectStatus(r, want, label) {
 
     step('7. anchorDocument (agent, sessionId INJECTED by the grant)  [budget 1/3]');
     r = await post('/anchorDocument', {
-        sha256: payloadHash,
+        payloadHash: payloadHash,
         storageRef: 'file:///tmp/agent-layer-e2e-contract.json',
         metadata: '{"type":"agent-layer-e2e"}',
         contractAddress
@@ -188,20 +196,20 @@ function expectStatus(r, want, label) {
     await pollJob(sessionId, r.body.jobId, 'attest', { headers: agent });
     console.log('OK   contract document anchored by the agent');
 
-    step('8. issueFieldPredicateAttestationBatch (agent): root in-batch + 2 claims  [budget 2/3]');
+    step('8. proveClaims (agent): root in-batch + 2 claims  [budget 2/3]');
     // Claims over the PREPARED fields: value <= / >= thresholds in the SAME
     // x1000 scale prepareDocumentProof used.
     const claims = [
         { ...pick(fields, 'contractValueEur'), predicate: 'lessOrEqual', threshold: String(300000 * 1000), unit: 'EUR' },
         { ...pick(fields, 'expiryDays'), predicate: 'greaterOrEqual', threshold: String(180 * 1000), unit: 'days' }
     ];
-    r = await post('/issueFieldPredicateAttestationBatch', {
+    r = await post('/proveClaims', {
         payloadHash, contentRoot, schemaId,
         claims: claims,
         contractAddress
         // again no sessionId: injected
     }, agent);
-    if (r.status >= 400) fail(`issueFieldPredicateAttestationBatch(agent) → ${r.status}: ${pretty(r.body)}`);
+    if (r.status >= 400) fail(`proveClaims(agent) → ${r.status}: ${pretty(r.body)}`);
     const batchRes = await pollJob(sessionId, r.body.jobId, 'batch', { headers: agent });
     const batchTx = batchRes?.proof?.proofValue;
     if (!batchTx) fail(`batch result has no txHash: ${pretty(batchRes)}`);
@@ -209,9 +217,9 @@ function expectStatus(r, want, label) {
 
     step('9. Per-claim crawler-free verification (agent)');
     for (const c of claims) {
-        const v = await pollVerify(fn('verifyPredicateState', {
+        const v = await pollVerify(fn('verifyPredicate', {
             contractAddress, attesterId, payloadHash,
-            predicate: c.predicate, threshold: Number(c.threshold), fieldKey: c.fieldKey
+            predicate: c.predicate, threshold: c.threshold, fieldKey: c.fieldKey
         }), c.unit, { headers: agent });
         if (v.proven !== true) fail(`claim ${c.unit}: expected proven=true: ${pretty(v)}`);
     }
@@ -231,7 +239,7 @@ function expectStatus(r, want, label) {
     const envelopeJson = r.body.envelopeJson;
     if (blake2b256Hex(envelopeJson) !== provPayloadHash) fail('envelope does not re-hash to payloadHash');
     await pollJob(sessionId, r.body.jobId, 'provenance', { headers: agent });
-    const prov = await pollVerify(fn('verifyAttestationState', {
+    const prov = await pollVerify(fn('verifyAttestation', {
         contractAddress, attesterId, payloadHash: provPayloadHash
     }), 'provenance', { headers: agent });
     if (prov.attested !== true) fail(`provenance anchor not attested: ${pretty(prov)}`);
@@ -240,14 +248,14 @@ function expectStatus(r, want, label) {
 
     step('11. NEGATIVE: 4th write action → 429 budget exhausted');
     r = await post('/anchorDocument', {
-        sha256: randomBytes(32).toString('hex'), storageRef: 'file:///tmp/over-budget', contractAddress
+        payloadHash: randomBytes(32).toString('hex'), storageRef: 'file:///tmp/over-budget', contractAddress
     }, agent);
     expectStatus(r, 429, 'anchorDocument beyond maxJobsPerDay');
 
     step('12. revokeAgentGrant (operator) → agent gets 401');
     r = await post('/revokeAgentGrant', { grantId });
     if (r.status >= 400 || r.body?.revoked !== true) fail(`revokeAgentGrant → ${r.status}: ${pretty(r.body)}`);
-    expectStatus(await get(fn('verifyAttestationState', { contractAddress, attesterId, payloadHash }), agent),
+    expectStatus(await get(fn('verifyAttestation', { contractAddress, attesterId, payloadHash }), agent),
         401, 'read with revoked token');
 
     console.log('\nAGENT-LAYER E2E PASSED.');

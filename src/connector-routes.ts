@@ -86,9 +86,6 @@ export function mountZkConfigRoute(app: RouteApp): void {
     });
 }
 
-// Contracts this package also exports for the browser as `@odatano/nightgate/browser/<name>`.
-const BROWSER_EXPORTED = new Set(['attestation-vault', 'attestation-vault-32']);
-
 function listContractCircuits(zkConfigPath: string): string[] {
     try {
         return fs.readdirSync(path.join(zkConfigPath, 'keys'))
@@ -117,7 +114,7 @@ export function mountContractManifestRoute(app: RouteApp): void {
                 circuits: listContractCircuits(reg.zkConfigPath),
                 artifactHash: etag ? etag.replace(/"/g, '') : null
             };
-            if (BROWSER_EXPORTED.has(name)) entry.artifactRef = `@odatano/nightgate/browser/${name}`;
+            if (reg.package) entry.artifactRef = reg.package.name;
             if (addresses.length) entry.addresses = addresses;
             return entry;
         }).filter(Boolean);

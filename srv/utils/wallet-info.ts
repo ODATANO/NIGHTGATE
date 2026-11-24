@@ -5,6 +5,7 @@ import { mnemonicToBip39SeedHex, deriveRoleSeeds, type RoleSeeds } from './walle
 import { deriveAttestationSecret } from '../submission/contract-witnesses';
 import { loadLedger } from '../midnight/sdk-loader';
 import { assertSeedHex } from './hex-patterns';
+import type { NightgateNetwork } from './nightgate-config';
 import type * as AddressFormat from '@midnightntwrk/wallet-sdk-address-format';
 import type * as UnshieldedWallet from '@midnightntwrk/wallet-sdk-unshielded-wallet';
 
@@ -15,14 +16,14 @@ export interface WalletInfo {
     dustAddress: string;     // mn_dust_..., receives generated dust
     attesterId: string;      // the wallet's identity in the attestation vault contract, 64 hex chars
     accountIndex: number;
-    network: string;
+    network: NightgateNetwork;
 }
 
 export interface DeriveWalletInfoOptions {
     mnemonic?: string | null;
     seedHex?: string | null; // 64-byte BIP39 seed as 128 hex chars
     accountIndex?: number;   // default 0
-    network: string;         // network the addresses are encoded for, for example preview
+    network: NightgateNetwork; // the network the addresses are encoded for
 }
 
 let cachedAddressFormat: typeof AddressFormat | undefined;

@@ -6,32 +6,32 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import cds from '@sap/cds';
 
 const HEX64_PARAMS: Record<string, string[]> = {
-    'NightgateService.issueFieldPredicateAttestation': ['payloadHash', 'attesterId', 'fieldKey', 'fieldSalt', 'contentRoot', 'schemaId'],
-    'NightgateService.issueFieldPredicateAttestationBatch': ['payloadHash', 'attesterId', 'contentRoot', 'schemaId'],
-    'NightgateService.issueFieldEqualityAttestation': ['payloadHash', 'attesterId', 'fieldKey', 'expectedDigest', 'fieldSalt', 'contentRoot', 'schemaId'],
-    'NightgateService.issueFieldMembershipAttestation': ['payloadHash', 'attesterId', 'fieldKey', 'valueDigest', 'setRoot', 'fieldSalt', 'contentRoot', 'schemaId'],
-    'NightgateService.issueDocumentIntegrityAttestation': ['payloadHashA', 'payloadHashB', 'attesterIdA', 'attesterIdB', 'contentRootA', 'contentRootB', 'schemaId'],
-    'NightgateService.issueDocumentDiffAttestation': ['payloadHashA', 'payloadHashB', 'attesterIdA', 'attesterIdB', 'contentRootA', 'contentRootB', 'schemaId'],
-    'NightgateService.verifyAttestationState': ['attesterId', 'payloadHash', 'documentId', 'contentRoot', 'schemaId'],
-    'NightgateService.verifyPredicateState': ['attesterId', 'payloadHash', 'fieldKey', 'expectedDigest', 'setRoot', 'payloadHashB', 'attesterIdB'],
-    'NightgateService.verifyDisclosureState': ['attesterId', 'payloadHash', 'grantee'],
-    'NightgateService.anchorDocument': ['sha256'],
-    'NightgateService.verifyDocument': ['providedSha256'],
+    'NightgateService.proveFieldPredicate': ['payloadHash', 'attesterId', 'fieldKey', 'fieldSalt', 'contentRoot', 'schemaId'],
+    'NightgateService.proveClaims': ['payloadHash', 'attesterId', 'contentRoot', 'schemaId'],
+    'NightgateService.proveFieldEquality': ['payloadHash', 'attesterId', 'fieldKey', 'expectedDigest', 'fieldSalt', 'contentRoot', 'schemaId'],
+    'NightgateService.proveFieldMembership': ['payloadHash', 'attesterId', 'fieldKey', 'valueDigest', 'setRoot', 'fieldSalt', 'contentRoot', 'schemaId'],
+    'NightgateService.proveDocumentIntegrity': ['payloadHashA', 'payloadHashB', 'attesterIdA', 'attesterIdB', 'contentRootA', 'contentRootB', 'schemaId'],
+    'NightgateService.proveDocumentDiff': ['payloadHashA', 'payloadHashB', 'attesterIdA', 'attesterIdB', 'contentRootA', 'contentRootB', 'schemaId'],
+    'NightgateService.verifyAttestation': ['attesterId', 'payloadHash', 'documentId', 'contentRoot', 'schemaId'],
+    'NightgateService.verifyPredicate': ['attesterId', 'payloadHash', 'fieldKey', 'expectedDigest', 'setRoot', 'payloadHashB', 'attesterIdB'],
+    'NightgateService.verifyDisclosure': ['attesterId', 'payloadHash', 'grantee'],
+    'NightgateService.anchorDocument': ['payloadHash'],
+    'NightgateService.verifyDocument': ['payloadHash'],
     'NightgateService.grantDisclosure': ['payloadHash', 'grantee'],
     'NightgateService.revokeDisclosure': ['payloadHash', 'grantee'],
-    'NightgateService.registerPassport': ['documentId', 'ownerId'],
+    'NightgateService.registerDocument': ['documentId', 'ownerId'],
     'NightgateService.retractAttestation': ['payloadHash'],
     'NightgateService.purgeExpired': ['key'],
     'NightgateService.deployContract': ['recoveryId'],
     'NightgateService.grantDisclosureToHolders': ['payloadHash', 'tokenType'],
     'NightgateService.claimDisclosure': ['payloadHash', 'tokenType', 'claimSecret'],
-    'NightgateService.sendNight': ['tokenTypeHex'],
+    'NightgateService.sendToken': ['tokenType'],
     'NightgateService.prepareDocumentProof': ['saltSeed'],
     'NightgateService.prepareMembershipSet': ['valueDigest'],
     'NightgateService.attestAgentOutput': ['inputHash', 'outputHash', 'policyHash'],
-    'NightgateVerifyService.verifyAttestationState': ['attesterId', 'payloadHash', 'documentId', 'contentRoot', 'schemaId'],
-    'NightgateVerifyService.verifyPredicateState': ['attesterId', 'payloadHash', 'fieldKey', 'expectedDigest', 'setRoot', 'payloadHashB', 'attesterIdB'],
-    'NightgateVerifyService.verifyDisclosureState': ['attesterId', 'payloadHash', 'grantee']
+    'NightgateVerifyService.verifyAttestation': ['attesterId', 'payloadHash', 'documentId', 'contentRoot', 'schemaId'],
+    'NightgateVerifyService.verifyPredicate': ['attesterId', 'payloadHash', 'fieldKey', 'expectedDigest', 'setRoot', 'payloadHashB', 'attesterIdB'],
+    'NightgateVerifyService.verifyDisclosure': ['attesterId', 'payloadHash', 'grantee']
 };
 
 /** `cds.validate` exists at runtime but is missing from the CAP type declarations. */

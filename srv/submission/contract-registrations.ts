@@ -33,8 +33,6 @@ export class ContractRegistrationError extends NightgateError {
     constructor(status: number, message: string) {
         super('CONTRACT_REGISTRATION_REJECTED', message, { status });
     }
-    /** @deprecated use `status`. */
-    get httpStatus(): number { return this.status; }
 }
 
 export interface RuntimeRegistrationInput {
@@ -200,7 +198,7 @@ export async function validateRuntimeRegistration(input: RuntimeRegistrationInpu
 export async function registerContractAtRuntime(
     db: DbRunner,
     input: RuntimeRegistrationInput,
-    ctx: { registeredBy?: string; networkId?: string } = {}
+    ctx: { registeredBy?: string; network?: string } = {}
 ): Promise<ContractListing> {
     const name = String(input.name ?? '').trim();
     // Lock per name, so the registry entry, its digest and the saved row always match.
@@ -213,7 +211,7 @@ async function registerContractAtRuntimeLocked(
     db: DbRunner,
     name: string,
     input: RuntimeRegistrationInput,
-    ctx: { registeredBy?: string; networkId?: string }
+    ctx: { registeredBy?: string; network?: string }
 ): Promise<ContractListing> {
     if (isConfigRegisteredContract(name)) {
         throw new ContractRegistrationError(409,
@@ -237,7 +235,7 @@ async function registerContractAtRuntimeLocked(
         zkConfigPath: registration.zkConfigPath,
         privateStateId: registration.privateStateId,
         slotWidth: registration.slotWidth ?? null,
-        networkId: ctx.networkId ?? null,
+        network: ctx.network ?? null,
         registeredBy: ctx.registeredBy ?? null
     };
     try {

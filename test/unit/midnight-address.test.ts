@@ -3,7 +3,7 @@
  * beyond the 90-character default of bech32. The format module is a stand-in that records the parts.
  */
 import { bech32m } from '@scure/base';
-import { parseMidnightAddress } from '../../srv/utils/midnight-address';
+import { parseMidnightAddress, receiverKind } from '../../srv/utils/midnight-address';
 
 const mainnet = Symbol('Mainnet');
 class MidnightBech32m {
@@ -14,6 +14,21 @@ const af = { MidnightBech32m, mainnet } as any;
 
 const bytesOf = (length: number): Uint8Array => Uint8Array.from({ length }, (_, i) => (i * 37 + 5) & 255);
 const encode = (prefix: string, bytes: Uint8Array) => bech32m.encode(prefix, bech32m.toWords(bytes), false);
+
+describe('receiverKind', () => {
+    it.each([
+        ['mn_addr_preprod', 32, 'unshielded'],
+        ['mn_addr', 32, 'unshielded'],
+        ['mn_shield-addr_preview', 64, 'shielded'],
+        ['mn_shield-addr', 64, 'shielded']
+    ])('reads %s as its kind, with and without a network part', (prefix, length, kind) => {
+        expect(receiverKind(encode(prefix, bytesOf(length)))).toBe(kind);
+    });
+
+    it.each(['mn_dust_preprod', 'mn_dust', 'mn_addrx_preprod', 'mn_shield-cpk', 'addr_test'])('takes no %s address', (prefix) => {
+        expect(receiverKind(encode(prefix, bytesOf(32)))).toBeNull();
+    });
+});
 
 describe('parseMidnightAddress', () => {
     it('decodes a 132-character shielded address into its 64 bytes', async () => {

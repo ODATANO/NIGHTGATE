@@ -14,8 +14,8 @@ describe('landedOnChain', () => {
         const { db, queries } = fakeDb({ ID: 't1' }, { status: 'SUCCESS', outcomeSource: 'substrate-system-events' });
         expect(await landedOnChain(db, '0x' + H.toUpperCase())).toBe(true);
         const where = JSON.stringify((queries[0] as { SELECT: { where: unknown } }).SELECT.where);
-        expect(where).toContain('"ledgerTxHash"');
-        expect(where).toContain('"hash"');
+        expect(where).toContain('"txHash"');
+        expect(where).toContain('"extrinsicHash"');
         expect(where).toContain(`"${H}"`);
         expect(where).not.toContain('0x');
     });

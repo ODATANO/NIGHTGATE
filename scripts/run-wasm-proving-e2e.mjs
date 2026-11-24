@@ -39,11 +39,19 @@ async function post(path, body, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
+
 async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS, intervalMs = JOB_POLL_MS } = {}) {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = null;
     while (Date.now() < deadline) {
-        const r = await post('/getJobStatus', { jobId, sessionId });
+        const r = await jobStatus(jobId, sessionId);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) → HTTP ${r.status}: ${pretty(r.body)}`);
         const { status, result, errorCode, errorMessage } = r.body;
         if (status !== lastStatus) {
@@ -54,7 +62,7 @@ async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS
         }
         if (status === 'succeeded') {
             process.stdout.write('\n');
-            return result ? JSON.parse(result) : {};
+            return result ?? {};
         }
         if (status === 'failed') {
             process.stdout.write('\n');
@@ -92,7 +100,7 @@ async function waitForServer() {
     const tPrewarm = Date.now();
     r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
     if (r.status !== 200 && r.status !== 201) fail(`connectWalletForSigning → HTTP ${r.status}: ${pretty(r.body)}`);
-    const prewarmJobId = r.body?.prewarmJobId;
+    const prewarmJobId = r.body?.jobId;
     if (prewarmJobId) {
         await pollJob(sessionId, prewarmJobId, 'prewarm');
     }
@@ -116,16 +124,16 @@ async function waitForServer() {
         }
         if (BigInt(balance.dustBalance) === 0n) fail('dust balance is 0; register NIGHT for dust generation first');
     } else {
-        console.log(`WARN getWalletBalance → HTTP ${r.status}; continuing (sendNight will validate funds)`);
+        console.log(`WARN getWalletBalance → HTTP ${r.status}; continuing (sendToken will validate funds)`);
     }
 
-    step(`5. sendNight ${AMOUNT} atoms → own address (proving in-process, mode=wasm on the server)`);
+    step(`5. sendToken ${AMOUNT} atoms → own address (proving in-process, mode=wasm on the server)`);
     const tSend = Date.now();
-    r = await post('/sendNight', { sessionId, receiverAddress: nightAddress, amount: AMOUNT });
-    if (r.status !== 200 && r.status !== 201) fail(`sendNight → HTTP ${r.status}: ${pretty(r.body)}`);
+    r = await post('/sendToken', { sessionId, receiverAddress: nightAddress, amount: AMOUNT });
+    if (r.status !== 200 && r.status !== 201) fail(`sendToken → HTTP ${r.status}: ${pretty(r.body)}`);
     const sendJob = r.body?.jobId;
-    if (!sendJob) fail(`sendNight returned no jobId: ${pretty(r.body)}`);
-    const sendResult = await pollJob(sessionId, sendJob, 'sendNight');
+    if (!sendJob) fail(`sendToken returned no jobId: ${pretty(r.body)}`);
+    const sendResult = await pollJob(sessionId, sendJob, 'sendToken');
     const sendSecs = ((Date.now() - tSend) / 1000).toFixed(1);
 
     if (!sendResult?.txId) fail(`send job succeeded but carries no txId: ${pretty(sendResult)}`);

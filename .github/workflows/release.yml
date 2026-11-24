@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 jobs:
-  # Release gates: the SAME checks CI and npm prepublishOnly run. A tag must
+  # Release gates: the SAME checks CI runs. A tag must
   # never publish an image/release that CI would have failed, and a
   # mis-versioned tag must die before anything is pushed.
   check:

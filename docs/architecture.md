@@ -18,7 +18,7 @@ Structure of NIGHTGATE, for developers extending it.
              │ contract actions                │ every 60 s
              ▼                                 ▼
   ┌─────────────────────────────────────────────────────────────┐
-  │ CAP database: SQLite, PostgreSQL or HANA                    │
+  │ CAP database: SQLite or PostgreSQL                          │
   └─────────────────────────────────────────────────────────────┘
              │
              ▼
@@ -54,8 +54,16 @@ Worker modules:
 | `rotation.ts` | worker restart after too many artifact generations |
 | `rpc.ts` | method table and dispatcher |
 | `private-state.ts` | private-state proxy to the main thread |
+| `wallet-tx.ts` | conversion between the SDK's transaction handles and ledger transactions |
+| `phased-submit.ts` | a send in three timed steps: connect, first status, block |
+| `dust-collapse.ts` | shrinks the saved dust state |
+| `dust-verify.ts` | client of the dust check helper thread |
+| `sync-replay.ts` | finds a restored wallet part whose saved position is behind its state |
+| `cancellation.ts` | lets the main thread cancel a call after its timeout |
+| `revocable-keystore.ts` | a keystore that can drop its key |
+| `bounded-cache.ts` | size-limited cache that drops the least recently used entry |
 
-The worker pushes `state-save`, `log` and `private-state-rpc` messages on `parentPort`.
+The worker posts messages with a `kind` on `parentPort`: `ready`, `log`, `state-save`, `save-stats`, `sync-progress`, `submit-intent`, `private-state-rpc`, `rotating` and `rotation-done`.
 
 ## Submission flow
 
@@ -70,11 +78,11 @@ Every action that writes to the chain runs as a background job:
 
 Job code lives in `srv/submission/`: `background-jobs.ts`, `job-store.ts`, `job-registry.ts`, `job-scheduler.ts`, `job-reconciliation.ts`. `job-kinds.ts` declares each kind's class. A `running` job with a heartbeat older than `NIGHTGATE_JOB_LEASE_TTL_MS` is reclaimed. A job that may have reached the chain is never reclaimed. Reconciliation resolves it by its identifier.
 
-The OData `sessionId` is a `WalletSessions` id. The worker keys facades by `accountId`, which is derived from the viewing key, so sessions of one wallet share a facade.
+The OData `sessionId` is the key of `WalletSessions`. The worker keys facades by `accountId`, which is derived from the viewing key, so sessions of one wallet share a facade.
 
 ## Signing and proving
 
-Server-side signing needs the seed. It is stored encrypted under `ENCRYPTION_KEY` and held in memory while the facade lives. To keep a key off the server, the caller builds, proves and signs with the [txbuilder](txbuilder.md), and a sponsor pays and submits through `sponsorFinalizedTransaction` or `sponsorUnboundTransaction`.
+Server-side signing needs the seed. It is stored encrypted under the account's data key, which the server key ring seals, and held in memory while the facade lives. To keep a key off the server, the caller builds, proves and signs with the [txbuilder](txbuilder.md), and a sponsor pays and submits through `sponsorFinalized` or `sponsorUnbound`.
 
 Proving uses a proof server or runs in-process. In wasm mode the SDK prover handles wallet circuits and `srv/midnight/wasm-proof-provider.ts` handles contract circuits.
 

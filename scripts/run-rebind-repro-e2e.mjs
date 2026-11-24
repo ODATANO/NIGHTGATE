@@ -37,11 +37,19 @@ async function post(path, body, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
+
 async function pollJobTerminal(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS, intervalMs = JOB_POLL_MS } = {}) {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = null;
     while (Date.now() < deadline) {
-        const r = await post('/getJobStatus', { jobId, sessionId });
+        const r = await jobStatus(jobId, sessionId);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) → HTTP ${r.status}: ${pretty(r.body)}`);
         const { status, chainStatus, result, errorCode, errorMessage } = r.body;
         if (status !== lastStatus) {
@@ -55,7 +63,7 @@ async function pollJobTerminal(sessionId, jobId, label, { timeoutMs = PREWARM_TI
             return {
                 ok: status === 'succeeded' && chainStatus !== 'failure',
                 status, chainStatus,
-                result: result ? JSON.parse(result) : {},
+                result: result ?? {},
                 errorCode, errorMessage
             };
         }
@@ -68,7 +76,7 @@ async function submitBatch(sessionId, vault, label, calls) {
     const r = await post('/submitContractCallBatch', {
         contractAddress: vault,
         calls: JSON.stringify(calls),
-        compiledArtifactRef: 'attestation-vault',
+        contractName: 'attestation-vault',
         sessionId
     });
     if (r.status !== 200 && r.status !== 201) fail(`${label}: submitContractCallBatch → HTTP ${r.status}: ${pretty(r.body)}`);
@@ -84,7 +92,7 @@ async function submitSingle(sessionId, vault, label, circuit, args) {
         contractAddress: vault,
         circuit,
         args: JSON.stringify(args),
-        compiledArtifactRef: 'attestation-vault',
+        contractName: 'attestation-vault',
         sessionId
     });
     if (r.status !== 200 && r.status !== 201) fail(`${label}: submitContractCall → HTTP ${r.status}: ${pretty(r.body)}`);
@@ -125,8 +133,8 @@ const freshBindCalls = (pid) => {
     const sessionId = r.body?.sessionId;
     if (!sessionId) fail(`connectWallet: ${pretty(r.body)}`);
     r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
-    if (r.body?.prewarmJobId) {
-        const pw = await pollJobTerminal(sessionId, r.body.prewarmJobId, 'prewarm');
+    if (r.body?.jobId) {
+        const pw = await pollJobTerminal(sessionId, r.body.jobId, 'prewarm');
         if (!pw.ok) fail(`prewarm failed: ${pw.errorCode}: ${pw.errorMessage}`);
     }
     console.log(`OK   session ${sessionId}`);
@@ -134,7 +142,7 @@ const freshBindCalls = (pid) => {
     let vault = process.env.REPRO_VAULT || '';
     if (!vault) {
         step('2. deploy throwaway vault');
-        r = await post('/deployContract', { compiledArtifactRef: 'attestation-vault', sessionId, initialPrivateState: '{}' });
+        r = await post('/deployContract', { contractName: 'attestation-vault', sessionId, initialPrivateState: '{}' });
         if (r.status !== 200 && r.status !== 201) fail(`deployContract → HTTP ${r.status}: ${pretty(r.body)}`);
         const dep = await pollJobTerminal(sessionId, r.body.jobId, 'deploy');
         if (!dep.ok) fail(`deploy failed: ${dep.errorCode}: ${dep.errorMessage}`);

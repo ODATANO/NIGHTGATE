@@ -2,7 +2,7 @@
 // Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
 import { hexToBytes } from '../utils/hex';
 import { importArtifact } from './artifact-import';
-import { buildPublicDataProvider, queryLedger9ContractState } from '../midnight/public-data-provider';
+import { buildPublicDataProvider, queryLedger9ContractStateAtTip } from '../midnight/public-data-provider';
 import { computeRecordKey, refusedByRuntime, type ContractArtifact } from './predicate-state';
 
 function hex(b: Uint8Array): string {
@@ -122,6 +122,8 @@ export interface ReadAttestationStateForContractArgs {
     /** Build of the artifact to load. Without it the module at `artifactPath` is imported as is. */
     artifactDigest?: string;
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
+    /** The indexer's newest block, to read the state at. Without it the latest state is read. */
+    tipHeight?: number;
 }
 
 /** Null without contract state and for a contract that is not a vault. */
@@ -139,7 +141,7 @@ export async function readAttestationStateForContract(
         contentRoot: args.contentRoot,
         schemaId: args.schemaId,
         ledger: artifact.ledger,
-        queryContractState: (addr: string) => queryLedger9ContractState(publicData, addr)
+        queryContractState: (addr: string) => queryLedger9ContractStateAtTip(publicData, addr, args.tipHeight)
     }).catch(async (err: unknown) => {
         if (await refusedByRuntime(err)) return null;
         throw err;

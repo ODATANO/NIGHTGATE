@@ -3,7 +3,7 @@
 // This module does not import `@sap/cds`, because the worker loads it too.
 
 import {
-    CONFIG_TABLE, configSpec, resolveOne, resolveConfigTable, camelConfigKey, isEnvOnlyKey,
+    CONFIG_TABLE, configSpec, resolveOne, resolveConfigTable, capConfigKey, capConfigValue, isEnvOnlyKey,
     type ConfigValue, type ConfigSpec
 } from './config-table';
 
@@ -44,11 +44,6 @@ export function setConfigOverrideSource(source: (() => Record<string, unknown> |
 /** Worker thread only: use this copy of the main thread's settings. */
 export function pinResolvedConfig(snapshot: Record<string, ConfigValue> | undefined | null): void {
     pinned = snapshot ? { ...snapshot } : undefined;
-}
-
-export function isConfigPinned(): boolean {
-    pinFromWorkerDataOnce();
-    return pinned !== undefined;
 }
 
 export function __resetConfigForTests(): void {
@@ -92,7 +87,7 @@ export function configIsSet(key: string): boolean {
     if (fromEnv !== undefined && fromEnv.trim() !== '') return true;
     const cap = overrideSource?.();
     if (!cap || isEnvOnlyKey(key)) return false;
-    const v = cap[camelConfigKey(key)];
+    const v = capConfigValue(cap, capConfigKey(spec));
     return v !== undefined && v !== null && v !== '';
 }
 

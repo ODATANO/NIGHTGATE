@@ -1,4 +1,4 @@
-// Checks through the client SDK that a minted shielded token's tokenTypeHex equals deriveTokenType.
+// Checks through the client SDK that the wallet holds a minted shielded token under the type deriveTokenType computes.
 // Run: node --env-file=.env scripts/run-mint-token-e2e.mjs against `npm run serve`
 // SPDX-License-Identifier: Apache-2.0
 
@@ -18,42 +18,48 @@ const ng = connect({ baseUrl: process.env.NIGHTGATE_URL || 'http://localhost:400
 step('1. Session');
 const { sessionId } = await ng.connectWallet({ viewingKey: VK });
 const conn = await ng.connectWalletForSigning({ sessionId, mnemonic: MNEMONIC });
-if (conn?.prewarmJobId) { console.log('     syncing...'); await ng.waitForJob({ jobId: conn.prewarmJobId, sessionId }); }
+if (conn?.jobId) { console.log('     syncing...'); await ng.waitForJob({ jobId: conn.jobId, sessionId }); }
 console.log(`OK   session ${sessionId}`);
 
 let contractAddress = process.env.MINT_E2E_CONTRACT || '';
 if (!contractAddress) {
     step('2. Deploy @odatano/contract-shielded-token');
-    const dep = await ng.deployContract({ compiledArtifactRef: 'shielded-token', sessionId, initialPrivateState: '{}' })
+    const dep = await ng.deployContract({ contractName: 'shielded-token', sessionId, initialPrivateState: '{}' })
         .catch(e => fail(`deploy: ${e.message}`));
     contractAddress = dep.contractAddress;
 }
 console.log(`OK   contract ${contractAddress}`);
 
-step('3. mintShieldedTestToken');
-const mint = await ng.mintShieldedTestToken({ contractAddress, sessionId })
+// The separator the contract pads to 32 bytes in its mint circuit.
+const DOMAIN_SEPARATOR = 'nightgate:zswap-e2e';
+
+step('3. deriveTokenType (compute-only)');
+const derived = await ng.deriveTokenType({ contractAddress, domainSeparator: DOMAIN_SEPARATOR });
+if (!/^[0-9a-f]{64}$/.test(derived.tokenType ?? '')) fail(`deriveTokenType returned no tokenType: ${JSON.stringify(derived)}`);
+const viaHex = await ng.deriveTokenType({ contractAddress, domainSeparator: derived.domainSeparator });
+if (viaHex.tokenType !== derived.tokenType) fail('the text form and the hex form of the separator disagree');
+const held = async () => BigInt((await ng.getWalletBalance({ sessionId })).shieldedTokens?.find(t => t.tokenType === derived.tokenType)?.amount ?? 0);
+const before = await held();
+console.log(`OK   tokenType ${derived.tokenType}, held before: ${before}`);
+
+step('4. submitContractCall mint()');
+const mint = await ng.submitContractCall({ contractAddress, circuit: 'mint', contractName: 'shielded-token', sessionId, args: '[]' })
     .catch(e => fail(`mint: ${e.message}`));
 if (!mint.txHash) fail(`mint returned no txHash: ${JSON.stringify(mint)}`);
-if (!/^[0-9a-f]{64}$/.test(mint.tokenTypeHex ?? '')) fail(`mint returned no tokenTypeHex: ${JSON.stringify(mint)}`);
 console.log(`OK   minted: tx ${mint.txHash}`);
-console.log(`     tokenTypeHex ${mint.tokenTypeHex}, amount ${mint.amount}`);
 
-step('4. deriveTokenType agrees (compute-only)');
-const derived = await ng.deriveTokenType({ contractAddress });
-if (derived.tokenTypeHex !== mint.tokenTypeHex) {
-    fail(`derivation mismatch: job says ${mint.tokenTypeHex}, deriveTokenType says ${derived.tokenTypeHex}`);
+step('5. The wallet holds the mint under the derived type');
+let after = before;
+for (let i = 0; i < 60 && after <= before; i++) {
+    await new Promise(r => setTimeout(r, 5000));
+    after = await held();
 }
-// and an explicit separator (string + hex form) lands on the same identity
-const viaString = await ng.deriveTokenType({ contractAddress, domainSeparator: 'nightgate:zswap-e2e' });
-const viaHex = await ng.deriveTokenType({ contractAddress, domainSeparator: derived.domainSeparator });
-if (viaString.tokenTypeHex !== derived.tokenTypeHex || viaHex.tokenTypeHex !== derived.tokenTypeHex) {
-    fail('separator forms disagree');
-}
-console.log(`OK   compute-only derivation matches the mint job (string + hex separator forms agree)`);
+if (after <= before) fail(`the wallet shows no new coin of type ${derived.tokenType} after 5 minutes`);
+console.log(`OK   held after: ${after}`);
 
 step('SUMMARY');
 console.log('OK   MINT + TOKEN-TYPE LANE WORKS');
 console.log(`     contract ${contractAddress}`);
 console.log(`     mint tx  ${mint.txHash}`);
-console.log(`     token    ${mint.tokenTypeHex} (${mint.amount} atoms to own zswap key)`);
+console.log(`     token    ${derived.tokenType} (${after - before} atoms to own zswap key)`);
 process.exit(0);

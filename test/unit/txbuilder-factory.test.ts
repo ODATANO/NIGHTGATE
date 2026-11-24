@@ -1,4 +1,4 @@
-// `@odatano/nightgate/txbuilder`, token factory: the issuer secret of a seed
+// `@odatano/nightgate-tx/txbuilder`, token factory: the issuer secret of a seed
 // equals the server's rule for a session on that seed; the kit helpers are
 // reachable from the builder entry.
 

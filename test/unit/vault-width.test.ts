@@ -38,10 +38,10 @@ describe('contract-registry slotWidth', () => {
 });
 
 describe('contract-witnesses factory dispatch', () => {
-    test('vault-family factory dispatch covers width variants and aliases', () => {
+    test('both vault packages get the vault witnesses, by the package they are and not by a name that starts alike', () => {
         expect(getContractWitnessFactory('attestation-vault')).toBe(buildAttestationVaultWitnesses);
         expect(getContractWitnessFactory('attestation-vault-32')).toBe(buildAttestationVaultWitnesses);
-        expect(getContractWitnessFactory('attestation-vault-v2-alias')).toBe(buildAttestationVaultWitnesses);
+        expect(getContractWitnessFactory('attestation-vault-v2-alias')).toBeUndefined();
         expect(getContractWitnessFactory('counter')).toBeUndefined();
     });
 });

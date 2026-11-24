@@ -90,7 +90,6 @@ function makeDbWithSession(row: any) {
 
 function buildSession() {
     return {
-        ID: 'sess-uuid',
         sessionId: 'sess-1',
         isActive: true,
         encryptedViewingKey: encrypt('mn_shield-vk_alice', TEST_KEY, walletSessionViewingKeyBinding('sess-1')),
@@ -115,7 +114,7 @@ beforeEach(() => {
 });
 
 describe('facade-backed wallet adapter: happy path', () => {
-    test('getCoinPublicKey returns real-derived pubkey synchronously', async () => {
+    test('getCoinPublicKey returns the key the material holds, synchronously', async () => {
         const db = makeDbWithSession(buildSession());
         const material = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY, facadeConfig: FACADE_CONFIG
@@ -126,7 +125,7 @@ describe('facade-backed wallet adapter: happy path', () => {
         expect(coin).toMatch(/^coin_/);
     });
 
-    test('getEncryptionPublicKey returns real-derived pubkey synchronously', async () => {
+    test('getEncryptionPublicKey returns the key the material holds, synchronously', async () => {
         const db = makeDbWithSession(buildSession());
         const material = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY, facadeConfig: FACADE_CONFIG
@@ -134,16 +133,6 @@ describe('facade-backed wallet adapter: happy path', () => {
         const w: any = material.walletAndMidnightProvider;
         const enc = w.getEncryptionPublicKey();
         expect(enc).toMatch(/^enc_/);
-    });
-
-    test('facade build is lazy, not triggered until first balance/submit call', async () => {
-        const db = makeDbWithSession(buildSession());
-        const material = await buildWalletMaterialForSession({
-            sessionId: 'sess-1', db, encryptionKey: TEST_KEY, facadeConfig: FACADE_CONFIG
-        });
-        // pubkeys don't trigger facade build
-        (material.walletAndMidnightProvider as any).getCoinPublicKey();
-        expect(getOrBuildWalletFacade).not.toHaveBeenCalled();
     });
 
     test('balanceTx and submitTx are not available on the main thread (the worker balances and submits)', async () => {

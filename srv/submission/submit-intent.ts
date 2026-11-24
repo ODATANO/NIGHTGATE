@@ -18,6 +18,9 @@ export interface SubmitIntentCoordinates {
     nullifiers?: string[];
     offerId?: string;
     deployReservation?: { grantId: string; count: number };
+    /** Contracts a maintenance update in this transaction changes. */
+    maintained?: string[];
+    maintenanceReservation?: { grantId: string; count: number };
     /** Unshielded tokens the calls moved into a contract. */
     unshielded?: UnshieldedMove[];
     /** The terms of a sponsored transfer. */

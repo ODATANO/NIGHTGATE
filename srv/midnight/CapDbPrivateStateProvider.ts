@@ -1,21 +1,22 @@
 // Stores a contract's private state in the CAP database instead of the SDK's LevelDB store.
-// Exports use the LevelDB format. One instance serves one account, its contracts are reached through `forContract`.
+// Exports have the shape midnight-js writes, so they move between this store and a midnight-js app.
+// One instance serves one account, its contracts are reached through `forContract`.
 
 import crypto from 'crypto';
+import type { SuperJSON } from 'superjson';
 import { NightgateError } from '../utils/errors';
 import cds from '@sap/cds';
 const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 import {
     StorageEncryption,
     decryptWithPassword,
-    decryptWithPasswordAsync,
     extractEncryptedComponents,
     SALT_LENGTH
 } from '../utils/storage-encryption';
 import { DEK_SCHEME } from '../submission/account-keys';
-import { ensureNightgateModelLoaded } from '../utils/cds-model';
-import { PrivateStates, ContractSigningKeys } from '#cds-models/midnight';
+import { PrivateStates, ContractSigningKeys, type PrivateState, type ContractSigningKey } from '#cds-models/midnight';
 import type { DbRunner } from '../utils/db-types';
+import { bareHex } from '../utils/hex-patterns';
 import type {
     ContractPrivateStates, ExportPrivateStatesOptions, ExportSigningKeysOptions, ImportPrivateStatesOptions, ImportPrivateStatesResult,
     ImportSigningKeysOptions, ImportSigningKeysResult, PrivateStateExport, PrivateStateId, PrivateStateProvider, SigningKeyExport
@@ -35,16 +36,50 @@ type SigningKey = Parameters<PrivateStateProvider['setSigningKey']>[1];
 
 const LEGACY_SIGNING_KEY = /^[0-9a-fA-F]{64}$/;
 
+/** `value` as a signing key, or undefined when it is none. */
+function asSigningKey(value: unknown): SigningKey | undefined {
+    const key = value as Partial<SigningKey> | null | undefined;
+    if (key && typeof key === 'object' && (key.tag === 'schnorr' || key.tag === 'ecdsa') && typeof key.value === 'string' && LEGACY_SIGNING_KEY.test(key.value)) {
+        return { tag: key.tag, value: key.value };
+    }
+    return undefined;
+}
+
 /** A stored signing key is JSON text of `{ tag, value }`. An older row holds a bare hex Schnorr key. */
-function readStoredSigningKey(stored: string, contractAddress: string): SigningKey {
+export function readStoredSigningKey(stored: string, contractAddress: string): SigningKey {
     if (LEGACY_SIGNING_KEY.test(stored)) return { tag: 'schnorr', value: stored };
     let parsed: unknown;
     try { parsed = JSON.parse(stored); } catch { parsed = undefined; }
-    const key = parsed as Partial<SigningKey> | undefined;
-    if (key && (key.tag === 'schnorr' || key.tag === 'ecdsa') && typeof key.value === 'string' && LEGACY_SIGNING_KEY.test(key.value)) {
-        return { tag: key.tag, value: key.value };
-    }
+    const key = asSigningKey(parsed);
+    if (key) return key;
     throw new Error(`The signing key stored for contract '${contractAddress}' is not a valid signing key`);
+}
+
+let codec: Promise<SuperJSON> | undefined;
+
+/** The serializer midnight-js uses for private state, with its rule for a Buffer. It keeps big integers and bytes, which plain JSON does not. */
+function stateCodec(): Promise<SuperJSON> {
+    codec ??= import('superjson').then(({ SuperJSON: Codec }) => {
+        const own = new Codec();
+        own.registerCustom<Buffer, string>({
+            isApplicable: (v): v is Buffer => v instanceof Buffer,
+            serialize: v => v.toString('hex'),
+            deserialize: v => Buffer.from(v, 'hex')
+        }, 'buffer');
+        return own;
+    });
+    return codec;
+}
+
+// A stored state is this prefix plus the serializer's text. A row without it is plain JSON from an older version.
+const STATE_PREFIX = 'sj1:';
+
+async function encodeState(state: unknown): Promise<string> {
+    return STATE_PREFIX + (await stateCodec()).stringify(state);
+}
+
+async function decodeState(stored: string): Promise<unknown> {
+    return stored.startsWith(STATE_PREFIX) ? (await stateCodec()).parse(stored.slice(STATE_PREFIX.length)) : JSON.parse(stored);
 }
 
 // Errors (names match SDK convention)
@@ -65,8 +100,6 @@ export interface CapDbPrivateStateProviderConfig {
     accountId: string;
     /** The account's storage password. Every row is written with it. */
     privateStoragePasswordProvider: () => Promise<string> | string;
-    /** Older passwords, used only for reading. A row opened with one is saved again with the current password. */
-    privateStoragePasswordFallbacks?: () => Promise<string[]> | string[];
     db?: DbRunner;
 }
 
@@ -80,6 +113,63 @@ export function privateStateStableSalt(accountId: string, password: string): Buf
         .digest();
 }
 
+/** The account whose rows move, and its password. Without a password nothing can be read, and every row stays. */
+export interface StoredRowPasswords { accountId: string; password?: string }
+
+/** Moves an account's private states and signing keys to another account and encrypts them with its password.
+ *  A row the target already has stays, and so does a row that cannot be read. Returns how many rows moved and stayed. */
+export async function movePrivateRows(
+    db: DbRunner, from: StoredRowPasswords, to: { accountId: string; password: string }
+): Promise<{ moved: number; left: number }> {
+    const readers = new Map<string, Promise<StorageEncryption>>();
+    let writer: Promise<StorageEncryption> | undefined;
+    const rewritten = async (ciphertext: string | null | undefined): Promise<string | null> => {
+        if (!ciphertext) return null;
+        let salt: Buffer;
+        try { salt = extractEncryptedComponents(Buffer.from(ciphertext, 'base64')).salt; } catch { return null; }
+        const password = from.password;
+        if (!password || !privateStateStableSalt(from.accountId, password).equals(salt)) return null;
+        let reader = readers.get(password);
+        if (!reader) readers.set(password, reader = StorageEncryption.createAsync(password, salt));
+        let plain: string;
+        try { plain = (await reader).decrypt(ciphertext); } catch { return null; }
+        writer ??= StorageEncryption.createAsync(to.password, privateStateStableSalt(to.accountId, to.password));
+        return (await writer).encrypt(plain);
+    };
+    let moved = 0;
+    let left = 0;
+    const move = async (ciphertext: string | null | undefined, taken: unknown, insert: (fresh: string) => unknown, remove: () => unknown): Promise<void> => {
+        const fresh = taken ? null : await rewritten(ciphertext);
+        if (fresh === null) { left++; return; }
+        await insert(fresh);
+        await remove();
+        moved++;
+    };
+    try {
+        const states: PrivateState[] = await db.run(SELECT.from(PrivateStates).where({ accountId: from.accountId })) ?? [];
+        for (const row of states) {
+            const key = { contractAddress: row.contractAddress, privateStateId: row.privateStateId };
+            await move(
+                row.ciphertext,
+                await db.run(SELECT.one.from(PrivateStates).columns('accountId').where({ accountId: to.accountId, ...key })),
+                fresh => db.run(INSERT.into(PrivateStates).entries({ ...row, accountId: to.accountId, ciphertext: fresh, keyScheme: DEK_SCHEME })),
+                () => db.run(DELETE.from(PrivateStates).where({ accountId: from.accountId, ...key })));
+        }
+        const keys: ContractSigningKey[] = await db.run(SELECT.from(ContractSigningKeys).where({ accountId: from.accountId })) ?? [];
+        for (const row of keys) {
+            const key = { contractAddress: row.contractAddress };
+            await move(
+                row.ciphertext,
+                await db.run(SELECT.one.from(ContractSigningKeys).columns('accountId').where({ accountId: to.accountId, ...key })),
+                fresh => db.run(INSERT.into(ContractSigningKeys).entries({ ...row, accountId: to.accountId, ciphertext: fresh, keyScheme: DEK_SCHEME })),
+                () => db.run(DELETE.from(ContractSigningKeys).where({ accountId: from.accountId, ...key })));
+        }
+    } finally {
+        for (const key of [...readers.values(), writer]) void key?.then(k => k.clear(), () => undefined);
+    }
+    return { moved, left };
+}
+
 export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateStateId, PS = unknown> implements PrivateStateProvider<PSI, PS> {
     private db: DbRunner | undefined;
     private encryptionPromise: Promise<StorageEncryption> | undefined;
@@ -90,11 +180,12 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         if (config.db) this.db = config.db;
     }
 
-    /** Rows are keyed by the address as given. The view reports it in lower case, as the SDK's providers do. */
-    forContract(contractAddress: ContractAddress): ContractPrivateStates<PSI, PS> {
+    /** Rows are keyed by the address in lowercase hex without `0x`, the form the SDK's providers report. */
+    forContract(given: ContractAddress): ContractPrivateStates<PSI, PS> {
+        const contractAddress = bareHex(given);
         if (!contractAddress) throw new Error('Contract address must not be empty');
         return {
-            contractAddress: contractAddress.toLowerCase(),
+            contractAddress,
             set: (privateStateId, state) => this.set(contractAddress, privateStateId, state),
             get: (privateStateId) => this.get(contractAddress, privateStateId),
             remove: (privateStateId) => this.remove(contractAddress, privateStateId),
@@ -111,7 +202,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
 
     private async set(contractAddress: ContractAddress, privateStateId: PSI, state: PS): Promise<void> {
         const enc = await this.getEncryption();
-        const ciphertext = enc.encrypt(JSON.stringify(state));
+        const ciphertext = enc.encrypt(await encodeState(state));
         await this.upsertPrivateState(contractAddress, privateStateId, ciphertext);
     }
 
@@ -125,8 +216,8 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             })
         );
         if (!row) return null;
-        const json = await this.decryptStored(row.ciphertext, fresh => this.upsertPrivateState(contractAddress, privateStateId, fresh));
-        return JSON.parse(json) as PS;
+        const stored = await this.decryptStored(row.ciphertext);
+        return await decodeState(stored) as PS;
     }
 
     private async remove(contractAddress: ContractAddress, privateStateId: PSI): Promise<void> {
@@ -158,11 +249,11 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         const row = await db.run(
             SELECT.one.from(ContractSigningKeys).where({
                 accountId: this.config.accountId,
-                contractAddress: address
+                contractAddress: bareHex(address)
             })
         );
         if (!row) return null;
-        return readStoredSigningKey(await this.decryptStored(row.ciphertext, fresh => this.upsertSigningKey(address, fresh)), address);
+        return readStoredSigningKey(await this.decryptStored(row.ciphertext), address);
     }
 
     async removeSigningKey(address: ContractAddress): Promise<void> {
@@ -170,7 +261,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         await db.run(
             DELETE.from(ContractSigningKeys).where({
                 accountId: this.config.accountId,
-                contractAddress: address
+                contractAddress: bareHex(address)
             })
         );
     }
@@ -196,13 +287,15 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             throw new InvalidExportFormatError(`Too many states to export (${rows.length}). Maximum allowed: ${maxStates}`);
         }
 
-        const states: Record<string, unknown> = {};
+        // midnight-js exports each state as the serializer's text.
+        const states: Record<string, string> = {};
+        const serializer = await stateCodec();
         for (const r of rows) {
-            const json = await this.decryptStored(r.ciphertext, fresh => this.upsertPrivateState(contractAddress, r.privateStateId, fresh));
-            states[r.privateStateId] = JSON.parse(json);
+            const stored = await this.decryptStored(r.ciphertext);
+            states[r.privateStateId] = serializer.stringify(await decodeState(stored));
         }
 
-        const payload = { version: CURRENT_EXPORT_VERSION, stateCount: rows.length, states };
+        const payload = { version: CURRENT_EXPORT_VERSION, exportedAt: new Date().toISOString(), stateCount: rows.length, states };
         return sealExport(PRIVATE_STATE_EXPORT_FORMAT, payload, options?.password ?? await this.getStoragePassword());
     }
 
@@ -221,7 +314,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
 
         const importPassword = options?.password ?? await this.getStoragePassword();
 
-        let payload: { version: number; stateCount: number; states: Record<string, unknown> };
+        let payload: { version: number; exportedAt?: unknown; stateCount: number; states: Record<string, unknown> };
         try {
             const decryptedJson = decryptWithPassword(exportData.encryptedPayload, importPassword);
             payload = JSON.parse(decryptedJson);
@@ -255,13 +348,26 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             if (conflictCount > 0) throw new ImportConflictError(conflictCount);
         }
 
+        // An export that names its time holds each state as the serializer's text. An older one has no time and holds the state itself.
+        const serializer = await stateCodec();
+        const serialized = typeof payload.exportedAt === 'string';
+        const incoming = new Map<string, unknown>();
+        for (const id of stateIds) {
+            const value = payload.states[id];
+            try {
+                incoming.set(id, serialized ? serializer.parse(String(value)) : value);
+            } catch {
+                throw new InvalidExportFormatError('Invalid private state value');
+            }
+        }
+
         let imported = 0, skipped = 0, overwritten = 0;
         const enc = await this.getEncryption();
         for (const id of stateIds) {
             const existing = await this.get(contractAddress, id as PSI);
             const isConflict = existing !== null;
             if (isConflict && conflictStrategy === 'skip') { skipped++; continue; }
-            const ciphertext = enc.encrypt(JSON.stringify(payload.states[id]));
+            const ciphertext = enc.encrypt(await encodeState(incoming.get(id)));
             await this.upsertPrivateState(contractAddress, id, ciphertext);
             if (isConflict) overwritten++; else imported++;
         }
@@ -280,9 +386,9 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             throw new InvalidExportFormatError(`Too many signing keys to export (${rows.length}). Maximum allowed: ${maxKeys}`);
         }
 
-        const keys: Record<string, string> = {};
+        const keys: Record<string, SigningKey> = {};
         for (const r of rows) {
-            keys[r.contractAddress] = await this.decryptStored(r.ciphertext, fresh => this.upsertSigningKey(r.contractAddress, fresh));
+            keys[r.contractAddress] = readStoredSigningKey(await this.decryptStored(r.ciphertext), r.contractAddress);
         }
         return buildSigningKeyExport(keys, options?.password ?? await this.getStoragePassword());
     }
@@ -302,7 +408,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
 
         const importPassword = options?.password ?? await this.getStoragePassword();
 
-        let payload: { version: number; keyCount: number; keys: Record<string, string> };
+        let payload: { version: number; keyCount: number; keys: Record<string, unknown> };
         try {
             const decryptedJson = decryptWithPassword(exportData.encryptedPayload, importPassword);
             payload = JSON.parse(decryptedJson);
@@ -324,6 +430,16 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             throw new InvalidExportFormatError(`Too many keys in export (${addresses.length}). Maximum allowed: ${maxKeys}`);
         }
 
+        // A key from midnight-js is `{ tag, value }`. An export of an older version of this store holds the stored text.
+        const incoming = new Map<string, SigningKey>();
+        for (const a of addresses) {
+            const value = payload.keys[a];
+            let key: SigningKey | undefined;
+            try { key = typeof value === 'string' ? readStoredSigningKey(value, a) : asSigningKey(value); } catch { key = undefined; }
+            if (!key) throw new InvalidExportFormatError('Invalid signing key value');
+            incoming.set(a, key);
+        }
+
         if (conflictStrategy === 'error') {
             let conflictCount = 0;
             for (const a of addresses) {
@@ -338,7 +454,7 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
             const existing = await this.getSigningKey(a);
             const isConflict = existing !== null;
             if (isConflict && conflictStrategy === 'skip') { skipped++; continue; }
-            const ciphertext = enc.encrypt(payload.keys[a]);
+            const ciphertext = enc.encrypt(JSON.stringify(incoming.get(a)));
             await this.upsertSigningKey(a, ciphertext);
             if (isConflict) overwritten++; else imported++;
         }
@@ -347,7 +463,6 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
 
     private async getDb(): Promise<DbRunner> {
         if (this.db) return this.db;
-        await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
         return this.db;
     }
@@ -374,23 +489,8 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         return privateStateStableSalt(this.config.accountId, password);
     }
 
-    /** Decrypts with the current password, or with the older password that matches the salt. In that case the row is saved again. */
-    private async decryptStored(ciphertext: string, rewrite: (fresh: string) => Promise<void>): Promise<string> {
-        const enc = await this.getEncryption();
-        try {
-            return enc.decrypt(ciphertext);
-        } catch (primary) {
-            const fallbacks = await this.config.privateStoragePasswordFallbacks?.() ?? [];
-            let salt: Buffer;
-            try { salt = extractEncryptedComponents(Buffer.from(ciphertext, 'base64')).salt; } catch { throw primary; }
-            for (const password of fallbacks) {
-                if (!this.deriveStableSalt(password).equals(salt)) continue;
-                const plain = await decryptWithPasswordAsync(ciphertext, password);
-                try { await rewrite(enc.encrypt(plain)); } catch { /* the next read rewrites */ }
-                return plain;
-            }
-            throw primary;
-        }
+    private async decryptStored(ciphertext: string): Promise<string> {
+        return (await this.getEncryption()).decrypt(ciphertext);
     }
 
     private async upsertPrivateState(contractAddress: string, privateStateId: string, ciphertext: string): Promise<void> {
@@ -415,7 +515,8 @@ export class CapDbPrivateStateProvider<PSI extends PrivateStateId = PrivateState
         }
     }
 
-    private async upsertSigningKey(contractAddress: string, ciphertext: string): Promise<void> {
+    private async upsertSigningKey(given: string, ciphertext: string): Promise<void> {
+        const contractAddress = bareHex(given);
         const db = await this.getDb();
         const now = new Date().toISOString();
         const existing = await db.run(
@@ -456,8 +557,9 @@ function sealExport<F extends string>(format: F, payload: object, password: stri
 }
 
 /** Packs already decrypted signing keys into an export encrypted with `password`. */
-export function buildSigningKeyExport(keys: Record<string, string>, password: string): SigningKeyExport {
-    return sealExport(SIGNING_KEY_EXPORT_FORMAT, { version: CURRENT_EXPORT_VERSION, keyCount: Object.keys(keys).length, keys }, password);
+export function buildSigningKeyExport(keys: Record<string, SigningKey>, password: string): SigningKeyExport {
+    const payload = { version: CURRENT_EXPORT_VERSION, exportedAt: new Date().toISOString(), keyCount: Object.keys(keys).length, keys };
+    return sealExport(SIGNING_KEY_EXPORT_FORMAT, payload, password);
 }
 
 function validateSaltHex(saltHex: string): void {

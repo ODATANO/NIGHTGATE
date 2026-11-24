@@ -243,7 +243,7 @@ export class WorkerRpcClient {
                 if (reply?.ok) return reply.result;
                 const payload = reply?.error;
                 if (!payload || typeof payload.message !== 'string') throw new Error(`${name} rpc failed`);
-                if (payload.nightgate) throw nightgateErrorFromPayload({ ...payload.nightgate, name: payload.name, message: payload.message });
+                if (payload.nightgate) throw nightgateErrorFromPayload(payload.nightgate, { name: payload.name, message: payload.message });
                 const err = new Error(payload.message);
                 if (payload.name) err.name = payload.name;
                 throw err;

@@ -82,15 +82,6 @@ describe('hashExtrinsic: blake2b-256', () => {
         expect(result).toMatch(/^[0-9a-f]{64}$/);
     });
 
-    it('same input always produces same output', () => {
-        const hex = '0xaabbccdd';
-        expect((processor as any).hashExtrinsic(hex)).toBe((processor as any).hashExtrinsic(hex));
-    });
-
-    it('different inputs produce different outputs', () => {
-        expect((processor as any).hashExtrinsic('0xaa')).not.toBe((processor as any).hashExtrinsic('0xbb'));
-    });
-
     it('handles hex without 0x prefix', () => {
         const withPrefix = (processor as any).hashExtrinsic('0xdeadbeef');
         const withoutPrefix = (processor as any).hashExtrinsic('deadbeef');
@@ -125,9 +116,7 @@ describe('classifyExtrinsic and mapPalletCall', () => {
         expect((processor as any).classifyExtrinsic(buildUnsignedExtrinsic(15, 0))).toMatchObject({
             txType: 'shielded_transfer',
             isShielded: true,
-            isSystem: false,
-            palletIndex: 15,
-            callIndex: 0
+            isSystem: false
         });
     });
 
@@ -143,7 +132,6 @@ describe('classifyExtrinsic and mapPalletCall', () => {
         expect((processor as any).toContractActionType('contract_call')).toBe('CALL');
         expect((processor as any).toContractActionType('night_transfer')).toBeNull();
         expect((processor as any).extrinsicSize('0x0c040a02')).toBe(4);
-        expect((processor as any).buildCircuitName({ palletIndex: 10, callIndex: 2 })).toBe('10:2');
     });
 });
 

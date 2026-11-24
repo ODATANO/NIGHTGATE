@@ -11,7 +11,7 @@ What your own NIGHTGATE needs behind it. To only call NIGHTGATE, use the hosted 
 | Verify service | indexer GraphQL |
 | Proving | nothing by default, or a proof server in `proofServerUrl` |
 
-Preview has public endpoints built in. Mainnet and preprod have none, so NIGHTGATE refuses to start there until `nodeUrl` and `indexerHttpUrl` are set. Node and indexer must run ledger 9.
+Preview has public endpoints built in. Mainnet, preprod and stagenet have none, so NIGHTGATE stays offline there until `nodeUrl` and `indexerHttpUrl` are set. Node and indexer must run ledger 9.
 
 ## Option A: hosted node and indexer
 
@@ -41,8 +41,11 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"query":"{ block { heig
 - **Indexer**: the `indexer` service in `docker/docker-compose.yml` runs `midnightntwrk/indexer-standalone`. It reads the node in `INDEXER_UPSTREAM_NODE_URL`, which may also be a hosted node RPC with its token. It indexes from genesis, which takes days on mainnet.
 
 ```bash
+export INDEXER_SECRET=$(openssl rand -hex 32)   # keep it: the indexer reads its stored data only with the same secret
 INDEXER_UPSTREAM_NODE_URL=ws://<your-node>:9944 docker compose -f docker/docker-compose.yml up -d indexer
 ```
+
+The compose file publishes the node and the indexer on `127.0.0.1` only. `NODE_BIND_ADDRESS=0.0.0.0` and `INDEXER_BIND_ADDRESS=0.0.0.0` publish them on all addresses. The `nightgate` service of the same file reaches the indexer as `http://indexer:8088/api/v4/graphql`.
 
 Wait until its log shows `"caught_up":true` or `GET /ready` answers 200. A half-synced indexer gives wallets silent data gaps.
 
@@ -56,7 +59,7 @@ Probing and switching to your own indexer: [operations.md](operations.md).
 
 ## Verify calls on another network
 
-`verifyAttestationState`, `verifyPredicateState` and `verifyDisclosureState` take a `network` parameter. For a network other than the configured one, the indexer comes from `cds.requires.nightgate.networks.<network>.indexerHttpUrl`. Without that entry, mainnet and preprod answer "not verified" and preview uses its public indexer.
+`verifyAttestation`, `verifyPredicate` and `verifyDisclosure` take a `network` parameter. For a network other than the configured one, the indexer comes from `cds.requires.nightgate.networks.<network>.indexerHttpUrl`. Without that entry, mainnet and preprod answer "not verified" and preview uses its public indexer.
 
 ## Library users
 

@@ -6,6 +6,7 @@ import WebSocket from 'ws';
 import { loadMidnightSdk } from './sdk-loader';
 import { configNumber } from '../utils/config';
 import { NightgateError, messageWithoutUrls } from '../utils/errors';
+import { indexerQuery } from '../utils/indexer-graphql';
 import type { ContractState } from '@midnight-ntwrk/compact-runtime';
 import type { PublicDataProvider } from '@midnight-ntwrk/midnight-js-types';
 
@@ -78,8 +79,9 @@ const providers = new Map<string, Promise<ContractStateReader>>();
 const inFlight = new WeakMap<ContractStateReader, Map<string, Promise<ContractState | null>>>();
 
 /** Reads a contract state and narrows it to ledger 9. Null when the contract has no state.
- *  Calls for the same contract and height that overlap share one indexer request. Callers must not change the returned state. */
-export function queryLedger9ContractState(reader: ContractStateReader, contractAddress: string, at?: { type: 'blockHeight'; blockHeight: number }): Promise<ContractState | null> {
+ *  Calls for the same contract and height that overlap share one indexer request. Callers must not change the returned state.
+ *  `current` keeps the decoded state for later reads. It is true for a read of the latest state or at the indexer's newest block. */
+export function queryLedger9ContractState(reader: ContractStateReader, contractAddress: string, at?: { type: 'blockHeight'; blockHeight: number }, current: boolean = at === undefined): Promise<ContractState | null> {
     let pending = inFlight.get(reader);
     if (!pending) inFlight.set(reader, pending = new Map());
     const key = `${contractAddress.toLowerCase()}@${at ? at.blockHeight : 'latest'}`;
@@ -89,9 +91,40 @@ export function queryLedger9ContractState(reader: ContractStateReader, contractA
         const read = await reader.queryContractState(contractAddress, at).catch((err: unknown) => {
             throw new NightgateError('BAD_GATEWAY', `indexer could not serve the state of contract ${contractAddress.toLowerCase()}: ${messageWithoutUrls(err, '<indexer>')}`, { cause: err });
         });
-        return read ? decodedStateOf(contractAddress.toLowerCase(), read, at === undefined) : null;
+        return read ? decodedStateOf(contractAddress.toLowerCase(), read, current) : null;
     })().finally(() => pending.delete(key));
     pending.set(key, started);
+    return started;
+}
+
+/** The state at `tipHeight`, a height `indexerTipHeight` named. Without a height, the latest state. */
+export function queryLedger9ContractStateAtTip(reader: ContractStateReader, contractAddress: string, tipHeight?: number): Promise<ContractState | null> {
+    return tipHeight === undefined
+        ? queryLedger9ContractState(reader, contractAddress)
+        : queryLedger9ContractState(reader, contractAddress, { type: 'blockHeight', blockHeight: tipHeight }, true);
+}
+
+// One read of the newest block serves a burst of checks. A slightly older height is still exact, because the state is read at it.
+const TIP_REUSE_MS = 2_000;
+const tips = new Map<string, { height: number; at: number }>();
+const tipReads = new Map<string, Promise<number>>();
+
+/** The height of the indexer's newest block. */
+export function indexerTipHeight(indexerHttpUrl: string): Promise<number> {
+    const kept = tips.get(indexerHttpUrl);
+    if (kept && Date.now() - kept.at < TIP_REUSE_MS) return Promise.resolve(kept.height);
+    const running = tipReads.get(indexerHttpUrl);
+    if (running) return running;
+    const started = (async () => {
+        const data = await indexerQuery<{ block?: { height?: unknown } | null }>(indexerHttpUrl, '{ block { height } }');
+        const height = Number(data?.block?.height);
+        if (!Number.isSafeInteger(height) || height < 0) throw new Error('the answer names no block');
+        tips.set(indexerHttpUrl, { height, at: Date.now() });
+        return height;
+    })().catch((err: unknown) => {
+        throw new NightgateError('BAD_GATEWAY', `indexer could not name its newest block: ${messageWithoutUrls(err, '<indexer>')}`, { cause: err });
+    }).finally(() => tipReads.delete(indexerHttpUrl));
+    tipReads.set(indexerHttpUrl, started);
     return started;
 }
 
@@ -119,6 +152,7 @@ export function buildPublicDataProvider(endpoints: IndexerEndpoints): Promise<Co
 
 export function __resetPublicDataProvidersForTests(): void {
     providers.clear();
+    tips.clear();
     decoded.clear();
     decodedBytes = 0;
 }

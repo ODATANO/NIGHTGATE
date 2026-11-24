@@ -65,9 +65,9 @@ step('1. Server width check (attestation-vault-32 registered)');
 step('2. connectWallet + connectWalletForSigning (LACE session)');
 const { sessionId } = await ng.connectWallet({ viewingKey: VK });
 const signing = await ng.connectWalletForSigning({ sessionId, mnemonic: MNEMONIC });
-if (signing.prewarmJobId) {
+if (signing.jobId) {
     console.log('     syncing sponsor wallet...');
-    await ng.waitForJob({ jobId: signing.prewarmJobId, sessionId });
+    await ng.waitForJob({ jobId: signing.jobId, sessionId });
 }
 console.log(`OK   sessionId = ${sessionId}`);
 
@@ -76,7 +76,7 @@ const tDeploy = Date.now();
 let deployed;
 for (let attempt = 1; ; attempt++) {
     try {
-        deployed = await ng.deployContract({ compiledArtifactRef: 'attestation-vault-32', sessionId, initialPrivateState: '{}' });
+        deployed = await ng.deployContract({ contractName: 'attestation-vault-32', sessionId, initialPrivateState: '{}' });
         break;
     } catch (e) {
         const msg = String(e?.errorMessage ?? e?.message ?? e);
@@ -107,7 +107,7 @@ async function prepare(document, label) {
     const r = await ng.prepareDocumentProof({
         document: document,
         proofFields: PROOF_FIELDS,
-        compiledArtifactRef: 'attestation-vault-32'
+        contractName: 'attestation-vault-32'
     });
     const out = {
         payloadHash: r.payloadHash, contentRoot: r.contentRoot, schemaId: r.schemaId,
@@ -185,7 +185,7 @@ for (const [doc, label] of [[A, 'A'], [B, 'B']]) {
     for (;;) {
         const v = await ng.verifyAttestation({
             contractAddress, attesterId: b.attesterId, payloadHash: doc.payloadHash,
-            contentRoot: doc.contentRoot, schemaId: doc.schemaId, compiledArtifactRef: 'attestation-vault-32'
+            contentRoot: doc.contentRoot, schemaId: doc.schemaId, contractName: 'attestation-vault-32'
         }).catch(() => null);
         if (v?.attested === true && v?.contentRootOk === true && v?.schemaOk === true) break;
         if (Date.now() > deadline) fail(`doc ${label} not attested+anchored on chain within the read timeout`);
@@ -194,13 +194,13 @@ for (const [doc, label] of [[A, 'A'], [B, 'B']]) {
 }
 console.log('OK   both documents attested AND anchored, one batched tx per document');
 
-step('6. Server-side issueFieldEqualityAttestation on the 32er (depth-5 path)');
+step('6. Server-side proveFieldEquality on the 32er (depth-5 path)');
 const marker0 = A.fields.find(f => f.field === 'marker_00') || fail('marker_00 missing from prepared fields');
 const eq = await ng.proveFieldEquality({
     payloadHash: A.payloadHash, attesterId: b.attesterId, fieldKey: marker0.fieldKey,
     expectedValue: docA.marker_00, fieldSalt: marker0.salt,
     siblings: marker0.siblings, dirs: marker0.dirs,
-    sessionId, contractAddress, compiledArtifactRef: 'attestation-vault-32'
+    sessionId, contractAddress, contractName: 'attestation-vault-32'
 });
 if (!eq?.proof?.proofValue && !eq?.claim) fail(`equality job returned no proof: ${JSON.stringify(eq)}`);
 console.log(`OK   equality proven server-side, tx ${String(eq.proof?.proofValue ?? '').slice(0, 16)}...`);
@@ -211,7 +211,7 @@ await sponsorWithRetry('compare', async () => {
     const compare = await b.buildSponsorable({
         contractAddress,
         call: prepareProveFieldsDiffer({
-            recordKeyA: computeRecordKey(b.attesterId, A.payloadHash), recordKeyB: computeRecordKey(b.attesterId, B.payloadHash), k: CHANGED,
+            recordKeyA: await computeRecordKey(b.attesterId, A.payloadHash), recordKeyB: await computeRecordKey(b.attesterId, B.payloadHash), k: CHANGED,
             docPair: { schema: A.schema, openingA: A.opening, openingB: B.opening },
             slotWidth: 32
         })
@@ -224,7 +224,7 @@ await sponsorWithRetry('compare', async () => {
     for (;;) {
         const v = await ng.verifyPredicate({
             contractAddress, attesterId: b.attesterId, payloadHash: A.payloadHash, payloadHashB: B.payloadHash,
-            predicate: 'documentDiff', k: CHANGED, compiledArtifactRef: 'attestation-vault-32'
+            predicate: 'documentDiff', k: CHANGED, contractName: 'attestation-vault-32'
         }).catch(() => null);
         if (v?.verified === true) { console.log('OK   diff claim verified crawler-free (width 32)'); break; }
         if (Date.now() > deadline) fail('diff claim did not verify within the read timeout');
@@ -232,13 +232,13 @@ await sponsorWithRetry('compare', async () => {
     }
 }
 
-step('8. 32-bit mask pin: verifyPredicateState integrity with bit 31 set');
+step('8. 32-bit mask pin: verifyPredicate integrity with bit 31 set');
 {
     // No such claim exists: the point is that a mask above Int31 passes the
     // OData layer and the width-32 handler bounds, yielding a CLEAN negative.
     const v = await ng.verifyPredicate({
         contractAddress, attesterId: b.attesterId, payloadHash: A.payloadHash, payloadHashB: B.payloadHash,
-        predicate: 'documentIntegrity', allowedMask: 0x80000001, compiledArtifactRef: 'attestation-vault-32'
+        predicate: 'documentIntegrity', allowedMask: 0x80000001, contractName: 'attestation-vault-32'
     });
     if (v?.verified !== false) fail(`expected clean verified:false, got ${JSON.stringify(v)}`);
     console.log('OK   mask 0x80000001 accepted through OData + width-32 bounds, clean negative');

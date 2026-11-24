@@ -10,7 +10,7 @@ import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../uti
 import { deriveAccountId, deriveStoragePassword } from './wallet-material-factory';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
 import { assignDedicatedWorker, walletWaitForSyncedState, walletWorkerPoolConfig } from '../midnight/wallet-worker-client';
-import { NightgateError, errorMessage } from '../utils/errors';
+import { NightgateError, errorMessage, type ERROR_CODES } from '../utils/errors';
 import { publishPrewarmState } from '../utils/runtime-state';
 
 /**
@@ -20,12 +20,13 @@ export function prewarmSyncBudgetMs(env: NodeJS.ProcessEnv = process.env): numbe
     return configNumberFrom('NIGHTGATE_SPONSOR_PREWARM_SYNC_MS', env);
 }
 
+/** The statuses the table lists for the code. A fault of the server itself is no refusal of the sponsor. */
+type FeeSponsorStatus = (typeof ERROR_CODES)['FEE_SPONSOR_UNUSABLE']['statuses'][number];
+
 export class FeeSponsorError extends NightgateError {
-    constructor(status: number, message: string) {
+    constructor(status: FeeSponsorStatus, message: string) {
         super('FEE_SPONSOR_UNUSABLE', message, { status });
     }
-    /** @deprecated use `status`. */
-    get httpStatus(): number { return this.status; }
 }
 
 export interface ResolvedFeeSponsor {
@@ -75,7 +76,7 @@ export async function resolveFeeSponsor(opts: ResolveFeeSponsorOptions): Promise
     if (!session) {
         throw new FeeSponsorError(404,
             'Sponsor session not found, inactive, or not usable by this caller. ' +
-            'Use one of your own sessions, or a session listed in NIGHTGATE_FEE_SPONSOR_SESSION.');
+            'Use one of your own sessions, or a session listed in NIGHTGATE_FEE_SPONSOR_SESSIONS.');
     }
     if (isSessionExpired(opts.sponsorSessionId, session.expiresAt, opts.config)) {
         throw new FeeSponsorError(410, 'Sponsor session expired');
@@ -95,7 +96,7 @@ export async function resolveFeeSponsor(opts: ResolveFeeSponsorOptions): Promise
         viewingKey = decrypt(session.encryptedViewingKey, encKey, walletSessionViewingKeyBinding(session.sessionId));
         seedHex = decrypt(session.encryptedSeedKey, encKey, walletSessionSeedBinding(session.sessionId));
     } catch {
-        throw new FeeSponsorError(500, 'Failed to decrypt sponsor session keys (ENCRYPTION_KEY mismatch?)');
+        throw new NightgateError('INTERNAL', 'Failed to decrypt sponsor session keys (ENCRYPTION_KEY mismatch?)');
     }
 
     const accountId = deriveAccountId(viewingKey);

@@ -3,12 +3,13 @@ import {
     assertSupportedRuntimeTopology,
     getRuntimeTopology,
     openAuthRefusal,
+    openAuthKind,
     UnsupportedRuntimeTopologyError
 } from '../../srv/utils/runtime-topology';
 
 const ENV_KEYS = [
     'CDS_MULTITENANCY', 'CF_INSTANCE_COUNT', 'CF_INSTANCE_INDEX', 'KUBERNETES_REPLICA_COUNT',
-    'NIGHTGATE_REPLICA_COUNT', 'NIGHTGATE_ALLOW_PRODUCTION_SQLITE', 'NIGHTGATE_ALLOW_UNAUTHENTICATED', 'NODE_ENV', 'WEB_CONCURRENCY'
+    'NIGHTGATE_REPLICA_COUNT', 'NIGHTGATE_ALLOW_UNAUTHENTICATED', 'NODE_ENV', 'WEB_CONCURRENCY'
 ] as const;
 const originalEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
 const originalRequires = (cds.env as any).requires;
@@ -71,19 +72,21 @@ describe('runtime topology guard', () => {
         expect(topology.errors.join(' ')).toMatch(/tenant context/i);
     });
 
-    it('fails closed for production SQLite', () => {
+    it('SQLite with one instance is a supported way to run, in production too', () => {
         process.env.NODE_ENV = 'production';
+        (cds.env as any).requires.auth = { kind: 'basic' };
         const topology = getRuntimeTopology({ replicaCount: 1 });
-        expect(topology).toMatchObject({ valid: false, databaseKind: 'sqlite' });
-        expect(topology.errors.join(' ')).toMatch(/SQLite is unsupported in production/);
+        expect(topology).toMatchObject({ valid: true, databaseKind: 'sqlite' });
+        expect(topology.errors).toEqual([]);
+        expect(topology.warnings.join(' ')).not.toMatch(/SQLite/);
     });
 
-    it('allows production SQLite only through the explicit emergency override', () => {
+    it('SQLite does not lift the rule of one instance', () => {
         process.env.NODE_ENV = 'production';
-        process.env.NIGHTGATE_ALLOW_PRODUCTION_SQLITE = 'true';
-        const topology = getRuntimeTopology({ replicaCount: 1 });
-        expect(topology.valid).toBe(true);
-        expect(topology.warnings.join(' ')).toMatch(/emergency compatibility override/);
+        (cds.env as any).requires.auth = { kind: 'basic' };
+        const topology = getRuntimeTopology({ replicaCount: 2 });
+        expect(topology).toMatchObject({ valid: false, databaseKind: 'sqlite' });
+        expect(topology.errors.join(' ')).toMatch(/exactly one replica/);
     });
 
     it('refuses dummy auth in production', () => {
@@ -133,6 +136,20 @@ describe('runtime topology guard', () => {
         (cds.env as any).requires.auth = { kind: 'dummy' };
         process.env.NIGHTGATE_ALLOW_UNAUTHENTICATED = 'true';
         expect(openAuthRefusal()).toBeNull();
+    });
+
+    it('names the open auth kind in every profile, also with the override', () => {
+        (cds.env as any).requires.auth = { kind: 'dummy' };
+        expect(openAuthKind()).toBe('dummy');
+        process.env.NODE_ENV = 'production';
+        process.env.NIGHTGATE_ALLOW_UNAUTHENTICATED = 'true';
+        expect(openAuthKind()).toBe('dummy');
+        (cds.env as any).requires.auth = { kind: 'mocked' };
+        expect(openAuthKind()).toBe('mocked');
+        for (const kind of ['basic', 'jwt', 'xsuaa']) {
+            (cds.env as any).requires.auth = { kind };
+            expect(openAuthKind(), kind).toBeUndefined();
+        }
     });
 
     it('leaves dummy auth alone outside production', () => {

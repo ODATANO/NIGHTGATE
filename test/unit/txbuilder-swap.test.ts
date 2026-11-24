@@ -1,4 +1,4 @@
-// `@odatano/nightgate/txbuilder`, shielded swaps: reading a half's terms, offer
+// `@odatano/nightgate-tx/txbuilder`, shielded swaps: reading a half's terms, offer
 // files, the swap wallet against a fake wallet SDK, recipients, sync modes.
 // The live path is covered by the swap probes against a running server.
 
@@ -34,6 +34,8 @@ vi.mock('../../src/txbuilder/api-provider.mjs', async (importOriginal) => ({
 }));
 
 const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
+const importInternals = () => import('../../src/txbuilder/internals.mjs' as string);
+const importSwap = () => import('../../src/txbuilder/swap.mjs' as string);
 
 /** A stand-in for a ledger transaction that is one half of a swap. */
 function half(deltas: Array<[string, bigint]>, over: Record<string, unknown> = {}, top: Record<string, unknown> = {}): any {
@@ -121,7 +123,8 @@ describe('offer files in the builder', () => {
 
 describe('revertBuilt', () => {
     it("decodes an offer file, base64 or bytes, bound or not, and hands the transaction to the facade's revert", async () => {
-        const { revertBuilt, encodeOffer } = await importTxBuilder();
+        const { revertBuilt } = await importInternals();
+        const { encodeOffer } = await importTxBuilder();
         const bound = half([[A, 10n], [B, -3n]]);
         const unbound = half([[A, 10n], [B, -3n]]);
         const boundBytes = registered(bound, 4, 'binding');
@@ -138,7 +141,7 @@ describe('revertBuilt', () => {
     });
 
     it('refuses input that is no transaction before touching the wallets', async () => {
-        const { revertBuilt } = await importTxBuilder();
+        const { revertBuilt } = await importInternals();
         const facade = { revertTransaction: vi.fn(async () => {}) };
         await expect(revertBuilt(facade, 'not base64!')).rejects.toThrow(/neither an offer file nor base64/);
         await expect(revertBuilt(facade, Buffer.from('junk').toString('base64'))).rejects.toThrow(/not a proven transaction/);
@@ -418,7 +421,7 @@ describe('createSwapWallet', () => {
 describe('coin selection within the input cap', () => {
     const coinsOf = (values: number[]) => values.map(v => ({ type: A, value: BigInt(v) }));
     const run = async (values: number[], need: number, slots = 4) => {
-        const { chooseSwapCoin } = await importTxBuilder();
+        const { chooseSwapCoin } = await importSwap();
         const plan = { remaining: BigInt(need), slots };
         let pool = [...coinsOf(values), { type: B, value: 1000n }];
         const picked: number[] = [];
@@ -448,7 +451,7 @@ describe('coin selection within the input cap', () => {
     });
 
     it('spendableWithin sums the largest coins of one type', async () => {
-        const { spendableWithin, SWAP_MAX_INPUTS } = await importTxBuilder();
+        const { spendableWithin, SWAP_MAX_INPUTS } = await importSwap();
         expect(SWAP_MAX_INPUTS).toBe(4);
         expect(spendableWithin([...coinsOf([1, 2, 3, 4, 5, 6]), { type: B, value: 99n }], A)).toBe(18n);
         expect(spendableWithin(coinsOf([1, 2, 3]), A, 2)).toBe(5n);
@@ -458,7 +461,7 @@ describe('coin selection within the input cap', () => {
 
 describe('recipients and sync modes', () => {
     it('recipientKeyMap maps coin public keys to encryption public keys', async () => {
-        const { recipientKeyMap } = await importTxBuilder();
+        const { recipientKeyMap } = await importInternals();
         const map = recipientKeyMap([{ coinPublicKey: 'C1'.repeat(32), encryptionPublicKey: 'e1'.repeat(32) }]);
         expect(Array.from(map.entries())).toEqual([['c1'.repeat(32), 'e1'.repeat(32)]]);
         expect(recipientKeyMap(undefined)).toBeUndefined();
@@ -469,7 +472,7 @@ describe('recipients and sync modes', () => {
     });
 
     it('walletSyncMode: true and absent sync everything, false nothing, shielded the coins', async () => {
-        const { walletSyncMode } = await importTxBuilder();
+        const { walletSyncMode } = await importInternals();
         expect([undefined, true, false, 'shielded'].map(walletSyncMode)).toEqual(['all', 'all', 'none', 'shielded']);
         expect(() => walletSyncMode('dust')).toThrow(/walletSync must be true, false, 'shielded' or 'coins'/);
     });

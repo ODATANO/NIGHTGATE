@@ -3,15 +3,14 @@
 import cds from '@sap/cds';
 import { type NightgateNetwork, VALID_NIGHTGATE_NETWORKS } from '../../utils/nightgate-config';
 import { startJob } from '../background-jobs';
-import { vaultRef, UINT64_MAX, vaultDims, parsePredicate, coerceMask, liveProviderConfigured } from '../verify-state';
+import { vaultRef, UINT64_MAX, vaultDims, parsePredicate, coerceMask, liveProviderConfigured, type ClaimPredicate } from '../verify-state';
 import { blake2b256Hex, PureCircuitsUnavailableError } from '../document-proof';
 import { membershipPathFor, SET_DEPTH } from '../set-root';
 import { PredicateAttestations, type PredicateAttestation } from '#cds-models/midnight';
-import { startJobWithRows, readUnsignedArg, VALUE_EXCEEDS, THRESHOLD_EXCEEDS, parseValidUntil, resolveClaimValidUntil, SchemaSlotWire, OpeningWire, parseInclusionPath, inclusionPathOrThrow, type InclusionPath, validateSchemaSlots, validateOpening, isVacuousMask, INT64_MAX, parseDocPairInputs, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, runSubmission, landedOnChain } from './common';
+import { startJobWithRows, readUnsignedArg, VALUE_EXCEEDS, parseValidUntil, resolveClaimValidUntil, SchemaSlotWire, OpeningWire, parseInclusionPath, inclusionPathOrThrow, type InclusionPath, validateSchemaSlots, validateOpening, isVacuousMask, parseDocPairInputs, facadeConfigFromEnv, recordedNetworkId, artifactDigestOrNull, rejectIfMainnetBlocked, runSubmission, landedOnChain } from './common';
 import type { SubmissionContext } from './context';
 import { HEX64_ANY_CASE_RE } from '../../utils/hex-patterns';
-import { issueDocumentDiffAttestation, issueDocumentIntegrityAttestation, issueFieldEqualityAttestation, issueFieldMembershipAttestation, issueFieldPredicateAttestation, issueFieldPredicateAttestationBatch, verifyPredicateAttestation, type IssuedClaim } from '#cds-models/NightgateService';
-import { int64Value } from '../../utils/numbers';
+import { proveDocumentDiff, proveDocumentIntegrity, proveFieldEquality, proveFieldMembership, proveFieldPredicate, proveClaims, verifyPredicateAttestation, type IssuedClaim } from '#cds-models/NightgateService';
 import { checkRateClass } from '../../utils/rate-classes';
 
 const { INSERT, SELECT } = cds.ql;
@@ -19,7 +18,7 @@ const { INSERT, SELECT } = cds.ql;
 export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'db' | 'walletFactory' | 'contractResolver' | 'pureCircuitsLoader' | 'verifyPredicateViaState' | 'resolveAttester' | 'resolveSponsorForRequest'>): void {
     const { srv, db, walletFactory, contractResolver, pureCircuitsLoader, verifyPredicateViaState, resolveAttester, resolveSponsorForRequest } = ctx;
 
-    srv.on(issueFieldPredicateAttestation, async (req) => {
+    srv.on(proveFieldPredicate, async (req) => {
         const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
@@ -33,16 +32,16 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             return req.reject(400, 'fieldSalt is required (v4 salted leaves; prepareDocumentProof returns it per field)');
         }
 
-        const thresholdBig = readUnsignedArg(data.threshold, 'threshold', INT64_MAX, THRESHOLD_EXCEEDS);
+        const thresholdBig = readUnsignedArg(data.threshold, 'threshold', UINT64_MAX, VALUE_EXCEEDS);
         if (typeof thresholdBig === 'string') return req.reject(400, thresholdBig);
 
         const parsedPredicate = parsePredicate(data.predicate);
         if (!parsedPredicate || parsedPredicate.kind !== 'numeric') {
-            return req.reject(400, "predicate must be 'lessOrEqual' or 'greaterOrEqual' (use issueFieldEqualityAttestation / issueFieldMembershipAttestation for the bytes kinds)");
+            return req.reject(400, "predicate must be 'lessOrEqual' or 'greaterOrEqual' (use proveFieldEquality / proveFieldMembership for the bytes kinds)");
         }
         const op = parsedPredicate.opCode!;
 
-        const { depth } = vaultDims(data.compiledArtifactRef);
+        const { depth } = vaultDims(data.contractName);
         const path = parseInclusionPath(req, data.siblings, data.dirs, depth, { siblings: 'siblings', dirs: 'dirs' });
         if (!path) return;
         const { siblings, dirs: dirsBool } = path;
@@ -54,7 +53,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         const contractAddress = data.contractAddress;
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
 
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRateClass('prove', data.sessionId, req)) return;
@@ -70,15 +69,17 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             contractAddress,
             predicate: parsedPredicate.predicate,
             op,
-            threshold: data.threshold,
+            threshold: thresholdBig.toString(),
             unit: data.unit ?? null,
             // The verify functions need it to look up the claim on-chain.
             fieldKey: data.fieldKey.toLowerCase(),
             network: recordedNetworkId(),
-            compiledArtifactRef: compiledRef,
+            contractName: compiledRef,
             artifactDigest: artifactDigestOrNull(compiledRef),
             provenTxHash: null,
             provenAt: null,
+            userId: req.user?.id ?? null,
+            sessionId: data.sessionId,
             createdAt: insertedAt,
             modifiedAt: insertedAt
         });
@@ -90,7 +91,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
             const job = await startJobWithRows(db, PredicateAttestations, [predicateAttestationId], insertRows, () => startJob({
-                kind: 'issueFieldPredicateAttestation',
+                kind: 'proveFieldPredicate',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
@@ -99,15 +100,16 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress,
                     predicate: data.predicate,
-                    threshold: String(data.threshold),
+                    threshold: thresholdBig.toString(),
                     predicateAttestationId,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 idempotencyPayload: {
                     payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
                     contractAddress: data.contractAddress, predicate: data.predicate,
-                    threshold: String(data.threshold), value: data.value, fieldSalt: data.fieldSalt,
+                    threshold: thresholdBig.toString(), unit: data.unit ?? null, value: data.value, fieldSalt: data.fieldSalt,
                     contentRoot: data.contentRoot, schemaId: data.schemaId, siblings, dirs: dirsBool,
+                    validUntil: validUntilArg ?? null,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: req.user?.id,
@@ -117,7 +119,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 command: {
                     op: 'fieldPredicateWorkflow', predicateAttestationId, validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
-                    contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
+                    contractAddress: data.contractAddress!, contractName: compiledRef,
                     predicate: data.predicate!, threshold: thresholdBig.toString(), opCode: op,
                     unit: data.unit, value: valueBig.toString(), salt: data.fieldSalt!.toLowerCase(),
                     siblings: siblings.map(s => s.toLowerCase()),
@@ -131,7 +133,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on(issueFieldEqualityAttestation, async (req) => {
+    srv.on(proveFieldEquality, async (req) => {
         const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
@@ -149,7 +151,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             return req.reject(400, 'fieldSalt is required (v4 salted leaves; prepareDocumentProof returns it per field)');
         }
 
-        const path = parseInclusionPath(req, data.siblings, data.dirs, vaultDims(data.compiledArtifactRef).depth, { siblings: 'siblings', dirs: 'dirs' });
+        const path = parseInclusionPath(req, data.siblings, data.dirs, vaultDims(data.contractName).depth, { siblings: 'siblings', dirs: 'dirs' });
         if (!path) return;
         if (data.contentRoot && !data.schemaId) {
             return req.reject(400, 'schemaId is required when contentRoot is supplied (anchorContentRoot anchors both)');
@@ -157,7 +159,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
 
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRateClass('prove', data.sessionId, req)) return;
@@ -179,10 +181,12 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             fieldKey: data.fieldKey.toLowerCase(),
             expectedDigest,
             network: recordedNetworkId(),
-            compiledArtifactRef: compiledRef,
+            contractName: compiledRef,
             artifactDigest: artifactDigestOrNull(compiledRef),
             provenTxHash: null,
             provenAt: null,
+            userId: req.user?.id ?? null,
+            sessionId: data.sessionId,
             createdAt: insertedAt,
             modifiedAt: insertedAt
         });
@@ -194,7 +198,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
             const job = await startJobWithRows(db, PredicateAttestations, [predicateAttestationId], insertRows, () => startJob({
-                kind: 'issueFieldEqualityAttestation',
+                kind: 'proveFieldEquality',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
@@ -213,6 +217,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     expectedDigest, fieldSalt: data.fieldSalt,
                     contentRoot: data.contentRoot, schemaId: data.schemaId,
                     siblings: path.siblings, dirs: path.dirs,
+                    validUntil: validUntilArg ?? null,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: req.user?.id,
@@ -222,7 +227,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 command: {
                     op: 'fieldEqualityWorkflow', predicateAttestationId, validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
-                    contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
+                    contractAddress: data.contractAddress!, contractName: compiledRef,
                     expectedDigest, salt: data.fieldSalt!.toLowerCase(), siblings: path.siblings, dirs: path.dirs,
                     contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
                     sponsorSessionId: sponsor?.sponsorSessionId
@@ -234,7 +239,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on(issueFieldMembershipAttestation, async (req) => {
+    srv.on(proveFieldMembership, async (req) => {
         const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
@@ -260,7 +265,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             return req.reject(400, 'allowedValues or setRoot + setSiblings + setDirs is required');
         }
 
-        const path = parseInclusionPath(req, data.siblings, data.dirs, vaultDims(data.compiledArtifactRef).depth, { siblings: 'siblings', dirs: 'dirs' });
+        const path = parseInclusionPath(req, data.siblings, data.dirs, vaultDims(data.contractName).depth, { siblings: 'siblings', dirs: 'dirs' });
         if (!path) return;
         if (data.contentRoot && !data.schemaId) {
             return req.reject(400, 'schemaId is required when contentRoot is supplied (anchorContentRoot anchors both)');
@@ -268,7 +273,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
 
         // Build the set before the rate limit check, so a value missing from the list costs no budget.
         let setRoot: string;
@@ -328,10 +333,12 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             fieldKey: data.fieldKey.toLowerCase(),
             setRoot,
             network: recordedNetworkId(),
-            compiledArtifactRef: compiledRef,
+            contractName: compiledRef,
             artifactDigest: artifactDigestOrNull(compiledRef),
             provenTxHash: null,
             provenAt: null,
+            userId: req.user?.id ?? null,
+            sessionId: data.sessionId,
             createdAt: insertedAt,
             modifiedAt: insertedAt
         });
@@ -343,7 +350,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
             const job = await startJobWithRows(db, PredicateAttestations, [predicateAttestationId], insertRows, () => startJob({
-                kind: 'issueFieldMembershipAttestation',
+                kind: 'proveFieldMembership',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
@@ -362,6 +369,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     setRoot, valueDigest, fieldSalt: data.fieldSalt,
                     contentRoot: data.contentRoot, schemaId: data.schemaId,
                     siblings: path.siblings, dirs: path.dirs,
+                    validUntil: validUntilArg ?? null,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: req.user?.id,
@@ -371,7 +379,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 command: {
                     op: 'fieldMembershipWorkflow', predicateAttestationId, validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHash: data.payloadHash!.toLowerCase(), attesterId, fieldKey: data.fieldKey!.toLowerCase(),
-                    contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
+                    contractAddress: data.contractAddress!, contractName: compiledRef,
                     setRoot, valueDigest, salt: data.fieldSalt!.toLowerCase(),
                     siblings: path.siblings, dirs: path.dirs,
                     setSiblings, setDirs,
@@ -385,7 +393,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on(issueDocumentIntegrityAttestation, async (req) => {
+    srv.on(proveDocumentIntegrity, async (req) => {
         const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
@@ -396,7 +404,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (data.payloadHashA.toLowerCase() === data.payloadHashB.toLowerCase()) {
             return req.reject(400, 'payloadHashA and payloadHashB must differ (a document is trivially unchanged against itself)');
         }
-        const { width: intWidth, maxMask } = vaultDims(data.compiledArtifactRef);
+        const { width: intWidth, maxMask } = vaultDims(data.contractName);
         if (data.allowedMask === undefined || data.allowedMask === null) return req.reject(400, 'allowedMask is required');
         const allowedMask = coerceMask(data.allowedMask);
         if (allowedMask === null || allowedMask < 0 || allowedMask > maxMask) {
@@ -416,7 +424,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
 
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRateClass('prove', data.sessionId, req)) return;
@@ -444,10 +452,12 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             attesterIdB,
             allowedMask,
             network: recordedNetworkId(),
-            compiledArtifactRef: compiledRef,
+            contractName: compiledRef,
             artifactDigest: artifactDigestOrNull(compiledRef),
             provenTxHash: null,
             provenAt: null,
+            userId: req.user?.id ?? null,
+            sessionId: data.sessionId,
             createdAt: insertedAt,
             modifiedAt: insertedAt
         });
@@ -459,7 +469,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
             const job = await startJobWithRows(db, PredicateAttestations, [predicateAttestationId], insertRows, () => startJob({
-                kind: 'issueDocumentIntegrityAttestation',
+                kind: 'proveDocumentIntegrity',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
@@ -480,6 +490,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     contentRootA: data.contentRootA?.toLowerCase() ?? null,
                     contentRootB: data.contentRootB?.toLowerCase() ?? null,
                     schemaId: data.schemaId?.toLowerCase() ?? null,
+                    validUntil: validUntilArg ?? null,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: req.user?.id,
@@ -489,7 +500,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 command: {
                     op: 'documentIntegrityWorkflow', predicateAttestationId, validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(), attesterIdA, attesterIdB,
-                    contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
+                    contractAddress: data.contractAddress!, contractName: compiledRef,
                     allowedMask,
                     schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
                     contentRootA: data.contentRootA?.toLowerCase(),
@@ -504,7 +515,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on(issueDocumentDiffAttestation, async (req) => {
+    srv.on(proveDocumentDiff, async (req) => {
         const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
@@ -515,7 +526,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (data.payloadHashA.toLowerCase() === data.payloadHashB.toLowerCase()) {
             return req.reject(400, 'payloadHashA and payloadHashB must differ (a document has no differences against itself)');
         }
-        const { width: diffWidth } = vaultDims(data.compiledArtifactRef);
+        const { width: diffWidth } = vaultDims(data.contractName);
         if (data.k === undefined || data.k === null) return req.reject(400, 'k is required');
         if (!Number.isInteger(data.k) || data.k < 1 || data.k > diffWidth) {
             return req.reject(400, `k must be an integer in 1..${diffWidth} (minimum differing slots)`);
@@ -528,12 +539,11 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
 
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRateClass('prove', data.sessionId, req)) return;
 
-        // k is stored in the threshold column.
         const attesterIdA = await resolveAttester(req, data.sessionId, data.attesterIdA, Boolean(data.contentRootA));
         if (!attesterIdA) return;
         const attesterIdB = await resolveAttester(req, data.sessionId, data.attesterIdB ?? attesterIdA, Boolean(data.contentRootB));
@@ -547,7 +557,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             contractAddress: data.contractAddress,
             predicate: 'documentDiff',
             op: null,
-            threshold: data.k,
+            threshold: null,
+            k: data.k,
             unit: null,
             fieldKey: null,
             expectedDigest: null,
@@ -556,10 +567,12 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             attesterIdB,
             allowedMask: null,
             network: recordedNetworkId(),
-            compiledArtifactRef: compiledRef,
+            contractName: compiledRef,
             artifactDigest: artifactDigestOrNull(compiledRef),
             provenTxHash: null,
             provenAt: null,
+            userId: req.user?.id ?? null,
+            sessionId: data.sessionId,
             createdAt: insertedAt,
             modifiedAt: insertedAt
         });
@@ -571,7 +584,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             const sponsor = await resolveSponsorForRequest(req, data.sponsorSessionId);
 
             const job = await startJobWithRows(db, PredicateAttestations, [predicateAttestationId], insertRows, () => startJob({
-                kind: 'issueDocumentDiffAttestation',
+                kind: 'proveDocumentDiff',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
@@ -592,6 +605,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     contentRootA: data.contentRootA?.toLowerCase() ?? null,
                     contentRootB: data.contentRootB?.toLowerCase() ?? null,
                     schemaId: data.schemaId?.toLowerCase() ?? null,
+                    validUntil: validUntilArg ?? null,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: req.user?.id,
@@ -601,7 +615,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 command: {
                     op: 'documentDiffWorkflow', predicateAttestationId, validUntil: resolveClaimValidUntil(validUntilArg),
                     payloadHashA: data.payloadHashA!.toLowerCase(), payloadHashB: data.payloadHashB!.toLowerCase(), attesterIdA, attesterIdB,
-                    contractAddress: data.contractAddress!, compiledArtifactRef: compiledRef,
+                    contractAddress: data.contractAddress!, contractName: compiledRef,
                     k: data.k!,
                     schema: docPair.schema, openingA: docPair.openingA, openingB: docPair.openingB,
                     contentRootA: data.contentRootA?.toLowerCase(),
@@ -616,7 +630,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         });
     });
 
-    srv.on(issueFieldPredicateAttestationBatch, async (req) => {
+    srv.on(proveClaims, async (req) => {
         const data = req.data;
 
         const { validUntil: validUntilArg, error: validUntilError } = parseValidUntil(data.validUntil);
@@ -637,7 +651,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         // Document comparisons have no fieldKey or path. Document A is the batch payloadHash.
         interface BatchClaim {
             fieldKey?: string; siblings?: string[]; dirs?: boolean[];
-            predicate: string; unit?: string;
+            predicate: ClaimPredicate; unit?: string;
             value?: string; threshold?: string; opCode?: number;
             expectedDigest?: string;
             setRoot?: string; valueDigest?: string; setSiblings?: string[]; setDirs?: boolean[];
@@ -648,7 +662,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         }
         const parsePath = (sibs: unknown, ds: unknown, i: number, depth: number, sibName: string, dirName: string): InclusionPath =>
             inclusionPathOrThrow(sibs, ds, depth, { siblings: `claims[${i}].${sibName}`, dirs: `claims[${i}].${dirName}` });
-        const { width: batchWidth, depth: batchDepth, maxMask: batchMaxMask } = vaultDims(data.compiledArtifactRef);
+        const { width: batchWidth, depth: batchDepth, maxMask: batchMaxMask } = vaultDims(data.contractName);
         let claims: BatchClaim[];
         try {
             const v = data.claims;
@@ -714,7 +728,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     salt: entry.salt.toLowerCase(),
                     siblings: contentPath.siblings,
                     dirs: contentPath.dirs,
-                    predicate: entry.predicate as string,
+                    predicate: parsed.predicate,
                     unit: typeof entry.unit === 'string' && entry.unit.length > 0 ? entry.unit : undefined
                 };
 
@@ -754,7 +768,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
                 const valueBig = readUnsignedArg(entry.value, `claims[${i}].value`, UINT64_MAX, VALUE_EXCEEDS);
                 if (typeof valueBig === 'string') throw new Error(valueBig);
-                const thresholdBig = readUnsignedArg(entry.threshold, `claims[${i}].threshold`, INT64_MAX, THRESHOLD_EXCEEDS);
+                const thresholdBig = readUnsignedArg(entry.threshold, `claims[${i}].threshold`, UINT64_MAX, VALUE_EXCEEDS);
                 if (typeof thresholdBig === 'string') throw new Error(thresholdBig);
                 return { ...base, value: valueBig.toString(), threshold: thresholdBig.toString(), opCode: parsed.opCode! };
             });
@@ -762,7 +776,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             return req.reject(400, e instanceof Error && /^claims\[/.test(e.message) ? e.message : 'claims entries must match the predicate\'s inputs');
         }
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
 
         // Build the sets first. Duplicate removal needs the set root, and a value
         // missing from the list must not count against the rate limit.
@@ -827,7 +841,8 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             contractAddress,
             predicate: c.predicate,
             op: c.opCode ?? null,
-            threshold: int64Value(c.predicate === 'documentDiff' ? c.k : c.threshold),
+            threshold: c.threshold ?? null,
+            k: c.predicate === 'documentDiff' ? c.k ?? null : null,
             unit: c.unit ?? null,
             fieldKey: c.fieldKey ?? null,
             expectedDigest: c.expectedDigest ?? null,
@@ -836,10 +851,12 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             attesterIdB: c.attesterIdB ?? null,
             allowedMask: c.allowedMask ?? null,
             network: recordedNetworkId(),
-            compiledArtifactRef: compiledRef,
+            contractName: compiledRef,
             artifactDigest: artifactDigestOrNull(compiledRef),
             provenTxHash: null,
             provenAt: null,
+            userId: req.user?.id ?? null,
+            sessionId: data.sessionId,
             createdAt: insertedAt,
             modifiedAt: insertedAt
         })));
@@ -856,7 +873,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 const numeric = !['bytesEquality', 'setMembership', 'documentIntegrity', 'documentDiff'].includes(c.predicate);
                 return {
                     predicateAttestationId: c.predicateAttestationId, fieldKey: c.fieldKey ?? null, predicate: c.predicate,
-                    threshold: numeric ? int64Value(c.threshold) : null, unit: numeric ? c.unit ?? null : null,
+                    threshold: numeric ? c.threshold ?? null : null, unit: numeric ? c.unit ?? null : null,
                     expectedDigest: is('bytesEquality') ? c.expectedDigest ?? null : null,
                     setRoot: is('setMembership') ? c.setRoot ?? null : null,
                     payloadHashB: is('documentIntegrity') || is('documentDiff') ? c.payloadHashB ?? null : null,
@@ -865,7 +882,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 };
             });
             const job = await startJobWithRows(db, PredicateAttestations, rowedClaims.map(c => c.predicateAttestationId), insertRows, () => startJob({
-                kind: 'issueFieldPredicateAttestationBatch',
+                kind: 'proveClaims',
                 sessionId: data.sessionId!,
                 idempotencyKey: data.idempotencyKey,
                 request: {
@@ -881,14 +898,16 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     attesterId,
                     contractAddress: data.contractAddress,
                     contentRoot: data.contentRoot?.toLowerCase() ?? null,
+                    schemaId: data.schemaId?.toLowerCase() ?? null,
                     claims: uniqueClaims.map(c => ({
-                        fieldKey: c.fieldKey, predicate: c.predicate, threshold: c.threshold,
+                        fieldKey: c.fieldKey, predicate: c.predicate, threshold: c.threshold, unit: c.unit ?? null,
                         value: c.value, expectedDigest: c.expectedDigest,
                         setRoot: c.setRoot, valueDigest: c.valueDigest,
                         salt: c.salt, siblings: c.siblings, dirs: c.dirs,
                         payloadHashB: c.payloadHashB, attesterIdB: c.attesterIdB === attesterId ? undefined : c.attesterIdB, allowedMask: c.allowedMask, k: c.k,
                         schema: c.schema, openingA: c.openingA, openingB: c.openingB
                     })),
+                    validUntil: validUntilArg ?? null,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: req.user?.id,
@@ -900,7 +919,7 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                     payloadHash: data.payloadHash!.toLowerCase(),
                     attesterId,
                     contractAddress: data.contractAddress!,
-                    compiledArtifactRef: compiledRef,
+                    contractName: compiledRef,
                     contentRoot: data.contentRoot?.toLowerCase(), schemaId: data.schemaId?.toLowerCase(),
                     claims: rowedClaims.map(c => ({
                         predicateAttestationId: c.predicateAttestationId,
@@ -957,19 +976,28 @@ export function registerPredicateActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             current = await verifyPredicateViaState(row);
         }
 
+        // A field the predicate does not use is null, never 0 or empty text: both would read as a claim.
+        const kind = parsePredicate(row.predicate)?.kind;
+        const twoDocuments = kind === 'integrity' || kind === 'diff';
         return {
             verified: stateChecked && current,
             included,
             stateChecked,
-            predicate: row.predicate ?? '',
-            threshold: row.threshold ?? 0,
-            unit: row.unit ?? '',
-            expectedDigest: row.expectedDigest ?? '',
-            setRoot: row.setRoot ?? '',
-            payloadHashB: row.payloadHashB ?? '',
+            contractAddress: row.contractAddress ?? null,
+            attesterId: row.attesterId ?? null,
+            payloadHash: row.payloadHash ?? null,
+            fieldKey: row.fieldKey ?? null,
+            predicate: row.predicate ?? null,
+            threshold: kind === 'numeric' ? row.threshold ?? null : null,
+            unit: kind === 'numeric' ? row.unit ?? null : null,
+            expectedDigest: kind === 'equality' ? row.expectedDigest ?? null : null,
+            setRoot: kind === 'membership' ? row.setRoot ?? null : null,
+            attesterIdB: twoDocuments ? row.attesterIdB ?? null : null,
+            payloadHashB: twoDocuments ? row.payloadHashB ?? null : null,
             // Some database drivers return Integer64 columns as strings.
-            allowedMask: row.allowedMask === null || row.allowedMask === undefined ? null : coerceMask(row.allowedMask),
-            provenTxHash: row.provenTxHash ?? '',
+            allowedMask: kind === 'integrity' && row.allowedMask !== null && row.allowedMask !== undefined ? coerceMask(row.allowedMask) : null,
+            k: kind === 'diff' ? row.k ?? null : null,
+            provenTxHash: row.provenTxHash ?? null,
             provenAt: row.provenAt ?? null
         };
     });

@@ -9,17 +9,19 @@
 
 import {
     DEFAULT_NETWORK,
-    DEFAULT_PRIVATE_STATE_BACKEND,
     getConfiguredNightgateNetwork,
     getConfiguredNightgateNodeUrl,
     getConfiguredNightgateCrawlerNodeUrl,
-    getConfiguredPrivateStateBackend,
     isNightgateConfigured,
     isSelfServiceGranteeRegistrationAllowed,
+    mainnetSubmissionBlockReason,
     normalizeNightgateNetwork,
     resolveNightgateRuntimeConfig,
     resolveOverrideIndexerEndpoints,
-    warnIfCrawlerlessChainConfirmSet,
+    warnIfRetiredSettingsSet,
+    RETIRED_SETTINGS,
+    VALID_NIGHTGATE_NETWORKS,
+    warnIfFormerConfigKeys,
     isCloseSessionsOnRestartEnabled,
     resolveSubmissionEndpoints,
     resolveEffectiveProvingMode,
@@ -28,18 +30,20 @@ import {
     DEFAULT_INDEXER_URLS,
     missingEndpointsMessage
 } from '../../srv/utils/nightgate-config';
+import { CONFIG_TABLE } from '../../srv/utils/config-table';
 
 const ENV_KEYS = [
     'NIGHTGATE_NETWORK',
     'NIGHTGATE_NODE_URL',
     'NIGHTGATE_CRAWLER_NODE_URL',
     'NIGHTGATE_PRIVATE_STATE_BACKEND',
-    'NIGHTGATE_FETCH_CONCURRENCY',
-    'NIGHTGATE_RPC_BATCH_SIZE',
+    'NIGHTGATE_CRAWLER_FETCH_CONCURRENCY',
+    'NIGHTGATE_CRAWLER_RPC_BATCH_SIZE',
     'NIGHTGATE_CRAWLER_SUPPLEMENT_MAX_BPS',
     'NIGHTGATE_CRAWLER_INDEXER_URL',
     'NIGHTGATE_CRAWLER_ENABLED',
     'NIGHTGATE_ALLOW_SELF_SERVICE_GRANTEE_REGISTRATION',
+    'NIGHTGATE_ALLOW_MAINNET_SUBMISSION',
     'NIGHTGATE_CLOSE_SESSIONS_ON_RESTART',
     // Submission endpoints: a developer .env for live runs (or the IDE test
     // extension propagating it) would otherwise win over the config-based
@@ -68,7 +72,7 @@ afterAll(() => {
 describe('normalizeNightgateNetwork', () => {
     it('passes valid networks through unchanged', () => {
         expect(normalizeNightgateNetwork('preprod')).toEqual({ network: 'preprod' });
-        expect(normalizeNightgateNetwork('testnet')).toEqual({ network: 'testnet' });
+        expect(normalizeNightgateNetwork('stagenet')).toEqual({ network: 'stagenet' });
         expect(normalizeNightgateNetwork('undeployed')).toEqual({ network: 'undeployed' });
     });
 
@@ -76,6 +80,9 @@ describe('normalizeNightgateNetwork', () => {
         const result = normalizeNightgateNetwork('martian-net');
         expect(result.network).toBe(DEFAULT_NETWORK);
         expect(result.invalidNetwork).toBe('martian-net');
+        // A name of the SDK that the server has no network for is invalid too.
+        expect(normalizeNightgateNetwork('testnet')).toEqual({ network: DEFAULT_NETWORK, invalidNetwork: 'testnet' });
+        expect(VALID_NIGHTGATE_NETWORKS).toEqual(['preview', 'preprod', 'mainnet', 'stagenet', 'undeployed']);
     });
 
     it('returns DEFAULT_NETWORK with no invalidNetwork for undefined input', () => {
@@ -92,16 +99,8 @@ describe('isNightgateConfigured', () => {
         expect(isNightgateConfigured(undefined)).toBe(false);
     });
 
-    it('ignores the legacy kind marker: kind alone (no network) is NOT configured', () => {
-        expect(isNightgateConfigured({ kind: 'nightgate' })).toBe(false);
-    });
-
-    it('accepts configs that still carry the legacy kind marker alongside a network', () => {
-        expect(isNightgateConfigured({ kind: 'nightgate', network: 'preprod' })).toBe(true);
-    });
-
     it('returns true when a network is set without the kind marker', () => {
-        expect(isNightgateConfigured({ network: 'testnet' })).toBe(true);
+        expect(isNightgateConfigured({ network: 'undeployed' })).toBe(true);
     });
 
     it('returns false for a bare empty object', () => {
@@ -134,26 +133,6 @@ describe('getConfigured* helpers', () => {
     });
 });
 
-describe('getConfiguredPrivateStateBackend', () => {
-    it('returns the default when nothing is configured', () => {
-        expect(getConfiguredPrivateStateBackend()).toBe(DEFAULT_PRIVATE_STATE_BACKEND);
-    });
-
-    it('honours valid env-var values', () => {
-        process.env.NIGHTGATE_PRIVATE_STATE_BACKEND = 'level';
-        expect(getConfiguredPrivateStateBackend()).toBe('level');
-    });
-
-    it('honours valid config values', () => {
-        expect(getConfiguredPrivateStateBackend({ privateStateBackend: 'cap-db' })).toBe('cap-db');
-    });
-
-    it('rejects unknown values and returns the default', () => {
-        process.env.NIGHTGATE_PRIVATE_STATE_BACKEND = 'sqlite-of-the-damned';
-        expect(getConfiguredPrivateStateBackend()).toBe(DEFAULT_PRIVATE_STATE_BACKEND);
-    });
-});
-
 describe('isSelfServiceGranteeRegistrationAllowed', () => {
     it('defaults to DISABLED (secure default)', () => {
         expect(isSelfServiceGranteeRegistrationAllowed()).toBe(false);
@@ -178,6 +157,21 @@ describe('isSelfServiceGranteeRegistrationAllowed', () => {
     });
 });
 
+describe('mainnetSubmissionBlockReason', () => {
+    it('refuses mainnet until the operator turns submission on, by config or environment', () => {
+        expect(mainnetSubmissionBlockReason({ network: 'mainnet' })).toMatch(/real NIGHT and DUST.*NIGHTGATE_ALLOW_MAINNET_SUBMISSION=true/);
+        expect(mainnetSubmissionBlockReason({ network: 'mainnet', allowMainnetSubmission: true })).toBeNull();
+        process.env.NIGHTGATE_ALLOW_MAINNET_SUBMISSION = 'true';
+        expect(mainnetSubmissionBlockReason({ network: 'mainnet' })).toBeNull();
+        process.env.NIGHTGATE_ALLOW_MAINNET_SUBMISSION = 'false';
+        expect(mainnetSubmissionBlockReason({ network: 'mainnet', allowMainnetSubmission: true })).not.toBeNull();
+    });
+
+    it('never blocks another network', () => {
+        expect(mainnetSubmissionBlockReason({ network: 'preprod' })).toBeNull();
+    });
+});
+
 describe('isCloseSessionsOnRestartEnabled', () => {
     it('defaults ON: leaked handles from a dead process are the common case', () => {
         expect(isCloseSessionsOnRestartEnabled()).toBe(true);
@@ -198,29 +192,55 @@ describe('isCloseSessionsOnRestartEnabled', () => {
     });
 });
 
-describe('warnIfCrawlerlessChainConfirmSet', () => {
-    it('is silent when the removed option is not set', () => {
+describe('warnIfRetiredSettingsSet', () => {
+    const RETIRED = ['NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_ALLOW_PRODUCTION_SQLITE', 'NIGHTGATE_BATCH_SEGMENT_MODE', 'NIGHTGATE_PRIVATE_STATE_BACKEND', 'NIGHTGATE_ZK_CONFIG_BASE', 'NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES', 'NIGHTGATE_ASSUME_DB_NETWORK'];
+    afterEach(() => { for (const name of RETIRED) delete process.env[name]; });
+
+    it('is silent without a retired variable and names each that is still set, whatever its value', () => {
         const warn = vi.fn();
-        delete process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM;
-        expect(warnIfCrawlerlessChainConfirmSet({}, warn)).toBe(false);
+        for (const name of RETIRED) delete process.env[name];
+        expect(warnIfRetiredSettingsSet({}, warn)).toBe(0);
         expect(warn).not.toHaveBeenCalled();
+        for (const value of ['true', 'false']) {
+            process.env.NIGHTGATE_SPONSOR_ALLOW_DEPLOY = value;
+            expect(warnIfRetiredSettingsSet(undefined, warn)).toBe(1);
+        }
+        expect(warn).toHaveBeenCalledTimes(2);
+        expect(warn.mock.calls[0][0]).toMatch(/^NIGHTGATE_SPONSOR_ALLOW_DEPLOY is no longer a setting of the server: a grant with allowDeploy/);
+        process.env.NIGHTGATE_ALLOW_PRODUCTION_SQLITE = 'true';
+        process.env.NIGHTGATE_BATCH_SEGMENT_MODE = 'observe';
+        process.env.NIGHTGATE_PRIVATE_STATE_BACKEND = 'level';
+        process.env.NIGHTGATE_ZK_CONFIG_BASE = './contracts';
+        process.env.NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES = 'true';
+        process.env.NIGHTGATE_ASSUME_DB_NETWORK = 'preprod';
+        warn.mockClear();
+        expect(warnIfRetiredSettingsSet({}, warn)).toBe(7);
+        expect(warn.mock.calls.map(c => String(c[0]).split(' ')[0])).toEqual(RETIRED);
     });
 
-    it('reports a leftover config or env value once and ignores it (the confirmer always runs)', () => {
-        const warn = vi.fn();
-        expect(warnIfCrawlerlessChainConfirmSet({ crawlerlessChainConfirm: false }, warn)).toBe(true);
-        process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM = 'false';
-        expect(warnIfCrawlerlessChainConfirmSet({}, warn)).toBe(true);
-        delete process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM;
-        expect(warn).toHaveBeenCalledTimes(2);
-        expect(warn.mock.calls[0][0]).toMatch(/no longer an option/);
+    it('names a retired setting that is still in the CDS configuration, under the key it had', () => {
+        const warned: string[] = [];
+        const config = { privateStateBackend: 'level', zkConfigBasePath: './contracts', allowProductionSqlite: false, batchSegmentMode: 'observe' };
+        expect(warnIfRetiredSettingsSet(config as never, m => warned.push(m))).toBe(4);
+        expect(warned.map(m => m.split(' ')[0])).toEqual([
+            'cds.requires.nightgate.allowProductionSqlite', 'cds.requires.nightgate.batchSegmentMode',
+            'cds.requires.nightgate.privateStateBackend', 'cds.requires.nightgate.zkConfigBasePath'
+        ]);
+        expect(warned[2]).toBe('cds.requires.nightgate.privateStateBackend is no longer a setting: private contract state is stored encrypted in the database; remove it');
+        // The camel case of the variable is not the key the path setting had.
+        expect(warnIfRetiredSettingsSet({ zkConfigBase: './x' } as never, m => warned.push(m))).toBe(0);
+    });
+
+    it('no retired variable is a setting of the table any more', () => {
+        expect(Object.keys(RETIRED_SETTINGS)).toEqual(RETIRED);
+        expect(CONFIG_TABLE.filter(spec => RETIRED.includes(spec.key) || RETIRED.includes(spec.formerKey ?? ''))).toEqual([]);
     });
 });
 
 describe('resolveNightgateRuntimeConfig', () => {
-    it('parses NIGHTGATE_FETCH_CONCURRENCY / RPC_BATCH_SIZE env vars when present and positive', () => {
-        process.env.NIGHTGATE_FETCH_CONCURRENCY = '7';
-        process.env.NIGHTGATE_RPC_BATCH_SIZE = '42';
+    it('parses NIGHTGATE_CRAWLER_FETCH_CONCURRENCY / RPC_BATCH_SIZE env vars when present and positive', () => {
+        process.env.NIGHTGATE_CRAWLER_FETCH_CONCURRENCY = '7';
+        process.env.NIGHTGATE_CRAWLER_RPC_BATCH_SIZE = '42';
         const { crawlerConfig } = resolveNightgateRuntimeConfig({ network: 'preprod' });
         expect(crawlerConfig.fetchConcurrency).toBe(7);
         expect(crawlerConfig.rpcBatchSize).toBe(42);
@@ -257,8 +277,8 @@ describe('resolveNightgateRuntimeConfig', () => {
     });
 
     it('ignores non-numeric / non-positive env tuning values', () => {
-        process.env.NIGHTGATE_FETCH_CONCURRENCY = 'banana';
-        process.env.NIGHTGATE_RPC_BATCH_SIZE = '0';
+        process.env.NIGHTGATE_CRAWLER_FETCH_CONCURRENCY = 'banana';
+        process.env.NIGHTGATE_CRAWLER_RPC_BATCH_SIZE = '0';
         const { crawlerConfig } = resolveNightgateRuntimeConfig({
             network: 'preprod',
             crawler: { fetchConcurrency: 3, rpcBatchSize: 25 }
@@ -391,12 +411,12 @@ describe('resolveSubmissionEndpoints indexer ws derivation', () => {
         expect(missingEndpointsMessage('preprod', 'wss://node', '')).toMatch(/^network "preprod".*NIGHTGATE_INDEXER_HTTP_URL/);
         expect(missingEndpointsMessage('preprod', 'wss://node', '')).not.toMatch(/NIGHTGATE_NODE_URL/);
         expect(missingEndpointsMessage('preprod', 'wss://node', 'https://idx/graphql')).toBeNull();
-        for (const network of ['preview', 'testnet', 'undeployed'] as const) {
+        for (const network of ['preview', 'undeployed'] as const) {
             expect(missingEndpointsMessage(network, resolveNightgateRuntimeConfig({ network }).nodeUrl, resolveSubmissionEndpoints(network, {}).indexerHttpUrl)).toBeNull();
         }
         // a local network names no hosted service
-        expect(missingEndpointsMessage('testnet', '', 'http://localhost:8088/api/v4/graphql')).toMatch(/^network "testnet" has no built-in node: set NIGHTGATE_NODE_URL.*See docs\/self-hosted\.md\.$/);
-        expect(missingEndpointsMessage('testnet', '', '')).not.toMatch(/hosted ones/);
+        expect(missingEndpointsMessage('undeployed', '', 'http://localhost:8088/api/v4/graphql')).toMatch(/^network "undeployed" has no built-in node: set NIGHTGATE_NODE_URL.*See docs\/self-hosted\.md\.$/);
+        expect(missingEndpointsMessage('undeployed', '', '')).not.toMatch(/hosted ones/);
     });
 
     it('keeps a wss:// indexer URL encrypted when deriving the WebSocket URL', () => {
@@ -410,6 +430,33 @@ describe('resolveOverrideIndexerEndpoints (cross-network verify indexer endpoint
         const eps = resolveOverrideIndexerEndpoints('preview', {});
         expect(eps.indexerHttpUrl).toBe(DEFAULT_INDEXER_URLS.preview!.http);
         expect(eps.indexerWsUrl).toBe(DEFAULT_INDEXER_URLS.preview!.ws);
+    });
+
+    it('warns once for each setting written under a key the server does not read', () => {
+        const warned: string[] = [];
+        const count = warnIfFormerConfigKeys({ crawlerEnabled: false, feeSponsorSession: 's1', crawler: { enabled: true } } as never, m => warned.push(m));
+        expect(count).toBe(2);
+        expect(warned).toEqual([
+            'cds.requires.nightgate.crawlerEnabled is not read; the setting is crawler.enabled',
+            'cds.requires.nightgate.feeSponsorSession is not read; the setting is feeSponsorSessions'
+        ]);
+        expect(warnIfFormerConfigKeys({ crawler: { enabled: false } }, m => warned.push(m))).toBe(0);
+        expect(warned).toHaveLength(2);
+    });
+
+    it('warns for a variable and a CDS key under their former name, which are not read', () => {
+        const warned: string[] = [];
+        const saved = process.env.NIGHTGATE_SPONSOR_WAIT;
+        process.env.NIGHTGATE_SPONSOR_WAIT = 'finalized';
+        try {
+            expect(warnIfFormerConfigKeys({ sponsorSwapMaxInputs: 3 } as never, m => warned.push(m))).toBe(2);
+        } finally {
+            if (saved === undefined) delete process.env.NIGHTGATE_SPONSOR_WAIT; else process.env.NIGHTGATE_SPONSOR_WAIT = saved;
+        }
+        expect(warned).toEqual([
+            'cds.requires.nightgate.sponsorSwapMaxInputs is not read; the setting is sponsorMaxInputs',
+            'NIGHTGATE_SPONSOR_WAIT is not read; the setting is NIGHTGATE_SUBMIT_WAIT'
+        ]);
     });
 
     it('prefers cds.requires.nightgate.networks[<network>] over defaults', () => {

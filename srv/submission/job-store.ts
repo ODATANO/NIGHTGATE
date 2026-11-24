@@ -4,11 +4,14 @@ import { withLockContentionRetry, LOCK_CONTENTION_ATTEMPTS } from './db-write-re
 import cds from '@sap/cds';
 import crypto from 'crypto';
 import { AsyncResource } from 'async_hooks';
-import { BackgroundJobs, type BackgroundJob } from '#cds-models/midnight';
+import { BackgroundJobs, TransactionIdentifiers, PredicateAttestations, DisclosureGrants, type BackgroundJob, type PredicateAttestation } from '#cds-models/midnight';
 import { type SubmissionErrorClassification } from './TransactionSubmitter';
 import { configString, configMs } from '../utils/config';
 import { affectedRows, type DbRunner } from '../utils/db-types';
-import { NightgateError, errorMessage } from '../utils/errors';
+import { NightgateError, errorMessage, isNodeRejectCode, isTableErrorCode, type JobErrorCode } from '../utils/errors';
+import { parseJsonStringList } from '../utils/json-list';
+import { RENAMED_JOB_KINDS, currentActionName } from './job-kinds';
+import { storedCommand } from './job-registry';
 
 const { SELECT, UPDATE } = cds.ql;
 
@@ -22,7 +25,8 @@ export function safeStringify(value: unknown): string {
 
 export interface ReconciliationEvidence {
     submissionId: string | null;
-    txHash: string;
+    txId: string | null;
+    txHash: string | null;
     contractAddress: string | null;
     finalizedAt: string | null;
     blockHeight: number;
@@ -42,9 +46,19 @@ export function runWithoutAmbientTx<T>(fn: () => Promise<T>): Promise<T> {
     return detachedJobScope.runInAsyncScope(fn);
 }
 
-/** Where-clause of a job's attempt row: by its id when recorded, else by the transaction hash. */
-export function attemptRowOf(ref: { submissionId?: string | null; txHash?: string | null }): Record<string, unknown> {
-    return ref.submissionId ? { ID: ref.submissionId } : { txHash: ref.txHash };
+/** A job's stored result as an object, null when it has none. A stored value that is no object comes back as `{ raw }` with its text. */
+export function jobResultObject(stored: string | null | undefined): Record<string, unknown> | null {
+    if (!stored) return null;
+    try {
+        const parsed: unknown = JSON.parse(stored);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    } catch { /* returned as text below */ }
+    return { raw: stored };
+}
+
+/** Where-clause of a job's attempt row: by its id when recorded, else by the transaction's identifier. */
+export function attemptRowOf(ref: { submissionId?: string | null; txId?: string | null }): Record<string, unknown> {
+    return ref.submissionId ? { ID: ref.submissionId } : { txId: ref.txId };
 }
 
 /** Why a workflow fails with its child: the child's error and the steps already on chain. */
@@ -71,10 +85,10 @@ export async function hasCompletedChild(parentJobId: string): Promise<boolean> {
         const db = await cds.connect.to('db');
         if (!db) return true;
         const children = await db.run(
-            SELECT.from(BackgroundJobs).columns('status', 'txHash').where({ parentJobId })
-        ) as Array<{ status?: string; txHash?: string | null }>;
+            SELECT.from(BackgroundJobs).columns('status', 'txId', 'txHash').where({ parentJobId })
+        ) as Array<{ status?: string; txId?: string | null; txHash?: string | null }>;
         if (!Array.isArray(children)) return true;
-        return children.some(c => c.status === 'succeeded' || c.status === 'reconciliation_required' || !!c.txHash);
+        return children.some(c => c.status === 'succeeded' || c.status === 'reconciliation_required' || !!c.txId || !!c.txHash);
     } catch (err) {
         // When unsure, assume a step ran. Otherwise a retry could pay for a step that is already on chain.
         cds.log('nightgate').warn(
@@ -137,6 +151,166 @@ export async function dropPendingJobsForClosedSessions(sessionIds: string[]): Pr
         }
     });
     return dropped;
+}
+
+/** The row ids a proof or grant job names in its request or its command. */
+interface OwnedRowRequest {
+    predicateAttestationId?: string;
+    claims?: Array<{ predicateAttestationId?: string } | null>;
+    disclosureGrantId?: string;
+}
+
+const OWNED_ROW_SOURCES = [
+    {
+        entity: PredicateAttestations,
+        kinds: ['proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership',
+            'proveDocumentIntegrity', 'proveDocumentDiff', 'proveClaims'],
+        rowIds: (r: OwnedRowRequest) => [r.predicateAttestationId, ...(r.claims ?? []).map(c => c?.predicateAttestationId)]
+    },
+    { entity: DisclosureGrants, kinds: ['grantDisclosure'], rowIds: (r: OwnedRowRequest) => [r.disclosureGrantId] }
+] as const;
+
+// A job is stored right after its rows, so a job much newer than the newest row without an owner cannot name one.
+const OWNER_BACKFILL_SLACK_MS = 60 * 60 * 1000;
+
+/** Rows without an owner get the user and session of the job that wrote them. Returns how many rows it filled. */
+export async function backfillRowOwners(db: DbRunner): Promise<number> {
+    let filled = 0;
+    for (const source of OWNED_ROW_SOURCES) {
+        const unowned: Array<{ ID: string; createdAt?: string | null; modifiedAt?: string | null }> =
+            (await db.run(SELECT.from(source.entity).columns('ID', 'createdAt', 'modifiedAt').where({ userId: null }))) ?? [];
+        if (unowned.length === 0) continue;
+        const open = new Map(unowned.map(r => [r.ID, r.modifiedAt ?? null]));
+        const newestMs = unowned.reduce((max, r) => Math.max(max, Date.parse(r.createdAt ?? '') || 0), 0);
+        const jobsOf = SELECT.from(BackgroundJobs).columns('ID', 'requestedBy', 'sessionId', 'request', 'command', 'commandEncoding')
+            .where({ kind: { in: [...source.kinds] }, requestedBy: { '!=': null } });
+        if (newestMs > 0) jobsOf.and({ createdAt: { '<=': new Date(newestMs + OWNER_BACKFILL_SLACK_MS).toISOString() } });
+        const jobs: BackgroundJob[] = (await db.run(jobsOf)) ?? [];
+        for (const job of jobs) {
+            // A single proof names its row only in the command.
+            const named = new Set<unknown>();
+            for (const read of [() => JSON.parse(job.request ?? ''), () => (job.command ? storedCommand(job) : null)]) {
+                let fields: OwnedRowRequest | null = null;
+                try { fields = read(); } catch { /* unreadable: nothing to take from it */ }
+                for (const id of source.rowIds(fields ?? {})) named.add(id);
+            }
+            for (const id of named) {
+                if (typeof id !== 'string' || !open.has(id)) continue;
+                // The row keeps its change time: writing the owner is no change a reader should see.
+                const set = { userId: job.requestedBy, sessionId: job.sessionId, modifiedAt: open.get(id) };
+                open.delete(id);
+                filled += affectedRows(await db.run(UPDATE.entity(source.entity).set(set).where({ ID: id, userId: null })));
+            }
+        }
+    }
+    return filled;
+}
+
+/** A document diff of an older version kept its `k` in `threshold`. Moves it to `k`. Returns the rows changed. */
+export async function moveStoredDiffCounts(db: DbRunner): Promise<number> {
+    const rows: Array<Pick<PredicateAttestation, 'ID' | 'threshold'>> = (await db.run(
+        SELECT.from(PredicateAttestations).columns('ID', 'threshold').where({ predicate: 'documentDiff', threshold: { '!=': null } })
+    )) ?? [];
+    let moved = 0;
+    for (const row of rows) {
+        const set = { k: Number(row.threshold), threshold: null, modifiedAt: UNCHANGED_AT };
+        moved += affectedRows(await db.run(UPDATE.entity(PredicateAttestations).set(set).where({ ID: row.ID, predicate: 'documentDiff' })));
+    }
+    return moved;
+}
+
+// A ledger hash has 64 hex characters. A ledger identifier has 66 and starts with 00.
+const HASH_SHAPED = '_'.repeat(64);
+const ID_SHAPED = `00${'_'.repeat(64)}`;
+const UNCHANGED_AT = { xpr: [{ ref: ['modifiedAt'] }] };
+
+/** Tables that record the ledger hash of the transaction that settled a row. Named by entity, because the column differs per table. */
+const EVIDENCE_COLUMNS = [
+    ['midnight.Documents', 'anchoredTxHash'], ['midnight.PredicateAttestations', 'provenTxHash'],
+    ['midnight.DisclosureGrants', 'grantedTxHash'], ['midnight.DisclosureGrants', 'revokedTxHash'], ['midnight.SwapOffers', 'filledTxHash'],
+    ['midnight.LearnedTokenTypes', 'txHash']
+] as const;
+
+/** Sorts what an older version stored under one name: a ledger hash kept as the identifier moves to `txHash`,
+ *  and an identifier kept as a row's evidence becomes the ledger hash where a job or the index knows it. Returns the rows changed. */
+export async function sortStoredTxValues(db: DbRunner): Promise<number> {
+    let changed = 0;
+    const hashFirst = { xpr: [{ func: 'coalesce', args: [{ ref: ['txHash'] }, { ref: ['txId'] }] }] };
+    for (const entity of ['midnight.BackgroundJobs', 'midnight.PendingSubmissions']) {
+        changed += affectedRows(await db.run(
+            UPDATE.entity(entity).set({ txHash: hashFirst, txId: null, modifiedAt: UNCHANGED_AT }).where({ txId: { like: HASH_SHAPED } })
+        ));
+    }
+    for (const [entity, column] of EVIDENCE_COLUMNS) {
+        const rows: Array<Record<string, string | null>> = (await db.run(SELECT.distinct.from(entity).columns(column).where({ [column]: { like: ID_SHAPED } }))) ?? [];
+        const ids = rows.map(r => r[column]).filter((v): v is string => !!v);
+        for (let i = 0; i < ids.length; i += 200) {
+            const chunk = ids.slice(i, i + 200);
+            const hashOf = new Map<string, string>();
+            const indexed: Array<{ txId: string; txHash: string | null }> = (await db.run(
+                SELECT.from(TransactionIdentifiers).columns('txId', 'transaction.txHash as txHash').where({ txId: { in: chunk } })
+            )) ?? [];
+            const jobs: Array<Pick<BackgroundJob, 'txId' | 'txHash'>> = (await db.run(
+                SELECT.from(BackgroundJobs).columns('txId', 'txHash').where({ txId: { in: chunk }, txHash: { '!=': null } })
+            )) ?? [];
+            for (const known of [...indexed, ...jobs]) if (known.txId && known.txHash) hashOf.set(known.txId, known.txHash);
+            for (const [txId, txHash] of hashOf) {
+                changed += affectedRows(await db.run(UPDATE.entity(entity).set({ [column]: txHash, modifiedAt: UNCHANGED_AT }).where({ [column]: txId })));
+            }
+        }
+    }
+    return changed;
+}
+
+/** The job codes of an older version and what each is called now. */
+export const RENAMED_JOB_CODES: Readonly<Record<string, JobErrorCode>> = {
+    TxFailed: 'TX_FAILED', NetworkOrTimeout: 'NETWORK_OR_TIMEOUT', SubmitAmbiguous: 'SUBMIT_AMBIGUOUS', PoolInvalid: 'POOL_INVALID',
+    SubmitIntentRejected: 'SUBMIT_INTENT_REJECTED', SubmitIntentTimeout: 'SUBMIT_INTENT_TIMEOUT', SponsorPolicyRefused: 'SPONSOR_REFUSED',
+    BatchCausalityViolation: 'BATCH_CAUSALITY_VIOLATION', BatchGasBudgetExceeded: 'BATCH_GAS_BUDGET_EXCEEDED', MalformedResult: 'MALFORMED_RESULT',
+    WalletSigningNotAvailable: 'WALLET_SIGNING_NOT_AVAILABLE', UnknownError: 'UNKNOWN_ERROR', ContractTypeError: 'CONTRACT_CONFIG_INVALID',
+    IncompleteCallTxPrivateStateConfig: 'CONTRACT_CONFIG_INVALID', IncompleteFindContractPrivateStateConfig: 'CONTRACT_CONFIG_INVALID'
+};
+
+/** Gives stored jobs and attempts the current error codes. A code outside the table becomes UNKNOWN_ERROR
+ *  and moves to the front of the message. Returns the rows changed. */
+export async function renameStoredErrorCodes(db: DbRunner): Promise<number> {
+    let changed = 0;
+    for (const entity of ['midnight.BackgroundJobs', 'midnight.PendingSubmissions']) {
+        const stored: Array<{ errorCode?: string | null }> = (await db.run(SELECT.distinct.from(entity).columns('errorCode').where({ errorCode: { '!=': null } }))) ?? [];
+        for (const { errorCode: code } of stored) {
+            if (!code || isTableErrorCode(code) || isNodeRejectCode(code)) continue;
+            const renamed = RENAMED_JOB_CODES[code] ?? (code.startsWith('OnChainStatus:') ? 'TX_FAILED' : null);
+            const named = { xpr: [{ val: `${code}: ` }, '||', { func: 'coalesce', args: [{ ref: ['errorMessage'] }, { val: '' }] }] };
+            const set = renamed ? { errorCode: renamed, modifiedAt: UNCHANGED_AT } : { errorCode: 'UNKNOWN_ERROR', errorMessage: named, modifiedAt: UNCHANGED_AT };
+            changed += affectedRows(await db.run(UPDATE.entity(entity).set(set).where({ errorCode: code })));
+        }
+    }
+    return changed;
+}
+
+/** Brings stored jobs and grants to the current action names. A job of the former kind `retract` takes the name of the action its mode says. Returns the rows changed. */
+export async function renameStoredActions(db: DbRunner): Promise<number> {
+    let changed = 0;
+    for (const [from, to] of Object.entries(RENAMED_JOB_KINDS)) {
+        changed += affectedRows(await db.run(UPDATE.entity('midnight.BackgroundJobs').set({ kind: to, modifiedAt: UNCHANGED_AT }).where({ kind: from })));
+    }
+    const retracts: Array<Pick<BackgroundJob, 'ID' | 'request'>> = (await db.run(SELECT.from(BackgroundJobs).columns('ID', 'request').where({ kind: 'retract' }))) ?? [];
+    for (const job of retracts) {
+        let mode: unknown = 0;
+        try { mode = (JSON.parse(job.request ?? '') as { mode?: unknown } | null)?.mode; } catch { /* the default is the common action */ }
+        const kind = Number(mode) === 1 ? 'purgeExpired' : 'retractAttestation';
+        changed += affectedRows(await db.run(UPDATE.entity('midnight.BackgroundJobs').set({ kind, modifiedAt: UNCHANGED_AT }).where({ ID: job.ID, kind: 'retract' })));
+    }
+    const grants: Array<{ ID: string; allowedActions?: string | null }> = (await db.run(SELECT.from('midnight.AgentGrants').columns('ID', 'allowedActions'))) ?? [];
+    for (const grant of grants) {
+        const actions = parseJsonStringList(grant.allowedActions);
+        const current = [...new Set(actions.map(currentActionName))];
+        if (current.join('\n') === actions.join('\n')) continue;
+        changed += affectedRows(await db.run(
+            UPDATE.entity('midnight.AgentGrants').set({ allowedActions: JSON.stringify(current), modifiedAt: UNCHANGED_AT }).where({ ID: grant.ID })
+        ));
+    }
+    return changed;
 }
 
 export async function findLatestJob(kind: string, sessionId: string): Promise<{ ID: string; status: string } | null> {
@@ -207,8 +381,6 @@ export class IdempotencyKeyInvalidError extends NightgateError {
     constructor() {
         super('IDEMPOTENCY_KEY_INVALID', `idempotencyKey must be at most ${IDEMPOTENCY_KEY_MAX_LENGTH} characters`);
     }
-    /** @deprecated use `status`. */
-    get httpStatus(): number { return this.status; }
 }
 
 /** The job that holds an idempotency key. */
@@ -226,8 +398,6 @@ export class IdempotencyConflictError extends NightgateError {
         super('IDEMPOTENCY_KEY_CONFLICT', `Idempotency key '${idempotencyKey}' was already used with a different request payload.`);
         if (job) this['@nightgate.job'] = job;
     }
-    /** @deprecated use `status`. */
-    get httpStatus(): number { return this.status; }
 }
 
 /** The database was too busy to accept the job. Nothing was written, the caller may resend (503). */
@@ -237,8 +407,6 @@ export class JobAdmissionBusyError extends NightgateError {
     constructor(kind: string) {
         super('JOB_ADMISSION_BUSY', `the server is busy writing another job and could not admit this ${kind} request; nothing was submitted, retry in a moment`, { exposeMessage: true });
     }
-    /** @deprecated use `status`. */
-    get httpStatus(): number { return this.status; }
 }
 
 export { isUniqueViolation } from '../utils/db-errors';
@@ -323,7 +491,7 @@ export async function markFailed(jobId: string, classification: SubmissionErrorC
     }
 }
 
-export async function markReconciliationRequired(jobId: string, classification: { code: string; message: string }): Promise<void> {
+export async function markReconciliationRequired(jobId: string, classification: Pick<SubmissionErrorClassification, 'code' | 'message'>): Promise<void> {
     const db = await cds.connect.to('db');
     try {
         await withLockContentionRetry(`markReconciliationRequired(${jobId})`, async () => {
@@ -417,12 +585,12 @@ export async function markJobExternalExecution(jobId: string, submission: { subm
 }
 
 /**
- * Marks the job submitted with its tx hash, inside the caller's transaction. `firstBoundary` means the job comes from `running`. A rebuild updates a job already past it.
+ * Marks the job submitted with its identifier and hash, inside the caller's transaction. `firstBoundary` means the job comes from `running`. A rebuild updates a job already past it.
  */
 export async function markJobBroadcastOn(
     runner: { run: (q: unknown) => Promise<unknown> },
     jobId: string,
-    submission: { submissionId?: string; txHash?: string; firstBoundary?: boolean }
+    submission: { submissionId?: string; txId?: string; txHash?: string; firstBoundary?: boolean }
 ): Promise<void> {
     const now = new Date().toISOString();
     const first = submission.firstBoundary !== false;
@@ -431,6 +599,7 @@ export async function markJobBroadcastOn(
             .set({
                 status: 'submitted',
                 submissionId: submission.submissionId ?? null,
+                txId: submission.txId ?? null,
                 txHash: submission.txHash ?? null,
                 chainStatus: 'pending',
                 ...(first ? { externalExecutionAt: now } : {}),
@@ -446,30 +615,32 @@ export async function markJobBroadcastOn(
     throw new Error(`Lease lost before markJobBroadcastOn(${jobId})${first ? '' : ' (rebuild attempt)'}`);
 }
 
-/** Removes a rejected tx hash from the job, inside the caller's transaction. Matches only if lease and hash are unchanged. */
+/** Removes a rejected transaction from the job, inside the caller's transaction. Matches only if lease and identifier are unchanged. */
 export async function markJobSubmissionRejectedOn(
     runner: { run: (q: unknown) => Promise<unknown> },
     jobId: string,
-    submission: { submissionId?: string; txHash?: string }
+    submission: { submissionId?: string; txId?: string }
 ): Promise<void> {
     const affected = await runner.run(
         UPDATE.entity(BackgroundJobs)
             .set({
                 status: 'external_execution',
+                txId: null,
                 txHash: null,
                 chainStatus: null,
                 submissionId: submission.submissionId ?? null,
                 heartbeatAt: new Date().toISOString(),
                 leaseExpiresAt: leaseExpiry()
             })
-            .where({ ID: jobId, status: { in: ['external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId(), ...(submission.txHash ? { txHash: submission.txHash } : {}) })
+            .where({ ID: jobId, status: { in: ['external_execution', 'submitted'] }, leaseOwner: getRuntimeWorkerId(), ...(submission.txId ? { txId: submission.txId } : {}) })
     );
     if (affectedRows(affected) === 1) return;
-    throw new Error(`Lease lost (or hash already moved) before markJobSubmissionRejectedOn(${jobId})`);
+    throw new Error(`Lease lost (or identifier already moved) before markJobSubmissionRejectedOn(${jobId})`);
 }
 
 
-export async function markJobSubmitted(jobId: string, submission: { submissionId?: string; txHash?: string }): Promise<void> {
+/** Marks the job submitted. The identifier and the hash stay as announced unless the submission names them. */
+export async function markJobSubmitted(jobId: string, submission: { submissionId?: string; txId?: string; txHash?: string }): Promise<void> {
     const db = await cds.connect.to('db');
     const affected = await withLockContentionRetry(`markJobSubmitted(${jobId})`, async () => {
         return db.run(
@@ -477,7 +648,8 @@ export async function markJobSubmitted(jobId: string, submission: { submissionId
                 .set({
                     status: 'submitted',
                     submissionId: submission.submissionId ?? null,
-                    txHash: submission.txHash ?? null,
+                    ...(submission.txId ? { txId: submission.txId } : {}),
+                    ...(submission.txHash ? { txHash: submission.txHash } : {}),
                     chainStatus: 'pending',
                     submittedAt: new Date().toISOString(),
                     heartbeatAt: new Date().toISOString(),

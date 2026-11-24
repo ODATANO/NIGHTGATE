@@ -2,7 +2,7 @@
 // Decoding the state runs in wasm, so this module does not import `@sap/cds` and runs in the decode worker.
 import { hexToBytes } from '../utils/hex';
 import { importArtifact } from './artifact-import';
-import { buildPublicDataProvider, queryLedger9ContractState, type IndexerEndpoints } from '../midnight/public-data-provider';
+import { buildPublicDataProvider, queryLedger9ContractState, queryLedger9ContractStateAtTip, type IndexerEndpoints } from '../midnight/public-data-provider';
 import { computeRecordKey, refusedByRuntime, type ContractArtifact } from './predicate-state';
 import type { ContractProvidersConfig } from '../midnight/providers';
 
@@ -91,13 +91,15 @@ export interface ReadDisclosureLevelArgs {
     /** Build of the artifact to load. Without it the module at `artifactPath` is imported as is. */
     artifactDigest?: string;
     contractProvidersConfig: ContractProvidersConfig;
+    /** The indexer's newest block, to read the state at. Without it the latest state is read. */
+    tipHeight?: number;
 }
 
 /** The level one grantee holds on an attester's record. Null without a grant, without contract state and for a contract that is no vault. */
 export async function readDisclosureLevelForContract(args: ReadDisclosureLevelArgs): Promise<number | null> {
     const publicData = await buildPublicDataProvider(args.contractProvidersConfig);
     const artifact = await importArtifact(args.artifactPath, args.artifactDigest) as ContractArtifact<Partial<Pick<DisclosureLedger, 'disclosures'>>>;
-    const state = await queryLedger9ContractState(publicData, args.contractAddress.toLowerCase());
+    const state = await queryLedger9ContractStateAtTip(publicData, args.contractAddress.toLowerCase(), args.tipHeight);
     if (!state) return null;
     const recordKey = await computeRecordKey(args.attesterId, args.payloadHash);
     try {

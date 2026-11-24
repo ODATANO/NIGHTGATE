@@ -1,7 +1,7 @@
 // Applies an unproven batch to a local ledger before proving, the way the node will.
 // Only a gas failure stops the build. Any other failure, or a state that cannot be read, lets it go on.
 import { errorMessage } from './error-message.mjs';
-import { describeBatchSegments } from './batch-segment-order.mjs';
+import { describeBatchSegments, type BatchReport } from './batch-segment-order.mjs';
 import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
 import type { PublicDataProvider } from '@midnight-ntwrk/midnight-js-types';
 
@@ -9,7 +9,7 @@ const GAS_FAILURE = /out of gas|OutOfGas/;
 
 /** The message names the calls because the SDK may pass on only the message. */
 export class BatchGasBudgetError extends Error {
-    readonly code = 'BatchGasBudgetExceeded';
+    readonly code = 'BATCH_GAS_BUDGET_EXCEEDED';
     constructor(message: string) {
         super(message);
         this.name = 'BatchGasBudgetError';
@@ -19,7 +19,7 @@ export class BatchGasBudgetError extends Error {
 /** Throws a `BatchGasBudgetError` when a call of `tx` runs out of gas against the contract's current state. */
 export async function checkBatchGas(
     tx: LedgerV9.UnprovenTransaction, publicDataProvider: Partial<Pick<PublicDataProvider, 'queryZSwapAndContractState'>> | undefined,
-    networkId: string, contractAddress: string, circuits: string[]
+    networkId: string, contractAddress: string, circuits: string[], report?: (event: BatchReport) => void
 ): Promise<void> {
     let error: string | undefined;
     try {
@@ -48,14 +48,12 @@ export async function checkBatchGas(
         const [, result] = ledger.apply(verified, new L.TransactionContext(ledger, block));
         if (result.type !== 'success') error = String(result.error ?? result.type);
     } catch (e) {
-        // eslint-disable-next-line no-console -- shipped in the slim txbuilder, which has no logger
-        console.log(`[nightgate:batch-preflight] skipped for [${circuits.join('+')}]: ${errorMessage(e)}`);
+        report?.({ step: 'gas-check', outcome: 'skipped', detail: errorMessage(e) });
         return;
     }
     if (!error) return;
     if (!GAS_FAILURE.test(error)) {
-        // eslint-disable-next-line no-console -- shipped in the slim txbuilder, which has no logger
-        console.log(`[nightgate:batch-preflight] not a gas failure, going on for [${circuits.join('+')}]: ${error}`);
+        report?.({ step: 'gas-check', outcome: 'other-failure', detail: error });
         return;
     }
     throw new BatchGasBudgetError(

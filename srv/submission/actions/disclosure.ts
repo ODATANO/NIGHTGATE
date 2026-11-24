@@ -33,7 +33,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
 
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRateClass('prove', data.sessionId, req)) return;
@@ -56,7 +56,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
             // So the grantee never sees more than the chain has accepted.
             const insertedAt = new Date().toISOString();
             const existingGrant: DisclosureGrant | undefined = await db.run(
-                SELECT.one.from(DisclosureGrants).columns('ID', 'pendingLevel').where({
+                SELECT.one.from(DisclosureGrants).columns('ID', 'pendingLevel', 'userId').where({
                     contractAddress: contractAddressLc,
                     attesterId,
                     payloadHash: payloadHashLc,
@@ -64,9 +64,11 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
                 })
             );
             const disclosureGrantId = existingGrant?.ID ?? cds.utils.uuid();
+            const owner = { userId: req.user?.id ?? null, sessionId: data.sessionId };
             if (existingGrant) {
+                // A row read from the chain has no owner yet. The caller holds the attester key of this record, so the row is the caller's.
                 await db.run(UPDATE.entity(DisclosureGrants)
-                    .set({ pendingLevel: levelNum, modifiedAt: insertedAt })
+                    .set({ pendingLevel: levelNum, modifiedAt: insertedAt, ...(existingGrant.userId ? {} : owner) })
                     .where({ ID: disclosureGrantId }));
             } else {
                 await db.run(INSERT.into(DisclosureGrants).entries({
@@ -79,7 +81,8 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
                     contractAddress: contractAddressLc,
                     grantedTxHash: null,
                     revokedTxHash: null,
-                    active: false,
+                    isActive: false,
+                    ...owner,
                     createdAt: insertedAt,
                     modifiedAt: insertedAt
                 }));
@@ -107,7 +110,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
                     command: {
                         op: 'grantDisclosure', disclosureGrantId, payloadHash: payloadHashLc, attesterId,
                         grantee: granteeLc, level: levelNum, contractAddress: contractAddressLc,
-                        compiledArtifactRef: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
+                        contractName: compiledRef, sponsorSessionId: sponsor?.sponsorSessionId
                     }
                 });
             } catch (err) {
@@ -141,7 +144,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (!data.sessionId) return req.reject(400, 'sessionId is required');
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
 
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRateClass('prove', data.sessionId, req)) return;
@@ -174,7 +177,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
                 encryptCommand: true,
                 command: {
                     op: 'revokeDisclosure', payloadHash: payloadHashLc, attesterId, grantee: granteeLc,
-                    contractAddress: contractAddressLc, compiledArtifactRef: compiledRef,
+                    contractAddress: contractAddressLc, contractName: compiledRef,
                     sponsorSessionId: sponsor?.sponsorSessionId
                 }
             });
@@ -188,7 +191,7 @@ export function registerDisclosureActions(ctx: Pick<SubmissionContext, 'srv' | '
 
         if (!data.contractAddress) return req.reject(400, 'contractAddress is required');
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
         const contractAddressLc = data.contractAddress.toLowerCase();
 
         if (!checkRateClass('compute', contractAddressLc, req)) return;

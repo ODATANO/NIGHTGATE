@@ -13,16 +13,15 @@ Running, monitoring, upgrading and recovering NIGHTGATE. Configuration keys: [re
 | `npm run sync:start` | `connectWallet` and `connectWalletForSigning` against `localhost:4004`, keys from `.env` |
 | `npm run sync:probe` | Probes the local indexer on `localhost:8088` |
 | `npm run check:server` | Health, readiness and sponsor state of a running server. Optional URL argument, sponsor via `NIGHTGATE_SPONSOR_SESSION_ID` |
-| `npm run check:job-idempotency` | Reports duplicate job idempotency keys |
 | `node scripts/profile-workers.mjs [s]` | CPU profile of the main thread and every worker. Send `kill -USR1 <pid>` first |
 | `npm run build`, `typecheck`, `lint`, `test` | Build, checks and the Vitest suite |
 | `npm run check:release` | Release gate. `check:release:full` adds `integration:postgres` |
-| e2e lanes | `deploy:e2e`, `sponsored-deploy:e2e`, `wasm-proving:e2e`, `wasm-contract:e2e`, `wasm-zswap:e2e`, `width32:e2e`, `field-predicate-batch:e2e`, `membership:e2e`, `document-diff:e2e`, `anchor-batch:e2e`, `dust-wedge:e2e`, `agent-layer:e2e`, `disclosure:e2e`, `state-verify:e2e`, `txbuilder:e2e`, `burst-sponsor:e2e`, `mint-token:e2e`. Each script header names its env vars. Run them against `serve:sync`, never `dev` |
+| e2e lanes | `deploy:e2e`, `sponsored-deploy:e2e`, `wasm-proving:e2e`, `wasm-contract:e2e`, `wasm-zswap:e2e`, `width32:e2e`, `field-predicate-batch:e2e`, `membership:e2e`, `document-diff:e2e`, `anchor-batch:e2e`, `dust-wedge:e2e`, `agent-layer:e2e`, `disclosure:e2e`, `state-verify:e2e`, `txbuilder:e2e`, `burst-sponsor:e2e`, `mint-token:e2e`. Each script header names its env vars. Run them against `serve:sync`, never `dev`. `wasm-zswap:e2e` and `mint-token:e2e` mint the test token of `@odatano/contract-shielded-token`, which only the development profile registers |
 | integration lanes | `smoke:sdk`, `integration:providers`, `integration:wallet-keys`, `integration:wallet-facade`, `integration:contract-registry`, `integration:connector-routes`, `integration:schema-delta`, `integration:derive-wallet-info`, `integration:utxo-identity`, `integration:postgres` |
 
 `integration:postgres` starts a throwaway `postgres:16` container on port 15432 unless `NIGHTGATE_PG_URL` is set.
 
-Package binaries: `nightgate-schema-delta`, `nightgate-fetch-keys`, `nightgate-db-migrate`, `nightgate-rewrap-keys`, `nightgate-compact-contract-state`.
+Operator tools, run with `node` from the repository root, or in the image with the server stopped as `docker compose -f docker/docker-compose.yml run --rm --no-deps --entrypoint node nightgate scripts/<tool>.mjs`: `scripts/apply-schema-delta.mjs`, `scripts/fetch-contract-keys.mjs`, `scripts/migrate-sqlite-to-postgres.mjs`, `scripts/rewrap-encryption-keys.mjs`, `scripts/compact-contract-state.mjs`, `scripts/adopt-chain.mjs`.
 
 ## Environment
 
@@ -50,7 +49,8 @@ npm run sync:probe
 ```
 
 - It reads the node in `INDEXER_UPSTREAM_NODE_URL`. Empty means it refuses to start.
-- Set `INDEXER_SECRET` to 32 bytes of hex with at least one `a-f` character.
+- Set `INDEXER_SECRET` to 32 bytes of hex with at least one `a-f` character. Without it the indexer does not start. Keep it: stored data is read only with the same secret.
+- Node and indexer listen on `127.0.0.1`. `NODE_BIND_ADDRESS` and `INDEXER_BIND_ADDRESS` change that.
 - The compose limits are 8 CPUs and 8 GB. Catch-up is bound by node latency, not by resources.
 - A full mainnet sync takes days. Wait for `"caught_up":true` in `docker logs odatano-night-indexer`.
 - Switch NIGHTGATE over only after catch-up: `NIGHTGATE_INDEXER_HTTP_URL=http://localhost:8088/api/v4/graphql`. A half-synced indexer leaves silent gaps in wallet state.
@@ -63,7 +63,7 @@ npm run serve:sync
 npm run sync:start   # second terminal
 ```
 
-`connectWalletForSigning` schedules a prewarm job that syncs the wallet to the tip. Poll `getJobStatus(prewarmJobId, sessionId)` or `getWalletSyncProgress(sessionId)`. A cold sync from genesis takes hours. The worker saves state every `NIGHTGATE_SAVE_INTERVAL_MS` to `WalletSyncStates`, and a reconnect restores from it in seconds.
+`connectWalletForSigning` schedules a prewarm job that syncs the wallet to the tip. Poll `getJobStatus(jobId, sessionId)` with the `jobId` it answers, or `getWalletSyncProgress(sessionId)`. A cold sync from genesis takes hours. The worker saves state every `NIGHTGATE_SAVE_INTERVAL_MS` to `WalletSyncStates`, and a reconnect restores from it in seconds.
 
 ### Pre-synced wallet states
 
@@ -81,56 +81,78 @@ A saved state restores under the wallet SDK version that wrote it. The exception
 
 ## Prover keys
 
-Prover keys are in neither the npm tarballs nor git. Each `@odatano/contract-*` package ships verifier keys, zkir and `keys/manifest.json`. The first job that proves a circuit fetches the missing keys from the release assets in `contract.json#zkAssetUrl`, or from `NIGHTGATE_ZK_ASSET_URL`. Every key is checked against the manifest.
+Prover keys are in neither the contract packages nor git. Each `@odatano/contract-*` package ships verifier keys, zkir and `keys/manifest.json`. The first job that proves a circuit fetches the missing keys from the release assets in `contract.json#zkAssetUrl`, or from `NIGHTGATE_ZK_ASSET_URL`. Every key is checked against the manifest.
 
 Offline installs prefetch them once. The image does this at build time.
 
 ```bash
-npx nightgate-fetch-keys attestation-vault
-npx nightgate-fetch-keys @odatano/contract-attestation-vault-32
-npx nightgate-fetch-keys attestation-vault-32 --from https://<host>/zk-config/attestation-vault-32
+node scripts/fetch-contract-keys.mjs attestation-vault
+node scripts/fetch-contract-keys.mjs @odatano/contract-attestation-vault-32
+node scripts/fetch-contract-keys.mjs attestation-vault-32 --from https://<host>/zk-config/attestation-vault-32
 ```
 
 With `NIGHTGATE_ZK_ASSET_URL=none` nothing is fetched and a missing key fails the job with `PROVER_KEYS_UNAVAILABLE`.
 
 ## Schema upgrades
 
-A release that adds columns, tables or views needs the additive migration once, with the server stopped. Without it the startup check names the missing objects and NIGHTGATE stays offline.
+A release that adds or renames columns, changes a key, or adds tables or views needs the migration once, with the server stopped. Without it the startup check names the missing objects and NIGHTGATE stays offline.
 
 ```bash
-npx nightgate-schema-delta
-docker exec odatano-nightgate node scripts/apply-schema-delta.mjs   # in the image
+node scripts/apply-schema-delta.mjs   # in a clone
+docker compose -f docker/docker-compose.yml stop nightgate
+docker compose -f docker/docker-compose.yml run --rm --no-deps --entrypoint node nightgate scripts/apply-schema-delta.mjs
+docker compose -f docker/docker-compose.yml start nightgate
 ```
 
-The image runs `cds deploy` against PostgreSQL on every boot. Two changes need a manual step first, and the changelog names them:
+The image runs `cds deploy` against PostgreSQL on every boot. Before it, the image runs `scripts/apply-schema-delta.mjs --postgres`. That step gives the columns and keys of an older database their current names, turns a number column that became text into text and adds and fills the chain position columns, in the tables and in the model CAP stored in `cds_model`, in one transaction. It works on the schema `cds deploy` works on. An installation that deploys by other means runs it before its own deploy. Where a key moves or a column changes its type, the step drops the views of the model that read the table, and the deploy creates them again. A view of your own on such a table stops the step: drop the view, start again, then create it again.
+
+Two other changes need a manual step first, and the changelog names them:
 
 - A column that becomes `NOT NULL`: fix the rows that hold NULL in it.
 - A removed column: remove the element from the stored model in `cds_model.csn` before the first boot, then `ALTER TABLE ... DROP COLUMN`.
 
-On SQLite `nightgate-schema-delta` sets NULL rows of a `NOT NULL` column to the default and leaves a removed column in place.
+On SQLite `scripts/apply-schema-delta.mjs` sets NULL rows of a `NOT NULL` column to the default, builds a table again whose number column became text, fills the chain position columns it adds, and leaves a removed column in place.
 
-### Older databases
+### From 0.46
 
-- PostgreSQL binary columns written by older releases can hold base64 text: `ContractStates.state` and `zswapState`, `ContractActions.state` and `zswapState`, `Blocks.ledgerParameters`. Repair each column once: `UPDATE <table> SET <col> = decode(convert_from(<col>, 'UTF8'), 'base64') WHERE convert_from(substring(<col> from 1 for 12), 'UTF8') = 'bWlkbmlnaHQ6';`
-- Databases written before 0.46.0 hold block hashes, state roots, validators and extrinsic hashes with a `0x` prefix. The first start of 0.46.0 removes the prefix before the server listens, in one transaction. It drops the indexes the rewrite would change entry by entry and builds them again from their own definitions at the end: on PostgreSQL all indexes and constraints of `midnight_blocks` and `midnight_transactions`, on SQLite the index on `Transactions.hash`. A start that fails or is stopped leaves the database as it was, and the next start begins again. Before the upgrade:
-  - Take a backup. An older version cannot index on the rewritten database.
-  - Keep free disk space of about the size of the two tables. On PostgreSQL they grow by about half and keep that size: autovacuum frees the old row versions for new rows and does not return the space to the disk. The WAL comes on top.
-  - On PostgreSQL the database user must own both tables. They are locked until the commit, so a client that reads them directly waits for that time.
-  - `docker/watchdog.sh` restarts a container that does not listen after `NIGHTGATE_WATCHDOG_START_GRACE` seconds (default 900), and a restart discards the work. Set the grace above the duration for this start.
-  - Duration on a hosted PostgreSQL 16: 14 minutes for 3.5 million blocks and 11.3 million transactions (the transactions table 17 GB in all), 15 minutes for 3.5 million blocks and 13.0 million transactions (30 GB), 74 seconds for 195,000 blocks and 633,000 transactions. The index build is the larger part, 8 and 10 minutes of the two long runs. The rewrite raises `maintenance_work_mem` to 1 GB for its transaction unless the server sets a value itself. On SQLite 300,000 blocks with 450,000 transactions took 30 seconds on a developer machine.
-  - Afterwards on PostgreSQL, optional: the indexes built in that transaction also hold the old row versions and are about twice as large as needed. `REINDEX TABLE CONCURRENTLY midnight_transactions` and the same for `midnight_blocks` return that space while the server runs.
-- Contract states stored on every `ContractActions` row move into `ContractStates` with `npx nightgate-compact-contract-state --dry-run`, then without the flag. Server stopped, idempotent. Reclaim space with `VACUUM FULL midnight_contractactions` or `VACUUM` on SQLite.
+This version updates a database of 0.46.x. An older database is updated to 0.46.x first, or indexed again from an empty one.
+
+The start refuses a database that still holds rows in a format this version does not read, and names each with its fix:
+
+- Rows encrypted before the per-account data key, or without the bound `v3` envelope: run `nightgate-rewrap-keys` of 0.46.x until it reports no legacy rows, then update.
+- Contract states stored on every `ContractActions` row: `node scripts/compact-contract-state.mjs --dry-run`, then without the flag, with the server stopped. Reclaim the space with `VACUUM FULL midnight_contractactions`, or `VACUUM` on SQLite.
+- Contract addresses of `PrivateStates` and `ContractSigningKeys` with capital letters or `0x`: write them in lowercase without `0x` in both tables.
+- PostgreSQL binary columns that hold base64 text: `ContractStates.state` and `zswapState`, `ContractActions.state` and `zswapState`, `Blocks.ledgerParameters`. Repair each column once: `UPDATE <table> SET <col> = decode(convert_from(<col>, 'UTF8'), 'base64') WHERE substring(<col> from 1 for 12) = convert_to('bWlkbmlnaHQ6', 'UTF8');`
+
+The rows of 0.46 have no chain position. `scripts/apply-schema-delta.mjs` adds `blockHeight` and `indexInBlock` to `Transactions`, `ContractActions` and `UnshieldedUtxos` and fills them, on PostgreSQL in the step before the deploy and in one transaction. It writes every row of the three tables once. PostgreSQL drops all their indexes and constraints first and builds them again at the end, without the indexes on `createdAt`, which the position indexes replace. Before the update:
+
+- Take a backup.
+- Keep free disk space of about the size of the three tables. On PostgreSQL they grow by about half and keep that size. The WAL comes on top.
+- On PostgreSQL the database user must own the tables. They are locked until the commit.
+- The image's start runs the step itself, under `docker/watchdog.sh`. The watchdog restarts a container that does not listen after `NIGHTGATE_WATCHDOG_START_GRACE` seconds (default 900), and a restart discards the work. Run it as its own step with the server stopped instead, then start the server; its own run then finds nothing to do:
+
+  ```bash
+  docker compose -f docker/docker-compose.yml run --rm --no-deps --entrypoint node nightgate scripts/apply-schema-delta.mjs --postgres
+  ```
+
+  Without `--postgres` the tool looks for a SQLite file and stops without a change.
+- A row whose transaction or block is missing gets no position and stops the step with the table and the count. Remove such rows and run it again.
+- Duration on a copy of the preprod index (11.6 million transactions, PostgreSQL 16): 1,002 s, of which filling the positions took 489 s and the index build about 510 s. The three tables grew from 19.9 to 29.0 GB. A restored copy holds no dead rows, so a long-running database can grow more. Measure it on a copy of your own database.
+- Afterwards on PostgreSQL, optional: the indexes built in that transaction also hold the old row versions. `REINDEX TABLE CONCURRENTLY` on the three tables returns that space while the server runs.
+- Variables and `cds.requires.nightgate` keys under a former name are not read. The start names each one with its current name.
 
 ## Monitoring
 
-The probes of the indexer service need no credentials.
+The probes of the indexer service need no credentials. The metrics need a user with the admin role (`NIGHTGATE_HTTP_ROLES=admin` in the image).
 
 ```bash
 curl "http://localhost:4004/odata/v4/midnight-indexer/getLiveness()"
 curl -i "http://localhost:4004/odata/v4/midnight-indexer/getReadiness()"   # 503 names the failing check
 curl "http://localhost:4004/odata/v4/midnight-indexer/getHealth()"
-curl "http://localhost:4004/odata/v4/midnight-indexer/getMetrics()"        # Prometheus text in {"value": "..."}
+curl -u "nightgate:$NIGHTGATE_HTTP_PASSWORD" "http://localhost:4004/odata/v4/midnight-indexer/getMetrics()"   # Prometheus text in {"value": "..."}
 ```
+
+`getHealth()` and `getSyncStatus()` count in the rate class `read` per client address. `getLiveness()` and `getReadiness()` are never refused.
 
 The container HEALTHCHECK (`docker/healthcheck.mjs`) asks `getReadiness()`. Its database read gives up after `NIGHTGATE_READINESS_DB_TIMEOUT_MS`.
 
@@ -139,7 +161,7 @@ The container HEALTHCHECK (`docker/healthcheck.mjs`) asks `getReadiness()`. Its 
 | `starting` | Init not finished | false |
 | `failed` | Init ended offline | false |
 | `warming` | Sponsor pool prewarm running. Database, crawler and node checks do not count | true if runtime and init pass |
-| `catching-up` | Crawler behind the tip | true |
+| `catching_up` | Crawler behind the tip | true |
 | `ready` | All checks pass | true |
 | `degraded` | A check fails now | false |
 
@@ -177,8 +199,8 @@ The crawler runs on the main thread and catches up unthrottled. The image ships 
    ```bash
    NIGHTGATE_CRAWLER_START_HEIGHT=2351371   # empty index only
    NIGHTGATE_CRAWLER_MAX_BPS=20
-   NIGHTGATE_FETCH_CONCURRENCY=1
-   NIGHTGATE_RPC_BATCH_SIZE=8
+   NIGHTGATE_CRAWLER_FETCH_CONCURRENCY=1
+   NIGHTGATE_CRAWLER_RPC_BATCH_SIZE=8
    ```
 
 3. Start with admin `resumeCrawler`, stop with `pauseCrawler`. Neither survives a restart. `NIGHTGATE_CRAWLER_ENABLED` decides at boot.
@@ -188,11 +210,32 @@ The crawler runs on the main thread and catches up unthrottled. The image ships 
 
 ### Removing a fee sponsor
 
-A session in `NIGHTGATE_FEE_SPONSOR_SESSION` never expires, and while it is listed it only pays fees: it cannot send NIGHT, register for dust generation or act in any contract call. Take it out of the list to use it as a wallet again. Taken out of the list, it expires one session lifetime later (`sessionTtlMs`, default 24 h), and the cleanup then deletes its encrypted seed. Using that wallet again needs its mnemonic, so keep the mnemonic before you remove a sponsor. The boot log names each key-holding session with its expiry.
+A session in `NIGHTGATE_FEE_SPONSOR_SESSIONS` never expires, and while it is listed it only pays fees: it cannot send NIGHT, register for dust generation or act in any contract call. Take it out of the list to use it as a wallet again. Taken out of the list, it expires one session lifetime later (`sessionTtlMs`, default 24 h), and the cleanup then deletes its encrypted seed. Using that wallet again needs its mnemonic, so keep the mnemonic before you remove a sponsor. The boot log names each key-holding session with its expiry.
 
 ### Reorgs and reindexing
 
 A reorg rollback or `reindexFromHeight(h)` resets every job and submission confirmed at or above `h` to a pending chain status. The confirmer confirms them again. Never pass a height below the oldest job you care about, and never 0 on a production database.
+
+### A chain that was started again
+
+A test network can be started again under its name. The new chain may keep the first blocks of the old one, so its genesis hash says nothing. The crawler therefore compares the newest block it shares with the node on every catch-up. When the node has another block there, indexing stops with `syncStatus` `error` and `lastError` `SYNC_STATE_CHAIN_MISMATCH`, naming the block and both hashes. The server keeps running. A node that is only behind the index is not an error: the crawler waits for it.
+
+The crawler compares with the node it reads. A node that itself stayed on the old chain shows no difference, so check first that the node follows the new chain.
+
+`scripts/adopt-chain.mjs` moves the database to the node's chain:
+
+```bash
+node scripts/adopt-chain.mjs            # reports only: the last block both have, what would go
+node scripts/adopt-chain.mjs --apply    # with the server stopped
+```
+
+- It reads `NIGHTGATE_NODE_URL` or `NIGHTGATE_CRAWLER_NODE_URL`, and `NIGHTGATE_DB_URL` or `NIGHTGATE_DB_PATH`, like the server.
+- It finds the last block the index and the node's finalized chain share, with about `log2` of the index height questions to the node.
+- `--apply` removes the stored blocks above that block with everything indexed from them, and every saved wallet state. It refuses while a server holds the database.
+- Sessions, keys, grants, contract registrations, private states and documents stay. A job confirmed above that block returns to a pending chain status and ends as `BROADCAST_NOT_INCLUDED` once the new chain is past its ttl.
+- Exit 0 means the database is on the node's chain. Exit 1 means it is not, or the run failed.
+
+After the start the crawler indexes the new chain from that block and every wallet syncs again. What lived on the old chain is gone: fund the sponsor wallets and register them for DUST again, deploy contracts again and put their addresses into the sponsor policy. Take a copy of the database before `--apply`.
 
 ### A block that will not index
 
@@ -267,11 +310,10 @@ Point `NIGHTGATE_CONTRACTS_DIR` at the directory. On a running server use admin 
 Ciphertexts name their ring key id, so a rotation is additive.
 
 1. Add and activate the new key, keep the old one: `ENCRYPTION_KEYS=k2=<new secret>`, `ENCRYPTION_KEY_ACTIVE=k2`. Restart.
-2. Stop the server. Run `npx nightgate-rewrap-keys --dry-run`, then without the flag, with the server's database settings. Exit 0 means nothing is left. Exit 1 lists accounts that still need their viewing key, and the old key must stay.
-3. Start with both keys. Reconnecting wallets migrate their rows. Repeat step 2 until it exits 0. `--drop-legacy-sync-state` deletes sync states of wallets that never return.
-4. Remove the old key and restart.
+2. Stop the server. Run `node scripts/rewrap-encryption-keys.mjs --dry-run`, then without the flag, with the server's database settings. Exit 0 means every value is under the new key. Exit 1 names the values it could not read, and the old key must stay.
+3. Remove the old key and restart.
 
-Every ring secret needs at least 32 characters in production. A `v1` or `v2` value in a bound column is refused with `UnboundEnvelopeError` until the tool rewrote it. `NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES=true` reads them meanwhile. Removing a ring key before the rewrap loses the data keys it sealed.
+Every ring secret needs at least 32 characters in production. Removing a ring key before the rewrap loses the data keys it sealed.
 
 ## Contract signing keys
 
@@ -282,7 +324,7 @@ POST /odata/v4/midnight-admin/exportContractSigningKey
 { "sessionId": "<deploying session>", "contractAddress": "<address>", "password": "<16+ characters>" }
 ```
 
-The result is an envelope sealed under the password. Import exists in code only: `CapDbPrivateStateProvider.importSigningKeys`.
+The result is an envelope sealed under the password, in the shape midnight-js writes: its `importSigningKeys` takes it, and the key inside is `{ tag, value }`. NIGHTGATE has no action that imports it.
 
 ## Database resets
 
@@ -302,12 +344,12 @@ Back up the database and the encryption secrets. Without the ring keys the encry
 
 - [ ] `ENCRYPTION_KEY`, or `ENCRYPTION_KEYS` with `ENCRYPTION_KEY_ACTIVE`, set to real secrets
 - [ ] After a rotation, `nightgate-rewrap-keys` exited 0 before the old key was removed
-- [ ] PostgreSQL or HANA. Migrate SQLite with `nightgate-db-migrate`, see [docker.md](docker.md)
+- [ ] PostgreSQL. Migrate SQLite with `scripts/migrate-sqlite-to-postgres.mjs`, see [docker.md](docker.md)
 - [ ] One replica. A second process on the same database waits `NIGHTGATE_INSTANCE_LEASE_TTL_MS`, then refuses to start
 - [ ] Crawler on where indexed entities are needed. The image sets `NIGHTGATE_CRAWLER_ENABLED=false`
 - [ ] CAP auth configured. `dummy` admits everyone
 - [ ] Rate limits checked for production load
 - [ ] Own indexer, if used, at `caught_up: true` with enough disk
-- [ ] `allowMainnetSubmission` stays `false`
+- [ ] `NIGHTGATE_ALLOW_MAINNET_SUBMISSION` is `true` only where the server should spend real NIGHT and DUST on mainnet
 - [ ] Backups of the database and the secrets
 - [ ] `npm run check:release:full` passed

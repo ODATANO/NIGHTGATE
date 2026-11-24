@@ -56,6 +56,7 @@ vi.mock('@sap/cds', () => {
         },
         ApplicationService: class {
             before() { /* the hex input hook; its own tests boot the services */ }
+            after() { /* the 64-bit result form; its own tests boot the services */ }
             on(event: string, handler: Function) {
                 registeredHandlers[event] = handler;
             }
@@ -71,7 +72,7 @@ const mockUnregisterAtRuntime = vi.hoisted(() => vi.fn());
 const mockListContracts = vi.hoisted(() => vi.fn(() => []));
 vi.mock('../../srv/submission/contract-registrations', () => {
     class ContractRegistrationError extends Error {
-        constructor(public readonly httpStatus: number, message: string) { super(message); this.name = 'ContractRegistrationError'; }
+        constructor(public readonly status: number, message: string) { super(message); this.name = 'ContractRegistrationError'; }
     }
     return {
         ContractRegistrationError,
@@ -150,7 +151,7 @@ describe('NightgateAdminService', () => {
                 const out = await registeredHandlers['registerContract'](req);
                 expect(mockRegisterAtRuntime).toHaveBeenCalledWith(expect.anything(),
                     expect.objectContaining({ name: 'customer-vault', slotWidth: 16 }),
-                    { registeredBy: 'admin-1', networkId: 'preprod' });
+                    { registeredBy: 'admin-1', network: 'preprod' });
                 expect(out).toMatchObject({ name: 'customer-vault', source: 'runtime' });
             } finally {
                 delete process.env.NIGHTGATE_NETWORK;
@@ -168,13 +169,6 @@ describe('NightgateAdminService', () => {
             await registeredHandlers['unregisterContract'](req2);
             expect(req2.reject).toHaveBeenCalledWith(409, expect.stringContaining('removed'));
         });
-
-        it('unregister + list pass through', async () => {
-            mockUnregisterAtRuntime.mockResolvedValueOnce({ removed: true });
-            expect(await registeredHandlers['unregisterContract'](createMockRequest({ name: 'customer-vault' }, 'admin-1'))).toEqual({ removed: true });
-            mockListContracts.mockReturnValueOnce([{ name: 'a', source: 'config' }] as any);
-            expect(await registeredHandlers['listContracts'](createMockRequest({}, 'admin-1'))).toEqual([{ name: 'a', source: 'config' }]);
-        });
     });
 
     describe('invalidateSession', () => {
@@ -184,7 +178,6 @@ describe('NightgateAdminService', () => {
 
             // SELECT returns an active session
             mockDbRun.mockResolvedValueOnce({
-                ID: 'db-session-123',
                 sessionId: 'session-123',
                 isActive: true,
                 viewingKey: 'vk_test'
@@ -193,9 +186,10 @@ describe('NightgateAdminService', () => {
             mockDbRun.mockResolvedValueOnce(1);
 
             const req = createMockRequest({ sessionId: 'session-123' });
-            await handler(req);
+            const result = await handler(req);
 
             expect(req.reject).not.toHaveBeenCalled();
+            expect(result).toEqual({ sessionId: 'session-123', isActive: false });
             expect(mockDbRun).toHaveBeenCalledTimes(2);
             expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'session-123' });
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'session-123' });
@@ -237,14 +231,13 @@ describe('NightgateAdminService', () => {
             const req = createMockRequest({ sessionId: 'nonexistent' });
             await handler(req);
 
-            expect(req.reject).toHaveBeenCalledWith(404, expect.stringContaining('not found'));
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'SESSION_NOT_FOUND' }));
         });
 
         it('should reject when session already inactive', async () => {
             const handler = registeredHandlers['invalidateSession'];
 
             mockDbRun.mockResolvedValueOnce({
-                ID: 'db-session-123',
                 sessionId: 'session-123',
                 isActive: false
             });
@@ -266,7 +259,7 @@ describe('NightgateAdminService', () => {
             mockDbRun.mockResolvedValueOnce(5);  // UPDATE: 5 sessions invalidated
 
             const result = await handler();
-            expect(result).toBe(5);
+            expect(result).toEqual({ invalidated: 5 });
         });
 
         it('evicts every active facade after the bulk deactivation', async () => {
@@ -275,7 +268,7 @@ describe('NightgateAdminService', () => {
             mockDbRun.mockResolvedValueOnce([{ sessionId: 's1', encryptedViewingKey: 'e1' }, { sessionId: 's2', encryptedViewingKey: 'e2' }]);
             mockDbRun.mockImplementationOnce(async () => { evictOrder.push('update'); return 2; });
 
-            expect(await handler()).toBe(2);
+            expect(await handler()).toEqual({ invalidated: 2 });
             expect(evictOrder[0]).toBe('update');
             expect(evictOrder.filter(e => e.startsWith('evict:'))).toHaveLength(2);
         });
@@ -287,236 +280,7 @@ describe('NightgateAdminService', () => {
             mockDbRun.mockResolvedValueOnce(0);  // UPDATE: 0 invalidated
 
             const result = await handler();
-            expect(result).toBe(0);
-        });
-    });
-
-    describe('grantRole', () => {
-        // The handler runs attachDisclosureRole(req, this.db) BEFORE the INSERT.
-        // That issues one SELECT to look up the caller's existing disclosure
-        // rows. Tests set up `mockDbRun` to first return that row set, then
-        // (for the success path) the INSERT result.
-        const authorityRowsFor = (userId: string) => ([
-            { userId, role: 'authority', scope: null, validFrom: null, validUntil: null }
-        ]);
-
-        it('rejects when userId is missing', async () => {
-            const handler = registeredHandlers['grantRole'];
-            const req = createMockRequest({ role: 'legitimate_interest' }, 'admin-1');
-            await handler(req);
-            expect(req.reject).toHaveBeenCalledWith(400, 'userId is required');
-            expect(mockDbRun).not.toHaveBeenCalled();
-        });
-
-        it('rejects when role is missing', async () => {
-            const handler = registeredHandlers['grantRole'];
-            const req = createMockRequest({ userId: 'bob' }, 'admin-1');
-            await handler(req);
-            expect(req.reject).toHaveBeenCalledWith(400, 'role is required');
-        });
-
-        it('rejects when role is not a known disclosure tier', async () => {
-            const handler = registeredHandlers['grantRole'];
-            const req = createMockRequest(
-                { userId: 'bob', role: 'public' }, // CDS reserved word; not allowed
-                'admin-1'
-            );
-            await handler(req);
-            expect(req.reject).toHaveBeenCalledWith(
-                400,
-                expect.stringContaining('role must be one of')
-            );
-        });
-
-        it('rejects when caller does not hold the authority disclosure role', async () => {
-            const handler = registeredHandlers['grantRole'];
-            // Caller has only legitimate_interest
-            mockDbRun.mockResolvedValueOnce([
-                { userId: 'admin-1', role: 'legitimate_interest', scope: null, validFrom: null, validUntil: null }
-            ]);
-            const req = createMockRequest(
-                { userId: 'bob', role: 'authority' },
-                'admin-1'
-            );
-            await handler(req);
-            expect(req.reject).toHaveBeenCalledWith(
-                403,
-                expect.stringContaining('authority disclosure role')
-            );
-            // SELECT ran, INSERT did not
-            expect(insertEntriesSpy).not.toHaveBeenCalled();
-        });
-
-        it('rejects when caller has no disclosure grants at all', async () => {
-            const handler = registeredHandlers['grantRole'];
-            mockDbRun.mockResolvedValueOnce([]); // caller falls back to public_only
-            const req = createMockRequest(
-                { userId: 'bob', role: 'authority' },
-                'admin-1'
-            );
-            await handler(req);
-            expect(req.reject).toHaveBeenCalledWith(403, expect.any(String));
-            expect(insertEntriesSpy).not.toHaveBeenCalled();
-        });
-
-        it('inserts the grant when caller is authority', async () => {
-            const handler = registeredHandlers['grantRole'];
-            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1')); // caller lookup
-            mockDbRun.mockResolvedValueOnce(undefined); // INSERT
-
-            const req = createMockRequest(
-                { userId: 'bob', role: 'legitimate_interest' },
-                'admin-1'
-            );
-            await handler(req);
-
-            expect(req.reject).not.toHaveBeenCalled();
-            expect(insertEntriesSpy).toHaveBeenCalledTimes(1);
-            const entries = insertEntriesSpy.mock.calls[0][0];
-            expect(entries).toMatchObject({
-                userId: 'bob',
-                role: 'legitimate_interest',
-                scope: null,
-                grantedBy: 'admin-1'
-            });
-            expect(entries.validFrom).toEqual(expect.any(String));
-        });
-
-        it('passes through scope and validUntil when provided', async () => {
-            const handler = registeredHandlers['grantRole'];
-            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1'));
-            mockDbRun.mockResolvedValueOnce(undefined);
-
-            const future = new Date(Date.now() + 86_400_000).toISOString();
-            const req = createMockRequest(
-                {
-                    userId: 'bob',
-                    role: 'authority',
-                    scope: 'contract-X',
-                    validUntil: future
-                },
-                'admin-1'
-            );
-            await handler(req);
-
-            const entries = insertEntriesSpy.mock.calls[0][0];
-            expect(entries.scope).toBe('contract-X');
-            expect(entries.validUntil).toBe(future);
-        });
-
-        it('treats empty-string scope as null', async () => {
-            const handler = registeredHandlers['grantRole'];
-            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1'));
-            mockDbRun.mockResolvedValueOnce(undefined);
-
-            const req = createMockRequest(
-                { userId: 'bob', role: 'public_only', scope: '', validUntil: '' },
-                'admin-1'
-            );
-            await handler(req);
-
-            const entries = insertEntriesSpy.mock.calls[0][0];
-            expect(entries.scope).toBeNull();
-            expect(entries.validUntil).toBeNull();
-        });
-
-        it('rejects a validUntil that is not a timestamp or not in the future', async () => {
-            const handler = registeredHandlers['grantRole'];
-            const bad = createMockRequest({ userId: 'bob', role: 'authority', validUntil: 'soon' }, 'admin-1');
-            await handler(bad);
-            expect(bad.reject).toHaveBeenCalledWith(400, 'validUntil must be an ISO-8601 timestamp');
-
-            const past = createMockRequest(
-                { userId: 'bob', role: 'authority', validUntil: new Date(Date.now() - 1000).toISOString() },
-                'admin-1'
-            );
-            await handler(past);
-            expect(past.reject).toHaveBeenCalledWith(400, 'validUntil must be in the future');
-            expect(mockDbRun).not.toHaveBeenCalled();
-            expect(insertEntriesSpy).not.toHaveBeenCalled();
-        });
-
-        it('uses "unknown" as grantedBy when req.user is missing', async () => {
-            const handler = registeredHandlers['grantRole'];
-            // No userId on caller → attachDisclosureRole returns public_only
-            // immediately without touching the DB. So the 403 check fires first.
-            const req = createMockRequest({ userId: 'bob', role: 'authority' });
-            await handler(req);
-            expect(req.reject).toHaveBeenCalledWith(403, expect.any(String));
-        });
-    });
-
-    describe('revokeRole', () => {
-        const authorityRowsFor = (userId: string) => ([
-            { userId, role: 'authority', scope: null, validFrom: null, validUntil: null }
-        ]);
-
-        it('validates input before the caller lookup', async () => {
-            const handler = registeredHandlers['revokeRole'];
-            const noUser = createMockRequest({ role: 'authority' }, 'admin-1');
-            await handler(noUser);
-            expect(noUser.reject).toHaveBeenCalledWith(400, 'userId is required');
-
-            const badRole = createMockRequest({ userId: 'bob', role: 'public' }, 'admin-1');
-            await handler(badRole);
-            expect(badRole.reject).toHaveBeenCalledWith(400, expect.stringContaining('role must be one of'));
-            expect(mockDbRun).not.toHaveBeenCalled();
-        });
-
-        it('rejects a caller without the authority role', async () => {
-            const handler = registeredHandlers['revokeRole'];
-            mockDbRun.mockResolvedValueOnce([]);
-            const req = createMockRequest({ userId: 'bob', role: 'authority' }, 'admin-1');
-            await handler(req);
-            expect(req.reject).toHaveBeenCalledWith(403, expect.stringContaining('authority disclosure role'));
-            expect(updateSetSpy).not.toHaveBeenCalled();
-        });
-
-        it('ends only the active grants of the named scope and returns their count', async () => {
-            const handler = registeredHandlers['revokeRole'];
-            const future = new Date(Date.now() + 86_400_000).toISOString();
-            const past = new Date(Date.now() - 86_400_000).toISOString();
-            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1'));
-            mockDbRun.mockResolvedValueOnce([
-                { ID: 'g1', scope: null, validUntil: null },
-                { ID: 'g2', scope: '', validUntil: future },
-                { ID: 'g3', scope: null, validUntil: past },       // already ended
-                { ID: 'g4', scope: 'contract-X', validUntil: null } // other scope
-            ]);
-            mockDbRun.mockResolvedValueOnce(2); // UPDATE
-
-            const req = createMockRequest({ userId: 'bob', role: 'legitimate_interest' }, 'admin-1');
-            const result = await handler(req);
-
-            expect(req.reject).not.toHaveBeenCalled();
-            expect(result).toBe(2);
-            expect(selectWhereSpy).toHaveBeenLastCalledWith({ userId: 'bob', role: 'legitimate_interest' });
-            expect(updateSetSpy).toHaveBeenCalledWith({ validUntil: expect.any(String) });
-            expect(updateWhereSpy).toHaveBeenCalledWith({ ID: { in: ['g1', 'g2'] } });
-        });
-
-        it('matches a named scope exactly', async () => {
-            const handler = registeredHandlers['revokeRole'];
-            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1'));
-            mockDbRun.mockResolvedValueOnce([
-                { ID: 'g1', scope: null, validUntil: null },
-                { ID: 'g4', scope: 'contract-X', validUntil: null }
-            ]);
-            mockDbRun.mockResolvedValueOnce(1);
-
-            const req = createMockRequest({ userId: 'bob', role: 'authority', scope: 'contract-X' }, 'admin-1');
-            expect(await handler(req)).toBe(1);
-            expect(updateWhereSpy).toHaveBeenCalledWith({ ID: { in: ['g4'] } });
-        });
-
-        it('returns 0 without writing when nothing is active', async () => {
-            const handler = registeredHandlers['revokeRole'];
-            mockDbRun.mockResolvedValueOnce(authorityRowsFor('admin-1'));
-            mockDbRun.mockResolvedValueOnce([]);
-
-            const req = createMockRequest({ userId: 'bob', role: 'authority' }, 'admin-1');
-            expect(await handler(req)).toBe(0);
-            expect(updateSetSpy).not.toHaveBeenCalled();
+            expect(result).toEqual({ invalidated: 0 });
         });
     });
 
@@ -525,7 +289,7 @@ describe('NightgateAdminService', () => {
             'NIGHTGATE_SPONSOR_POLICY_FILE', 'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_DEPLOY'];
         const T = 'ab'.repeat(32);
         const grant = (over: Record<string, unknown> = {}) => ({
-            ID: 'grant-1', userId: 'operator-1', sessionId: 'sess-1', allowedActions: '["sponsorUnboundTransaction"]',
+            ID: 'grant-1', userId: 'operator-1', sessionId: 'sess-1', allowedActions: '["sponsorUnbound"]',
             isActive: true, revokedAt: null, validUntil: null,
             allowedContracts: JSON.stringify(['A']), allowedCircuits: null, allowedTokenTypes: JSON.stringify([T]),
             deployedContracts: JSON.stringify(['D']), allowDeploy: true, maxDeploys: 2, deploysUsed: 1, ...over
@@ -546,9 +310,10 @@ describe('NightgateAdminService', () => {
             expect(mockDbRun).not.toHaveBeenCalled();
             expect(result).toMatchObject({
                 source: 'env', path: null, loadedAt: null, ignoredEnv: [], floorError: null, grant: null, effectiveError: null,
-                floor: { allowedContracts: ['A', 'B'], allowedCircuits: [], allowedTokenTypes: [T], allowDeploy: true, allowContractMints: true },
+                floor: { allowedContracts: ['A', 'B'], allowedCircuits: [], allowedTokenTypes: [T], allowContractMints: true },
                 effective: { allowedContracts: ['A', 'B'], allowedTokenTypes: [T], allowDeploy: true, allowContractMints: true }
             });
+            expect(result.floor).not.toHaveProperty('allowDeploy');
         });
 
         it('with a grant: its lists and what the platform policy leaves of them', async () => {
@@ -556,7 +321,7 @@ describe('NightgateAdminService', () => {
             const result = await registeredHandlers['getSponsorPolicy'](createMockRequest({ grantId: 'grant-1' }, 'admin-1'));
             expect(selectWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1' });
             expect(result).toMatchObject({
-                grant: { grantId: 'grant-1', active: true, allowedContracts: ['A'], allowedTokenTypes: [T], deployedContracts: ['D'], allowDeploy: true, maxDeploys: 2, deploysUsed: 1 },
+                grant: { grantId: 'grant-1', isActive: true, allowedContracts: ['A'], allowedTokenTypes: [T], deployedContracts: ['D'], allowDeploy: true, maxDeploys: 2, deploysUsed: 1 },
                 effective: { allowedContracts: ['A', 'D'], ownContracts: ['D'], allowedTokenTypes: [T], allowDeploy: true, allowContractMints: true },
                 effectiveError: null
             });
@@ -575,7 +340,7 @@ describe('NightgateAdminService', () => {
 
             mockDbRun.mockResolvedValueOnce(grant({ isActive: false }));
             const revoked = await registeredHandlers['getSponsorPolicy'](createMockRequest({ grantId: 'grant-1' }, 'admin-1'));
-            expect(revoked).toMatchObject({ grant: { active: false }, effective: null, effectiveError: 'the grant is revoked or expired' });
+            expect(revoked).toMatchObject({ grant: { isActive: false }, effective: null, effectiveError: 'the grant is revoked or expired' });
         });
 
         it('an unknown grant is 404', async () => {

@@ -75,11 +75,38 @@ export function registerBackgroundJobReconciliationFinalizer(
     reconciliationFinalizers.set(processorKey(kind, version), finalizer);
 }
 
-function storedCommand(row: BackgroundJob): unknown {
+/** Operation names a stored command had under an older version. */
+const FORMER_COMMAND_OPS: Readonly<Record<string, string>> = { registerPassport: 'registerDocument', sendNight: 'sendToken' };
+
+/** Field names a stored command had under an older version, by its operation of today. `*` holds for every operation. */
+const FORMER_COMMAND_FIELDS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+    '*': { compiledArtifactRef: 'contractName' },
+    anchorDocument: { documentId: 'anchorId' },
+    registerDocument: { passportId: 'documentId' },
+    sendToken: { tokenTypeHex: 'tokenType' }
+};
+
+/** A stored command under the names of today. A field keeps its name when the command already has the current one. */
+export function currentCommand(stored: unknown): unknown {
+    if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return stored;
+    const fields = stored as Record<string, unknown>;
+    const op = typeof fields.op === 'string' && Object.hasOwn(FORMER_COMMAND_OPS, fields.op) ? FORMER_COMMAND_OPS[fields.op] : fields.op;
+    const ofOperation = typeof op === 'string' && Object.hasOwn(FORMER_COMMAND_FIELDS, op) ? FORMER_COMMAND_FIELDS[op] : {};
+    const former: Record<string, string> = { ...FORMER_COMMAND_FIELDS['*'], ...ofOperation };
+    const current: Record<string, unknown> = {};
+    for (const [name, value] of Object.entries(fields)) {
+        const renamed = Object.hasOwn(former, name) && !Object.hasOwn(fields, former[name]);
+        current[renamed ? former[name] : name] = name === 'op' ? op : value;
+    }
+    return current;
+}
+
+/** The stored command of a job, decrypted and under the names of today. */
+export function storedCommand(row: BackgroundJob): unknown {
     const serialized = row.commandEncoding === 'aes-gcm-v1'
         ? decryptAtRest(row.command!, getEncryptionKey(), jobCommandBinding(String(row.ID)))
         : row.command!;
-    return JSON.parse(serialized);
+    return currentCommand(JSON.parse(serialized));
 }
 
 export async function executePersistedCommand(row: BackgroundJob): Promise<unknown> {

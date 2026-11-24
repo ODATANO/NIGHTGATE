@@ -4,18 +4,91 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-    ERROR_CODES, errorCodeMarkdownRows, NightgateError, isNightgateError, findNightgateError, nightgateErrorFromPayload, statusClassCode
+    ERROR_CODES, errorCodeMarkdownRows, NightgateError, isNightgateError, isJobErrorCode, isNodeRejectCode, findNightgateError, nightgateErrorFromPayload,
+    retryableErrorCodes, statusClassCode, type ErrorCodeSpec
 } from '../../srv/utils/errors';
 import { normalizeHttpError } from '../../srv/utils/http-errors';
 
 describe('ERROR_CODES', () => {
-    it('are UPPER_SNAKE_CASE with an HTTP status and a doc line', () => {
-        for (const [code, spec] of Object.entries(ERROR_CODES)) {
+    it('are UPPER_SNAKE_CASE with a doc line, and each is a request code, a job code or both', () => {
+        for (const [code, spec] of Object.entries(ERROR_CODES as Record<string, ErrorCodeSpec>)) {
             expect(code).toMatch(/^[A-Z][A-Z0-9_]+$/);
-            expect(spec.status).toBeGreaterThanOrEqual(400);
-            expect(spec.status).toBeLessThan(600);
+            expect(spec.status !== undefined || spec.job === true, code).toBe(true);
+            if (spec.status !== undefined) {
+                expect(spec.status).toBeGreaterThanOrEqual(400);
+                expect(spec.status).toBeLessThan(600);
+            }
             expect(spec.doc.length).toBeGreaterThan(10);
         }
+    });
+
+    it('a code that comes with several statuses lists its default among them, and the sponsor code is raised with no other', () => {
+        for (const [code, spec] of Object.entries(ERROR_CODES as Record<string, ErrorCodeSpec>)) {
+            if (spec.statuses) expect(spec.statuses, code).toContain(spec.status);
+        }
+        const source = fs.readFileSync(path.resolve(__dirname, '../../srv/submission/fee-sponsor.ts'), 'utf8');
+        const raised = [...source.matchAll(/new FeeSponsorError\((\d+)/g)].map(m => Number(m[1]));
+        expect(raised.length).toBeGreaterThan(3);
+        expect(raised.filter(status => !ERROR_CODES.FEE_SPONSOR_UNUSABLE.statuses.includes(status as 404))).toEqual([]);
+    });
+
+    it('an error that crossed a thread keeps its own name and message; the text around it becomes its cause', () => {
+        class SyncError extends NightgateError {}
+        const thrown = new SyncError('WALLET_NOT_SYNCED', 'wallet not synced to tip after 1000ms', { exposeMessage: true });
+        const rebuilt = nightgateErrorFromPayload(thrown.toPayload(), { name: 'Error', message: 'send failed <- wallet not synced to tip after 1000ms <- socket closed' });
+        expect(rebuilt).toMatchObject({ name: 'SyncError', code: 'WALLET_NOT_SYNCED', status: 503, retryable: true, message: 'wallet not synced to tip after 1000ms' });
+        expect(rebuilt.cause).toMatchObject({ name: 'Error', message: 'send failed <- wallet not synced to tip after 1000ms <- socket closed' });
+        // The mark that keeps the message of a server error in production crosses with it.
+        expect((rebuilt as { $sanitize?: boolean }).$sanitize).toBe(false);
+        const plain = nightgateErrorFromPayload(new NightgateError('TX_FAILED', 'did not apply').toPayload(), { name: 'NightgateError', message: 'did not apply' });
+        expect(plain.cause).toBeUndefined();
+        expect((plain as { $sanitize?: boolean }).$sanitize).toBeUndefined();
+    });
+
+    it('tell a job code and a number of the node from any other text', () => {
+        expect(['TX_FAILED', 'UNKNOWN_ERROR', 'CHILD_FAILED'].every(isJobErrorCode)).toBe(true);
+        expect(['RATE_LIMITED', 'TxFailed', 'TypeError', '', null, 1010].some(isJobErrorCode)).toBe(false);
+        expect(['1010', '1010/104', '1014', '1016'].every(isNodeRejectCode)).toBe(true);
+        expect(['1010/', '1015', 'pool-invalid', '1010/abc', 1014].some(isNodeRejectCode)).toBe(false);
+    });
+
+    it('the client carries exactly the retryable codes of a refused request', async () => {
+        const { RETRYABLE_ERROR_CODES }: typeof import('../../src/sdk/client') = await import('../../src/sdk/client.mjs' as string);
+        expect([...RETRYABLE_ERROR_CODES].sort()).toEqual(retryableErrorCodes());
+        expect(retryableErrorCodes()).toContain('SUBMIT_INTENT_TIMEOUT');
+        // A code only a job ends with is no answer to a request, so it is not in the list.
+        expect(retryableErrorCodes()).not.toContain('NETWORK_OR_TIMEOUT');
+    });
+
+    it('no code of the table is dead: each is raised or written somewhere in the sources', () => {
+        const sources: string[] = [];
+        const walk = (dir: string): void => {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const file = path.join(dir, entry.name);
+                if (entry.isDirectory()) walk(file);
+                else if (/\.(ts|mts|mjs)$/.test(entry.name) && !/\.d\.m?ts$/.test(entry.name) && file !== path.resolve(__dirname, '../../srv/utils/errors.ts')) sources.push(fs.readFileSync(file, 'utf8'));
+            }
+        };
+        walk(path.resolve(__dirname, '../../srv'));
+        walk(path.resolve(__dirname, '../../src'));
+        // The module of the table itself counts from the end of the table on: it holds error classes that raise a code.
+        const own = fs.readFileSync(path.resolve(__dirname, '../../srv/utils/errors.ts'), 'utf8');
+        const text = [...sources, own.slice(own.indexOf('} as const satisfies'))].join('\n');
+        // The generic codes stand for an HTTP status and are chosen by number.
+        const generic = new Set(['INVALID_ARGUMENT', 'UNAUTHENTICATED', 'FORBIDDEN', 'NOT_FOUND', 'CONFLICT', 'GONE', 'PRECONDITION_FAILED', 'PAYLOAD_TOO_LARGE', 'RATE_LIMITED', 'INTERNAL', 'NOT_IMPLEMENTED', 'BAD_GATEWAY', 'UNAVAILABLE']);
+        const dead = Object.keys(ERROR_CODES).filter(code => !generic.has(code) && !new RegExp(`\\b${code}\\b`).test(text));
+        expect(dead).toEqual([]);
+    });
+
+    it('every code the server writes into a job is in the table as a job code', () => {
+        const literals = new Set<string>();
+        const dir = path.resolve(__dirname, '../../srv/submission');
+        for (const file of fs.readdirSync(dir).filter(f => f.endsWith('.ts') && !f.endsWith('.d.ts'))) {
+            const source = fs.readFileSync(path.join(dir, file), 'utf8');
+            for (const m of source.matchAll(/errorCode: '([^']+)'/g)) literals.add(m[1]);
+        }
+        expect(literals.size).toBeGreaterThan(10);
+        expect([...literals].filter(code => !isJobErrorCode(code))).toEqual([]);
     });
 
     it('maps every status the services reject with to a class code', () => {
@@ -137,6 +210,42 @@ describe('normalizeHttpError', () => {
         expect(err.message).toBe('detail');
         expect(() => normalizeHttpError(undefined)).not.toThrow();
         expect(() => normalizeHttpError('x')).not.toThrow();
+    });
+});
+
+describe('a read the database stopped', () => {
+    it('answers 504 QUERY_TIMEOUT with the time limit and drops the statement text', () => {
+        const err: Record<string, unknown> = {
+            code: '57014', message: 'canceling statement due to statement timeout', status: 500, severity: 'ERROR', query: 'SELECT secret FROM t'
+        };
+        normalizeHttpError(err);
+        expect(err).toEqual({
+            status: 504, code: 'QUERY_TIMEOUT', $sanitize: false,
+            message: 'The read ran longer than 15 s and was stopped. Narrow the filter or sort by an indexed column.'
+        });
+    });
+
+    it('names a limit under a second in milliseconds', () => {
+        process.env.NIGHTGATE_QUERY_TIMEOUT_MS = '300';
+        try {
+            const err: Record<string, unknown> = { code: '57014', message: 'canceling statement due to statement timeout' };
+            normalizeHttpError(err);
+            expect(err.message).toMatch(/longer than 300 ms /);
+        } finally {
+            delete process.env.NIGHTGATE_QUERY_TIMEOUT_MS;
+        }
+    });
+
+    it('keeps its message in production', () => {
+        const saved = process.env.NODE_ENV;
+        process.env.NODE_ENV = 'production';
+        try {
+            const err: Record<string, unknown> = { code: '57014', message: 'canceling statement due to statement timeout', status: 500 };
+            normalizeHttpError(err);
+            expect(err.message).toMatch(/stopped/);
+        } finally {
+            process.env.NODE_ENV = saved;
+        }
     });
 });
 

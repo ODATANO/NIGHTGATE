@@ -3,7 +3,7 @@
 // out (generic-pool.js `#dispense`, non-pending branch: neither loaned nor
 // returned to `_available`); under load the pool empties and every request
 // fails with "Pool resource could not be acquired". NIGHTGATE therefore
-// selects `generic-pool` (features.use_generic_pool) unless the config decided.
+// selects `generic-pool` (features.use_generic_pool in package.json).
 // The first test pins the upstream defect against the installed version: when
 // it starts failing, the workaround can go.
 import { describe, it, expect } from 'vitest';
@@ -56,16 +56,8 @@ describe('CAP db connection pool under acquire timeouts', () => {
         expect(s.available).toBe(2);
     });
 
-    it('features.use_generic_pool defaults to true and an explicit choice is left alone', async () => {
-        const { applyPoolDefault } = await import('../../src/cap-pool-default.js');
-        const fresh: { features?: Record<string, unknown> } = {};
-        expect(applyPoolDefault(fresh)).toBe(true);
-        expect(fresh.features?.use_generic_pool).toBe(true);
-        const undecided = { features: { other: 1 } as Record<string, unknown> };
-        expect(applyPoolDefault(undecided)).toBe(true);
-        expect(undecided.features).toEqual({ other: 1, use_generic_pool: true });
-        const optedOut = { features: { use_generic_pool: false } as Record<string, unknown> };
-        expect(applyPoolDefault(optedOut)).toBe(false);
-        expect(optedOut.features.use_generic_pool).toBe(false);
+    it('the app config selects generic-pool', () => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        expect(require('../../package.json').cds.features.use_generic_pool).toBe(true);
     });
 });

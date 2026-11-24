@@ -39,6 +39,17 @@ export async function syncedAtLedger9(wallet, forks) {
     });
 }
 
+const FACADE_WALLETS = ['shielded', 'unshielded', 'dust'];
+
+/** Resolves once the named sub-wallets of a facade caught up and read the chain at ledger 9; default all three. `forks` comes from the wallet configuration. */
+export async function waitForWalletSync(facade, forks, wallets = FACADE_WALLETS) {
+    for (const name of wallets) {
+        if (!FACADE_WALLETS.includes(name)) throw new Error(`waitForWalletSync: '${name}' is no wallet of a facade (${FACADE_WALLETS.join(', ')})`);
+        if (typeof facade?.[name]?.state?.subscribe !== 'function') throw new Error(`waitForWalletSync: the facade has no ${name} wallet`);
+    }
+    await Promise.all(wallets.map(name => syncedAtLedger9(facade[name], forks)));
+}
+
 /** Reads the ledger transaction out of a handle, in the form its stage names: unproven, proven or sealed. */
 export async function openTx(handle) {
     const ledger = await loadLedger();

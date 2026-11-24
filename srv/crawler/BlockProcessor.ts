@@ -8,7 +8,6 @@ import { Metadata } from '@polkadot/types/metadata';
 import type { Vec } from '@polkadot/types';
 import type { EventRecord } from '@polkadot/types/interfaces';
 import { MidnightNodeProvider, SignedBlock } from '../providers/MidnightNodeProvider';
-import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { isUniqueViolation } from '../utils/db-errors';
 import {
     getNightgateConfig, getConfiguredNightgateNetwork, normalizeNightgateNetwork
@@ -35,8 +34,6 @@ interface ExtrinsicClassification {
     txType: string;
     isShielded: boolean;
     isSystem: boolean;
-    palletIndex?: number;
-    callIndex?: number;
 }
 
 export interface PalletMapping {
@@ -242,7 +239,6 @@ export class BlockProcessor {
     }
 
     async init(): Promise<void> {
-        await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
     }
 
@@ -507,7 +503,6 @@ export class BlockProcessor {
                 const classification = this.classifyExtrinsic(extrinsicHex, palletMap);
                 const extrinsicHash = this.hashExtrinsic(extrinsicHex);
                 const txSize = this.extrinsicSize(extrinsicHex);
-                const circuitName = this.buildCircuitName(classification);
                 const events = extrinsicEvents?.get(i);
                 const projection = projections.get(i);
                 const contractAddress = events?.contracts[0]?.address ?? null;
@@ -519,9 +514,10 @@ export class BlockProcessor {
 
                 txRows.push({
                     ID: txId,
-                    transactionId: i,
-                    hash: extrinsicHash,
-                    ledgerTxHash: events?.ledgerTxHash ?? null,
+                    blockHeight: height,
+                    indexInBlock: i,
+                    extrinsicHash,
+                    txHash: events?.txHash ?? null,
                     protocolVersion,
                     raw: hexToBase64(extrinsicHex),
                     transactionType: classification.isSystem ? 'SYSTEM' : 'REGULAR',
@@ -532,7 +528,6 @@ export class BlockProcessor {
                     nightAmount,
                     hasProof: shielded,
                     contractAddress,
-                    circuitName,
                     size: txSize,
                     block_ID: blockId
                 });
@@ -558,10 +553,11 @@ export class BlockProcessor {
                 for (const action of this.contractActionsFor(events, classification)) {
                     contractActionRows.push({
                         ID: cds.utils.uuid(),
+                        blockHeight: height,
+                        indexInBlock: i,
                         actionIndex: actionIndex++,
-                        address: action.address,
+                        contractAddress: action.address,
                         actionType: action.actionType,
-                        entryPoint: circuitName,
                         state: null,
                         transaction_ID: txId
                     });
@@ -569,7 +565,7 @@ export class BlockProcessor {
                 }
 
                 for (const utxo of projection?.created ?? []) {
-                    utxoRows.push({ ID: cds.utils.uuid(), ...utxo, createdAtTransaction_ID: txId });
+                    utxoRows.push({ ID: cds.utils.uuid(), ...utxo, blockHeight: height, indexInBlock: i, createdAtTransaction_ID: txId });
                     // Only NIGHT counts towards NightBalances.
                     if (utxo.tokenType !== NIGHT_RAW_TOKEN_TYPE) continue;
                     const delta = deltaFor(utxo.owner);
@@ -818,13 +814,7 @@ export class BlockProcessor {
         }
 
         const indices = parseExtrinsicCallIndices(hex);
-        if (indices) {
-            return {
-                ...this.mapPalletCall(indices.palletIndex, indices.callIndex, palletMap),
-                palletIndex: indices.palletIndex,
-                callIndex: indices.callIndex
-            };
-        }
+        if (indices) return this.mapPalletCall(indices.palletIndex, indices.callIndex, palletMap);
 
         // Not parseable, so guess by length.
         if (hex.length < 100) {
@@ -843,14 +833,6 @@ export class BlockProcessor {
         if (txType === 'contract_call') return 'CALL';
         if (txType === 'contract_update') return 'UPDATE';
         return null;
-    }
-
-    private buildCircuitName(classification: ExtrinsicClassification): string | null {
-        if (classification.palletIndex == null || classification.callIndex == null) {
-            return null;
-        }
-
-        return `${classification.palletIndex}:${classification.callIndex}`;
     }
 
     private mapPalletCall(palletIndex: number, callIndex: number, palletMap: Map<number, PalletMapping> = this.defaultPalletMap): {

@@ -109,7 +109,7 @@ describe('prepareDocumentProof handler', () => {
 
     it('rejects 404 when the artifact is unknown or exports no pure circuits', async () => {
         loadPure.mockRejectedValueOnce(new PureCircuitsUnavailableError("contract 'nope' is not registered"));
-        const req = makeReq({ ...VALID, compiledArtifactRef: 'nope' });
+        const req = makeReq({ ...VALID, contractName: 'nope' });
         await handlers.prepareDocumentProof(req);
         expect(req.reject).toHaveBeenCalledWith(404, expect.stringContaining('nope'));
     });
@@ -204,7 +204,7 @@ describe('prepareMembershipSet handler', () => {
 
     it('rejects 404 when the artifact is unavailable', async () => {
         loadPure.mockRejectedValueOnce(new PureCircuitsUnavailableError("contract 'nope' is not registered"));
-        const req = makeReq({ allowedValues: LIST, compiledArtifactRef: 'nope' });
+        const req = makeReq({ allowedValues: LIST, contractName: 'nope' });
         await handlers.prepareMembershipSet(req);
         expect(req.reject).toHaveBeenCalledWith(404, expect.stringContaining('nope'));
     });
@@ -223,7 +223,7 @@ describe('attestAgentOutput handler', () => {
         vi.clearAllMocks();
         Object.keys(handlers).forEach(k => delete handlers[k]);
         registerDocumentProofHandlers(srv, { loadPure: vi.fn(), findProducedAt: findSpy });
-        sendSpy.mockResolvedValue({ jobId: 'job-1', status: 'pending', documentId: 'doc-1' });
+        sendSpy.mockResolvedValue({ jobId: 'job-1', status: 'pending', anchorId: 'doc-1' });
     });
 
     const VALID = {
@@ -266,13 +266,13 @@ describe('attestAgentOutput handler', () => {
         expect(result.envelopeJson).toBe(canonicalize(envelope)); // canonical form
         expect(result.payloadHash).toBe(blake2b256Hex(result.envelopeJson));
         expect(result.jobId).toBe('job-1');
-        expect(result.documentId).toBe('doc-1');
+        expect(result.anchorId).toBe('doc-1');
 
         const sent = sendSpy.mock.calls[0][0];
         expect(sent.event).toBe('anchorDocument');
         expect(sent.user).toEqual({ id: 'user-1' });
         expect(sent.data).toMatchObject({
-            sha256: result.payloadHash,
+            payloadHash: result.payloadHash,
             metadata: result.envelopeJson,
             storageRef: 'agent-output://agent://doc-bot',
             sessionId: 'sess-1',

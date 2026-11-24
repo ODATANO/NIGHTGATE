@@ -1,16 +1,16 @@
-// `@odatano/nightgate/txbuilder` self-funded submission helpers: reject
+// `@odatano/nightgate-tx/txbuilder` self-funded submission helpers: reject
 // classification, one-shot submit, indexer probe, dust guard. The live path
 // is a consumer concern (own wallet, own node); everything here is pure or
 // runs against injected seams.
 
 import { describe, it, expect, vi } from 'vitest';
 
-const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
+const importInternals = () => import('../../src/txbuilder/internals.mjs' as string);
 const importSubmit = () => import('../../src/txbuilder/submit.mjs' as string);
 
 describe('txbuilder: runSingleCall honors the before hook like a batch entry', () => {
     it('runs the hook, then the circuit, with the call args', async () => {
-        const { runSingleCall } = await importTxBuilder();
+        const { runSingleCall } = await importInternals();
         const order: string[] = [];
         const call = { circuitId: 'attest', args: [1n, 2n], before: () => order.push('before') };
         const fn = (...args: unknown[]) => { order.push('fn:' + args.join(',')); return 'built'; };
@@ -19,13 +19,13 @@ describe('txbuilder: runSingleCall honors the before hook like a batch entry', (
     });
 
     it('works without a hook and with missing args', async () => {
-        const { runSingleCall } = await importTxBuilder();
+        const { runSingleCall } = await importInternals();
         const fn = (...args: unknown[]) => args.length;
         await expect(runSingleCall({ circuitId: 'attest' }, fn)).resolves.toBe(0);
     });
 
     it('a throwing hook aborts before the circuit runs', async () => {
-        const { runSingleCall } = await importTxBuilder();
+        const { runSingleCall } = await importInternals();
         let ran = false;
         const call = { circuitId: 'attest', args: [], before: () => { throw new Error('unarmed'); } };
         await expect(runSingleCall(call, () => { ran = true; })).rejects.toThrow('unarmed');
@@ -154,11 +154,11 @@ describe('txbuilder submit: nodeHttpUrlFor', () => {
     });
 });
 
-describe('txbuilder submit: txIdentifiers', () => {
+describe('txbuilder submit: txIds', () => {
     it('returns every identifier as a string', async () => {
-        const { txIdentifiers } = await importSubmit();
-        expect(txIdentifiers({ identifiers: () => ['aa', 'bb'] })).toEqual(['aa', 'bb']);
-        expect(() => txIdentifiers({} as never)).toThrow(/deserializeTransaction/);
+        const { txIds } = await importSubmit();
+        expect(txIds({ identifiers: () => ['aa', 'bb'] })).toEqual(['aa', 'bb']);
+        expect(() => txIds({} as never)).toThrow(/deserializeTransaction/);
     });
 });
 
@@ -375,37 +375,37 @@ describe('txbuilder submit: probeLanded over the NIGHTGATE API', () => {
     const client = (answer: unknown) => ({
         contractStateAt: async () => null,
         contractDeploy: async () => null,
-        transactionByIdentifier: vi.fn(async () => answer)
+        transactionByTxId: vi.fn(async () => answer)
     });
 
     it('null while the server has not indexed the identifier, or has no result for it yet', async () => {
         const { probeLanded } = await importSubmit();
         await expect(probeLanded('id1', { api: client(null) })).resolves.toBeNull();
-        await expect(probeLanded('id1', { api: client({ hash: '0xtx', blockHeight: 3, status: null, failedSegments: [] }) })).resolves.toBeNull();
+        await expect(probeLanded('id1', { api: client({ extrinsicHash: '0xtx', blockHeight: 3, status: null, failedSegments: [] }) })).resolves.toBeNull();
     });
 
     it('maps the inclusion to the probe result, txHash = the ledger hash', async () => {
         const { probeLanded } = await importSubmit();
-        const api = client({ hash: '0xextrinsic', ledgerTxHash: 'ab12', blockHeight: 42, status: 'FAILURE', failedSegments: [1] });
+        const api = client({ extrinsicHash: '0xextrinsic', txHash: 'ab12', blockHeight: 42, status: 'FAILURE', failedSegments: [1] });
         await expect(probeLanded('id1', { api })).resolves.toEqual({ height: '42', status: 'FAILURE', failedSegments: [1], applied: false, txHash: 'ab12' });
-        expect(api.transactionByIdentifier).toHaveBeenCalledWith('id1');
+        expect(api.transactionByTxId).toHaveBeenCalledWith('id1');
     });
 
     it('no txHash while the server has no ledger hash for the transaction', async () => {
         const { probeLanded } = await importSubmit();
-        const api = client({ hash: '0xextrinsic', ledgerTxHash: null, blockHeight: 42, status: 'SUCCESS', failedSegments: [] });
+        const api = client({ extrinsicHash: '0xextrinsic', txHash: null, blockHeight: 42, status: 'SUCCESS', failedSegments: [] });
         await expect(probeLanded('id1', { api })).resolves.toEqual({ height: '42', status: 'SUCCESS', failedSegments: [], applied: true, txHash: undefined });
     });
 
     it('a server error reads as unknown, never as landed', async () => {
         const { probeLanded } = await importSubmit();
-        const api = { ...client(null), transactionByIdentifier: vi.fn(async () => { throw new Error('503'); }) };
+        const api = { ...client(null), transactionByTxId: vi.fn(async () => { throw new Error('503'); }) };
         await expect(probeLanded('id1', { api })).resolves.toBeNull();
     });
 
     it('waitLanded polls the server until the transaction shows', async () => {
         const { waitLanded } = await importSubmit();
-        const api = { ...client(null), transactionByIdentifier: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ hash: '0xtx', blockHeight: 1, status: 'SUCCESS', failedSegments: [] }) };
+        const api = { ...client(null), transactionByTxId: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ extrinsicHash: '0xtx', blockHeight: 1, status: 'SUCCESS', failedSegments: [] }) };
         await expect(waitLanded('id1', { api, timeoutMs: 1_000, pollMs: 1 })).resolves.toEqual(expect.objectContaining({ applied: true }));
     });
 
@@ -420,7 +420,7 @@ describe('txbuilder submit: a refused API request is not "unknown"', () => {
         const { probeLanded } = await importSubmit();
         const refusing = (status: number) => ({
             contractStateAt: async () => null, contractDeploy: async () => null,
-            transactionByIdentifier: vi.fn(async () => { throw Object.assign(new Error(`HTTP ${status}`), { status }); })
+            transactionByTxId: vi.fn(async () => { throw Object.assign(new Error(`HTTP ${status}`), { status }); })
         });
         for (const status of [400, 401, 403]) await expect(probeLanded('id1', { api: refusing(status) })).rejects.toThrow(`HTTP ${status}`);
         for (const status of [429, 500, 503]) await expect(probeLanded('id1', { api: refusing(status) })).resolves.toBeNull();

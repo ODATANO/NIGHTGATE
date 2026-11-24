@@ -1,8 +1,8 @@
 /**
  * Tests for the optional `network` override on the crawler-free state-verify
  * surface:
- *   - verifyAttestationState(..., network)
- *   - verifyPredicateState(..., network)
+ *   - verifyAttestation(..., network)
+ *   - verifyPredicate(..., network)
  *
  * Properties under test:
  *   1. Override to another network reads via that network's indexer endpoints
@@ -10,7 +10,7 @@
  *   2. Omitted (or equal to the configured network) uses the configured
  *      endpoints; env/config overrides for the configured network win.
  *   3. Invalid network → 400, never a silent fallback.
- *   4. Same for verifyPredicateState.
+ *   4. Same for verifyPredicate.
  *   5. No wallet / proof-server / crawler involvement on the override path
  *      (readers only ever get the contract-only provider config).
  *
@@ -28,6 +28,12 @@ vi.mock('../../srv/utils/nightgate-config', async () => {
         resolveNightgateRuntimeConfig: () => mockRuntimeCfg
     };
 });
+
+const tipHeight = vi.hoisted(() => vi.fn(async (url: string) => (url === 'http://configured-idx' ? 500 : 700)));
+vi.mock('../../srv/midnight/public-data-provider', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../../srv/midnight/public-data-provider')>()),
+    indexerTipHeight: tipHeight
+}));
 
 // startJob is not exercised by these read handlers, but handlers.ts imports it.
 vi.mock('../../srv/submission/background-jobs', async () => ({
@@ -82,15 +88,15 @@ beforeEach(() => {
     mockCfg = {};
 });
 
-// ---- verifyAttestationState ------------------------------------------------
+// ---- verifyAttestation ------------------------------------------------
 
-describe('verifyAttestationState network override', () => {
+describe('verifyAttestation network override', () => {
     const POSITIVE = { attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc' };
 
     test('omitted network → configured endpoints', async () => {
         const reader = vi.fn(async () => POSITIVE);
         const srv = setup({ attestationStateReader: reader });
-        await srv.handlers['verifyAttestationState'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD }));
+        await srv.handlers['verifyAttestation'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD }));
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractProvidersConfig: expect.objectContaining({
                 indexerHttpUrl: 'http://configured-idx',
@@ -102,7 +108,7 @@ describe('verifyAttestationState network override', () => {
     test('network equal to the configured one → configured endpoints (env/config overrides keep winning)', async () => {
         const reader = vi.fn(async () => POSITIVE);
         const srv = setup({ attestationStateReader: reader });
-        await srv.handlers['verifyAttestationState'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'preprod' }));
+        await srv.handlers['verifyAttestation'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'preprod' }));
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractProvidersConfig: expect.objectContaining({
                 indexerHttpUrl: 'http://configured-idx',
@@ -114,16 +120,19 @@ describe('verifyAttestationState network override', () => {
     test('override to another network → that network\'s default public indexer, proof server unchanged', async () => {
         const reader = vi.fn(async () => POSITIVE);
         const srv = setup({ attestationStateReader: reader });
-        const r = await srv.handlers['verifyAttestationState'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'preview' }));
+        const r = await srv.handlers['verifyAttestation'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'preview' }));
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractProvidersConfig: expect.objectContaining({
                 indexerHttpUrl: DEFAULT_INDEXER_URLS.preview!.http,
                 indexerWsUrl: DEFAULT_INDEXER_URLS.preview!.ws,
                 proofServerUrl: 'http://proof',
                 zkConfigPath: RESOLVED.zkConfigPath
-            })
+            }),
+            tipHeight: 700
         }));
-        expect(r.verified).toBe(true);
+        // The block height comes from the indexer of the network that was read.
+        expect(tipHeight).toHaveBeenLastCalledWith(DEFAULT_INDEXER_URLS.preview!.http);
+        expect(r).toMatchObject({ verified: true, blockHeight: 700 });
     });
 
     test('override honours the cds.requires.nightgate.networks escape hatch', async () => {
@@ -132,7 +141,7 @@ describe('verifyAttestationState network override', () => {
         };
         const reader = vi.fn(async () => POSITIVE);
         const srv = setup({ attestationStateReader: reader });
-        await srv.handlers['verifyAttestationState'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'preview' }));
+        await srv.handlers['verifyAttestation'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'preview' }));
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractProvidersConfig: expect.objectContaining({
                 indexerHttpUrl: 'http://own-preview-idx',
@@ -145,7 +154,7 @@ describe('verifyAttestationState network override', () => {
         const reader = vi.fn();
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'devnet' });
-        await srv.handlers['verifyAttestationState'](req);
+        await srv.handlers['verifyAttestation'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/network must be one of: .*preview.*preprod/));
         expect(reader).not.toHaveBeenCalled();
     });
@@ -154,7 +163,7 @@ describe('verifyAttestationState network override', () => {
         mockRuntimeCfg = NO_PROVIDER;
         const reader = vi.fn(async () => POSITIVE);
         const srv = setup({ attestationStateReader: reader });
-        const r = await srv.handlers['verifyAttestationState'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'preview' }));
+        const r = await srv.handlers['verifyAttestation'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, network: 'preview' }));
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractProvidersConfig: expect.objectContaining({
                 indexerHttpUrl: DEFAULT_INDEXER_URLS.preview!.http
@@ -167,21 +176,21 @@ describe('verifyAttestationState network override', () => {
         mockRuntimeCfg = NO_PROVIDER;
         const reader = vi.fn();
         const srv = setup({ attestationStateReader: reader });
-        const r = await srv.handlers['verifyAttestationState'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD }));
-        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false, attesterId: '', payloadHash: '', recordKey: '', documentId: '' });
+        const r = await srv.handlers['verifyAttestation'](makeReq({ contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD }));
+        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false, attesterId: '', payloadHash: '', recordKey: '', documentId: '', blockHeight: null });
         expect(reader).not.toHaveBeenCalled();
     });
 });
 
-// ---- verifyPredicateState ----------------------------------------------------
+// ---- verifyPredicate ----------------------------------------------------
 
-describe('verifyPredicateState network override', () => {
+describe('verifyPredicate network override', () => {
     const ARGS = { contractAddress: VAULT, attesterId: 'b'.repeat(64), payloadHash: PAYLOAD, fieldKey: 'e'.repeat(64), predicate: 'greaterOrEqual', threshold: 42 };
 
     test('override to another network → that network\'s default public indexer', async () => {
         const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
-        const r = await srv.handlers['verifyPredicateState'](makeReq({ ...ARGS, network: 'preview' }));
+        const r = await srv.handlers['verifyPredicate'](makeReq({ ...ARGS, network: 'preview' }));
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractProvidersConfig: expect.objectContaining({
                 indexerHttpUrl: DEFAULT_INDEXER_URLS.preview!.http,
@@ -189,13 +198,13 @@ describe('verifyPredicateState network override', () => {
                 proofServerUrl: 'http://proof'
             })
         }));
-        expect(r).toEqual({ verified: true, proven: true });
+        expect(r).toEqual({ verified: true, proven: true, blockHeight: 700 });
     });
 
     test('omitted network → configured endpoints', async () => {
         const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
-        await srv.handlers['verifyPredicateState'](makeReq({ ...ARGS }));
+        await srv.handlers['verifyPredicate'](makeReq({ ...ARGS }));
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractProvidersConfig: expect.objectContaining({
                 indexerHttpUrl: 'http://configured-idx'
@@ -207,7 +216,7 @@ describe('verifyPredicateState network override', () => {
         const reader = vi.fn();
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...ARGS, network: 'PREVIEW' });
-        await srv.handlers['verifyPredicateState'](req);
+        await srv.handlers['verifyPredicate'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/network must be one of/));
         expect(reader).not.toHaveBeenCalled();
     });

@@ -45,7 +45,7 @@ describe('agent token reads over HTTP', () => {
             allowedActions: JSON.stringify(['anchorDocument']), isActive: true, createdAt: now, modifiedAt: now
         }));
         const doc = (id: string, sessionId: string | null, storageRef: string) => ({
-            ID: id, userId: OPERATOR, sha256: sha256Hex(id), storageRef, sessionId,
+            ID: id, userId: OPERATOR, payloadHash: sha256Hex(id), storageRef, sessionId,
             contractAddress: 'b'.repeat(64), createdAt: now, modifiedAt: now
         });
         await db.run(cds.ql.INSERT.into('midnight.Documents').entries([
@@ -62,18 +62,40 @@ describe('agent token reads over HTTP', () => {
         expect(refs).toEqual(['s3://private/own-session']);
     });
 
-    it('a token calls the bound read functions of the chain entities', async () => {
+    it('a token sees only the proofs and disclosure grants of its own session', async () => {
+        const db = await cds.connect.to('db');
+        const now = new Date().toISOString();
+        const owned = (n: number, sessionId: string | null) => ({
+            ID: `44444444-4444-4444-8444-44444444444${n}`, userId: OPERATOR, sessionId,
+            payloadHash: 'ab'.repeat(32), contractAddress: 'b'.repeat(64), createdAt: now, modifiedAt: now
+        });
+        await db.run(cds.ql.INSERT.into('midnight.PredicateAttestations').entries(
+            [owned(1, SESSION), owned(2, OTHER_SESSION), owned(3, null)].map(r => ({ ...r, predicate: 'greaterOrEqual', op: 1, threshold: 7 }))));
+        await db.run(cds.ql.INSERT.into('midnight.DisclosureGrants').entries(
+            [owned(1, SESSION), owned(2, OTHER_SESSION), owned(3, null)].map((r, i) => ({ ...r, grantee: String(i).repeat(64), level: 1 }))));
+        for (const entity of ['PredicateAttestations', 'DisclosureGrants']) {
+            const res = await get(entity, asToken);
+            expect(res.status).toBe(200);
+            expect(res.data.value.map((r: any) => r.ID)).toEqual(['44444444-4444-4444-8444-444444444441']);
+            const own = await get(entity, asOperator);
+            expect(own.data.value).toHaveLength(3);
+        }
+    });
+
+    it('a token reads the chain entities and calls their bound read functions', async () => {
         const db = await cds.connect.to('db');
         const now = new Date().toISOString();
         await db.run(cds.ql.INSERT.into('midnight.Blocks').entries({
             ID: cds.utils.uuid(), hash: 'a'.repeat(64), height: 7, protocolVersion: 1, timestamp: 1700000000,
             createdAt: now, modifiedAt: now
         }));
-        const latest = await get('Blocks/latest()', asToken);
-        expect(latest.status).toBe(200);
-        expect(String(latest.data.height)).toBe('7');
-        const holders = await get('NightBalances/getTopHolders(limit=5)', asToken);
+        const newest = await get('Blocks?$orderby=height%20desc&$top=1', asToken);
+        expect(newest.status).toBe(200);
+        expect(String(newest.data.value[0].height)).toBe('7');
+        const holders = await get('NightBalances?$orderby=balance%20desc&$top=5', asToken);
         expect(holders.status).toBe(200);
+        const byHash = await get(`Transactions/byHash(hash='${'b'.repeat(64)}')`, asToken);
+        expect(byHash.status).toBe(200);
     });
 
     it('a token cannot read GranteeIdentities', async () => {
@@ -93,8 +115,9 @@ describe('agent token reads over HTTP', () => {
         await db.run(cds.ql.INSERT.into('midnight.BackgroundJobs').entries([
             job(own, GRANT), job(otherGrant, 'a1a1a1a1-0000-4000-8000-00000000000b'), job(noGrant, null)
         ]));
-        const status = (body: Record<string, string>, headers: Record<string, string>) =>
-            cap.axios.post(`${API}/getJobStatus`, body, { headers, validateStatus: () => true });
+        const status = (ids: Record<string, string>, headers: Record<string, string>) => cap.axios.get(
+            `${API}/getJobStatus(${Object.entries(ids).map(([name, id]) => `${name}='${id}'`).join(',')})`, { headers, validateStatus: () => true }
+        );
 
         const mine = await status({ jobId: own }, asToken);
         expect([mine.status, mine.data.jobId, mine.data.status]).toEqual([200, own, 'succeeded']);
@@ -102,6 +125,9 @@ describe('agent token reads over HTTP', () => {
         expect((await status({ jobId: noGrant }, asToken)).status).toBe(404);
         // naming the session the job runs under works as before
         expect((await status({ jobId: own, sessionId: POOL }, asToken)).status).toBe(200);
+        // naming the pool opens no job another grant of the same user started there
+        expect((await status({ jobId: otherGrant, sessionId: POOL }, asToken)).status).toBe(404);
+        expect((await status({ jobId: noGrant, sessionId: POOL }, asToken)).status).toBe(404);
         // the operator started all three
         for (const jobId of [own, otherGrant, noGrant]) expect((await status({ jobId }, asOperator)).status).toBe(200);
     });

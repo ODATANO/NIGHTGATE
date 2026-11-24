@@ -9,15 +9,15 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json package-lock.json ./
-# Full install on purpose: the repo-as-app serves via its devDependencies
-# (@sap/cds, @sap/cds-dk, @cap-js/sqlite). Slimming is a later optimization.
+# The build needs the dev packages (TypeScript, cds-typer). They are pruned below.
 RUN npm ci
 COPY . .
 RUN npm run build
 # The image carries every prover key of the registered lineages (fetched from
 # the packages' release assets, verified against their manifests); refuse to
 # build one that would fetch at runtime.
-RUN set -e; for c in counter shielded-token token-factory holder-registry attestation-vault attestation-vault-32; do node scripts/fetch-contract-keys.mjs "$c"; done
+RUN set -e; for c in counter token-factory holder-registry attestation-vault attestation-vault-32; do node scripts/fetch-contract-keys.mjs "$c"; done
+RUN npm prune --omit=dev
 
 FROM node:22.23.4-slim
 ARG VERSION=dev

@@ -26,8 +26,8 @@ export type ChainOutcome = {
     status: 'success' | 'failure';
     blockHeight: number;
     blockHash?: string | null;
-    /** The indexer's own transaction hash. It differs from the identifier and the node's extrinsic hash. */
-    indexerTxHash?: string | null;
+    /** The ledger hash, as the indexer names the transaction. */
+    txHash?: string | null;
     /** The indexer's raw result. PARTIAL_SUCCESS counts as `failure` in `status`. */
     result?: 'SUCCESS' | 'PARTIAL_SUCCESS' | 'FAILURE';
     /** Parts of the transaction that the indexer reports as not applied. */
@@ -82,18 +82,19 @@ interface IndexedTxSlice {
     failedSegments: number[];
 }
 
+/** What a job knows of its transaction. A job stored before both were kept may carry only one of them. */
+export interface TxRef { txId?: string | null; txHash?: string | null }
+
 /**
  * Looks a transaction up by identifier, then by hash. Returns the result, "absent", or null when known but not final. Throws on network or query errors.
  */
 export function createHttpTxConfirmer(
     cfg: IndexerTxConfirmerConfig
-): (txHash: string) => Promise<ChainLookup> {
+): (ref: TxRef) => Promise<ChainLookup> {
     if (!cfg.indexerHttpUrl) throw new Error('indexerHttpUrl is required');
     const doFetch = cfg.fetchFn ?? fetch;
     const timeoutMs = cfg.timeoutMs ?? 8000;
 
-    // The stored `txHash` is usually the ledger transaction identifier.
-    // The lookup by hash covers rows that stored a hash instead.
     type Lookup = { present: false; asOfMs: number | null; keyInvalid: boolean } | { present: true; slice: IndexedTxSlice | null };
     const lookup = async (offset: Record<string, string>): Promise<Lookup> => {
         let data: TxStatusAnswer | null | undefined;
@@ -128,14 +129,17 @@ export function createHttpTxConfirmer(
             }
         };
     };
-    return async (txHash: string): Promise<ChainLookup> => {
-        const byId = await lookup({ identifier: txHash });
-        if (byId.present) return outcomeOf(byId.slice);
-        const byHash = await lookup({ hash: txHash });
-        if (byHash.present) return outcomeOf(byHash.slice);
-        // The two answers may come from different indexer servers, so use the older block time.
+    return async (ref: TxRef): Promise<ChainLookup> => {
+        const offsets: Array<Record<string, string>> = [...(ref.txId ? [{ identifier: ref.txId }] : []), ...(ref.txHash ? [{ hash: ref.txHash }] : [])];
+        const missing: Array<Extract<Lookup, { present: false }>> = [];
+        for (const offset of offsets) {
+            const found = await lookup(offset);
+            if (found.present) return outcomeOf(found.slice);
+            missing.push(found);
+        }
+        // The answers may come from different indexer servers, so use the older block time.
         // A missing time means no conclusion. Lookups with a wrong value form are ignored.
-        const tips = [byId, byHash].filter((l) => !l.keyInvalid).map((l) => l.asOfMs);
+        const tips = missing.filter((l) => !l.keyInvalid).map((l) => l.asOfMs);
         const asOfMs = tips.length === 0 || tips.some((t) => t === null) ? null : Math.min(...(tips as number[]));
         return chainAbsent(asOfMs);
     };
@@ -144,7 +148,7 @@ export function createHttpTxConfirmer(
         const mapped = mapIndexerStatus(slice.status);
         if (!mapped) return null;
         return {
-            status: mapped, blockHeight: slice.blockHeight, blockHash: slice.blockHash, indexerTxHash: slice.hash,
+            status: mapped, blockHeight: slice.blockHeight, blockHash: slice.blockHash, txHash: slice.hash,
             result: slice.status as ChainOutcome['result'], failedSegments: slice.failedSegments
         };
     }

@@ -8,9 +8,6 @@
  */
 
 vi.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({ __esModule: true, marker: 'indexer' }));
-vi.mock('@midnight-ntwrk/midnight-js-http-client-proof-provider', () => ({ __esModule: true, marker: 'proof' }));
-vi.mock('@midnight-ntwrk/midnight-js-node-zk-config-provider', () => ({ __esModule: true, marker: 'zk' }));
-vi.mock('@midnight-ntwrk/midnight-js-level-private-state-provider', () => ({ __esModule: true, marker: 'level' }));
 vi.mock('@midnightntwrk/ledger-v9', () => ({ __esModule: true, marker: 'ledger-v9' }));
 
 import {
@@ -25,12 +22,10 @@ describe('sdk-loader', () => {
     });
 
     describe('loadMidnightSdk', () => {
-        it('loads the four provider packages and returns them as a bundle', async () => {
+        it('loads the indexer provider package, the one the main thread uses', async () => {
             const bundle: any = await loadMidnightSdk();
+            expect(Object.keys(bundle)).toEqual(['indexer']);
             expect(bundle.indexer.marker).toBe('indexer');
-            expect(bundle.proof.marker).toBe('proof');
-            expect(bundle.zk.marker).toBe('zk');
-            expect(bundle.level.marker).toBe('level');
         });
 
         it('returns the cached bundle on subsequent calls (same object reference)', async () => {

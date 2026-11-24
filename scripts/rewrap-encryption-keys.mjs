@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Re-encrypts every stored ciphertext under the active key. Stop the server first; exit 0 means the old key may leave the ring.
-// Run: npx nightgate-rewrap-keys [--dry-run] [--batch 200] [--drop-legacy-sync-state]
+// Run: node scripts/rewrap-encryption-keys.mjs [--dry-run] [--batch 200]
 // Env: ENCRYPTION_KEYS="id=secret,..." with the old key, ENCRYPTION_KEY_ACTIVE, and NIGHTGATE_DB_URL or NIGHTGATE_DB_PATH.
 
 import { createRequire } from 'node:module';
@@ -11,14 +11,6 @@ import { fileURLToPath } from 'node:url';
 const require = createRequire(import.meta.url);
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-function requireFromHost(name, hint) {
-    const candidates = [require, createRequire(path.join(process.cwd(), 'package.json'))];
-    for (const r of candidates) {
-        try { return r(name); } catch (e) { if (e?.code !== 'MODULE_NOT_FOUND' || !String(e.message).includes(name)) throw e; }
-    }
-    console.error(`'${name}' is not installed (neither next to @odatano/nightgate nor in ${process.cwd()}). ${hint}`);
-    process.exit(2);
-}
 
 function arg(name, fallback) {
     const i = process.argv.indexOf(name);
@@ -26,16 +18,14 @@ function arg(name, fallback) {
     return fallback;
 }
 const DRY = process.argv.includes('--dry-run');
-const DROP_LEGACY_SYNC = process.argv.includes('--drop-legacy-sync-state');
 const BATCH = Math.max(1, Number(arg('--batch', '200')) || 200);
 const positional = process.argv.slice(2).filter((a, i, all) => !a.startsWith('--') && all[i - 1] !== '--batch');
 
-const cds = requireFromHost('@sap/cds', 'Run this from a CAP project that has @sap/cds installed.');
+const cds = require('@sap/cds');
 const { postgresCredentials, postgresKind } = await import(new URL('../docker/cds-config.mjs', import.meta.url).href);
 
 const dbUrl = String(process.env.NIGHTGATE_DB_URL ?? '').trim();
 if (dbUrl) {
-    requireFromHost('@cap-js/postgres/package.json', 'Install it in the host: npm i @cap-js/postgres');
     cds.env.requires.kinds = { ...(cds.env.requires.kinds ?? {}), postgres: postgresKind() };
     cds.env.requires.db = { kind: 'postgres', credentials: postgresCredentials(dbUrl) };
 } else {
@@ -62,20 +52,15 @@ cds.model = cds.compile.for.nodejs(model);
 const db = await cds.connect.to('db');
 
 try {
-    const report = await rewrapStoredCiphertexts(db, { ring, dryRun: DRY, batchSize: BATCH, dropLegacySyncState: DROP_LEGACY_SYNC, log: m => console.log(`[rewrap] ${m}`) });
-    const total = report.envelope.reduce((n, e) => n + e.rewrapped, 0) + report.syncState.blobsRewrapped + report.privateState.rowsRewrapped;
+    const report = await rewrapStoredCiphertexts(db, { ring, dryRun: DRY, batchSize: BATCH, log: m => console.log(`[rewrap] ${m}`) });
+    const total = report.envelope.reduce((n, e) => n + e.rewrapped, 0);
+    const unreadable = report.envelope.reduce((n, e) => n + e.unreadable, 0);
     console.log(`[rewrap] ${DRY ? 'would rewrap' : 'rewrapped'} ${total} value(s) under key '${report.activeId}'`);
-    const legacy = report.legacy;
-    const stuck = legacy.accounts.filter(a => !report.migratableAccounts.includes(a));
-    if (legacy.total > 0 && (!DRY || stuck.length > 0)) {
-        for (const t of legacy.tables) if (t.rows > 0) console.log(`[rewrap] ! ${t.entity}: ${t.rows} legacy ${t.what} of ${t.accounts} account(s)`);
-        for (const a of stuck) console.log(`[rewrap] ! account ${a.slice(0, 16)}: no session with a readable viewing key; its rows migrate when the wallet reconnects`);
-        console.log(`[rewrap] ! ${DRY ? 'after a real run ' : ''}${stuck.length} account(s) keep rows under a pre-account-key derivation. The key they were written under MUST stay in the ring until every one of them has reconnected (run this tool again until it reports zero legacy rows), or until their sync-state rows are dropped (--drop-legacy-sync-state; private state and signing keys are never dropped).`);
+    if (unreadable > 0) {
+        console.log(`[rewrap] ! ${unreadable} value(s) could not be read and stay under their old key. That key MUST stay in the ring.`);
         process.exitCode = 1;
     } else if (!DRY) {
-        console.log('[rewrap] done, no legacy rows remain; the old key can leave the ring once every server using this database has restarted with the new ring');
-    } else {
-        console.log('[rewrap] dry run: a real run leaves no legacy rows behind');
+        console.log('[rewrap] done; the old key can leave the ring once every server using this database has restarted with the new ring');
     }
 } catch (err) {
     console.error(`[rewrap] ! ${err?.message ?? err}`);

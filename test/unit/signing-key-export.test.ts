@@ -22,7 +22,8 @@ const OTHER_RING = new KeyRing({ activeId: 'z', keys: [{ id: 'z', secret: 'anoth
 const VK = 'vk-export-'.padEnd(64, 'e');
 const SESSION = '33333333-3333-4333-8333-333333333333';
 const CONTRACT = 'c'.repeat(64);
-const SIGNING_KEY = 'synthetic-signing-key-material';
+const SIGNING_KEY_VALUE = { tag: 'schnorr', value: '5a'.repeat(32) };
+const SIGNING_KEY = JSON.stringify(SIGNING_KEY_VALUE);
 const PASSWORD = 'custody-password-of-sixteen+';
 
 describe('contract signing key export', () => {
@@ -38,7 +39,7 @@ describe('contract signing key export', () => {
         await db.run(DELETE.from('midnight.ContractSigningKeys'));
         await db.run(DELETE.from('midnight.AccountKeys'));
         await db.run(INSERT.into('midnight.WalletSessions').entries({
-            ID: 'sess-export', sessionId: SESSION, userId: 'operator', connectedAt: new Date().toISOString(), isActive: true,
+            sessionId: SESSION, userId: 'operator', connectedAt: new Date().toISOString(), isActive: true,
             viewingKeyHash: 'hx', encryptedViewingKey: encrypt(VK, RING, walletSessionViewingKeyBinding(SESSION)), encryptedSeedKey: null
         }));
         accountId = deriveAccountId(VK);
@@ -59,7 +60,8 @@ describe('contract signing key export', () => {
         expect(out.accountId).toBe(accountId);
         expect(out.salt).toMatch(HEX64_RE);
         const payload = JSON.parse(decryptWithPassword(out.encryptedPayload, PASSWORD));
-        expect(payload).toEqual({ version: 1, keyCount: 1, keys: { [CONTRACT]: SIGNING_KEY } });
+        // The key is the object midnight-js writes and checks on import, not the stored text.
+        expect(payload).toEqual({ version: 1, exportedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/), keyCount: 1, keys: { [CONTRACT]: SIGNING_KEY_VALUE } });
         expect(() => decryptWithPassword(out.encryptedPayload, 'not-the-export-password')).toThrow();
     });
 
@@ -72,9 +74,7 @@ describe('contract signing key export', () => {
         await expect(foreign).rejects.toMatchObject({ status: 500 });
     });
 
-    test('refuses an inactive session and a row still under a pre-account-key derivation', async () => {
-        await db.run(UPDATE.entity('midnight.ContractSigningKeys').set({ keyScheme: null }).where({ accountId, contractAddress: CONTRACT }));
-        await expect(exportContractSigningKeyForSession(db, RING, SESSION, CONTRACT, PASSWORD)).rejects.toMatchObject({ status: 409 });
+    test('refuses an inactive session', async () => {
         await db.run(UPDATE.entity('midnight.WalletSessions').set({ isActive: false }).where({ sessionId: SESSION }));
         await expect(exportContractSigningKeyForSession(db, RING, SESSION, CONTRACT, PASSWORD)).rejects.toMatchObject({ status: 404 });
     });

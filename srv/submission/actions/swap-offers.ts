@@ -31,7 +31,6 @@ const MAX_LIST_LIMIT = 200;
 export const boardWaiters = waiterPool(100);
 
 type StatusFilter = SwapOfferStatus | 'all';
-const STATUS_FILTERS: ReadonlySet<string> = new Set(['open', 'filled', 'retired', 'expired', 'all']);
 
 function parseTags(v: readonly unknown[] | null | undefined): string[] | string {
     if (v === undefined || v === null) return [];
@@ -53,19 +52,25 @@ function isPoster(row: SwapOffer, req: Request): boolean {
 }
 
 /** When the offer last changed: the row update, or the moment it expired. */
-function changedAtOf(row: SwapOffer, now: Date): string | null {
+function changedAtOf(row: Pick<SwapOffer, 'status' | 'expiresAt' | 'modifiedAt' | 'createdAt'>, now: Date): string | null {
     const stamped = row.modifiedAt ?? row.createdAt ?? null;
     if (row.status !== 'open' || !row.expiresAt || Date.parse(row.expiresAt) > now.getTime()) return stamped;
     return stamped && Date.parse(stamped) > Date.parse(row.expiresAt) ? stamped : row.expiresAt;
 }
 
-function publicView(row: SwapOffer, now: Date) {
+/** `changedAtOf` as a query expression, so the database can sort and compare by it. */
+function changedAtExpr(nowIso: string) {
+    return { xpr: ['case', 'when', { ref: ['status'] }, '=', { val: 'open' }, 'and', { ref: ['expiresAt'] }, '<=', { val: nowIso },
+        'and', { ref: ['expiresAt'] }, '>', { ref: ['modifiedAt'] }, 'then', { ref: ['expiresAt'] }, 'else', { ref: ['modifiedAt'] }, 'end'] };
+}
+
+function listView(row: Omit<SwapOffer, 'offer'>, now: Date) {
     return {
-        offerId: row.ID, offer: row.offer, bound: row.bound === true,
+        offerId: row.ID, bound: row.bound === true,
         givesType: row.givesType, givesAmount: row.givesAmount, wantsType: row.wantsType, wantsAmount: row.wantsAmount,
         tags: parseJsonStringList(row.tags), expiresAt: row.expiresAt ?? null, postedAt: row.createdAt ?? null,
         status: effectiveSwapOfferStatus(row, now), filledTxHash: row.filledTxHash ?? null, closedAt: row.closedAt ?? null,
-        changedAt: changedAtOf(row, now), directed: !!row.takerSecretHash
+        changedAt: changedAtOf(row, now)
     };
 }
 
@@ -87,11 +92,6 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         }
         const parsedTags = parseTags(tags);
         if (typeof parsedTags === 'string') return req.reject(400, parsedTags);
-        let takerSecretHash: string | null = null;
-        if (req.data.takerSecretHash !== undefined && req.data.takerSecretHash !== null && req.data.takerSecretHash !== '') {
-            takerSecretHash = String(req.data.takerSecretHash).trim().toLowerCase();
-            if (!HEX64_RE.test(takerSecretHash)) return req.reject(400, 'takerSecretHash must be 64 hex characters (sha256 of the taker secret)');
-        }
         if (!checkRateClass('compute', 'compute', req)) return;
 
         return runSubmission(req, async () => {
@@ -110,14 +110,12 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 ID, offer: offer.trim(), givesType: half.gives.tokenType, givesAmount: half.gives.amount,
                 wantsType: half.wants.tokenType, wantsAmount: half.wants.amount, bound: half.bound, inputs: half.inputs,
                 nullifiers: JSON.stringify(half.nullifiers), tags: JSON.stringify(parsedTags), status: 'open', expiresAt: expiry,
-                takerSecretHash,
                 ...posterOf(req), sessionId: req.agentGrant?.sessionId ?? null, createdAt: now, modifiedAt: now
             }));
             return {
                 offerId: ID, status: 'open', bound: half.bound,
                 givesType: half.gives.tokenType, givesAmount: half.gives.amount,
-                wantsType: half.wants.tokenType, wantsAmount: half.wants.amount, expiresAt: expiry,
-                directed: !!takerSecretHash
+                wantsType: half.wants.tokenType, wantsAmount: half.wants.amount, expiresAt: expiry
             };
         });
     });
@@ -132,10 +130,8 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
             if (!HEX64_RE.test(v)) return req.reject(400, `${name} must be 64 hex characters`);
             where[name] = v;
         }
-        const n = limit === undefined || limit === null ? DEFAULT_LIST_LIMIT : Number(limit);
-        if (!Number.isInteger(n) || n < 1 || n > MAX_LIST_LIMIT) return req.reject(400, `limit must be an integer from 1 to ${MAX_LIST_LIMIT}`);
-        const statusFilter = (status === undefined || status === null || status === '' ? 'open' : String(status).trim().toLowerCase()) as StatusFilter;
-        if (!STATUS_FILTERS.has(statusFilter)) return req.reject(400, `status must be one of ${[...STATUS_FILTERS].join(', ')}`);
+        const n = limit ?? DEFAULT_LIST_LIMIT;
+        const statusFilter: StatusFilter = status ?? 'open';
         let sinceIso: string | null = null;
         if (since !== undefined && since !== null && since !== '') {
             const ms = Date.parse(String(since));
@@ -150,18 +146,24 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
 
         // Expiry is checked in the query. Listing never writes the expired status,
         // so the limit counts only matching offers.
+        // A list row carries the terms only. The half, up to 256 KB each, is read by id with getSwapOffer.
+        type ListedOffer = Omit<SwapOffer, 'offer'>;
+        const listed = () => { const q = SELECT.from(SwapOffers); q.SELECT.excluding = ['offer']; return q; };
         const offers = (nowIso: string) => {
-            const q = SELECT.from(SwapOffers).where(where);
+            const q = listed().where(where);
             if (statusFilter === 'open') q.where({ status: 'open' }).and('expiresAt is null or expiresAt >', nowIso);
             else if (statusFilter === 'expired') q.where("status = 'expired' or (status = 'open' and expiresAt <=", nowIso, ')');
             else if (statusFilter !== 'all') q.where({ status: statusFilter });
             // An expired offer counts as changed at expiresAt, even if its row still says open.
             if (sinceIso) q.where('modifiedAt >', sinceIso, "or (status = 'open' and expiresAt <=", nowIso, 'and expiresAt >', sinceIso, ')');
-            return q.orderBy(statusFilter === 'open' ? 'createdAt desc' : 'modifiedAt desc');
+            // A feed reads the oldest changes first, so the next `since` is the last `changedAt` and nothing beyond the limit is lost.
+            if (sinceIso) q.SELECT.orderBy = [{ ...changedAtExpr(nowIso), sort: 'asc' }, { ref: ['ID'], sort: 'asc' }];
+            else q.orderBy(statusFilter === 'open' ? 'createdAt desc' : 'modifiedAt desc');
+            return q;
         };
-        const load = async (now: Date): Promise<SwapOffer[]> => {
+        const load = async (now: Date): Promise<ListedOffer[]> => {
             const nowIso = now.toISOString();
-            if (!wantTag) return (await db.run(offers(nowIso).limit(n)) as SwapOffer[] | undefined) ?? [];
+            if (!wantTag) return (await db.run(offers(nowIso).limit(n)) as ListedOffer[] | undefined) ?? [];
             // Tags are stored as JSON text. The database keeps the rows whose text holds the quoted tag, the exact check follows per row.
             // Page through IDs and tags until enough offers match, then load only those offers.
             const tagged = (): ReturnType<typeof offers> => offers(nowIso).where`contains(tags, ${JSON.stringify(wantTag)})`;
@@ -176,22 +178,37 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
                 if (heads.length < page) break;
             }
             if (ids.length === 0) return [];
-            const rows = (await db.run(SELECT.from(SwapOffers).where({ ID: { in: ids } })) as SwapOffer[] | undefined) ?? [];
+            const rows = (await db.run(listed().where({ ID: { in: ids } })) as ListedOffer[] | undefined) ?? [];
             const order = new Map(ids.map((id, i) => [id, i]));
             return rows.sort((a, b) => (order.get(a.ID) ?? 0) - (order.get(b.ID) ?? 0));
+        };
+        // A full feed page ends with every offer that changed at the same instant as its last one.
+        // Otherwise the next read, `since` that instant, would skip the rest of them.
+        const feedPage = async (now: Date): Promise<ListedOffer[]> => {
+            const rows = await load(now);
+            if (!sinceIso || rows.length < n) return rows;
+            const last = changedAtOf(rows[rows.length - 1], now);
+            if (!last) return rows;
+            const nowIso = now.toISOString();
+            const tie = offers(nowIso);
+            tie.SELECT.where = [...(tie.SELECT.where ?? []), 'and', changedAtExpr(nowIso), '=', { val: last }];
+            const seen = new Set(rows.map(r => r.ID));
+            const more = ((await db.run(tie) as ListedOffer[] | undefined) ?? [])
+                .filter(r => !seen.has(r.ID) && (!wantTag || parseJsonStringList(r.tags).includes(wantTag)));
+            return [...rows, ...more];
         };
 
         if (!waitMs) {
             const now = new Date();
-            return (await load(now)).map(row => publicView(row, now));
+            return (await feedPage(now)).map(row => listView(row, now));
         }
         // Each read runs outside the request's transaction, so a waiting call holds no database connection.
         const readOnce = async () => {
             const now = new Date();
-            return { rows: await runWithoutAmbientTx(() => load(now)), now };
+            return { rows: await runWithoutAmbientTx(() => feedPage(now)), now };
         };
         const result = await holdUntil(req, waitMs, boardWaiters, await readOnce(), readOnce, r => r.rows.length > 0);
-        return result.rows.map(row => publicView(row, result.now));
+        return result.rows.map(row => listView(row, result.now));
     });
 
     srv.on(getSwapOffer, async (req) => {
@@ -200,7 +217,7 @@ export function registerSwapOfferActions(ctx: Pick<SubmissionContext, 'srv' | 'd
         if (!checkRateClass('read', 'read', req)) return;
         const row = await loadSwapOffer(db, String(offerId));
         if (!row) return req.reject(404, 'swap offer not found');
-        return publicView(row, new Date());
+        return { ...listView(row, new Date()), offer: row.offer };
     });
 
     srv.on(retireSwapOffer, async (req) => {

@@ -2,30 +2,28 @@
 // The account id and storage passwords derive from the viewing key, so a reconnect finds the same encrypted state.
 
 import cds from '@sap/cds';
-import { assertSeedHex } from '../utils/hex-patterns';
+import { assertSeedHex, bareHex } from '../utils/hex-patterns';
 const { SELECT } = cds.ql;
-import { WalletSessions } from '#cds-models/midnight';
+import { WalletSessions, type WalletSession } from '#cds-models/midnight';
 import crypto from 'crypto';
-import { decrypt, getEncryptionKey, deriveBoundSecret, KeyRing } from '../utils/crypto';
+import { decrypt, getEncryptionKey, hashViewingKey, KeyRing } from '../utils/crypto';
 import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../utils/envelope-bindings';
-import { resolveAccountDek, privateStatePasswordFromDek } from './account-keys';
+import { resolveAccountDek, privateStatePasswordFromDek, syncStatePassphraseFromDek, dropAccountDek, evictAccountDek } from './account-keys';
+import { movePrivateRows } from '../midnight/CapDbPrivateStateProvider';
+import { moveSyncState, evictEncryptionKey } from './wallet-sync-state-store';
 import { loadLedger } from '../midnight/sdk-loader';
 import { deriveRoleSeeds, type RoleSeeds } from '../utils/wallet-hd';
 import { deriveAttesterId } from '../utils/wallet-info';
 import { isSessionExpired } from '../utils/session-expiry';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
-import type { WalletMaterial, PrivateStateBackend, WalletPublicKeys } from '../midnight/providers';
+import type { WalletMaterial, WalletPublicKeys } from '../midnight/providers';
 import type { DbRunner } from '../utils/db-types';
 import type { DustSecretKey, ZswapSecretKeys } from '@midnightntwrk/ledger-v9';
-import { NightgateError } from '../utils/errors';
+import { NightgateError, SessionNotFoundError } from '../utils/errors';
 
 // ---- Errors ---------------------------------------------------------------
 
-export class SessionNotFoundError extends NightgateError {
-    constructor(sessionId: string) {
-        super('SESSION_NOT_FOUND', `Session '${sessionId}' not found, expired, or inactive`);
-    }
-}
+export { SessionNotFoundError };
 
 /** Thrown when a session that holds only a viewing key is asked to sign. */
 export class WalletSigningNotAvailable extends NightgateError {
@@ -50,7 +48,6 @@ export interface BuildWalletMaterialOptions {
     sessionId: string;
     /** The user who owns the session. Another user gets SessionNotFound. */
     expectedUserId?: string;
-    privateStateBackend?: PrivateStateBackend;
     /** For tests. Defaults to cds.connect.to('db'). */
     db?: DbRunner;
     /** For tests. Defaults to the process key from srv/utils/crypto.ts. */
@@ -93,14 +90,12 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
     }
 
     const accountId = deriveAccountId(viewingKey);
-    // The per-account data key is created here when first needed. Data still encrypted
-    // with an older password is read with that password and re-encrypted under the data key.
+    // The per-account data key is created here when first needed.
     const ring = encKey instanceof KeyRing ? encKey : Buffer.isBuffer(encKey) ? KeyRing.fromKek(encKey) : getEncryptionKey();
     const storagePassword = deriveStoragePassword(viewingKey);
     const dek = await resolveAccountDek({ db, ring, accountId, storagePassword });
     if (!dek) throw new SessionNotFoundError(opts.sessionId);
     const password = privateStatePasswordFromDek(dek, accountId);
-    const legacyPasswords = privateStatePasswordCandidates(ring, viewingKey).map(c => c.password);
     // The sync-state store finds the data key itself from this password.
     const syncStatePassphrase = storagePassword;
     // Taken from the session row, never from the caller, so it matches the viewing key's account.
@@ -134,9 +129,7 @@ export async function buildWalletMaterialForSession(opts: BuildWalletMaterialOpt
     return {
         accountId,
         privateStoragePasswordProvider: () => password,
-        privateStoragePasswordFallbacks: () => legacyPasswords,
         walletAndMidnightProvider,
-        privateStateBackend: opts.privateStateBackend,
         ensureFacade
     };
 }
@@ -153,20 +146,80 @@ export function deriveStoragePassword(viewingKey: string): string {
     return crypto.createHmac('sha256', PRIVATE_STATE_PASSWORD_LABEL).update(viewingKey).digest('hex');
 }
 
-const PRIVATE_STATE_INFO = 'nightgate/private-state/v2';
+// ---- One account per viewing key ------------------------------------------
 
-/** Older private-state password under master key `keyId`. Only used for reading. */
-export function derivePrivateStatePassword(ring: KeyRing, keyId: string, viewingKey: string): string {
-    return deriveBoundSecret(ring, keyId, deriveStoragePassword(viewingKey), PRIVATE_STATE_INFO).toString('hex');
+const ACCOUNT_TABLES = ['midnight.AccountKeys', 'midnight.PrivateStates', 'midnight.ContractSigningKeys', 'midnight.WalletSyncStates'];
+
+async function isAccountStored(db: DbRunner, accountId: string): Promise<boolean> {
+    for (const table of ACCOUNT_TABLES) {
+        if (await db.run(SELECT.one.from(table).columns('accountId').where({ accountId }))) return true;
+    }
+    return false;
 }
 
-/** All private-state passwords to try when reading, the active master key first. Also used by the re-encryption tool. */
-export function privateStatePasswordCandidates(ring: KeyRing, viewingKey: string): Array<{ keyId: string | null; password: string; legacy: boolean }> {
-    const out = [ring.activeId, ...ring.ids().filter(i => i !== ring.activeId)].map(id => ({
-        keyId: id as string | null, password: derivePrivateStatePassword(ring, id, viewingKey), legacy: false
-    }));
-    out.push({ keyId: null, password: deriveStoragePassword(viewingKey), legacy: true });
-    return out;
+/** Spellings of a viewing key that an account may still be stored under: the one the caller sent, and upper case. */
+export function otherSpellings(viewingKey: string, sent?: string): string[] {
+    const canonical = bareHex(viewingKey);
+    const spellings = [sent?.replace(/^0x/i, ''), canonical.toUpperCase()];
+    return [...new Set(spellings.filter((s): s is string => !!s && s !== canonical))];
+}
+
+/** The sessions whose stored viewing key has this spelling. */
+export async function sessionsHolding(db: DbRunner, spelling: string): Promise<string[]> {
+    const rows: Array<Pick<WalletSession, 'sessionId'>> = await db.run(SELECT.from(WalletSessions).columns('sessionId')
+        .where({ viewingKeyHash: hashViewingKey(spelling), encryptedViewingKey: { '!=': null } })) ?? [];
+    return rows.map(r => String(r.sessionId));
+}
+
+/** Moves what is stored under another spelling of a viewing key to the account of its lowercase spelling. Null when nothing is stored.
+ *  Run it in one transaction. If that does not commit, call `forgetAccountKeys`. */
+export async function moveAccountOfSpelling(db: DbRunner, ring: KeyRing, spelling: string): Promise<{ moved: number; left: number } | null> {
+    const canonical = bareHex(spelling);
+    const from = deriveAccountId(spelling);
+    if (spelling === canonical || !await isAccountStored(db, from)) return null;
+    const to = deriveAccountId(canonical);
+    const fromPassword = deriveStoragePassword(spelling);
+    const fromDek = await resolveAccountDek({ db, ring, accountId: from, storagePassword: fromPassword, create: false, readOnly: true });
+    const toDek = await resolveAccountDek({ db, ring, accountId: to, storagePassword: deriveStoragePassword(canonical) });
+    if (!toDek) throw new Error('the account key of the lowercase spelling could not be created');
+    try {
+        const rows = await movePrivateRows(db, {
+            accountId: from,
+            password: fromDek ? privateStatePasswordFromDek(fromDek, from) : undefined
+        }, { accountId: to, password: privateStatePasswordFromDek(toDek, to) });
+        await moveSyncState(db,
+            { accountId: from, dekPassphrase: fromDek ? syncStatePassphraseFromDek(fromDek, from) : undefined },
+            { accountId: to, dekPassphrase: syncStatePassphraseFromDek(toDek, to) });
+        // Rows left behind are still encrypted with the old account's key.
+        if (rows.left === 0) await dropAccountDek(db, from);
+        return rows;
+    } finally {
+        fromDek?.fill(0);
+        toDek.fill(0);
+        evictAccountDek(from);
+    }
+}
+
+/** Moves the accounts stored under other spellings of this key to its account. Refuses while an open session holds one of them. */
+export async function adoptFormerSpellings(db: DbRunner, ring: KeyRing, viewingKey: string, sent?: string): Promise<{ moved: number; left: number } | null> {
+    const found: Array<{ moved: number; left: number }> = [];
+    for (const spelling of otherSpellings(viewingKey, sent)) {
+        if ((await sessionsHolding(db, spelling)).length) {
+            throw new NightgateError('ACCOUNT_MOVE_BLOCKED',
+                'An open session holds this wallet under another spelling of its viewing key. Close that session, then connect again.');
+        }
+        const rows = await moveAccountOfSpelling(db, ring, spelling);
+        if (rows) found.push(rows);
+    }
+    if (!found.length) return null;
+    return { moved: found.reduce((n, r) => n + r.moved, 0), left: found.reduce((n, r) => n + r.left, 0) };
+}
+
+/** Drops the cached keys of a viewing key's account. Call it when the transaction that created or moved them did not commit. */
+export async function forgetAccountKeys(viewingKey: string): Promise<void> {
+    const accountId = deriveAccountId(bareHex(viewingKey));
+    evictAccountDek(accountId);
+    await evictEncryptionKey(accountId);
 }
 
 // ---- Wallet adapter -------------------------------------------------------

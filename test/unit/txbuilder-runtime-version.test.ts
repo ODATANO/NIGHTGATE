@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const importBuilder = () => import('../../src/txbuilder/index.mjs' as string);
+const importInternals = () => import('../../src/txbuilder/internals.mjs' as string);
 
 describe('describeLocalZkAssets', () => {
     it('asks a ledger 8 package for no compiler manifest, and every other directory for one', async () => {
@@ -45,7 +46,7 @@ describe('explainPreForkMismatch', () => {
     const provider = (era: string | null) => ({ watchForDeployTxData: async () => { if (!era) throw new Error('down'); return { era }; } });
 
     it('names the cause when the keys of a contract from before the fork do not match', async () => {
-        const { explainPreForkMismatch } = await importBuilder();
+        const { explainPreForkMismatch } = await importInternals();
         const original = new ContractTypeError('mismatched');
         const explained = await explainPreForkMismatch(original, ContractTypeError, provider('v8'), 'ab');
         expect(explained.message).toMatch(/deployed before ledger 9/);
@@ -53,7 +54,7 @@ describe('explainPreForkMismatch', () => {
     });
 
     it('keeps the error for a newer contract, another error and a failed read', async () => {
-        const { explainPreForkMismatch } = await importBuilder();
+        const { explainPreForkMismatch } = await importInternals();
         const mismatch = new ContractTypeError('mismatched');
         expect(await explainPreForkMismatch(mismatch, ContractTypeError, provider('v9'), 'ab')).toBe(mismatch);
         expect(await explainPreForkMismatch(mismatch, ContractTypeError, provider(null), 'ab')).toBe(mismatch);

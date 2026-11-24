@@ -8,3 +8,8 @@ const { UPDATE } = cds.ql;
 export function deployRefund(grantId: string, count: number) {
     return UPDATE.entity(AgentGrants).set({ deploysUsed: { '-=': count } }).where({ ID: grantId, deploysUsed: { '>=': count } });
 }
+
+/** Gives `count` reserved maintenance updates back to a grant. The count never drops below zero. */
+export function maintenanceRefund(grantId: string, count: number) {
+    return UPDATE.entity(AgentGrants).set({ maintenanceUpdatesUsed: { '-=': count } }).where({ ID: grantId, maintenanceUpdatesUsed: { '>=': count } });
+}

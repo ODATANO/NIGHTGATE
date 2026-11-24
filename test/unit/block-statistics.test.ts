@@ -13,8 +13,8 @@ const TXS = 'midnight.Transactions';
 const block = (n: number) => ({
     ID: cds.utils.uuid(), hash: n.toString(16).padStart(64, '0'), height: n, protocolVersion: 1, timestamp: 1_700_000_000 + n
 });
-const tx = (blockId: string, n: number) => ({
-    ID: cds.utils.uuid(), block_ID: blockId, transactionId: n, hash: cds.utils.uuid().replace(/-/g, '').padEnd(64, '0'),
+const tx = (of: { ID: string; height: number }, n: number) => ({
+    ID: cds.utils.uuid(), block_ID: of.ID, blockHeight: of.height, indexInBlock: n, extrinsicHash: cds.utils.uuid().replace(/-/g, '').padEnd(64, '0'),
     protocolVersion: 1, transactionType: 'REGULAR'
 });
 
@@ -26,7 +26,7 @@ describe('BlockStatistics', () => {
         await db.run(cds.ql.DELETE.from(TXS));
         await db.run(cds.ql.DELETE.from(BLOCKS));
         await db.run(cds.ql.INSERT.into(BLOCKS).entries(blocks));
-        await db.run(cds.ql.INSERT.into(TXS).entries([tx(blocks[1].ID, 0), tx(blocks[1].ID, 1), tx(blocks[2].ID, 0)]));
+        await db.run(cds.ql.INSERT.into(TXS).entries([tx(blocks[1], 0), tx(blocks[1], 1), tx(blocks[2], 0)]));
     });
 
     it('counts the transactions of each block, zero included', async () => {

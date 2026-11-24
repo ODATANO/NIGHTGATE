@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import cds, { type ActionRequest } from '@sap/cds';
-import { verifyAttestationState, verifyDisclosureState, verifyPredicateState } from '#cds-models/NightgateService';
+import { verifyAttestation, verifyDisclosure, verifyPredicate } from '#cds-models/NightgateService';
+import type { PredicateAttestation } from '#cds-models/midnight';
 import { resolveContract, ContractNotRegisteredError, getContractRegistration, slotWidthOf } from './contract-registry';
 import { CoercionError } from './arg-coercion';
 import type { readAttestationStateForContract } from './attestation-state';
 import type { readPredicateStateForContract } from './predicate-state';
 import type { readDisclosureLevelForContract } from './disclosure-grants';
 import { readAttestationStateInWorker, readDisclosureLevelInWorker, readPredicateStateInWorker } from '../midnight/decode-worker-client';
+import { indexerTipHeight } from '../midnight/public-data-provider';
 import { checkRateClass } from '../utils/rate-classes';
 import type { ContractProvidersConfig } from '../midnight/providers';
 import {
@@ -38,10 +40,20 @@ export function vaultDims(compiledRef: string | null | undefined): { width: numb
 // The circuits take Uint<64>. Checking early avoids an unclear failure during proving.
 export const UINT64_MAX = (1n << 64n) - 1n;
 
+/** What is wrong with the form of an integer from a request, or null. JSON rounds a number above 2^53 before any handler sees it, so only text carries such a value. */
+export function integerFormProblem(raw: unknown, name: string): string | null {
+    if (typeof raw === 'number' && Number.isInteger(raw) && !Number.isSafeInteger(raw)) {
+        return `${name} is above 2^53 as a JSON number, which is rounded on the way; send it as a decimal string`;
+    }
+    if (typeof raw === 'string' && !/^-?\d+$/.test(raw.trim())) return `${name} must be an integer (decimal string)`;
+    return null;
+}
+
 export type PredicateKind = 'numeric' | 'equality' | 'membership' | 'integrity' | 'diff';
+export type ClaimPredicate = NonNullable<PredicateAttestation['predicate']>;
 
 /** The single parser for predicate names, so an unknown name never yields a wrong claim. `opCode` is set for numeric predicates only. */
-export function parsePredicate(literal: unknown): { predicate: string; kind: PredicateKind; opCode: number | null } | null {
+export function parsePredicate(literal: unknown): { predicate: ClaimPredicate; kind: PredicateKind; opCode: number | null } | null {
     if (literal === 'lessOrEqual') return { predicate: literal, kind: 'numeric', opCode: 0 };
     if (literal === 'greaterOrEqual') return { predicate: literal, kind: 'numeric', opCode: 1 };
     if (literal === 'bytesEquality') return { predicate: literal, kind: 'equality', opCode: null };
@@ -142,7 +154,7 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
     const disclosureLevelReader = deps.disclosureLevelReader ?? readDisclosureLevelInWorker;
     const gate = deps.gate ?? ((req: ActionRequest<unknown, unknown>) => checkRateClass('verify', 'verify', req));
 
-    srv.on(verifyAttestationState, async (req) => {
+    srv.on(verifyAttestation, async (req) => {
         if (!(await gate(req))) return;
         const data = req.data;
 
@@ -154,14 +166,16 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
         const netParsed = parseVerifyNetworkOverride(data.network, req);
         if (!netParsed.ok) return;
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
 
-        const NEGATIVE = { verified: false, attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false, attesterId: '', payloadHash: '', recordKey: '', documentId: '' };
+        const NEGATIVE = { verified: false, attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false, attesterId: '', payloadHash: '', recordKey: '', documentId: '', blockHeight: null };
 
         if (!liveProviderConfigured(netParsed.network)) return NEGATIVE;
 
         return runVerify(req, async () => {
             const resolved = await contractResolver(compiledRef);
+            const contractProvidersConfig = contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network);
+            const blockHeight = await indexerTipHeight(contractProvidersConfig.indexerHttpUrl);
             const state = await attestationStateReader({
                 contractAddress: data.contractAddress!,
                 attesterId: data.attesterId ? data.attesterId.toLowerCase() : undefined,
@@ -171,10 +185,11 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
                 schemaId: data.schemaId ?? undefined,
                 artifactPath: resolved.artifactPath,
                 artifactDigest: resolved.artifactDigest,
-                contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
+                contractProvidersConfig,
+                tipHeight: blockHeight
             });
 
-            if (!state) return NEGATIVE;
+            if (!state) return { ...NEGATIVE, blockHeight };
 
             const verified = state.attested
                 && (data.contentRoot ? state.contentRootOk : true)
@@ -188,12 +203,13 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
                 attesterId: state.attesterId,
                 payloadHash: state.payloadHash,
                 recordKey: state.recordKey,
-                documentId: state.documentId
+                documentId: state.documentId,
+                blockHeight
             };
         });
     });
 
-    srv.on(verifyPredicateState, async (req) => {
+    srv.on(verifyPredicate, async (req) => {
         if (!(await gate(req))) return;
         const data = req.data;
 
@@ -214,7 +230,7 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
         let allowedMask: number | undefined;
         let k: number | undefined;
         if (parsed.kind === 'integrity' || parsed.kind === 'diff') {
-            const { width: verifyWidth, maxMask: verifyMaxMask } = vaultDims(data.compiledArtifactRef);
+            const { width: verifyWidth, maxMask: verifyMaxMask } = vaultDims(data.contractName);
             if (!data.payloadHashB) {
                 return req.reject(400, `payloadHashB is required for predicate '${data.predicate}'`);
             }
@@ -236,6 +252,8 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
         } else if (parsed.kind === 'numeric') {
             if (!data.fieldKey) return req.reject(400, `fieldKey is required for predicate '${data.predicate}'`);
             if (data.threshold === undefined || data.threshold === null) return req.reject(400, 'threshold is required');
+            const form = integerFormProblem(data.threshold, 'threshold');
+            if (form) return req.reject(400, form);
             try { thresholdBig = BigInt(data.threshold); } catch { return req.reject(400, 'threshold must be an integer'); }
             if (thresholdBig < 0n) return req.reject(400, 'threshold must be a non-negative integer');
             if (thresholdBig > UINT64_MAX) return req.reject(400, 'threshold exceeds Uint<64>');
@@ -257,14 +275,16 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
         const netParsed = parseVerifyNetworkOverride(data.network, req);
         if (!netParsed.ok) return;
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
 
-        const NEGATIVE = { verified: false, proven: false };
+        const NEGATIVE = { verified: false, proven: false, blockHeight: null };
 
         if (!liveProviderConfigured(netParsed.network)) return NEGATIVE;
 
         return runVerify(req, async () => {
             const resolved = await contractResolver(compiledRef);
+            const contractProvidersConfig = contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network);
+            const blockHeight = await indexerTipHeight(contractProvidersConfig.indexerHttpUrl);
             const proven = await predicateStateReader({
                 contractAddress: data.contractAddress!,
                 attesterId: data.attesterId!.toLowerCase(),
@@ -281,14 +301,15 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
                 slotWidth: vaultDims(compiledRef).width,
                 artifactPath: resolved.artifactPath,
                 artifactDigest: resolved.artifactDigest,
-                contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
+                contractProvidersConfig,
+                tipHeight: blockHeight
             });
 
-            return { verified: proven === true, proven: proven === true };
+            return { verified: proven === true, proven: proven === true, blockHeight };
         });
     });
 
-    srv.on(verifyDisclosureState, async (req) => {
+    srv.on(verifyDisclosure, async (req) => {
         if (!(await gate(req))) return;
         const data = req.data;
 
@@ -300,15 +321,17 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
         const netParsed = parseVerifyNetworkOverride(data.network, req);
         if (!netParsed.ok) return;
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
         const minLevel = data.minLevel ?? 0;
 
-        const NEGATIVE = { verified: false, granted: false, level: null };
+        const NEGATIVE = { verified: false, granted: false, level: null, blockHeight: null };
 
         if (!liveProviderConfigured(netParsed.network)) return NEGATIVE;
 
         return runVerify(req, async () => {
             const resolved = await contractResolver(compiledRef);
+            const contractProvidersConfig = contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network);
+            const blockHeight = await indexerTipHeight(contractProvidersConfig.indexerHttpUrl);
             const level = await disclosureLevelReader({
                 contractAddress: data.contractAddress!,
                 attesterId: data.attesterId!.toLowerCase(),
@@ -316,11 +339,12 @@ export function registerVerifyStateHandlers(srv: cds.ApplicationService, deps: V
                 grantee: data.grantee!.toLowerCase(),
                 artifactPath: resolved.artifactPath,
                 artifactDigest: resolved.artifactDigest,
-                contractProvidersConfig: contractProvidersConfigForNetwork(resolved.zkConfigPath, netParsed.network)
+                contractProvidersConfig,
+                tipHeight: blockHeight
             });
 
-            if (level === null) return NEGATIVE;
-            return { verified: level >= minLevel, granted: true, level };
+            if (level === null) return { ...NEGATIVE, blockHeight };
+            return { verified: level >= minLevel, granted: true, level, blockHeight };
         });
     });
 }

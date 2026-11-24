@@ -201,10 +201,8 @@ describe('readSupplementBlock', () => {
 
     test('maps a block onto the supplement shape', () => {
         const mapped = readSupplementBlock(block)!;
-        expect(mapped.height).toBe(42);
         const tx = mapped.transactions[0];
-        expect(tx.ledgerTxHash).toBe('abc');
-        expect(tx.status).toBe('PARTIAL_SUCCESS');
+        expect(tx.txHash).toBe('abc');
         expect(tx.fee).toBe('1');
         expect(tx.estimatedFee).toBe('2');
         expect(tx.segments).toEqual([{ segmentId: 0, success: true }, { segmentId: 3283, success: false }]);
@@ -230,12 +228,12 @@ describe('readSupplementBlock', () => {
 
     test('a missing block and a transaction without a hash are skipped', () => {
         expect(readSupplementBlock({})).toBeNull();
-        expect(readSupplementBlock({ block: { height: 1, transactions: [{ hash: '' }] } })!.transactions).toEqual([]);
+        expect(readSupplementBlock({ block: { transactions: [{ hash: '' }] } })!.transactions).toEqual([]);
     });
 
     test('an unknown contract action type is dropped rather than guessed', () => {
         const mapped = readSupplementBlock({
-            block: { height: 1, transactions: [{ hash: '0x1', contractActions: [{ __typename: 'Something', address: '0x2' }] }] }
+            block: { transactions: [{ hash: '0x1', contractActions: [{ __typename: 'Something', address: '0x2' }] }] }
         })!;
         expect(mapped.transactions[0].contractActions).toEqual([]);
     });

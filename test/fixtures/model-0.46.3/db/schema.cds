@@ -1,0 +1,556 @@
+namespace midnight;
+
+using {
+    cuid,
+    managed
+} from '@sap/cds/common';
+using {
+    HexEncoded,
+    UnshieldedAddr,
+    DustAddr,
+    BigInt,
+    TransactionResultStatus,
+    TransactionType,
+    ContractActionType,
+    DustLedgerEventType,
+    PayloadDecodeState,
+    TxType,
+    SyncStatus,
+    PendingSubmissionStatus,
+    BackgroundJobStatus,
+    BackgroundJobKind,
+    BackgroundJobChainStatus,
+    CommandEncoding,
+    DisclosureRole,
+    SwapOfferStatus
+} from './types.cds';
+
+@assert.unique.hash: [hash]
+entity Blocks : cuid, managed {
+    hash             : HexEncoded not null;
+    height           : Integer64 not null;
+    protocolVersion  : Integer not null;
+    timestamp        : Integer not null;
+    author           : HexEncoded; // null = not known; AURA public key of the validator that produced the block
+    slot             : Integer64; // null = the header names none; AURA slot of the block
+    stateRoot        : HexEncoded;
+    ledgerParameters : LargeBinary;
+    parent           : Association to Blocks;
+    transactions     : Composition of many Transactions
+                           on transactions.block = $self;
+}
+
+// The extrinsic hash can repeat across blocks. The position in the block is unique.
+@assert.unique.blockPosition: [
+    block,
+    transactionId
+]
+entity Transactions : cuid, managed {
+    transactionId            : Integer not null;
+    hash                     : HexEncoded not null;
+    ledgerTxHash             : HexEncoded;
+    protocolVersion          : Integer not null;
+    raw                      : LargeBinary;
+    transactionType          : TransactionType not null;
+    merkleTreeRoot           : HexEncoded;
+    startIndex               : Integer64;
+    endIndex                 : Integer64;
+    identifiers              : LargeString;
+    txType                   : TxType;
+    isShielded               : Boolean;
+    senderAddress            : String(256);
+    receiverAddress          : String(256);
+    nightAmount              : BigInt;
+    dustConsumed             : BigInt;
+    hasProof                 : Boolean;
+    contractAddress          : HexEncoded;
+    circuitName              : String(100);
+    size                     : Integer;
+    payloadDecode            : PayloadDecodeState;
+    zswapInputCount          : Integer;
+    zswapOutputCount         : Integer;
+    zswapTransientCount      : Integer;
+    dustSpendCount           : Integer;
+    dustRegistrationCount    : Integer;
+    block                    : Association to Blocks not null;
+    transactionResult        : Composition of one TransactionResults
+                                   on transactionResult.transaction = $self;
+    transactionFees          : Composition of one TransactionFees
+                                   on transactionFees.transaction = $self;
+    contractActions          : Composition of many ContractActions
+                                   on contractActions.transaction = $self;
+    unshieldedCreatedOutputs : Composition of many UnshieldedUtxos
+                                   on unshieldedCreatedOutputs.createdAtTransaction = $self;
+    unshieldedSpentOutputs   : Association to many UnshieldedUtxos
+                                   on unshieldedSpentOutputs.spentAtTransaction = $self;
+    zswapLedgerEvents        : Composition of many ZswapLedgerEvents
+                                   on zswapLedgerEvents.transaction = $self;
+    dustLedgerEvents         : Composition of many DustLedgerEvents
+                                   on dustLedgerEvents.transaction = $self;
+}
+
+/** One row per ledger identifier of a transaction, so a transaction can be found by one of them. */
+entity TransactionIdentifiers {
+    key identifier  : HexEncoded;
+    key transaction : Association to Transactions;
+}
+
+entity TransactionResults : cuid {
+    status        : TransactionResultStatus not null;
+    outcomeSource : String(40); // 'substrate-system-events'
+    transaction   : Association to Transactions;
+    segments      : Composition of many TransactionSegments
+                        on segments.transactionResult = $self;
+}
+
+/** A transaction runs in segments that succeed or fail separately. One row per segment. */
+entity TransactionSegments : cuid {
+    segmentId         : Integer not null;
+    success           : Boolean not null;
+    transactionResult : Association to TransactionResults;
+}
+
+entity TransactionFees : cuid {
+    paidFees      : BigInt not null;
+    estimatedFees : BigInt not null;
+    transaction   : Association to Transactions;
+}
+
+entity ContractActions : cuid, managed {
+    actionIndex        : Integer; // order of action in tx
+    address            : HexEncoded;
+    state              : LargeBinary;
+    zswapState         : LargeBinary;
+    stateHash          : HexEncoded;
+    stateSize          : Integer;
+    zswapStateHash     : HexEncoded;
+    zswapStateSize     : Integer;
+    actionType         : ContractActionType not null;
+    entryPoint         : String(256);
+    transaction        : Association to Transactions not null;
+    deploy             : Association to ContractActions; // null = not a CALL;
+    unshieldedBalances : Composition of many ContractBalances
+                             on unshieldedBalances.contractAction = $self;
+}
+
+entity ContractBalances : cuid {
+    tokenType      : HexEncoded not null;
+    amount         : BigInt not null;
+    contractAction : Association to ContractActions;
+}
+
+/** The newest known state of each contract. */
+entity ContractStates : managed {
+    key address        : HexEncoded;
+        height         : Integer64 not null;
+        state          : LargeBinary;
+        zswapState     : LargeBinary;
+        stateHash      : HexEncoded;
+        zswapStateHash : HexEncoded;
+        contractAction : Association to ContractActions;
+}
+
+// The ledger names a UTXO by intent hash and output index.
+// One transaction can hold several intents whose outputs all start at 0.
+@assert.unique.createdOutput: [
+    intentHash,
+    outputIndex
+]
+entity UnshieldedUtxos : cuid, managed {
+    owner                       : UnshieldedAddr not null;
+    tokenType                   : HexEncoded not null;
+    value                       : BigInt not null;
+    intentHash                  : HexEncoded not null;
+    outputIndex                 : Integer not null;
+    ctime                       : Integer; // UNIX seconds; creation time
+    initialNonce                : HexEncoded not null;
+    registeredForDustGeneration : Boolean default false;
+
+    createdAtTransaction        : Association to Transactions not null;
+    spentAtTransaction          : Association to Transactions;
+}
+
+entity ZswapLedgerEvents : cuid {
+    eventId     : Integer not null;
+    raw         : LargeBinary;
+    maxId       : Integer not null;
+    transaction : Association to Transactions not null;
+}
+
+entity DustLedgerEvents : cuid {
+    eventId         : Integer not null;
+    raw             : LargeBinary;
+    maxId           : Integer not null;
+    eventType       : DustLedgerEventType not null;
+    dustOutputNonce : HexEncoded; // null = not INITIAL_UTXO
+
+    transaction     : Association to Transactions not null;
+}
+
+/** A user's connected wallet. Every session action checks `userId`. */
+@assert.unique.sessionId: [sessionId]
+entity WalletSessions : cuid, managed {
+    userId              : String(200);
+    label               : String(100);
+    viewingKeyHash      : String(64);
+    encryptedViewingKey : LargeString;
+    encryptedSeedKey    : LargeString; // null = viewing only
+    accountIndex        : Integer;
+    sessionId           : UUID not null;
+    connectedAt         : Timestamp not null;
+    disconnectedAt      : Timestamp;
+    expiresAt           : Timestamp;
+    isActive            : Boolean default true;
+}
+
+/** A bearer token that lets an agent act on one wallet session within limits. Only the token's hash is stored.
+ *  Requests with the token run as `userId` and only on `sessionId`. A grant can only narrow what the session may do.
+ *  The allowed contracts, circuits and token types are the platform lists narrowed by the grant. */
+@assert.unique.tokenHash: [tokenHash]
+entity AgentGrants : cuid, managed {
+    userId            : String(200) not null;
+    agentLabel        : String(100);
+    sessionId         : UUID not null;
+    tokenHash         : String(64) not null;
+    allowedActions    : LargeString not null; // JSON array of strings; action names
+    maxJobsPerDay     : Integer; // null = no limit; per UTC day
+    jobsUsedToday     : Integer default 0;
+    budgetWindow      : String(10); // YYYY-MM-DD; the UTC day jobsUsedToday counts for
+    maxJobsPerHour    : Integer; // null = no limit; per UTC hour
+    jobsUsedThisHour  : Integer default 0;
+    hourWindow        : String(13); // YYYY-MM-DDTHH; the UTC hour jobsUsedThisHour counts for
+    sponsorSessionId  : UUID;
+    allowedContracts  : LargeString; // JSON array of strings; null = platform list
+    allowedCircuits   : LargeString; // JSON array of strings; null = platform list
+    allowDeploy       : Boolean default false;
+    maxDeploys        : Integer; // default 1 when allowDeploy
+    deploysUsed       : Integer default 0;
+    deployedContracts : LargeString; // JSON array of strings; always allowed
+    allowedTokenTypes : LargeString; // JSON array of strings; null = platform list
+    mintedTokenTypes  : LargeString; // JSON array of strings; always allowed
+    allowUnshieldedOffers : Boolean default false;
+    allowedUnshieldedTokenTypes : LargeString; // JSON array of strings; null = platform list
+    maxValuePerDay    : LargeString; // JSON object: token type to atoms; null = no limit; per UTC day
+    valueUsedToday    : LargeString; // JSON object: token type to atoms
+    valueWindow       : String(10); // YYYY-MM-DD; the UTC day valueUsedToday counts for
+    validUntil        : Timestamp; // null = no expiry
+    isActive          : Boolean default true;
+    revokedAt         : Timestamp;
+}
+
+/** Swap offers posted for others to take. A row only advertises the offer.
+ *  The tokens move when someone completes the swap on chain. */
+entity SwapOffers : cuid, managed {
+    offer         : LargeString not null; // offer file or base64
+    givesType     : HexEncoded not null;
+    givesAmount   : String(40) not null; // decimal; smallest token unit
+    wantsType     : HexEncoded not null;
+    wantsAmount   : String(40) not null; // decimal; smallest token unit
+    bound         : Boolean not null;
+    inputs        : Integer;
+    nullifiers    : LargeString not null; // JSON array of strings
+    tags          : LargeString; // JSON array of strings
+    status        : SwapOfferStatus not null default 'open';
+    expiresAt     : Timestamp;
+    posterUserId  : String(200) not null;
+    posterGrantId : UUID; // null = no agent grant
+    sessionId     : UUID;
+    takerSecretHash : HexEncoded; // sha256 of the taker secret; null = anyone may take
+    filledTxHash  : HexEncoded;
+    closedAt      : Timestamp;
+}
+
+/** A document text that holders of a shielded token type may read.
+ *  A reader proves on the holder registry contract `registryAddress` that it holds the token. */
+entity HolderDisclosureGrants : cuid, managed {
+    payloadHash     : HexEncoded not null;
+    tokenType       : HexEncoded not null;
+    registryAddress : HexEncoded not null;
+    grantorUserId   : String(200) not null;
+    grantorGrantId  : UUID; // null = no agent grant
+    contentType     : String(100);
+    contentHashKind : String(20); // 'blake2b-256' or 'sha256'; hash of the text that equals payloadHash
+    content         : LargeString; // encrypted with the server key
+    expiresAt       : Timestamp;
+    active          : Boolean default true;
+    revokedAt       : Timestamp;
+}
+
+/**
+ * Known Shielded token types
+ */
+entity LearnedTokenTypes : managed {
+    key tokenType        : HexEncoded;
+        grantId          : UUID; // null = no agent grant
+        sponsorSessionId : String(64);
+        txHash           : HexEncoded;
+}
+
+/** Contracts registered at runtime, in addition to those in the config. A name from the config cannot be registered here. */
+entity ContractRegistrations : managed {
+    key name           : String(100);
+        artifactPath   : String(1000) not null; // absolute path inside NIGHTGATE_CONTRACTS_DIR; compiled contract JS module
+        zkConfigPath   : String(1000) not null; // absolute path inside NIGHTGATE_CONTRACTS_DIR; folder with keys/ and zkir/
+        privateStateId : String(200) not null;
+        slotWidth      : Integer; // null = 16
+        networkId      : String(30);
+        registeredBy   : String(200);
+}
+
+/** Progress of the block indexer. Exactly one row. */
+entity SyncState {
+    key ID                      : String(10) default 'SINGLETON';
+        networkId               : String(30);
+        lastIndexedHeight       : Integer64 default 0;
+        lastIndexedHash         : HexEncoded;
+        lastIndexedAt           : Timestamp;
+        lastDecodedHeight       : Integer64;
+        lastSupplementedHeight  : Integer64;
+        lastFinalizedHeight     : Integer64 default 0;
+        lastFinalizedHash       : HexEncoded;
+        nodeUrl                 : String(200);
+        chainHeight             : Integer64 default 0;
+        syncStatus              : SyncStatus default 'stopped';
+        reorgGeneration         : Integer64 default 0;
+        syncProgress            : Decimal(5, 2) default 0; // percent; lastIndexedHeight of chainHeight
+        blocksPerSecond         : Decimal(10, 2) default 0;
+        lastError               : String(500);
+        lastErrorAt             : Timestamp;
+        consecutiveErrors       : Integer default 0;
+        identifiersBackfilledAt : Timestamp; // null = rows decoded before TransactionIdentifiers existed are not filled in yet
+        authorBackfillHeight    : Integer64; // null = not started; blocks up to this height carry the validator in author
+        authorsBackfilledAt     : Timestamp; // null = blocks stored with the slot in author are not all rewritten yet
+        reindexTargetHeight     : Integer64; // null = no reindex open; a rollback must reach this height before the crawler runs
+}
+
+entity ReorgLog : cuid, managed {
+    detectedAt       : Timestamp not null;
+    forkHeight       : Integer64 not null;
+    oldTipHash       : HexEncoded not null;
+    newTipHash       : HexEncoded not null;
+    blocksRolledBack : Integer default 0;
+    blocksReIndexed  : Integer default 0;
+    status           : String(20); // 'in_progress', 'completed' or 'failed'; failed = the new branch was not indexed in that run
+}
+
+/** Transactions submitted through this server.
+ *  `txHash` and, for deploys, `contractAddress` stay null until the SDK returns them. */
+entity PendingSubmissions : cuid, managed {
+    txHash           : HexEncoded;
+    contractAddress  : HexEncoded;
+    circuitName      : String(100);
+    actionType       : ContractActionType not null;
+    submittedAt      : Timestamp not null;
+    status           : PendingSubmissionStatus not null default 'pending';
+    finalizedAt      : Timestamp;
+    finalizedTxData  : LargeString; // JSON
+    chainBlockHeight : Integer;
+    chainBlockHash   : HexEncoded;
+    indexerTxHash    : HexEncoded; // the Midnight indexer's hash
+    submitIntentData : LargeString;
+    errorCode        : String(50);
+    errorMessage     : String(500);
+    sessionId        : UUID;
+}
+
+/** Work that runs in the background, such as building and submitting a transaction. */
+@assert.unique.idempotency: [
+    sessionId,
+    kind,
+    idempotencyKey
+]
+entity BackgroundJobs : cuid, managed {
+    kind                : BackgroundJobKind not null;
+    sessionId           : String(64);
+    status              : BackgroundJobStatus not null default 'pending';
+    idempotencyKey      : String(128); // optional; unique per sessionId and kind
+    request             : LargeString; // JSON; secrets removed
+    payloadFingerprint  : String(64);
+    commandVersion      : Integer; // null = the job cannot be replayed after a restart
+    command             : LargeString;
+    commandEncoding     : CommandEncoding;
+    requestedBy         : String(200);
+    grantId             : UUID; // null = no agent grant
+    parentJobId         : UUID;
+    workflowStep        : String(64);
+    result              : LargeString; // JSON
+    errorCode           : String(64);
+    errorMessage        : LargeString;
+    startedAt           : Timestamp;
+    queuedAt            : Timestamp;
+    externalExecutionAt : Timestamp; // when the job began work that may reach the chain
+    submittedAt         : Timestamp;
+    finishedAt          : Timestamp;
+    attempt             : Integer not null default 0;
+    maxAttempts         : Integer not null default 1;
+    leaseOwner          : String(200);
+    leaseExpiresAt      : Timestamp;
+    heartbeatAt         : Timestamp;
+    submissionId        : UUID;
+    txHash              : HexEncoded;
+    chainStatus         : BackgroundJobChainStatus; // null = nothing submitted
+    chainFinalizedAt    : Timestamp;
+    chainBlockHeight    : Integer;
+    chainBlockHash      : HexEncoded;
+    indexerTxHash       : HexEncoded; // the Midnight indexer's hash, differs from txHash
+    chainSegments       : LargeString; // JSON; batches only; which calls of each segment applied
+}
+
+entity PrivateStates {
+    key accountId       : String(200);
+    key contractAddress : String(200);
+    key privateStateId  : String(200);
+        ciphertext      : LargeString not null;
+        keyScheme       : String(16); // 'dek1'; null = key derived from the viewing key
+        createdAt       : Timestamp;
+        updatedAt       : Timestamp;
+}
+
+entity ContractSigningKeys {
+    key accountId       : String(200);
+    key contractAddress : String(200);
+        ciphertext      : LargeString not null;
+        keyScheme       : String(16); // 'dek1'; null = key derived from the viewing key
+        createdAt       : Timestamp;
+        updatedAt       : Timestamp;
+}
+
+/** The key that encrypts an account's private states, signing keys and wallet state ('dek1'). It is stored twice.
+ *  One copy opens with the server key ring, so the operator can rotate the ring.
+ *  The other opens with the account's viewing key, so data stays readable after a ring change. */
+entity AccountKeys {
+    key accountId              : String(200);
+        wrappedDek             : LargeString not null;
+        wrappedDekByViewingKey : LargeString not null;
+        createdAt              : Timestamp;
+        rotatedAt              : Timestamp;
+}
+
+/** Saved wallet state, one row per account. */
+entity WalletSyncStates {
+    key accountId           : String(200);
+        shieldedStateBlob   : LargeString;
+        unshieldedStateBlob : LargeString;
+        dustStateBlob       : LargeString;
+        keyScheme           : String(16); // 'dek1'
+        sdkVersion          : String(64) not null;
+        networkId           : String(32);
+        seedFingerprint     : String(64);
+        createdAt           : Timestamp;
+        updatedAt           : Timestamp;
+}
+
+entity Attestations : cuid, managed {
+    attestationId   : HexEncoded not null; // blake2b-256; the payload hash
+    contractAddress : HexEncoded not null;
+    attester        : HexEncoded not null;
+    publicMetadata  : LargeString; // JSON
+    payloadCipher   : LargeBinary;
+    anchoredTxHash  : HexEncoded;
+    anchoredAt      : Timestamp;
+}
+
+/** Documents whose hash was written to an attestation contract.
+ *  Agent tokens see only rows of their own session. Rows with a null `sessionId` are visible to the owner only. */
+entity Documents : cuid, managed {
+    sha256              : HexEncoded not null;
+    contentType         : String(100);
+    size                : Integer64;
+    storageRef          : String(500); // file://, s3:// or ipfs:// URL
+    anchoredTxHash      : HexEncoded;
+    anchoredAt          : Timestamp;
+    userId              : String(200);
+    contractAddress     : HexEncoded;
+    network             : String(30);
+    compiledArtifactRef : String(200); // contract name; may later point to a newer build
+    artifactDigest      : HexEncoded;
+    sessionId           : UUID;
+    attesterId          : HexEncoded;
+}
+
+/** Zero-knowledge proofs about a document's fields */
+entity PredicateAttestations : cuid, managed {
+    payloadHash         : HexEncoded not null;
+    attesterId          : HexEncoded;
+    contractAddress     : HexEncoded not null;
+    predicate           : String(20) not null; // 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'
+    op                  : Integer; // 0 or 1; null = not a numeric predicate
+    threshold           : Integer64; // scaled integer for numeric predicates; for documentDiff the minimum number of differing fields
+    unit                : String(50);
+    fieldKey            : HexEncoded; // null = proof not tied to one field
+    expectedDigest      : HexEncoded;
+    setRoot             : HexEncoded;
+    payloadHashB        : HexEncoded;
+    attesterIdB         : HexEncoded;
+    allowedMask         : Integer64; // documentIntegrity only; bit i set = field i may differ
+    provenTxHash        : HexEncoded;
+    provenAt            : Timestamp;
+    network             : String(30);
+    compiledArtifactRef : String(200); // contract name
+    artifactDigest      : HexEncoded;
+}
+
+entity DisclosureRoles : cuid, managed {
+    userId     : String(200) not null;
+    role       : DisclosureRole not null;
+    scope      : String(500); // null = global; contract address or attestation id
+    grantedBy  : String(200);
+    validFrom  : Timestamp;
+    validUntil : Timestamp;
+}
+
+/** Who may read an attested document, mirrored from the attestation contract. The contract decides access.
+ *  `grantDisclosure` inserts a row as inactive. It turns active once the grant shows up in the contract state. */
+@assert.unique.logicalGrant: [
+    contractAddress,
+    attesterId,
+    payloadHash,
+    grantee
+]
+entity DisclosureGrants : cuid, managed {
+    payloadHash     : HexEncoded not null;
+    attesterId      : HexEncoded;
+    grantee         : HexEncoded not null;
+    level           : Integer not null; // 0 public, 1 legitimate interest, 2 authority;
+    pendingLevel    : Integer;
+    contractAddress : HexEncoded not null;
+    grantedTxHash   : HexEncoded;
+    revokedTxHash   : HexEncoded;
+    active          : Boolean default false; // granted on chain and not revoked
+    changedAtHeight : Integer64; // block of the last applied change
+}
+
+/** Links a user to the grantee id the attestation contract checks. A row with a scope wins over a global one. */
+entity GranteeIdentities : cuid, managed {
+    userId      : String(200) not null;
+    granteeId   : HexEncoded not null;
+    bindingKind : String(20) not null; // 'wallet', 'did' or 'custom'
+    scope       : String(500); // null = global; contract address or attestation id
+}
+
+/** Unshielded NIGHT balance per address. */
+entity NightBalances {
+    key address            : String(256);
+        balance            : Decimal(20, 0) default 0;
+        utxoCount          : Integer default 0;
+        firstSeenHeight    : Integer64;
+        firstSeenAt        : Timestamp;
+        lastActivityHeight : Integer64;
+        lastActivityAt     : Timestamp;
+        txSentCount        : Integer default 0;
+        txReceivedCount    : Integer default 0;
+        totalSent          : Decimal(20, 0) default 0;
+        totalReceived      : Decimal(20, 0) default 0;
+        dustAddress        : DustAddr;
+        isDustRegistered   : Boolean default false;
+        lastUpdatedHeight  : Integer64;
+        lastUpdatedAt      : Timestamp;
+}
+
+/** The server instance that runs the background work on this database. It renews the lease while running and releases it on stop. */
+entity InstanceLeases {
+    key role        : String(20);
+        instanceId  : String(200);
+        acquiredAt  : Timestamp;
+        heartbeatAt : Timestamp;
+}

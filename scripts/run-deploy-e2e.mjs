@@ -53,12 +53,20 @@ async function post(path, body, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
+
 /** Polls getJobStatus until the job succeeds or fails and returns the parsed result. */
 async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS, intervalMs = JOB_POLL_MS } = {}) {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = null;
     while (Date.now() < deadline) {
-        const r = await post('/getJobStatus', { jobId, sessionId });
+        const r = await jobStatus(jobId, sessionId);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) → HTTP ${r.status}: ${pretty(r.body)}`);
 
         const { status, result, errorCode, errorMessage } = r.body;
@@ -72,7 +80,7 @@ async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS
 
         if (status === 'succeeded') {
             process.stdout.write('\n');
-            return result ? JSON.parse(result) : {};
+            return result ?? {};
         }
         if (status === 'failed') {
             process.stdout.write('\n');
@@ -117,13 +125,13 @@ async function waitForServer() {
     console.log(`OK   signing enabled: ${pretty(r.body)}`);
 
     // Wait for the background prewarm job, so later actions skip the cold sync and a prewarm error fails here.
-    const prewarmJobId = r.body?.prewarmJobId;
+    const prewarmJobId = r.body?.jobId;
     if (prewarmJobId) {
         step(`2b. Waiting for prewarm job ${prewarmJobId.slice(0, 8)} (cold sync can take hours on a fresh seed)`);
         await pollJob(sessionId, prewarmJobId, 'prewarm');
         console.log('OK   facade prewarm complete');
     } else {
-        console.log('WARN no prewarmJobId returned - scheduling may have failed; first action will pay sync cost inline.');
+        console.log('WARN no prewarm job returned - scheduling may have failed; first action will pay sync cost inline.');
     }
 
     if (!SKIP_DUST) {
@@ -152,7 +160,7 @@ async function waitForServer() {
     const artifact = process.env.DEPLOY_E2E_ARTIFACT || 'counter';
     step(`5. deployContract(${artifact}) (async job)`);
     r = await post('/deployContract', {
-        compiledArtifactRef: artifact,
+        contractName: artifact,
         sessionId,
         initialPrivateState: '{}'
     });

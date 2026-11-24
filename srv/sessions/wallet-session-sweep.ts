@@ -4,17 +4,59 @@
 import cds from '@sap/cds';
 import { WalletSessions, type WalletSession } from '#cds-models/midnight';
 import { getNightgateConfig, type NightgateConfig } from '../utils/nightgate-config';
+import { configMs } from '../utils/config';
 import { getConfiguredFeeSponsorSessions } from '../submission/fee-sponsor';
-import type { DbRunner, Row } from '../utils/db-types';
+import type { DbRunner, DbService, Row } from '../utils/db-types';
 import { evictFacadeUnlessShared } from './wallet-session-lifecycle';
 import { errorMessage } from '../utils/errors';
+import { decrypt, encrypt, getEncryptionKey, hashViewingKey } from '../utils/crypto';
+import { walletSessionViewingKeyBinding } from '../utils/envelope-bindings';
+import { bareHex } from '../utils/hex-patterns';
+import { moveAccountOfSpelling, sessionsHolding, forgetAccountKeys } from '../submission/wallet-material-factory';
 
 const { SELECT, UPDATE } = cds.ql;
 
 /** Rows per UPDATE, small enough for the database driver's parameter limit. */
 const SESSION_CLOSE_CHUNK = 200;
 
-const DEFAULT_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** At startup rewrites every stored viewing key to lowercase and moves its account there, each key in one transaction.
+ *  A key that fails keeps its spelling and its account. Returns how many spellings were rewritten. */
+export async function adoptStoredSpellings(db: DbService): Promise<number> {
+    const log = cds.log('nightgate:sessions');
+    const ring = getEncryptionKey();
+    const rows: Array<Pick<WalletSession, 'sessionId' | 'encryptedViewingKey'>> = (await db.run(
+        SELECT.from(WalletSessions).columns('sessionId', 'encryptedViewingKey').where({ encryptedViewingKey: { '!=': null } }))) || [];
+    const seen = new Set<string>();
+    let adopted = 0;
+    for (const row of rows) {
+        let spelling: string;
+        try {
+            spelling = decrypt(String(row.encryptedViewingKey), ring, walletSessionViewingKeyBinding(String(row.sessionId)));
+        } catch { continue; }
+        const canonical = bareHex(spelling);
+        if (spelling === canonical || seen.has(hashViewingKey(spelling))) continue;
+        seen.add(hashViewingKey(spelling));
+        try {
+            const moved = await db.tx(async tx => {
+                const rowsMoved = await moveAccountOfSpelling(tx, ring, spelling);
+                for (const sessionId of await sessionsHolding(tx, spelling)) {
+                    await tx.run(UPDATE.entity(WalletSessions).set({
+                        encryptedViewingKey: encrypt(canonical, ring, walletSessionViewingKeyBinding(sessionId)),
+                        viewingKeyHash: hashViewingKey(canonical)
+                    }).where({ sessionId }));
+                }
+                return rowsMoved;
+            });
+            adopted++;
+            log.info(`Session ${String(row.sessionId).slice(0, 8)}: viewing key stored in lowercase now, ${moved?.moved ?? 0} row(s) moved to its account, ${moved?.left ?? 0} left under the former spelling`);
+        } catch (err) {
+            await forgetAccountKeys(canonical);
+            log.error(`Session ${String(row.sessionId).slice(0, 8)}: the account of its viewing key was not moved to the lowercase spelling, the session keeps its account: ${errorMessage(err)}`);
+        }
+    }
+    return adopted;
+}
 
 /** At startup closes the previous process's view-only sessions and returns their ids. Assumes one server instance. Fee sponsors and key-holding sessions stay open. */
 export async function closeSessionsFromPreviousProcess(db: DbRunner, config?: NightgateConfig): Promise<string[]> {
@@ -47,16 +89,16 @@ export async function closeSessionsFromPreviousProcess(db: DbRunner, config?: Ni
 }
 
 // A sponsor's expiry moves with every run, so a sponsor taken out of the pool keeps its keys for one session lifetime.
-async function extendSponsorSessions(db: DbRunner, sponsors: readonly string[], config: NightgateConfig): Promise<void> {
+async function extendSponsorSessions(db: DbRunner, sponsors: readonly string[]): Promise<void> {
     if (sponsors.length === 0) return;
-    const expiresAt = new Date(Date.now() + (config.sessionTtlMs || DEFAULT_SESSION_TTL_MS)).toISOString();
+    const expiresAt = new Date(Date.now() + configMs('NIGHTGATE_SESSION_TTL_MS')).toISOString();
     await db.run(UPDATE.entity(WalletSessions).set({ expiresAt }).where({ sessionId: { in: [...sponsors] } }));
 }
 
 export function startSessionCleanup(db: DbRunner): ReturnType<typeof setInterval> {
     const SESSION_CLEANUP_INTERVAL = 15 * 60 * 1000;
     const firstConfig = getNightgateConfig();
-    extendSponsorSessions(db, getConfiguredFeeSponsorSessions(firstConfig), firstConfig)
+    extendSponsorSessions(db, getConfiguredFeeSponsorSessions(firstConfig))
         .catch(err => cds.log('nightgate').warn(`Sponsor session expiry not extended: ${errorMessage(err)}`));
     const timer = setInterval(async () => {
         try {
@@ -64,7 +106,7 @@ export function startSessionCleanup(db: DbRunner): ReturnType<typeof setInterval
             // Platform fee sponsors never expire, so they are never closed or wiped.
             const config = getNightgateConfig();
             const sponsors = getConfiguredFeeSponsorSessions(config);
-            await extendSponsorSessions(db, sponsors, config);
+            await extendSponsorSessions(db, sponsors);
             const platformSponsors = new Set(sponsors);
             const expiring: Row<WalletSession, 'sessionId'>[] = ((await db.run(
                 SELECT.from(WalletSessions)

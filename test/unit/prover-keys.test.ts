@@ -114,7 +114,7 @@ describe('prover keys on demand', () => {
         const none = await ensureProverKeys('vault', reg, { env: { [ZK_ASSET_URL_ENV]: 'none' }, fetchFn: fetchOf({}) }).catch(e => e);
         expect(none).toBeInstanceOf(ProverKeysUnavailableError);
         expect(none.message).toMatch(new RegExp(ZK_ASSET_URL_ENV));
-        expect(none.message).toMatch(/nightgate-fetch-keys vault/);
+        expect(none.message).toMatch(/scripts\/fetch-contract-keys\.mjs vault/);
         expect(none.retryable).toBe(false);
         const missing404 = await ensureProverKeys('vault', reg, { env: { [ZK_ASSET_URL_ENV]: 'https://h' }, fetchFn: fetchOf({}) }).catch(e => e);
         expect(missing404.message).toMatch(/HTTP 404/);

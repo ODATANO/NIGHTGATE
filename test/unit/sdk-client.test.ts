@@ -21,6 +21,9 @@ function fakeFetch(responses: Array<{ status?: number; body?: unknown }>) {
     return { fn, calls };
 }
 
+/** The parameters of a getJobStatus call, as they stand in its URL. */
+const pollOf = (call: { url: string }) => decodeURIComponent(call.url).split('/getJobStatus')[1];
+
 describe('connect: encoding', () => {
     test('requires baseUrl', async () => {
         const { connect } = await importClient();
@@ -36,25 +39,25 @@ describe('connect: encoding', () => {
             k: 3, network: undefined, fieldKey: ''
         });
         expect(calls[0].url).toBe(
-            "https://ng.example/odata/v4/midnight/verifyPredicateState(contractAddress='o''hara',payloadHash='ab',threshold=9007199254740993,k=3)"
+            "https://ng.example/odata/v4/midnight/verifyPredicate(contractAddress='o''hara',payloadHash='ab',threshold=9007199254740993,k=3)"
         );
         expect(calls[0].init.method).toBe('GET');
     });
 
-    test('verifyDisclosure reads verifyDisclosureState', async () => {
+    test('verifyDisclosure reads verifyDisclosure', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([{ body: { verified: true, granted: true, level: 1 } }]);
         const ng = connect({ baseUrl: 'https://ng.example/', fetchFn: fn as any });
         expect(await ng.verifyDisclosure({ contractAddress: 'c', attesterId: 'a', payloadHash: 'p', grantee: 'g', minLevel: 1 })).toEqual({ verified: true, granted: true, level: 1 });
-        expect(calls[0].url).toBe("https://ng.example/odata/v4/midnight/verifyDisclosureState(contractAddress='c',attesterId='a',payloadHash='p',grantee='g',minLevel=1)");
+        expect(calls[0].url).toBe("https://ng.example/odata/v4/midnight/verifyDisclosure(contractAddress='c',attesterId='a',payloadHash='p',grantee='g',minLevel=1)");
     });
 
     test('actions POST a JSON body; bigint becomes a string; undefined dropped', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([{ body: { jobId: null } }]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
-        await ng.callAction('sendNight', { amount: 5n, receiverAddress: 'addr', ttlIso: undefined });
-        expect(calls[0].url).toBe('https://ng.example/odata/v4/midnight/sendNight');
+        await ng.callAction('sendToken', { amount: 5n, receiverAddress: 'addr', expiresAt: undefined });
+        expect(calls[0].url).toBe('https://ng.example/odata/v4/midnight/sendToken');
         expect(JSON.parse(calls[0].init.body)).toEqual({ amount: '5', receiverAddress: 'addr' });
     });
 
@@ -72,6 +75,23 @@ describe('connect: encoding', () => {
             .rejects.toMatchObject({ name: 'NightgateApiError', status: 400, code: 'BadThing', message: 'nope' });
         expect(new NightgateApiError(1, 'x', 'y')).toBeInstanceOf(Error);
     });
+
+    test('a key conflict names the job that holds the key, when the server sends it', async () => {
+        const { connect } = await importClient();
+        const holder = { jobId: 'j7', status: 'succeeded', chainStatus: 'success' };
+        const conflict = { code: 'IDEMPOTENCY_KEY_CONFLICT', message: 'used with a different request payload' };
+        const { fn } = fakeFetch([
+            { status: 409, body: { error: { ...conflict, '@nightgate.job': holder } } },
+            { status: 409, body: { error: conflict } }
+        ]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        const first = await ng.callAction('anchorDocument', { idempotencyKey: 'k' }).catch((e: unknown) => e) as { code: string; job?: unknown };
+        expect(first).toMatchObject({ name: 'NightgateApiError', status: 409, code: 'IDEMPOTENCY_KEY_CONFLICT', job: holder });
+        // Another caller gets the conflict without the job.
+        const second = await ng.callAction('anchorDocument', { idempotencyKey: 'k' }).catch((e: unknown) => e) as { job?: unknown };
+        expect(second).toMatchObject({ status: 409 });
+        expect('job' in second).toBe(false);
+    });
 });
 
 describe('connect: service paths', () => {
@@ -82,7 +102,7 @@ describe('connect: service paths', () => {
         await ng.getHealth();
         await ng.verifyAttestation({ contractAddress: 'c', payloadHash: 'p' });
         expect(calls[0].url).toBe('https://ng.example/odata/v4/midnight-indexer/getHealth()');
-        expect(calls[1].url.startsWith('https://ng.example/odata/v4/midnight/verifyAttestationState(')).toBe(true);
+        expect(calls[1].url.startsWith('https://ng.example/odata/v4/midnight/verifyAttestation(')).toBe(true);
 
         const old = fakeFetch([{ body: {} }]);
         const ngOld = connect({
@@ -92,7 +112,7 @@ describe('connect: service paths', () => {
         await ngOld.getHealth();
         await ngOld.verifyAttestation({ contractAddress: 'c', payloadHash: 'p' });
         expect(old.calls[0].url).toBe('https://ng.example/gateway/midnight-indexer/getHealth()');
-        expect(old.calls[1].url.startsWith('https://ng.example/gateway/midnight/verifyAttestationState(')).toBe(true);
+        expect(old.calls[1].url.startsWith('https://ng.example/gateway/midnight/verifyAttestation(')).toBe(true);
     });
 });
 
@@ -123,45 +143,81 @@ describe('connect: auth headers', () => {
     });
 });
 
+describe('connect: reading a table', () => {
+    test('sends one OData read with the query encoded and returns the rows', async () => {
+        const { connect } = await importClient();
+        const rows = [{ ID: 't1', blockHeight: 5 }, { ID: 't2', blockHeight: 5 }];
+        const { fn, calls } = fakeFetch([{ body: { '@odata.context': 'x', value: rows } }, { body: { value: [] } }, { body: { value: [{ ID: 'SINGLETON' }] } }]);
+        const ng = connect({ baseUrl: 'https://ng.example/', fetchFn: fn as any, agentToken: 'ngat_x' });
+        const out = await ng.read('Transactions', { filter: "txType eq 'contract_call' and blockHeight ge 5", orderby: 'blockHeight desc,indexInBlock desc', top: 50, skip: 100, select: ['ID', 'blockHeight'] });
+        expect(out).toEqual(rows);
+        expect(calls[0].init.method).toBe('GET');
+        expect(calls[0].init.headers['x-agent-token']).toBe('ngat_x');
+        expect(calls[0].url).toBe("https://ng.example/odata/v4/midnight/Transactions?$filter=txType%20eq%20'contract_call'%20and%20blockHeight%20ge%205"
+            + '&$orderby=blockHeight%20desc%2CindexInBlock%20desc&$select=ID%2CblockHeight&$top=50&$skip=100');
+
+        // No query reads the first page; an empty page is an empty list.
+        expect(await ng.read('Blocks')).toEqual([]);
+        expect(calls[1].url).toBe('https://ng.example/odata/v4/midnight/Blocks');
+        expect(await ng.read('SyncState', { service: 'indexer', top: 1 })).toEqual([{ ID: 'SINGLETON' }]);
+        expect(calls[2].url).toBe('https://ng.example/odata/v4/midnight-indexer/SyncState?$top=1');
+    });
+
+    test('refuses what is no table name, no page position or no service, before any request', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        for (const entity of ['', 'Blocks?$top=1', '../admin/AgentGrants', "Blocks('x')", 42]) {
+            await expect(ng.read(entity as string)).rejects.toThrow('read: entity must be the name of a table, such as Blocks');
+        }
+        await expect(ng.read('Blocks', { top: -1 })).rejects.toThrow('read: top must be a non-negative integer');
+        await expect(ng.read('Blocks', { skip: 1.5 })).rejects.toThrow('read: skip must be a non-negative integer');
+        await expect(ng.read('Blocks', { service: 'admin' as never })).rejects.toThrow("read: service must be 'main' or 'indexer'");
+        expect(calls).toHaveLength(0);
+    });
+});
+
 describe('connect: jobs', () => {
-    test('write actions submit, poll and return the PARSED job result with txHash', async () => {
+    test('write actions submit, poll and return the PARSED job result with txId and txHash', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([
             { body: { jobId: 'j1', status: 'pending' } },
             { body: { status: 'processing' } },
-            { body: { status: 'succeeded', result: JSON.stringify({ txHash: '00ab', documentId: 'd1' }) } }
+            { body: { status: 'succeeded', result: { txId: '00ab', txHash: 'cd01', anchorId: 'd1' } } }
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
-        const out = await ng.anchorDocument({ sha256: 'x', sessionId: 's1', contractAddress: 'c' });
-        expect(out).toMatchObject({ jobId: 'j1', txHash: '00ab', documentId: 'd1' });
+        const out = await ng.anchorDocument({ payloadHash: 'x', sessionId: 's1', contractAddress: 'c' });
+        expect(out).toMatchObject({ jobId: 'j1', txId: '00ab', txHash: 'cd01', anchorId: 'd1' });
+        // A job answer without a chain verdict gives null, never a missing field.
+        expect(out).toMatchObject({ chainStatus: null, blockHeight: null });
         // the polls carry the SESSION the job was started under
-        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j1', sessionId: 's1', waitMs: 20_000 });
+        expect(pollOf(calls[1])).toBe("(jobId='j1',sessionId='s1',waitMs=20000)");
     });
 
     test('sponsorFinalized polls under the SPONSOR session the server returns', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([
             { body: { jobId: 'j2', status: 'pending', sessionId: 'sponsor-1' } },
-            { body: { status: 'succeeded', result: JSON.stringify({ txHash: '00cd' }) } }
+            { body: { status: 'succeeded', result: { txHash: '00cd' } } }
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
         const out = await ng.sponsorFinalized({ finalizedTxB64: 'AAAA' });
         expect(out.txHash).toBe('00cd');
         expect(JSON.parse(calls[0].init.body)).toMatchObject({ finalizedTxB64: 'AAAA' });
-        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 'sponsor-1', waitMs: 20_000 });
+        expect(pollOf(calls[1])).toBe("(jobId='j2',sessionId='sponsor-1',waitMs=20000)");
     });
 
     test('sponsorSwap posts both halves and polls under the SPONSOR session', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([
             { body: { jobId: 'job-9', status: 'pending', sessionId: 'sponsor-1' } },
-            { body: { status: 'succeeded', result: JSON.stringify({ txHash: '00aa', swap: { gives: { tokenType: 'a', amount: '10' }, wants: { tokenType: 'b', amount: '3' } } }) } }
+            { body: { status: 'succeeded', result: { txHash: '00aa', swap: { gives: { tokenType: 'a', amount: '10' }, wants: { tokenType: 'b', amount: '3' } } } } }
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
         const out = await ng.sponsorSwap({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC' });
         expect(calls[0].url).toBe('https://ng.example/odata/v4/midnight/sponsorSwap');
         expect(JSON.parse(calls[0].init.body)).toMatchObject({ makerHalfB64: 'swapoffer1xyz', takerHalfB64: 'AAEC' });
-        expect(JSON.parse(calls[1].init.body)).toMatchObject({ jobId: 'job-9', sessionId: 'sponsor-1' });
+        expect(pollOf(calls[1])).toContain("jobId='job-9',sessionId='sponsor-1'");
         expect(out).toMatchObject({ txHash: '00aa', swap: { gives: { amount: '10' } } });
     });
 
@@ -169,22 +225,22 @@ describe('connect: jobs', () => {
         const { connect, NightgateJobError } = await importClient();
         const { fn } = fakeFetch([
             { body: { jobId: 'j3', status: 'pending' } },
-            { body: { status: 'failed', errorCode: 'BatchCausalityViolation', errorMessage: 'split the batch' } }
+            { body: { status: 'failed', errorCode: 'BATCH_CAUSALITY_VIOLATION', errorMessage: 'split the batch' } }
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
         const err = await ng.proveFieldPredicate({ sessionId: 's' }).catch((e: unknown) => e);
         expect(err).toBeInstanceOf(NightgateJobError);
-        expect((err as any).job).toMatchObject({ jobId: 'j3', errorCode: 'BatchCausalityViolation' });
+        expect((err as any).job).toMatchObject({ jobId: 'j3', errorCode: 'BATCH_CAUSALITY_VIOLATION' });
     });
 
-    test('sendNight is submit-and-wait like every other write action', async () => {
+    test('sendToken is submit-and-wait like every other write action', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([
             { body: { jobId: 'j5', status: 'pending' } },
-            { body: { status: 'succeeded', result: JSON.stringify({ txId: '00ef', toLedger: 'unshielded' }) } }
+            { body: { status: 'succeeded', result: { txId: '00ef', toLedger: 'unshielded' } } }
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
-        const out = await ng.sendNight({ sessionId: 's1', receiverAddress: 'addr', amount: '5' });
+        const out = await ng.sendToken({ sessionId: 's1', receiverAddress: 'addr', amount: '5' });
         expect(out).toMatchObject({ jobId: 'j5', txId: '00ef' });
         expect(calls[1].url).toContain('/getJobStatus');
     });
@@ -194,12 +250,12 @@ describe('connect: jobs', () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([
             { body: { jobId: 'j6', status: 'pending', sessionId: 'server-side-sponsor' } },
-            { body: { status: 'succeeded', result: JSON.stringify({ txHash: '0011' }) } }
+            { body: { status: 'succeeded', result: { txHash: '0011' } } }
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
         const out = await ng.sponsorFinalized({ finalizedTxB64: 'AAAA' });
         expect(out.txHash).toBe('0011');
-        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j6', sessionId: 'server-side-sponsor', waitMs: 20_000 });
+        expect(pollOf(calls[1])).toBe("(jobId='j6',sessionId='server-side-sponsor',waitMs=20000)");
     });
 
     test('an action without a jobId returns as-is (sync surface)', async () => {
@@ -213,23 +269,15 @@ describe('connect: jobs', () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([
             { body: { status: 'running' } },
-            { body: { status: 'succeeded', txHash: '00ab', transactionHash: 'cd01', result: '{}' } }
+            { body: { status: 'succeeded', txId: '00ab', txHash: 'cd01', chainStatus: 'pending', blockHeight: null, result: {} } }
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1, longPollMs: 15_000 });
         const out = await ng.waitForJob({ jobId: 'j1', sessionId: 's', timeoutMs: 60_000 });
-        expect(out).toEqual(expect.objectContaining({ txHash: '00ab', transactionHash: 'cd01' }));
-        expect(JSON.parse(calls[0].init.body)).toEqual({ jobId: 'j1', sessionId: 's', waitMs: 15_000 });
-    });
-
-    test('waitForJob polls without waitMs against a server that does not know it', async () => {
-        const { connect } = await importClient();
-        const { fn, calls } = fakeFetch([
-            { status: 400, body: { error: { message: "Property 'waitMs' does not exist in NightgateService.getJobStatus" } } },
-            { body: { status: 'succeeded', result: '{"txHash":"00ef"}' } }
-        ]);
-        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
-        expect((await ng.waitForJob({ jobId: 'j2', sessionId: 's' })).txHash).toBe('00ef');
-        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 's' });
+        expect(out).toEqual(expect.objectContaining({ txId: '00ab', txHash: 'cd01' }));
+        // The job succeeded before the chain answered, and the result says so.
+        expect(out).toMatchObject({ chainStatus: 'pending', blockHeight: null });
+        expect(pollOf(calls[0])).toBe("(jobId='j1',sessionId='s',waitMs=15000)");
+        expect(calls[0].init.method).toBe('GET');
     });
 
     const RECEIPT = { payload: '{}', signature: 'ab', publicKey: 'cd', algorithm: 'ed25519' };
@@ -242,20 +290,7 @@ describe('connect: jobs', () => {
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, longPollMs: 15_000 });
         expect(await ng.waitForReceipt({ jobId: 'j1', sessionId: 's', pollMs: 1 })).toEqual(RECEIPT);
-        expect(JSON.parse(calls[0].init.body)).toEqual({ jobId: 'j1', sessionId: 's', waitMs: 15_000, untilChain: true });
-    });
-
-    test('waitForReceipt polls against a server that does not know untilChain', async () => {
-        const { connect } = await importClient();
-        const { fn, calls } = fakeFetch([
-            { status: 400, body: { error: { message: "Property 'untilChain' does not exist in NightgateService.getJobStatus" } } },
-            { body: { status: 'succeeded', chainStatus: 'pending', receipt: null } },
-            { body: { status: 'succeeded', chainStatus: 'success', receipt: RECEIPT } }
-        ]);
-        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
-        expect(await ng.waitForReceipt({ jobId: 'j2', sessionId: 's', pollMs: 1 })).toEqual(RECEIPT);
-        expect(JSON.parse(calls[1].init.body)).toEqual({ jobId: 'j2', sessionId: 's' });
-        expect(JSON.parse(calls[2].init.body)).toEqual({ jobId: 'j2', sessionId: 's' });
+        expect(pollOf(calls[0])).toBe("(jobId='j1',sessionId='s',waitMs=15000,untilChain=true)");
     });
 
     test('waitForReceipt throws for a failed job and for a job that gets no receipt', async () => {
@@ -277,21 +312,21 @@ describe('connect: jobs', () => {
 
     test('waitForJob keeps waitMs inside the server maximum and the request timeout', async () => {
         const { connect } = await importClient();
-        const { fn, calls } = fakeFetch([{ body: { status: 'succeeded', result: '{}' } }]);
+        const { fn, calls } = fakeFetch([{ body: { status: 'succeeded', result: {} } }]);
         await connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, longPollMs: 30_000.5 }).waitForJob({ jobId: 'a', sessionId: 's' });
-        expect(JSON.parse(calls[0].init.body).waitMs).toBe(25_000);
+        expect(pollOf(calls[0])).toContain('waitMs=25000');
         await connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, timeoutMs: 15_000 }).waitForJob({ jobId: 'b', sessionId: 's' });
-        expect(JSON.parse(calls[1].init.body).waitMs).toBe(10_000);
+        expect(pollOf(calls[1])).toContain('waitMs=10000');
         await connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, timeoutMs: 4_000 }).waitForJob({ jobId: 'c', sessionId: 's' });
-        expect(JSON.parse(calls[2].init.body)).toEqual({ jobId: 'c', sessionId: 's' });
+        expect(pollOf(calls[2])).toBe("(jobId='c',sessionId='s')");
     });
 
     test('waitForJob with longPollMs 0 never sends waitMs', async () => {
         const { connect } = await importClient();
-        const { fn, calls } = fakeFetch([{ body: { status: 'succeeded', result: '{}' } }]);
+        const { fn, calls } = fakeFetch([{ body: { status: 'succeeded', result: {} } }]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, longPollMs: 0 });
         await ng.waitForJob({ jobId: 'j3', sessionId: 's' });
-        expect(JSON.parse(calls[0].init.body)).toEqual({ jobId: 'j3', sessionId: 's' });
+        expect(pollOf(calls[0])).toBe("(jobId='j3',sessionId='s')");
     });
 
     test('waitForJob times out rather than spinning forever', async () => {
@@ -309,7 +344,7 @@ describe('connect: jobs', () => {
             { status: 502, body: { error: { message: 'Bad Gateway' } } },
             { status: 503, body: {} },
             { body: { status: 'processing' } },
-            { body: { status: 'succeeded', result: JSON.stringify({ txHash: 'tx-after-502' }) } }
+            { body: { status: 'succeeded', result: { txHash: 'tx-after-502' } } }
         ]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any, pollMs: 1 });
         const out = await ng.waitForJob({ jobId: 'j5', sessionId: 's' });
@@ -355,7 +390,7 @@ describe('connect: stale keep-alive socket', () => {
             .mockRejectedValueOnce(staleSocket())
             .mockResolvedValueOnce({ ok: true, status: 200, text: async () => JSON.stringify({ jobId: 'j1' }) });
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
-        await expect(ng.callAction('sendNight', { amount: '1', receiverAddress: 'addr', idempotencyKey: 'k-1' })).resolves.toMatchObject({ jobId: 'j1' });
+        await expect(ng.callAction('sendToken', { amount: '1', receiverAddress: 'addr', idempotencyKey: 'k-1' })).resolves.toMatchObject({ jobId: 'j1' });
         expect(fn).toHaveBeenCalledTimes(2);
         expect(JSON.parse(fn.mock.calls[1][1].body)).toMatchObject({ idempotencyKey: 'k-1' });
 
@@ -371,8 +406,8 @@ describe('connect: stale keep-alive socket', () => {
         const { connect } = await importClient();
         const receipt = { payload: '{}', signature: 'aa', publicKey: 'bb', algorithm: 'ed25519' };
         const answers = [
-            { jobId: 'j1', status: 'pending', sessionId: 'pool' }, { status: 'succeeded', txHash: '00aa', result: '{}' },
-            { jobId: 'j2', status: 'pending', sessionId: 'pool' }, { status: 'succeeded', txHash: '00bb', result: '{}', receipt }
+            { jobId: 'j1', status: 'pending', sessionId: 'pool' }, { status: 'succeeded', txId: '00aa', result: {} },
+            { jobId: 'j2', status: 'pending', sessionId: 'pool' }, { status: 'succeeded', txId: '00bb', result: {}, receipt }
         ];
         const fn = vi.fn(async () => ({ ok: true, status: 200, text: async () => JSON.stringify(answers.shift()) }));
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
@@ -422,7 +457,7 @@ describe('connect: stale keep-alive socket', () => {
         const { connect } = await importClient();
         const once = vi.fn().mockRejectedValue(staleSocket());
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: once as any });
-        await expect(ng.callAction('sendNight', { amount: '1', receiverAddress: 'addr' })).rejects.toThrow(/fetch failed/);
+        await expect(ng.callAction('sendToken', { amount: '1', receiverAddress: 'addr' })).rejects.toThrow(/fetch failed/);
         expect(once).toHaveBeenCalledTimes(1);
     });
 
@@ -443,7 +478,7 @@ describe('connect: stale keep-alive socket', () => {
         try {
             const port = (server.address() as any).port;
             const ng = connect({ baseUrl: `http://127.0.0.1:${port}`, timeoutMs: 5000 });
-            await expect(ng.callAction('sendNight', { sessionId: 's', receiverAddress: 'addr', amount: '1' })).rejects.toThrow();
+            await expect(ng.callAction('sendToken', { sessionId: 's', receiverAddress: 'addr', amount: '1' })).rejects.toThrow();
             expect(received).toBe(1);
         } finally {
             server.closeAllConnections();
@@ -455,11 +490,11 @@ describe('connect: stale keep-alive socket', () => {
         const { connect } = await importClient();
         const twice = vi.fn().mockRejectedValue(staleSocket());
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: twice as any });
-        await expect(ng.callAction('getJobStatus', { jobId: 'j1', idempotencyKey: 'k' })).rejects.toThrow(/fetch failed/);
+        await expect(ng.callAction('anchorDocument', { payloadHash: 'ab', idempotencyKey: 'k' })).rejects.toThrow(/fetch failed/);
         expect(twice).toHaveBeenCalledTimes(2);
         const refused = vi.fn().mockRejectedValue(Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) }));
         const ng2 = connect({ baseUrl: 'https://ng.example', fetchFn: refused as any });
-        await expect(ng2.callAction('getJobStatus', { jobId: 'j1' })).rejects.toThrow(/fetch failed/);
+        await expect(ng2.callAction('anchorDocument', { payloadHash: 'ab' })).rejects.toThrow(/fetch failed/);
         expect(refused).toHaveBeenCalledTimes(1);
     });
 });
@@ -467,9 +502,8 @@ describe('connect: stale keep-alive socket', () => {
 describe('isRetryable', () => {
     test('the client list is exactly the retryable codes of the server registry', async () => {
         const { RETRYABLE_ERROR_CODES } = await importClient();
-        const { ERROR_CODES } = await import('../../srv/utils/errors.js');
-        const serverRetryable = Object.entries(ERROR_CODES as Record<string, { retryable?: boolean }>).filter(([, s]) => s.retryable).map(([c]) => c).sort();
-        expect([...RETRYABLE_ERROR_CODES].sort()).toEqual(serverRetryable);
+        const { retryableErrorCodes } = await import('../../srv/utils/errors.js');
+        expect([...RETRYABLE_ERROR_CODES].sort()).toEqual(retryableErrorCodes());
     });
 
     test('decides on the code first, then the status, then network errors', async () => {
@@ -576,25 +610,25 @@ describe('a write that failed to start', () => {
 describe('connect: the chain reads a transaction builder needs', () => {
     test('contractStateAt asks stateAt with a null height, lowercases the address and drops a 0x prefix', async () => {
         const { connect } = await importClient();
-        const { fn, calls } = fakeFetch([{ body: { address: 'ab', height: 7, state: 'c3Q=', ledgerParameters: null } }]);
+        const { fn, calls } = fakeFetch([{ body: { contractAddress: 'ab', height: 7, state: 'c3Q=', ledgerParameters: null } }]);
         const ng = connect({ baseUrl: 'https://ng.example', agentToken: 'ngat_x', fetchFn: fn as any });
-        const snap = await ng.contractStateAt({ address: '0xAB' });
-        expect(calls[0].url).toBe("https://ng.example/odata/v4/midnight/ContractStates/stateAt(address='ab',height=null)");
+        const snap = await ng.contractStateAt({ contractAddress: '0xAB' });
+        expect(calls[0].url).toBe("https://ng.example/odata/v4/midnight/ContractStates/stateAt(contractAddress='ab',height=null)");
         expect(snap).toEqual(expect.objectContaining({ height: 7, state: 'c3Q=' }));
-        await ng.contractStateAt({ address: 'ab', height: 12 });
+        await ng.contractStateAt({ contractAddress: 'ab', height: 12 });
         expect(calls[1].url).toMatch(/height=12\)$/);
     });
 
-    test('transactionByIdentifier is null on 404 and the inclusion otherwise', async () => {
+    test('transactionByTxId is null on 404 and the inclusion otherwise', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([{ status: 404, body: { error: { message: 'no indexed transaction carries identifier ffff' } } }]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
-        expect(await ng.transactionByIdentifier('0xFFFF')).toBeNull();
-        expect(calls[0].url).toBe("https://ng.example/odata/v4/midnight/Transactions/byIdentifier(identifier='ffff')");
+        expect(await ng.transactionByTxId('0xFFFF')).toBeNull();
+        expect(calls[0].url).toBe("https://ng.example/odata/v4/midnight/Transactions/byTxId(txId='ffff')");
 
-        const found = fakeFetch([{ body: { identifier: 'ffff', hash: '0xtx', blockHeight: 5, status: 'SUCCESS', failedSegments: [] } }]);
+        const found = fakeFetch([{ body: { txId: 'ffff', extrinsicHash: '0xtx', blockHeight: 5, status: 'SUCCESS', failedSegments: [] } }]);
         const ng2 = connect({ baseUrl: 'https://ng.example', fetchFn: found.fn as any });
-        expect(await ng2.transactionByIdentifier('ffff')).toEqual(expect.objectContaining({ hash: '0xtx', blockHeight: 5, status: 'SUCCESS' }));
+        expect(await ng2.transactionByTxId('ffff')).toEqual(expect.objectContaining({ extrinsicHash: '0xtx', blockHeight: 5, status: 'SUCCESS' }));
     });
 
     test('contractDeploy filters the deploy action with its transaction, block and result, and names the deploy identifier', async () => {
@@ -603,7 +637,7 @@ describe('connect: the chain reads a transaction builder needs', () => {
             value: [{
                 actionIndex: 1,
                 transaction: {
-                    hash: '0xdeploy', ledgerTxHash: '0xledger', identifiers: JSON.stringify(['id0', 'id1']),
+                    extrinsicHash: '0xdeploy', txHash: '0xledger', identifiers: JSON.stringify(['id0', 'id1']),
                     block: { height: 7, hash: '0xb7', timestamp: 1700, protocolVersion: 2001000 },
                     transactionResult: { status: 'PARTIAL_SUCCESS', segments: [{ segmentId: 0, success: true }, { segmentId: 1, success: false }] }
                 }
@@ -613,21 +647,33 @@ describe('connect: the chain reads a transaction builder needs', () => {
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
         const deploy = await ng.contractDeploy('0x' + 'AB'.repeat(32));
         const url = decodeURIComponent(calls[0].url);
-        expect(url).toContain(`/ContractActions?$filter=address eq '${'ab'.repeat(32)}' and actionType eq 'DEPLOY'`);
+        expect(url).toContain(`/ContractActions?$filter=contractAddress eq '${'ab'.repeat(32)}' and actionType eq 'DEPLOY'`);
         expect(url).toContain('$expand=transaction($expand=block,transactionResult($expand=segments))');
         expect(deploy).toEqual({
-            txHash: '0xdeploy', ledgerTxHash: '0xledger', blockHeight: 7, blockHash: '0xb7', blockTimestamp: 1700, protocolVersion: 2001000, status: 'PARTIAL_SUCCESS',
+            extrinsicHash: '0xdeploy', txHash: '0xledger', blockHeight: 7, blockHash: '0xb7', blockTimestamp: 1700, protocolVersion: 2001000, status: 'PARTIAL_SUCCESS',
             failedSegments: [1], identifiers: ['id0', 'id1'], txId: 'id1'
         });
     });
 
     test('ledgerTransaction returns the base64 bytes, and null while the server has not indexed them', async () => {
         const { connect } = await importClient();
-        const { fn, calls } = fakeFetch([{ body: { hash: '0xdeploy', ledgerTransaction: 'dHg=' } }, { status: 404, body: { error: { message: 'none' } } }]);
+        const { fn, calls } = fakeFetch([{ body: { extrinsicHash: '0xdeploy', ledgerTransaction: 'dHg=' } }, { status: 404, body: { error: { message: 'none' } } }]);
         const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
         expect(await ng.ledgerTransaction('0xdeploy')).toBe('dHg=');
         expect(decodeURIComponent(calls[0].url)).toContain('/Transactions/ledgerTransaction(');
         expect(await ng.ledgerTransaction('0xother')).toBeNull();
+    });
+
+    test('blockAt reads the newest block or the one at a height from the Blocks entity', async () => {
+        const { connect } = await importClient();
+        const row = { ID: 'b-1', hash: 'ab20', height: 20, protocolVersion: 2001000, timestamp: 1700 };
+        const { fn, calls } = fakeFetch([{ body: { value: [row] } }, { body: { value: [{ ...row, hash: 'ab9', height: '9' }] } }, { body: { value: [] } }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        expect(await ng.blockAt()).toEqual({ hash: 'ab20', height: 20, protocolVersion: 2001000, timestamp: 1700 });
+        expect(decodeURIComponent(calls[0].url)).toBe('https://ng.example/odata/v4/midnight/Blocks?$orderby=height desc&$top=1&$select=hash,height,protocolVersion,timestamp');
+        expect(await ng.blockAt(9)).toEqual(expect.objectContaining({ hash: 'ab9', height: 9 }));
+        expect(decodeURIComponent(calls[1].url)).toContain('/Blocks?$filter=height eq 9&$top=1');
+        expect(await ng.blockAt(4)).toBeNull();
     });
 
     test('contractDeploy is null while the server has no deploy action', async () => {

@@ -102,7 +102,7 @@ describe('checkBatchGas', () => {
         const a = await attest(vault.withOne, 1_000_001, 900_001);
         const b = await attest(a.next, 1_000_002, 900_002);
         await expect(checkBatchGas(batch(b, a), provider(vault.withOne), NETWORK, vault.address, ['attest', 'attest']))
-            .rejects.toMatchObject({ code: 'BatchGasBudgetExceeded', message: expect.stringMatching(/runs out of gas on the ledger/) });
+            .rejects.toMatchObject({ code: 'BATCH_GAS_BUDGET_EXCEEDED', message: expect.stringMatching(/runs out of gas on the ledger/) });
     });
 
     test('applies the ledger parameters the provider returns', async () => {
@@ -111,7 +111,7 @@ describe('checkBatchGas', () => {
         const read = vi.fn(() => L.LedgerParameters.initialParameters().serialize());
         const withParams = provider(vault.withOne, { serialize: read });
         await expect(checkBatchGas(batch(a, b), withParams, NETWORK, vault.address, ['attest', 'attest'])).resolves.toBeUndefined();
-        await expect(checkBatchGas(batch(b, a), withParams, NETWORK, vault.address, ['attest', 'attest'])).rejects.toMatchObject({ code: 'BatchGasBudgetExceeded' });
+        await expect(checkBatchGas(batch(b, a), withParams, NETWORK, vault.address, ['attest', 'attest'])).rejects.toMatchObject({ code: 'BATCH_GAS_BUDGET_EXCEEDED' });
         expect(read).toHaveBeenCalledTimes(2);
     });
 
@@ -121,5 +121,19 @@ describe('checkBatchGas', () => {
         await expect(checkBatchGas({} as any, { queryZSwapAndContractState: async () => null }, NETWORK, vault.address, ['attest'])).resolves.toBeUndefined();
         const v8: any = { queryZSwapAndContractState: async () => ({ zswapChainState: { era: 'v8' }, contractState: { era: 'v8' }, ledgerParameters: { era: 'v8' } }) };
         await expect(checkBatchGas({} as any, v8, NETWORK, vault.address, ['attest'])).resolves.toBeUndefined();
+    });
+
+    test('tells its caller when it could not check, and writes nothing to the console', async () => {
+        const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => { });
+        try {
+            const failing = { queryZSwapAndContractState: async () => { throw new Error('indexer down'); } };
+            const reports: unknown[] = [];
+            await checkBatchGas({} as any, failing, NETWORK, vault.address, ['attest', 'attest'], (event: unknown) => reports.push(event));
+            expect(reports).toEqual([{ step: 'gas-check', outcome: 'skipped', detail: 'indexer down' }]);
+            await checkBatchGas({} as any, failing, NETWORK, vault.address, ['attest', 'attest']);
+            expect(consoleLog).not.toHaveBeenCalled();
+        } finally {
+            consoleLog.mockRestore();
+        }
     });
 });

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Builds the CDS_CONFIG JSON for the standalone image from the environment. Called by docker/entrypoint.sh.
-// Reads NIGHTGATE_DB_URL or NIGHTGATE_DB_PATH, NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS, NIGHTGATE_AUTH and NIGHTGATE_HTTP_USER, _PASSWORD, _ROLES.
+// Reads NIGHTGATE_DB_URL or NIGHTGATE_DB_PATH, NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS and NIGHTGATE_HTTP_USER, _PASSWORD, _ROLES.
 // Prints the JSON on stdout. Exits 2 with a message on stderr when the environment is unusable.
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
@@ -63,11 +63,8 @@ export function databaseConfig(env = process.env) {
 }
 
 export function authConfig(env = process.env) {
-    const kind = String(env.NIGHTGATE_AUTH ?? 'basic');
-    if (kind === 'dummy') return { kind: 'dummy' };
-    if (kind !== 'basic') throw new Error(`unsupported NIGHTGATE_AUTH='${kind}' (use: basic | dummy)`);
     const password = String(env.NIGHTGATE_HTTP_PASSWORD ?? '');
-    if (!password) throw new Error('NIGHTGATE_HTTP_PASSWORD is required with basic auth (local unauthenticated testing only: NIGHTGATE_AUTH=dummy)');
+    if (!password) throw new Error('NIGHTGATE_HTTP_PASSWORD is required: the server checks every caller with basic auth');
     const user = String(env.NIGHTGATE_HTTP_USER || 'nightgate');
     // No role by default: the admin service (signing-key export, session
     // invalidation, job queue) needs NIGHTGATE_HTTP_ROLES=admin.

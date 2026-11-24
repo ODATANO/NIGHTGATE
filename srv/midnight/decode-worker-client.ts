@@ -28,10 +28,6 @@ export function getDecodeWorkerStatus(): DecodeWorkerStatus {
     return client.status();
 }
 
-export function startDecodeWorker(): Promise<void> {
-    return client.start();
-}
-
 export function stopDecodeWorker(): Promise<void> {
     return client.stop();
 }

@@ -20,6 +20,7 @@ const FILES = [
     // the local builder + self-funded submission
     { path: 'src/txbuilder/index.mjs' },
     { path: 'src/txbuilder/index.d.ts' },
+    { path: 'src/txbuilder/internals.mjs' },
     { path: 'src/txbuilder/submit.mjs' },
     { path: 'src/txbuilder/api-provider.mjs' },
     { path: 'src/txbuilder/swap.mjs' },
@@ -30,8 +31,7 @@ const FILES = [
     { path: 'src/txbuilder/holder.d.mts' },
     { path: 'src/txbuilder/factory.mjs' },
     { path: 'src/txbuilder/factory.d.mts' },
-    // the call/witness helpers (identical to @odatano/nightgate/browser; the
-    // implementation is @odatano/contract-kit) and the lineage re-exports
+    // the call and witness helpers, implemented in @odatano/contract-kit, and the vault contracts
     { path: 'src/browser/attestation-vault.mjs' },
     { path: 'src/browser/attestation-vault.d.mts' },
     { path: 'src/browser/attestation-vault-32.mjs' },
@@ -49,7 +49,6 @@ const FILES = [
     { path: 'src/browser/providers.d.mts' },
     { path: 'src/browser/contract.mjs' },
     { path: 'src/browser/contract.d.mts' },
-    { path: 'src/browser/zk-config.mjs' },
     // helpers the builder requires by relative path (BUILD OUTPUT)
     { path: 'srv/utils/wallet-hd.js', buildOutput: true },
     { path: 'srv/utils/wallet-hd.d.ts', buildOutput: true },
@@ -81,28 +80,16 @@ const FILES = [
     { path: 'srv/midnight/wasm-proof-provider.d.ts', buildOutput: true },
     // Batch path: the scope runner, the segment order and the gas check.
     // The builder and the browser runner load the same files.
-    { path: 'srv/midnight/batch-call-scope.js', buildOutput: true },
-    { path: 'srv/midnight/batch-call-scope.d.ts', buildOutput: true },
     { path: 'src/shared/batch-call-scope.mjs', buildOutput: true },
     { path: 'src/shared/batch-call-scope.d.mts', buildOutput: true },
     { path: 'src/shared/batch-segment-order.mjs', buildOutput: true },
     { path: 'src/shared/batch-segment-order.d.mts', buildOutput: true },
     { path: 'src/shared/batch-gas-preflight.mjs', buildOutput: true },
     { path: 'src/shared/batch-gas-preflight.d.mts', buildOutput: true },
-    // the canonical membership-set rule (a public subpath of the main
-    // package); a re-export of @odatano/contract-kit.
+    // the canonical membership-set rule, a re-export of @odatano/contract-kit
     { path: 'srv/submission/set-root.js', buildOutput: true },
     { path: 'srv/submission/set-root.d.ts', buildOutput: true },
     { path: 'LICENSE' }
-];
-
-/** Doc + identity strings that must name the slim package, not NIGHTGATE. */
-const REWRITES = [
-    [/@odatano\/nightgate\/browser\/attestation-vault/g, '@odatano/nightgate-tx/attestation-vault'],
-    [/@odatano\/nightgate\/txbuilder/g, '@odatano/nightgate-tx/txbuilder'],
-    [/@odatano\/nightgate\/client/g, '@odatano/nightgate-tx/client'],
-    [/@odatano\/nightgate\/browser/g, '@odatano/nightgate-tx/calls'],
-    [/@odatano\/nightgate\/set-root/g, '@odatano/nightgate-tx/set-root']
 ];
 
 const exists = (p) => access(p).then(() => true, () => false);
@@ -125,7 +112,7 @@ async function main() {
     for (const d of ['src', 'srv', 'contracts']) await rm(join(OUT, d), { recursive: true, force: true });
     await rm(join(OUT, 'LICENSE'), { force: true });
 
-    let copied = 0, bytes = 0, rewritten = 0;
+    let copied = 0, bytes = 0;
     const missingBuildOutput = [];
     for (const { path, buildOutput } of FILES) {
         const from = join(ROOT, path);
@@ -136,18 +123,9 @@ async function main() {
         const to = join(OUT, path);
         await mkdir(dirname(to), { recursive: true });
 
-        if (/\.(mjs|js|ts|mts)$/.test(path)) {
-            let text = await readFile(from, 'utf8');
-            const before = text;
-            for (const [re, to_] of REWRITES) text = text.replace(re, to_);
-            if (text !== before) rewritten++;
-            await writeFile(to, text);
-            bytes += Buffer.byteLength(text);
-        } else {
-            const buf = await readFile(from);
-            await writeFile(to, buf);
-            bytes += buf.length;
-        }
+        const buf = await readFile(from);
+        await writeFile(to, buf);
+        bytes += buf.length;
         copied++;
     }
 
@@ -170,12 +148,12 @@ async function main() {
         if (/(from|require\()\s*['"]@sap\/cds/.test(text)) leftovers.push(`${path} (imports @sap/cds)`);
     }
     if (leftovers.length) {
-        throw new Error('build-slim-package: unrewritten references:\n  - ' + leftovers.join('\n  - '));
+        throw new Error('build-slim-package: files that name @odatano/nightgate or import CAP:\n  - ' + leftovers.join('\n  - '));
     }
 
     const total = await dirSize(OUT);
     console.log(`build-slim-package: ${pkg.name}@${pkg.version}`);
-    console.log(`  ${copied} files copied (${rewritten} with rewritten package names)`);
+    console.log(`  ${copied} files copied`);
     console.log(`  payload ${(bytes / 1024).toFixed(0)} KB, package dir ${(total / 1024).toFixed(0)} KB`);
     console.log(`  out: ${relative(ROOT, OUT)}`);
 }

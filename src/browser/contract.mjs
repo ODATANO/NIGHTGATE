@@ -33,24 +33,24 @@ function batchWitnesses(calls, given, connected) {
 }
 
 // midnight-js calls the ledger identifier `txId` and the hash explorers show `txHash`.
-const landed = (pub) => ({ txHash: pub.txId, transactionHash: pub.txHash, blockHeight: pub.blockHeight });
+const landed = (pub) => ({ txId: pub.txId, txHash: pub.txHash, blockHeight: pub.blockHeight });
 
 /** Connects to one contract of the server's manifest. Returns `call`, `batch` and `deploy` for it. */
 export async function connectContract(opts = {}) {
     const {
-        connector, contract, contractClass, manifestUrl, fetchFn, webSocket, expectedManifestHash,
+        connector, contractName, contractClass, manifestUrl, fetchFn, webSocket, expectedManifestHash,
         proving = 'server', proofServerUrl, witnesses: connectedWitnesses, initialPrivateState, ttlMinutes = 30
     } = opts;
     if (!connector) throw new Error('connectContract: connector is required (the connected wallet)');
-    if (!contract) throw new Error('connectContract: contract is required (its name in the manifest)');
+    if (!contractName) throw new Error('connectContract: contractName is required (the name in the manifest)');
     if (typeof contractClass !== 'function') throw new Error('connectContract: contractClass is required (the compiled Contract)');
-    if (!Number.isInteger(ttlMinutes) || ttlMinutes <= 0) throw new Error(`connectContract: ttlMinutes must be a positive whole number, got ${String(ttlMinutes)}`);
-    const privateStateId = opts.privateStateId ?? `${contract}PrivateState`;
+    if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) throw new Error(`connectContract: ttlMinutes must be a positive number (got ${String(ttlMinutes)})`);
+    const privateStateId = opts.privateStateId ?? `${contractName}PrivateState`;
     let contractAddress = opts.contractAddress;
 
     const manifest = opts.manifest ?? await loadManifest(manifestUrl, fetchFn);
     const [assembled, contracts, { CompiledContract }, walletMod] = await Promise.all([
-        createNightgateConnectorProviders({ connector, manifest, manifestUrl, contract, fetchFn, webSocket, proving, proofServerUrl, expectedManifestHash }),
+        createNightgateConnectorProviders({ connector, manifest, manifestUrl, contractName, fetchFn, webSocket, proving, proofServerUrl, expectedManifestHash }),
         import('@midnight-ntwrk/midnight-js-contracts'),
         import('@midnight-ntwrk/compact-js'),
         import('@midnight-ntwrk/midnight-js-dapp-connector-proof-provider')
@@ -71,7 +71,7 @@ export async function connectContract(opts = {}) {
         config: { networkId: network.networkId, ttlSeconds: ttlMinutes * 60 }
     };
 
-    const compiledWith = (witnesses) => CompiledContract.make(contract, contractClass).pipe(
+    const compiledWith = (witnesses) => CompiledContract.make(contractName, contractClass).pipe(
         witnesses ? CompiledContract.withWitnesses(witnesses) : CompiledContract.withVacantWitnesses
     );
     const find = (witnesses) => {

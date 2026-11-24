@@ -2,10 +2,10 @@
  * The vault state readers against real contract state of both vault widths: the disclosure level, and how the
  * three readers answer for a contract that is not a vault. The indexer is a fake public data provider.
  */
-const providerState = vi.hoisted(() => ({ read: null as any }));
+const providerState = vi.hoisted(() => ({ read: null as any, at: [] as unknown[] }));
 vi.mock('../../srv/midnight/public-data-provider', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../../srv/midnight/public-data-provider')>()),
-    buildPublicDataProvider: vi.fn(async () => ({ queryContractState: async () => providerState.read }))
+    buildPublicDataProvider: vi.fn(async () => ({ queryContractState: async (_address: string, at?: unknown) => { providerState.at.push(at); return providerState.read; } }))
 }));
 
 import fs from 'node:fs';
@@ -125,6 +125,14 @@ describe.each(['@odatano/contract-attestation-vault', '@odatano/contract-attesta
     test('on the vault the attestation is found and an unproven claim is not', async () => {
         expect(await attestation()).toMatchObject({ attested: true, attesterId, payloadHash: hex(PAYLOAD) });
         expect(await claim()).toBe(false);
+    });
+
+    test('with a tip height, all three read the state at that block', async () => {
+        providerState.at = [];
+        await attestation({ tipHeight: 41 });
+        await claim({ tipHeight: 42 });
+        await level({ tipHeight: 43 });
+        expect(providerState.at).toEqual([41, 42, 43].map(blockHeight => ({ type: 'blockHeight', blockHeight })));
     });
 
     test('a contract without state answers null in all three', async () => {

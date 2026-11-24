@@ -136,14 +136,16 @@ describe('UnshieldedTokens events become UTXO rows', () => {
             intentHash: 'd1'.repeat(32),
             outputIndex: 0,
             initialNonce: `nonce-${'d1'.repeat(4)}-0`,
-            ctime: 1_789_997_496,
+            ctime: '1789997496',
             spentAtTransaction_ID: null
         }));
         expect(String(rows[0].value)).toBe('5000000000');
         expect(String(rows[1].value)).toBe('44344323000000');
-        // Bound to the transaction that produced them.
+        // Bound to the transaction that produced them, and at its place in the chain.
         const txRow = await db.run(cds.ql.SELECT.one.from(TRANSACTIONS));
         expect(rows.every((r: any) => r.createdAtTransaction_ID === txRow.ID)).toBe(true);
+        expect([Number(txRow.blockHeight), txRow.indexInBlock]).toEqual([10, 0]);
+        expect(rows.map((r: any) => [Number(r.blockHeight), r.indexInBlock, r.outputIndex])).toEqual([[10, 0, 0], [10, 0, 1]]);
     });
 
     it('accepts two outputs numbered 0 in one transaction when the intents differ', async () => {
@@ -230,13 +232,15 @@ describe('contract events drive ContractActions and the transaction type', () =>
             ])
         });
 
-        const actions = await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS));
+        const actions = await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).orderBy('blockHeight', 'indexInBlock', 'actionIndex'));
         expect(actions).toHaveLength(3);
-        expect(actions.every((a: any) => a.address === CONTRACT)).toBe(true);
-        expect(new Set(actions.map((a: any) => a.actionType))).toEqual(new Set(['DEPLOY', 'CALL', 'UPDATE']));
+        expect(actions.every((a: any) => a.contractAddress === CONTRACT)).toBe(true);
+        // Every action carries its place in the chain, so the order needs no join and no insert time.
+        expect(actions.map((a: any) => [a.actionType, Number(a.blockHeight), a.indexInBlock, a.actionIndex]))
+            .toEqual([['DEPLOY', 30, 0, 0], ['CALL', 30, 1, 0], ['UPDATE', 30, 2, 0]]);
 
         const txRows = (await db.run(cds.ql.SELECT.from(TRANSACTIONS)))
-            .sort((a: any, b: any) => a.transactionId - b.transactionId);
+            .sort((a: any, b: any) => a.indexInBlock - b.indexInBlock);
         expect(txRows.map((t: any) => t.txType)).toEqual(['contract_deploy', 'contract_call', 'contract_update']);
         expect(txRows.every((t: any) => t.contractAddress === CONTRACT)).toBe(true);
     });
@@ -258,7 +262,7 @@ describe('contract events drive ContractActions and the transaction type', () =>
         const actions = await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS));
         expect(actions).toHaveLength(1);
         expect(actions[0].actionType).toBe('CALL');
-        expect(actions[0].address).toBeNull();
+        expect(actions[0].contractAddress).toBeNull();
         expect(await db.run(cds.ql.SELECT.from(TX_RESULTS))).toHaveLength(0);
     });
 
@@ -283,7 +287,7 @@ describe('transaction results', () => {
         });
 
         const txRows = (await db.run(cds.ql.SELECT.from(TRANSACTIONS)))
-            .sort((a: any, b: any) => a.transactionId - b.transactionId);
+            .sort((a: any, b: any) => a.indexInBlock - b.indexInBlock);
         const results = await db.run(cds.ql.SELECT.from(TX_RESULTS));
         const byTx = new Map(results.map((r: any) => [r.transaction_ID, r.status]));
         expect(txRows.map((t: any) => byTx.get(t.ID))).toEqual(['SUCCESS', 'PARTIAL_SUCCESS', 'FAILURE']);

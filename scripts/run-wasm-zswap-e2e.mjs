@@ -45,12 +45,20 @@ async function post(path, body, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
+
 /** Poll a job to a terminal state. Returns { ok, result | errorCode+errorMessage }. */
 async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS, intervalMs = JOB_POLL_MS } = {}) {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = null;
     while (Date.now() < deadline) {
-        const r = await post('/getJobStatus', { jobId, sessionId });
+        const r = await jobStatus(jobId, sessionId);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) → HTTP ${r.status}: ${pretty(r.body)}`);
         const { status, result, errorCode, errorMessage } = r.body;
         if (status !== lastStatus) {
@@ -61,7 +69,7 @@ async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS
         }
         if (status === 'succeeded') {
             process.stdout.write('\n');
-            return { ok: true, result: result ? JSON.parse(result) : {} };
+            return { ok: true, result: result ?? {} };
         }
         if (status === 'failed') {
             process.stdout.write('\n');
@@ -100,8 +108,8 @@ function domainSepBytes() {
 
     r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
     if (r.status !== 200 && r.status !== 201) fail(`connectWalletForSigning → HTTP ${r.status}: ${pretty(r.body)}`);
-    if (r.body?.prewarmJobId) {
-        const pw = await pollJob(sessionId, r.body.prewarmJobId, 'prewarm');
+    if (r.body?.jobId) {
+        const pw = await pollJob(sessionId, r.body.jobId, 'prewarm');
         if (!pw.ok) fail(`prewarm failed: ${pw.errorCode}: ${pw.errorMessage}`);
     }
     console.log('OK   prewarm done');
@@ -119,7 +127,7 @@ function domainSepBytes() {
     } else {
         step('3. deployContract(shielded-token)');
         const tDeploy = Date.now();
-        r = await post('/deployContract', { compiledArtifactRef: 'shielded-token', sessionId, initialPrivateState: '{}' });
+        r = await post('/deployContract', { contractName: 'shielded-token', sessionId, initialPrivateState: '{}' });
         if (r.status >= 400) fail(`deployContract → HTTP ${r.status}: ${pretty(r.body)}`);
         const dep = await pollJob(sessionId, r.body.jobId, 'deploy');
         if (!dep.ok) fail(`deploy failed: ${dep.errorCode}: ${dep.errorMessage}`);
@@ -128,8 +136,8 @@ function domainSepBytes() {
         console.log(`OK   deployed in ${((Date.now() - tDeploy) / 1000).toFixed(1)}s: ${contractAddress}`);
     }
 
-    const tokenTypeHex = rawTokenType(domainSepBytes(), contractAddress);
-    console.log(`     rawTokenType = ${tokenTypeHex}`);
+    const tokenType = rawTokenType(domainSepBytes(), contractAddress);
+    console.log(`     rawTokenType = ${tokenType}`);
 
     if (process.env.ZSWAP_E2E_SKIP_MINT === '1') {
         step('4. Skipping mint (ZSWAP_E2E_SKIP_MINT=1)');
@@ -139,7 +147,7 @@ function domainSepBytes() {
         r = await post('/submitContractCall', {
             contractAddress,
             circuit: 'mint',
-            compiledArtifactRef: 'shielded-token',
+            contractName: 'shielded-token',
             sessionId,
             args: '[]'
         });
@@ -156,13 +164,13 @@ function domainSepBytes() {
     let sendSecs = null;
     for (let attempt = 1; attempt <= SYNC_RETRIES; attempt++) {
         const tSend = Date.now();
-        r = await post('/sendNight', {
+        r = await post('/sendToken', {
             sessionId,
             receiverAddress: shieldedAddress,
             amount: SEND_AMOUNT,
-            tokenTypeHex
+            tokenType
         });
-        if (r.status >= 400) fail(`sendNight → HTTP ${r.status}: ${pretty(r.body)}`);
+        if (r.status >= 400) fail(`sendToken → HTTP ${r.status}: ${pretty(r.body)}`);
         const send = await pollJob(sessionId, r.body.jobId, `send#${attempt}`);
         if (send.ok) {
             sendResult = send.result;
@@ -177,7 +185,7 @@ function domainSepBytes() {
 
     console.log(`\nPASS  zswap circuits proved in-process (mode=wasm on the server)`);
     console.log(`      contract      = ${contractAddress}`);
-    console.log(`      tokenType     = ${tokenTypeHex}`);
+    console.log(`      tokenType     = ${tokenType}`);
     console.log(`      transfer txId = ${sendResult.txId}`);
     console.log(`      toLedger=${sendResult.toLedger} amount=${sendResult.amount}`);
     console.log(`      send job wall-clock ${sendSecs}s (sync gate + build + zswap prove + submit)`);

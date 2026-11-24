@@ -32,18 +32,21 @@ export default [
             'srv/**/*.d.ts.map',
             'test/**/*.js',
             'test/**/*.d.ts',
-            // scripts/ are runners and probes, except the published bins
-            // (file patterns, not a directory pattern: a negation cannot
-            // un-ignore a file below an ignored directory).
+            // scripts/ are runners and probes, except the operator tools. A negation cannot
+            // un-ignore a file below an ignored directory, so these are file patterns.
             'scripts/**/*.{js,mjs,cjs,ts}',
             '!scripts/apply-schema-delta.mjs',
             '!scripts/fetch-contract-keys.mjs',
-            '!scripts/migrate-sqlite-to-postgres.mjs'
+            '!scripts/migrate-sqlite-to-postgres.mjs',
+            '!scripts/migrate-values.mjs',
+            '!scripts/rewrap-encryption-keys.mjs',
+            '!scripts/compact-contract-state.mjs',
+            '!scripts/adopt-chain.mjs'
         ]
     },
     ...cds.recommended,
     {
-        // The published bins are CLIs; their output IS the console.
+        // The operator tools are CLIs; their output is the console.
         files: ['scripts/*.mjs'],
         rules: { 'no-console': 'off' }
     },

@@ -1,5 +1,7 @@
 using { midnight } from '../db/schema';
-using { HexEncoded } from '../db/types';
+using {
+    BackgroundJobStatus, ContractSource, Hex64List, HexEncoded, HexList, PolicySource, UnshieldedAddr, WorkerThread
+} from '../db/types';
 
 @path: '/odata/v4/midnight-admin'
 @requires: 'admin'
@@ -12,12 +14,8 @@ service NightgateAdminService {
         encryptedSeedKey
     };
 
-    /** Read-only. Roles change through grantRole and revokeRole. A role ends at `validUntil`. */
-    @readonly
-    entity DisclosureRoles as projection on midnight.DisclosureRoles;
-
     /** Background jobs without their payloads.
-     * This is a database view. An existing database gets it only after `cds deploy` or `nightgate-schema-delta`. */
+     * This is a database view. An existing database gets it only after `cds deploy` or `scripts/apply-schema-delta.mjs`. */
     @readonly
     entity BackgroundJobs  as
         projection on midnight.BackgroundJobs
@@ -35,8 +33,30 @@ service NightgateAdminService {
     @readonly
     entity SwapOffers as projection on midnight.SwapOffers;
 
-    action invalidateSession(sessionId: UUID);
-    action invalidateAllSessions();
+    /** Every agent grant with its lists as JSON text, its budgets and its counters. */
+    @readonly
+    entity AgentGrants as projection on midnight.AgentGrants excluding {
+        tokenHash
+    };
+
+    /** One row per transaction this server sent. `finalized` once the server has indexed its block. Callers follow a send with getJobStatus. */
+    @readonly
+    entity PendingSubmissions as projection on midnight.PendingSubmissions excluding {
+        submitIntentData
+    };
+
+    /** The crawler's state with the markers of its background passes. */
+    @readonly
+    entity SyncState as projection on midnight.SyncState;
+
+    action invalidateSession(sessionId: UUID) returns {
+        sessionId : UUID;
+        isActive  : Boolean;
+    };
+
+    action invalidateAllSessions() returns {
+        invalidated : Integer; // sessions that were active
+    };
 
     /** Exports the key that may upgrade a contract, taken from the session that deployed it.
      * The export is encrypted with `password`, at least 16 characters. No action restores it.
@@ -45,7 +65,7 @@ service NightgateAdminService {
         format          : String;
         encryptedPayload: LargeString;
         salt            : String;
-        contractAddress : String;
+        contractAddress : HexEncoded;
         accountId       : String;
     };
 
@@ -54,7 +74,7 @@ service NightgateAdminService {
      * When `hasProverKeys` is false, this server can deploy and verify but not create proofs. */
     function listContracts() returns array of {
         name           : String;
-        source         : String; // 'config' or 'runtime'
+        source         : ContractSource;
         artifactPath   : String;
         zkConfigPath   : String;
         privateStateId : String;
@@ -73,7 +93,7 @@ service NightgateAdminService {
                             slotWidth: Integer // optional; default 16; 16 or 32 document fields
     ) returns {
         name           : String;
-        source         : String;
+        source         : ContractSource;
         artifactPath   : String;
         zkConfigPath   : String;
         privateStateId : String;
@@ -90,8 +110,8 @@ service NightgateAdminService {
     /** Records a CPU profile of a running thread and summarizes where the time went.
      * `seconds` is 1 to 120, default 20. `thread` is 'worker', the default, or 'main'.
      * The .cpuprofile file goes to `nightgate-profiles/` in the OS temp folder, or to the subfolder `dir`. */
-    action profileWorker(seconds: Integer, dir: String, thread: String) returns {
-        thread        : String;
+    action profileWorker(seconds: Integer, dir: String, thread: WorkerThread) returns {
+        thread        : WorkerThread;
         seconds       : Integer;
         file          : String;
         facadeCount   : Integer;
@@ -104,7 +124,7 @@ service NightgateAdminService {
         topInclusive  : array of { label: String; percent: Double };
         heapBefore    : { usedMb: Integer; totalMb: Integer; limitMb: Integer; externalMb: Integer; mallocedMb: Integer; rssMb: Integer; arrayBuffersMb: Integer };
         heapAfter     : { usedMb: Integer; totalMb: Integer; limitMb: Integer; externalMb: Integer; mallocedMb: Integer; rssMb: Integer; arrayBuffersMb: Integer };
-        gc            : { count: Integer; totalMs: Integer; byKind: String }; // byKind is JSON: count and ms per GC kind
+        gc            : { count: Integer; totalMs: Integer; byKind: Map }; // byKind: count and ms per GC kind
     };
 
     /** The circuits sponsored on one contract instead of `allowedCircuits`. */
@@ -117,52 +137,56 @@ service NightgateAdminService {
     /** Shows what the fee sponsor may pay for. `floor` holds the platform lists.
      * With `grantId`, `effective` holds what the grant may use. `effectiveError` says why it may use nothing. */
     function getSponsorPolicy(grantId: UUID) returns {
-        source         : String; // 'file' or 'env'
+        source         : PolicySource;
         path           : String;
         loadedAt       : Timestamp; // null = no policy file
         ignoredEnv     : array of String; // environment settings the policy file overrides
         floorError     : String;
         floor          : {
-            allowedContracts   : array of String; // empty = any
+            allowedContracts   : HexList; // empty = any
             allowedCircuits    : array of String; // empty = any
             contractCircuits   : array of ContractCircuitRule;
-            allowedTokenTypes  : array of String; // empty = none
-            allowDeploy        : Boolean;
+            allowedTokenTypes  : Hex64List; // empty = none
             allowContractMints : Boolean;
             allowSwaps         : Boolean;
             allowTransfers     : Boolean;
             allowUnshieldedOffers       : Boolean;
-            allowedUnshieldedTokenTypes : array of String; // empty = NIGHT only
+            allowedUnshieldedTokenTypes : Hex64List; // empty = NIGHT only
         };
         grant          : {
             grantId           : UUID;
-            active            : Boolean;
-            allowedContracts  : array of String;
+            isActive          : Boolean;
+            allowedContracts  : HexList;
             allowedCircuits   : array of String;
-            allowedTokenTypes : array of String;
-            deployedContracts : array of String;
-            mintedTokenTypes  : array of String;
+            allowedTokenTypes : Hex64List;
+            deployedContracts : HexList;
+            mintedTokenTypes  : Hex64List;
             allowDeploy       : Boolean;
+            allowMaintenance  : Boolean;
             allowSwaps        : Boolean;
             allowTransfers    : Boolean;
             allowUnshieldedOffers       : Boolean;
-            allowedUnshieldedTokenTypes : array of String;
+            allowedUnshieldedTokenTypes : Hex64List;
             maxDeploys        : Integer;
             deploysUsed       : Integer;
+            maxMaintenanceUpdates  : Integer;
+            maintenanceUpdatesUsed : Integer;
         };
         effective      : {
-            allowedContracts   : array of String;
+            allowedContracts   : HexList;
             allowedCircuits    : array of String;
             contractCircuits   : array of ContractCircuitRule;
-            allowedTokenTypes  : array of String;
-            ownContracts       : array of String;
-            ownTokenTypes      : array of String;
+            allowedTokenTypes  : Hex64List;
+            ownContracts       : HexList;
+            ownTokenTypes      : Hex64List;
             allowDeploy        : Boolean;
+            allowMaintenance   : Boolean;
+            maintainableContracts : HexList;
             allowContractMints : Boolean;
             allowSwaps         : Boolean;
             allowTransfers     : Boolean;
             allowUnshieldedOffers       : Boolean;
-            allowedUnshieldedTokenTypes : array of String;
+            allowedUnshieldedTokenTypes : Hex64List;
         };
         effectiveError : String;
     };
@@ -173,7 +197,7 @@ service NightgateAdminService {
         since               : Timestamp;
         total               : Integer;
         byStatus            : array of {
-            status : String;
+            status : BackgroundJobStatus;
             count  : Integer;
         };
         topErrors           : array of {
@@ -185,11 +209,11 @@ service NightgateAdminService {
 
     /** Finds NightBalances rows that do not match the indexed UTXOs. Changes nothing.
      * Checks one `address`, or up to `limit` addresses after `after`. `limit` is at most 500. */
-    function reconcileNightBalances(address: String, after: String, limit: Integer) returns {
+    function reconcileNightBalances(address: UnshieldedAddr, after: UnshieldedAddr, @assert.range: [1, 500] limit: Integer) returns {
         checked : Integer;
-        next    : String; // null = done; pass as `after` for the next page
+        next    : UnshieldedAddr; // null = done; pass as `after` for the next page
         drifted : array of {
-            address  : String;
+            address  : UnshieldedAddr;
             field    : String; // column name, or 'row'
             stored   : String;
             computed : String;
@@ -204,19 +228,4 @@ service NightgateAdminService {
         blocks                : Integer64;
         changed               : Boolean;
     };
-
-    // Grants a disclosure role. The caller also needs the disclosure role 'authority'.
-    action grantRole(
-        userId:     String,
-        role:       String,
-        scope:      String,
-        validUntil: Timestamp
-    );
-
-    // Ends the matching roles now and returns how many ended. The rows are kept.
-    action revokeRole(
-        userId: String,
-        role:   String,
-        scope:  String
-    ) returns Integer;
 }

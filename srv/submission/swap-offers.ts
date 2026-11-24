@@ -2,7 +2,6 @@
 // An offer closes when it is filled on chain, withdrawn by its poster, or expires.
 // SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
-import crypto from 'node:crypto';
 import { SwapOffers, type SwapOffer } from '#cds-models/midnight';
 import { runWithoutAmbientTx } from './background-jobs';
 import { HEX64_RE } from '../utils/hex';
@@ -31,7 +30,7 @@ export async function loadSwapOffer(db: DbRunner, offerId: string): Promise<Swap
 }
 
 /** The status shown to readers. An open row past its expiry shows as expired, even before it is saved. */
-export function effectiveSwapOfferStatus(row: SwapOffer, now: Date = new Date()): SwapOfferStatus {
+export function effectiveSwapOfferStatus(row: Pick<SwapOffer, 'status' | 'expiresAt'>, now: Date = new Date()): SwapOfferStatus {
     if (row.status !== 'open') return row.status;
     return row.expiresAt && Date.parse(row.expiresAt) <= now.getTime() ? 'expired' : 'open';
 }
@@ -48,18 +47,12 @@ export async function requireOpenSwapOffer(runner: DbRunner, offerId: string): P
     throw new NightgateError('GONE', `swap offer ${offerId} is ${row ? effectiveSwapOfferStatus(row) : 'unknown'}, so the swap was not sent`);
 }
 
-/** The hash a directed offer stores: sha256 of the secret's UTF-8 text, as hex. */
-export function hashTakerSecret(secret: string): string {
-    return crypto.createHash('sha256').update(secret, 'utf8').digest('hex');
-}
-
-/** True when the offer is open to anyone, or `secret` hashes to the stored taker secret hash. */
-export function takerSecretMatches(row: Pick<SwapOffer, 'takerSecretHash'>, secret: unknown): boolean {
-    if (!row.takerSecretHash) return true;
-    if (typeof secret !== 'string' || secret.length === 0 || secret.length > 256) return false;
-    const given = Buffer.from(hashTakerSecret(secret), 'hex');
-    const stored = Buffer.from(String(row.takerSecretHash).toLowerCase(), 'hex');
-    return given.length === stored.length && crypto.timingSafeEqual(given, stored);
+/** Retires the open offers that were posted for one taker. The board lists only offers anyone can take. */
+export async function retireOffersForOneTaker(db: DbRunner, now: Date = new Date()): Promise<number> {
+    const n = await runWithoutAmbientTx(() => db.run(
+        UPDATE.entity(SwapOffers).set({ status: 'retired', closedAt: now.toISOString() }).where({ status: 'open', takerSecretHash: { '!=': null } })
+    ));
+    return typeof n === 'number' ? n : 0;
 }
 
 async function moveSwapOffer(db: DbRunner, offerId: string, from: SwapOfferStatus[], status: Exclude<SwapOfferStatus, 'open'>, txHash?: string | null): Promise<boolean> {

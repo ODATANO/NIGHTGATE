@@ -20,10 +20,29 @@ type HexList                  : array of HexEncoded;
 @assert.format.message: 'must be 128 hex characters'
 type SeedHex                  : String; // 64-byte BIP39 seed as 128 hex characters
 
-type UnshieldedAddr           : String(256); // Bech32m
-type DustAddr                 : String(256); // Bech32m
+// Bech32m as `mn_<kind>[_<network>]1...`. Mainnet has no network part.
+@assert.format        : '^mn_addr[_1][0-9a-zA-Z_-]+$'
+@assert.format.message: 'must be an unshielded address (mn_addr...)'
+type UnshieldedAddr           : String(256);
+
+@assert.format        : '^mn_shield-addr[_1][0-9a-zA-Z_-]+$'
+@assert.format.message: 'must be a shielded address (mn_shield-addr...)'
+type ShieldedAddr             : String(256);
+
+@assert.format        : '^mn_dust[_1][0-9a-zA-Z_-]+$'
+@assert.format.message: 'must be a DUST address (mn_dust...)'
+type DustAddr                 : String(256);
+
+@assert.format        : '^mn_(shield-addr|addr)[_1][0-9a-zA-Z_-]+$'
+@assert.format.message: 'must be a shielded (mn_shield-addr...) or an unshielded (mn_addr...) address'
+type ReceiverAddr             : String(256); // the kind picks the ledger a payment comes from
+
+@assert.format        : '^[0-9]+$'
+@assert.format.message: 'must be a decimal integer'
 type BigInt                   : String(78); // decimal; unsigned 128-bit integer
 
+// Spelling of values: our own states are lowercase with underscores, values of the Midnight indexer keep
+// its upper case, and names of checks are written like action names.
 type TransactionResultStatus  : String enum {
     SUCCESS;
     PARTIAL_SUCCESS;
@@ -107,15 +126,107 @@ type CommandEncoding          : String(20) enum {
     aes_gcm_v1 = 'aes-gcm-v1';
 }
 
-type DisclosureRole           : String(30) enum {
-    public_only;
-    legitimate_interest;
-    authority;
-}
-
 type SwapOfferStatus          : String(10) enum {
     open;
     filled;
     retired;
     expired;
+}
+
+@assert.range
+type NumericPredicate         : String(20) enum {
+    lessOrEqual;
+    greaterOrEqual;
+}
+
+@assert.range
+type ClaimPredicate           : String(20) enum {
+    lessOrEqual;
+    greaterOrEqual;
+    bytesEquality;
+    setMembership;
+    documentIntegrity;
+    documentDiff;
+}
+
+@assert.range
+type Network                  : String(32) enum {
+    preview;
+    preprod;
+    mainnet;
+    stagenet;
+    undeployed;
+}
+
+type GranteeBinding           : String(20) enum {
+    wallet;
+    did;
+    custom;
+}
+
+type ContentHashKind          : String(20) enum {
+    blake2b_256 = 'blake2b-256';
+    sha256;
+}
+
+type ReorgStatus              : String(20) enum {
+    in_progress;
+    completed;
+    failed;
+}
+
+type ReadinessPhase           : String enum {
+    starting;
+    warming;
+    catching_up;
+    ready;
+    degraded;
+    failed;
+}
+
+type ProvingMode              : String enum {
+    wasm;
+    server;
+}
+
+type SponsorWorkers           : String enum {
+    shared;
+    dedicated;
+}
+
+type StateSource              : String(10) enum {
+    history;
+    current;
+    indexer;
+}
+
+@assert.range
+type SwapOfferFilter          : String(10) enum {
+    open;
+    filled;
+    retired;
+    expired;
+    ![all];
+}
+
+type HolderGrantStatus        : String enum {
+    granted;
+    updated;
+    revoked;
+}
+
+type ContractSource           : String enum {
+    config;
+    runtime;
+}
+
+type PolicySource             : String enum {
+    file;
+    env;
+}
+
+@assert.range
+type WorkerThread             : String enum {
+    main;
+    worker;
 }

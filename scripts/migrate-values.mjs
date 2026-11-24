@@ -1,4 +1,4 @@
-// Converts SQLite row values for nightgate-db-migrate. Integers arrive as BigInt.
+// Converts SQLite row values for scripts/migrate-sqlite-to-postgres.mjs. Integers arrive as BigInt.
 // A Decimal stored as a REAL of 2^53 or more was already rounded by SQLite, so the run aborts.
 // SPDX-License-Identifier: Apache-2.0
 const SMALL_INTS = new Set(['cds.Integer', 'cds.Int32', 'cds.Int16', 'cds.UInt8']);

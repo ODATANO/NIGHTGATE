@@ -1,4 +1,4 @@
-/** `@odatano/nightgate/browser`, the entry point for browser apps. See index.mjs. */
+/** `@odatano/nightgate-tx/calls`, the entry point for browser apps. See index.mjs. */
 
 
 export {
@@ -21,31 +21,38 @@ export {
     type AttestationVaultWitnesses
 } from '@odatano/contract-kit';
 
-import {
-    FetchZkConfigProvider as MidnightFetchZkConfigProvider,
-    type FetchZkConfigProviderOptions
-} from '@midnight-ntwrk/midnight-js-fetch-zk-config-provider';
-import type { ZKConfigRegistry } from '@midnight-ntwrk/midnight-js-types';
+import { FetchZkConfigProvider } from '@midnight-ntwrk/midnight-js-fetch-zk-config-provider';
+import type { ProofProvider, ZKConfigProvider, ZKConfigRegistry } from '@midnight-ntwrk/midnight-js-types';
 import type {
     DAppConnectorNetworkAPI,
     DAppConnectorProvingAPI,
     DAppConnectorWalletAPI
 } from '@midnight-ntwrk/midnight-js-dapp-connector-proof-provider';
 
-/** Loads a contract's proving files over HTTP from `/zk-config/<contract>` and checks each against the compiler's manifest there. */
-export class FetchZkConfigProvider extends MidnightFetchZkConfigProvider<string> {
-    /** `baseUrl` is absolute. `fetchFn` defaults to the platform's fetch. */
-    constructor(baseUrl: string, fetchFn?: typeof fetch, options?: Omit<FetchZkConfigProviderOptions, 'fetchFunc'>);
-}
+/** The class of midnight-js that loads a contract's proving files over HTTP, here from `/zk-config/<contract>`: `new FetchZkConfigProvider(baseUrl, { fetchFunc? })`. */
+export { FetchZkConfigProvider };
 
 import type { InMemoryPrivateStateProvider } from '@odatano/contract-kit';
-import type { ProvingModality, AssembledProvingModality } from './providers.mjs';
-export type { ProvingModality, AssembledProvingModality };
+/** Where the proof provider finds a circuit's files: one contract's provider, or a registry of several. */
+export type KeyMaterialSource = ZKConfigProvider<string> | ZKConfigRegistry;
+
+/**
+ * Where proofs are made.
+ *   'server' - on the proof server the wallet reports. This is the default.
+ *   'wallet' - in the wallet. Throws if the wallet cannot prove.
+ *   'auto'   - in the wallet if it can prove, else on the server.
+ */
+export type ProvingModality = 'server' | 'wallet' | 'auto';
+/** Where proofs end up being made. 'none' when the wallet cannot prove and reports no proof server, so the app can only read. */
+export type AssembledProvingModality = 'server' | 'wallet' | 'none';
+
+/** The module that makes a proof provider for a proof server: `@midnight-ntwrk/midnight-js-http-client-proof-provider`. */
+export interface HttpProofModule { httpClientProofProvider(proofServerUrl: string, zkConfigProvider: KeyMaterialSource): ProofProvider }
 
 export interface ConnectorProvidersResult {
     publicDataProvider: unknown;
-    zkConfigProvider: FetchZkConfigProvider;
-    proofProvider: unknown | undefined;
+    zkConfigProvider: FetchZkConfigProvider<string>;
+    proofProvider: ProofProvider | undefined;
     /** Where proofs are actually made. Log it, because it says where the private inputs go. */
     provingModality: AssembledProvingModality;
     privateStateProvider: InMemoryPrivateStateProvider;
@@ -53,7 +60,6 @@ export interface ConnectorProvidersResult {
     config: { indexerUri: string; indexerWsUri: string; substrateNodeUri: string; networkId: string; proverServerUri?: string };
     walletKeys: { coinPublicKey?: string; encryptionPublicKey?: string; shieldedAddress?: string };
     zkConfigBaseUrl: string;
-    keyMaterialProvider(): ReturnType<ZKConfigRegistry['asKeyMaterialProvider']>;
 }
 
 /** The parsed answer of the server's `/contract-manifest` route. */
@@ -62,13 +68,14 @@ export interface ContractManifest {
 }
 
 export function createNightgateConnectorProviders(opts: {
-    connector: any;
+    connector: ContractConnector;
     manifest: ContractManifest;
     /** The URL the manifest was loaded from. Needed when the manifest has relative URLs and the app runs on another origin. */
     manifestUrl?: string;
-    contract: string;
+    contractName: string;
     fetchFn?: typeof fetch;
-    webSocket?: any;
+    /** The WebSocket class for the indexer connection; default the platform's. */
+    webSocket?: typeof WebSocket;
     proving?: ProvingModality;
     proofServerUrl?: string; // optional; default the server the wallet reports; a proof server for 'server' and 'auto'
     expectedManifestHash?: string; // SHA-256 as 64 hex; optional; the compiler manifest the served files must match
@@ -77,11 +84,13 @@ export function createNightgateConnectorProviders(opts: {
 /** Creates only the proof provider, for apps that set up the other providers themselves. */
 export function buildProofProvider(input: {
     proving?: ProvingModality;
-    connector: any;
-    zkConfigProvider: MidnightFetchZkConfigProvider<string> | ZKConfigRegistry;
-    proverServerUri?: string;
-    proofMod: any;
-}): Promise<{ proofProvider: unknown | undefined; provingModality: AssembledProvingModality }>;
+    /** The wallet. Only `getProvingProvider` is read, and only to prove in the wallet. */
+    connector: Partial<DAppConnectorProvingAPI>;
+    zkConfigProvider: KeyMaterialSource;
+    /** A proof server for 'server' and 'auto'. Without one and without a wallet that proves, nothing can prove. */
+    proofServerUrl?: string;
+    proofMod: HttpProofModule;
+}): Promise<{ proofProvider: ProofProvider | undefined; provingModality: AssembledProvingModality }>;
 
 /** The wallet methods `connectContract` uses. `getProvingProvider` is only needed to prove in the wallet. */
 export type ContractConnector = DAppConnectorNetworkAPI & DAppConnectorWalletAPI & Partial<DAppConnectorProvingAPI>;
@@ -98,10 +107,10 @@ export interface ContractCall {
 
 /** A transaction that landed and applied fully. */
 export interface ContractTxResult {
-    /** The ledger identifier of the transaction. */
+    /** A ledger identifier of the transaction. */
+    txId: string;
+    /** The ledger hash, as explorers show it. */
     txHash: string;
-    /** The hash explorers show. */
-    transactionHash: string;
     blockHeight: number | null; // null = the SDK reported none
 }
 
@@ -109,7 +118,7 @@ export interface ConnectContractOptions {
     /** The connected wallet, as the DApp connector returns it. */
     connector: ContractConnector;
     /** The contract's name in the manifest. */
-    contract: string;
+    contractName: string;
     /** The compiled contract class, from a contract package or from your own build. */
     contractClass: Function;
     /** The parsed `/contract-manifest`. Without it `manifestUrl` is fetched. */
@@ -157,8 +166,8 @@ export interface ConnectedContract {
     call(call: ContractCall): Promise<ContractTxResult & { result: unknown }>;
     /**
      * Runs up to 8 calls as one transaction, in array order.
-     * It fails before proving with `code: 'BatchCausalityViolation'` when the ledger would reject the order,
-     * and with `code: 'BatchGasBudgetExceeded'` when a call would run out of gas.
+     * It fails before proving with `code: 'BATCH_CAUSALITY_VIOLATION'` when the ledger would reject the order,
+     * and with `code: 'BATCH_GAS_BUDGET_EXCEEDED'` when a call would run out of gas.
      */
     batch(calls: ContractCall[], options?: ContractBatchOptions): Promise<ContractTxResult>;
     /** Deploys the contract. Later calls of this object go to the new address. */
@@ -178,10 +187,7 @@ export {
     prepareAttest,
     recordKeyOf,
     prepareRegisterDocument,
-    prepareRegisterPassport,
     prepareBindDocument,
-    prepareBindPassport,
-    prepareRetract,
     prepareRetractAttestation,
     preparePurgeExpired,
     prepareAnchorContentRoot,

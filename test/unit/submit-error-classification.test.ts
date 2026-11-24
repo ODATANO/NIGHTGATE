@@ -136,7 +136,7 @@ describe('classifySubmitFailure', () => {
     it('a wait that ended without a reply is ambiguous, never transport: the send may have landed', () => {
         // An RPC or submit timeout after the send: a resend would duplicate a
         // landed transaction (1013) and a rebuild would double-spend.
-        expect(classifySubmitFailure(new Error("wallet-worker rpc 'transferNight' timed out after 1000ms"))).toEqual({ code: 'ambiguous', ledgerCode: 'no-reply', retryable: false });
+        expect(classifySubmitFailure(new Error("wallet-worker rpc 'transferToken' timed out after 1000ms"))).toEqual({ code: 'ambiguous', ledgerCode: 'no-reply', retryable: false });
         expect(classifySubmitFailure(new Error('TimeoutError: no response from ws://relay within 30000ms'))).toEqual({ code: 'ambiguous', ledgerCode: 'no-reply', retryable: false });
         // a connect timeout is a failed connection: nothing was sent
         expect(classifySubmitFailure(new Error('connect ETIMEDOUT 10.0.0.1:9944'))).toEqual({ code: 'transport', retryable: true });

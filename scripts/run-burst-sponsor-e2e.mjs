@@ -62,9 +62,9 @@ const settled = await Promise.allSettled(built.map(r =>
 const dt = ((Date.now() - t0) / 1000).toFixed(1);
 console.log(`\nburst settled in ${dt}s`);
 
-async function blockOf(txHash) {
+async function blockOf(txId) {
   // The sponsor returns the tx IDENTIFIER (tx.identifiers().at(-1)), so query by identifier, not hash.
-  const q = `{ transactions(offset:{identifier:"${txHash}"}) { block { height } } }`;
+  const q = `{ transactions(offset:{identifier:"${txId}"}) { block { height } } }`;
   try { const r = await fetch(IHTTP, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: q }) });
     const j = await r.json(); const h = j.data?.transactions?.[0]?.block?.height; if (h != null) return h; } catch {}
   return null;
@@ -72,7 +72,7 @@ async function blockOf(txHash) {
 
 const landed = [], failed = [];
 settled.forEach((res, k) => res.status === 'fulfilled' ? landed.push(res.value) : failed.push({ i: built[k].i, reason: String(res.reason?.message || res.reason).slice(0, 160) }));
-for (const l of landed) l.block = await blockOf(l.txHash);
+for (const l of landed) l.block = await blockOf(l.txId);
 
 console.log('\n--- BURST RESULT ---');
 console.log(`landed ${landed.length}/${built.length}, failed ${failed.length}`);

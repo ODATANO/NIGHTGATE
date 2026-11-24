@@ -146,12 +146,30 @@ export function normalizeHexParams(data: unknown, operation: Operation | undefin
     normalizeFields(data as Record<string, unknown>, operation.params);
 }
 
+const sentText = new WeakMap<object, Record<string, string>>();
+
+/** A hex parameter of this request as the caller spelled it. Undefined when it came in the stored spelling. */
+export function hexParamAsSent(req: object, name: string): string | undefined {
+    return sentText.get(req)?.[name];
+}
+
+function rememberSent(req: object, data: unknown, operation: Operation | undefined): void {
+    if (!operation?.params || !data || typeof data !== 'object') return;
+    for (const [name, field] of Object.entries(operation.params)) {
+        const value = (data as Record<string, unknown>)[name];
+        if (!field[MARK] || typeof value !== 'string' || value === bareHex(value)) continue;
+        sentText.set(req, { ...sentText.get(req), [name]: value });
+    }
+}
+
 /** Registers the normalization on a service. Call it before the service's own handlers, so they see the stored spelling. */
 export function attachHexInput(srv: cds.ApplicationService): void {
     srv.before('*', (req) => {
         const target = req.target as unknown as Entity | undefined;
         const unbound = srv.actions as unknown as Record<string, Operation> | undefined;
-        normalizeHexParams(req.data, (target?.actions ?? unbound)?.[req.event]);
+        const operation = (target?.actions ?? unbound)?.[req.event];
+        rememberSent(req, req.data, operation);
+        normalizeHexParams(req.data, operation);
         const select = (req.query as unknown as { SELECT?: Select } | undefined)?.SELECT;
         if (!select) return;
         try {

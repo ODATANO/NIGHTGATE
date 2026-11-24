@@ -10,7 +10,7 @@ import { evictWalletFacade } from '../submission/wallet-facade-builder';
 import { withKeyedLock } from '../utils/keyed-lock';
 import { deriveAccountId, deriveStoragePassword } from '../submission/wallet-material-factory';
 import { registerNightUtxosForDust, deregisterNightUtxosFromDust } from '../submission/dust-registration';
-import { sendNight } from '../submission/token-ops';
+import { sendToken } from '../submission/token-ops';
 import { getOrBuildWalletFacade } from '../submission/wallet-facade-builder';
 import { walletWaitForSyncedState } from '../midnight/wallet-worker-client';
 import { resolveNightgateRuntimeConfig, getNightgateConfig } from '../utils/nightgate-config';
@@ -21,7 +21,7 @@ import { resolveFeeSponsor, ensureFeeSponsorFacade } from '../submission/fee-spo
 import { isSessionExpired } from '../utils/session-expiry';
 import { configMs } from '../utils/config';
 import type { DbRunner, Row } from '../utils/db-types';
-import { errorMessage } from '../utils/errors';
+import { SessionNotFoundError, errorMessage, type NightgateError } from '../utils/errors';
 
 const { SELECT } = cds.ql;
 const log = cds.log('nightgate:sessions');
@@ -35,7 +35,7 @@ type WalletCommand =
     | { op: 'prewarm' }
     | { op: 'registerDust'; dustReceiverAddress?: string }
     | { op: 'deregisterDust'; sponsorSessionId?: string }
-    | { op: 'sendNight'; receiverAddress: string; amount: string; ttlIso?: string; tokenTypeHex?: string };
+    | { op: 'sendToken'; receiverAddress: string; amount: string; ttlIso?: string; tokenType?: string };
 
 export const WALLET_COMMAND_KINDS: readonly string[] = jobKindsOf('wallet');
 
@@ -50,7 +50,7 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db:
     const session = await db.run(
         SELECT.one.from(WalletSessions).where({ sessionId: job.sessionId, isActive: true, userId: job.requestedBy })
     );
-    if (!session) throw new Error('Session not found, inactive, or no longer owned by the requesting principal');
+    if (!session) throw new SessionNotFoundError(job.sessionId);
     if (isSessionExpired(job.sessionId, session.expiresAt)) throw new Error('Session expired');
     if (!session.encryptedViewingKey || !session.encryptedSeedKey) throw new Error('Session no longer has signing material');
 
@@ -76,9 +76,9 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db:
         return { ready: true };
     }
     // Store each transaction id on the job before it is sent. If the node rejects it
-    // before inclusion, the id is removed again. So the job's txHash may be on chain.
+    // before inclusion, the id is removed again. So the job's txId may be on chain.
     let announced: string | null = null;
-    const onSubmitIntent = async (txHash: string) => { await reportBroadcastOn(db, { txHash, firstBoundary: false }); announced = txHash; };
+    const onSubmitIntent = async ({ txId, txHash }: { txId: string; txHash: string }) => { await reportBroadcastOn(db, { txId, txHash, firstBoundary: false }); announced = txId; };
     const withRejectBookkeeping = async <T>(work: () => Promise<T>): Promise<T> => {
         try {
             return await work();
@@ -86,7 +86,7 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db:
             const rejected = announced;
             if (rejected && isPreInclusionReject(err)) {
                 try {
-                    await reportSubmissionRejectedOn(db, { txHash: rejected });
+                    await reportSubmissionRejectedOn(db, { txId: rejected });
                     announced = null;
                 } catch (e) {
                     cds.log('nightgate').warn(`rejected identifier ${rejected.slice(0, 16)} could not be taken off job ${job.ID}; it stays for reconciliation: ${errorMessage(e)}`);
@@ -98,7 +98,7 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db:
     if (command.op === 'registerDust') {
         await reportExternalExecution({});
         const result = await withRejectBookkeeping(() => registerNightUtxosForDust({
-            cacheKey: accountId, seedHex, facadeConfig,
+            cacheKey: accountId,
             dustReceiverAddress: command.dustReceiverAddress || undefined,
             onSubmitIntent
         }));
@@ -113,15 +113,20 @@ export async function executeWalletCommand(raw: unknown, job: BackgroundJob, db:
         const result = await withRejectBookkeeping(() => deregisterNightUtxosFromDust({ cacheKey: accountId, sponsorCacheKey: sponsor?.accountId, onSubmitIntent }));
         return { txId: result.txId ?? '', deregisteredCount: result.deregisteredCount, totalNightUtxos: result.totalNightUtxos, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
     }
-    if (command.op === 'sendNight') {
+    if (command.op === 'sendToken') {
         await reportExternalExecution({});
-        const result = await withRejectBookkeeping(() => sendNight({ cacheKey: accountId, receiverAddress: command.receiverAddress, amount: command.amount, ttlIso: command.ttlIso, tokenTypeHex: command.tokenTypeHex, onSubmitIntent }));
+        const result = await withRejectBookkeeping(() => sendToken({ cacheKey: accountId, receiverAddress: command.receiverAddress, amount: command.amount, ttlIso: command.ttlIso, tokenType: command.tokenType, onSubmitIntent }));
         return { txId: result.txId, toLedger: result.toLedger, amount: result.amount, receiverAddress: result.receiverAddress };
     }
     throw new Error(`Unsupported wallet command operation: ${(command as { op: unknown }).op}`);
 }
 
-type SessionRefusal = { ok: false; status: number; msg: string };
+/** A refused session check. With `error` it is answered as that error, else with the status and the text. */
+type SessionRefusal = { ok: false; status: number; msg: string; error?: NightgateError };
+
+export function rejectSession(req: Pick<cds.Request, 'reject'>, refusal: SessionRefusal): never {
+    return refusal.error ? req.reject(refusal.error) : req.reject(refusal.status, refusal.msg);
+}
 
 /** Checks the user's active signing session without decrypting it; others read as 404. Reads outside the request tx, so no connection is held. */
 export async function checkSigningSession(
@@ -137,7 +142,10 @@ export async function checkSigningSession(
     const session: Row<WalletSession, 'sessionId'> | undefined = await runWithoutAmbientTx(() => db.run(
         SELECT.one.from(WalletSessions).where(where)
     ));
-    if (!session) return { ok: false, status: 404, msg: 'Session not found or inactive' };
+    if (!session) {
+        const error = new SessionNotFoundError(sessionId);
+        return { ok: false, status: error.status, msg: error.message, error };
+    }
     if (!session.encryptedViewingKey) return { ok: false, status: 404, msg: 'Session has no viewing key' };
     if (!session.encryptedSeedKey) return { ok: false, status: 412, msg: 'Session has no signing key. Call connectWalletForSigning first.' };
     if (!ignoreExpiry && isSessionExpired(sessionId, session.expiresAt)) {

@@ -18,7 +18,7 @@ if (process.argv.includes('--write')) {
     const end = text.indexOf('<!-- config-table:end -->');
     if (start < 0 || end < 0) throw new Error('docs/reference.md: config-table markers not found');
     const eol = text.includes('\r\n') ? '\r\n' : '\n';
-    const header = ['| Variable | Kind | Default | Purpose |', '|---|---|---|---|'].join(eol);
+    const header = ['| Variable | CDS key | Kind | Default | Purpose |', '|---|---|---|---|---|'].join(eol);
     const next = text.slice(0, start) + '<!-- config-table:start -->' + eol + header + eol + rows.replace(/\n/g, eol) + eol + text.slice(end);
     writeFileSync(doc, next);
     console.log(`docs/reference.md: ${configTableMarkdownRows().length} rows written`);

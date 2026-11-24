@@ -1,4 +1,4 @@
-// `@odatano/nightgate/txbuilder`, unshielded transfers: the wallet builds and signs a fee-free payment of
+// `@odatano/nightgate-tx/txbuilder`, unshielded transfers: the wallet builds and signs a fee-free payment of
 // NIGHT or another unshielded type for `sponsorTransfer`, and `readUnshieldedTransfer` reads what the
 // sponsor reads. Against a fake wallet SDK; the live path is covered by the probes.
 
@@ -45,11 +45,16 @@ function paymentTx(offer: Record<string, unknown> = {}, intent: Record<string, u
 }
 
 describe('readUnshieldedTransfer', () => {
-    it('reads type, amount and the raw recipient of a signed payment', async () => {
+    it('reads type, amount and the recipient of a signed payment, as an address of the network and as raw hex', async () => {
         const { readUnshieldedTransfer } = await importTxBuilder();
-        expect(await readUnshieldedTransfer(paymentTx())).toEqual({ tokenType: NIGHT, amount: 700n, to: TO_RAW, inputs: 1, outputs: 2 });
+        const af = await import('@midnightntwrk/wallet-sdk-address-format' as string);
+        const address = (networkId: string) => af.MidnightBech32m.encode(networkId, new af.UnshieldedAddress(Buffer.from(TO_RAW, 'hex'))).toString();
+        expect(await readUnshieldedTransfer(paymentTx())).toEqual({ tokenType: NIGHT, amount: 700n, to: address('mainnet'), toHex: TO_RAW, inputs: 1, outputs: 2 });
+        const onPreprod = await readUnshieldedTransfer(paymentTx(), { networkId: 'preprod' });
+        expect(onPreprod.to).toBe(address('preprod'));
+        expect(onPreprod.to).toMatch(/^mn_addr_preprod1/);
         const guaranteed = paymentTx({}, { fallibleUnshieldedOffer: undefined, guaranteedUnshieldedOffer: { inputs: [input(9n, CREDIT)], outputs: [output(9n, TO_RAW, CREDIT)], signatures: [{}] } });
-        expect(await readUnshieldedTransfer(guaranteed)).toEqual({ tokenType: CREDIT, amount: 9n, to: TO_RAW, inputs: 1, outputs: 1 });
+        expect(await readUnshieldedTransfer(guaranteed)).toMatchObject({ tokenType: CREDIT, amount: 9n, toHex: TO_RAW, inputs: 1, outputs: 1 });
     });
 
     it('refuses what the sponsor refuses', async () => {

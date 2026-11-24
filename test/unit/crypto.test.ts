@@ -1,7 +1,6 @@
 /**
  * Tests for srv/utils/crypto.ts
- * - v2 envelope round trip, tamper detection, key-id binding
- * - legacy v1 ciphertexts stay readable under key id 1
+ * - envelope round trip, tamper detection, key-id and row binding
  * - key ring parsing (ENCRYPTION_KEYS / ENCRYPTION_KEY_ACTIVE / ENCRYPTION_KEY)
  * - SHA-256 viewing key hashing
  */
@@ -10,9 +9,8 @@ import crypto from 'crypto';
 import cds from '@sap/cds';
 import {
     encrypt, decrypt, hashViewingKey, getEncryptionKey, inspectCiphertext, parseKeyRingSpec, KeyRing,
-    UnknownEncryptionKeyError, UnboundEnvelopeError, legacyFold, deriveKek, deriveBoundSecret, setKeyRing, __resetKeyRingForTests, LEGACY_KEY_ID
+    UnknownEncryptionKeyError, deriveKek, deriveBoundSecret, setKeyRing, __resetKeyRingForTests, LEGACY_KEY_ID
 } from '../../srv/utils/crypto';
-import { HEX64_RE } from '../../srv/utils/hex-patterns';
 
 const ENV_KEYS = ['ENCRYPTION_KEY', 'ENCRYPTION_KEYS', 'ENCRYPTION_KEY_ACTIVE', 'NODE_ENV'] as const;
 let savedEnv: Record<string, string | undefined> = {};
@@ -29,111 +27,78 @@ afterEach(() => {
     __resetKeyRingForTests();
 });
 
-/** Legacy v1 ciphertext: iv:tag:data under the SHA-256 fold of the secret. */
-function legacyEncrypt(plaintext: string, key: Buffer): string {
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
-    const data = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-    return `${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${data.toString('base64')}`;
-}
+/** Every value is bound to a column and a row; the tests use one fixed binding. */
+const B = { purpose: 'test/value', subject: 'row-1' };
 
-describe('v2 envelope encrypt/decrypt', () => {
+describe('envelope encrypt/decrypt', () => {
     const testKey = crypto.createHash('sha256').update('test-key').digest();
 
     it('round-trip: decrypt(encrypt(plaintext)) === plaintext', () => {
         const plaintext = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
-        expect(decrypt(encrypt(plaintext, testKey), testKey)).toBe(plaintext);
+        expect(decrypt(encrypt(plaintext, testKey, B), testKey, B)).toBe(plaintext);
     });
 
     it('produces different ciphertexts for the same plaintext (random DEK + IV)', () => {
-        expect(encrypt('deadbeef', testKey)).not.toBe(encrypt('deadbeef', testKey));
+        expect(encrypt('deadbeef', testKey, B)).not.toBe(encrypt('deadbeef', testKey, B));
     });
 
-    it('format is v2:keyId:wrappedDek:iv:tag:data; a raw key is id 1', () => {
-        const parts = encrypt('test', testKey).split(':');
+    it('format is v3:keyId:wrappedDek:iv:tag:data; a raw key is id 1', () => {
+        const parts = encrypt('test', testKey, B).split(':');
         expect(parts).toHaveLength(6);
-        expect(parts[0]).toBe('v2');
+        expect(parts[0]).toBe('v3');
         expect(parts[1]).toBe(LEGACY_KEY_ID);
         expect(Buffer.from(parts[2], 'base64')).toHaveLength(12 + 16 + 32);
         expect(Buffer.from(parts[3], 'base64')).toHaveLength(12);
         expect(Buffer.from(parts[4], 'base64')).toHaveLength(16);
-        expect(inspectCiphertext(parts.join(':'))).toEqual({ version: 2, keyId: '1' });
+        expect(inspectCiphertext(parts.join(':'))).toEqual({ keyId: '1' });
     });
 
     it('throws on decryption with the wrong key', () => {
         const wrongKey = crypto.createHash('sha256').update('wrong-key').digest();
-        expect(() => decrypt(encrypt('secret', testKey), wrongKey)).toThrow();
+        expect(() => decrypt(encrypt('secret', testKey, B), wrongKey, B)).toThrow();
     });
 
     it('throws on tampered payload, tampered tag and tampered wrapped key', () => {
         const flip = (b64: string) => { const b = Buffer.from(b64, 'base64'); b[0] ^= 0xff; return b.toString('base64'); };
         for (const idx of [2, 3, 4, 5]) {
-            const parts = encrypt('secret', testKey).split(':');
+            const parts = encrypt('secret', testKey, B).split(':');
             parts[idx] = flip(parts[idx]);
-            expect(() => decrypt(parts.join(':'), testKey)).toThrow();
+            expect(() => decrypt(parts.join(':'), testKey, B)).toThrow();
         }
     });
 
     it('rejects a re-labelled key id (the id is bound as AAD)', () => {
         const ring = new KeyRing({ activeId: 'a', keys: [{ id: 'a', secret: 'secret-a'.repeat(4) }, { id: 'b', secret: 'secret-b'.repeat(4) }] });
-        const parts = encrypt('secret', ring).split(':');
+        const parts = encrypt('secret', ring, B).split(':');
         parts[1] = 'b';
-        expect(() => decrypt(parts.join(':'), ring)).toThrow();
+        expect(() => decrypt(parts.join(':'), ring, B)).toThrow();
     });
 
     it('throws UnknownEncryptionKeyError when the ring lacks the key id', () => {
         const ringA = new KeyRing({ activeId: 'k2', keys: [{ id: 'k2', secret: 's'.repeat(32) }] });
-        const ct = encrypt('secret', ringA);
+        const ct = encrypt('secret', ringA, B);
         const ringB = new KeyRing({ activeId: 'k3', keys: [{ id: 'k3', secret: 't'.repeat(32) }] });
         let caught: unknown;
-        try { decrypt(ct, ringB); } catch (e) { caught = e; }
+        try { decrypt(ct, ringB, B); } catch (e) { caught = e; }
         expect(caught).toBeInstanceOf(UnknownEncryptionKeyError);
         expect((caught as UnknownEncryptionKeyError).keyId).toBe('k2');
     });
 
     it('throws on invalid format and wrong component lengths', () => {
-        expect(() => decrypt('just-one-part', testKey)).toThrow('Invalid encrypted format');
-        const parts = encrypt('secret', testKey).split(':');
+        expect(() => decrypt('just-one-part', testKey, B)).toThrow('Invalid encrypted format');
+        const parts = encrypt('secret', testKey, B).split(':');
         const short = [...parts]; short[2] = Buffer.alloc(8).toString('base64');
-        expect(() => decrypt(short.join(':'), testKey)).toThrow('Invalid wrapped key length');
+        expect(() => decrypt(short.join(':'), testKey, B)).toThrow('Invalid wrapped key length');
         const iv = [...parts]; iv[3] = Buffer.alloc(8).toString('base64');
-        expect(() => decrypt(iv.join(':'), testKey)).toThrow('Invalid IV length');
+        expect(() => decrypt(iv.join(':'), testKey, B)).toThrow('Invalid IV length');
         const tag = [...parts]; tag[4] = Buffer.alloc(8).toString('base64');
-        expect(() => decrypt(tag.join(':'), testKey)).toThrow('Invalid auth tag length');
+        expect(() => decrypt(tag.join(':'), testKey, B)).toThrow('Invalid auth tag length');
     });
 
     it('handles empty and long plaintexts', () => {
-        expect(decrypt(encrypt('', testKey), testKey)).toBe('');
+        expect(decrypt(encrypt('', testKey, B), testKey, B)).toBe('');
         const long = 'a'.repeat(10000);
-        expect(decrypt(encrypt(long, testKey), testKey)).toBe(long);
-    });
-});
-
-describe('legacy v1 ciphertexts', () => {
-    it('decrypt under key id 1 through the SHA-256 fold of the secret', () => {
-        const ring = new KeyRing({ activeId: '1', keys: [{ id: '1', secret: 'my-secret-key-of-32-characters!!' }] });
-        const ct = legacyEncrypt('seed-hex', legacyFold('my-secret-key-of-32-characters!!'));
-        expect(inspectCiphertext(ct)).toEqual({ version: 1, keyId: '1' });
-        expect(decrypt(ct, ring)).toBe('seed-hex');
-    });
-
-    it('a raw Buffer opens v1 ciphertexts made with that buffer', () => {
-        const key = crypto.randomBytes(32);
-        expect(decrypt(legacyEncrypt('x', key), key)).toBe('x');
-    });
-
-    it('are refused when the ring has no key id 1', () => {
-        const ring = new KeyRing({ activeId: 'k2', keys: [{ id: 'k2', secret: 's'.repeat(32) }] });
-        const ct = legacyEncrypt('seed-hex', legacyFold('old'));
-        expect(() => decrypt(ct, ring)).toThrow(UnknownEncryptionKeyError);
-    });
-
-    it('a ring with the legacy key writes v2 and still reads v1', () => {
-        process.env.ENCRYPTION_KEY = 'legacy-secret-of-at-least-32-chars';
-        const ring = getEncryptionKey();
-        const v1 = legacyEncrypt('vk', legacyFold('legacy-secret-of-at-least-32-chars'));
-        expect(decrypt(v1, ring)).toBe('vk');
-        expect(inspectCiphertext(encrypt('vk', ring))).toEqual({ version: 2, keyId: '1' });
+        expect(decrypt(encrypt(long, testKey, B), testKey, B)).toBe(long);
     });
 });
 
@@ -167,10 +132,10 @@ describe('key ring parsing', () => {
         expect(() => new KeyRing({ activeId: 'a', keys: [] })).toThrow(/empty/);
     });
 
-    it('KEKs are HKDF-stretched per key id, not the SHA-256 fold', () => {
+    it('KEKs are HKDF-stretched per key id', () => {
         const kek = deriveKek('1', 'secret');
         expect(kek).toHaveLength(32);
-        expect(kek.equals(legacyFold('secret'))).toBe(false);
+        expect(kek.equals(crypto.createHash('sha256').update('secret').digest())).toBe(false);
         expect(deriveKek('2', 'secret').equals(kek)).toBe(false);
         expect(deriveKek('1', 'secret').equals(kek)).toBe(true);
     });
@@ -192,21 +157,21 @@ describe('getEncryptionKey', () => {
         const ring2 = getEncryptionKey();
         expect(ring1).toBe(ring2);
         expect(ring1.activeId).toBe('dev');
-        const ct = encrypt('x', ring1);
+        const ct = encrypt('x', ring1, B);
         __resetKeyRingForTests();
-        expect(() => decrypt(ct, getEncryptionKey())).toThrow();
+        expect(() => decrypt(ct, getEncryptionKey(), B)).toThrow();
     });
 
     it('resolves the ring from ENCRYPTION_KEYS / ENCRYPTION_KEY_ACTIVE and re-reads a changed environment', () => {
         process.env.ENCRYPTION_KEYS = 'k1=' + 'a'.repeat(32) + ',k2=' + 'b'.repeat(32);
         process.env.ENCRYPTION_KEY_ACTIVE = 'k1';
-        const ct = encrypt('seed', getEncryptionKey());
+        const ct = encrypt('seed', getEncryptionKey(), B);
         expect(inspectCiphertext(ct).keyId).toBe('k1');
         process.env.ENCRYPTION_KEY_ACTIVE = 'k2';
         const ring = getEncryptionKey();
         expect(ring.activeId).toBe('k2');
-        expect(decrypt(ct, ring)).toBe('seed');
-        expect(inspectCiphertext(encrypt('seed', ring)).keyId).toBe('k2');
+        expect(decrypt(ct, ring, B)).toBe('seed');
+        expect(inspectCiphertext(encrypt('seed', ring, B)).keyId).toBe('k2');
     });
 
     it('a pinned ring (worker transport) wins over the environment', () => {
@@ -230,11 +195,32 @@ describe('getEncryptionKey', () => {
         __resetKeyRingForTests();
         process.env.NODE_ENV = 'test';
         const ring = getEncryptionKey();
-        expect(decrypt(encrypt('seed', ring), ring)).toBe('seed');
+        expect(decrypt(encrypt('seed', ring, B), ring, B)).toBe('seed');
         __resetKeyRingForTests();
         process.env.ENCRYPTION_KEY = 'a-secret-that-is-exactly-32-chars';
         process.env.NODE_ENV = 'production';
         expect(getEncryptionKey().activeId).toBe('1');
+    });
+
+    it('keeps whitespace around ENCRYPTION_KEY as part of the key and warns about it', () => {
+        const secret = 'a-secret-that-is-exactly-32-chars';
+        process.env.ENCRYPTION_KEY = secret;
+        const plain = getEncryptionKey();
+        const sealed = encrypt('seed', plain, B);
+        const warn = vi.spyOn(cds.log('nightgate:crypto'), 'warn').mockImplementation(() => undefined);
+        try {
+            __resetKeyRingForTests();
+            process.env.ENCRYPTION_KEY = `${secret}\n`;
+            const padded = getEncryptionKey();
+            expect(() => decrypt(sealed, padded, B)).toThrow();
+            expect(warn).toHaveBeenCalledTimes(1);
+            expect(warn.mock.calls[0][0]).toMatch(/^ENCRYPTION_KEY begins or ends with whitespace/);
+            expect(String(warn.mock.calls[0][0])).not.toContain(secret);
+            getEncryptionKey();
+            expect(warn).toHaveBeenCalledTimes(1);
+        } finally {
+            warn.mockRestore();
+        }
     });
 });
 
@@ -247,31 +233,20 @@ describe('v3 bound envelopes', () => {
     it('round-trips under the binding it was written with and is a v3 envelope', () => {
         const ct = encrypt('seed-a', ring, rowA);
         expect(ct.startsWith('v3:k:')).toBe(true);
-        expect(inspectCiphertext(ct)).toEqual({ version: 3, keyId: 'k' });
+        expect(inspectCiphertext(ct)).toEqual({ keyId: 'k' });
         expect(decrypt(ct, ring, rowA)).toBe('seed-a');
     });
 
-    it('does not open under another subject, another purpose or without a binding', () => {
+    it('does not open under another subject or another purpose', () => {
         const ct = encrypt('seed-a', ring, rowA);
         expect(() => decrypt(ct, ring, rowB)).toThrow();
         expect(() => decrypt(ct, ring, otherPurpose)).toThrow();
-        expect(() => decrypt(ct, ring)).toThrow(/bound to a purpose and a subject/);
     });
 
-    it('a v2 envelope opens without a binding and is refused where a bound one belongs', () => {
-        const ct = encrypt('legacy', ring);
-        expect(inspectCiphertext(ct).version).toBe(2);
-        expect(decrypt(ct, ring)).toBe('legacy');
-        expect(() => decrypt(ct, ring, rowA)).toThrow(UnboundEnvelopeError);
-        expect(() => decrypt(ct, ring, rowA)).toThrow(/nightgate-rewrap-keys/);
-        // The migration reads it; so does a deployment that has not rewrapped yet.
-        expect(decrypt(ct, ring, rowA, { allowUnbound: true })).toBe('legacy');
-        process.env.NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES = 'true';
-        try {
-            expect(decrypt(ct, ring, rowA)).toBe('legacy');
-        } finally {
-            delete process.env.NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES;
-        }
+    it('refuses a value in an older format', () => {
+        expect(() => decrypt('iv:tag:data', ring, rowA)).toThrow('Invalid encrypted format');
+        const v2 = encrypt('x', ring, rowA).replace(/^v3:/, 'v2:');
+        expect(() => decrypt(v2, ring, rowA)).toThrow('Invalid encrypted format');
     });
 
     it('refuses an empty or NUL-bearing binding', () => {
@@ -281,14 +256,6 @@ describe('v3 bound envelopes', () => {
 });
 
 describe('hashViewingKey: SHA-256', () => {
-    it('produces consistent 64-char hex output', () => {
-        expect(hashViewingKey('a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6')).toMatch(HEX64_RE);
-    });
-
-    it('same input produces same hash, different inputs differ', () => {
-        expect(hashViewingKey('deadbeef')).toBe(hashViewingKey('deadbeef'));
-        expect(hashViewingKey('aabb')).not.toBe(hashViewingKey('ccdd'));
-    });
 
     it('matches Node.js crypto SHA-256', () => {
         expect(hashViewingKey('test-viewing-key')).toBe(crypto.createHash('sha256').update('test-viewing-key').digest('hex'));

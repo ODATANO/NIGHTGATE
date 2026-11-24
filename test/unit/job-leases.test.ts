@@ -55,9 +55,9 @@ test('a running job without a heartbeat for longer than the TTL is re-queued wit
         row('stale', {}),
         row('fresh', { heartbeatAt: minutesAgo(1) }),
         row('never-beat', { heartbeatAt: null }),
-        row('past-boundary', { status: 'submitted', txHash: 'id-1' }),
-        row('silent-before-send', { status: 'external_execution', txHash: null }),
-        row('fresh-submitted', { status: 'submitted', txHash: 'id-2', heartbeatAt: minutesAgo(1) }),
+        row('past-boundary', { status: 'submitted', txId: 'id-1' }),
+        row('silent-before-send', { status: 'external_execution', txId: null }),
+        row('fresh-submitted', { status: 'submitted', txId: 'id-2', heartbeatAt: minutesAgo(1) }),
         row('legacy-closure', { commandVersion: null, command: null }),
         row('worn-out', { attempt: 4 })
     ));
@@ -152,11 +152,11 @@ test('a restart counts as an attempt: a running job is queued again, and after t
 test('the cleanup after a restart parks a workflow whose step is done or on chain, and fails the rest', async () => {
     const queued = { status: 'pending', leaseOwner: null, startedAt: null, heartbeatAt: null, sessionId: 'closed' };
     await db.run(cds.ql.INSERT.into(BG).entries(
-        row('parent-step-done', { ...queued, kind: 'issueFieldPredicateAttestation' }),
+        row('parent-step-done', { ...queued, kind: 'proveFieldPredicate' }),
         row('step-done', { ...queued, status: 'succeeded', parentJobId: 'parent-step-done' }),
-        row('parent-step-on-chain', { ...queued, kind: 'issueFieldPredicateAttestation' }),
-        row('step-on-chain', { ...queued, status: 'reconciliation_required', txHash: 'id-3', parentJobId: 'parent-step-on-chain' }),
-        row('parent-nothing-ran', { ...queued, kind: 'issueFieldPredicateAttestation' }),
+        row('parent-step-on-chain', { ...queued, kind: 'proveFieldPredicate' }),
+        row('step-on-chain', { ...queued, status: 'reconciliation_required', txId: 'id-3', parentJobId: 'parent-step-on-chain' }),
+        row('parent-nothing-ran', { ...queued, kind: 'proveFieldPredicate' }),
         row('step-not-started', { ...queued, parentJobId: 'parent-nothing-ran' }),
         row('other-session', { ...queued, sessionId: 'open' })
     ));

@@ -8,7 +8,7 @@
  */
 
 import crypto from 'node:crypto';
-import { extractEncryptedComponents, StorageEncryption } from '../../srv/utils/storage-encryption';
+import { decryptWithPassword, StorageEncryption } from '../../srv/utils/storage-encryption';
 import {
     CapDbPrivateStateProvider,
     privateStateStableSalt,
@@ -97,9 +97,10 @@ function whereFromCqn(where: any): Row | null {
 const PASSWORD = 'a-test-passphrase-of-sufficient-length';
 const ACCOUNT  = 'addr_test1q...accountA';
 const ACCOUNT_B = 'addr_test1q...accountB';
-const CONTRACT = '0xcontract-1';
-const CONTRACT_B = '0xcontract-2';
+const CONTRACT = 'aa'.repeat(32);
+const CONTRACT_B = 'bb'.repeat(32);
 const sk = (n: number) => ({ tag: 'schnorr' as const, value: n.toString(16).padStart(64, '0') });
+const EXPORT_PASSWORD = 'export-pass-of-sufficient-length';
 
 function newProvider(accountId = ACCOUNT, db = makeFakeDb()) {
     const provider = new CapDbPrivateStateProvider({
@@ -112,76 +113,20 @@ function newProvider(accountId = ACCOUNT, db = makeFakeDb()) {
 
 // ---- Tests -----------------------------------------------------------------
 
-describe('CapDbPrivateStateProvider: password fallbacks', () => {
-    test('a row under an older password is read through the fallback and rewritten under the current one', async () => {
-        const { provider: old, db } = newProvider();
-        await old.forContract(CONTRACT).set('ps-1', { v: 1 });
-        await old.setSigningKey(CONTRACT, sk(1));
-        const before = db.tables['midnight.PrivateStates'][0].ciphertext;
-
-        const current = new CapDbPrivateStateProvider({
-            accountId: ACCOUNT,
-            privateStoragePasswordProvider: () => PASSWORD + '-rotated',
-            privateStoragePasswordFallbacks: () => ['not-this-one-but-long-enough', PASSWORD],
-            db
-        });
-        expect(await current.forContract(CONTRACT).get('ps-1')).toEqual({ v: 1 });
-        expect(await current.getSigningKey(CONTRACT)).toEqual(sk(1));
-        // rewritten: the stored blob now carries the current password's stable salt
-        const after = db.tables['midnight.PrivateStates'][0].ciphertext;
-        expect(after).not.toBe(before);
-        expect(privateStateStableSalt(ACCOUNT, PASSWORD + '-rotated').equals(extractEncryptedComponents(Buffer.from(after, 'base64')).salt)).toBe(true);
-        // and opens without any fallback from now on
-        const strict = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD + '-rotated', db });
-        expect(await strict.forContract(CONTRACT).get('ps-1')).toEqual({ v: 1 });
-        expect(await strict.getSigningKey(CONTRACT)).toEqual(sk(1));
-    });
-
-    test('exporting signing keys reads a row under an older password through the fallback', async () => {
-        const { provider: old, db } = newProvider();
-        await old.setSigningKey(CONTRACT, sk(1));
-        const current = new CapDbPrivateStateProvider({
-            accountId: ACCOUNT,
-            privateStoragePasswordProvider: () => PASSWORD + '-rotated',
-            privateStoragePasswordFallbacks: () => [PASSWORD],
-            db
-        });
-        const exported = await current.exportSigningKeys({ password: 'export-password-long-enough' });
-        expect(exported.format).toBe('midnight-signing-key-export');
-        const strict = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD + '-rotated', db });
-        expect(await strict.getSigningKey(CONTRACT)).toEqual(sk(1));
-    });
-
-    test('without a matching fallback the original decrypt error surfaces', async () => {
-        const { provider: old, db } = newProvider();
-        await old.forContract(CONTRACT).set('ps-1', { v: 1 });
-        const current = new CapDbPrivateStateProvider({
-            accountId: ACCOUNT,
-            privateStoragePasswordProvider: () => PASSWORD + '-rotated',
-            privateStoragePasswordFallbacks: () => ['some-other-password-of-length'],
-            db
-        });
-        await expect(current.forContract(CONTRACT).get('ps-1')).rejects.toThrow(/Salt mismatch/);
-    });
-});
-
-describe('CapDbPrivateStateProvider: key scheme marker', () => {
-    test('every write and every fallback rewrite marks the row dek1', async () => {
-        const { provider: old, db } = newProvider();
-        await old.forContract(CONTRACT).set('ps-1', { v: 1 });
-        await old.setSigningKey(CONTRACT, sk(1));
+describe('CapDbPrivateStateProvider: the account password', () => {
+    test('every write marks the row dek1', async () => {
+        const { provider, db } = newProvider();
+        await provider.forContract(CONTRACT).set('ps-1', { v: 1 });
+        await provider.setSigningKey(CONTRACT, sk(1));
         expect(db.tables['midnight.PrivateStates'][0].keyScheme).toBe('dek1');
         expect(db.tables['midnight.ContractSigningKeys'][0].keyScheme).toBe('dek1');
-        // A legacy row (no marker) read through a fallback comes back marked.
-        db.tables['midnight.PrivateStates'][0].keyScheme = null;
-        const current = new CapDbPrivateStateProvider({
-            accountId: ACCOUNT,
-            privateStoragePasswordProvider: () => PASSWORD + '-dek',
-            privateStoragePasswordFallbacks: () => [PASSWORD],
-            db
-        });
-        expect(await current.forContract(CONTRACT).get('ps-1')).toEqual({ v: 1 });
-        expect(db.tables['midnight.PrivateStates'][0].keyScheme).toBe('dek1');
+    });
+
+    test('a row under another password does not open', async () => {
+        const { provider: old, db } = newProvider();
+        await old.forContract(CONTRACT).set('ps-1', { v: 1 });
+        const current = new CapDbPrivateStateProvider({ accountId: ACCOUNT, privateStoragePasswordProvider: () => PASSWORD + '-rotated', db });
+        await expect(current.forContract(CONTRACT).get('ps-1')).rejects.toThrow(/Salt mismatch/);
     });
 });
 
@@ -393,6 +338,86 @@ describe('CapDbPrivateStateProvider: export / import', () => {
         await expect(provider.forContract(CONTRACT).importPrivateStates(
             { format: 'midnight-private-state-export', encryptedPayload: 'AAA', salt: 'not-hex' }
         )).rejects.toBeInstanceOf(InvalidExportFormatError);
+    });
+
+    test('a state with a big integer and bytes survives storing, and plain JSON from an older version still reads', async () => {
+        const { provider, db } = newProvider();
+        const state = { counter: 2n ** 70n, secret: new Uint8Array([1, 2, 255]), raw: Buffer.from('abcd', 'hex'), nested: { when: new Date(0), tags: new Set(['a']) } };
+        await provider.forContract(CONTRACT).set('rich', state);
+        const back = await provider.forContract(CONTRACT).get('rich') as typeof state;
+        expect(back.counter).toBe(2n ** 70n);
+        expect(back.secret).toBeInstanceOf(Uint8Array);
+        expect([...back.secret]).toEqual([1, 2, 255]);
+        expect(Buffer.isBuffer(back.raw)).toBe(true);
+        expect(back.raw.toString('hex')).toBe('abcd');
+        expect(back.nested.when).toEqual(new Date(0));
+        expect([...back.nested.tags]).toEqual(['a']);
+
+        // A row written before: plain JSON without the marker.
+        const enc = new StorageEncryption(PASSWORD, privateStateStableSalt(ACCOUNT, PASSWORD));
+        db.tables['midnight.PrivateStates'].push({ ...db.tables['midnight.PrivateStates'][0], privateStateId: 'older', ciphertext: enc.encrypt(JSON.stringify({ v: 7, json: 'not a marker' })) });
+        expect(await provider.forContract(CONTRACT).get('older')).toEqual({ v: 7, json: 'not a marker' });
+    });
+
+    test('the address is stored in lowercase hex without 0x, so every spelling reaches the same rows', async () => {
+        const { provider } = newProvider();
+        await provider.forContract('0x' + CONTRACT.toUpperCase()).set('a', { n: 1 });
+        await provider.setSigningKey('0x' + CONTRACT.toUpperCase(), sk(1));
+        expect(provider.forContract('0x' + CONTRACT.toUpperCase()).contractAddress).toBe(CONTRACT);
+        expect(await provider.forContract(CONTRACT).get('a')).toEqual({ n: 1 });
+        expect(await provider.getSigningKey(CONTRACT)).toEqual(sk(1));
+    });
+
+    test('an export holds what midnight-js writes: each state as the serializer\'s text, each key as an object', async () => {
+        const { provider } = newProvider();
+        await provider.forContract(CONTRACT).set('a', { n: 5n });
+        await provider.setSigningKey(CONTRACT, sk(1));
+        const open = (blob: { encryptedPayload: string }) => JSON.parse(decryptWithPassword(blob.encryptedPayload, EXPORT_PASSWORD));
+
+        const states = open(await provider.forContract(CONTRACT).exportPrivateStates({ password: EXPORT_PASSWORD }));
+        expect(states).toMatchObject({ version: 1, stateCount: 1, exportedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/) });
+        expect(typeof states.states.a).toBe('string');
+        expect(JSON.parse(states.states.a)).toEqual({ json: { n: '5' }, meta: { values: { n: ['bigint'] }, v: 1 } });
+
+        const keys = open(await provider.exportSigningKeys({ password: EXPORT_PASSWORD }));
+        expect(keys).toMatchObject({ version: 1, keyCount: 1, keys: { [CONTRACT]: sk(1) } });
+    });
+
+    test('imports what midnight-js exports, and what an older version of this store exported', async () => {
+        const seal = (format: string, payload: object) => {
+            const enc = new StorageEncryption(EXPORT_PASSWORD);
+            return { format, encryptedPayload: enc.encrypt(JSON.stringify(payload)), salt: enc.salt.toString('hex') } as never;
+        };
+        const { provider } = newProvider();
+        const fromSdk = seal('midnight-private-state-export', { version: 1, exportedAt: '2026-11-01T00:00:00.000Z', stateCount: 2, states: { big: '{"json":{"n":"9"},"meta":{"values":{"n":["bigint"]}}}', plain: '{"json":{"v":1}}' } });
+        expect(await provider.forContract(CONTRACT).importPrivateStates(fromSdk, { password: EXPORT_PASSWORD })).toEqual({ imported: 2, skipped: 0, overwritten: 0 });
+        expect(await provider.forContract(CONTRACT).get('big')).toEqual({ n: 9n });
+        expect(await provider.forContract(CONTRACT).get('plain')).toEqual({ v: 1 });
+
+        // An older export has no time and holds each state itself, also a state that is a string.
+        const older = seal('midnight-private-state-export', { version: 1, stateCount: 2, states: { old: { v: 3 }, text: 'a plain string' } });
+        expect(await provider.forContract(CONTRACT_B).importPrivateStates(older, { password: EXPORT_PASSWORD })).toEqual({ imported: 2, skipped: 0, overwritten: 0 });
+        expect(await provider.forContract(CONTRACT_B).get('old')).toEqual({ v: 3 });
+        expect(await provider.forContract(CONTRACT_B).get('text')).toBe('a plain string');
+
+        // Text that is no serializer output stops the import before anything is written.
+        const broken = seal('midnight-private-state-export', { version: 1, exportedAt: '2026-11-01T00:00:00.000Z', stateCount: 2, states: { fine: '{"json":{}}', bad: 'not json' } });
+        await expect(provider.forContract(CONTRACT_B).importPrivateStates(broken, { password: EXPORT_PASSWORD, conflictStrategy: 'overwrite' })).rejects.toThrow('Invalid private state value');
+        expect(await provider.forContract(CONTRACT_B).get('fine')).toBeNull();
+
+        const keysFromSdk = seal('midnight-signing-key-export', { version: 1, keyCount: 1, keys: { [CONTRACT]: sk(4) } });
+        expect(await provider.importSigningKeys(keysFromSdk, { password: EXPORT_PASSWORD })).toEqual({ imported: 1, skipped: 0, overwritten: 0 });
+        expect(await provider.getSigningKey(CONTRACT)).toEqual(sk(4));
+        const olderKeys = seal('midnight-signing-key-export', { version: 1, keyCount: 2, keys: { [CONTRACT]: JSON.stringify(sk(5)), [CONTRACT_B]: '0b'.repeat(32) } });
+        expect(await provider.importSigningKeys(olderKeys, { password: EXPORT_PASSWORD, conflictStrategy: 'overwrite' })).toEqual({ imported: 1, skipped: 0, overwritten: 1 });
+        expect(await provider.getSigningKey(CONTRACT)).toEqual(sk(5));
+        expect(await provider.getSigningKey(CONTRACT_B)).toEqual({ tag: 'schnorr', value: '0b'.repeat(32) });
+
+        for (const bad of [{ tag: 'schnorr', value: 'zz' }, { tag: 'other', value: '0c'.repeat(32) }, 'no key', 42, null]) {
+            const refused = seal('midnight-signing-key-export', { version: 1, keyCount: 1, keys: { [CONTRACT]: bad } });
+            await expect(provider.importSigningKeys(refused, { password: EXPORT_PASSWORD, conflictStrategy: 'overwrite' })).rejects.toThrow('Invalid signing key value');
+        }
+        expect(await provider.getSigningKey(CONTRACT)).toEqual(sk(5));
     });
 
     test('signing keys export/import round-trip', async () => {

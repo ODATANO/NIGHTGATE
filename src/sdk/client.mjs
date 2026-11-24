@@ -8,20 +8,23 @@ export { verifyReceipt } from './receipt.mjs';
 
 /** Error of a failed server call, with the server's status and error code. `retryAfterSeconds` comes from `Retry-After` when the server sent it. */
 export class NightgateApiError extends Error {
-    constructor(status, code, message, retryAfterSeconds) {
+    constructor(status, code, message, retryAfterSeconds, job) {
         super(message);
         this.name = 'NightgateApiError';
         this.status = status;
         this.code = code;
         this.retryAfterSeconds = retryAfterSeconds;
+        if (job && typeof job === 'object') this.job = job;
     }
 }
 
-/** Server error codes a client may retry unchanged. */
+/** Server error codes a client may retry unchanged. `npm run errors:table` writes the list from the server's table of codes. */
 export const RETRYABLE_ERROR_CODES = new Set([
-    'RATE_LIMITED', 'BAD_GATEWAY', 'UNAVAILABLE', 'ACCOUNT_KEY_UNAVAILABLE', 'JOB_ADMISSION_BUSY',
-    'PROVER_KEYS_UNAVAILABLE', 'RUNTIME_UNAVAILABLE', 'SPONSOR_POLICY_UNAVAILABLE', 'SUBMIT_INTENT_TIMEOUT',
-    'WALLET_NOT_SYNCED', 'WALLET_SYNCING', 'WORKER_ROTATING'
+    // retryable-codes:start
+    'ACCOUNT_KEY_UNAVAILABLE', 'BAD_GATEWAY', 'JOB_ADMISSION_BUSY', 'PROVER_KEYS_UNAVAILABLE',
+    'RATE_LIMITED', 'RUNTIME_UNAVAILABLE', 'SPONSOR_POLICY_UNAVAILABLE', 'SUBMIT_INTENT_TIMEOUT',
+    'UNAVAILABLE', 'WALLET_NOT_SYNCED', 'WALLET_SYNCING', 'WORKER_ROTATING'
+    // retryable-codes:end
 ]);
 
 /** Whether a failed call may be retried unchanged. Uses the server's error code, else the HTTP status. Network errors are retryable.
@@ -128,8 +131,7 @@ export function connect(opts) {
     } = opts ?? {};
     // The server waits at most 25 s. Each wait ends 5 s before the request timeout so the answer still arrives.
     const longPollCapMs = Math.max(0, Math.min(Math.floor(Number(longPollMs) || 0), 25_000, timeoutMs - 5_000));
-    // Turned off for this client when the server does not know getJobStatus' waitMs.
-    let longPoll = longPollCapMs > 0;
+    const longPoll = longPollCapMs > 0;
     if (!baseUrl) throw new Error('connect: baseUrl is required');
     const doFetch = fetchFn || fetch;
     const service = String(baseUrl).replace(/\/$/, '') + servicePath;
@@ -169,7 +171,7 @@ export function connect(opts) {
             const err = payload?.error;
             const retryAfter = Number(response.headers?.get?.('retry-after'));
             throw new NightgateApiError(response.status, err?.code, err?.message ?? `NIGHTGATE request failed with HTTP ${response.status}`,
-                Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined);
+                Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined, err?.['@nightgate.job']);
         }
         return stripODataNoise(payload);
     }
@@ -210,13 +212,9 @@ export function connect(opts) {
             const waitMs = longPoll ? Math.max(0, Math.min(longPollCapMs, deadline - Date.now())) : 0;
             const asked = Date.now();
             try {
-                job = await callAction('getJobStatus', waitMs > 0 ? { jobId, sessionId, waitMs } : { jobId, sessionId });
+                job = await callFunction('getJobStatus', waitMs > 0 ? { jobId, sessionId, waitMs } : { jobId, sessionId });
                 firstPollFailure = null;
             } catch (err) {
-                if (waitMs > 0 && err instanceof NightgateApiError && err.status === 400 && /waitMs/.test(err.message) && !/waitMs must be/.test(err.message)) {
-                    longPoll = false;
-                    continue;
-                }
                 if (!isTransientPollError(err)) throw err;
                 firstPollFailure ??= Date.now();
                 // Give up when poll errors last too long or the overall deadline has passed.
@@ -225,10 +223,10 @@ export function connect(opts) {
                 continue;
             }
             if (job.status === 'succeeded') {
-                let result = {};
-                try { result = job.result ? JSON.parse(job.result) : {}; } catch { result = { raw: job.result }; }
+                const result = job.result ?? {};
                 // A receipt exists only once the chain confirmed the job. The session lets a caller ask for it later.
-                return { ...result, jobId, sessionId, txHash: result.txHash ?? job.txHash, transactionHash: job.transactionHash ?? null, ...(job.receipt ? { receipt: job.receipt } : {}) };
+                const chain = { chainStatus: job.chainStatus ?? null, blockHeight: job.blockHeight ?? null };
+                return { ...result, jobId, sessionId, txId: result.txId ?? job.txId ?? null, txHash: result.txHash ?? job.txHash ?? null, ...chain, ...(job.receipt ? { receipt: job.receipt } : {}) };
             }
             if (job.status === 'failed' || job.status === 'reconciliation_required') {
                 throw new NightgateJobError({ ...job, jobId });
@@ -243,21 +241,16 @@ export function connect(opts) {
     async function waitForReceipt({ jobId, sessionId, pollMs: overridePollMs, timeoutMs: waitTimeoutMs = 10 * 60 * 1000, pollGraceMs = 5 * 60 * 1000 }) {
         if (!jobId) throw new Error('waitForReceipt: jobId is required');
         const deadline = Date.now() + waitTimeoutMs;
-        let holding = longPoll;
         let interval = overridePollMs ?? RECEIPT_POLL_MS;
         let firstPollFailure = null;
         for (;;) {
             let job;
-            const waitMs = holding ? Math.max(0, Math.min(longPollCapMs, deadline - Date.now())) : 0;
+            const waitMs = longPoll ? Math.max(0, Math.min(longPollCapMs, deadline - Date.now())) : 0;
             const asked = Date.now();
             try {
-                job = await callAction('getJobStatus', waitMs > 0 ? { jobId, sessionId, waitMs, untilChain: true } : { jobId, sessionId });
+                job = await callFunction('getJobStatus', waitMs > 0 ? { jobId, sessionId, waitMs, untilChain: true } : { jobId, sessionId });
                 firstPollFailure = null;
             } catch (err) {
-                if (waitMs > 0 && err instanceof NightgateApiError && err.status === 400 && /waitMs|untilChain/.test(err.message) && !/waitMs must be/.test(err.message)) {
-                    holding = false;
-                    continue;
-                }
                 if (!isTransientPollError(err)) throw err;
                 firstPollFailure ??= Date.now();
                 if (Date.now() - firstPollFailure > pollGraceMs || Date.now() > deadline) throw err;
@@ -306,28 +299,55 @@ export function connect(opts) {
     const orNull = (promise) => promise.catch((err) => { if (err instanceof NightgateApiError && err.status === 404) return null; throw err; });
 
     /** The contract's state at `height`, or its newest one. `state`, `zswapState` and `ledgerParameters` are base64. */
-    function contractStateAt({ address, height } = {}) {
-        if (!address) throw new Error('contractStateAt: address is required');
+    function contractStateAt({ contractAddress, height } = {}) {
+        if (!contractAddress) throw new Error('contractStateAt: contractAddress is required');
         const at = height == null ? 'null' : odataLiteral(height);
-        return orNull(request('GET', `${service}/ContractStates/stateAt(address=${odataLiteral(hexOf(address))},height=${at})`));
+        return orNull(request('GET', `${service}/ContractStates/stateAt(contractAddress=${odataLiteral(hexOf(contractAddress))},height=${at})`));
     }
 
     /** Where a transaction landed, by one of its ledger identifiers. Null while the server has not indexed it. */
-    function transactionByIdentifier(identifier) {
-        if (!identifier) throw new Error('transactionByIdentifier: identifier is required');
-        return orNull(callFunction('Transactions/byIdentifier', { identifier: hexOf(identifier) }));
+    function transactionByTxId(txId) {
+        if (!txId) throw new Error('transactionByTxId: txId is required');
+        return orNull(callFunction('Transactions/byTxId', { txId: hexOf(txId) }));
     }
 
     /** The serialized ledger transaction as base64, or null while the server has not indexed it. */
     async function ledgerTransaction(hash) {
         if (!hash) throw new Error('ledgerTransaction: hash is required');
-        return (await orNull(callFunction('Transactions/ledgerTransaction', { hash })))?.ledgerTransaction ?? null;
+        return (await orNull(callFunction('Transactions/ledgerTransaction', { hash: hexOf(hash) })))?.ledgerTransaction ?? null;
+    }
+
+    /** The block at `height`, or the newest one. Null while the server has not indexed it. */
+    /** One page of a table's rows. The server hands out at most its page size per read, 1000 rows by default: page with `skip` until a read is empty. */
+    async function readTable(entity, { filter, orderby, top, skip, select, service: from = 'main' } = {}) {
+        if (typeof entity !== 'string' || !/^[A-Za-z][A-Za-z0-9_]*$/.test(entity)) throw new Error('read: entity must be the name of a table, such as Blocks');
+        if (from !== 'main' && from !== 'indexer') throw new Error("read: service must be 'main' or 'indexer'");
+        const options = [];
+        const add = (name, value) => { if (value !== undefined && value !== null && value !== '') options.push(`${name}=${encodeURIComponent(String(value))}`); };
+        add('$filter', filter);
+        add('$orderby', orderby);
+        add('$select', Array.isArray(select) ? select.join(',') : select);
+        for (const [name, value] of [['top', top], ['skip', skip]]) {
+            if (value === undefined || value === null) continue;
+            if (!Number.isInteger(value) || value < 0) throw new Error(`read: ${name} must be a non-negative integer`);
+            add(`$${name}`, value);
+        }
+        const page = await request('GET', `${from === 'indexer' ? indexerService : service}/${entity}${options.length ? `?${options.join('&')}` : ''}`);
+        return Array.isArray(page?.value) ? page.value : [];
+    }
+
+    async function blockAt(height) {
+        const pick = height == null ? '$orderby=height%20desc' : `$filter=${encodeURIComponent(`height eq ${odataLiteral(height)}`)}`;
+        const page = await request('GET', `${service}/Blocks?${pick}&$top=1&$select=hash,height,protocolVersion,timestamp`);
+        const block = Array.isArray(page?.value) ? page.value[0] : undefined;
+        if (!block?.hash) return null;
+        return { hash: block.hash, height: Number(block.height), protocolVersion: Number(block.protocolVersion), timestamp: Number(block.timestamp) };
     }
 
     /** The transaction that deployed the contract, or null while the server has not indexed it. */
-    async function contractDeploy(address) {
-        if (!address) throw new Error('contractDeploy: address is required');
-        const filter = `address eq ${odataLiteral(hexOf(address))} and actionType eq 'DEPLOY'`;
+    async function contractDeploy(contractAddress) {
+        if (!contractAddress) throw new Error('contractDeploy: contractAddress is required');
+        const filter = `contractAddress eq ${odataLiteral(hexOf(contractAddress))} and actionType eq 'DEPLOY'`;
         const expand = '$expand=transaction($expand=block,transactionResult($expand=segments))';
         const page = await request('GET', `${service}/ContractActions?$filter=${encodeURIComponent(filter)}&${expand}&$top=1`);
         const action = Array.isArray(page?.value) ? page.value[0] : undefined;
@@ -336,8 +356,8 @@ export function connect(opts) {
         const identifiers = parseStringList(tx.identifiers);
         const segments = tx.transactionResult?.segments ?? [];
         return {
-            txHash: tx.hash,
-            ledgerTxHash: tx.ledgerTxHash ?? null,
+            extrinsicHash: tx.extrinsicHash,
+            txHash: tx.txHash ?? null,
             blockHeight: Number(tx.block.height),
             blockHash: tx.block.hash,
             blockTimestamp: Number(tx.block.timestamp),
@@ -358,14 +378,16 @@ export function connect(opts) {
 
         // ---- chain reads a transaction builder needs. No wallet, no login beyond the token. ----
         contractStateAt,
-        transactionByIdentifier,
+        read: readTable,
+        blockAt,
+        transactionByTxId,
         contractDeploy,
         ledgerTransaction,
 
         // ---- checks that read the chain directly. No wallet. ----
-        verifyAttestation: (p) => callFunction('verifyAttestationState', p),
-        verifyPredicate: (p) => callFunction('verifyPredicateState', p),
-        verifyDisclosure: (p) => callFunction('verifyDisclosureState', p),
+        verifyAttestation: (p) => callFunction('verifyAttestation', p),
+        verifyPredicate: (p) => callFunction('verifyPredicate', p),
+        verifyDisclosure: (p) => callFunction('verifyDisclosure', p),
         verifyPredicateAttestation: (p) => callFunction('verifyPredicateAttestation', p),
         verifyDocument: (p) => callFunction('verifyDocument', p),
         deriveTokenType: (p) => callFunction('deriveTokenType', p),
@@ -390,18 +412,17 @@ export function connect(opts) {
         // ---- documents and zero-knowledge proofs. These wait for the job result. ----
         anchorDocument: (p) => act('anchorDocument', p),
         attestAgentOutput: (p) => act('attestAgentOutput', p),
-        proveFieldPredicate: (p) => act('issueFieldPredicateAttestation', p),
-        proveFieldEquality: (p) => act('issueFieldEqualityAttestation', p),
-        proveFieldMembership: (p) => act('issueFieldMembershipAttestation', p),
-        proveFieldPredicatesBatch: (p) => act('issueFieldPredicateAttestationBatch', p),
-        proveDocumentIntegrity: (p) => act('issueDocumentIntegrityAttestation', p),
-        proveDocumentDiff: (p) => act('issueDocumentDiffAttestation', p),
+        proveFieldPredicate: (p) => act('proveFieldPredicate', p),
+        proveFieldEquality: (p) => act('proveFieldEquality', p),
+        proveFieldMembership: (p) => act('proveFieldMembership', p),
+        proveClaims: (p) => act('proveClaims', p),
+        proveDocumentIntegrity: (p) => act('proveDocumentIntegrity', p),
+        proveDocumentDiff: (p) => act('proveDocumentDiff', p),
 
         // ---- disclosure ----
         grantDisclosure: (p) => act('grantDisclosure', p),
         revokeDisclosure: (p) => act('revokeDisclosure', p),
-        registerPassport: (p) => act('registerPassport', p),
-        registerDocument: (p) => act('registerPassport', p),
+        registerDocument: (p) => act('registerDocument', p),
         retractAttestation: (p) => act('retractAttestation', p),
         purgeExpired: (p) => act('purgeExpired', p),
 
@@ -409,17 +430,16 @@ export function connect(opts) {
         deployContract: (p) => act('deployContract', p),
         submitContractCall: (p) => act('submitContractCall', p),
         submitContractCallBatch: (p) => act('submitContractCallBatch', p),
-        mintShieldedTestToken: (p) => act('mintShieldedTestToken', p),
-        /** Mints a named token on a token factory. Takes `name`, `amount`, `recipientCoinPublicKey`, optionally `contractAddress` and `sessionId`. */
+        /** Mints a named token on a token factory. Takes `name`, `amount`, `receiverCoinPublicKey`, optionally `contractAddress` and `sessionId`. */
         mintFactoryToken: (p) => act('mintFactoryToken', p),
         /** Burns `amount` of a factory token the session holds. Takes `name`, `amount`, `sessionId`, optionally `contractAddress` and `issuerKey`. */
         burnFactoryToken: (p) => act('burnFactoryToken', p),
-        sendNight: (p) => act('sendNight', p),
+        sendToken: (p) => act('sendToken', p),
 
         /** Sends a transaction built without a fee, txbuilder's finalizedTxB64. The server adds the fee, submits it and returns the txHash. */
-        sponsorFinalized: (p) => act('sponsorFinalizedTransaction', p),
+        sponsorFinalized: (p) => act('sponsorFinalized', p),
         /** Like sponsorFinalized, for a transaction built with `bind: false`. The server can pay for several of these at once. */
-        sponsorUnbound: (p) => act('sponsorUnboundTransaction', p),
+        sponsorUnbound: (p) => act('sponsorUnbound', p),
         /** Takes both halves of a private token swap. The server joins them, pays the fee and submits. */
         sponsorSwap: (p) => act('sponsorSwap', p),
         /** Takes a plain transfer (`transferTxB64`, `tokenType`, `amount`) built by the swap wallet or the unshielded wallet. The server pays the fee and submits. */

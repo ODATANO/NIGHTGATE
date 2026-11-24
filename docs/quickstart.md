@@ -21,8 +21,11 @@ ENCRYPTION_KEY=<output of openssl rand -hex 32>
 
 ```bash
 npm ci
+npm run deploy
 npm run dev
 ```
+
+Started this way the server checks no credentials. It therefore listens on `127.0.0.1` only, and no other machine reaches it. [A server others reach](#a-server-others-reach) shows the other way.
 
 The crawler catches up from block 1 on the first run and resumes afterwards. Block 0 has no events and is not indexed. Once the log shows `Live subscription active`:
 
@@ -64,37 +67,41 @@ curl "http://localhost:4004/odata/v4/midnight/getWalletBalance(sessionId='<sessi
 
 ## 3. Send a transaction
 
-Mainnet submission is off by default. Set `cds.requires.nightgate.allowMainnetSubmission` to `true` in `package.json` or `.cdsrc.json` first. The transaction spends real NIGHT and DUST.
+Mainnet submission is off by default, because the transaction spends real NIGHT and DUST. Until it is on, an action that submits answers 403. Set `NIGHTGATE_ALLOW_MAINNET_SUBMISSION=true`, or `cds.requires.nightgate.allowMainnetSubmission` to `true` in `package.json` or `.cdsrc.json`.
 
 The wallet needs DUST. Estimate the fee first and compare it with `dustBalance`:
 
 ```bash
-curl "http://localhost:4004/odata/v4/midnight/estimateSendNightFee(sessionId='<session>',receiverAddress='mn_addr1...',amount='1000000')"
+curl "http://localhost:4004/odata/v4/midnight/estimateSendTokenFee(sessionId='<session>',receiverAddress='mn_addr1...',amount='1000000')"
 ```
 
 Send NIGHT:
 
 ```bash
-curl -X POST http://localhost:4004/odata/v4/midnight/sendNight \
+curl -X POST http://localhost:4004/odata/v4/midnight/sendToken \
   -H "Content-Type: application/json" \
   -d '{ "sessionId": "<session>", "receiverAddress": "mn_addr1...", "amount": "1000000" }'
 ```
 
 The answer is `{ "jobId": "...", "status": "pending" }`. Poll `getJobStatus` until `status` is `succeeded`. `result` holds the `txId`.
 
+```bash
+curl "http://localhost:4004/odata/v4/midnight/getJobStatus(jobId='<job>',sessionId='<session>')"
+```
+
 Deploy a contract:
 
 ```bash
 curl -X POST http://localhost:4004/odata/v4/midnight/deployContract \
   -H "Content-Type: application/json" \
-  -d '{ "compiledArtifactRef": "counter", "sessionId": "<session>", "initialPrivateState": {} }'
+  -d '{ "contractName": "counter", "sessionId": "<session>", "initialPrivateState": {} }'
 ```
 
-The job's `result` carries `txHash` and `contractAddress`. `npm run deploy:e2e` runs connect, prewarm, dust registration and deploy end to end.
+The job's `result` carries `txId`, `txHash` and `contractAddress`. `npm run deploy:e2e` runs connect, prewarm, dust registration and deploy end to end.
 
 ## Contracts
 
-The contracts are npm dependencies, registered in `cds.requires.nightgate.contracts` with one `{ "package": "..." }` entry each: `@odatano/contract-counter`, `-attestation-vault`, `-attestation-vault-32`, `-shielded-token`, `-token-factory`, `-holder-registry`. Sources: [NIGHTGATE-CONTRACTS](https://github.com/ODATANO/NIGHTGATE-CONTRACTS).
+The contracts are npm dependencies, registered in `cds.requires.nightgate.contracts` with one `{ "package": "..." }` entry each: `@odatano/contract-counter`, `-attestation-vault`, `-attestation-vault-32`, `-token-factory`, `-holder-registry`. `counter` is the example contract of this guide. The development profile also registers `@odatano/contract-shielded-token`, a token the test runs mint. Sources: [NIGHTGATE-CONTRACTS](https://github.com/ODATANO/NIGHTGATE-CONTRACTS).
 
 The packages ship verifier keys and zkir but no prover keys. The first proving job fetches them. `NIGHTGATE_ZK_ASSET_URL` overrides the source. Without outbound access, run `npx nightgate-fetch-keys <contract>` once.
 
@@ -102,6 +109,18 @@ The packages ship verifier keys and zkir but no prover keys. The first proving j
 
 - Default: wasm in-process. A proof costs tens of seconds to minutes of worker CPU.
 - Production: `docker compose -f docker/docker-compose.yml up -d proof-server` and `NIGHTGATE_PROOF_SERVER_URL=http://localhost:6300`. A proof-server URL selects server proving. `NIGHTGATE_PROVING_MODE` overrides.
+
+## A server others reach
+
+A server for other machines checks credentials. Run the production profile with basic auth, as the image does:
+
+```bash
+export NODE_ENV=production NIGHTGATE_HTTP_PASSWORD=<password> NIGHTGATE_HTTP_ROLES=admin
+export NIGHTGATE_DB_PATH=db/midnight.db
+CDS_CONFIG="$(node docker/cds-config.mjs)" npm run serve:sync
+```
+
+The user is `nightgate` unless `NIGHTGATE_HTTP_USER` names another. Basic auth is plain text without TLS, so put a TLS reverse proxy in front. With `NIGHTGATE_DB_URL` the server uses PostgreSQL, see [docker.md](docker.md).
 
 ## Next
 

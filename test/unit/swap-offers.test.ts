@@ -80,7 +80,10 @@ describe('offer board over HTTP', () => {
         const listed = await list({ wantsType: T_CREDIT }, asB);
         expect(listed.status).toBe(200);
         const mine = listed.data.value.find((o: any) => o.offerId === res.data.offerId);
-        expect(mine).toMatchObject({ offer: halfText(1), givesType: T_CERT, wantsAmount: '250', tags: ['cert', 'copper'] });
+        expect(mine).toMatchObject({ givesType: T_CERT, wantsAmount: '250', tags: ['cert', 'copper'] });
+        // The list carries the terms only. The half itself is read by id.
+        expect(mine).not.toHaveProperty('offer');
+        expect((await getOffer(res.data.offerId, asB)).data.offer).toBe(halfText(1));
         expect(mine).not.toHaveProperty('posterUserId');
         expect(mine).not.toHaveProperty('nullifiers');
         const own = (await list({ wantsType: T_CREDIT, mine: true }, asA)).data.value.find((o: any) => o.offerId === res.data.offerId);
@@ -245,6 +248,37 @@ describe('offer board over HTTP', () => {
         expect(await offersModule.closeSwapOffersByNullifiers(db, [shared], 'ff'.repeat(32))).toEqual([]);
     });
 
+    it('the board takes no taker secret: the parameters are refused and no row says directed', async () => {
+        const withHash = await post('postSwapOffer', { offer: halfText(61), takerSecretHash: 'ab'.repeat(32) }, asA);
+        expect(withHash.status).toBe(400);
+        describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '61'], nullifiers: [nullifier(61)] });
+        const posted = await post('postSwapOffer', { offer: halfText(61) }, asA);
+        expect(posted.status).toBe(200);
+        expect(posted.data).not.toHaveProperty('directed');
+        expect((await getOffer(posted.data.offerId, asB)).data).not.toHaveProperty('directed');
+        const take = await post('sponsorSwap', { offerId: posted.data.offerId, takerHalfB64: halfText(62), takerSecret: 'x' }, asA);
+        expect(take.status).toBe(400);
+    });
+
+    it('at start an open offer that was posted for one taker is retired; other offers keep their status', async () => {
+        const db = await cds.connect.to('db');
+        const posts: string[] = [];
+        for (const seed of [63, 64, 65]) {
+            describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, String(seed)], nullifiers: [nullifier(seed)] });
+            posts.push((await post('postSwapOffer', { offer: halfText(seed) }, asA)).data.offerId);
+        }
+        const [forOne, forAll, filledForOne] = posts;
+        await db.run(cds.ql.UPDATE.entity('midnight.SwapOffers').set({ takerSecretHash: 'cd'.repeat(32) }).where({ ID: [forOne, filledForOne] }));
+        await offersModule.closeSwapOffersByNullifiers(db, [nullifier(65)], 'ef'.repeat(32));
+
+        expect(await offersModule.retireOffersForOneTaker(db)).toBe(1);
+        expect((await getOffer(forOne, asB)).data).toMatchObject({ status: 'retired' });
+        expect((await getOffer(forOne, asB)).data.closedAt).toBeTruthy();
+        expect((await getOffer(forAll, asB)).data.status).toBe('open');
+        expect((await getOffer(filledForOne, asB)).data.status).toBe('filled');
+        expect(await offersModule.retireOffersForOneTaker(db)).toBe(0);
+    });
+
     it("getSwapOffer reads one offer by id in the board's shape, open or closed, for every token", async () => {
         describeAs({ gives: [T_CERT, '1'], wants: [T_CREDIT, '70'], nullifiers: [nullifier(71)] });
         const posted = await post('postSwapOffer', { offer: halfText(31), tags: ['single'] }, asA);
@@ -308,6 +342,29 @@ describe('offer board over HTTP', () => {
         expect(ids(await list({ givesType: type, status: 'all', mine: true }, asA)).sort()).toEqual(
             [toFill, stays, expiring].map(r => r.data.offerId).sort());
         expect(ids(await list({ givesType: type, status: 'all', mine: true }, asB))).toEqual([]);
+    });
+
+    it('a change feed reads the oldest changes first and never splits an instant, so no change beyond the limit is lost', async () => {
+        const type = 'e5'.repeat(32);
+        const posted: string[] = [];
+        for (let i = 0; i < 5; i++) {
+            describeAs({ gives: [type, '1'], wants: [T_CREDIT, String(60 + i)], nullifiers: [nullifier(160 + i)] });
+            posted.push((await post('postSwapOffer', { offer: halfText(60 + i) }, asA)).data.offerId);
+        }
+        // One change at t1, three at the same instant t2, one at t3.
+        const at = (s: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, s)).toISOString();
+        const db = await cds.connect.to('db');
+        const stamps = [at(1), at(2), at(2), at(2), at(3)];
+        for (const [i, id] of posted.entries()) await db.run('UPDATE midnight_SwapOffers SET modifiedAt = ? WHERE ID = ?', [stamps[i], id]);
+        const page = async (since: string) => (await list({ givesType: type, status: 'all', since, limit: 2 }, asB)).data.value as Array<{ offerId: string; changedAt: string }>;
+
+        const first = await page(at(0));
+        expect(first.map(o => o.offerId)).toEqual([posted[0], ...posted.slice(1, 4).sort()]);
+        const second = await page(first.at(-1)!.changedAt);
+        expect(second.map(o => o.offerId)).toEqual([posted[4]]);
+        expect(await page(second.at(-1)!.changedAt)).toEqual([]);
+        // Without `since` the board stays newest first.
+        expect((await list({ givesType: type, status: 'all', limit: 1 }, asB)).data.value[0].offerId).toBe(posted[4]);
     });
 
     it('waitMs holds an empty answer until an offer matches or the time is up; a full one returns at once', async () => {

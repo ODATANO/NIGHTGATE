@@ -1,5 +1,9 @@
 using {midnight} from '../db/schema';
-using { Hex64, Hex64List, HexEncoded, HexList, SeedHex, TxType } from '../db/types';
+using {
+    BackgroundJobChainStatus, BackgroundJobKind, BackgroundJobStatus, BigInt, ClaimPredicate, ContentHashKind, DustAddr, GranteeBinding,
+    Hex64, Hex64List, HexEncoded, HexList, HolderGrantStatus, Network, NumericPredicate, ReceiverAddr, SeedHex, ShieldedAddr,
+    StateSource, SwapOfferFilter, SwapOfferStatus, TransactionResultStatus, UnshieldedAddr
+} from '../db/types';
 
 /** Midnight chain data, attestations, zero-knowledge proofs, wallet sessions and transaction jobs.
  * Actions that write to the chain return a `jobId` to poll with `getJobStatus`. A retry with the same `idempotencyKey` returns the first job.
@@ -16,16 +20,6 @@ service NightgateService {
             *,
             parent,
             transactions
-        }
-        actions {
-            @cds.odata.bindingparameter.collection
-            function latest()                                                            returns Blocks;
-
-            @cds.odata.bindingparameter.collection
-            function byHeight(@assert.range: [0, _] height: Integer)                                           returns Blocks;
-
-            @cds.odata.bindingparameter.collection
-            function range(startHeight: Integer64, endHeight: Integer64, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of Blocks;
         };
 
     @readonly
@@ -41,17 +35,20 @@ service NightgateService {
             zswapLedgerEvents,
             dustLedgerEvents
         }
+        excluding {
+            identifiers,
+            merkleTreeRoot,
+            startIndex,
+            endIndex
+        }
         actions {
             // hash: the extrinsic hash or the ledger hash. One extrinsic hash can land in more than one block. Newest first, limit default 100.
             @cds.odata.bindingparameter.collection
             function byHash(hash: HexEncoded, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of Transactions;
 
+            // txId: a ledger identifier of the transaction, hex. 404 while the indexer has not seen it.
             @cds.odata.bindingparameter.collection
-            function byType(@assert.range txType: TxType, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of Transactions;
-
-            // identifier: a ledger identifier of the transaction, hex. 404 while the indexer has not seen it.
-            @cds.odata.bindingparameter.collection
-            function byIdentifier(identifier: HexEncoded)   returns TransactionInclusion;
+            function byTxId(txId: HexEncoded)               returns TransactionInclusion;
 
             // hash: the extrinsic hash or the ledger hash. 404 while not indexed or when the row carries no ledger transaction.
             @cds.odata.bindingparameter.collection
@@ -60,18 +57,18 @@ service NightgateService {
 
     /** The serialized ledger transaction inside a transaction's extrinsic. */
     type TransactionLedgerBytes {
-        hash              : String;
+        extrinsicHash     : Hex64;
         ledgerTransaction : String; // base64
     }
 
     /** Where a transaction landed. `status` is null until the indexer supplement has the result. */
     type TransactionInclusion {
-        identifier     : String;
-        hash           : String;
-        ledgerTxHash   : String;
+        txId           : HexEncoded;
+        extrinsicHash  : Hex64;
+        txHash         : Hex64;
         blockHeight    : Integer64;
-        blockHash      : String;
-        status         : String; // SUCCESS | PARTIAL_SUCCESS | FAILURE
+        blockHash      : Hex64;
+        status         : TransactionResultStatus;
         failedSegments : array of Integer;
     }
 
@@ -84,7 +81,7 @@ service NightgateService {
 
     /** A server rate class as it stands for the caller. */
     type RateClassState {
-        name          : String; // prove | deploy | sponsor | compute | read
+        name          : String; // prove | deploy | sponsor | compute | read | query | verify
         windowSeconds : Integer;
         max           : Integer;
         remaining     : Integer;
@@ -93,14 +90,14 @@ service NightgateService {
     /** Most atoms of one token type a grant may move per UTC day through sponsored swaps, transfers and mints. */
     type ValueBudget {
         tokenType : Hex64;
-        amount    : String; // decimal; atoms
+        amount    : BigInt; // decimal; atoms
     }
 
     /** One value budget of a grant as it stands today. */
     type ValueBudgetState {
-        tokenType : String;
-        max       : String; // decimal; atoms
-        used      : String; // decimal; atoms
+        tokenType : Hex64;
+        max       : BigInt; // decimal; atoms
+        used      : BigInt; // decimal; atoms
         resetsAt  : Timestamp; // when `used` returns to 0
     }
 
@@ -128,15 +125,6 @@ service NightgateService {
             transaction,
             deploy,
             unshieldedBalances
-        }
-        actions {
-            // Oldest first, limit default 100. Page with skip to read every action.
-            @cds.odata.bindingparameter.collection
-            function byAddress(address: HexEncoded, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of ContractActions;
-
-            // Newest first, limit default 100.
-            @cds.odata.bindingparameter.collection
-            function history(address: HexEncoded, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer)   returns array of ContractActions;
         };
 
     @readonly
@@ -144,15 +132,15 @@ service NightgateService {
 
     /** The state of a contract at a block. `state` and `zswapState` are base64. */
     type ContractStateSnapshot {
-        address          : String;
+        contractAddress  : HexEncoded;
         height           : Integer64; // null if not known locally
         state            : LargeString;
         zswapState       : LargeString;
-        stateHash        : String;
-        zswapStateHash   : String;
-        source           : String(10); // history | current | indexer
+        stateHash        : Hex64;
+        zswapStateHash   : Hex64;
+        source           : StateSource;
         verified         : Boolean; // only for source indexer: the state matches the hash stored on chain
-        blockHash        : String; // the block the state comes from
+        blockHash        : Hex64; // the block the state comes from
         ledgerParameters : LargeString; // base64; in effect at the requested height, default the chain tip; null = not known to this server
         coveredHeight    : Integer64; // the database holds every contract state up to this block; null = supplement never ran, or source indexer
         chainHeight      : Integer64; // the chain tip the crawler last saw
@@ -168,7 +156,7 @@ service NightgateService {
         actions {
             // height: optional, default the current state
             @cds.odata.bindingparameter.collection
-            function stateAt(address: HexEncoded, height: Integer64) returns ContractStateSnapshot;
+            function stateAt(contractAddress: HexEncoded, height: Integer64) returns ContractStateSnapshot;
         };
 
     @readonly
@@ -177,15 +165,6 @@ service NightgateService {
             *,
             createdAtTransaction,
             spentAtTransaction
-        }
-        actions {
-            // Newest first, limit default 1000.
-            @cds.odata.bindingparameter.collection
-            function byOwner(owner: String, @assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of UnshieldedUtxos;
-
-            // Newest first, limit default 1000.
-            @cds.odata.bindingparameter.collection
-            function unspent(@assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer)                returns array of UnshieldedUtxos;
         };
 
     @readonly
@@ -197,21 +176,9 @@ service NightgateService {
     /** Unshielded NIGHT balance per address. */
     @readonly
     entity NightBalances         as projection on midnight.NightBalances
-        actions {
-            @cds.odata.bindingparameter.collection
-            function getBalance(address: String)   returns NightBalances;
-
-            // Highest balance first, limit default 10.
-            @cds.odata.bindingparameter.collection
-            function getTopHolders(@assert.range: [1, 5000] limit: Integer, @assert.range: [0, _] skip: Integer) returns array of NightBalances;
-        };
-
-    /** Transactions this server submitted. They become `finalized` once the server has indexed their block. */
-    @readonly
-    entity PendingSubmissions    as
-        projection on midnight.PendingSubmissions
         excluding {
-            submitIntentData
+            dustAddress,
+            isDustRegistered
         };
 
     // ---- Documents ----
@@ -222,42 +189,42 @@ service NightgateService {
 
     /** Records a document hash and its public metadata on chain, signed by the session's wallet.
      * The server does not store the document itself. Keeping the bytes at `storageRef` is up to you. */
-    action   anchorDocument(sha256: Hex64,
+    action   anchorDocument(payloadHash: Hex64,
                             contentType: String(100),
                             size: Integer64,
                             storageRef: String(500),
                             metadata: LargeString, // JSON
                             sessionId: UUID,
                             contractAddress: HexEncoded,
-                            compiledArtifactRef: String, // optional, default 'attestation-vault'
+                            contractName: String, // optional, default 'attestation-vault'
                             idempotencyKey: String, // optional
                             sponsorSessionId: UUID // optional
     )                                                                         returns {
         jobId      : UUID;
-        status     : String;
-        documentId : UUID;
+        status     : BackgroundJobStatus;
+        anchorId   : UUID; // the server's id of this anchored document
         attesterId : Hex64;
     };
 
     /** Checks a hash against a recorded document. A mismatch or a record not yet on chain gives `verified: false`. */
-    function verifyDocument(documentId: UUID,
-                            providedSha256: Hex64,
+    function verifyDocument(anchorId: UUID,
+                            payloadHash: Hex64,
                             contractAddress: HexEncoded, // optional; needed only for rows without a stored contract
-                            compiledArtifactRef: String // optional, default 'attestation-vault'
+                            contractName: String // optional, default 'attestation-vault'
     )                                                                         returns {
-        verified       : Boolean;
-        included       : Boolean;
-        stateChecked   : Boolean; // false means the answer comes from the local index, not from the contract state
-        anchoredTxHash : String;
+        verified       : Boolean not null;
+        included       : Boolean not null;
+        stateChecked   : Boolean not null; // false means the answer comes from the local index, not from the contract state
+        anchoredTxHash : Hex64 not null;
         anchoredAt     : Timestamp;
-        originalSha256 : String; // empty unless the hash matches
+        payloadHash    : Hex64 not null; // the recorded hash; empty unless the given one matches
     };
 
     // ---- Zero-knowledge proofs about document fields ----
     // The inputs come from prepareDocumentProof: payloadHash, contentRoot, schemaId, fieldKey, fieldSalt, siblings, dirs.
     // A contentRoot passed here is recorded on chain first, under the session's own attester only.
 
-    /** Proofs created by the issue* actions. `provenTxHash` and `provenAt` are set once the proof is on chain. */
+    /** Proofs created by the prove* actions. `provenTxHash` and `provenAt` are set once the proof is on chain. */
     @readonly
     entity PredicateAttestations as projection on midnight.PredicateAttestations;
 
@@ -313,22 +280,14 @@ service NightgateService {
 
     /** One claim of a batch: the inputs of the single action selected by `predicate`. */
     type BatchClaim {
-        @assert.range
-        predicate      : String enum {
-            lessOrEqual;
-            greaterOrEqual;
-            bytesEquality;
-            setMembership;
-            documentIntegrity;
-            documentDiff;
-        };
+        predicate      : ClaimPredicate;
         fieldKey       : Hex64; // all but the document kinds
         salt           : Hex64; // all but the document kinds
         siblings       : Hex64List; // all but the document kinds
         dirs           : array of Boolean; // all but the document kinds
         unit           : String(50); // optional
         value          : String; // numeric: decimal integer, scaled; setMembership: the exact string
-        threshold      : Integer64; // numeric; scaled like the value
+        threshold      : BigInt; // numeric; scaled like the value, at most 2^64-1
         expectedValue  : String; // bytesEquality; one of expectedValue, expectedDigest
         expectedDigest : Hex64; // bytesEquality
         valueDigest    : Hex64; // setMembership; one of value, valueDigest
@@ -348,9 +307,9 @@ service NightgateService {
     /** One claim of a batch as recorded, with its `PredicateAttestations` row. */
     type IssuedClaim {
         predicateAttestationId : UUID;
-        predicate              : String;
+        predicate              : ClaimPredicate;
         fieldKey               : Hex64;
-        threshold              : Integer64;
+        threshold              : BigInt;
         unit                   : String;
         expectedDigest         : Hex64;
         setRoot                : Hex64;
@@ -360,58 +319,54 @@ service NightgateService {
     }
 
     /** Proves that a numeric document field is at most or at least `threshold`, without revealing the value. */
-    action   issueFieldPredicateAttestation(payloadHash: Hex64,
+    action   proveFieldPredicate(payloadHash: Hex64,
                                             attesterId: Hex64, // optional, default the session's attester
                                             fieldKey: Hex64,
-                                            value: String, // decimal integer, scaled like the prepared field
+                                            value: BigInt, // scaled like the prepared field, at most 2^64-1
                                             fieldSalt: Hex64,
                                             contentRoot: Hex64, // optional
                                             schemaId: Hex64, // required with contentRoot
                                             siblings: Hex64List, // inclusion path; one entry per tree level
                                             dirs: array of Boolean, // inclusion path; one entry per tree level
-                                            @assert.range
-                                            predicate: String enum {
-                                                lessOrEqual;
-                                                greaterOrEqual;
-                                            },
-                                            threshold: Integer64, // scaled like the value
+                                            predicate: NumericPredicate,
+                                            threshold: BigInt, // scaled like the value, at most 2^64-1
                                             unit: String(50), // optional
                                             sessionId: UUID,
                                             contractAddress: HexEncoded,
-                                            compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                            contractName: String, // optional, default 'attestation-vault'
                                             idempotencyKey: String, // optional
                                             sponsorSessionId: UUID, // optional
-                                            validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+                                            validUntil: Timestamp // optional, default one year from now; at most five years
     )                                                                         returns {
         jobId                  : UUID;
-        status                 : String;
+        status                 : BackgroundJobStatus;
         predicateAttestationId : UUID;
     };
 
     /** Proves up to 8 claims about one document in a single transaction, 7 if `contentRoot` is given.
      * Each entry in `claims` has the inputs of the matching single action, selected by `predicate`.
      * If only part of the transaction succeeds on chain, the job fails. Then verify each claim on its own. */
-    action   issueFieldPredicateAttestationBatch(payloadHash: Hex64,
+    action   proveClaims(payloadHash: Hex64,
                                                  attesterId: Hex64, // optional, default the session's attester
                                                  contentRoot: Hex64, // optional
                                                  schemaId: Hex64, // required with contentRoot
                                                  claims: array of BatchClaim,
                                                  sessionId: UUID,
                                                  contractAddress: HexEncoded,
-                                                 compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                                 contractName: String, // optional, default 'attestation-vault'
                                                  idempotencyKey: String, // optional
                                                  sponsorSessionId: UUID, // optional
-                                                 validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+                                                 validUntil: Timestamp // optional, default one year from now; at most five years
     )                                                                         returns {
         jobId             : UUID;
-        status            : String;
+        status            : BackgroundJobStatus;
         claims            : array of IssuedClaim;
         droppedDuplicates : Integer;
     };
 
     /** Proves that a text field holds exactly the value behind `expectedDigest`.
      * This proves authenticity, not secrecy. A short or common value can be guessed from its digest. */
-    action   issueFieldEqualityAttestation(payloadHash: Hex64,
+    action   proveFieldEquality(payloadHash: Hex64,
                                            attesterId: Hex64, // optional, default the session's attester
                                            fieldKey: Hex64,
                                            expectedValue: String,
@@ -423,19 +378,19 @@ service NightgateService {
                                            dirs: array of Boolean, // inclusion path; one entry per tree level
                                            sessionId: UUID,
                                            contractAddress: HexEncoded,
-                                           compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                           contractName: String, // optional, default 'attestation-vault'
                                            idempotencyKey: String, // optional
                                            sponsorSessionId: UUID, // optional
-                                           validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+                                           validUntil: Timestamp // optional, default one year from now; at most five years
     )                                                                         returns {
         jobId                  : UUID;
-        status                 : String;
+        status                 : BackgroundJobStatus;
         predicateAttestationId : UUID;
     };
 
     /** Proves that a hidden text field is one of up to 64 allowed values.
      * Pass the allowed values as `allowedValues`, or the set from prepareMembershipSet as `setRoot` with its path. */
-    action   issueFieldMembershipAttestation(payloadHash: Hex64,
+    action   proveFieldMembership(payloadHash: Hex64,
                                              attesterId: Hex64, // optional, default the session's attester
                                              fieldKey: Hex64,
                                              value: String,
@@ -451,19 +406,19 @@ service NightgateService {
                                              dirs: array of Boolean, // inclusion path; one entry per tree level
                                              sessionId: UUID,
                                              contractAddress: HexEncoded,
-                                             compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                             contractName: String, // optional, default 'attestation-vault'
                                              idempotencyKey: String, // optional
                                              sponsorSessionId: UUID, // optional
-                                             validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+                                             validUntil: Timestamp // optional, default one year from now; at most five years
     )                                                                         returns {
         jobId                  : UUID;
-        status                 : String;
+        status                 : BackgroundJobStatus;
         predicateAttestationId : UUID;
     };
 
     /** Proves that document B differs from document A only in the fields allowed by `allowedMask`, without revealing values.
      * Both documents must be prepared with the same field list. The order of A and B is part of the proof. */
-    action   issueDocumentIntegrityAttestation(payloadHashA: Hex64,
+    action   proveDocumentIntegrity(payloadHashA: Hex64,
                                                payloadHashB: Hex64,
                                                attesterIdA: Hex64, // optional, default the session's attester
                                                attesterIdB: Hex64, // optional, default attesterIdA
@@ -476,19 +431,19 @@ service NightgateService {
                                                schemaId: Hex64, // required with contentRootA or contentRootB
                                                sessionId: UUID,
                                                contractAddress: HexEncoded,
-                                               compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                               contractName: String, // optional, default 'attestation-vault'
                                                idempotencyKey: String, // optional
                                                sponsorSessionId: UUID, // optional
-                                               validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+                                               validUntil: Timestamp // optional, default one year from now; at most five years
     )                                                                         returns {
         jobId                  : UUID;
-        status                 : String;
+        status                 : BackgroundJobStatus;
         predicateAttestationId : UUID;
     };
 
     /** Proves that at least `k` fields differ between two documents, without revealing which.
-     * A field present in only one document counts as different. Inputs work as in issueDocumentIntegrityAttestation. */
-    action   issueDocumentDiffAttestation(payloadHashA: Hex64,
+     * A field present in only one document counts as different. Inputs work as in proveDocumentIntegrity. */
+    action   proveDocumentDiff(payloadHashA: Hex64,
                                           payloadHashB: Hex64,
                                           attesterIdA: Hex64, // optional, default the session's attester
                                           attesterIdB: Hex64, // optional, default attesterIdA
@@ -501,100 +456,103 @@ service NightgateService {
                                           schemaId: Hex64, // required with contentRootA or contentRootB
                                           sessionId: UUID,
                                           contractAddress: HexEncoded,
-                                          compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                          contractName: String, // optional, default 'attestation-vault'
                                           idempotencyKey: String, // optional
                                           sponsorSessionId: UUID, // optional
-                                          validUntil: Integer64 // UNIX seconds; optional, default one year from now; at most five years
+                                          validUntil: Timestamp // optional, default one year from now; at most five years
     )                                                                         returns {
         jobId                  : UUID;
-        status                 : String;
+        status                 : BackgroundJobStatus;
         predicateAttestationId : UUID;
     };
 
     /** Checks a stored proof row against the contract on chain. An unproven or expired proof gives `verified: false`. */
     function verifyPredicateAttestation(predicateAttestationId: UUID)         returns {
-        verified       : Boolean;
-        included       : Boolean;
-        stateChecked   : Boolean; // false means the answer comes from the local index, not from the contract state
-        predicate      : String;
-        threshold      : Integer64; // for 'documentDiff' this is k
-        unit           : String;
-        expectedDigest : String;
-        setRoot        : String;
-        payloadHashB   : String;
-        allowedMask    : Integer64;
-        provenTxHash   : String;
-        provenAt       : Timestamp;
+        verified       : Boolean not null;
+        included       : Boolean not null;
+        stateChecked   : Boolean not null; // false means the answer comes from the local index, not from the contract state
+        // What verifyPredicate needs to check the claim on chain.
+        contractAddress : HexEncoded;
+        attesterId      : Hex64;
+        payloadHash     : Hex64;
+        fieldKey        : Hex64; // null = the claim compares two documents
+        predicate       : ClaimPredicate;
+        // Of the following, a field the predicate does not use is null.
+        threshold       : BigInt; // lessOrEqual, greaterOrEqual
+        unit            : String; // lessOrEqual, greaterOrEqual; optional
+        expectedDigest  : Hex64; // bytesEquality
+        setRoot         : Hex64; // setMembership
+        attesterIdB     : Hex64; // documentIntegrity, documentDiff
+        payloadHashB    : Hex64; // documentIntegrity, documentDiff
+        allowedMask     : Integer64; // documentIntegrity
+        k               : Integer; // documentDiff
+        provenTxHash    : Hex64; // null = not proven yet
+        provenAt        : Timestamp;
     };
 
     /** Checks on chain whether an attester has attested a payload hash.
      * Only the attester vouches for its attestation, so check `attesterId` against attesters you trust.
      * If nothing is found, the result is `verified: false`, not an error. */
-    function verifyAttestationState(contractAddress: HexEncoded,
+    function verifyAttestation(contractAddress: HexEncoded,
                                     attesterId: Hex64,
                                     payloadHash: Hex64,
                                     documentId: Hex64, // instead of attesterId and payloadHash
                                     contentRoot: Hex64, // optional; must match the stored content root
                                     schemaId: Hex64, // optional; must match the stored schema id
-                                    compiledArtifactRef: String, // optional, default 'attestation-vault'
-                                    network: String // optional, default the server's network; e.g. 'preview'
+                                    contractName: String, // optional, default 'attestation-vault'
+                                    network: Network // optional, default the server's network
     )                                                                         returns {
-        verified          : Boolean;
-        attested          : Boolean; // the payload hash is attested
-        contentRootOk     : Boolean; // contentRoot matches
-        schemaOk          : Boolean; // schemaId matches
-        bindingRegistered : Boolean; // documentId belongs to this attester
-        attesterId        : String;
-        payloadHash       : String;
-        recordKey         : String; // the key the attestation is stored under on chain
-        documentId        : String;
+        verified          : Boolean not null;
+        attested          : Boolean not null; // the payload hash is attested
+        contentRootOk     : Boolean not null; // contentRoot matches
+        schemaOk          : Boolean not null; // schemaId matches
+        bindingRegistered : Boolean not null; // documentId belongs to this attester
+        attesterId        : Hex64 not null;
+        payloadHash       : Hex64 not null;
+        recordKey         : Hex64 not null; // the key the attestation is stored under on chain
+        documentId        : Hex64 not null;
+        blockHeight       : Integer64; // null = no indexer to read from; the answer holds at this block
     };
 
     /** Checks on chain whether a proof about a document field was recorded as true.
      * The inputs must be exactly those of the proof, otherwise the result is `verified: false`.
      * For a comparison of two documents, A and B must be in the same order as when proving. */
-    function verifyPredicateState(contractAddress: HexEncoded,
+    function verifyPredicate(contractAddress: HexEncoded,
                                   attesterId: Hex64,
                                   payloadHash: Hex64, // document A when comparing two documents
                                   fieldKey: Hex64, // required for single-field predicates
-                                  @assert.range
-                                  predicate: String enum {
-                                      lessOrEqual;
-                                      greaterOrEqual;
-                                      bytesEquality;
-                                      setMembership;
-                                      documentIntegrity;
-                                      documentDiff;
-                                  },
-                                  threshold: Integer64, // required for numeric predicates; the scaled integer used when proving
+                                  predicate: ClaimPredicate,
+                                  threshold: BigInt, // required for numeric predicates; the scaled integer used when proving
                                   expectedDigest: Hex64, // required for 'bytesEquality'
                                   setRoot: Hex64, // required for 'setMembership'
                                   payloadHashB: Hex64, // required when comparing two documents; document B
                                   attesterIdB: Hex64, // optional, default attesterId; attester of document B
                                   allowedMask: Integer64, // required for 'documentIntegrity'; bit i set = field i may differ
                                   k: Integer, // required for 'documentDiff'; minimum number of differing fields
-                                  compiledArtifactRef: String, // optional, default 'attestation-vault'
-                                  network: String // optional, default the server's network; e.g. 'preview'
+                                  contractName: String, // optional, default 'attestation-vault'
+                                  network: Network // optional, default the server's network
     )                                                                         returns {
-        verified : Boolean;
-        proven   : Boolean; // the proof is recorded on chain as true
+        verified    : Boolean not null;
+        proven      : Boolean not null; // the proof is recorded on chain as true
+        blockHeight : Integer64; // null = no indexer to read from; the answer holds at this block
     };
 
     /** Checks on chain which disclosure level an attester has granted to `grantee` on a payload hash.
      * A revoked grant and a retracted attestation leave no grant.
      * If nothing is found, the result is `verified: false`, not an error. */
-    function verifyDisclosureState(contractAddress: HexEncoded,
+    function verifyDisclosure(contractAddress: HexEncoded,
                                    attesterId: Hex64,
                                    payloadHash: Hex64,
                                    grantee: Hex64,
                                    @assert.range: [0, 2]
                                    minLevel: Integer, // optional, default 0; the lowest level that counts as verified
-                                   compiledArtifactRef: String, // optional, default 'attestation-vault'
-                                   network: String // optional, default the server's network; e.g. 'preview'
+                                   contractName: String, // optional, default 'attestation-vault'
+                                   network: Network // optional, default the server's network
     )                                                                         returns {
-        verified : Boolean;
-        granted  : Boolean; // a grant for the grantee is recorded on chain
-        level    : Integer; // 0 public, 1 legitimate interest, 2 authority; null = no grant
+        verified    : Boolean not null;
+        granted     : Boolean not null; // a grant for the grantee is recorded on chain
+        level       : Integer; // 0 public, 1 legitimate interest, 2 authority; null = no grant
+        blockHeight : Integer64; // null = no indexer to read from; the answer holds at this block
     };
 
     // ---- Disclosure ----
@@ -605,9 +563,9 @@ service NightgateService {
 
     /** Updates `DisclosureGrants` from the contract on chain, e.g. after a grant submitted outside this server. */
     action   reindexDisclosures(contractAddress: HexEncoded,
-                                compiledArtifactRef: String // optional, default 'attestation-vault'
+                                contractName: String // optional, default 'attestation-vault'
     )                                                                         returns {
-        contractAddress : String;
+        contractAddress : HexEncoded;
         active          : Integer;
         deactivated     : Integer;
         reconciledAt    : Timestamp;
@@ -616,15 +574,16 @@ service NightgateService {
     /** Grants `grantee` a disclosure level on an attestation. Only the attester can grant. */
     action   grantDisclosure(payloadHash: Hex64,
                              grantee: Hex64,
+                             @assert.range: [0, 2]
                              level: Integer, // 0 public, 1 legitimate interest, 2 authority
                              sessionId: UUID,
                              contractAddress: HexEncoded,
-                             compiledArtifactRef: String, // optional, default 'attestation-vault'
+                             contractName: String, // optional, default 'attestation-vault'
                              idempotencyKey: String, // optional
                              sponsorSessionId: UUID // optional
     )                                                                         returns {
         jobId             : UUID;
-        status            : String;
+        status            : BackgroundJobStatus;
         disclosureGrantId : UUID;
     };
 
@@ -633,29 +592,29 @@ service NightgateService {
                               grantee: Hex64,
                               sessionId: UUID,
                               contractAddress: HexEncoded,
-                              compiledArtifactRef: String, // optional, default 'attestation-vault'
+                              contractName: String, // optional, default 'attestation-vault'
                               idempotencyKey: String, // optional
                               sponsorSessionId: UUID // optional
     )                                                                         returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
     /** Manages which attester may attest a document id. Modes 0 to 2 need the registrar's session, modes 3 and 4 the recovery identity's.
      * Mode 0 assigns `documentId` to `ownerId` and removes a previous owner's binding. Mode 1 removes the assignment.
      * Mode 2 hands the registrar role to `ownerId`. Mode 3 sets a new registrar. Mode 4 hands the recovery role to `ownerId`. */
-    action   registerPassport(documentId: Hex64,
-                              passportId: Hex64, // optional; default documentId
+    action   registerDocument(documentId: Hex64,
                               ownerId: Hex64,
+                              @assert.range: [0, 4]
                               mode: Integer, // optional, default 0
                               sessionId: UUID,
                               contractAddress: HexEncoded,
-                              compiledArtifactRef: String, // optional, default 'attestation-vault'
+                              contractName: String, // optional, default 'attestation-vault'
                               idempotencyKey: String, // optional
                               sponsorSessionId: UUID // optional
     )                                                                         returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
     /** Withdraws an attestation. Only its attester can do this.
@@ -663,12 +622,12 @@ service NightgateService {
     action   retractAttestation(payloadHash: Hex64,
                                 sessionId: UUID,
                                 contractAddress: HexEncoded,
-                                compiledArtifactRef: String, // optional, default 'attestation-vault'
+                                contractName: String, // optional, default 'attestation-vault'
                                 idempotencyKey: String, // optional
                                 sponsorSessionId: UUID // optional
     )                                                                         returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
     /** Removes an expired proof from the contract. Anyone can call it. */
@@ -679,12 +638,12 @@ service NightgateService {
                           key: Hex64,
                           sessionId: UUID,
                           contractAddress: HexEncoded,
-                          compiledArtifactRef: String, // optional, default 'attestation-vault'
+                          contractName: String, // optional, default 'attestation-vault'
                           idempotencyKey: String, // optional
                           sponsorSessionId: UUID // optional
     )                                                                         returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
     /** Links between users and the grantee ids that disclosure grants name. */
@@ -698,22 +657,22 @@ service NightgateService {
                                      scope: String // optional, default a global link
     )                                                                         returns {
         ID          : UUID;
-        granteeId   : String;
-        bindingKind : String;
+        granteeId   : HexEncoded;
+        bindingKind : GranteeBinding;
     };
 
     // ---- Contracts ----
 
     /** Deploys a contract known to the server. */
-    action   deployContract(compiledArtifactRef: String,
+    action   deployContract(contractName: String,
                             sessionId: UUID,
                             initialPrivateState: Map, // optional, default {}
                             idempotencyKey: String, // optional
                             sponsorSessionId: UUID, // optional
-                            recoveryId: Hex64 // optional; the attester that may use registerPassport modes 3 and 4
+                            recoveryId: Hex64 // optional; the attester that may use registerDocument modes 3 and 4
     )                                                                         returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
     /** Calls a circuit on a deployed contract.
@@ -721,7 +680,7 @@ service NightgateService {
      * A sponsor session must be your own signing session or a platform fee sponsor. */
     action   submitContractCall(contractAddress: HexEncoded,
                                 circuit: String,
-                                compiledArtifactRef: String,
+                                contractName: String,
                                 sessionId: UUID,
                                 args: LargeString, // JSON array
                                 idempotencyKey: String, // optional
@@ -729,35 +688,35 @@ service NightgateService {
                                 sponsorSessionId: UUID // optional
     )                                                                         returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
     /** Builds, proves and signs a contract call as the caller, without paying the fee and without submitting it.
-     * A sponsor then submits the result with sponsorFinalizedTransaction. */
+     * A sponsor then submits the result with sponsorFinalized. */
     action   buildSponsorable(contractAddress: HexEncoded,
                               circuit: String,
-                              compiledArtifactRef: String,
+                              contractName: String,
                               sessionId: UUID,
                               args: LargeString)                              returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
     /** Pays the fee for a signed transaction built by someone else and submits it.
      * The sponsor only pays for contracts and circuits its policy allows. */
-    action   sponsorFinalizedTransaction(finalizedTxB64: LargeString,
+    action   sponsorFinalized(finalizedTxB64: LargeString,
                                          idempotencyKey: String)              returns { // optional
         jobId     : UUID;
-        status    : String;
+        status    : BackgroundJobStatus;
         sessionId : UUID; // the session the job runs under
     };
 
     /** Pays the fee for a signed transaction that is not yet sealed and submits it.
      * Such a transaction comes from the transaction builder with `bind: false`. One sponsor can pay several at once. */
-    action   sponsorUnboundTransaction(unboundTxB64: LargeString,
+    action   sponsorUnbound(unboundTxB64: LargeString,
                                        idempotencyKey: String)                returns { // optional
         jobId     : UUID;
-        status    : String;
+        status    : BackgroundJobStatus;
         sessionId : UUID; // the session the job runs under
     };
 
@@ -767,10 +726,9 @@ service NightgateService {
     action   sponsorSwap(makerHalfB64: LargeString, // required unless offerId is given
                          takerHalfB64: LargeString,
                          idempotencyKey: String, // optional
-                         offerId: UUID, // optional; a posted offer to use as the maker half
-                         takerSecret: String)                                 returns { // optional; required to take a directed offer
+                         offerId: UUID)                                       returns { // optional; a posted offer to use as the maker half
         jobId     : UUID;
-        status    : String;
+        status    : BackgroundJobStatus;
         sessionId : UUID; // the session the job runs under
     };
 
@@ -778,10 +736,10 @@ service NightgateService {
      * An unshielded transfer shows them, so both must match the transaction. */
     action   sponsorTransfer(transferTxB64: LargeString, // base64; bound or unbound
                              tokenType: Hex64, // the type moved; must be allowed for the caller
-                             amount: String, // decimal; atoms the recipient receives
+                             amount: BigInt, // decimal; atoms the recipient receives
                              idempotencyKey: String)                          returns { // optional
         jobId     : UUID;
-        status    : String;
+        status    : BackgroundJobStatus;
         sessionId : UUID; // the session the job runs under
     };
 
@@ -791,46 +749,42 @@ service NightgateService {
      * The offer closes when a sponsored swap uses it, when it expires or when the poster retires it. */
     action   postSwapOffer(offer: LargeString, // offer file or base64
                            expiresAt: Timestamp, // optional
-                           tags: array of String, // up to 8; optional
-                           takerSecretHash: Hex64)                            returns { // optional; sha256 of the taker secret
+                           tags: array of String)                             returns { // up to 8; optional
         offerId     : UUID;
-        status      : String;
+        status      : SwapOfferStatus;
         bound       : Boolean; // the half is already sealed
-        givesType   : String;
-        givesAmount : String;
-        wantsType   : String;
-        wantsAmount : String;
+        givesType   : Hex64;
+        givesAmount : BigInt;
+        wantsType   : Hex64;
+        wantsAmount : BigInt;
         expiresAt   : Timestamp;
-        directed    : Boolean; // only the holder of the taker secret can take it
     };
 
-    /** Lists offers, by default the open ones, newest first.
+    /** Lists offers, by default the open ones, newest first. A row carries the terms, `getSwapOffer` the half itself.
      * With `status: 'all'` and `since`, polling returns every change since the last call.
      * With `waitMs` the call holds while nothing matches, until an offer matches or the time is up, so one call replaces many polls. */
     function listSwapOffers(givesType: Hex64, // optional
                             wantsType: Hex64, // optional
                             tag: String, // optional
-                            limit: Integer, // optional, default 50, at most 200
-                            status: String, // optional, default 'open'; 'filled' | 'retired' | 'expired' | 'all'
+                            @assert.range: [1, 200] limit: Integer, // optional, default 50
+                            status: SwapOfferFilter, // optional, default 'open'
                             since: Timestamp, // optional
                             mine: Boolean, // optional; only the caller's own offers
                             waitMs: Integer // ms; optional, at most 25000; hold the call until there is something to return
     )                                                                         returns array of {
         offerId      : UUID;
-        offer        : LargeString;
         bound        : Boolean; // the half is already sealed
-        givesType    : String;
-        givesAmount  : String;
-        wantsType    : String;
-        wantsAmount  : String;
+        givesType    : Hex64;
+        givesAmount  : BigInt;
+        wantsType    : Hex64;
+        wantsAmount  : BigInt;
         tags         : many String;
         expiresAt    : Timestamp;
         postedAt     : Timestamp;
-        status       : String; // open | filled | retired | expired
-        filledTxHash : String;
+        status       : SwapOfferStatus;
+        filledTxHash : Hex64;
         closedAt     : Timestamp;
         changedAt    : Timestamp;
-        directed     : Boolean; // only the holder of the taker secret can take it
     };
 
     /** One offer by id, open or closed. An unknown id gives 404. */
@@ -838,24 +792,23 @@ service NightgateService {
         offerId      : UUID;
         offer        : LargeString;
         bound        : Boolean; // the half is already sealed
-        givesType    : String;
-        givesAmount  : String;
-        wantsType    : String;
-        wantsAmount  : String;
+        givesType    : Hex64;
+        givesAmount  : BigInt;
+        wantsType    : Hex64;
+        wantsAmount  : BigInt;
         tags         : many String;
         expiresAt    : Timestamp;
         postedAt     : Timestamp;
-        status       : String; // open | filled | retired | expired
-        filledTxHash : String;
+        status       : SwapOfferStatus;
+        filledTxHash : Hex64;
         closedAt     : Timestamp;
         changedAt    : Timestamp;
-        directed     : Boolean; // only the holder of the taker secret can take it
     };
 
     /** Closes an open offer. Only the user or agent token that posted it can do this. An offer already closed answers its status. */
     action   retireSwapOffer(offerId: UUID)                                   returns {
         offerId : UUID;
-        status  : String; // retired; expired | filled when the offer was closed before the call
+        status  : SwapOfferStatus; // retired; expired | filled when the offer was closed before the call
     };
 
     // ---- Disclosure to token holders ----
@@ -869,18 +822,18 @@ service NightgateService {
                                       contentType: String, // optional, default 'text/plain'
                                       expiresAt: Timestamp)                   returns { // optional
         holderGrantId   : UUID;
-        payloadHash     : String;
-        tokenType       : String;
-        registryAddress : String;
+        payloadHash     : Hex64;
+        tokenType       : Hex64;
+        registryAddress : HexEncoded;
         hasContent      : Boolean;
         expiresAt       : Timestamp;
-        status          : String;
+        status          : HolderGrantStatus;
     };
 
     /** Revokes a holder disclosure. Only its grantor can do this. */
     action   revokeHolderDisclosure(holderGrantId: UUID)                      returns {
         holderGrantId : UUID;
-        status        : String;
+        status        : HolderGrantStatus;
     };
 
     /** Proves a token holding and returns what the issuer disclosed to holders.
@@ -890,12 +843,12 @@ service NightgateService {
                              claimSecret: Hex64)                              returns {
         entitled        : Boolean;
         reason          : String;
-        payloadHash     : String;
-        tokenType       : String;
-        registryAddress : String;
+        payloadHash     : Hex64;
+        tokenType       : Hex64;
+        registryAddress : HexEncoded;
         holderGrantId   : UUID;
         contentType     : String;
-        contentHashKind : String;
+        contentHashKind : ContentHashKind;
         content         : LargeString;
         expiresAt       : Timestamp;
         /** The registries that were checked, for a negative answer. */
@@ -909,7 +862,7 @@ service NightgateService {
      * If only part of the transaction succeeds on chain, the job fails. */
     action   submitContractCallBatch(contractAddress: HexEncoded,
                                      calls: LargeString, // JSON array of { circuit, args }
-                                     compiledArtifactRef: String,
+                                     contractName: String,
                                      sessionId: UUID,
                                      idempotencyKey: String, // optional
                                      initialPrivateState: Map, // optional, default {}
@@ -917,23 +870,23 @@ service NightgateService {
                                      independentCalls: Boolean // optional; true lets the server reorder calls that do not depend on each other
     )                                                                         returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
     /** Mints a token on a token factory contract and sends it to a shielded address.
      * The session is the issuer, so the same `name` from another session is a different token. */
     action   mintFactoryToken(contractAddress: HexEncoded, // optional; default NIGHTGATE_TOKEN_FACTORY_CONTRACT
                               name: String, // UTF-8, at most 32 bytes
-                              amount: String,
-                              recipientCoinPublicKey: Hex64,
+                              amount: BigInt,
+                              receiverCoinPublicKey: Hex64,
                               sessionId: UUID, // optional for a token caller; default the session of its grant
                               idempotencyKey: String, // optional
                               sponsorSessionId: UUID)                         returns { // optional
         jobId     : UUID;
-        status    : String;
+        status    : BackgroundJobStatus;
         name      : String;
-        amount    : String;
-        issuerKey : String;
+        amount    : BigInt;
+        issuerKey : Hex64;
         domain    : String;
         tokenType : Hex64;
     };
@@ -941,38 +894,27 @@ service NightgateService {
     /** Burns `amount` of a factory token the session holds; `issuerKey` names the issuer, default the session's own. */
     action   burnFactoryToken(contractAddress: HexEncoded, // optional; default NIGHTGATE_TOKEN_FACTORY_CONTRACT
                               name: String, // UTF-8, at most 32 bytes
-                              amount: String,
+                              amount: BigInt,
                               issuerKey: Hex64, // optional; default the session's own issuer key
                               sessionId: UUID,
                               idempotencyKey: String, // optional
                               sponsorSessionId: UUID)                         returns { // optional
         jobId     : UUID;
-        status    : String;
+        status    : BackgroundJobStatus;
         name      : String;
-        amount    : String;
-        issuerKey : String;
+        amount    : BigInt;
+        issuerKey : Hex64;
         domain    : String;
         tokenType : Hex64;
     };
 
-    /** Mints 100000000 units of the bundled test token to the caller's shielded address. */
-    action   mintShieldedTestToken(contractAddress: HexEncoded,
-                                   sessionId: UUID,
-                                   compiledArtifactRef: String, // optional, default 'shielded-token'
-                                   idempotencyKey: String, // optional
-                                   sponsorSessionId: UUID // optional
-    )                                                                         returns {
-        jobId  : UUID;
-        status : String;
-    };
-
-    /** Computes the token type a contract mints, for use as `tokenTypeHex` in sendNight. */
+    /** Computes the token type a contract mints, for use as `tokenType` in sendToken. */
     function deriveTokenType(contractAddress: HexEncoded,
-                             domainSeparator: String // text or 64 hex; optional, default the bundled test token's
+                             domainSeparator: String // text or 64 hex; the separator the contract mints under
     )                                                                         returns {
-        tokenTypeHex    : String;
-        contractAddress : String;
-        domainSeparator : Hex64;
+        tokenType    : Hex64 not null;
+        contractAddress : HexEncoded not null;
+        domainSeparator : Hex64 not null;
     };
 
     // ---- Wallet sessions ----
@@ -987,23 +929,25 @@ service NightgateService {
         };
 
     /** Creates a read-only wallet session. The viewing key is stored encrypted. */
-    action   connectWallet(viewingKey: String, // taken exactly as sent, never a hex type; the wallet's account is derived from this text
+    action   connectWallet(viewingKey: Hex64, // required; the wallet's account is derived from it
                            label: String // at most 100 characters; optional
     )                                                                         returns {
-        ID          : UUID;
-        sessionId   : UUID;
+        sessionId   : UUID not null;
         label       : String;
-        connectedAt : Timestamp;
-        expiresAt   : Timestamp;
-        isActive    : Boolean;
+        connectedAt : Timestamp not null;
+        expiresAt   : Timestamp not null;
+        isActive    : Boolean not null;
     };
 
     /** Closes a session and deletes its stored keys. */
-    action   disconnectWallet(sessionId: UUID);
+    action   disconnectWallet(sessionId: UUID)                                returns {
+        sessionId : UUID not null;
+        isActive  : Boolean not null;
+    };
 
     /** Lets a session sign transactions. The seed is stored encrypted and must belong to the session's viewing key.
      * Keys are derived from the seed the same way the Lace wallet does, so the addresses match Lace.
-     * The wallet then syncs with the chain in the background, tracked by `prewarmJobId`. */
+     * The wallet then syncs with the chain in the background, tracked by `jobId`. */
     action   connectWalletForSigning(sessionId: UUID,
                                      mnemonic: String, // BIP39 phrase; required unless seedHex is given
                                      seedHex: SeedHex, // optional
@@ -1011,10 +955,10 @@ service NightgateService {
                                      idempotencyKey: String, // optional
                                      prewarm: Boolean // optional, default true; false syncs only when needed
     )                                                                         returns {
-        sessionId      : UUID;
-        signingEnabled : Boolean;
-        prewarmJobId   : UUID;
-        prewarmStatus  : String;
+        sessionId      : UUID not null;
+        signingEnabled : Boolean not null;
+        jobId          : UUID; // null = no sync was started
+        status         : BackgroundJobStatus; // null = no sync was started
     };
 
     /** Derives a wallet's viewing key, addresses and attester id from a mnemonic or seed. Stores nothing. */
@@ -1022,22 +966,22 @@ service NightgateService {
                               seedHex: SeedHex, // optional
                               accountIndex: Integer // optional, default 0
     )                                                                         returns {
-        viewingKey      : Hex64;
-        shieldedAddress : String;
-        nightAddress    : String;
-        dustAddress     : String;
-        attesterId      : Hex64;
-        accountIndex    : Integer;
-        network         : String;
+        viewingKey      : Hex64 not null;
+        shieldedAddress : ShieldedAddr not null;
+        nightAddress    : UnshieldedAddr not null;
+        dustAddress     : DustAddr not null;
+        attesterId      : Hex64 not null;
+        accountIndex    : Integer not null;
+        network         : Network not null;
     };
 
     /** Registers the wallet's NIGHT coins so they generate DUST, the resource that pays transaction fees. */
     action   registerForDustGeneration(sessionId: UUID,
-                                       dustReceiverAddress: String, // optional, default the wallet's own DUST address
+                                       dustReceiverAddress: DustAddr, // optional, default the wallet's own DUST address
                                        idempotencyKey: String // optional
     )                                                                         returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
     /** Stops DUST generation for all of the wallet's NIGHT coins. */
@@ -1046,49 +990,49 @@ service NightgateService {
                                           sponsorSessionId: UUID // optional
     )                                                                         returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
-    /** Sends NIGHT, or the token `tokenTypeHex`, to an address.
-     * An `mn_shield-addr_` address is paid from the shielded balance, an `mn_addr_` address from the unshielded one. */
-    action   sendNight(sessionId: UUID,
-                       receiverAddress: String,
-                       amount: String,
-                       ttlIso: String, // ISO 8601; optional, default 10 minutes from now
+    /** Sends NIGHT, or the token `tokenType`, to an address.
+     * An `mn_shield-addr` address is paid from the shielded balance, an `mn_addr` address from the unshielded one. */
+    action   sendToken(sessionId: UUID,
+                       receiverAddress: ReceiverAddr,
+                       amount: BigInt,
+                       expiresAt: Timestamp, // optional, default 10 minutes from now; the transaction is refused after it
                        idempotencyKey: String, // optional
-                       tokenTypeHex: Hex64 // optional, default NIGHT
+                       tokenType: Hex64 // optional, default NIGHT
     )                                                                         returns {
         jobId  : UUID;
-        status : String;
+        status : BackgroundJobStatus;
     };
 
     /** Wallet balances. */
     function getWalletBalance(sessionId: UUID)                                returns {
-        shieldedNight            : String;
-        unshieldedNight          : String;
+        shieldedNight            : BigInt not null;
+        unshieldedNight          : BigInt not null;
         shieldedTokens           : array of {
-            tokenType : Hex64;
-            amount    : String;
-        };
-        dustBalance              : String;
-        registeredNightUtxoCount : Integer;
-        totalNightUtxoCount      : Integer;
-        dustUtxoCount            : Integer;
-        dustPendingCount         : Integer;
-        dustPendingValue         : String;
-        dustRestoreCount         : Integer;
+            tokenType : Hex64 not null;
+            amount    : BigInt not null;
+        } not null;
+        dustBalance              : BigInt not null;
+        registeredNightUtxoCount : Integer not null;
+        totalNightUtxoCount      : Integer not null;
+        dustUtxoCount            : Integer not null;
+        dustPendingCount         : Integer not null;
+        dustPendingValue         : BigInt not null;
+        dustRestoreCount         : Integer not null;
     };
 
     /** How far the wallet has caught up with the chain. The sync is stuck when `appliedIndex` stops growing. */
     function getWalletSyncProgress(sessionId: UUID)                           returns {
-        known                : Boolean;
-        caughtUp             : Boolean;
+        known                : Boolean not null;
+        caughtUp             : Boolean not null;
         appliedIndex         : String;
         streamTip            : String;
         behindEvents         : String;
         eventsPerSecond      : Decimal;
         etaSeconds           : Integer;
-        blockHeight          : String;
+        blockHeight          : Integer64;
         isConnected          : Boolean;
         indexerFresh         : Boolean;
         indexerTipAgeSeconds : Integer;
@@ -1112,8 +1056,8 @@ service NightgateService {
         sessionId            : UUID;
         configured           : Boolean;
         usable               : Boolean;
-        dustBalance          : String;
-        unshieldedNight      : String;
+        dustBalance          : BigInt;
+        unshieldedNight      : BigInt;
         totalNightUtxoCount  : Integer;
         registeredNightUtxos : Integer;
         dustNotes            : Integer; // how many transactions the sponsor can pay at the same time
@@ -1125,12 +1069,12 @@ service NightgateService {
         lastError            : String;
     };
 
-    /** Estimates the DUST fee of a sendNight without proving or submitting anything. */
-    function estimateSendNightFee(sessionId: UUID,
-                                  receiverAddress: String,
-                                  amount: String,
-                                  ttlIso: String, // ISO 8601; optional, default 10 minutes from now
-                                  tokenTypeHex: Hex64 // optional, default NIGHT
+    /** Estimates the DUST fee of a sendToken without proving or submitting anything. */
+    function estimateSendTokenFee(sessionId: UUID,
+                                  receiverAddress: ReceiverAddr,
+                                  amount: BigInt,
+                                  expiresAt: Timestamp, // optional, default 10 minutes from now; the transaction is refused after it
+                                  tokenType: Hex64 // optional, default NIGHT
     )                                                                         returns {
         fee      : String;
         toLedger : String;
@@ -1144,34 +1088,34 @@ service NightgateService {
     action   prepareDocumentProof(document: Map, // the JSON document
                                   proofFields: array of ProofField, // at most 16 or 32 entries depending on the contract
                                   saltSeed: Hex64, // optional, default random
-                                  compiledArtifactRef: String // optional, default 'attestation-vault'
+                                  contractName: String // optional, default 'attestation-vault'
     )                                                                         returns {
-        payloadHash       : Hex64;
-        canonicalDocument : LargeString; // the exact text that was hashed
-        contentRoot       : Hex64;
-        fields            : array of PreparedField;
-        emptyFields       : array of String;
-        schemaId          : Hex64;
-        schema            : array of SchemaSlot;
-        leaves            : Hex64List; // salted leaf hashes in slot order
-        opening           : DocumentOpening;
+        payloadHash       : Hex64 not null;
+        canonicalDocument : LargeString not null; // the exact text that was hashed
+        contentRoot       : Hex64 not null;
+        fields            : array of PreparedField not null;
+        emptyFields       : array of String not null;
+        schemaId          : Hex64 not null;
+        schema            : array of SchemaSlot not null;
+        leaves            : Hex64List not null; // salted leaf hashes in slot order
+        opening           : DocumentOpening not null;
     };
 
-    /** Builds the set of allowed values for issueFieldMembershipAttestation.
+    /** Builds the set of allowed values for proveFieldMembership.
      * With `value` or `valueDigest` it also returns the path that proves the value is in the set. */
     action   prepareMembershipSet(allowedValues: array of String, // up to 64 distinct values
                                   value: String, // optional
                                   valueDigest: Hex64, // optional; blake2b-256 of value
-                                  compiledArtifactRef: String // optional, default 'attestation-vault'
+                                  contractName: String // optional, default 'attestation-vault'
     )                                                                         returns {
-        setRoot         : Hex64;
-        memberCount     : Integer;
-        setSiblings     : Hex64List; // empty without value or valueDigest
-        setDirs         : array of Boolean; // empty without value or valueDigest
+        setRoot         : Hex64 not null;
+        memberCount     : Integer not null;
+        setSiblings     : Hex64List not null; // empty without value or valueDigest
+        setDirs         : array of Boolean not null; // empty without value or valueDigest
     };
 
     /** Records on chain that an agent produced an output from an input, signed by the session's wallet.
-     * Anyone can check it by hashing `envelopeJson` and calling verifyAttestationState. */
+     * Anyone can check it by hashing `envelopeJson` and calling verifyAttestation. */
     action   attestAgentOutput(agentId: String, // at most 200 characters
                                inputHash: Hex64,
                                outputHash: Hex64,
@@ -1181,23 +1125,39 @@ service NightgateService {
                                storageRef: String(500), // optional, default 'agent-output://<agentId>'
                                sessionId: UUID,
                                contractAddress: HexEncoded,
-                               compiledArtifactRef: String, // optional, default 'attestation-vault'
+                               contractName: String, // optional, default 'attestation-vault'
                                idempotencyKey: String, // optional
                                sponsorSessionId: UUID // optional
     )                                                                         returns {
         jobId        : UUID;
-        status       : String;
-        documentId   : UUID;
+        status       : BackgroundJobStatus;
+        anchorId     : UUID; // the server's id of this anchored document
         payloadHash  : Hex64;
         envelopeJson : LargeString;
     };
 
-    /** The caller's agent grants. */
+    /** The caller's agent grants. Their lists come back from the create and update actions, their use from getGrantUsage. */
     @readonly
     entity AgentGrants           as
         projection on midnight.AgentGrants
         excluding {
-            tokenHash
+            tokenHash,
+            allowedActions,
+            allowedContracts,
+            allowedCircuits,
+            allowedTokenTypes,
+            allowedUnshieldedTokenTypes,
+            deployedContracts,
+            mintedTokenTypes,
+            maxValuePerDay,
+            jobsUsedToday,
+            budgetWindow,
+            jobsUsedThisHour,
+            hourWindow,
+            deploysUsed,
+            maintenanceUpdatesUsed,
+            valueUsedToday,
+            valueWindow
         };
 
     /** Creates a token that lets an agent act as the caller on one wallet session. The agent sends it in the `x-agent-token` header.
@@ -1209,11 +1169,13 @@ service NightgateService {
                               maxJobsPerHour: Integer, // optional; default NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR, else unlimited
                               sponsorSessionId: UUID, // optional
                               validUntil: Timestamp, // optional, default no expiry
-                              agentLabel: String, // optional
+                              label: String, // optional
                               allowedContracts: HexList, // optional, default all the platform allows
                               allowedCircuits: array of String, // optional, default all the platform allows
-                              allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent, needs NIGHTGATE_SPONSOR_ALLOW_DEPLOY
+                              allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent
                               maxDeploys: Integer, // optional, default 1 when allowDeploy is true
+                              allowMaintenance: Boolean, // optional; the sponsor pays for maintenance updates of the contracts deployed under this grant
+                              maxMaintenanceUpdates: Integer, // optional, default 8 when allowMaintenance is true
                               allowedTokenTypes: Hex64List, // optional, default all the platform allows
                               allowUnshieldedOffers: Boolean, // optional; sponsored calls may pay the agent's own unshielded tokens in and the contract's payouts out, and sponsorTransfer takes unshielded transfers; needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
                               allowedUnshieldedTokenTypes: Hex64List, // optional, default all the platform allows besides NIGHT
@@ -1222,19 +1184,21 @@ service NightgateService {
         grantId                     : UUID;
         token                       : String; // shown only once
         allowedActions              : array of String;
-        allowedContracts            : array of String;
+        allowedContracts            : HexList;
         allowedCircuits             : array of String;
         allowDeploy                 : Boolean;
         maxDeploys                  : Integer;
-        allowedTokenTypes           : array of String;
+        allowMaintenance            : Boolean;
+        maxMaintenanceUpdates       : Integer;
+        allowedTokenTypes           : Hex64List;
         allowUnshieldedOffers       : Boolean;
-        allowedUnshieldedTokenTypes : array of String;
+        allowedUnshieldedTokenTypes : Hex64List;
         maxValuePerDay              : array of ValueBudget;
         validUntil                  : Timestamp;
     };
 
     /** Creates up to 50 grants with the same settings, each with its own token.
-     * Without `labels` they are named `<agentLabel>-1` to `<agentLabel>-n`. */
+     * Without `labels` they are named `<label>-1` to `<label>-n`. */
     action   createAgentGrants(count: Integer,
                                sessionId: UUID,
                                allowedActions: array of String,
@@ -1243,11 +1207,13 @@ service NightgateService {
                                maxJobsPerHour: Integer, // optional; default NIGHTGATE_GRANT_DEFAULT_JOBS_PER_HOUR, else unlimited
                                sponsorSessionId: UUID, // optional
                                validUntil: Timestamp, // optional, default no expiry
-                               agentLabel: String, // optional
+                               label: String, // optional
                                allowedContracts: HexList, // optional, default all the platform allows
                                allowedCircuits: array of String, // optional, default all the platform allows
-                               allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent, needs NIGHTGATE_SPONSOR_ALLOW_DEPLOY
+                               allowDeploy: Boolean, // optional; the sponsor pays for deploys built by the agent
                                maxDeploys: Integer, // optional, default 1 when allowDeploy is true
+                               allowMaintenance: Boolean, // optional; the sponsor pays for maintenance updates of the contracts deployed under this grant
+                               maxMaintenanceUpdates: Integer, // optional, default 8 when allowMaintenance is true
                                allowedTokenTypes: Hex64List, // optional, default all the platform allows
                                allowUnshieldedOffers: Boolean, // optional; sponsored calls may pay the agent's own unshielded tokens in and the contract's payouts out, and sponsorTransfer takes unshielded transfers; needs NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS
                                allowedUnshieldedTokenTypes: Hex64List, // optional, default all the platform allows besides NIGHT
@@ -1256,16 +1222,18 @@ service NightgateService {
         grants                      : array of {
             grantId    : UUID;
             token      : String; // shown only once
-            agentLabel : String;
+            label : String;
         };
         allowedActions              : array of String;
-        allowedContracts            : array of String;
+        allowedContracts            : HexList;
         allowedCircuits             : array of String;
         allowDeploy                 : Boolean;
         maxDeploys                  : Integer;
-        allowedTokenTypes           : array of String;
+        allowMaintenance            : Boolean;
+        maxMaintenanceUpdates       : Integer;
+        allowedTokenTypes           : Hex64List;
         allowUnshieldedOffers       : Boolean;
-        allowedUnshieldedTokenTypes : array of String;
+        allowedUnshieldedTokenTypes : Hex64List;
         maxValuePerDay              : array of ValueBudget;
         validUntil                  : Timestamp;
     };
@@ -1277,7 +1245,7 @@ service NightgateService {
 
     /** Changes the given settings of a grant. */
     action   updateAgentGrant(grantId: UUID,
-                              agentLabel: String,
+                              label: String,
                               allowedActions: array of String,
                               maxJobsPerDay: Integer,
                               maxJobsPerHour: Integer,
@@ -1286,6 +1254,8 @@ service NightgateService {
                               allowedTokenTypes: Hex64List,
                               allowDeploy: Boolean,
                               maxDeploys: Integer,
+                              allowMaintenance: Boolean,
+                              maxMaintenanceUpdates: Integer,
                               allowUnshieldedOffers: Boolean,
                               allowedUnshieldedTokenTypes: Hex64List,
                               maxValuePerDay: array of ValueBudget,
@@ -1306,17 +1276,19 @@ service NightgateService {
         since         : Timestamp;
         until         : Timestamp;
         jobs          : array of {
-            kind   : String;
-            status : String;
+            kind   : BackgroundJobKind;
+            status : BackgroundJobStatus;
             count  : Integer;
         };
         landed        : Integer; // transactions that succeeded on chain
         failed        : Integer;
         deploysUsed   : Integer;
         maxDeploys    : Integer;
+        maintenanceUpdatesUsed : Integer;
+        maxMaintenanceUpdates  : Integer;
         jobsUsedToday : Integer;
         maxJobsPerDay : Integer;
-        dustPaid      : String;
+        dustPaid      : BigInt;
         limits        : {
             jobsPerHour : Budget;
             jobsPerDay  : Budget;
@@ -1325,32 +1297,36 @@ service NightgateService {
         };
     };
 
-    /** Returns the status of a background job. Poll until `status` is `succeeded` or `failed`.
-     * `result` is the action's result as JSON. This is a POST but changes nothing.
-     * With `waitMs` the call holds until the job settles or the time is up, so one call replaces many polls. */
+    /** One part of a batch transaction: its calls and whether they applied on chain. */
+    type ChainSegment {
+        segment : Integer;
+        calls   : array of String;
+        applied : Boolean;
+    }
 
-    action   getJobStatus(jobId: UUID,
-                          sessionId: UUID, // optional; the job's session; without it a token reads the jobs of its own grant
+    /** Returns the status of a background job. Poll until `status` is `succeeded` or `failed`.
+     * With `waitMs` the call holds until the job settles or the time is up, so one call replaces many polls. */
+    function getJobStatus(jobId: UUID,
+                          sessionId: UUID, // optional; the job's session. A token reads only the jobs of its own grant
                           waitMs: Integer, // ms; optional, at most 25000; hold the call until there is something to return
                           untilChain: Boolean // default false; with waitMs, a succeeded job also waits for the chain's verdict
     )                                                                         returns {
         jobId               : UUID;
-        kind                : String;
-        status              : String; // pending | running | external_execution | submitted | reconciliation_required | succeeded | failed
-        result              : LargeString;
+        kind                : BackgroundJobKind;
+        status              : BackgroundJobStatus;
+        result              : Map; // null = no result yet; what the action returns
         errorCode           : String;
         errorMessage        : LargeString;
         attempt             : Integer;
         maxAttempts         : Integer;
         submissionId        : UUID;
-        txHash              : String; // hex; null before the build; the ledger identifier, same as transactionId
-        transactionId       : String; // hex; null before the build; the ledger identifier, stable when the sponsor adds its fee
-        transactionHash     : String; // hex; null until indexed; the transaction hash explorers show
-        chainStatus         : String; // null | pending | success | failure | dropped
+        txId                : HexEncoded; // hex; null before the build; a ledger identifier, stable when the sponsor adds its fee
+        txHash              : Hex64; // hex; null before the send; the ledger hash, as explorers show it
+        chainStatus         : BackgroundJobChainStatus;
         chainFinalizedAt    : Timestamp;
-        chainBlockHeight    : Integer;
-        chainBlockHash      : String;
-        chainSegments       : LargeString;
+        blockHeight         : Integer64;
+        blockHash           : Hex64;
+        chainSegments       : array of ChainSegment; // empty = not a batch, or not on chain yet
         queuedAt            : Timestamp;
         externalExecutionAt : Timestamp;
         submittedAt         : Timestamp;
@@ -1366,11 +1342,12 @@ annotate NightgateService.Blocks with {
 };
 
 annotate NightgateService.Transactions with {
-    hash @title: 'Transaction Hash';
+    txHash        @title: 'Transaction Hash';
+    extrinsicHash @title: 'Extrinsic Hash';
 };
 
 annotate NightgateService.ContractActions with {
-    address @title: 'Contract Address';
+    contractAddress @title: 'Contract Address';
 };
 
 annotate NightgateService.NightBalances with {

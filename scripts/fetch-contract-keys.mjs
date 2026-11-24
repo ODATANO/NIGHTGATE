@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Fetches a contract's prover keys into the installed package ahead of time and verifies each against its manifest.
-// Run: npx nightgate-fetch-keys attestation-vault-32 [--from https://host/zk-config/attestation-vault-32]
+// Run: node scripts/fetch-contract-keys.mjs attestation-vault-32 [--from https://host/zk-config/attestation-vault-32]
 
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -15,7 +15,7 @@ const fromIdx = args.indexOf('--from');
 const from = fromIdx >= 0 ? args[fromIdx + 1] : undefined;
 
 if (!target || args.includes('-h') || args.includes('--help')) {
-    console.log('usage: nightgate-fetch-keys <contract|package> [--from <zk-config base url>]');
+    console.log('usage: node scripts/fetch-contract-keys.mjs <contract|package> [--from <zk-config base url>]');
     console.log('       fetches the missing keys/*.prover of an installed contract lineage package');
     process.exit(target ? 0 : 1);
 }
@@ -28,7 +28,7 @@ function resolveTarget(spec) {
             try { return resolveContractPackage(name, from); } catch (e) { errors.push(`${name}: ${e.message}`); }
         }
     }
-    console.error(`nightgate-fetch-keys: '${spec}' is not an installed contract package:\n  ${errors.join('\n  ')}`);
+    console.error(`fetch-contract-keys: '${spec}' is not an installed contract package:\n  ${errors.join('\n  ')}`);
     process.exit(1);
 }
 
@@ -36,7 +36,7 @@ const resolved = resolveTarget(target);
 const circuits = verifierCircuits(resolved.zkConfigPath);
 const missing = missingProverKeys(resolved.zkConfigPath);
 if (missing.length === 0) {
-    console.log(`nightgate-fetch-keys: ${resolved.name}@${resolved.version} already has all ${circuits.length} prover keys, nothing to do`);
+    console.log(`fetch-contract-keys: ${resolved.name}@${resolved.version} already has all ${circuits.length} prover keys, nothing to do`);
     process.exit(0);
 }
 
@@ -46,16 +46,16 @@ const registration = from
 const env = { ...process.env };
 if (from) delete env.NIGHTGATE_ZK_ASSET_URL;
 
-console.log(`nightgate-fetch-keys: ${missing.length} of ${circuits.length} prover keys missing for ${resolved.name}@${resolved.version}`);
+console.log(`fetch-contract-keys: ${missing.length} of ${circuits.length} prover keys missing for ${resolved.name}@${resolved.version}`);
 console.log(`  into: ${path.join(resolved.zkConfigPath, 'keys')}`);
 
 // Build output of the server tree; a raw C:\ path needs a file:// URL.
 const { ensureProverKeys } = await import(pathToFileURL(path.join(pkgRoot, 'srv', 'submission', 'prover-keys.js')).href);
 try {
     const result = await ensureProverKeys(resolved.manifest.name, registration, { env, log: (m) => console.log(`  ${m}`) });
-    console.log(`nightgate-fetch-keys: ${resolved.name} complete (${result.fetched.length} key(s) fetched from ${result.source}), all keys verified against the manifest.`);
+    console.log(`fetch-contract-keys: ${resolved.name} complete (${result.fetched.length} key(s) fetched from ${result.source}), all keys verified against the manifest.`);
     console.log('  The artifact generation digest is unchanged; a running server picks the keys up on the next job.');
 } catch (e) {
-    console.error(`nightgate-fetch-keys: ${e?.message ?? e}`);
+    console.error(`fetch-contract-keys: ${e?.message ?? e}`);
     process.exit(1);
 }

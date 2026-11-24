@@ -8,8 +8,6 @@ A NIGHTGATE server supplies the list of its contracts under
 `/contract-manifest` and their proving files under `/zk-config`. It works for
 every contract in that list.
 
-In `@odatano/nightgate` the same export is `@odatano/nightgate/browser`.
-
 ## Use
 
 ```js
@@ -19,14 +17,14 @@ import { Contract } from './managed/counter/contract/index.js';
 const connector = await window.midnight.mnLace.connect('preprod');
 const counter = await connectContract({
     connector,
-    contract: 'counter',            // its name in the manifest
+    contractName: 'counter',        // its name in the manifest
     contractClass: Contract,
     manifestUrl: 'https://gateway.example/contract-manifest',
     contractAddress: COUNTER
 });
 
 const tx = await counter.call({ circuitId: 'increment' });
-// { txHash, transactionHash, blockHeight, result }
+// { txId, txHash, blockHeight, result }
 ```
 
 ## `connectContract(opts) -> ConnectedContract`
@@ -34,13 +32,13 @@ const tx = await counter.call({ circuitId: 'increment' });
 | option | required | meaning |
 | --- | --- | --- |
 | `connector` | yes | the connected wallet, as `window.midnight.<wallet>.connect(networkId)` returns it |
-| `contract` | yes | the contract's name in the manifest |
+| `contractName` | yes | the contract's name in the manifest |
 | `contractClass` | yes | the compiled `Contract` class |
 | `manifestUrl` | yes, unless `manifest` | the server's `/contract-manifest` |
 | `manifest` | no | the parsed manifest, when the app fetched it already. Pass `manifestUrl` too when the app runs on another origin |
 | `contractAddress` | yes, unless you deploy | the deployed contract |
 | `witnesses` | no | the contract's witnesses. A call can bring its own |
-| `privateStateId` | no | default `<contract>PrivateState` |
+| `privateStateId` | no | default `<contractName>PrivateState` |
 | `initialPrivateState` | no | default `{}` |
 | `proving` | no | `'server'` (default), `'wallet'` or `'auto'` |
 | `proofServerUrl` | no | a proof server for `'server'` and `'auto'`. Default: the one the wallet reports |
@@ -53,9 +51,9 @@ three methods.
 
 | method | returns |
 | --- | --- |
-| `call(call)` | `{ txHash, transactionHash, blockHeight, result }` |
-| `batch(calls, { witnesses?, independentCalls?, orderedPrefix? })` | `{ txHash, transactionHash, blockHeight }` |
-| `deploy({ args?, witnesses?, initialPrivateState? })` | `{ txHash, transactionHash, blockHeight, contractAddress }` |
+| `call(call)` | `{ txId, txHash, blockHeight, result }` |
+| `batch(calls, { witnesses?, independentCalls?, orderedPrefix? })` | `{ txId, txHash, blockHeight }` |
+| `deploy({ args?, witnesses?, initialPrivateState? })` | `{ txId, txHash, blockHeight, contractAddress }` |
 
 A call is `{ circuitId, args?, witnesses?, before? }`. The `prepare*` helpers
 return this shape, so their result goes straight into `call()`:
@@ -64,12 +62,12 @@ return this shape, so their result goes straight into `call()`:
 import { connectContract, prepareAttest } from '@odatano/nightgate-tx/calls';
 import { Contract } from '@odatano/nightgate-tx/attestation-vault-32';
 
-const vault = await connectContract({ connector, contract: 'attestation-vault-32', contractClass: Contract, manifestUrl, contractAddress: VAULT });
+const vault = await connectContract({ connector, contractName: 'attestation-vault-32', contractClass: Contract, manifestUrl, contractAddress: VAULT });
 await vault.call(prepareAttest({ payloadHash, metadataHash, attestationSecret }));
 ```
 
-`txHash` is the ledger identifier, `transactionHash` the hash explorers show,
-as in the job results of the server. A result means the transaction applied
+`txId` is a ledger identifier of the transaction, `txHash` the hash explorers
+show, as in the job results of the server. A result means the transaction applied
 fully. One that lands without applying fully throws the `TxFailedError` of
 midnight-js, with the fee spent.
 
@@ -87,7 +85,7 @@ midnight-js, with the fee spent.
 apply in array order.
 
 - A contract takes its witnesses once. Pass one `witnesses` object to `batch()` and set what differs per call in each call's `before` hook. Calls that all carry the same `witnesses` object work too.
-- A batch the ledger would refuse fails before proving. The error has `code: 'BatchCausalityViolation'` with `calls: [{ name, segId, stages }]` in apply order, or `code: 'BatchGasBudgetExceeded'`. Split the batch.
+- A batch the ledger would refuse fails before proving. The error has `code: 'BATCH_CAUSALITY_VIOLATION'` with `calls: [{ name, segId, stages }]` in apply order, or `code: 'BATCH_GAS_BUDGET_EXCEEDED'`. Split the batch.
 - `independentCalls: true` groups the calls after `orderedPrefix` by stage. The rules are those of the builder, see [Batches](txbuilder.md#batches).
 
 For the attestation vault, `prepareVaultBatch` builds the shared witnesses and
@@ -109,7 +107,7 @@ carry on chain, as hex.
 ## Deploy
 
 ```js
-const counter = await connectContract({ connector, contract: 'counter', contractClass: Contract, manifestUrl });
+const counter = await connectContract({ connector, contractName: 'counter', contractClass: Contract, manifestUrl });
 const { contractAddress } = await counter.deploy();
 await counter.call({ circuitId: 'increment' });
 ```

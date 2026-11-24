@@ -85,7 +85,7 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
             if (height === null && rowHeight !== null && existing.revokedTxHash) continue;
             // Only update if the height is unchanged. A revoke confirmed meanwhile has a newer height.
             await db.run(UPDATE.entity(DisclosureGrants)
-                .set({ level: g.level, active: true, revokedTxHash: null, modifiedAt: now, ...stamp })
+                .set({ level: g.level, isActive: true, revokedTxHash: null, modifiedAt: now, ...stamp })
                 .where({ ID: existing.ID, changedAtHeight: rowHeight }));
         } else {
             await db.run(INSERT.into(DisclosureGrants).entries({
@@ -97,7 +97,7 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
                 contractAddress,
                 grantedTxHash: null,
                 revokedTxHash: null,
-                active: true,
+                isActive: true,
                 changedAtHeight: height,
                 createdAt: now,
                 modifiedAt: now
@@ -107,7 +107,7 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
 
     // Rows with a height are compared by height. Rows without one use the grace window.
     const activeRows: DisclosureGrant[] = (await db.run(
-        SELECT.from(DisclosureGrants).where({ contractAddress, active: true })
+        SELECT.from(DisclosureGrants).where({ contractAddress, isActive: true })
     )) || [];
 
     const cutoff = Date.now() - sweepGraceMs;
@@ -122,7 +122,7 @@ async function reindexOnce(deps: ReindexDeps): Promise<ReindexResult> {
             if (Number.isFinite(modifiedAtMs) && modifiedAtMs > cutoff) continue;
         }
         await db.run(UPDATE.entity(DisclosureGrants)
-            .set({ active: false, modifiedAt: now, ...stamp })
+            .set({ isActive: false, modifiedAt: now, ...stamp })
             .where({ ID: r.ID, changedAtHeight: rowHeight }));
         deactivated++;
     }

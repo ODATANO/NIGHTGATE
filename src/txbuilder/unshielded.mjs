@@ -51,9 +51,13 @@ function transferTermsOf(tx, addressFromKey) {
     return { tokenType, amount, to, inputs: inputs.length, outputs: outputs.length };
 }
 
-/** Reads type, amount and recipient of a plain unshielded transfer, by the sponsor's rule. `to` is the raw address. Throws for anything else. */
-export async function readUnshieldedTransfer(tx) {
-    return transferTermsOf(tx, (await loadLedger()).addressFromKey);
+/** Reads type, amount and recipient of a plain unshielded transfer, by the sponsor's rule. Throws for anything else.
+ *  `to` is the address of `networkId` as wallets show it, `toHex` the raw one. */
+export async function readUnshieldedTransfer(tx, { networkId = 'mainnet' } = {}) {
+    const [ledger, af] = await Promise.all([loadLedger(), import('@midnightntwrk/wallet-sdk-address-format')]);
+    const { to: toHex, ...terms } = transferTermsOf(tx, ledger.addressFromKey);
+    const to = af.MidnightBech32m.encode(networkId, new af.UnshieldedAddress(Buffer.from(toHex, 'hex'))).toString();
+    return { ...terms, to, toHex };
 }
 
 /** Creates a wallet that syncs only the seed's unshielded coins and builds transfers for `sponsorTransfer`. The seed never leaves this process.

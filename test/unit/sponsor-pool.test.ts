@@ -6,11 +6,21 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
     pickFreeSponsor, acquireSponsor, releaseSponsor, benchSponsor,
-    isRetryableSponsorFailure, isDustRaceFailure, isGenericInvalidFailure, __resetSponsorPoolForTests, PLATFORM_POOL_SENTINEL,
-    sponsorCandidatesNonExclusive, isPreInclusionReject, isAmbiguousSubmitOutcome, isCallNotAppliedFailure, decideSponsorFailure
+    isRetryableSponsorFailure, __resetSponsorPoolForTests, PLATFORM_POOL_SENTINEL,
+    sponsorCandidatesNonExclusive, isPreInclusionReject, isCallNotAppliedFailure, decideSponsorFailure
 } from '../../srv/submission/sponsor-pool';
 import { WorkerSubmitError } from '../../srv/midnight/wallet-worker-protocol';
 import { NightgateError } from '../../srv/utils/errors';
+
+const isDustRace = (msg: string) => decideSponsorFailure(new Error(msg)).decision === 'dust-rebuild';
+const isAmbiguous = (msg: string) => decideSponsorFailure(new Error(msg)).decision === 'ambiguous';
+const isGenericInvalid = (msg: string) => decideSponsorFailure(new Error(msg)).generic;
+const sponsorHealthFailures = () => [
+    new NightgateError('WALLET_NOT_SYNCED', 'wallet not genuinely synced within 180000ms'),
+    new NightgateError('FEE_SPONSOR_UNUSABLE', 'No facade for sponsorSessionId=abc', { status: 412 }),
+    new NightgateError('FEE_SPONSOR_UNUSABLE', 'Sponsor session expired', { status: 410 }),
+    new NightgateError('SPONSOR_DUST_UNAVAILABLE', 'no free dust backing within 30000ms (all backings busy)')
+];
 
 const POOL = ['sp-a', 'sp-b', 'sp-c'];
 
@@ -62,13 +72,10 @@ describe('sponsor pool', () => {
     });
 
     it('classifies sponsor-state failures as retryable, caller failures as not', () => {
-        for (const msg of [
-            'wallet not genuinely synced within 180000ms',
-            'No facade for sponsorSessionId=abc',
-            '1010: Invalid Transaction: Custom error: 170',
-            'dust note stale (validity window)',
-            '503 WALLET_SYNCING'
-        ]) expect(isRetryableSponsorFailure(new Error(msg)), msg).toBe(true);
+        for (const err of sponsorHealthFailures()) expect(isRetryableSponsorFailure(err), err.message).toBe(true);
+        expect(isRetryableSponsorFailure(new Error('1010: Invalid Transaction: Custom error: 170'))).toBe(true);
+        // Without its code the same text decides nothing.
+        expect(isRetryableSponsorFailure(new Error('No facade for sponsorSessionId=abc'))).toBe(false);
 
         for (const msg of [
             'refusing to sponsor: circuit \'sendAllMyMoney\' is not sponsorable',
@@ -92,28 +99,24 @@ describe('sponsor pool', () => {
             // Pool status Invalid: the loser reached the pool, the winner consumed the note first.
             'Transaction submission error <- SubmissionError: Transaction submission failed <- TransactionInvalidError: Transaction is invalid and was rejected by the node',
         ]) {
-            expect(isDustRaceFailure(new Error(msg)), msg).toBe(true);
+            expect(isDustRace(msg), msg).toBe(true);
             // Only the coded rejects are ALSO sponsor-health retryable (fail over
             // once the dust retries are exhausted); a pool 'Invalid' status is not
             // a sponsor problem and must not bench a healthy sponsor.
             expect(isRetryableSponsorFailure(new Error(msg)), msg).toBe(!/TransactionInvalidError/.test(msg));
         }
         // Digit-boundary: 1700 / 1960 are not our codes.
-        expect(isDustRaceFailure(new Error('Custom error: 1700'))).toBe(false);
+        expect(isDustRace('Custom error: 1700')).toBe(false);
         // The bare top-level SDK message (what crossed the boundary BEFORE
         // formatErrWithCauses) is NOT a dust race: the code must be visible.
-        expect(isDustRaceFailure(new Error('Transaction submission error'))).toBe(false);
+        expect(isDustRace('Transaction submission error')).toBe(false);
         // Sponsor-health failures are retryable but NOT dust races (they fail over).
-        for (const msg of [
-            'wallet not genuinely synced within 180000ms',
-            'No facade for sponsorSessionId=abc',
-            '503 WALLET_SYNCING'
-        ]) {
-            expect(isDustRaceFailure(new Error(msg)), msg).toBe(false);
-            expect(isRetryableSponsorFailure(new Error(msg)), msg).toBe(true);
+        for (const err of sponsorHealthFailures()) {
+            expect(decideSponsorFailure(err).decision, err.message).not.toBe('dust-rebuild');
+            expect(isRetryableSponsorFailure(err), err.message).toBe(true);
         }
         // A non-retryable shape failure is neither.
-        expect(isDustRaceFailure(new Error('circuit \'x\' is not sponsorable'))).toBe(false);
+        expect(isDustRace('circuit \'x\' is not sponsorable')).toBe(false);
     });
 
     it('the sentinel is a RESERVED UUID (every carrying surface is Edm.Guid)', () => {
@@ -141,11 +144,11 @@ describe('non-exclusive candidates (unbound path)', () => {
         expect(sponsorCandidatesNonExclusive(['sp-a', 'sp-b', 'sp-c'], Date.now(), atGate)).toEqual(['sp-a', 'sp-b']);
     });
 
-    it('isGenericInvalidFailure: a bare pool Invalid is generic; coded rejects and our own markers are not', () => {
-        expect(isGenericInvalidFailure(new Error('Transaction submission error <- SubmissionError: Transaction submission failed <- TransactionInvalidError: Transaction is invalid and was rejected by the node'))).toBe(true);
-        expect(isGenericInvalidFailure(new Error('1010: Invalid Transaction: Custom error: 196'))).toBe(false);
-        expect(isGenericInvalidFailure(new Error('sponsored transaction 00ab is in block 1 but its contract call did NOT apply (ledger result PARTIAL_SUCCESS, failed segment 1); ...'))).toBe(false);
-        expect(isGenericInvalidFailure(new Error('submit watch timed out after 60000ms without a Finalized status'))).toBe(false);
+    it('a bare pool Invalid is generic; coded rejects and our own markers are not', () => {
+        expect(isGenericInvalid('Transaction submission error <- SubmissionError: Transaction submission failed <- TransactionInvalidError: Transaction is invalid and was rejected by the node')).toBe(true);
+        expect(isGenericInvalid('1010: Invalid Transaction: Custom error: 196')).toBe(false);
+        expect(isGenericInvalid('sponsored transaction 00ab is in block 1 but its contract call did NOT apply (ledger result PARTIAL_SUCCESS, failed segment 1); ...')).toBe(false);
+        expect(isGenericInvalid('submit watch timed out after 60000ms without a Finalized status')).toBe(false);
     });
 });
 
@@ -160,15 +163,15 @@ describe('submit outcome classification', () => {
         ];
         for (const m of rejects) {
             expect(isPreInclusionReject(new Error(m)), m).toBe(true);
-            expect(isAmbiguousSubmitOutcome(new Error(m)), m).toBe(false);
+            expect(isAmbiguous(m), m).toBe(false);
         }
         const notApplied = 'sponsored transaction 00ab is in block 1 but its contract call did NOT apply (ledger result PARTIAL_SUCCESS, failed segment 1); ...';
-        expect(isDustRaceFailure(new Error(notApplied))).toBe(false);  // NOT a dust race: the caller's transcript is stale, terminal for the sponsor job
+        expect(isDustRace(notApplied)).toBe(false);  // NOT a dust race: the caller's transcript is stale, terminal for the sponsor job
         expect(isCallNotAppliedFailure(new Error(notApplied))).toBe(true);
         expect(isPreInclusionReject(new Error(notApplied))).toBe(false); // it IS on-chain
         const timeout = 'submit watch timed out after 60000ms without a Finalized status';
-        expect(isAmbiguousSubmitOutcome(new Error(timeout))).toBe(true);
-        expect(isDustRaceFailure(new Error(timeout))).toBe(false);  // never rebuild on it
+        expect(isAmbiguous(timeout)).toBe(true);
+        expect(isDustRace(timeout)).toBe(false);  // never rebuild on it
         expect(isPreInclusionReject(new Error(timeout))).toBe(false);
     });
 });
@@ -197,12 +200,10 @@ describe('decideSponsorFailure (one table for both sponsoring channels)', () => 
         expect(decideSponsorFailure(race).decision).toBe('dust-rebuild');
     });
 
-    it('sponsor-health failures fail over (text fallback: they never cross the RPC with a code)', () => {
-        for (const msg of ['wallet not genuinely synced within 180000ms', 'No facade for sponsorSessionId=abc', '503 WALLET_SYNCING']) {
-            expect(decideSponsorFailure(new Error(msg)), msg).toEqual({ decision: 'failover', generic: false, preInclusion: false });
+    it('sponsor-health failures fail over by their code', () => {
+        for (const err of sponsorHealthFailures()) {
+            expect(decideSponsorFailure(err), err.message).toMatchObject({ decision: 'failover', generic: false });
         }
-        const gone = new Error('Sponsor session expired'); gone.name = 'FeeSponsorError';
-        expect(decideSponsorFailure(gone).decision).toBe('failover');
         expect(decideSponsorFailure(new Error("refusing to sponsor: circuit 'x' is not sponsorable")).decision).toBe('fail');
         expect(decideSponsorFailure(new Error('finalized-tx round-trip FAILED at deserialize')).decision).toBe('fail');
     });

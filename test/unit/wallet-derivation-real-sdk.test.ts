@@ -40,18 +40,6 @@ const PIN = {
 
 const hex = (u8: Uint8Array) => Buffer.from(u8).toString('hex');
 
-describe('mnemonicToBip39SeedHex', () => {
-    it('produces the BIP39 spec seed for the test vector phrase', () => {
-        const seed = mnemonicToBip39SeedHex(MNEMONIC);
-        expect(seed).toHaveLength(128);
-        expect(seed.startsWith(PIN.seedHexPrefix)).toBe(true);
-    });
-
-    it('rejects an invalid phrase', () => {
-        expect(() => mnemonicToBip39SeedHex('not a valid mnemonic phrase at all')).toThrow(/Invalid BIP39 mnemonic/);
-    });
-});
-
 describe('deriveRoleSeeds (real wallet-sdk-hd)', () => {
     const bip39Seed = () => new Uint8Array(Buffer.from(mnemonicToBip39SeedHex(MNEMONIC), 'hex'));
 

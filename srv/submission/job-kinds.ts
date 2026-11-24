@@ -3,9 +3,9 @@
 export interface JobKindTraits {
     /** Runs a full ZK proof. All heavy kinds share one limit on how many run at once. */
     heavy: boolean;
-    /** Runs other jobs as its steps. It has no txHash of its own, its state follows from the steps. */
+    /** Runs other jobs as its steps. It has no transaction of its own, its state follows from the steps. */
     workflowParent: boolean;
-    /** `txHash` holds the ledger transaction identifier, which only the indexer can look up, not the crawler. */
+    /** Pays for a caller's transaction. Its outcome is settled from the indexer. */
     identifierKeyed: boolean;
     /** One job at a time. The work queues on the worker thread anyway, so parallel runs only delay the first result. */
     serial?: boolean;
@@ -14,7 +14,7 @@ export interface JobKindTraits {
 }
 
 /** Which executor runs a kind. `wallet` kinds are registered by the wallet session module. */
-export type JobExecutor = 'wallet' | 'contract' | 'mintShieldedTestToken' | 'mintFactoryToken' | 'sponsorFinalized' | 'sponsorUnbound' | 'reindexDisclosures';
+export type JobExecutor = 'wallet' | 'contract' | 'mintFactoryToken' | 'sponsorFinalized' | 'sponsorUnbound' | 'reindexDisclosures';
 
 /** Bookkeeping that runs once a job whose outcome was unclear is confirmed on-chain. */
 export type JobFinalizer = 'contractProjection' | 'sponsoredSubmission' | 'factoryMint';
@@ -40,29 +40,29 @@ export const JOB_KINDS: Readonly<Record<string, JobKindDefinition>> = {
     connectWalletForSigning: { traits: { ...LIGHT_KIND, serial: true, sessionBound: true }, executor: 'wallet', op: 'prewarm' },
     registerForDustGeneration: { traits: HEAVY_KIND, executor: 'wallet', op: 'registerDust' },
     deregisterFromDustGeneration: { traits: HEAVY_KIND, executor: 'wallet', op: 'deregisterDust' },
-    sendNight: { traits: HEAVY_KIND, executor: 'wallet', op: 'sendNight' },
+    sendToken: { traits: HEAVY_KIND, executor: 'wallet', op: 'sendToken' },
 
     // Contract jobs, see srv/submission/actions/.
     deployContract: contract('deploy'),
     submitContractCall: contract('call'),
     submitContractCallBatch: contract('callBatch', HEAVY_KIND, 'contractProjection'),
-    mintShieldedTestToken: { traits: HEAVY_KIND, executor: 'mintShieldedTestToken', op: 'call' },
     mintFactoryToken: { traits: HEAVY_KIND, executor: 'mintFactoryToken', op: 'call', finalizer: 'factoryMint' },
     anchorDocument: contract('anchorDocument', HEAVY_KIND, 'contractProjection'),
     grantDisclosure: contract('grantDisclosure', HEAVY_KIND, 'contractProjection'),
     revokeDisclosure: contract('revokeDisclosure', HEAVY_KIND, 'contractProjection'),
-    registerPassport: contract('registerPassport', HEAVY_KIND, 'contractProjection'),
-    retract: contract('retract', HEAVY_KIND, 'contractProjection'),
+    registerDocument: contract('registerDocument', HEAVY_KIND, 'contractProjection'),
+    retractAttestation: contract('retract', HEAVY_KIND, 'contractProjection'),
+    purgeExpired: contract('retract', HEAVY_KIND, 'contractProjection'),
     // Retries a failed table update after a submit. Sends nothing to the chain.
     reindexDisclosures: { traits: LIGHT_KIND, executor: 'reindexDisclosures', op: 'reindexDisclosures' },
 
     // Proof workflows and their steps.
-    issueFieldPredicateAttestation: contract('fieldPredicateWorkflow', WORKFLOW_PARENT_KIND),
-    issueFieldPredicateAttestationBatch: contract('fieldPredicateBatchWorkflow', WORKFLOW_PARENT_KIND),
-    issueFieldEqualityAttestation: contract('fieldEqualityWorkflow', WORKFLOW_PARENT_KIND),
-    issueFieldMembershipAttestation: contract('fieldMembershipWorkflow', WORKFLOW_PARENT_KIND),
-    issueDocumentIntegrityAttestation: contract('documentIntegrityWorkflow', WORKFLOW_PARENT_KIND),
-    issueDocumentDiffAttestation: contract('documentDiffWorkflow', WORKFLOW_PARENT_KIND),
+    proveFieldPredicate: contract('fieldPredicateWorkflow', WORKFLOW_PARENT_KIND),
+    proveClaims: contract('fieldPredicateBatchWorkflow', WORKFLOW_PARENT_KIND),
+    proveFieldEquality: contract('fieldEqualityWorkflow', WORKFLOW_PARENT_KIND),
+    proveFieldMembership: contract('fieldMembershipWorkflow', WORKFLOW_PARENT_KIND),
+    proveDocumentIntegrity: contract('documentIntegrityWorkflow', WORKFLOW_PARENT_KIND),
+    proveDocumentDiff: contract('documentDiffWorkflow', WORKFLOW_PARENT_KIND),
     fieldAnchorRoot: contract('call'),
     fieldPredicateProof: contract('call'),
     fieldPredicateBatchProof: contract('callBatch', HEAVY_KIND, 'contractProjection'),
@@ -72,13 +72,13 @@ export const JOB_KINDS: Readonly<Record<string, JobKindDefinition>> = {
     documentDiffProof: contract('call'),
 
     // Paying fees for transactions built elsewhere. An unbound sponsor job proves its own dust spend.
-    buildSponsorableTx: contract('buildSponsorable'),
-    sponsorFinalizedTransaction: {
+    buildSponsorable: contract('buildSponsorable'),
+    sponsorFinalized: {
         traits: { heavy: false, workflowParent: false, identifierKeyed: true }, executor: 'sponsorFinalized', finalizer: 'sponsoredSubmission'
     },
     // Runs in parallel. The worker proves and submits these outside the per-wallet lock,
     // so several jobs can run at once, each on its own dust source.
-    sponsorUnboundTransaction: {
+    sponsorUnbound: {
         traits: { heavy: true, workflowParent: false, identifierKeyed: true }, executor: 'sponsorUnbound', finalizer: 'sponsoredSubmission'
     },
     // Takes two swap halves instead of one transaction. After merging them it runs like the job above.
@@ -110,4 +110,30 @@ export function declaredJobKindTraits(kind: string): JobKindTraits {
     const traits = Object.prototype.hasOwnProperty.call(JOB_KIND_TRAITS, kind) ? JOB_KIND_TRAITS[kind] : undefined;
     if (!traits) throw new Error(`job kind '${kind}' is not declared in srv/submission/job-kinds.ts`);
     return traits;
+}
+
+/** Names an action had before. The start renames stored grants and jobs that still carry one. */
+export const RENAMED_ACTIONS: Readonly<Record<string, string>> = {
+    issueFieldPredicateAttestation: 'proveFieldPredicate',
+    issueFieldEqualityAttestation: 'proveFieldEquality',
+    issueFieldMembershipAttestation: 'proveFieldMembership',
+    issueDocumentIntegrityAttestation: 'proveDocumentIntegrity',
+    issueDocumentDiffAttestation: 'proveDocumentDiff',
+    issueFieldPredicateAttestationBatch: 'proveClaims',
+    verifyAttestationState: 'verifyAttestation',
+    verifyPredicateState: 'verifyPredicate',
+    verifyDisclosureState: 'verifyDisclosure',
+    sponsorFinalizedTransaction: 'sponsorFinalized',
+    sponsorUnboundTransaction: 'sponsorUnbound',
+    registerPassport: 'registerDocument',
+    sendNight: 'sendToken',
+    estimateSendNightFee: 'estimateSendTokenFee'
+};
+
+/** Names a job kind had before: those of the renamed actions and one that was never an action name. */
+export const RENAMED_JOB_KINDS: Readonly<Record<string, string>> = { ...RENAMED_ACTIONS, buildSponsorableTx: 'buildSponsorable' };
+
+/** The current name of an action that had another one before, else the name as given. */
+export function currentActionName(name: string): string {
+    return Object.hasOwn(RENAMED_ACTIONS, name) ? RENAMED_ACTIONS[name] : name;
 }

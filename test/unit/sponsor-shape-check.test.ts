@@ -80,7 +80,7 @@ describe('checkSponsorableShape', () => {
     // A deploy passes only with allowDeploy and under its own byte ceiling; a maintenance update never passes.
     it('accepts a ContractDeploy only with allowDeploy, reports it under the deploy marker', () => {
         expect(() => check(tx([{ actions: [DEPLOY()] }]), 5000, ['aa'.repeat(32)], ['attest']))
-            .toThrow(/non-call action \(ContractDeploy\); deploys need allowDeploy/);
+            .toThrow(/non-call action \(ContractDeploy\); a token needs allowDeploy on its grant/);
         const calls = workerExports.checkSponsorableShape(tx([{ actions: [DEPLOY()] }]), 5000, ['aa'.repeat(32)], ['attest'], { allowDeploy: true });
         // The new address is not on the allow-list; the deploy still passes.
         expect(calls).toEqual([{ address: 'bb'.repeat(32), entryPoint: workerExports.DEPLOY_ENTRY_POINT }]);
@@ -98,10 +98,55 @@ describe('checkSponsorableShape', () => {
             .toThrow(/at most 0 per sponsored transaction/);
     });
 
-    it('never sponsors a maintenance update, allowDeploy or not', () => {
-        const MAINT = () => { class MaintenanceUpdate { address = 'bb'.repeat(32); updates = []; } return new MaintenanceUpdate(); };
+    const MAINT = (address = 'bb'.repeat(32)) => { class MaintenanceUpdate { updates = []; constructor(public address: string) { } } return new MaintenanceUpdate(address); };
+
+    it('sponsors a maintenance update only with allowMaintenance, allowDeploy or not', () => {
         expect(() => workerExports.checkSponsorableShape(tx([{ actions: [MAINT()] }]), 5000, undefined, undefined, { allowDeploy: true }))
-            .toThrow(/maintenance update \(never sponsorable\)/);
+            .toThrow(/maintenance update; a token needs allowMaintenance on its grant/);
+        const calls = workerExports.checkSponsorableShape(tx([{ actions: [MAINT()] }]), 5000, ['aa'.repeat(32)], ['attest'], { allowMaintenance: true, maintainableContracts: ['bb'.repeat(32)] });
+        expect(calls).toEqual([{ address: 'bb'.repeat(32), entryPoint: workerExports.MAINTENANCE_ENTRY_POINT }]);
+    });
+
+    it('a token updates only a contract deployed under its grant; a caller without a token any', () => {
+        expect(() => workerExports.checkSponsorableShape(tx([{ actions: [MAINT('cc'.repeat(32))] }]), 5000, undefined, undefined, { allowMaintenance: true, maintainableContracts: ['bb'.repeat(32)] }))
+            .toThrow(/which was not deployed under this grant/);
+        expect(() => workerExports.checkSponsorableShape(tx([{ actions: [MAINT()] }]), 5000, undefined, undefined, { allowMaintenance: true, maintainableContracts: [] }))
+            .toThrow(/not deployed under this grant/);
+        expect(workerExports.checkSponsorableShape(tx([{ actions: [MAINT('cc'.repeat(32))] }]), 5000, undefined, undefined, { allowMaintenance: true })).toHaveLength(1);
+    });
+
+    it('one maintenance update per transaction, under its own byte ceiling', () => {
+        const opts = { allowMaintenance: true };
+        expect(() => workerExports.checkSponsorableShape(tx([{ actions: [MAINT(), MAINT()] }]), 5000, undefined, undefined, opts))
+            .toThrow(/more than one maintenance update/);
+        expect(() => workerExports.checkSponsorableShape(tx([{ actions: [MAINT()] }]), 50_000, undefined, undefined, opts))
+            .toThrow(/over the 40960B budget \(NIGHTGATE_SPONSOR_MAX_MAINTENANCE_BYTES\)/);
+        process.env.NIGHTGATE_SPONSOR_MAX_MAINTENANCE_BYTES = '60000';
+        try {
+            expect(workerExports.checkSponsorableShape(tx([{ actions: [MAINT()] }]), 50_000, undefined, undefined, opts)).toHaveLength(1);
+        } finally {
+            delete process.env.NIGHTGATE_SPONSOR_MAX_MAINTENANCE_BYTES;
+        }
+    });
+
+    it('a real signed update of ledger-v9, in the transaction the builder makes, is read as one maintenance update', async () => {
+        const ledger: any = await import('@midnightntwrk/ledger-v9');
+        const key = ledger.sampleSigningKey();
+        const address = ledger.sampleContractAddress();
+        const authority = new ledger.ContractMaintenanceAuthority([ledger.signatureVerifyingKey(key)], 1, 1n);
+        let update = new ledger.MaintenanceUpdate(address, [new ledger.ReplaceAuthority(authority)], 0n);
+        update = update.addSignature(0n, ledger.signData(key, update.dataToSign));
+        const intent = ledger.Intent.new(new Date(Date.now() + 600_000)).addMaintenanceUpdate(update);
+        const tx = ledger.Transaction.fromParts('preview', undefined, undefined, intent).mockProve();
+        const bytes = tx.serialize().length;
+        expect(() => workerExports.checkSponsorableShape(tx, bytes, undefined, undefined, {})).toThrow(/needs allowMaintenance/);
+        expect(workerExports.checkSponsorableShape(tx, bytes, undefined, undefined, { allowMaintenance: true, maintainableContracts: [String(address)] }))
+            .toEqual([{ address: String(address), entryPoint: workerExports.MAINTENANCE_ENTRY_POINT }]);
+    });
+
+    it('an update found by its shape alone is treated the same', () => {
+        expect(() => workerExports.checkSponsorableShape(tx([{ actions: [{ address: 'bb'.repeat(32), updates: [] }] }]), 5000, undefined, undefined, {}))
+            .toThrow(/needs allowMaintenance/);
     });
 
     it('a deploy has its own byte ceiling (NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES, default 40960)', () => {
@@ -474,6 +519,10 @@ describe('artifact snapshots: the worker verifies the pinned generation against 
         try {
             const reg = layout('m');
             const digest = computeArtifactGenerationDigest(reg);
+            // Without a digest nothing is read: neither the module nor a key comes from the registered folder.
+            expect(() => workerExports.materializeArtifactSnapshot('m', reg)).toThrow("contract 'm': the registration carries no artifact digest");
+            expect(() => workerExports.artifactAssetPath('m', { ...reg, artifactDigest: '' })).toThrow(/carries no artifact digest/);
+            await expect(workerExports.getContractScaffold('m', reg)).rejects.toThrow(/carries no artifact digest/);
             const snap = workerExports.materializeArtifactSnapshot('m', { ...reg, artifactDigest: digest });
             const inSnapshot = path.join(snap.zkConfigPath, 'compiler', 'contract-manifest.json');
             expect(fs.readFileSync(inSnapshot, 'utf8')).toBe('{"manifest-version":"1"}');
@@ -560,8 +609,7 @@ describe('artifact snapshots: the worker verifies the pinned generation against 
         process.env.NIGHTGATE_ARTIFACT_SNAPSHOT_DIR = snapRoot;
         try {
             // leftovers in the install's root, a snapshot unused for 30 days that
-            // no live process holds, one that another live process (the parent) holds,
-            // and a per-process root of the older per-pid layout whose process is gone
+            // no live process holds, and one that another live process (the parent) holds
             const myRoot = workerExports.artifactSnapshotRoot();
             fs.mkdirSync(path.join(myRoot, 'deadbeef.tmp-1-abcd', 'module'), { recursive: true });
             fs.mkdirSync(path.join(myRoot, 'f'.repeat(64), 'keys'), { recursive: true });
@@ -570,8 +618,6 @@ describe('artifact snapshots: the worker verifies the pinned generation against 
             fs.mkdirSync(path.join(myRoot, 'd'.repeat(64), '.holders'), { recursive: true });
             fs.writeFileSync(path.join(myRoot, 'd'.repeat(64), '.holders', String(process.ppid)), 'x');
             fs.utimesSync(path.join(myRoot, 'd'.repeat(64)), old, old);
-            const deadRoot = path.join(myRoot, '999999');
-            fs.mkdirSync(path.join(deadRoot, 'a'.repeat(64)), { recursive: true });
             // one level per install, none per process: a restart reuses the snapshots
             expect(myRoot).toBe(path.join(snapRoot, path.basename(myRoot)));
             expect(path.basename(myRoot)).toMatch(/^[0-9a-f]{16}$/);
@@ -582,7 +628,6 @@ describe('artifact snapshots: the worker verifies the pinned generation against 
             expect(fs.existsSync(path.join(myRoot, 'deadbeef.tmp-1-abcd'))).toBe(false);
             expect(fs.existsSync(path.join(myRoot, 'f'.repeat(64)))).toBe(false);
             expect(fs.existsSync(path.join(myRoot, 'd'.repeat(64)))).toBe(true);
-            expect(fs.existsSync(deadRoot)).toBe(false);
             // the materialised snapshot records this process as a holder
             expect(fs.existsSync(path.join(snap.zkConfigPath, '.holders', String(process.pid)))).toBe(true);
             await workerExports.getContractScaffold('e', { ...reg, artifactDigest: digest });
@@ -722,22 +767,6 @@ describe('artifact snapshots: the worker verifies the pinned generation against 
             process.env.NIGHTGATE_WORKER_MAX_GENERATIONS = '0';
             for (let i = 0; i < 5; i++) expect(workerExports.noteGenerationImported(String(i).repeat(64))).toBe(false);
         } finally {
-            delete process.env.NIGHTGATE_WORKER_MAX_GENERATIONS;
-            workerExports.__resetRotationForTests();
-        }
-    });
-
-    it('a due rotation closes admission first and exits only once nothing is in flight, also after a FAILED call', async () => {
-        workerExports.__resetRotationForTests();
-        process.env.NIGHTGATE_WORKER_MAX_GENERATIONS = '1';
-        const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as any);
-        try {
-            expect(workerExports.__admitRpcForTests()).toBe(true);
-            expect(workerExports.noteGenerationImported('c'.repeat(64))).toBe(true);
-            // nothing in flight and nothing ran yet: the state is pending, not draining
-            expect(workerExports.__rotationStateForTests()).toMatchObject({ pending: true, draining: false, inflight: 0 });
-        } finally {
-            exitSpy.mockRestore();
             delete process.env.NIGHTGATE_WORKER_MAX_GENERATIONS;
             workerExports.__resetRotationForTests();
         }

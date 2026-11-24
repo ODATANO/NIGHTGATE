@@ -4,7 +4,6 @@
 const BLOCK_QUERY = `query($height: Int!) {
   block(offset: { height: $height }) {
     hash
-    height
     ledgerParameters
     transactions {
       hash
@@ -17,7 +16,7 @@ const BLOCK_QUERY = `query($height: Int!) {
       }
       ... on RegularTransaction {
         fees { paidFees estimatedFees }
-        transactionResult { status segments { id success } }
+        transactionResult { segments { id success } }
       }
     }
   }
@@ -61,8 +60,7 @@ export interface SupplementDustEvent extends SupplementLedgerEvent {
 }
 
 export interface SupplementTransaction {
-    ledgerTxHash: string;
-    status: string | null;
+    txHash: string;
     /** Computing the fee needs ledger parameters the node does not provide, so it comes from the indexer. */
     fee: string | null;
     estimatedFee: string | null;
@@ -76,7 +74,6 @@ export interface SupplementTransaction {
 export interface SupplementBlock {
     /** Bare lowercase hex. The crawler writes nothing when it differs from the hash of its own block at this height. */
     hash: string;
-    height: number;
     /** Base64. The node does not provide these parameters. */
     ledgerParameters: string | null;
     transactions: SupplementTransaction[];
@@ -104,11 +101,11 @@ interface TransactionAnswer {
     zswapLedgerEvents?: unknown;
     dustLedgerEvents?: unknown;
     fees?: { paidFees?: unknown; estimatedFees?: unknown } | null;
-    transactionResult?: { status?: string | null; segments?: Array<{ id?: unknown; success?: unknown } | null> | null } | null;
+    transactionResult?: { segments?: Array<{ id?: unknown; success?: unknown } | null> | null } | null;
 }
 
 export interface BlockAnswer {
-    block?: { hash?: unknown; height?: unknown; ledgerParameters?: unknown; transactions?: Array<TransactionAnswer | null> | null } | null;
+    block?: { hash?: unknown; ledgerParameters?: unknown; transactions?: Array<TransactionAnswer | null> | null } | null;
 }
 
 const ACTION_TYPE: Record<string, SupplementContractAction['actionType']> = {
@@ -157,8 +154,8 @@ export function readSupplementBlock(payload: BlockAnswer | null | undefined): Su
 
     const transactions: SupplementTransaction[] = [];
     for (const tx of block.transactions ?? []) {
-        const ledgerTxHash = bareHex(tx?.hash);
-        if (!ledgerTxHash) continue;
+        const txHash = bareHex(tx?.hash);
+        if (!txHash) continue;
 
         const contractActions: SupplementContractAction[] = [];
         for (const action of tx?.contractActions ?? []) {
@@ -177,8 +174,7 @@ export function readSupplementBlock(payload: BlockAnswer | null | undefined): Su
         }
 
         transactions.push({
-            ledgerTxHash,
-            status: tx?.transactionResult?.status ?? null,
+            txHash,
             fee: tx?.fees?.paidFees == null ? null : String(tx.fees.paidFees),
             estimatedFee: tx?.fees?.estimatedFees == null ? null : String(tx.fees.estimatedFees),
             segments: (tx?.transactionResult?.segments ?? [])
@@ -194,7 +190,6 @@ export function readSupplementBlock(payload: BlockAnswer | null | undefined): Su
 
     return {
         hash: bareHex(block.hash),
-        height: toInt(block.height),
         ledgerParameters: hexToBase64(block.ledgerParameters),
         transactions
     };

@@ -42,10 +42,9 @@ jobs:
       - name: Build
         run: npm run build
 
-      # The SAME gate set npm prepublishOnly and the tag-release workflow
-      # run (lint, typecheck, full suite with coverage, real-artifact vault
-      # integration, legacy schema-delta migration, browser bundle + types,
-      # packed-tarball invariants). One definition, three consumers.
+      # The SAME gate set the tag-release workflow runs (lint, typecheck, full
+      # suite with coverage, schema-delta migration, browser bundle and types,
+      # the client package). One definition, two consumers.
       - name: Release gates
         env:
           CI: true

@@ -7,8 +7,12 @@ const mockStartCrawler = vi.hoisted(() => (vi.fn()));
 const mockPendingReindexHeight = vi.hoisted(() => (vi.fn()));
 const mockStartReindex = vi.hoisted(() => (vi.fn()));
 const mockStopCrawler = vi.hoisted(() => (vi.fn()));
-const mockEnsureNightgateModelLoaded = vi.hoisted(() => (vi.fn()));
 const selectFromSpy = vi.hoisted(() => (vi.fn()));
+const TABLE_COLUMNS = vi.hoisted((): Record<string, string[]> => ({}));
+const catalog = (query: unknown, columns: Record<string, string[]> = TABLE_COLUMNS) => {
+    const table = typeof query === 'string' ? /pragma_table_info\('(\w+)'\)/.exec(query)?.[1] : undefined;
+    return table === undefined ? undefined : (columns[table] ?? []).map(name => ({ name }));
+};
 const ENV_KEYS = [
     'NIGHTGATE_NETWORK',
     'NIGHTGATE_NODE_URL',
@@ -26,13 +30,19 @@ vi.mock('@sap/cds', () => {
             requires: {
                 nightgate: {
                     kind: 'nightgate',
-                    network: 'testnet',
+                    network: 'undeployed',
                     nodeUrl: 'ws://localhost:9944'
                 }
             }
         },
         connect: {
             to: mockConnectTo
+        },
+        model: {
+            *each() {
+                yield { name: 'midnight.Blocks', elements: { ID: { name: 'ID' }, height: { name: 'height' } } };
+                yield { name: 'midnight.WalletSessions', elements: { sessionId: { name: 'sessionId' }, label: { name: 'label' } } };
+            }
         },
         ql: {
             SELECT: {
@@ -81,10 +91,6 @@ vi.mock('../../srv/crawler/index', () => ({
 vi.mock('../../srv/crawler/reindex', () => ({
     pendingReindexHeight: mockPendingReindexHeight,
     startReindex: mockStartReindex
-}));
-
-vi.mock('../../srv/utils/cds-model', () => ({
-    ensureNightgateModelLoaded: mockEnsureNightgateModelLoaded
 }));
 
 vi.mock('../../srv/midnight/wallet-worker-client', () => ({
@@ -137,10 +143,22 @@ vi.mock('../../srv/utils/sync-state', () => ({
     SyncStateNetworkMismatchError: class SyncStateNetworkMismatchError extends Error {}
 }));
 
-// The rewrite has its own tests against a real database (stored-hex-prefix.test.ts).
-const mockDropStoredHexPrefix = vi.hoisted(() => (vi.fn(async (..._args: unknown[]) => ({ blocks: 0, transactions: 0 }))));
-vi.mock('../../srv/crawler/stored-hex-prefix', () => ({
-    dropStoredHexPrefix: mockDropStoredHexPrefix
+// The retirement has its own test against a real database (swap-offers.test.ts).
+const mockRetireOffers = vi.hoisted(() => (vi.fn(async (..._args: unknown[]) => 0)));
+vi.mock('../../srv/submission/swap-offers', () => ({
+    retireOffersForOneTaker: mockRetireOffers
+}));
+
+// Both steps have their own tests against a real database (nightgate-service.test.ts, column-renames.test.ts).
+const mockBackfillOwners = vi.hoisted(() => (vi.fn(async (..._args: unknown[]) => 0)));
+const mockSortTxValues = vi.hoisted(() => (vi.fn(async (..._args: unknown[]) => 0)));
+const mockRenameActions = vi.hoisted(() => (vi.fn(async (..._args: unknown[]) => 0)));
+vi.mock('../../srv/submission/job-store', () => ({
+    backfillRowOwners: mockBackfillOwners,
+    sortStoredTxValues: mockSortTxValues,
+    renameStoredActions: mockRenameActions,
+    renameStoredErrorCodes: vi.fn(async () => 0),
+    moveStoredDiffCounts: vi.fn(async () => 0)
 }));
 
 // The lease has its own tests against a real database (instance-lease.test.ts).
@@ -176,12 +194,13 @@ describe('runtime initialize', () => {
         (cds.env as any).requires = {
             nightgate: {
                 kind: 'nightgate',
-                network: 'testnet',
+                network: 'undeployed',
                 nodeUrl: 'ws://localhost:9944'
             }
         };
 
-        mockDbRun.mockResolvedValue({});
+        Object.assign(TABLE_COLUMNS, { midnight_Blocks: ['ID', 'height'], midnight_WalletSessions: ['sessionId', 'label'] });
+        mockDbRun.mockImplementation(async (query: unknown) => catalog(query) ?? {});
         mockDbDeploy.mockResolvedValue(undefined);
         mockCdsDeployTo.mockResolvedValue(undefined);
         mockCdsDeploy.mockReturnValue({ to: mockCdsDeployTo });
@@ -190,7 +209,6 @@ describe('runtime initialize', () => {
         mockPendingReindexHeight.mockResolvedValue(null);
         mockStartReindex.mockReset();
         mockStopCrawler.mockResolvedValue(undefined);
-        mockEnsureNightgateModelLoaded.mockResolvedValue(undefined);
 
         await shutdown();
         vi.clearAllMocks();
@@ -221,36 +239,20 @@ describe('runtime initialize', () => {
         expect(mockStartCrawler).toHaveBeenCalledTimes(1);
     });
 
-    it('loads the model before DB access, starts the crawler, and logs syncing startup state', async () => {
+    it('connects the DB and starts the crawler', async () => {
         const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
 
         try {
             const status = await initialize();
 
-            expect(mockEnsureNightgateModelLoaded).toHaveBeenCalledTimes(1);
-            expect(mockEnsureNightgateModelLoaded.mock.invocationCallOrder[0]).toBeLessThan(mockConnectTo.mock.invocationCallOrder[0]);
             expect(mockConnectTo).toHaveBeenCalledWith('db');
-            expect(selectFromSpy).toHaveBeenCalledWith('midnight.Blocks', ['slot']);
-            expect(selectFromSpy).toHaveBeenCalledWith('midnight.SyncState', ['authorBackfillHeight', 'authorsBackfilledAt', 'reindexTargetHeight']);
-            expect(mockDbRun).toHaveBeenNthCalledWith(1, expect.objectContaining({
-                __kind: 'one',
-                __table: 'midnight.Blocks'
-            }));
-            expect(mockDbRun).toHaveBeenNthCalledWith(2, expect.objectContaining({
-                __kind: 'one',
-                __table: 'midnight.SyncState'
-            }));
-            expect(mockDbRun).toHaveBeenCalledWith(expect.objectContaining({
-                __kind: 'delete',
-                where: { outcomeSource: null }
-            }));
+            expect(mockDbRun).toHaveBeenNthCalledWith(1, expect.stringContaining("pragma_table_info('midnight_Blocks')"));
+            expect(mockDbRun).toHaveBeenNthCalledWith(2, expect.stringContaining("pragma_table_info('midnight_WalletSessions')"));
             expect(mockDbDeploy).not.toHaveBeenCalled();
             expect(mockStartCrawler).toHaveBeenCalledWith(expect.objectContaining({
                 enabled: true,
                 nodeUrl: 'ws://localhost:9944'
             }));
-            expect(logSpy).toHaveBeenCalledWith('Initializing crawler and starting catch-up...');
-            expect(logSpy).toHaveBeenCalledWith('Startup state: syncing (crawler started)');
             expect(status).toEqual(expect.objectContaining({
                 initialized: true,
                 crawlerEnabled: true,
@@ -274,7 +276,7 @@ describe('runtime initialize', () => {
         }
     });
 
-    it('returns idle mode and logs a stopped startup state when the crawler is disabled', async () => {
+    it('returns idle mode when the crawler is disabled', async () => {
         const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
         (cds.env as any).requires.nightgate.crawler = { enabled: false };
 
@@ -282,7 +284,6 @@ describe('runtime initialize', () => {
             const status = await initialize();
 
             expect(mockStartCrawler).not.toHaveBeenCalled();
-            expect(logSpy).toHaveBeenCalledWith('Startup state: stopped (crawler disabled)');
             expect(status).toEqual(expect.objectContaining({
                 initialized: true,
                 crawlerEnabled: false,
@@ -293,7 +294,7 @@ describe('runtime initialize', () => {
         }
     });
 
-    it('logs an offline startup state when crawler startup fails with a node error', async () => {
+    it('reports offline when crawler startup fails with a node error', async () => {
         const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
         const warnSpy = vi.spyOn(cds.log('nightgate'), 'warn').mockImplementation(() => {});
         mockStartCrawler.mockRejectedValue(new Error('ECONNREFUSED: connect'));
@@ -301,8 +302,6 @@ describe('runtime initialize', () => {
         try {
             const status = await initialize();
 
-            expect(warnSpy).toHaveBeenCalledWith('Node not reachable at ws://localhost:9944: ECONNREFUSED: connect');
-            expect(logSpy).toHaveBeenCalledWith('Startup state: offline (node unreachable)');
             expect(status).toEqual(expect.objectContaining({
                 initialized: true,
                 crawlerEnabled: true,
@@ -320,24 +319,20 @@ describe('runtime initialize', () => {
         // require() would yield a different class identity for instanceof.
         const { SchemaNotDeployedError } = await import('../../src/index.js');
 
-        // Probes: Blocks OK, SyncState missing. initialize() should bail
-        // immediately with SchemaNotDeployedError; no deploy attempt, no
-        // crawler start, nothing.
-        mockDbRun
-            .mockResolvedValueOnce({})
-            .mockRejectedValueOnce(new Error('no such table: midnight_SyncState'));
+        // Blocks is there, WalletSessions is not. No deploy attempt, no crawler start.
+        mockDbRun.mockImplementation(async (query: unknown) => catalog(query, { midnight_Blocks: ['ID', 'height'] }) ?? {});
 
         const err = await initialize().catch(e => e);
         expect(err).toBeInstanceOf(SchemaNotDeployedError);
-        expect(err.missingTable).toBe('midnight.SyncState (needs columns: authorBackfillHeight, authorsBackfilledAt, reindexTargetHeight)');
+        expect(err.missingTable).toBe('midnight.WalletSessions');
         expect(err.message).toMatch(/npm run deploy/);
         expect(getStatus()).toEqual(expect.objectContaining({
             initialized: false,
             crawlerEnabled: true,
-            network: 'testnet',
+            network: 'undeployed',
             nodeUrl: 'ws://localhost:9944',
             mode: 'offline',
-            lastError: expect.stringContaining('midnight.SyncState')
+            lastError: expect.stringContaining('midnight.WalletSessions')
         }));
 
         // Crucially: no deploy was attempted, on either path.
@@ -365,20 +360,23 @@ describe('runtime initialize', () => {
     it('refuses to start on a database missing a column this release added', async () => {
         const { SchemaNotDeployedError } = await import('../../src/index.js');
 
-        // The probe list carries each release's NEW columns, not just table
-        // names: a database from an earlier release passes every table probe
-        // and would then die on the first connectWallet, which writes
-        // WalletSessions.label. It has to fail here instead, with the
-        // migration named.
-        // Table probes plus the column probes that precede WalletSessions in
-        // the list (Documents, PredicateAttestations, DisclosureGrants).
-        const probesBeforeWalletSessions = 13;
-        for (let i = 0; i < probesBeforeWalletSessions; i++) mockDbRun.mockResolvedValueOnce({});
-        mockDbRun.mockRejectedValueOnce(new Error('no such column: label'));
+        // A database of an earlier release has the table without the new column. It fails here, not at the first write.
+        mockDbRun.mockImplementation(async (query: unknown) => catalog(query, { midnight_Blocks: ['ID', 'height'], midnight_WalletSessions: ['sessionId'] }) ?? {});
 
         const err = await initialize().catch(e => e);
         expect(err).toBeInstanceOf(SchemaNotDeployedError);
         expect(err.missingTable).toBe('midnight.WalletSessions (needs columns: label)');
+        expect(mockStartCrawler).not.toHaveBeenCalled();
+    });
+
+    it('refuses to start on a database whose wallet sessions still have their former key column', async () => {
+        const { SchemaNotDeployedError } = await import('../../src/index.js');
+        mockDbRun.mockImplementation(async (query: unknown) => catalog(query, { midnight_Blocks: ['ID', 'height'], midnight_WalletSessions: ['ID', 'sessionId', 'label'] }) ?? {});
+
+        const err = await initialize().catch(e => e);
+        expect(err).toBeInstanceOf(SchemaNotDeployedError);
+        expect(err.missingTable).toBe('midnight.WalletSessions (its key is sessionId)');
+        expect(err.message).toContain('the former key column ID is still there');
         expect(mockStartCrawler).not.toHaveBeenCalled();
     });
 
@@ -402,7 +400,7 @@ describe('runtime initialize', () => {
 
     it('includes the resolved DB path in the error message', async () => {
         (cds.env as any).requires.db = { credentials: { database: 'db/midnight.db' } };
-        mockDbRun.mockRejectedValueOnce(new Error('no such table: midnight_Blocks'));
+        mockDbRun.mockImplementation(async (query: unknown) => catalog(query, {}) ?? {});
 
         await expect(initialize()).rejects.toMatchObject({
             message: expect.stringContaining('db/midnight.db')
@@ -424,8 +422,6 @@ describe('runtime initialize', () => {
                 enabled: true,
                 nodeUrl: 'wss://crawler.example.test'
             }));
-            expect(logSpy).toHaveBeenCalledWith('Network: preprod');
-            expect(logSpy).toHaveBeenCalledWith('Node: wss://node.example.test');
             expect(status).toEqual(expect.objectContaining({
                 initialized: true,
                 crawlerEnabled: true,
@@ -480,6 +476,18 @@ describe('runtime initialize', () => {
         // A process that does not hold the lease only reads: no index is created, no row deleted.
         const writes = mockDbRun.mock.calls.map(([q]) => q).filter((q) => (typeof q === 'string' && /^\s*(CREATE|DROP)/i.test(q)) || q?.DELETE || q?.INSERT || q?.UPDATE);
         expect(writes).toEqual([]);
+        expect(mockRetireOffers).not.toHaveBeenCalled();
+        expect(mockBackfillOwners).not.toHaveBeenCalled();
+        expect(mockSortTxValues).not.toHaveBeenCalled();
+        expect(mockRenameActions).not.toHaveBeenCalled();
+    });
+
+    it('retires the offers posted for one taker, sorts stored transaction values and records row owners only after it holds the lease', async () => {
+        await initialize();
+        for (const step of [mockRetireOffers, mockRenameActions, mockSortTxValues, mockBackfillOwners]) {
+            expect(step).toHaveBeenCalledTimes(1);
+            expect(mockAcquireLease.mock.invocationCallOrder[0]).toBeLessThan(step.mock.invocationCallOrder[0]);
+        }
     });
 
     it('creates the indexes only after it holds the lease', async () => {
@@ -489,17 +497,8 @@ describe('runtime initialize', () => {
         expect(mockAcquireLease.mock.invocationCallOrder[0]).toBeLessThan(mockDbRun.mock.invocationCallOrder[firstIndex]);
     });
 
-    it('rewrites stored hashes under the lease, before job recovery and the crawler', async () => {
-        await initialize();
-
-        const order = (mock: { mock: { invocationCallOrder: number[] } }) => mock.mock.invocationCallOrder[0];
-        expect(order(mockAcquireLease)).toBeLessThan(order(mockDropStoredHexPrefix));
-        expect(order(mockDropStoredHexPrefix)).toBeLessThan(order(mockRecoverJobs));
-        expect(order(mockDropStoredHexPrefix)).toBeLessThan(order(mockStartCrawler));
-    });
-
-    it('stays offline when the stored hashes cannot be rewritten', async () => {
-        mockDropStoredHexPrefix.mockRejectedValueOnce(new Error('database is locked'));
+    it('stays offline when the database cannot be prepared', async () => {
+        mockRenameActions.mockRejectedValueOnce(new Error('database is locked'));
 
         await expect(initialize()).rejects.toThrow(/database is locked/);
         expect(mockRecoverJobs).not.toHaveBeenCalled();

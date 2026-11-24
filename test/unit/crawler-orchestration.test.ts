@@ -34,12 +34,14 @@ vi.mock('../../srv/crawler/BlockProcessor', () => ({
     BlockProcessor: mockBlockProcessorConstructor
 }));
 
-vi.mock('../../srv/utils/sync-state', () => ({
+vi.mock('../../srv/utils/sync-state', async (original) => ({
+    ...await original<typeof import('../../srv/utils/sync-state')>(),
     ensureSyncStateSingleton: vi.fn().mockResolvedValue(undefined)
 }));
 
 import { RpcBatchRefusedError } from '../../srv/providers/MidnightNodeProvider';
 import cds from '@sap/cds';
+import { inBlock, inTransaction } from '../fixtures/chain-position';
 import { MidnightCrawler } from '../../srv/crawler/Crawler';
 
 // Boot the in-memory CAP server. Not assigned to a `test` const on purpose
@@ -92,8 +94,9 @@ async function seedTransaction(
     const id = cds.utils.uuid();
     await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
         ID: id,
-        transactionId: txIndex,
-        hash,
+        ...(await inBlock(db, blockId)),
+        indexInBlock: txIndex,
+        extrinsicHash: hash,
         protocolVersion: 1,
         transactionType: 'Regular',
         block_ID: blockId,
@@ -106,7 +109,12 @@ beforeAll(async () => {
     db = await cds.connect.to('db');
 });
 
+// The tests below seed hashes that no node mock answers for. The comparison of index and node has its own tests.
+let chainCheck: ReturnType<typeof vi.spyOn>;
+afterEach(() => { chainCheck.mockRestore(); });
+
 beforeEach(async () => {
+    chainCheck = vi.spyOn(MidnightCrawler.prototype as any, 'assertNodeServesIndexedChain').mockResolvedValue(undefined);
     mockProcessorInit.mockReset().mockResolvedValue(undefined);
     mockProcessorProcessBlockByHeight.mockReset();
     mockProcessorFetchBlockBatch.mockReset();
@@ -124,6 +132,89 @@ beforeEach(async () => {
     await db.run(cds.ql.DELETE.from(BLOCKS));
     await db.run(cds.ql.DELETE.from(REORG_LOG));
     await setSyncState({ syncStatus: 'stopped', lastIndexedHeight: 0, chainHeight: 0, consecutiveErrors: 0 });
+});
+
+describe('the node and the index are on one chain', () => {
+    const HEAD = `0x${'aa'.repeat(32)}`;
+    const OTHER = `0x${'bb'.repeat(32)}`;
+    const bare = (hash: string) => hash.slice(2);
+
+    function crawlerOn(provider: Record<string, unknown>): MidnightCrawler {
+        chainCheck.mockRestore();
+        const crawler = new MidnightCrawler(provider as any, { enabled: true, batchSize: 10 });
+        (crawler as any).db = db;
+        (crawler as any).isRunning = true;
+        (crawler as any).processor = { fetchBlockBatch: mockProcessorFetchBlockBatch, persistPreparedBlock: mockProcessorPersistPreparedBlock };
+        return crawler;
+    }
+    /** A node whose finalized head is `tip` with the hash `tipHash`. `at` answers the hash of a lower block. */
+    const nodeAt = (tip: number, tipHash: string, at: (height: number) => string | null = () => null) => ({
+        getFinalizedHead: vi.fn().mockResolvedValue(tipHash),
+        getHeader: vi.fn().mockResolvedValue({ number: `0x${tip.toString(16)}` }),
+        getBlockHash: vi.fn(async (height: number) => at(height))
+    });
+
+    it('a node level with the index and on its block: nothing to do, no extra question to the node', async () => {
+        await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: bare(HEAD) });
+        const node = nodeAt(5, HEAD);
+        await expect((crawlerOn(node) as any).catchUp()).resolves.toBe(0);
+        expect(node.getBlockHash).not.toHaveBeenCalled();
+    });
+
+    it('a node ahead that has another block at the indexed head serves another chain', async () => {
+        await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: bare(HEAD) });
+        const node = nodeAt(9, `0x${'cc'.repeat(32)}`, height => (height === 5 ? OTHER : null));
+        const failed = await (crawlerOn(node) as any).catchUp().catch((e: unknown) => e);
+        expect(failed).toMatchObject({ code: 'SYNC_STATE_CHAIN_MISMATCH', height: 5, storedHash: bare(HEAD), nodeHash: bare(OTHER) });
+        expect(mockProcessorFetchBlockBatch).not.toHaveBeenCalled();
+    });
+
+    it('a node ahead that has the indexed head goes on indexing', async () => {
+        await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: bare(HEAD) });
+        const node = nodeAt(6, `0x${'cc'.repeat(32)}`, height => (height === 5 ? HEAD : null));
+        const crawler = crawlerOn(node);
+        const pipeline = vi.spyOn(crawler as any, 'runCatchUpPipeline').mockResolvedValue(1);
+        await expect((crawler as any).catchUp()).resolves.toBe(1);
+        expect(pipeline).toHaveBeenCalledWith(6, 6, 1);
+    });
+
+    it('a node behind the index is on the same chain when its head is the stored block: wait', async () => {
+        await seedBlock(3, HEAD);
+        await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: 'ee'.repeat(32) });
+        const node = nodeAt(3, HEAD);
+        await expect((crawlerOn(node) as any).catchUp()).resolves.toBe(0);
+        expect(node.getBlockHash).not.toHaveBeenCalled();
+    });
+
+    it('a node behind the index with another block at its head serves another chain', async () => {
+        await seedBlock(3, HEAD);
+        await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: 'ee'.repeat(32) });
+        const failed = await (crawlerOn(nodeAt(3, OTHER)) as any).catchUp().catch((e: unknown) => e);
+        expect(failed).toMatchObject({ code: 'SYNC_STATE_CHAIN_MISMATCH', height: 3, storedHash: bare(HEAD), nodeHash: bare(OTHER) });
+    });
+
+    it('a node behind the lowest stored block gives no verdict', async () => {
+        await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: bare(HEAD) });
+        await expect((crawlerOn(nodeAt(2, OTHER)) as any).catchUp()).resolves.toBe(0);
+    });
+
+    it('another chain stops the crawler for good and names the block in SyncState', async () => {
+        await setSyncState({ syncStatus: 'synced', lastIndexedHeight: 5, lastIndexedHash: bare(HEAD), consecutiveErrors: 0 });
+        const crawler = crawlerOn(nodeAt(9, `0x${'cc'.repeat(32)}`, height => (height === 5 ? OTHER : null)));
+        const stop = vi.spyOn(crawler, 'stop').mockResolvedValue(undefined);
+        const redrive = vi.spyOn(crawler as any, 'scheduleRedrive');
+
+        (crawler as any).driveIngest();
+        await (crawler as any).ingestPromise;
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(redrive).not.toHaveBeenCalled();
+        expect(stop).toHaveBeenCalledWith('error');
+        const state = await getSyncState();
+        expect(state.syncStatus).toBe('error');
+        expect(state.lastError).toContain('The node serves another chain than this database was indexed from: block 5');
+        expect(state.lastError).toContain(bare(OTHER));
+    });
 });
 
 describe('MidnightCrawler orchestration', () => {
@@ -1710,6 +1801,8 @@ describe('MidnightCrawler orchestration', () => {
             const actionId = cds.utils.uuid();
             await db.run(cds.ql.INSERT.into(CONTRACT_ACTIONS).entries({
                 ID: actionId,
+                ...(await inTransaction(db, tx10)),
+                actionIndex: 0,
                 address: '0xcontract',
                 actionType: 'Call',
                 transaction_ID: tx10
@@ -1741,6 +1834,7 @@ describe('MidnightCrawler orchestration', () => {
             const createdUtxo = cds.utils.uuid();
             await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
                 ID: createdUtxo,
+                ...(await inTransaction(db, tx10)),
                 owner: 'addr_created',
                 tokenType: '0'.repeat(64),
                 value: '50',
@@ -1754,6 +1848,7 @@ describe('MidnightCrawler orchestration', () => {
             const spentUtxo = cds.utils.uuid();
             await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
                 ID: spentUtxo,
+                ...(await inTransaction(db, survivingBlockTx)),
                 owner: 'addr_spent',
                 tokenType: '0'.repeat(64),
                 value: '25',
@@ -1813,6 +1908,7 @@ describe('MidnightCrawler orchestration', () => {
             ] as const) {
                 await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
                     ID: cds.utils.uuid(),
+                    ...(await inTransaction(db, txId)),
                     owner: 'addr_b',
                     tokenType: '0'.repeat(64),
                     value,

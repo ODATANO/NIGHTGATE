@@ -5,7 +5,7 @@ import { Documents, PredicateAttestations, Transactions, TransactionIdentifiers,
 import { getArtifactGenerationDigest } from '../contract-registry';
 import { resolveNightgateRuntimeConfig, getNightgateConfig, mainnetSubmissionBlockReason } from '../../utils/nightgate-config';
 import { WorkflowReconciliationRequiredError, type StartJobResult } from '../background-jobs';
-import { UINT64_MAX } from '../verify-state';
+import { UINT64_MAX, integerFormProblem, type ClaimPredicate } from '../verify-state';
 import { effectiveSponsorPolicy, getGlobalSponsorPolicy, type SponsorPolicy } from '../sponsor-policy';
 import { currentGrantPolicy, consumeValueBudget, refundValueBudget } from '../../sessions/agent-grants';
 
@@ -53,14 +53,15 @@ export function resolveClaimValidUntil(requested?: number): number {
 export function claimValidUntil(requested?: number): bigint {
     return BigInt(resolveClaimValidUntil(requested));
 }
-/** Parses an optional caller `validUntil`. On bad input it returns the error text for a 400. */
+/** Reads an optional caller `validUntil`, a timestamp, as the UNIX seconds the circuit takes. On bad input it returns the error text for a 400. */
 export function parseValidUntil(raw: unknown): { validUntil?: number; error?: string } {
     if (raw === undefined || raw === null || raw === '') return {};
-    const v = Number(raw);
+    const ms = raw instanceof Date ? raw.getTime() : typeof raw === 'string' ? Date.parse(raw) : NaN;
+    if (!Number.isFinite(ms)) return { error: 'validUntil must be a timestamp (ISO 8601)' };
+    const v = Math.floor(ms / 1000);
     const now = Math.floor(Date.now() / 1000);
-    if (!Number.isInteger(v)) return { error: 'validUntil must be an integer UNIX time in seconds' };
     if (v <= now + 60) return { error: 'validUntil must lie at least a minute in the future' };
-    if (v > now + CLAIM_MAX_LIFETIME_S) return { error: `validUntil may lie at most ${CLAIM_MAX_LIFETIME_S} seconds (5 years) ahead; the vault refuses longer claims` };
+    if (v > now + CLAIM_MAX_LIFETIME_S) return { error: 'validUntil may lie at most five years ahead; the vault refuses longer claims' };
     return { validUntil: v };
 }
 
@@ -86,7 +87,7 @@ export type DocPairBundle = {
 };
 
 export type BatchClaimCommand = {
-    predicateAttestationId: string; predicate: string; unit?: string;
+    predicateAttestationId: string; predicate: ClaimPredicate; unit?: string;
     validUntil?: number;
     /** Missing only for the claims that compare two documents. */
     fieldKey?: string;
@@ -105,22 +106,22 @@ export type BatchClaimCommand = {
 };
 
 export type ContractCommandV1 =
-    | { op: 'deploy'; compiledArtifactRef: string; initialPrivateState: unknown; sponsorSessionId?: string; recoveryId?: string }
-    | { op: 'call'; contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[]; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle; mintedTokenType?: string }
-    | { op: 'callBatch'; contractAddress: string; calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>; compiledArtifactRef: string; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle; independentCalls?: boolean; orderedPrefix?: number }
-    | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHash: string; attesterId: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
-    | { op: 'fieldEqualityWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHash: string; attesterId: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; expectedDigest: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
-    | { op: 'fieldMembershipWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHash: string; attesterId: string; fieldKey: string; contractAddress: string; compiledArtifactRef: string; setRoot: string; valueDigest: string; salt: string; siblings: string[]; dirs: boolean[]; setSiblings: string[]; setDirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
-    | { op: 'fieldPredicateBatchWorkflow'; payloadHash: string; attesterId: string; validUntil?: number; contractAddress: string; compiledArtifactRef: string; contentRoot?: string; schemaId?: string; claims: BatchClaimCommand[]; sponsorSessionId?: string }
-    | { op: 'documentIntegrityWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHashA: string; payloadHashB: string; attesterIdA: string; attesterIdB: string; contractAddress: string; compiledArtifactRef: string; allowedMask: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
-    | { op: 'documentDiffWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHashA: string; payloadHashB: string; attesterIdA: string; attesterIdB: string; contractAddress: string; compiledArtifactRef: string; k: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
-    | { op: 'anchorDocument'; documentId: string; payloadHash: string; metadataHash: string; attesterId?: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
-    | { op: 'grantDisclosure'; disclosureGrantId: string; payloadHash: string; attesterId: string; grantee: string; level: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
-    | { op: 'revokeDisclosure'; payloadHash: string; attesterId: string; grantee: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
-    | { op: 'registerPassport'; passportId: string; ownerId: string; mode?: number; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string }
+    | { op: 'deploy'; contractName: string; initialPrivateState: unknown; sponsorSessionId?: string; recoveryId?: string }
+    | { op: 'call'; contractAddress: string; circuit: string; contractName: string; args: unknown[]; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle; mintedTokenType?: string }
+    | { op: 'callBatch'; contractAddress: string; calls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>; contractName: string; initialPrivateState?: unknown; sponsorSessionId?: string; merkleProof?: MerkleProofBundle; independentCalls?: boolean; orderedPrefix?: number }
+    | { op: 'fieldPredicateWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHash: string; attesterId: string; fieldKey: string; contractAddress: string; contractName: string; predicate: string; threshold: string; opCode: number; unit?: string; value: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'fieldEqualityWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHash: string; attesterId: string; fieldKey: string; contractAddress: string; contractName: string; expectedDigest: string; salt: string; siblings: string[]; dirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'fieldMembershipWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHash: string; attesterId: string; fieldKey: string; contractAddress: string; contractName: string; setRoot: string; valueDigest: string; salt: string; siblings: string[]; dirs: boolean[]; setSiblings: string[]; setDirs: boolean[]; contentRoot?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'fieldPredicateBatchWorkflow'; payloadHash: string; attesterId: string; validUntil?: number; contractAddress: string; contractName: string; contentRoot?: string; schemaId?: string; claims: BatchClaimCommand[]; sponsorSessionId?: string }
+    | { op: 'documentIntegrityWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHashA: string; payloadHashB: string; attesterIdA: string; attesterIdB: string; contractAddress: string; contractName: string; allowedMask: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'documentDiffWorkflow'; predicateAttestationId: string; validUntil?: number; payloadHashA: string; payloadHashB: string; attesterIdA: string; attesterIdB: string; contractAddress: string; contractName: string; k: number; schema: SchemaSlotWire[]; openingA: OpeningWire; openingB: OpeningWire; contentRootA?: string; contentRootB?: string; schemaId?: string; sponsorSessionId?: string }
+    | { op: 'anchorDocument'; anchorId: string; payloadHash: string; metadataHash: string; attesterId?: string; contractAddress: string; contractName: string; sponsorSessionId?: string }
+    | { op: 'grantDisclosure'; disclosureGrantId: string; payloadHash: string; attesterId: string; grantee: string; level: number; contractAddress: string; contractName: string; sponsorSessionId?: string }
+    | { op: 'revokeDisclosure'; payloadHash: string; attesterId: string; grantee: string; contractAddress: string; contractName: string; sponsorSessionId?: string }
+    | { op: 'registerDocument'; documentId: string; ownerId: string; mode?: number; contractAddress: string; contractName: string; sponsorSessionId?: string }
     // Retract mode 0 removes the owner's own attestation. attesterId is the session's and is used for the local database update.
     // Mode 1 removes an expired claim.
-    | { op: 'retract'; mode: number; key: string; attesterId?: string; contractAddress: string; compiledArtifactRef: string; sponsorSessionId?: string };
+    | { op: 'retract'; mode: number; key: string; attesterId?: string; contractAddress: string; contractName: string; sponsorSessionId?: string };
 
 /**
  * A command plus the digest of the contract build it was made for. The name can later point to another build, so the digest is checked before running.
@@ -139,6 +140,8 @@ export type SponsorJobCommand = Partial<Pick<SponsorPolicy, 'allowedContracts' |
 /** A non-negative integer argument up to `max`: the value, or what is wrong with it. */
 export function readUnsignedArg(raw: unknown, name: string, max: bigint, exceeds: string): bigint | string {
     if (raw === undefined || raw === null || raw === '') return `${name} is required`;
+    const form = integerFormProblem(raw, name);
+    if (form) return form;
     let n: bigint;
     try { n = BigInt(raw as string | number | bigint); } catch { return `${name} must be an integer (decimal string)`; }
     if (n < 0n) return `${name} must be a non-negative integer`;
@@ -158,7 +161,6 @@ export function readArgsJson(args: string | null | undefined): unknown[] | strin
 }
 
 export const VALUE_EXCEEDS = 'exceeds Uint<64>';
-export const THRESHOLD_EXCEEDS = 'exceeds the recorded range (at most 9223372036854775807)';
 
 export interface InclusionPath { siblings: string[]; dirs: boolean[] }
 
@@ -255,8 +257,6 @@ export function isVacuousMask(allowedMask: number, schema: SchemaSlotWire[]): bo
     return schema.every((s, i) => s.kind === 2 || (allowedMask & (1 << i)) !== 0);
 }
 
-/** `PredicateAttestations.threshold` is an Integer64 column, so a stored threshold must stay below 2^63. */
-export const INT64_MAX = 9223372036854775807n;
 
 /** Checks the schema and both document openings. On bad input it rejects with 400 and returns null. */
 export function parseDocPairInputs(
@@ -393,19 +393,19 @@ export async function runSubmission<T>(req: ActionRequest<unknown, unknown>, op:
     }
 }
 
-/** The indexed transaction a job's txHash names. A job holds the ledger hash, the extrinsic hash or one of the transaction's identifiers. */
+/** The indexed transaction a value names: its ledger hash, its extrinsic hash or one of its identifiers. A row of an older version may hold an identifier where a hash belongs. */
 async function indexedTransactionId(db: DbRunner, bare: string): Promise<string | undefined> {
     const byHash: Pick<Transaction, 'ID'> | undefined = await db.run(
-        SELECT.one.from(Transactions).columns('ID').where`ledgerTxHash = ${bare} or hash = ${bare}`
+        SELECT.one.from(Transactions).columns('ID').where`txHash = ${bare} or extrinsicHash = ${bare}`
     );
     if (byHash?.ID) return byHash.ID;
-    const byIdentifier: { transaction_ID?: string | null } | undefined = await db.run(
-        SELECT.one.from(TransactionIdentifiers).columns('transaction_ID').where({ identifier: bare })
+    const byTxId: { transaction_ID?: string | null } | undefined = await db.run(
+        SELECT.one.from(TransactionIdentifiers).columns('transaction_ID').where({ txId: bare })
     );
-    return byIdentifier?.transaction_ID ?? undefined;
+    return byTxId?.transaction_ID ?? undefined;
 }
 
-/** True when the indexed transaction of a job's txHash landed with a success outcome. */
+/** True when the indexed transaction this hash or identifier names landed with a success outcome. */
 export async function landedOnChain(db: DbRunner, txHash: string | null | undefined): Promise<boolean> {
     const bare = bareHex(txHash);
     if (!bare) return false;

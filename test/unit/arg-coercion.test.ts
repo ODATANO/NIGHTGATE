@@ -109,6 +109,19 @@ describe('Uint coercion errors', () => {
     });
 });
 
+describe('a number JSON has rounded', () => {
+    it('is refused, because the value the caller sent is gone', () => {
+        // 9007199254740993 arrives as 9007199254740992 after JSON.parse.
+        const [rounded] = JSON.parse('[9007199254740993]') as number[];
+        expect(coerceErr(rounded, UINT64).message).toMatch(/above 2\^53 must be a decimal string/);
+    });
+
+    it('the same value as text and the largest exact number pass', () => {
+        expect(coerceCircuitArgs(['9007199254740993'], [UINT64])).toEqual([9007199254740993n]);
+        expect(coerceCircuitArgs([Number.MAX_SAFE_INTEGER], [UINT64])).toEqual([9007199254740991n]);
+    });
+});
+
 describe('Boolean and passthrough coercion', () => {
     it('rejects non-boolean values for Boolean parameters', () => {
         expect(coerceErr('true', BOOL).message).toMatch(/expected boolean, got string/);

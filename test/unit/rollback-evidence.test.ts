@@ -2,14 +2,15 @@
  * Reorg rollback of submission evidence (srv/crawler/rollback.ts): what the
  * indexer confirmer recorded at/above the fork height is undone in the
  * rollback's own transaction, against the real in-memory CAP DB. The
- * correlation is the confirmed block HEIGHT: a job's txHash is the ledger
- * identifier, the crawler indexes the Substrate extrinsic hash, the indexer
- * reports a third hash, so the fixtures below use three unrelated values.
+ * correlation is the confirmed block HEIGHT. A job's txId is a ledger identifier,
+ * its txHash the ledger hash, and the crawler indexes the extrinsic hash, so
+ * the fixtures below use three unrelated values.
  * The chain-data cascade itself is covered by the handleReorg tests in
  * crawler-orchestration.test.ts.
  */
 
 import cds from '@sap/cds';
+import { inBlock, inTransaction } from '../fixtures/chain-position';
 import { rollbackIndexedDataFromHeight } from '../../srv/crawler/rollback';
 
 cds.test(__dirname + '/../..');
@@ -34,19 +35,19 @@ async function seedBlock(height: number, hash: string): Promise<string> {
 async function seedTransaction(blockId: string, hash: string, index = 0): Promise<string> {
     const id = cds.utils.uuid();
     await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
-        ID: id, transactionId: index, hash, protocolVersion: 1, transactionType: 'Regular', block_ID: blockId
+        ID: id, ...(await inBlock(db, blockId)), indexInBlock: index, extrinsicHash: hash, protocolVersion: 1, transactionType: 'Regular', block_ID: blockId
     }));
     return id;
 }
 
-async function seedSubmission(ID: string, txHash: string, status: string, confirmedAt?: number, extra: Record<string, unknown> = {}): Promise<void> {
+async function seedSubmission(ID: string, txId: string, status: string, confirmedAt?: number, extra: Record<string, unknown> = {}): Promise<void> {
     await db.run(cds.ql.INSERT.into(PENDING).entries({
-        ID, txHash, status, actionType: 'CALL', submittedAt: new Date().toISOString(),
+        ID, txId, status, actionType: 'CALL', submittedAt: new Date().toISOString(),
         finalizedAt: status === 'finalized' ? new Date().toISOString() : null,
         finalizedTxData: status === 'finalized' ? JSON.stringify({ blockHeight: confirmedAt ?? null }) : null,
-        chainBlockHeight: confirmedAt ?? null,
-        chainBlockHash: confirmedAt != null ? `0xblock${confirmedAt}` : null,
-        indexerTxHash: confirmedAt != null ? `0xindexer-${ID}` : null,
+        blockHeight: confirmedAt ?? null,
+        blockHash: confirmedAt != null ? `0xblock${confirmedAt}` : null,
+        txHash: confirmedAt != null ? `0xindexer-${ID}` : null,
         ...extra
     }));
 }
@@ -82,17 +83,16 @@ describe('rollbackIndexedDataFromHeight: submission evidence', () => {
         await seedSubmission('sub-unconfirmed', '00idopen', 'included');        // no evidence yet: untouched
         await seedSubmission('sub-failed', '00idfailed', 'failed');             // rejected before the mempool: no height, stays rejected
         await seedSubmission('sub-chain-failed', '00idchainfailed', 'failed', 10, { errorCode: 'CHAIN_EXECUTION_FAILED', errorMessage: 'contract call did not apply' });
-        await seedJob('job-keep', { txHash: '00idkeep', chainBlockHeight: 9, chainBlockHash: '0xblock9' });
-        await seedJob('job-gone', { txHash: '00idgone', chainBlockHeight: 10, chainBlockHash: '0xblock10', indexerTxHash: '0xindexer-gone' });
-        await seedJob('job-chain-failed', {
-            txHash: '00idfailed', status: 'failed', chainStatus: 'failure', errorCode: 'CHAIN_EXECUTION_FAILED',
+        await seedJob('job-keep', { txId: '00idkeep', blockHeight: 9, blockHash: '0xblock9' });
+        await seedJob('job-gone', { txId: '00idgone', blockHeight: 10, blockHash: '0xblock10', txHash: '0xindexer-gone' });
+        await seedJob('job-chain-failed', { txId: '00idfailed', status: 'failed', chainStatus: 'failure', errorCode: 'CHAIN_EXECUTION_FAILED',
             errorMessage: 'Transaction 00idfailed is on-chain but its contract call did not apply', finishedAt: new Date().toISOString(),
-            chainBlockHeight: 10
+            blockHeight: 10
         });
-        await seedJob('job-unconfirmed', { txHash: '00idopen', chainStatus: 'pending', chainFinalizedAt: null });
-        await seedJob('job-other-failure', { txHash: '00idgone', status: 'failed', chainStatus: null, errorCode: 'TIMEOUT', chainBlockHeight: 10 });
+        await seedJob('job-unconfirmed', { txId: '00idopen', chainStatus: 'pending', chainFinalizedAt: null });
+        await seedJob('job-other-failure', { txId: '00idgone', status: 'failed', chainStatus: null, errorCode: 'TIMEOUT', blockHeight: 10 });
         await db.run(cds.ql.INSERT.into(DOCUMENTS).entries({
-            ID: 'doc-1', sha256: 'ab'.repeat(32), anchoredTxHash: '00idgone', anchoredAt: new Date().toISOString()
+            ID: 'doc-1', payloadHash: 'ab'.repeat(32), anchoredTxHash: '00idgone', anchoredAt: new Date().toISOString()
         }));
 
         const result = await db.tx((tx: any) => rollbackIndexedDataFromHeight(tx, 10, { syncStatus: 'syncing' }));
@@ -100,19 +100,19 @@ describe('rollbackIndexedDataFromHeight: submission evidence', () => {
         expect(Number((await db.run(cds.ql.SELECT.one.from(SYNC_STATE).where({ ID: 'SINGLETON' }))).reorgGeneration)).toBe(1);
 
         const subs = Object.fromEntries((await db.run(cds.ql.SELECT.from(PENDING))).map((r: any) => [r.ID, r]));
-        expect(subs['sub-keep']).toMatchObject({ status: 'finalized', chainBlockHeight: 9 });
-        expect(subs['sub-gone']).toMatchObject({ status: 'pending', txHash: '00idgone', finalizedAt: null, finalizedTxData: null, chainBlockHeight: null, chainBlockHash: null, indexerTxHash: null });
-        expect(subs['sub-gone-included']).toMatchObject({ status: 'pending', chainBlockHeight: null });
+        expect(subs['sub-keep']).toMatchObject({ status: 'finalized', blockHeight: '9' });
+        expect(subs['sub-gone']).toMatchObject({ status: 'pending', txId: '00idgone', txHash: '0xindexer-sub-gone', finalizedAt: null, finalizedTxData: null, blockHeight: null, blockHash: null });
+        expect(subs['sub-gone-included']).toMatchObject({ status: 'pending', blockHeight: null });
         expect(subs['sub-unconfirmed']).toMatchObject({ status: 'included' });
         expect(subs['sub-failed']).toMatchObject({ status: 'failed' });
         // A chain-proven execution failure is inclusion evidence: back to pending with the job.
-        expect(subs['sub-chain-failed']).toMatchObject({ status: 'pending', errorCode: null, errorMessage: null, chainBlockHeight: null });
+        expect(subs['sub-chain-failed']).toMatchObject({ status: 'pending', errorCode: null, errorMessage: null, blockHeight: null });
 
         const jobs = Object.fromEntries((await db.run(cds.ql.SELECT.from(JOBS))).map((r: any) => [r.ID, r]));
-        expect(jobs['job-keep']).toMatchObject({ status: 'succeeded', chainStatus: 'success', chainBlockHeight: 9 });
-        expect(jobs['job-gone']).toMatchObject({ status: 'succeeded', chainStatus: 'pending', chainFinalizedAt: null, chainBlockHeight: null, chainBlockHash: null, indexerTxHash: null });
+        expect(jobs['job-keep']).toMatchObject({ status: 'succeeded', chainStatus: 'success', blockHeight: '9' });
+        expect(jobs['job-gone']).toMatchObject({ status: 'succeeded', chainStatus: 'pending', chainFinalizedAt: null, blockHeight: null, blockHash: null, txId: '00idgone', txHash: '0xindexer-gone' });
         expect(jobs['job-chain-failed']).toMatchObject({
-            status: 'reconciliation_required', chainStatus: 'pending', errorCode: null, errorMessage: null, finishedAt: null, chainBlockHeight: null
+            status: 'reconciliation_required', chainStatus: 'pending', errorCode: null, errorMessage: null, finishedAt: null, blockHeight: null
         });
         expect(jobs['job-unconfirmed']).toMatchObject({ status: 'succeeded', chainStatus: 'pending' });
         expect(jobs['job-other-failure']).toMatchObject({ status: 'failed', errorCode: 'TIMEOUT' });
@@ -124,7 +124,7 @@ describe('rollbackIndexedDataFromHeight: submission evidence', () => {
 
     it('reverts confirmed evidence at the height even when no local block is indexed there (crawler off, manual reindex)', async () => {
         await seedSubmission('sub-x', '00idx', 'finalized', 12);
-        await seedJob('job-x', { txHash: '00idx', chainBlockHeight: 12 });
+        await seedJob('job-x', { txId: '00idx', blockHeight: 12 });
         const result = await db.tx((tx: any) => rollbackIndexedDataFromHeight(tx, 10, { syncStatus: 'stopped' }));
         expect(result).toMatchObject({ blocksRolledBack: 0, submissionsReverted: 1, jobsReverted: 1 });
         expect((await db.run(cds.ql.SELECT.one.from(JOBS).where({ ID: 'job-x' }))).chainStatus).toBe('pending');
@@ -164,7 +164,7 @@ describe('rollbackIndexedDataFromHeight: submission evidence', () => {
             ID: cds.utils.uuid(), hash: `0xb${i}`, height: 10 + i, protocolVersion: 1, timestamp: 1_700_000_000 + i, stateRoot: '0xabcd'
         }));
         const txs = blocks.map((b, i) => ({
-            ID: cds.utils.uuid(), transactionId: 0, hash: `0xt${i}`, protocolVersion: 1, transactionType: 'Regular', block_ID: b.ID
+            ID: cds.utils.uuid(), blockHeight: b.height, indexInBlock: 0, extrinsicHash: `0xt${i}`, protocolVersion: 1, transactionType: 'Regular', block_ID: b.ID
         }));
         await db.run(cds.ql.INSERT.into(BLOCKS).entries(blocks));
         await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries(txs));
@@ -172,7 +172,7 @@ describe('rollbackIndexedDataFromHeight: submission evidence', () => {
         const utxo = { owner: 'addr', tokenType: '00', value: '1', outputIndex: 0, initialNonce: '00' };
         // Created below the fork, spent in the last chunk: survives unspent.
         await db.run(cds.ql.INSERT.into('midnight.UnshieldedUtxos').entries({
-            ID: 'u-keep', ...utxo, intentHash: 'aa', createdAtTransaction_ID: survivor, spentAtTransaction_ID: txs[count - 1].ID
+            ID: 'u-keep', ...(await inTransaction(db, survivor)), ...utxo, intentHash: 'aa', createdAtTransaction_ID: survivor, spentAtTransaction_ID: txs[count - 1].ID
         }));
 
         const result = await db.tx((tx: any) => rollbackIndexedDataFromHeight(tx, 10, { syncStatus: 'stopped' }));

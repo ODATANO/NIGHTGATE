@@ -22,7 +22,7 @@ vi.mock('@sap/cds', () => {
         connect: { to: mockDbConnect },
         env: {
             requires: {
-                nightgate: { network: 'testnet', nodeUrl: 'ws://localhost:9944' }
+                nightgate: { network: 'undeployed', nodeUrl: 'ws://localhost:9944' }
             }
         },
         ql: {
@@ -46,6 +46,7 @@ vi.mock('@sap/cds', () => {
         },
         ApplicationService: class {
             before() { /* the hex input hook; its own tests boot the services */ }
+            after() { /* the 64-bit result form; its own tests boot the services */ }
             on(event: string, handler: Function) {
                 registeredHandlers[event] = handler;
             }
@@ -67,37 +68,6 @@ describe('IndexerService SyncState', () => {
         Object.keys(registeredHandlers).forEach(k => delete registeredHandlers[k]);
     });
 
-    it('should create SyncState row at init when missing', async () => {
-        // First call (SELECT): returns null (no existing row)
-        // Second call (INSERT): succeeds
-        mockDbRun
-            .mockResolvedValueOnce(null)    // SELECT.one → null
-            .mockResolvedValueOnce(undefined); // INSERT → ok
-
-        service = new NightgateIndexerService();
-        await service.init();
-
-        // First DB call should be the SELECT check
-        expect(mockDbRun).toHaveBeenCalledTimes(2);
-    });
-
-    it('should not overwrite existing SyncState at init', async () => {
-        // SELECT returns an existing, network-bound row (a null networkId
-        // would trigger the legacy backfill/guard instead).
-        mockDbRun.mockResolvedValueOnce({
-            ID: 'SINGLETON',
-            networkId: 'testnet',
-            syncStatus: 'syncing',
-            lastIndexedHeight: 500
-        });
-
-        service = new NightgateIndexerService();
-        await service.init();
-
-        // Only 1 DB call (the SELECT), no INSERT
-        expect(mockDbRun).toHaveBeenCalledTimes(1);
-    });
-
     it('should handle DB error during SyncState init gracefully', async () => {
         mockDbRun.mockRejectedValueOnce(new Error('table not found'));
         const warnSpy = vi.spyOn(cds.log('nightgate:indexer'), 'warn').mockImplementation(() => {});
@@ -109,28 +79,5 @@ describe('IndexerService SyncState', () => {
             expect.stringContaining('SyncState init skipped'),
             expect.any(String)
         );
-    });
-
-    it('getSyncStatus should return defaults when SyncState is null', async () => {
-        // Init with existing SyncState
-        mockDbRun.mockResolvedValueOnce({ ID: 'SINGLETON' });
-
-        service = new NightgateIndexerService();
-        await service.init();
-
-        // Now call getSyncStatus handler with null DB result
-        const handler = registeredHandlers['getSyncStatus'];
-        expect(handler).toBeDefined();
-
-        mockDbRun.mockResolvedValueOnce(null); // getSyncStatus SELECT returns null
-        const result = await handler();
-
-        expect(result).toEqual(expect.objectContaining({
-            ID: 'SINGLETON',
-            syncStatus: 'stopped',
-            lastIndexedHeight: 0,
-            chainHeight: 0,
-            consecutiveErrors: 0
-        }));
     });
 });

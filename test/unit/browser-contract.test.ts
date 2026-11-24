@@ -42,7 +42,7 @@ class Counter { }
 const MANIFEST = { contracts: [{ name: 'counter', zkConfigBaseUrl: 'http://api/zk-config/counter', circuits: ['increment', 'reset'] }] };
 const ADDRESS = 'aa'.repeat(32);
 const LANDED = { txId: 'id-1', txHash: '0xhash', blockHeight: 12, status: 'SucceedEntirely' };
-const RESULT = { txHash: 'id-1', transactionHash: '0xhash', blockHeight: 12 };
+const RESULT = { txId: 'id-1', txHash: '0xhash', blockHeight: 12 };
 
 function connector(extra: Record<string, unknown> = {}): any {
     return {
@@ -53,7 +53,7 @@ function connector(extra: Record<string, unknown> = {}): any {
 }
 
 const connect = (opts: Record<string, unknown> = {}) => connectContract({
-    connector: connector(), manifest: MANIFEST, contract: 'counter', contractClass: Counter, contractAddress: ADDRESS, webSocket: class { }, ...opts
+    connector: connector(), manifest: MANIFEST, contractName: 'counter', contractClass: Counter, contractAddress: ADDRESS, webSocket: class { }, ...opts
 } as any);
 
 /** A found contract whose circuits record their arguments and answer `LANDED`. */
@@ -70,10 +70,11 @@ function foundWith(...circuits: string[]) {
 describe('connectContract', () => {
     it('names what is missing', async () => {
         await expect(connectContract({} as any)).rejects.toThrow(/connector is required/);
-        await expect(connectContract({ connector: connector() } as any)).rejects.toThrow(/contract is required/);
-        await expect(connectContract({ connector: connector(), contract: 'counter' } as any)).rejects.toThrow(/contractClass is required/);
+        await expect(connectContract({ connector: connector() } as any)).rejects.toThrow(/contractName is required/);
+        await expect(connectContract({ connector: connector(), contractName: 'counter' } as any)).rejects.toThrow(/contractClass is required/);
         await expect(connect({ manifest: undefined })).rejects.toThrow(/manifest or manifestUrl is required/);
-        await expect(connect({ ttlMinutes: 0 })).rejects.toThrow(/ttlMinutes must be a positive whole number/);
+        await expect(connect({ ttlMinutes: 0 })).rejects.toThrow('connectContract: ttlMinutes must be a positive number (got 0)');
+        await expect(connect({ ttlMinutes: 'soon' })).rejects.toThrow('connectContract: ttlMinutes must be a positive number (got soon)');
     });
 
     it('refuses at once when nothing can prove, and names both ways out', async () => {
@@ -247,7 +248,7 @@ describe('batch', () => {
         const counter = await connect();
 
         await expect(counter.batch([{ circuitId: 'increment' }, { circuitId: 'reset' }])).rejects.toMatchObject({
-            code: 'BatchCausalityViolation',
+            code: 'BATCH_CAUSALITY_VIOLATION',
             calls: [{ name: 'increment', segId: 3, stages: 'f' }, { name: 'reset', segId: 7, stages: 'g' }]
         });
     });
@@ -256,6 +257,6 @@ describe('batch', () => {
         foundWith('increment', 'reset');
         sdk.withContractScopedTransaction.mockRejectedValue(new Error('batch [increment+reset] runs out of gas on the ledger: OutOfGas'));
         const counter = await connect();
-        await expect(counter.batch([{ circuitId: 'increment' }, { circuitId: 'reset' }])).rejects.toMatchObject({ code: 'BatchGasBudgetExceeded' });
+        await expect(counter.batch([{ circuitId: 'increment' }, { circuitId: 'reset' }])).rejects.toMatchObject({ code: 'BATCH_GAS_BUDGET_EXCEEDED' });
     });
 });

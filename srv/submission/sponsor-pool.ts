@@ -52,7 +52,7 @@ export function pickFreeSponsor(poolIds: string[], now: number = Date.now(), atG
 }
 
 export async function acquireSponsor(poolIds: string[], waitMs: number, atGate?: SponsorAtGate): Promise<string> {
-    if (poolIds.length === 0) throw new Error('sponsor pool is empty (NIGHTGATE_FEE_SPONSOR_SESSION)');
+    if (poolIds.length === 0) throw new Error('sponsor pool is empty (NIGHTGATE_FEE_SPONSOR_SESSIONS)');
     const deadline = Date.now() + waitMs;
     for (;;) {
         const id = pickFreeSponsor(poolIds, Date.now(), atGate);
@@ -85,20 +85,9 @@ export function benchSponsor(id: string, cooldownMs: number): void {
  */
 export function isRetryableSponsorFailure(err: unknown): boolean {
     const coded = findNightgateError(err)?.code;
-    if (coded === 'WALLET_NOT_SYNCED' || coded === 'FEE_SPONSOR_UNUSABLE') return true;
-    const e = err as { name?: unknown; message?: unknown } | null | undefined;
-    if (e?.name === 'FeeSponsorError') return true;
+    if (coded === 'WALLET_NOT_SYNCED' || coded === 'FEE_SPONSOR_UNUSABLE' || coded === 'SPONSOR_DUST_UNAVAILABLE') return true;
     const info = classifySubmitFailure(err);
-    if (info.code === 'dust-race') return info.ledgerCode !== 'pool-invalid';
-    if (info.code !== 'internal') return false;
-    // These failures arrive from the worker without an error code, so match the message text.
-    const msg = String(e?.message ?? err ?? '');
-    return /genuine(ly)? sync|not caught up|sync.*(timeout|timed out|stalled)|not synced to tip|No facade for sponsorSessionId|dust.*(stale|validity)|WALLET_SYNCING|Sponsor session|no free dust backing/i.test(msg);
-}
-
-/** A short-lived dust conflict. Rebuild with the same sponsor. */
-export function isDustRaceFailure(err: unknown): boolean {
-    return classifySubmitFailure(err).code === 'dust-race';
+    return info.code === 'dust-race' && info.ledgerCode !== 'pool-invalid';
 }
 
 /** The tx is in a block but its contract call failed. Final: only the caller can build a new one. */
@@ -113,19 +102,6 @@ export function isPreInclusionReject(err: unknown): boolean {
     // The request never left the client.
     return info.code === 'transport'
         && (info.ledgerCode === 'closing-socket' || info.ledgerCode === 'not-sent' || info.ledgerCode === 'wallet-not-synced');
-}
-
-/** The tx may still land, so never rebuild or the fee could be paid twice. The job goes to reconciliation_required. */
-export function isAmbiguousSubmitOutcome(err: unknown): boolean {
-    return classifySubmitFailure(err).code === 'ambiguous';
-}
-
-/**
- * The node rejected the tx without a reason, which looks the same as an invalid caller tx. Each retry costs the sponsor a dust proof, so it gets at most one rebuild.
- */
-export function isGenericInvalidFailure(err: unknown): boolean {
-    const info = classifySubmitFailure(err);
-    return info.code === 'dust-race' && info.ledgerCode === 'pool-invalid';
 }
 
 /** What to do after a failed sponsoring attempt. Used for both bound and unbound transactions. */

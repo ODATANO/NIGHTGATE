@@ -1,4 +1,4 @@
-// In-memory map from a contract name (`compiledArtifactRef`) to its compiled module, `privateStateId` and `zkConfigPath`.
+// In-memory map from a contract name to its compiled module, `privateStateId` and `zkConfigPath`.
 // Filled from `cds.requires.nightgate.contracts`. A generation digest identifies the exact build behind a name: module, keys and settings.
 
 import type { NightgateConfig } from '../utils/nightgate-config';
@@ -6,7 +6,6 @@ import cds from '@sap/cds';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { pathToFileURL } from 'url';
 import { computeArtifactGenerationDigest } from './artifact-digest';
 import { resolveContractPackage, contractPackageDigestProblem, type ZkAssetLayout } from '@odatano/contract-kit/node';
 import { versionString as compactRuntimeVersion } from '@midnight-ntwrk/compact-runtime';
@@ -39,6 +38,10 @@ export interface ContractRegistration {
 export interface ContractPackageRef {
     name: string;
     version: string;
+    /** The contract's name in the package's contract.json, such as `attestation-vault`. */
+    lineage: string;
+    /** The digest the package's contract.json states for its build. */
+    digest: string;
     zkAssetUrl?: string;
     zkAssetLayout?: ZkAssetLayout;
 }
@@ -61,6 +64,17 @@ export interface ResolvedContract {
     /** The worker imports the module again from this path, because compiledContract cannot be sent to another thread. */
     artifactPath: string;
     artifactDigest: string;
+    /** The contract package this build is, by digest; absent for any other build. Only such a build gets the witnesses that carry a caller's secret. */
+    witnessLineage?: string;
+}
+
+/** What the worker gets of a resolved contract. */
+export function workerRegistration(resolved: ResolvedContract) {
+    return {
+        artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath,
+        ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}),
+        ...(resolved.witnessLineage !== undefined ? { witnessLineage: resolved.witnessLineage } : {})
+    };
 }
 
 const registry = new Map<string, ContractRegistration>();
@@ -206,10 +220,37 @@ export function registrationFromPackage(packageName: string, baseDir = process.c
         package: {
             name: pkg.name,
             version: pkg.version,
+            lineage: pkg.manifest.name,
+            digest: pkg.manifest.digest,
             zkAssetUrl: pkg.manifest.zkAssetUrl,
             zkAssetLayout: pkg.manifest.zkAssetLayout
         }
     };
+}
+
+const witnessLineageField = (lineage: string | undefined): { witnessLineage?: string } => (lineage ? { witnessLineage: lineage } : {});
+
+let installedLineages: Map<string, string> | undefined;
+
+/** Digest to contract name, for the contract packages this server depends on. */
+function installedPackageLineages(): Map<string, string> {
+    if (installedLineages) return installedLineages;
+    const found = new Map<string, string>();
+    const dependencies: Record<string, string> = JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, 'package.json'), 'utf8')).dependencies ?? {};
+    for (const name of Object.keys(dependencies).filter(n => n.startsWith('@odatano/contract-') && n !== '@odatano/contract-kit')) {
+        try {
+            const pkg = resolveContractPackage(name, PACKAGE_ROOT);
+            if (!contractPackageDigestProblem(pkg)) found.set(pkg.manifest.digest, pkg.manifest.name);
+        } catch { /* not installed, so no build can be this package */ }
+    }
+    installedLineages = found;
+    return found;
+}
+
+/** The contract package a build is: the one whose contract.json states the build's digest. The name it is registered under does not count. */
+export function lineageOfBuild(reg: Pick<ContractRegistration, 'package'>, digest: string): string | undefined {
+    if (reg.package && reg.package.digest === digest) return reg.package.lineage;
+    return installedPackageLineages().get(digest);
 }
 
 /** An entry is either `{ package }` or `{ artifactPath, privateStateId, zkConfigPath, slotWidth? }`. */
@@ -252,7 +293,7 @@ function warnOnMissingProverKeys(name: string, zkConfigPath: string): void {
     cds.log('nightgate').info(
         `contract '${name}' has no prover keys for ${missing.length} circuit(s) ` +
         `(${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', …' : ''}); they are fetched on first need ` +
-        `(${ZK_ASSET_URL_ENV}, verified against keys/manifest.json). Offline: "npx nightgate-fetch-keys ${name}" ` +
+        `(${ZK_ASSET_URL_ENV}, verified against keys/manifest.json). Offline: "node scripts/fetch-contract-keys.mjs ${name}" ` +
         `puts them under ${path.join(zkConfigPath, 'keys')}; no restart needed, the digest does not change.`);
 }
 
@@ -306,7 +347,8 @@ export async function resolveContract(name: string, expectedDigest?: string, opt
         zkConfigPath: reg.zkConfigPath,
         artifactPath: reg.artifactPath,
         artifactDigest: digest,
-        ...(reg.slotWidth !== undefined ? { slotWidth: reg.slotWidth } : {})
+        ...(reg.slotWidth !== undefined ? { slotWidth: reg.slotWidth } : {}),
+        ...witnessLineageField(lineageOfBuild(reg, digest))
     };
 }
 
@@ -326,14 +368,6 @@ export async function importRegisteredArtifact(name: string): Promise<ArtifactEx
     const reg = registry.get(name);
     if (!reg) throw new ContractNotRegisteredError(name, listRegisteredContracts());
     return importArtifactGeneration(reg.artifactPath, getArtifactGenerationDigest(name)) as Promise<ArtifactExports>;
-}
-
-export async function importArtifactByPath(artifactPath: string): Promise<ArtifactExports> {
-    const wanted = path.resolve(artifactPath);
-    for (const [name, reg] of registry) {
-        if (path.resolve(reg.artifactPath) === wanted) return importRegisteredArtifact(name);
-    }
-    return import(path.isAbsolute(artifactPath) ? pathToFileURL(artifactPath).href : artifactPath);
 }
 
 export class ContractNotRegisteredError extends NightgateError {

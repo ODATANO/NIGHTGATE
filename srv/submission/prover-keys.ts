@@ -104,7 +104,7 @@ async function ensureProverKeysNow(
     if (!source) {
         throw new ProverKeysUnavailableError(
             `contract '${name}' has no prover keys for ${missing.join(', ')} and no source to fetch them from: ` +
-            `set ${ZK_ASSET_URL_ENV} to a /zk-config base that serves them, or run "npx nightgate-fetch-keys ${name}" once`,
+            `set ${ZK_ASSET_URL_ENV} to a /zk-config base that serves them, or run "node scripts/fetch-contract-keys.mjs ${name}" once`,
             name, missing, false);
     }
     const keysDir = path.join(zkConfigPath, 'keys');

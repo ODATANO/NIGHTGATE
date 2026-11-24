@@ -24,7 +24,7 @@ export interface ContractEvent {
 export interface ExtrinsicEvents {
     outcome?: 'SUCCESS' | 'FAILURE';
     /** Hash of the ledger transaction, not the extrinsic hash. The Midnight indexer identifies transactions by it. */
-    ledgerTxHash?: string;
+    txHash?: string;
     applied: boolean;
     /** True on `TxPartialSuccess`: the transaction was applied, but not every part succeeded. */
     partialSuccess: boolean;
@@ -104,7 +104,7 @@ export function readBlockEvents(records: Iterable<EventRecord>): Map<number, Ext
         const payload: Record<string, unknown> = typeof first === 'object' && !Array.isArray(first) ? { ...first } : {};
 
         const txHash = bareHex(payload.txHash);
-        if (txHash) at(index).ledgerTxHash = txHash;
+        if (txHash) at(index).txHash = txHash;
 
         if (method === 'UnshieldedTokens') {
             const entry = at(index);

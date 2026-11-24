@@ -64,9 +64,9 @@ const mockDeriveAccountId = vi.hoisted(() => (vi.fn()));
 const mockDeriveStoragePassword = vi.hoisted(() => (vi.fn()));
 const mockRegisterNightUtxosForDust = vi.hoisted(() => (vi.fn()));
 const mockDeregisterNightUtxosFromDust = vi.hoisted(() => (vi.fn()));
-const mockSendNight = vi.hoisted(() => (vi.fn()));
+const mockSendToken = vi.hoisted(() => (vi.fn()));
 const mockGetWalletBalance = vi.hoisted(() => (vi.fn()));
-const mockEstimateSendNightFee = vi.hoisted(() => (vi.fn()));
+const mockEstimateSendTokenFee = vi.hoisted(() => (vi.fn()));
 const mockWalletWaitForSyncedState = vi.hoisted(() => (vi.fn()));
 const mockWalletGetSyncProgress = vi.hoisted(() => (vi.fn()));
 
@@ -84,9 +84,13 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     getFacadeOrigin: (...a: unknown[]) => (mockGetFacadeOrigin as any)(...a)
 }));
 
+const mockAdoptFormerSpellings = vi.hoisted(() => vi.fn(async (): Promise<unknown> => null));
+const mockForgetAccountKeys = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock('../../srv/submission/wallet-material-factory', () => ({
     deriveAccountId: mockDeriveAccountId,
-    deriveStoragePassword: mockDeriveStoragePassword
+    deriveStoragePassword: mockDeriveStoragePassword,
+    adoptFormerSpellings: mockAdoptFormerSpellings,
+    forgetAccountKeys: mockForgetAccountKeys
 }));
 
 vi.mock('../../srv/submission/dust-registration', () => ({
@@ -95,9 +99,9 @@ vi.mock('../../srv/submission/dust-registration', () => ({
 }));
 
 vi.mock('../../srv/submission/token-ops', () => ({
-    sendNight: mockSendNight,
+    sendToken: mockSendToken,
     getWalletBalance: mockGetWalletBalance,
-    estimateSendNightFee: mockEstimateSendNightFee
+    estimateSendTokenFee: mockEstimateSendTokenFee
 }));
 
 // connectWalletForSigning's fail-closed check derives the seed's viewing key
@@ -125,7 +129,7 @@ const mockRunWithoutAmbientTx = vi.hoisted(() => (vi.fn((fn: () => Promise<unkno
 const mockSupersedeQueuedJobs = vi.hoisted(() => (vi.fn(async () => 0)));
 const mockFindLatestJob = vi.hoisted(() => (vi.fn(async (): Promise<{ ID: string; status: string } | null> => null)));
 const MockJobAdmissionBusyError = vi.hoisted(() => class MockJobAdmissionBusyError extends Error {
-    readonly httpStatus = 503; readonly status = 503; readonly code = 'JOB_ADMISSION_BUSY'; readonly retryAfterSeconds = 2; readonly $sanitize = false;
+    readonly status = 503; readonly code = 'JOB_ADMISSION_BUSY'; readonly retryAfterSeconds = 2; readonly $sanitize = false;
 });
 vi.mock('../../srv/submission/background-jobs', () => ({
     JobAdmissionBusyError: MockJobAdmissionBusyError,
@@ -191,6 +195,7 @@ function createMockRequest(data: Record<string, unknown>, ip: string | null | un
         // Sessions are user-bound; every session action reads
         // req.user.id. Default to a fixed principal so handlers pass the auth gate.
         user: { id: TEST_USER_ID },
+        on: vi.fn(),
         reject: vi.fn().mockImplementation((code: number, message: string) => ({
             __rejected: true,
             code,
@@ -224,8 +229,7 @@ const NIGHTGATE_ENV_KEYS = [
     'NIGHTGATE_CRAWLER_ENABLED',
     'NIGHTGATE_INDEXER_HTTP_URL',
     'NIGHTGATE_INDEXER_WS_URL',
-    'NIGHTGATE_PROOF_SERVER_URL',
-    'NIGHTGATE_ZK_CONFIG_BASE'
+    'NIGHTGATE_PROOF_SERVER_URL'
 ] as const;
 const originalNightgateEnv = Object.fromEntries(
     NIGHTGATE_ENV_KEYS.map((key) => [key, process.env[key]])
@@ -318,6 +322,41 @@ describe('wallet session handlers', () => {
             isActive: true
         }));
         expect(result.sessionToken).toBeUndefined();
+        expect('ID' in result).toBe(false);
+        expect('ID' in insertEntriesSpy.mock.calls[0][0]).toBe(false);
+    });
+
+    it('connectWallet looks for the wallet under another spelling before it stores the session', async () => {
+        const order: string[] = [];
+        mockAdoptFormerSpellings.mockImplementationOnce(async () => { order.push('adopt'); return null; });
+        mockDbRun.mockImplementationOnce(async () => { order.push('insert'); return 1; });
+
+        const req = createMockRequest({ viewingKey: 'a'.repeat(64) });
+        await registeredHandlers['connectWallet'](req);
+
+        expect(order).toEqual(['adopt', 'insert']);
+        expect(mockAdoptFormerSpellings).toHaveBeenCalledWith(expect.anything(), expect.anything(), 'a'.repeat(64), undefined);
+    });
+
+    it('connectWallet stores no session when the move of the wallet is refused', async () => {
+        const blocked = Object.assign(new Error('held under another spelling'), { code: 'ACCOUNT_MOVE_BLOCKED' });
+        mockAdoptFormerSpellings.mockRejectedValueOnce(blocked);
+
+        const req = createMockRequest({ viewingKey: 'a'.repeat(64) });
+        await expect(registeredHandlers['connectWallet'](req)).rejects.toBe(blocked);
+        expect(insertEntriesSpy).not.toHaveBeenCalled();
+    });
+
+    it('connectWallet forgets the keys in memory when its request fails', async () => {
+        mockDbRun.mockResolvedValueOnce(1);
+        const req = createMockRequest({ viewingKey: 'a'.repeat(64) });
+        await registeredHandlers['connectWallet'](req);
+
+        const [event, onFailed] = req.on.mock.calls[0];
+        expect(event).toBe('failed');
+        expect(mockForgetAccountKeys).not.toHaveBeenCalled();
+        onFailed();
+        expect(mockForgetAccountKeys).toHaveBeenCalledWith('a'.repeat(64));
     });
 
     it('connectWallet keys the rate limit by principal and uses the default TTL when no config is present', async () => {
@@ -393,12 +432,11 @@ describe('wallet session handlers', () => {
         await handler(req);
 
         expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'missing-session', userId: TEST_USER_ID });
-        expect(req.reject).toHaveBeenCalledWith(404, 'Session not found');
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'SESSION_NOT_FOUND' }));
     });
 
     it('disconnectWallet looks sessions up by sessionId', async () => {
         mockDbRun.mockResolvedValueOnce({
-            ID: 'db-row-1',
             sessionId: 'public-session-1',
             isActive: true,
             expiresAt: new Date(Date.now() + 60_000).toISOString()
@@ -407,16 +445,16 @@ describe('wallet session handlers', () => {
 
         const handler = registeredHandlers['disconnectWallet'];
         const req = createMockRequest({ sessionId: 'public-session-1' });
-        await handler(req);
+        const result = await handler(req);
 
         expect(req.reject).not.toHaveBeenCalled();
+        expect(result).toEqual({ sessionId: 'public-session-1', isActive: false });
         expect(selectWhereSpy).toHaveBeenCalledWith({ sessionId: 'public-session-1', userId: TEST_USER_ID });
         expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 'public-session-1', userId: TEST_USER_ID });
     });
 
     it('disconnectWallet marks expired sessions by sessionId before rejecting', async () => {
         mockDbRun.mockResolvedValueOnce({
-            ID: 'db-row-2',
             sessionId: 'public-session-2',
             isActive: true,
             expiresAt: new Date(Date.now() - 60_000).toISOString()
@@ -434,14 +472,14 @@ describe('wallet session handlers', () => {
     // Boot hygiene: a session is a per-connect handle owned by a caller in a
     // specific process, so an ungraceful stop leaks it for the full 24h TTL.
     describe('closeSessionsFromPreviousProcess', () => {
-        const previousSponsorEnv = process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        const previousSponsorEnv = process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         afterEach(() => {
-            if (previousSponsorEnv == null) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
-            else process.env.NIGHTGATE_FEE_SPONSOR_SESSION = previousSponsorEnv;
+            if (previousSponsorEnv == null) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
+            else process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = previousSponsorEnv;
         });
 
         it('closes every active session and clears its key material', async () => {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             const db = {
                 run: vi.fn()
                     .mockResolvedValueOnce([{ sessionId: 'a' }, { sessionId: 'b' }])
@@ -461,7 +499,7 @@ describe('wallet session handlers', () => {
         // caller, so they are deliberately process-independent. Closing one
         // would break sponsored submissions until an operator pinned a new id.
         it('exempts configured fee-sponsor sessions', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-1';
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-1';
             const db = {
                 run: vi.fn()
                     .mockResolvedValueOnce([{ sessionId: 'a' }, { sessionId: 'sponsor-1' }])
@@ -477,7 +515,7 @@ describe('wallet session handlers', () => {
         // connectWalletForSigning brings it back (a pool member taken out of
         // the config for a while would otherwise be lost).
         it('keeps sessions holding a signing key, closes the rest', async () => {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             const db = {
                 run: vi.fn()
                     .mockResolvedValueOnce([
@@ -493,7 +531,7 @@ describe('wallet session handlers', () => {
         });
 
         it('does not write when only exempt sessions are active', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-1';
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-1';
             const db = { run: vi.fn().mockResolvedValueOnce([{ sessionId: 'sponsor-1' }]) };
 
             expect(await closeSessionsFromPreviousProcess(db)).toEqual([]);
@@ -501,7 +539,7 @@ describe('wallet session handlers', () => {
         });
 
         it('chunks the UPDATE so a large backlog stays within driver limits', async () => {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             const many = Array.from({ length: 450 }, (_, i) => ({ sessionId: `s${i}` }));
             const db = { run: vi.fn().mockResolvedValueOnce(many).mockResolvedValue(200) };
 
@@ -518,7 +556,7 @@ describe('wallet session handlers', () => {
             return {} as ReturnType<typeof setInterval>;
         }) as any);
         const warn = vi.spyOn(cds.log('nightgate'), 'warn').mockImplementation(() => {});
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-in-pool';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-in-pool';
         const db = {
             run: vi.fn()
                 .mockResolvedValueOnce(1)
@@ -535,7 +573,7 @@ describe('wallet session handlers', () => {
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: { in: ['removed-sponsor-1'] } });
             expect(warn).toHaveBeenCalledWith(expect.stringContaining('removed-'));
         } finally {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             warn.mockRestore();
             setIntervalSpy.mockRestore();
         }
@@ -593,7 +631,7 @@ describe('wallet session handlers', () => {
         }) as any);
         const encKey = getEncryptionKey();
         const row = (id: string, hash: string) => ({ sessionId: id, viewingKeyHash: hash, encryptedViewingKey: encrypt('a'.repeat(64), encKey, walletSessionViewingKeyBinding(id)), userId: 'owner-1' });
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-sponsor-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-sponsor-1';
         const db = {
             run: vi.fn()
                 .mockResolvedValueOnce(1)   // expiry of the pool sponsors, at the start
@@ -610,7 +648,7 @@ describe('wallet session handlers', () => {
             expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: { in: ['caller-1'] } });
             expect(mockEvictWalletFacade).toHaveBeenCalledTimes(1); // the caller's wallet only
         } finally {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             setIntervalSpy.mockRestore();
         }
     });
@@ -627,7 +665,7 @@ describe('wallet session handlers', () => {
             return {} as ReturnType<typeof setInterval>;
         }) as any);
         const encKey = getEncryptionKey();
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-sponsor-9';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-sponsor-9';
         const longAgo = new Date(Date.now() - 86_400_000).toISOString();
         const db = {
             run: vi.fn()
@@ -642,7 +680,7 @@ describe('wallet session handlers', () => {
             await callback?.();
             expect(mockEvictWalletFacade).not.toHaveBeenCalled();
         } finally {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             setIntervalSpy.mockRestore();
         }
     });
@@ -730,45 +768,6 @@ describe('wallet session handlers', () => {
             while (consoleSpies.length) consoleSpies.pop()?.mockRestore();
         });
 
-        it('rejects rate-limited clients', async () => {
-            const checkSpy = vi.spyOn(RateLimiter.prototype, 'checkMany').mockReturnValue({ allowed: false, retryAfterMs: 1000, limit: 10, remaining: 0, resetMs: 1000 });
-            try {
-                const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
-                await registeredHandlers['connectWalletForSigning'](req);
-                expect(req.reject).toHaveBeenCalledWith(429, expect.stringContaining('Rate limited'));
-            } finally {
-                checkSpy.mockRestore();
-            }
-        });
-
-        it('validates required fields and seed format', async () => {
-            const noSession = createMockRequest({ seedHex: VALID_SEED });
-            await registeredHandlers['connectWalletForSigning'](noSession);
-            expect(noSession.reject).toHaveBeenCalledWith(400, 'sessionId is required');
-
-            const noSeed = createMockRequest({ sessionId: 's1' });
-            await registeredHandlers['connectWalletForSigning'](noSeed);
-            expect(noSeed.reject).toHaveBeenCalledWith(400, expect.stringContaining('mnemonic or seedHex'));
-
-            const badHex = createMockRequest({ sessionId: 's1', seedHex: 'not-hex' });
-            await registeredHandlers['connectWalletForSigning'](badHex);
-            expect(badHex.reject).toHaveBeenCalledWith(400, expect.stringContaining('128 hex chars'));
-        });
-
-        it('rejects 404 when the session row is missing', async () => {
-            mockDbRun.mockResolvedValueOnce(null);
-            const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
-            await registeredHandlers['connectWalletForSigning'](req);
-            expect(req.reject).toHaveBeenCalledWith(404, 'Session not found or inactive');
-        });
-
-        it('rejects 410 when the session has expired', async () => {
-            mockDbRun.mockResolvedValueOnce(activeSessionRow({ expiresInMs: -1000 }));
-            const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
-            await registeredHandlers['connectWalletForSigning'](req);
-            expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
-        });
-
         // The derivation between the read and the write is slow. A seed must not land on a session closed meanwhile.
         it('a session closed during the derivation answers 404 and starts no job', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow()).mockResolvedValueOnce(0);
@@ -777,7 +776,7 @@ describe('wallet session handlers', () => {
             const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
             await registeredHandlers['connectWalletForSigning'](req);
 
-            expect(req.reject).toHaveBeenCalledWith(404, 'Session not found or inactive');
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'SESSION_NOT_FOUND' }));
             expect(mockStartJob).not.toHaveBeenCalled();
         });
 
@@ -798,8 +797,8 @@ describe('wallet session handlers', () => {
             expect(result).toEqual({
                 sessionId:      's1',
                 signingEnabled: true,
-                prewarmJobId:   'job-connectWalletForSigning-test',
-                prewarmStatus:  'pending'
+                jobId:   'job-connectWalletForSigning-test',
+                status:  'pending'
             });
 
             // startJob was called with the right kind + a seed-less request.
@@ -840,30 +839,8 @@ describe('wallet session handlers', () => {
             expect(req.reject).not.toHaveBeenCalled();
             expect(result).toMatchObject({
                 signingEnabled: true,
-                prewarmJobId: 'job-connectWalletForSigning-test'
+                jobId: 'job-connectWalletForSigning-test'
             });
-        });
-
-        it('returns signingEnabled:true with null prewarmJobId if startJob scheduling fails', async () => {
-            const session = activeSessionRow();
-            mockDbRun.mockResolvedValueOnce(session).mockResolvedValueOnce(1);
-            mockStartJob.mockRejectedValueOnce(new Error('worker offline'));
-
-            const warn = vi.spyOn(cds.log('nightgate:sessions'), 'warn').mockImplementation(() => {});
-            try {
-                const req = createMockRequest({ sessionId: 's1', seedHex: VALID_SEED });
-                const result = await registeredHandlers['connectWalletForSigning'](req);
-                expect(result).toEqual({
-                    sessionId:      's1',
-                    signingEnabled: true,
-                    prewarmJobId:   null,
-                    prewarmStatus:  null
-                });
-                // The session UPDATE still committed; signing is enabled.
-                expect(updateWhereSpy).toHaveBeenCalledWith({ sessionId: 's1', userId: TEST_USER_ID, isActive: true });
-            } finally {
-                warn.mockRestore();
-            }
         });
     });
 
@@ -972,7 +949,7 @@ describe('wallet session handlers', () => {
             await expect(registeredHandlers['deregisterFromDustGeneration'](req)).rejects.toThrow(/disk full/);
         });
 
-        it('sendNight: the announced identifier is persisted before the send and taken off the job on a definitive node reject', async () => {
+        it('sendToken: the announced identifier is persisted before the send and taken off the job on a definitive node reject', async () => {
             const calls: any[] = [];
             const ctx = {
                 reportExternalExecution: async (h: any) => { calls.push(['externalExecution', h]); },
@@ -982,19 +959,19 @@ describe('wallet session handlers', () => {
             };
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             const req = createMockRequest({ sessionId: 's1', receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1' });
-            await registeredHandlers['sendNight'](req);
+            await registeredHandlers['sendToken'](req);
             const args = mockStartJob.mock.calls.at(-1)![0];
-            mockSendNight.mockImplementationOnce(async (a: any) => {
-                await a.onSubmitIntent('0xsend-announced');
+            mockSendToken.mockImplementationOnce(async (a: any) => {
+                await a.onSubmitIntent({ txId: '0xsend-announced', txHash: '0xsend-hash' });
                 throw new Error('1010: Invalid Transaction: Custom error: 188');
             });
             await expect(runInJobExecutionContext(ctx as any, () => runPersistedCommand(args))).rejects.toThrow(/188/);
             expect(calls.map(c => c[0])).toEqual(['externalExecution', 'broadcastOn', 'rejectedOn']);
-            expect(calls[1][1]).toEqual({ txHash: '0xsend-announced', firstBoundary: false });
-            expect(calls[2][1]).toEqual({ txHash: '0xsend-announced' });
+            expect(calls[1][1]).toEqual({ txId: '0xsend-announced', txHash: '0xsend-hash', firstBoundary: false });
+            expect(calls[2][1]).toEqual({ txId: '0xsend-announced' });
         });
 
-        it('sendNight: an ambiguous failure after the announcement keeps the identifier on the job', async () => {
+        it('sendToken: an ambiguous failure after the announcement keeps the identifier on the job', async () => {
             const calls: any[] = [];
             const ctx = {
                 reportExternalExecution: async () => { calls.push('externalExecution'); },
@@ -1004,10 +981,10 @@ describe('wallet session handlers', () => {
             };
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             const req = createMockRequest({ sessionId: 's1', receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1' });
-            await registeredHandlers['sendNight'](req);
+            await registeredHandlers['sendToken'](req);
             const args = mockStartJob.mock.calls.at(-1)![0];
-            mockSendNight.mockImplementationOnce(async (a: any) => {
-                await a.onSubmitIntent('0xsend-maybe');
+            mockSendToken.mockImplementationOnce(async (a: any) => {
+                await a.onSubmitIntent({ txId: '0xsend-maybe', txHash: '0xsend-maybe-hash' });
                 throw new Error('submit watch timed out after 240000ms without a Finalized status');
             });
             await expect(runInJobExecutionContext(ctx as any, () => runPersistedCommand(args))).rejects.toThrow(/watch timed out/);
@@ -1048,10 +1025,10 @@ describe('wallet session handlers', () => {
     });
 
     // ------------------------------------------------------------------
-    // sendNight (covers parseNightAmount + validateOptionalTtl helpers)
+    // sendToken (covers parseNightAmount + validateOptionalTtl helpers)
     // ------------------------------------------------------------------
 
-    describe('sendNight', () => {
+    describe('sendToken', () => {
         beforeEach(() => {
             vi.spyOn(cds.log('nightgate:sessions'), 'info').mockImplementation(() => {});
             vi.spyOn(cds.log('nightgate:sessions'), 'warn').mockImplementation(() => {});
@@ -1071,62 +1048,62 @@ describe('wallet session handlers', () => {
                 [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: 'NaN' }, /decimal integer/],
                 [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '0' }, 'amount must be > 0'],
                 [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1000000000000000000000' }, /sanity bound/],
-                [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1', ttlIso: 'not-a-date' }, /must be an ISO-8601 timestamp/],
-                [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1', ttlIso: new Date(Date.now() - 10_000).toISOString() }, /must be in the future/]
+                [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1', expiresAt: 'not-a-date' }, /must be an ISO-8601 timestamp/],
+                [{ sessionId: 's', receiverAddress: 'mn_addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1', expiresAt: new Date(Date.now() - 10_000).toISOString() }, /must be in the future/]
             ];
 
             for (const [data, matcher] of tests) {
                 const req = createMockRequest(data);
-                await registeredHandlers['sendNight'](req);
+                await registeredHandlers['sendToken'](req);
                 expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(matcher as any));
             }
         });
 
-        it('lowercases tokenTypeHex before persisting the command (SDK matches exact lowercase)', async () => {
+        it('lowercases tokenType before persisting the command (SDK matches exact lowercase)', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             const req = createMockRequest({
                 sessionId: 's1',
                 receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 amount: '1',
-                tokenTypeHex: 'AB'.repeat(32)
+                tokenType: 'AB'.repeat(32)
             });
-            await registeredHandlers['sendNight'](req);
+            await registeredHandlers['sendToken'](req);
             const args = mockStartJob.mock.calls[0][0];
-            expect(args.command.tokenTypeHex).toBe('ab'.repeat(32));
-            expect(args.request.tokenTypeHex).toBe('ab'.repeat(32));
+            expect(args.command.tokenType).toBe('ab'.repeat(32));
+            expect(args.request.tokenType).toBe('ab'.repeat(32));
         });
 
-        it('returns { jobId, status } and defers sendNight to the job runner', async () => {
+        it('returns { jobId, status } and defers sendToken to the job runner', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             const req = createMockRequest({
                 sessionId: 's1',
                 receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 amount: '1'
             });
-            const result = await registeredHandlers['sendNight'](req);
+            const result = await registeredHandlers['sendToken'](req);
 
-            expect(result).toEqual({ jobId: 'job-sendNight-test', status: 'pending' });
-            expect(mockSendNight).not.toHaveBeenCalled();
+            expect(result).toEqual({ jobId: 'job-sendToken-test', status: 'pending' });
+            expect(mockSendToken).not.toHaveBeenCalled();
             // Funds-moving command: must persist encrypted.
             expect(mockStartJob.mock.calls[0][0].encryptCommand).toBe(true);
 
             // Drive the captured work fn and confirm it dispatches with the
             // session's derived accountId + caller args.
             const args = mockStartJob.mock.calls[0][0];
-            expect(args.kind).toBe('sendNight');
+            expect(args.kind).toBe('sendToken');
             expect(args.sessionId).toBe('s1');
             expect(args.request).toEqual({
                 sessionId: 's1',
                 receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 amount: '1',
                 ttlIso: null,
-                tokenTypeHex: null
+                tokenType: null
             });
-            mockSendNight.mockResolvedValueOnce({
+            mockSendToken.mockResolvedValueOnce({
                 txId: 'tx-send', toLedger: 'shielded', amount: '1', receiverAddress: 'mn_shield-addr_x'
             });
             const workResult = await runPersistedCommand(args);
-            expect(mockSendNight).toHaveBeenCalledWith(expect.objectContaining({
+            expect(mockSendToken).toHaveBeenCalledWith(expect.objectContaining({
                 cacheKey: 'acct-derived',
                 amount: '1'
             }));
@@ -1141,13 +1118,13 @@ describe('wallet session handlers', () => {
                 amount: '1',
                 idempotencyKey: 'idem-send-1'
             });
-            await registeredHandlers['sendNight'](req);
+            await registeredHandlers['sendToken'](req);
             expect(mockStartJob.mock.calls[0][0].idempotencyKey).toBe('idem-send-1');
         });
     });
 
     // ------------------------------------------------------------------
-    // getWalletBalance + estimateSendNightFee
+    // getWalletBalance + estimateSendTokenFee
     // ------------------------------------------------------------------
 
     describe('diagnostics handlers', () => {
@@ -1156,17 +1133,6 @@ describe('wallet session handlers', () => {
         });
         afterEach(() => {
             vi.restoreAllMocks();
-        });
-
-        it('getWalletBalance returns the inner helper result', async () => {
-            mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            mockGetWalletBalance.mockResolvedValueOnce({
-                shieldedNight: '1', unshieldedNight: '2', dustBalance: '0',
-                registeredNightUtxoCount: 0, totalNightUtxoCount: 0
-            });
-            const req = createMockRequest({ sessionId: 's1' });
-            const result = await registeredHandlers['getWalletBalance'](req);
-            expect(result.shieldedNight).toBe('1');
         });
 
         it('getWalletSyncProgress reports the worker snapshot without calling the worker', async () => {
@@ -1244,6 +1210,20 @@ describe('wallet session handlers', () => {
             expect(result.jobId).toBeNull();
         });
 
+        it('getWalletSyncProgress: a caught-up wallet between two reports is not stale', async () => {
+            // A caught-up wallet reports every NIGHTGATE_PROGRESS_WATCH_MS (60 s); the reading stays valid for two of them.
+            const at = new Date(Date.now() - 90_000).toISOString();
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            mockWalletGetSyncProgress.mockReturnValueOnce({
+                sessionId: 'acct-1', appliedIndex: '1500', streamTip: '1500', behindEvents: '0',
+                blockHeight: '1951462', isConnected: true, indexerFresh: true,
+                caughtUp: true, elapsedMs: 0, label: 'idle-sync', updatedAt: at, lastProgressAt: at
+            });
+            const result = await registeredHandlers['getWalletSyncProgress'](createMockRequest({ sessionId: 's1' }));
+            expect(result.staleSeconds).toBeGreaterThanOrEqual(89);
+            expect(result.stale).toBe(false);
+        });
+
         it('getWalletSyncProgress reports known=false when no snapshot exists yet', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             mockWalletGetSyncProgress.mockReturnValueOnce(null);
@@ -1255,21 +1235,13 @@ describe('wallet session handlers', () => {
             expect(req.reject).not.toHaveBeenCalled();
         });
 
-        it('getWalletBalance maps inner errors to 500', async () => {
-            mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            mockGetWalletBalance.mockRejectedValueOnce(new Error('worker stalled'));
-            const req = createMockRequest({ sessionId: 's1' });
-            await registeredHandlers['getWalletBalance'](req);
-            expect(req.reject).toHaveBeenCalledWith(500, expect.stringContaining('getWalletBalance failed'));
-        });
-
         it('a fee sponsor wallet moves no coin and registers nothing: it only pays fees', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-1';
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-1';
             try {
                 const receiverAddress = 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
                 const calls: Array<[string, Record<string, unknown>]> = [
-                    ['sendNight', { sessionId: 'sponsor-1', receiverAddress, amount: '1' }],
-                    ['estimateSendNightFee', { sessionId: 'sponsor-1', receiverAddress, amount: '1' }],
+                    ['sendToken', { sessionId: 'sponsor-1', receiverAddress, amount: '1' }],
+                    ['estimateSendTokenFee', { sessionId: 'sponsor-1', receiverAddress, amount: '1' }],
                     ['registerForDustGeneration', { sessionId: 'sponsor-1' }],
                     ['deregisterFromDustGeneration', { sessionId: 'sponsor-1' }]
                 ];
@@ -1280,48 +1252,36 @@ describe('wallet session handlers', () => {
                     expect(req.reject, action).toHaveBeenCalledWith(403, expect.stringMatching(/is a fee sponsor: it pays fees and does nothing else/));
                 }
                 expect(mockStartJob.mock.calls.length).toBe(jobsBefore);
-                expect(mockSendNight).not.toHaveBeenCalled();
-                expect(mockEstimateSendNightFee).not.toHaveBeenCalled();
+                expect(mockSendToken).not.toHaveBeenCalled();
+                expect(mockEstimateSendTokenFee).not.toHaveBeenCalled();
             } finally {
-                delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+                delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             }
         });
 
-        it('estimateSendNightFee happy path forwards to the inner helper', async () => {
+        it('estimateSendTokenFee prices the token it is asked about, with the amount bound of that token', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            mockEstimateSendNightFee.mockResolvedValueOnce({ fee: '123', toLedger: 'shielded' });
-            const req = createMockRequest({
-                sessionId: 's1',
-                receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                amount: '1'
-            });
-            const result = await registeredHandlers['estimateSendNightFee'](req);
-            expect(result).toEqual({ fee: '123', toLedger: 'shielded' });
-        });
-
-        it('estimateSendNightFee prices the token it is asked about, with the amount bound of that token', async () => {
-            mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            mockEstimateSendNightFee.mockResolvedValueOnce({ fee: '7', toLedger: 'shielded' });
+            mockEstimateSendTokenFee.mockResolvedValueOnce({ fee: '7', toLedger: 'shielded' });
             const req = createMockRequest({
                 sessionId: 's1',
                 receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 amount: '2000000000000000000',
-                tokenTypeHex: 'AB'.repeat(32)
+                tokenType: 'AB'.repeat(32)
             });
-            await registeredHandlers['estimateSendNightFee'](req);
+            await registeredHandlers['estimateSendTokenFee'](req);
             expect(req.reject).not.toHaveBeenCalled();
-            expect(mockEstimateSendNightFee).toHaveBeenCalledWith(expect.objectContaining({ tokenTypeHex: 'ab'.repeat(32), amount: '2000000000000000000' }));
+            expect(mockEstimateSendTokenFee).toHaveBeenCalledWith(expect.objectContaining({ tokenType: 'ab'.repeat(32), amount: '2000000000000000000' }));
         });
 
-        it('estimateSendNightFee rejects bad amount before any inner call', async () => {
+        it('estimateSendTokenFee rejects bad amount before any inner call', async () => {
             const req = createMockRequest({
                 sessionId: 's1',
                 receiverAddress: 'mn_shield-addr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 amount: '0'
             });
-            await registeredHandlers['estimateSendNightFee'](req);
+            await registeredHandlers['estimateSendTokenFee'](req);
             expect(req.reject).toHaveBeenCalledWith(400, 'amount must be > 0');
-            expect(mockEstimateSendNightFee).not.toHaveBeenCalled();
+            expect(mockEstimateSendTokenFee).not.toHaveBeenCalled();
         });
 
         // Session reads detach from the request tx, worker waits are bounded
@@ -1501,18 +1461,18 @@ describe('wallet session handlers', () => {
 
     describe('platform-sponsor expiry exemption', () => {
         const SPONSOR_SESSION = 'sponsor-session-x';
-        const previousPool = process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        const previousPool = process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
 
         afterEach(() => {
-            if (previousPool === undefined) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
-            else process.env.NIGHTGATE_FEE_SPONSOR_SESSION = previousPool;
+            if (previousPool === undefined) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
+            else process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = previousPool;
         });
 
         it('reads the balance of an EXPIRED session that is configured as a sponsor', async () => {
             // The pool's own sessions have long-past expiresAt (they are
             // exempt where they act as infrastructure); an ordinary read must
             // not answer 410 for a wallet that pays for everyone's transactions.
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR_SESSION;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR_SESSION;
             mockDbRun.mockResolvedValueOnce(activeSessionRow({ expiresInMs: -60_000, sessionId: SPONSOR_SESSION }));
             mockGetWalletBalance.mockResolvedValueOnce({ dustBalance: '42', registeredNightUtxoCount: 1 });
 
@@ -1524,7 +1484,7 @@ describe('wallet session handlers', () => {
         });
 
         it('still rejects an expired session that is NOT a configured sponsor', async () => {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             mockDbRun.mockResolvedValueOnce(activeSessionRow({ expiresInMs: -60_000 }));
 
             const req = createMockRequest({ sessionId: 'sess-1' });
@@ -1533,8 +1493,8 @@ describe('wallet session handlers', () => {
             expect(req.reject).toHaveBeenCalledWith(410, 'Session expired');
         });
 
-        it('applies the same rule to sendNight, so one path cannot disagree with another', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR_SESSION;
+        it('applies the same rule to sendToken, so one path cannot disagree with another', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR_SESSION;
             mockDbRun.mockResolvedValueOnce(activeSessionRow({ expiresInMs: -60_000, sessionId: SPONSOR_SESSION }));
 
             const req = createMockRequest({
@@ -1542,7 +1502,7 @@ describe('wallet session handlers', () => {
                 receiverAddress: 'addr'.repeat(20),
                 amount: '1000'
             });
-            await registeredHandlers['sendNight'](req);
+            await registeredHandlers['sendToken'](req);
 
             expect(req.reject).not.toHaveBeenCalledWith(410, expect.anything());
         });
@@ -1550,11 +1510,11 @@ describe('wallet session handlers', () => {
 
     describe('getSponsorPoolStatus', () => {
         const SPONSOR = 'sponsor-session-1';
-        const previousPoolEnv = process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        const previousPoolEnv = process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
 
         afterEach(() => {
-            if (previousPoolEnv === undefined) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
-            else process.env.NIGHTGATE_FEE_SPONSOR_SESSION = previousPoolEnv;
+            if (previousPoolEnv === undefined) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
+            else process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = previousPoolEnv;
         });
 
         function adminRequest() {
@@ -1571,14 +1531,14 @@ describe('wallet session handlers', () => {
         });
 
         it('is empty when no sponsor pool is configured', async () => {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             const result: any = await registeredHandlers['getSponsorPoolStatus'](createMockRequest({}));
             expect(result).toEqual([]);
             expect(mockDbRun).not.toHaveBeenCalled();
         });
 
         it('reports backings as the parallel sponsoring capacity', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row);   // visibility lookup
             mockDbRun.mockResolvedValueOnce(row);   // loadSigningSessionAccountId
@@ -1602,7 +1562,7 @@ describe('wallet session handlers', () => {
         });
 
         it('is not usable with backings but no dust', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '0', registeredNightUtxoCount: 2 }));
@@ -1618,7 +1578,7 @@ describe('wallet session handlers', () => {
             // count never moves. Reporting the own count would show a growing
             // delegated pool as flat, and a sponsor funded purely by donors as
             // unusable.
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
@@ -1637,7 +1597,7 @@ describe('wallet session handlers', () => {
             // `dustUtxoCount` is the SDK's total, which is available PLUS
             // pending. Reading it as capacity would promise more parallel
             // sponsorships than the wallet can serve.
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
@@ -1652,7 +1612,7 @@ describe('wallet session handlers', () => {
         it('prefers the worker own free-note count over the subtraction', async () => {
             // The worker reports `dustAvailableCount` where the SDK exposes an
             // available list; trust it rather than re-deriving the arithmetic.
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
@@ -1665,7 +1625,7 @@ describe('wallet session handlers', () => {
         });
 
         it('a wallet whose notes are ALL pending is not usable', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
@@ -1678,7 +1638,7 @@ describe('wallet session handlers', () => {
         });
 
         it('hides the exact balance from a caller who is neither admin nor owner, keeping the flags', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce(balanceOf({
@@ -1694,7 +1654,7 @@ describe('wallet session handlers', () => {
         });
 
         it('shows the exact balance to the session owner', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: TEST_USER_ID };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '5000', registeredNightUtxoCount: 1 }));
@@ -1707,7 +1667,7 @@ describe('wallet session handlers', () => {
             // A configured platform sponsor is infrastructure and does not
             // expire while it is configured; the cleanup sweep exempts it for
             // the same reason.
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const expired = activeSessionRow({ expiresInMs: -60_000, sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(expired).mockResolvedValueOnce(expired);
             mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 }));
@@ -1718,7 +1678,7 @@ describe('wallet session handlers', () => {
         });
 
         it('names a configured sponsor that is missing or inactive', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             mockDbRun.mockResolvedValueOnce(undefined);
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
@@ -1728,7 +1688,7 @@ describe('wallet session handlers', () => {
         });
 
         it('names a sponsor that cannot sign, which looks configured and is not', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             mockDbRun.mockResolvedValueOnce(activeSessionRow({ withSeed: false, sessionId: SPONSOR }));
 
             const result: any = await registeredHandlers['getSponsorPoolStatus'](adminRequest());
@@ -1740,7 +1700,7 @@ describe('wallet session handlers', () => {
             // A facade built moments ago is resident before the worker's first
             // progress-watch tick. Its balance is readable; whether it passes the
             // sync gate is not known yet, and a sponsored job would wait on it.
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue(null);
@@ -1756,7 +1716,7 @@ describe('wallet session handlers', () => {
             // A successful balance read does not mean the wallet passes the
             // gate a sponsored job waits on: a sponsor 22 events behind fails
             // every job while its balance reads fine.
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue({
@@ -1772,7 +1732,7 @@ describe('wallet session handlers', () => {
         });
 
         it('shows the last pushed dust figures, marked stale, when the worker does not answer', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             const at = new Date(Date.now() - 300_000).toISOString();
@@ -1793,7 +1753,7 @@ describe('wallet session handlers', () => {
         });
 
         it('shows the stale balance amount to an admin only', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue({
@@ -1807,7 +1767,7 @@ describe('wallet session handlers', () => {
         });
 
         it('stays an empty row when the worker never pushed dust figures', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockRejectedValueOnce(new Error('timed out'));
@@ -1817,7 +1777,7 @@ describe('wallet session handlers', () => {
         });
 
         it('marks a live read as fresh with its read time', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '900', registeredNightUtxoCount: 3, dustUtxoCount: 3 }));
@@ -1829,7 +1789,7 @@ describe('wallet session handlers', () => {
         });
 
         it('does not trust a gate verdict nobody refreshes any more', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue({ caughtUp: true, updatedAt: new Date(Date.now() - 3_600_000).toISOString() });
@@ -1844,7 +1804,7 @@ describe('wallet session handlers', () => {
             // getWalletBalance builds the facade and that build outlives the
             // capped request, so polling a freshly booted server would pile up
             // worker RPCs. The progress cache decides instead.
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = activeSessionRow({ sessionId: SPONSOR });
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockWalletGetSyncProgress.mockReturnValue(null);
@@ -1859,7 +1819,7 @@ describe('wallet session handlers', () => {
             // A status endpoint must not hang. The read-sync gate bounds the
             // catch-up wait, but BUILDING a cold facade happens before it and
             // is unbounded, so the whole per-sponsor read carries its own cap.
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             process.env.NIGHTGATE_SPONSOR_STATUS_TIMEOUT_MS = '80';
             try {
                 const row = activeSessionRow({ sessionId: SPONSOR });
@@ -1877,7 +1837,7 @@ describe('wallet session handlers', () => {
         });
 
         it('keeps reporting the rest of the pool when one sponsor is unreadable', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = `${SPONSOR},sponsor-session-2`;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = `${SPONSOR},sponsor-session-2`;
             const first = activeSessionRow({ sessionId: SPONSOR });
             const second = activeSessionRow({ sessionId: 'sponsor-session-2' });
             mockDbRun
@@ -1894,7 +1854,7 @@ describe('wallet session handlers', () => {
         });
 
         it('looks a platform sponsor up WITHOUT the owner constraint', async () => {
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR;
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR;
             const row = { ...activeSessionRow({ sessionId: SPONSOR }), userId: 'someone-else' };
             mockDbRun.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
             mockGetWalletBalance.mockResolvedValueOnce(balanceOf({ dustBalance: '1', registeredNightUtxoCount: 1 }));

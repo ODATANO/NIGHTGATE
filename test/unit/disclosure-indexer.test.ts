@@ -126,13 +126,13 @@ describe('reindexDisclosures', () => {
         const insert = db.calls.find(c => classify(c) === 'INSERT');
         expect(insert.INSERT.entries[0]).toMatchObject({
             contractAddress: CONTRACT, attesterId: A_HEX, payloadHash: PAYLOAD_AA,
-            grantee: hx(b(0xcc)), level: 1, active: true, changedAtHeight: 500
+            grantee: hx(b(0xcc)), level: 1, isActive: true, changedAtHeight: 500
         });
         expect(db.calls.some(c => classify(c) === 'UPDATE')).toBe(false);
     });
 
     test('updates an existing optimistic row to active=true (no duplicate insert)', async () => {
-        const existing = { ID: 'row-1', grantedTxHash: '0xabc', active: false };
+        const existing = { ID: 'row-1', grantedTxHash: '0xabc', isActive: false };
         const db = seqDb([existing, undefined, []]);
         await reindexDisclosures({
             db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant())
@@ -141,13 +141,13 @@ describe('reindexDisclosures', () => {
         expect(db.calls.some(c => classify(c) === 'INSERT')).toBe(false);
         const upd = db.calls.find(c => classify(c) === 'UPDATE');
         // The UPDATE flips active and re-affirms level; grantedTxHash untouched.
-        expect(setOf(upd)).toContain('"active":true');
+        expect(setOf(upd)).toContain('"isActive":true');
         expect(setOf(upd)).not.toContain('grantedTxHash');
     });
 
     test('the snapshot is read at the given height and stamps the rows it changes', async () => {
         const readGrants = vi.fn(grantsOf(oneGrant()));
-        const existing = { ID: 'row-1', active: false, changedAtHeight: 400 };
+        const existing = { ID: 'row-1', isActive: false, changedAtHeight: 400 };
         const db = seqDb([existing, undefined, []]);
         await reindexDisclosures({ db, contractAddress: CONTRACT, readGrants, atHeight: 500 });
         expect(readGrants).toHaveBeenCalledWith(CONTRACT, 500);
@@ -168,7 +168,7 @@ describe('reindexDisclosures', () => {
     test('a snapshot older than the row never revives a revoked grant', async () => {
         // The revoke landed at 600; a reindex that read the ledger at 590 still
         // sees the grant. It must not flip the row back or clear the marker.
-        const revoked = { ID: 'row-1', active: false, revokedTxHash: '0xrevoke', changedAtHeight: 600 };
+        const revoked = { ID: 'row-1', isActive: false, revokedTxHash: '0xrevoke', changedAtHeight: 600 };
         const db = seqDb([revoked, []]);
         const res = await reindexDisclosures({
             db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant()), atHeight: 590
@@ -178,7 +178,7 @@ describe('reindexDisclosures', () => {
     });
 
     test('a snapshot older than the row never rolls a level back', async () => {
-        const downgraded = { ID: 'row-1', active: true, level: 1, changedAtHeight: 600 };
+        const downgraded = { ID: 'row-1', isActive: true, level: 1, changedAtHeight: 600 };
         const db = seqDb([downgraded, [{ ...downgraded, attesterId: A_HEX, payloadHash: PAYLOAD_AA, grantee: hx(b(0xcc)) }]]);
         await reindexDisclosures({
             db, contractAddress: CONTRACT, readGrants: grantsOf(makeLedger({ 0x50: { owner: ATTESTER, payload: 0xaa, grants: [[0xcc, 2]] } })), atHeight: 590
@@ -187,7 +187,7 @@ describe('reindexDisclosures', () => {
     });
 
     test('an unordered snapshot never revives a confirmed revoke', async () => {
-        const revoked = { ID: 'row-1', active: false, revokedTxHash: '0xrevoke', changedAtHeight: 600 };
+        const revoked = { ID: 'row-1', isActive: false, revokedTxHash: '0xrevoke', changedAtHeight: 600 };
         const db = seqDb([revoked, []]);
         await reindexDisclosures({
             db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant())
@@ -196,18 +196,18 @@ describe('reindexDisclosures', () => {
     });
 
     test('a snapshot at or past the row applies the on-chain grant', async () => {
-        const revoked = { ID: 'row-1', active: false, revokedTxHash: '0xrevoke', changedAtHeight: 600 };
+        const revoked = { ID: 'row-1', isActive: false, revokedTxHash: '0xrevoke', changedAtHeight: 600 };
         const db = seqDb([revoked, undefined, []]);
         await reindexDisclosures({
             db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant()), atHeight: 600
         });
         const upd = db.calls.find(c => classify(c) === 'UPDATE');
-        expect(setOf(upd)).toContain('"active":true');
+        expect(setOf(upd)).toContain('"isActive":true');
         expect(setOf(upd)).toContain('"revokedTxHash":null');
     });
 
     test('the upsert is a compare-and-set on the height the row was read at (a revoke confirmed in between is kept)', async () => {
-        const existing = { ID: 'row-1', active: true, level: 1, changedAtHeight: 400 };
+        const existing = { ID: 'row-1', isActive: true, level: 1, changedAtHeight: 400 };
         const db = seqDb([existing, undefined, []]);
         await reindexDisclosures({
             db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant()), atHeight: 500
@@ -217,7 +217,7 @@ describe('reindexDisclosures', () => {
     });
 
     test('the upsert of a row without a height matches only while it still has none', async () => {
-        const existing = { ID: 'row-1', active: false };
+        const existing = { ID: 'row-1', isActive: false };
         const db = seqDb([existing, undefined, []]);
         await reindexDisclosures({
             db, contractAddress: CONTRACT, readGrants: grantsOf(oneGrant()), atHeight: 500
@@ -235,7 +235,7 @@ describe('reindexDisclosures', () => {
             db, contractAddress: CONTRACT, readGrants: grantsOf(noGrants())
         });
         expect(res).toEqual({ indexed: 0, deactivated: 1, snapshotHeight: null });
-        expect(setOf(db.calls.find(c => classify(c) === 'UPDATE'))).toContain('"active":false');
+        expect(setOf(db.calls.find(c => classify(c) === 'UPDATE'))).toContain('"isActive":false');
     });
 
     test('does not sweep a still-present grant (seen on-chain)', async () => {

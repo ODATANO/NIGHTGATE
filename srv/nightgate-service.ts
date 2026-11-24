@@ -2,17 +2,20 @@ import cds from '@sap/cds';
 
 import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/wallet-sessions';
 import { attachAgentGrantEnforcement, registerAgentGrantHandlers, awaitAgentPrincipal } from './sessions/agent-grants';
-import { ensureNightgateModelLoaded } from './utils/cds-model';
-import { attachRuntimeGate } from './utils/runtime-gate';
+import { attachRuntimeGate, attachReadLimits } from './utils/runtime-gate';
 import { attachHexInput } from './utils/hex-input';
+import { attachInt64Results } from './utils/numbers';
 import { registerSubmissionHandlers } from './submission/handlers';
 import { registerDocumentProofHandlers } from './submission/document-proof';
 import { receiptForJob } from './submission/receipts';
 import { getJobById, runWithoutAmbientTx } from './submission/background-jobs';
+import { jobResultObject } from './submission/job-store';
+import { storedChainSegments } from './submission/job-reconciliation';
 import { LONG_POLL_MAX_MS, holdUntil, waiterPool } from './utils/long-poll';
 import { contractStateAt, IndexerBudgetExhausted, IndexerBehind, IndexerUnavailable, type ContractStateFetcher, type FetchedContractState, type LedgerParametersFetcher } from './crawler/contract-state';
 import { fetchContractState, fetchLedgerParameters } from './crawler/indexer-supplement';
 import { normalizeIdentifier } from './crawler/transaction-identifiers';
+import { parseJsonStringList } from './utils/json-list';
 import { readCapBinary } from './crawler/cap-binary';
 import { extractLedgerPayload } from './crawler/ledger-payload';
 import { parseExtrinsicCall } from './utils/scale';
@@ -20,10 +23,10 @@ import { getNightgateConfig, resolveNightgateRuntimeConfig } from './utils/night
 import { RateLimiter } from './utils/rate-limiter';
 import { configNumber } from './utils/config';
 import { rejectRateLimited } from './utils/rate-classes';
-import { Blocks, Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, ContractActions, UnshieldedUtxos, NightBalances, WalletSessions, type WalletSession, type TransactionResult, type TransactionSegment, type Transaction as IndexedTransaction, type BackgroundJob } from '#cds-models/midnight';
+import { Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, type TransactionResult, type TransactionSegment, type Transaction as IndexedTransaction, type BackgroundJob } from '#cds-models/midnight';
 import { normalizeHttpError } from './utils/http-errors';
 import { messageWithoutUrls } from './utils/errors';
-import { getJobStatus, Block, ContractAction, ContractState, NightBalance, Transaction, UnshieldedUtxo } from '#cds-models/NightgateService';
+import { getJobStatus, ContractState, Transaction } from '#cds-models/NightgateService';
 import { narrowRead } from './utils/request-types';
 
 // One limit for all callers of this server, because an indexer may block the host's IP after too many requests.
@@ -40,11 +43,11 @@ function listPage(data: { limit?: number | null; skip?: number | null }, default
 const stateAtInFlight = new Map<string, Promise<FetchedContractState | null>>();
 const stateAtCache = new Map<string, { at: number; value: FetchedContractState }>();
 
-/** What byIdentifier reads across the identifier row, its transaction and that transaction's block. */
+/** What byTxId reads across the identifier row, its transaction and that transaction's block. */
 interface TransactionLocation {
     ID: string;
-    hash: string;
-    ledgerTxHash?: string | null;
+    extrinsicHash: string;
+    txHash?: string | null;
     blockHeight: number | string;
     blockHash: string;
 }
@@ -56,26 +59,30 @@ const jobWaiters = waiterPool(100);
 const readJob = (jobId: string): Promise<BackgroundJob | null> => runWithoutAmbientTx(() => getJobById(jobId));
 
 /** The indexed transaction that carries a ledger identifier, newest block first. */
-async function locateByIdentifier(db: cds.DatabaseService, identifier: string): Promise<TransactionLocation | undefined> {
+async function locateByTxId(db: cds.DatabaseService, txId: string): Promise<TransactionLocation | undefined> {
     return db.run(
         cds.ql.SELECT.one.from(TransactionIdentifiers)
-            .columns('transaction.ID as ID', 'transaction.hash as hash', 'transaction.ledgerTxHash as ledgerTxHash',
-                'transaction.block.height as blockHeight', 'transaction.block.hash as blockHash')
-            .where({ identifier })
-            .orderBy('transaction.block.height desc')
+            .columns('transaction.ID as ID', 'transaction.extrinsicHash as extrinsicHash', 'transaction.txHash as txHash',
+                'transaction.blockHeight as blockHeight', 'transaction.block.hash as blockHash')
+            .where({ txId })
+            .orderBy('transaction.blockHeight desc')
     );
 }
 
-/** The hash explorers show for a job's `txHash`: found by identifier, or the value itself when a row stored that hash. */
-async function explorerHashOf(db: cds.DatabaseService, txHash: string | null | undefined): Promise<string | null> {
-    const value = normalizeIdentifier(String(txHash ?? ''));
-    if (!value || !/^[0-9a-f]+$/.test(value)) return null;
-    const located = await locateByIdentifier(db, value);
-    if (located?.ledgerTxHash) return located.ledgerTxHash;
-    const stored: Pick<IndexedTransaction, 'ledgerTxHash'> | undefined = await db.run(
-        cds.ql.SELECT.one.from(Transactions).columns('ledgerTxHash').where({ ledgerTxHash: value })
+/** The identifier of a job stored with its ledger hash alone: the last one the indexed transaction lists. Null when the index does not have it. */
+async function indexedTxIdOf(db: cds.DatabaseService, txHash: string | null | undefined): Promise<string | null> {
+    if (!txHash) return null;
+    const row: Pick<IndexedTransaction, 'identifiers'> | undefined = await db.run(
+        cds.ql.SELECT.one.from(Transactions).columns('identifiers').where({ txHash })
     );
-    return stored?.ledgerTxHash ?? null;
+    return parseJsonStringList(row?.identifiers).at(-1) ?? null;
+}
+
+/** The ledger hash of a job stored with its identifier alone, from the local index. Null when the index does not have the transaction. */
+async function indexedHashOf(db: cds.DatabaseService, txId: string | null | undefined): Promise<string | null> {
+    const value = normalizeIdentifier(String(txId ?? ''));
+    if (!value || !/^[0-9a-f]+$/.test(value)) return null;
+    return (await locateByTxId(db, value))?.txHash ?? null;
 }
 
 function indexerUrls(): string[] {
@@ -156,56 +163,18 @@ export default class NightgateService extends cds.ApplicationService {
 
     async init(): Promise<void> {
         this.on('error', normalizeHttpError);
-        await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
 
         // The agent-token check must be the first before-hook.
         attachAgentGrantEnforcement(this, this.db);
 
         attachRuntimeGate(this);
+        attachReadLimits(this, ['byHash', 'byTxId', 'ledgerTransaction', 'stateAt', 'getJobStatus']);
         attachHexInput(this);
+        attachInt64Results(this);
 
         this.on('READ', 'Blocks', async (req) => {
             return await this.db.run(req.query) || [];
-        });
-
-        this.on('latest', 'Blocks', async () => {
-            return this.db.run(
-                cds.ql.SELECT.one.from(Blocks).orderBy('height desc')
-            );
-        });
-
-        this.on(Block.actions.byHeight, 'Blocks', async (req) => {
-            const { height } = req.data;
-            if (height == null) return req.reject(400, 'height is required');
-            return this.db.run(
-                cds.ql.SELECT.one.from(Blocks).where({ height })
-            );
-        });
-
-        this.on(Block.actions.range, 'Blocks', async (req) => {
-            const { startHeight, endHeight } = req.data;
-
-            if (startHeight == null || endHeight == null) {
-                return req.reject(400, 'startHeight and endHeight are required');
-            }
-
-            if (!Number.isInteger(startHeight) || !Number.isInteger(endHeight) || startHeight < 0 || endHeight < 0) {
-                return req.reject(400, 'startHeight and endHeight must be non-negative integers');
-            }
-
-            if (endHeight < startHeight) {
-                return req.reject(400, 'endHeight must be greater than or equal to startHeight');
-            }
-
-            const page = listPage(req.data, 100);
-            // A tagged template, because '>=' and '<=' on one column in an object silently lose a condition.
-            return this.db.run(
-                cds.ql.SELECT.from(Blocks)
-                    .where`height >= ${startHeight} and height <= ${endHeight}`
-                    .orderBy('height asc')
-                    .limit(page.limit, page.skip)
-            );
         });
 
         this.on('READ', 'Transactions', async (req) => {
@@ -217,16 +186,16 @@ export default class NightgateService extends cds.ApplicationService {
             if (!hash) return req.reject(400, 'hash is required');
             const page = listPage(req.data, 100);
             return this.db.run(
-                cds.ql.SELECT.from(Transactions).where`hash = ${hash} or ledgerTxHash = ${hash}`
-                    .orderBy('createdAt desc', 'ID').limit(page.limit, page.skip)
+                cds.ql.SELECT.from(Transactions).where`extrinsicHash = ${hash} or txHash = ${hash}`
+                    .orderBy('blockHeight desc', 'indexInBlock desc').limit(page.limit, page.skip)
             );
         });
 
-        this.on(Transaction.actions.byIdentifier, 'Transactions', async (req) => {
-            const { identifier } = req.data;
-            if (!identifier) return req.reject(400, 'identifier is required');
-            const found = await locateByIdentifier(this.db, identifier);
-            if (!found) return req.reject(404, `no indexed transaction carries identifier ${identifier}`);
+        this.on(Transaction.actions.byTxId, 'Transactions', async (req) => {
+            const { txId } = req.data;
+            if (!txId) return req.reject(400, 'txId is required');
+            const found = await locateByTxId(this.db, txId);
+            if (!found) return req.reject(404, `no indexed transaction carries identifier ${txId}`);
             const result: Pick<TransactionResult, 'ID' | 'status'> | undefined = await this.db.run(
                 cds.ql.SELECT.one.from(TransactionResults).columns('ID', 'status').where({ transaction_ID: found.ID })
             );
@@ -234,9 +203,9 @@ export default class NightgateService extends cds.ApplicationService {
                 cds.ql.SELECT.from(TransactionSegments).columns('segmentId').where({ transactionResult_ID: result.ID, success: false })
             ) : [];
             return {
-                identifier,
-                hash: found.hash,
-                ledgerTxHash: found.ledgerTxHash ?? null,
+                txId,
+                extrinsicHash: found.extrinsicHash,
+                txHash: found.txHash ?? null,
                 blockHeight: Number(found.blockHeight),
                 blockHash: found.blockHash,
                 status: result?.status ?? null,
@@ -247,51 +216,18 @@ export default class NightgateService extends cds.ApplicationService {
         this.on(Transaction.actions.ledgerTransaction, 'Transactions', async (req) => {
             const { hash } = req.data;
             if (!hash) return req.reject(400, 'hash is required');
-            const row: Pick<IndexedTransaction, 'raw'> | undefined = await this.db.run(
-                cds.ql.SELECT.one.from(Transactions).columns('raw').where`hash = ${hash} or ledgerTxHash = ${hash}`.orderBy('createdAt desc', 'ID')
+            const row: Pick<IndexedTransaction, 'raw' | 'extrinsicHash'> | undefined = await this.db.run(
+                cds.ql.SELECT.one.from(Transactions).columns('raw', 'extrinsicHash').where`extrinsicHash = ${hash} or txHash = ${hash}`.orderBy('blockHeight desc', 'indexInBlock desc')
             );
             const raw = row ? await readCapBinary(row.raw) : null;
             const call = raw ? parseExtrinsicCall('0x' + raw.toString('hex')) : null;
             const payload = call ? extractLedgerPayload(call.buf, call.argsOffset) : null;
             if (!payload) return req.reject(404, `no indexed ledger transaction for ${hash}`);
-            return { hash, ledgerTransaction: Buffer.from(payload).toString('base64') };
-        });
-
-        this.on(Transaction.actions.byType, 'Transactions', async (req) => {
-            const { txType } = req.data;
-            if (!txType) return req.reject(400, 'txType is required');
-            const page = listPage(req.data, 100);
-            return this.db.run(
-                cds.ql.SELECT.from(Transactions)
-                    .where({ txType })
-                    .orderBy('createdAt desc', 'ID')
-                    .limit(page.limit, page.skip)
-            );
+            return { extrinsicHash: row?.extrinsicHash ?? null, ledgerTransaction: Buffer.from(payload).toString('base64') };
         });
 
         this.on('READ', 'ContractActions', async (req) => {
             return await this.db.run(req.query) || [];
-        });
-
-        this.on(ContractAction.actions.byAddress, 'ContractActions', async (req) => {
-            const { address } = req.data;
-            if (!address) return req.reject(400, 'address is required');
-            const page = listPage(req.data, 100);
-            return this.db.run(
-                cds.ql.SELECT.from(ContractActions).where({ address }).orderBy('createdAt asc', 'ID').limit(page.limit, page.skip)
-            );
-        });
-
-        this.on(ContractAction.actions.history, 'ContractActions', async (req) => {
-            const { address } = req.data;
-            if (!address) return req.reject(400, 'address is required');
-            const page = listPage(req.data, 100);
-            return this.db.run(
-                cds.ql.SELECT.from(ContractActions)
-                    .where({ address })
-                    .orderBy('createdAt desc', 'ID')
-                    .limit(page.limit, page.skip)
-            );
         });
 
         this.on('READ', 'ContractStates', async (req) => {
@@ -299,16 +235,16 @@ export default class NightgateService extends cds.ApplicationService {
         });
 
         this.on(ContractState.actions.stateAt, 'ContractStates', async (req) => {
-            const { address, height } = req.data;
-            if (!address) return req.reject(400, 'address is required');
+            const { contractAddress, height } = req.data;
+            if (!contractAddress) return req.reject(400, 'contractAddress is required');
             if (height != null && (!Number.isInteger(Number(height)) || Number(height) < 0)) {
                 return req.reject(400, 'height must be a non-negative integer');
             }
             try {
                 const snapshot = await contractStateAt(
-                    this.db, address, height == null ? null : Number(height), fetchContractStateFromIndexers(), fetchLedgerParametersFromIndexers()
+                    this.db, contractAddress, height == null ? null : Number(height), fetchContractStateFromIndexers(), fetchLedgerParametersFromIndexers()
                 );
-                if (!snapshot) return req.reject(404, `no state known for contract ${address}`);
+                if (!snapshot) return req.reject(404, `no state known for contract ${contractAddress}`);
                 return snapshot;
             } catch (err) {
                 if (err instanceof IndexerBudgetExhausted) {
@@ -337,37 +273,6 @@ export default class NightgateService extends cds.ApplicationService {
             return await this.db.run(req.query) || [];
         });
 
-        this.on(UnshieldedUtxo.actions.byOwner, 'UnshieldedUtxos', async (req) => {
-            const { owner } = req.data;
-            if (!owner) return req.reject(400, 'owner is required');
-            const page = listPage(req.data, 1000);
-            return this.db.run(cds.ql.SELECT.from(UnshieldedUtxos).where({ owner }).orderBy('createdAt desc', 'ID').limit(page.limit, page.skip));
-        });
-
-        this.on(UnshieldedUtxo.actions.unspent, 'UnshieldedUtxos', async (req) => {
-            const page = listPage(req.data, 1000);
-            return this.db.run(
-                cds.ql.SELECT.from(UnshieldedUtxos).where({ spentAtTransaction_ID: null }).orderBy('createdAt desc', 'ID').limit(page.limit, page.skip)
-            );
-        });
-
-        this.on(NightBalance.actions.getBalance, 'NightBalances', async (req) => {
-            const { address } = req.data;
-            if (!address) return req.reject(400, 'address is required');
-            return this.db.run(
-                cds.ql.SELECT.one.from(NightBalances).where({ address })
-            );
-        });
-
-        this.on(NightBalance.actions.getTopHolders, 'NightBalances', async (req) => {
-            const page = listPage(req.data, 10);
-            return this.db.run(
-                cds.ql.SELECT.from(NightBalances)
-                    .orderBy('balance desc', 'address')
-                    .limit(page.limit, page.skip)
-            );
-        });
-
         // A caller reads only its own rows. An admin reads all of them.
         const ownRowsOnly = async (req: cds.Request) => {
             await awaitAgentPrincipal(req);
@@ -381,18 +286,7 @@ export default class NightgateService extends cds.ApplicationService {
         this.before('READ', 'WalletSessions', ownRowsOnly);
         registerAgentGrantHandlers(this, this.db);
         this.before('READ', 'AgentGrants', ownRowsOnly);
-        for (const entity of ['Documents', 'GranteeIdentities'] as const) this.before('READ', entity, ownRowsOnly);
-
-        this.on('READ', 'PendingSubmissions', async (req) => {
-            const user = req.user;
-            if (!user?.is?.('admin')) {
-                const userId = user?.id;
-                if (!userId) return req.reject(401, 'authentication required');
-                // As a subquery: a user may have had any number of sessions, and a value list would hit the driver's parameter limit.
-                narrowRead(req, { sessionId: { in: cds.ql.SELECT.from(WalletSessions).columns('sessionId').where({ userId }) } });
-            }
-            return await this.db.run(req.query) || [];
-        });
+        for (const entity of ['Documents', 'GranteeIdentities', 'PredicateAttestations', 'DisclosureGrants'] as const) this.before('READ', entity, ownRowsOnly);
 
         registerSubmissionHandlers(this, this.db);
         registerDocumentProofHandlers(this);
@@ -413,22 +307,12 @@ export default class NightgateService extends cds.ApplicationService {
             const user = req.user;
             if (!user?.is?.('admin')) {
                 const requesterId = user?.id;
-                // A token that names no session reads the jobs its own grant started.
-                if (!sessionId && req.agentGrant && job.grantId !== req.agentGrant.ID) {
+                // A token reads only the jobs its own grant started. Grants of one user share the sponsor pool.
+                if (req.agentGrant && job.grantId !== req.agentGrant.ID) {
                     return req.reject(404, 'Job not found');
                 }
-                if (job.requestedBy) {
-                    if (!requesterId || job.requestedBy !== requesterId) {
-                        return req.reject(404, 'Job not found');
-                    }
-                } else {
-                    const jobSessionId = job.sessionId;
-                    const sess: WalletSession | undefined = await cds.tx({}, (tx) =>
-                        tx.run(cds.ql.SELECT.one.from(WalletSessions).columns('userId').where({ sessionId: jobSessionId }))
-                    );
-                    if (!sess?.userId || !requesterId || sess.userId !== requesterId) {
-                        return req.reject(404, 'Job not found');
-                    }
+                if (!requesterId || job.requestedBy !== requesterId) {
+                    return req.reject(404, 'Job not found');
                 }
             }
 
@@ -438,32 +322,31 @@ export default class NightgateService extends cds.ApplicationService {
                     && !(untilChain === true && j.status === 'succeeded' && j.chainStatus === 'pending');
                 job = await holdUntil(req, waitMs, jobWaiters, found, async () => (await readJob(jobId)) ?? found, settled);
             }
-            const transactionHash = await explorerHashOf(this.db, job.txHash);
+            const txHash = job.txHash ?? await indexedHashOf(this.db, job.txId);
 
             return {
                 jobId: job.ID,
                 kind: job.kind,
                 status: job.status,
-                result: job.result,
+                result: jobResultObject(job.result),
                 errorCode: job.errorCode,
                 errorMessage: job.errorMessage,
                 attempt: job.attempt,
                 maxAttempts: job.maxAttempts,
                 submissionId: job.submissionId,
-                txHash: job.txHash,
-                transactionId: job.txHash ?? null,
-                transactionHash,
+                txId: job.txId ?? await indexedTxIdOf(this.db, txHash),
+                txHash,
                 chainStatus: job.chainStatus,
                 chainFinalizedAt: job.chainFinalizedAt,
-                chainBlockHeight: job.chainBlockHeight ?? null,
-                chainBlockHash: job.chainBlockHash ?? null,
-                chainSegments: job.chainSegments ?? null,
+                blockHeight: job.blockHeight ?? null,
+                blockHash: job.blockHash ?? null,
+                chainSegments: storedChainSegments(job.chainSegments) ?? [],
                 queuedAt: job.queuedAt ?? job.createdAt,
                 externalExecutionAt: job.externalExecutionAt,
                 submittedAt: job.submittedAt,
                 startedAt: job.startedAt,
                 finishedAt: job.finishedAt,
-                receipt: receiptForJob(job, transactionHash, String(resolveNightgateRuntimeConfig(getNightgateConfig()).network))
+                receipt: receiptForJob(job, txHash, String(resolveNightgateRuntimeConfig(getNightgateConfig()).network))
             };
         });
 

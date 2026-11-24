@@ -5,7 +5,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.46.3}
+    image: ghcr.io/odatano/nightgate:${NIGHTGATE_IMAGE_TAG:-0.47.0}
     container_name: odatano-nightgate
     # Loopback only by default: basic auth is plain text without TLS, so put a
     # TLS reverse proxy in front. NIGHTGATE_BIND_ADDRESS=0.0.0.0 publishes it.
@@ -19,8 +19,7 @@ services:
       # Optional: PostgreSQL instead of the SQLite file under /data.
       # With `--profile postgres` the bundled service below matches this URL.
       NIGHTGATE_DB_URL: "${NIGHTGATE_DB_URL:-}"
-      # Basic-auth credentials for the OData services (NIGHTGATE_AUTH=dummy
-      # serves unauthenticated, local testing only).
+      # Basic-auth credentials for the OData services.
       NIGHTGATE_HTTP_USER: "${NIGHTGATE_HTTP_USER:-nightgate}"
       NIGHTGATE_HTTP_PASSWORD: "${NIGHTGATE_HTTP_PASSWORD:-}"   # refused by cds-config.mjs when empty
       NIGHTGATE_NETWORK: "${NIGHTGATE_NETWORK:-mainnet}"
@@ -43,8 +42,24 @@ services:
       # Roles for the single basic-auth operator, none by default. `admin`
       # opens the admin service (signing-key export, session invalidation, job queue).
       NIGHTGATE_HTTP_ROLES: "${NIGHTGATE_HTTP_ROLES:-}"
+      # A key ring instead of ENCRYPTION_KEY, see docs/operations.md.
+      ENCRYPTION_KEYS: "${ENCRYPTION_KEYS:-}"
+      ENCRYPTION_KEY_ACTIVE: "${ENCRYPTION_KEY_ACTIVE:-}"
+      NIGHTGATE_TRUST_PROXY: "${NIGHTGATE_TRUST_PROXY:-}"
+      NIGHTGATE_DB_DEPLOY: "${NIGHTGATE_DB_DEPLOY:-}"
+      NIGHTGATE_PUBLIC_VERIFY: "${NIGHTGATE_PUBLIC_VERIFY:-}"
+      NIGHTGATE_FEE_SPONSOR_SESSIONS: "${NIGHTGATE_FEE_SPONSOR_SESSIONS:-}"
+      NIGHTGATE_SPONSOR_POLICY_FILE: "${NIGHTGATE_SPONSOR_POLICY_FILE:-}"
+      # The defaults are the image's. An empty NIGHTGATE_NODE_FLAGS sets no V8 flags.
+      NODE_OPTIONS: "${NODE_OPTIONS:---max-old-space-size=8192}"
+      NIGHTGATE_NODE_FLAGS: "${NIGHTGATE_NODE_FLAGS---no-concurrent-recompilation}"
     volumes:
       - nightgate-data:/data
+    # With `--profile postgres` the server starts once the database answers.
+    depends_on:
+      nightgate-postgres:
+        condition: service_healthy
+        required: false
     restart: unless-stopped
     # A graceful stop flushes wallet state and closes sessions; with three
     # warm facades that takes longer than docker's default 10 s.
@@ -73,9 +88,10 @@ services:
   node:
     image: midnightntwrk/midnight-node:2.1.101
     container_name: odatano-night-node
+    # On this machine only. NODE_BIND_ADDRESS=0.0.0.0 publishes both ports.
     ports:
-      - "9944:9944" # Substrate RPC
-      - "30333:30333" # P2P
+      - "${NODE_BIND_ADDRESS:-127.0.0.1}:9944:9944" # Substrate RPC
+      - "${NODE_BIND_ADDRESS:-127.0.0.1}:30333:30333" # P2P
     environment:
       # Local dev preset. A preprod node also needs Cardano db-sync and Postgres, else it fails config validation.
       # A hosted node with its token in the URL (docs/self-hosted.md) spares that.
@@ -104,14 +120,15 @@ services:
           cpus: "1.0"
           memory: 2G
 
-  # Midnight indexer (standalone): one container, embedded SQLite, indexes from the
-  # Substrate node in INDEXER_UPSTREAM_NODE_URL. A sync from genesis takes days on preprod.
-  # NIGHTGATE uses it with NIGHTGATE_INDEXER_HTTP_URL=http://localhost:8088/api/v4/graphql.
+  # Midnight indexer (standalone): one container, embedded SQLite, fed by the node in INDEXER_UPSTREAM_NODE_URL.
+  # A sync from genesis takes days on preprod. NIGHTGATE on this machine reaches it at
+  # http://localhost:8088/api/v4/graphql, the `nightgate` service of this file at http://indexer:8088/api/v4/graphql.
   indexer:
     image: midnightntwrk/indexer-standalone:4.4.101
     container_name: odatano-night-indexer
+    # On this machine only. INDEXER_BIND_ADDRESS=0.0.0.0 publishes it.
     ports:
-      - "8088:8088"
+      - "${INDEXER_BIND_ADDRESS:-127.0.0.1}:8088:8088"
     environment:
       # The wallet-SDK queries via this network ID. Has to match NIGHTGATE's
       # configured network (cds.requires.nightgate.network).
@@ -121,9 +138,9 @@ services:
       # The `node` service above is a local dev chain, not preprod. Empty = the indexer refuses to start.
       APP__INFRA__NODE__URL: "${INDEXER_UPSTREAM_NODE_URL:-}"
       APP__INFRA__SPO_NODE__URL: "${INDEXER_UPSTREAM_NODE_URL:-}"
-      # Hex-encoded 32-byte secret that encrypts stored data. Set INDEXER_SECRET for production and never commit it.
+      # Hex-encoded 32-byte secret that encrypts stored data. Without INDEXER_SECRET the indexer does not start.
       # It needs at least one a-f character, or the indexer reads it as a number and crash-loops.
-      APP__INFRA__SECRET: "${INDEXER_SECRET:-deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe}"
+      APP__INFRA__SECRET: "${INDEXER_SECRET:-}"
       # SPO lookups off for vanilla wallet-SDK usage. The key name is the indexer's; a
       # placeholder is required by its config schema.
       APP__INFRA__SPO_NODE__BLOCKFROST_ID: "dummy-not-using-spo"
@@ -155,11 +172,9 @@ services:
 
   # Midnight Proof Server. Makes the ZK proofs for contract calls and deploys. The crawler does not need it.
   # The first run downloads about 500 MB of ZK parameters. The named volume keeps them across restarts.
-  # NIGHTGATE_PROOF_NETWORK picks the network, default mainnet. Use testnet for the local node.
   proof-server:
     image: midnightntwrk/proof-server:9.0.2
     container_name: odatano-night-proof-server
-    command: ["midnight-proof-server", "--network", "${NIGHTGATE_PROOF_NETWORK:-mainnet}"]
     environment:
       # Per-job TTL of the proving pool, seconds (default 600). A finished
       # job past it answers 5xx; keep it above NIGHTGATE_PROOF_TIMEOUT_MS.

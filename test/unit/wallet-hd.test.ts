@@ -21,10 +21,6 @@ describe('mnemonicToBip39SeedHex', () => {
         expect(hex).toBe(mnemonicToSeedSync(VALID).toString('hex'));
     });
 
-    test('is deterministic for the same phrase', () => {
-        expect(mnemonicToBip39SeedHex(VALID)).toBe(mnemonicToBip39SeedHex(VALID));
-    });
-
     test('trims surrounding whitespace before deriving', () => {
         expect(mnemonicToBip39SeedHex(`  ${VALID}  \n`)).toBe(mnemonicToBip39SeedHex(VALID));
     });

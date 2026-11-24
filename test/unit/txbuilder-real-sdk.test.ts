@@ -43,8 +43,8 @@ function apiProvider() {
         }),
         contractDeploy: async () => ({ txHash: '0xdeploy', blockHeight: 5, blockHash: 'b5', blockTimestamp: 1, protocolVersion: LEDGER_9_SPEC, status: 'SUCCESS', identifiers: ['id0'], txId: 'id0' }),
         ledgerTransaction: async () => b64(ledger.Transaction.fromParts(NETWORK).mockProve().serialize()),
-        transactionByIdentifier: async () => null,
-        callFunction: async () => ({ hash: `0x${'ab'.repeat(32)}`, height: 5, protocolVersion: LEDGER_9_SPEC })
+        transactionByTxId: async () => null,
+        blockAt: async () => ({ hash: `0x${'ab'.repeat(32)}`, height: 5, protocolVersion: LEDGER_9_SPEC })
     };
     return apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion: 2_000_000 });
 }
@@ -59,7 +59,7 @@ beforeAll(async () => {
     const { NodeZkConfigProvider } = await import('@midnight-ntwrk/midnight-js-node-zk-config-provider');
     ({ InMemoryPrivateStateProvider } = await import('@odatano/contract-kit' as string));
     ({ apiPublicDataProvider } = await import('../../src/txbuilder/api-provider.mjs' as string));
-    ({ applyGasHeadroom } = await import('../../src/txbuilder/index.mjs' as string));
+    ({ applyGasHeadroom } = await import('../../src/txbuilder/internals.mjs' as string));
     const counter = await import('@odatano/contract-counter' as string);
     compiled = (CompiledContract as any).make('counter', counter.Contract).pipe(
         (CompiledContract as any).withVacantWitnesses,
@@ -122,7 +122,7 @@ describe('txbuilder providers on the real SDK', () => {
     }, 60_000);
 
     it('gasHeadroom is lowered to what the ledger\'s time to dismiss leaves, with the limits read from the real parameters', async () => {
-        const { timeToDismissLimits } = await import('../../src/txbuilder/index.mjs' as string);
+        const { timeToDismissLimits } = await import('../../src/txbuilder/internals.mjs' as string);
         expect(timeToDismissLimits(ledger.LedgerParameters.initialParameters())).toEqual({ perByte: 2e6, min: 15e9 });
 
         const publicDataProvider = apiProvider();
@@ -146,6 +146,35 @@ describe('txbuilder providers on the real SDK', () => {
         expect(costOf(asAsked.unprovenTx)).toThrow(/time to dismiss/);
     }, 60_000);
 
+    it('a deploy build carries the given signing key into the contract and stores nothing', async () => {
+        const { buildDeploy } = await import('../../src/txbuilder/internals.mjs' as string);
+        const { providers, seen } = wrappedProviders(apiProvider());
+        const signingKey = ledger.sampleSigningKey();
+        const built: { nextPrivateState?: unknown } = {};
+        await expect(buildDeploy(contracts, providers, { compiledContract: compiled, signingKey, privateStateId: 'ps', initialPrivateState: { note: 'start' } }, built)).rejects.toThrow();
+        expect(seen).toHaveLength(1);
+        expect(built.nextPrivateState).toEqual({ note: 'start' });
+        // The deployed contract names the verifying key of the given key as its maintenance authority.
+        const deploy = [...seen[0].deserialize({ v9: ledger.Transaction }).intents.values()][0].actions[0];
+        const authority = deploy.initialState.maintenanceAuthority;
+        expect(authority.committee).toEqual([ledger.signatureVerifyingKey(signingKey)]);
+        expect(await providers.privateStateProvider.getSigningKey(deploy.address)).toBeNull();
+    }, 60_000);
+
+    it('a single call build hands out the private state after the call and stores nothing', async () => {
+        const { buildSingleCall } = await import('../../src/txbuilder/internals.mjs' as string);
+        const { providers, seen } = wrappedProviders(apiProvider());
+        const states = providers.privateStateProvider.forContract(contractAddress);
+        await states.set('ps', { note: 'before' });
+        const options = contracts.createCallTxOptions(compiled, 'increment', contractAddress, 'ps', undefined, []);
+        const built: { nextPrivateState?: unknown } = {};
+        await expect(buildSingleCall(contracts, providers, options, 'increment', built)).rejects.toThrow();
+        expect(seen).toHaveLength(1);
+        // The counter has no witness, so its call leaves the private state as it was.
+        expect(built.nextPrivateState).toEqual({ note: 'before' });
+        expect(await states.get('ps')).toEqual({ note: 'before' });
+    }, 60_000);
+
     it('a state decoded for the readers works in the compiled contract\'s ledger function', async () => {
         const { contractStateOf } = await import('../../srv/midnight/public-data-provider' as string);
         const counter = await import('@odatano/contract-counter' as string);
@@ -160,7 +189,7 @@ describe('txbuilder providers on the real SDK', () => {
             contractStateAt: async () => ({ height: 5, state: b64(new ledger8.ContractState().serialize()), ledgerParameters: b64(ledger8.LedgerParameters.initialParameters().serialize()) }),
             contractDeploy: async () => ({ txHash: '0xdeploy', blockHeight: 5, blockHash: 'b5', protocolVersion: 1_000_300, status: 'SUCCESS', identifiers: ['id0'], txId: 'id0' }),
             ledgerTransaction: async () => b64(ledger8.Transaction.fromParts(NETWORK).mockProve().serialize()),
-            transactionByIdentifier: async () => null
+            transactionByTxId: async () => null
         };
         const provider = apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion: 2_000_000 });
         const deploy = await provider.watchForDeployTxData(contractAddress);
@@ -173,7 +202,7 @@ describe('txbuilder providers on the real SDK', () => {
     });
 
     it('a state of another kind is refused, not passed on', async () => {
-        const client = { contractStateAt: async () => ({ height: 5, state: b64(new TextEncoder().encode('not a state')) }), callFunction: async () => null, contractDeploy: async () => null, transactionByIdentifier: async () => null };
+        const client = { contractStateAt: async () => ({ height: 5, state: b64(new TextEncoder().encode('not a state')) }), blockAt: async () => null, contractDeploy: async () => null, transactionByTxId: async () => null };
         const provider = apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion: 2_000_000 });
         await expect(provider.queryContractState(contractAddress)).rejects.toThrow();
     });

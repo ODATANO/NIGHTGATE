@@ -82,19 +82,20 @@ describe('docker/cds-config.mjs', () => {
         expect(bad.err).toMatch(/unsupported sslmode='verify-everything'/);
     });
 
-    it('refuses a non-postgres URL, a missing basic password and an unknown auth kind (exit 2, secret not echoed)', () => {
+    it('refuses a non-postgres URL and a missing password (exit 2, secret not echoed)', () => {
         const bad = run({ NIGHTGATE_HTTP_PASSWORD: 'pw', NIGHTGATE_DB_URL: 'mysql://u:secret@h/db' });
         expect(bad.code).toBe(2);
         expect(bad.err).toMatch(/must be a postgres:\/\/ URL/);
         expect(bad.err).not.toMatch(/secret/);
         expect(run({}).code).toBe(2);
         expect(run({}).err).toMatch(/NIGHTGATE_HTTP_PASSWORD is required/);
-        expect(run({ NIGHTGATE_AUTH: 'jwt' }).err).toMatch(/unsupported NIGHTGATE_AUTH/);
     });
 
-    it('dummy auth needs no password', () => {
-        const cfg = JSON.parse(run({ NIGHTGATE_AUTH: 'dummy' }).out);
-        expect(cfg.requires.auth).toEqual({ kind: 'dummy' });
+    it('the image has no way around the password', () => {
+        const asked = run({ NIGHTGATE_AUTH: 'dummy' });
+        expect(asked.code).toBe(2);
+        expect(asked.err).toMatch(/NIGHTGATE_HTTP_PASSWORD is required/);
+        expect(JSON.parse(run({ NIGHTGATE_AUTH: 'dummy', NIGHTGATE_HTTP_PASSWORD: 'pw' }).out).requires.auth.kind).toBe('basic');
     });
 
     it('--db-only (migrate mode) emits the database binding without auth and needs no password', () => {
@@ -138,7 +139,19 @@ describe('docker/entrypoint.sh node flags', () => {
     });
 });
 
-describe('scripts/migrate-values.mjs (nightgate-db-migrate row conversion)', () => {
+describe('docker/docker-compose.yml', () => {
+    it('starts the proof server with the command of its image: the binary has no network option and refuses one', () => {
+        const yml = fs.readFileSync(path.resolve(__dirname, '../../docker/docker-compose.yml'), 'utf8').replace(/\r\n/g, '\n');
+        const from = yml.indexOf('\n  proof-server:\n');
+        const next = /\n {2}[a-z][a-z0-9-]*:\n/.exec(yml.slice(from + 1));
+        const service = yml.slice(from, next ? from + 1 + next.index : undefined);
+        expect(service).toMatch(/image: midnightntwrk\/proof-server:/);
+        expect(service).not.toMatch(/^\s*(command|entrypoint):/m);
+        expect(yml).not.toMatch(/NIGHTGATE_PROOF_NETWORK/);
+    });
+});
+
+describe('scripts/migrate-values.mjs (row conversion of the SQLite to PostgreSQL move)', () => {
     const el = (type: string) => ({ type });
 
     it('keeps every digit of Integer64 and Decimal read as BigInt; refuses a Number that already lost precision', () => {

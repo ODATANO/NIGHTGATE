@@ -107,10 +107,10 @@ describe('validateRuntimeRegistration', () => {
     it('refuses a path outside NIGHTGATE_CONTRACTS_DIR (importing an artifact executes it)', async () => {
         const a = writeArtifact(path.join(outside, 'evil'));
         await expect(validateRuntimeRegistration({ name: 'evil', privateStateId: 'ps', ...a }))
-            .rejects.toMatchObject({ httpStatus: 400, message: expect.stringMatching(/inside NIGHTGATE_CONTRACTS_DIR/) });
+            .rejects.toMatchObject({ status: 400, message: expect.stringMatching(/inside NIGHTGATE_CONTRACTS_DIR/) });
         // Traversal out of the root is the same refusal.
         await expect(validateRuntimeRegistration({ name: 'evil', privateStateId: 'ps', artifactPath: `../${path.basename(outside)}/evil/contract/index.cjs`, zkConfigPath: `../${path.basename(outside)}/evil` }))
-            .rejects.toMatchObject({ httpStatus: 400 });
+            .rejects.toMatchObject({ status: 400 });
     });
 
     it('refuses bad names, widths, missing assets, and a module without a Contract class', async () => {
@@ -132,13 +132,13 @@ describe('registerContractAtRuntime / unregisterContractAtRuntime', () => {
     it('registers in memory with a generation digest and persists the row', async () => {
         const a = writeArtifact(path.join(root, 'vault'), { prover: true });
         const db = fakeDb();
-        const out = await registerContractAtRuntime(db, { name: 'customer-vault', privateStateId: 'ps', slotWidth: 32, ...a }, { registeredBy: 'admin-1', networkId: 'preprod' });
+        const out = await registerContractAtRuntime(db, { name: 'customer-vault', privateStateId: 'ps', slotWidth: 32, ...a }, { registeredBy: 'admin-1', network: 'preprod' });
         expect(out).toMatchObject({ name: 'customer-vault', source: 'runtime', slotWidth: 32, hasProverKeys: true });
         expect(out.artifactDigest).toBe(getArtifactGenerationDigest('customer-vault'));
         expect(getContractRegistration('customer-vault')?.slotWidth).toBe(32);
         const upsert = db.queries.find(q => q.UPSERT);
         expect(upsert.UPSERT.into).toBe(ContractRegistrations);
-        expect(upsert.UPSERT.entries[0]).toMatchObject({ name: 'customer-vault', slotWidth: 32, registeredBy: 'admin-1', networkId: 'preprod' });
+        expect(upsert.UPSERT.entries[0]).toMatchObject({ name: 'customer-vault', slotWidth: 32, registeredBy: 'admin-1', network: 'preprod' });
         expect(listContracts()).toEqual([expect.objectContaining({ name: 'customer-vault', source: 'runtime' })]);
     });
 
@@ -147,8 +147,8 @@ describe('registerContractAtRuntime / unregisterContractAtRuntime', () => {
         loadRegistryFromConfig({ contracts: { floor: { artifactPath: cfg.artifactPath, zkConfigPath: cfg.zkConfigPath, privateStateId: 'p' } } });
         const db = fakeDb();
         const a = writeArtifact(path.join(root, 'other'));
-        await expect(registerContractAtRuntime(db, { name: 'floor', privateStateId: 'ps', ...a })).rejects.toMatchObject({ httpStatus: 409 });
-        await expect(unregisterContractAtRuntime(db, 'floor')).rejects.toMatchObject({ httpStatus: 409 });
+        await expect(registerContractAtRuntime(db, { name: 'floor', privateStateId: 'ps', ...a })).rejects.toMatchObject({ status: 409 });
+        await expect(unregisterContractAtRuntime(db, 'floor')).rejects.toMatchObject({ status: 409 });
         expect(db.queries).toHaveLength(0);
         expect(listContracts()).toEqual([expect.objectContaining({ name: 'floor', source: 'config' })]);
     });
@@ -228,14 +228,14 @@ describe('registerContractAtRuntime / unregisterContractAtRuntime', () => {
     it('refuses a zk directory without the compiler manifest, because nothing proves from it', async () => {
         const a = writeArtifact(path.join(root, 'no-manifest'), { noManifest: true });
         await expect(validateRuntimeRegistration({ name: 'no-manifest', privateStateId: 'ps', ...a }))
-            .rejects.toMatchObject({ httpStatus: 400, message: expect.stringMatching(/no compiler\/contract-manifest\.json/) });
+            .rejects.toMatchObject({ status: 400, message: expect.stringMatching(/no compiler\/contract-manifest\.json/) });
     });
 
     it('a regular FILE named zkir does not pass validation', async () => {
         const a = writeArtifact(path.join(root, 'zkir-file'));
         fs.rmSync(path.join(a.zkConfigPath, 'zkir'), { recursive: true, force: true });
         fs.writeFileSync(path.join(a.zkConfigPath, 'zkir'), 'not a directory');
-        await expect(validateRuntimeRegistration({ name: 'zkir-file', privateStateId: 'ps', ...a })).rejects.toMatchObject({ httpStatus: 400, message: expect.stringMatching(/no zkir\/ directory/) });
+        await expect(validateRuntimeRegistration({ name: 'zkir-file', privateStateId: 'ps', ...a })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/no zkir\/ directory/) });
     });
 
     it('a worker that cannot even be constructed reports the error instead of a ReferenceError from the timer', async () => {

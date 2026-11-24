@@ -98,15 +98,15 @@ export async function startJob<TIn, TOut>(
     // Insert in the caller's transaction. Handlers often write first, so it already holds the SQLite write lock.
     const jobId = crypto.randomUUID();
     const queuedAt = new Date().toISOString();
-    // `compiledArtifactRef` is a name that can later point to another contract build.
+    // A contract name can later point to another build.
     // Store the build's digest now so the job refuses to run if the name changes.
     let effectiveCommand: unknown = command;
     if (replayable && command && typeof command === 'object'
-        && 'compiledArtifactRef' in command && typeof command.compiledArtifactRef === 'string'
+        && 'contractName' in command && typeof command.contractName === 'string'
         && !('artifactDigest' in command && command.artifactDigest !== undefined)) {
         effectiveCommand = {
             ...command,
-            artifactDigest: getArtifactGenerationDigest(command.compiledArtifactRef)
+            artifactDigest: getArtifactGenerationDigest(command.contractName)
         };
     }
     const serializedCommand = replayable ? safeStringify(effectiveCommand) : null;

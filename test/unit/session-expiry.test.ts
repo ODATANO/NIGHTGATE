@@ -25,27 +25,27 @@ const PLAIN = 'plain-session-1';
 const past = new Date(Date.now() - 60_000).toISOString();
 const future = new Date(Date.now() + 60_000).toISOString();
 
-const previous = process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
-beforeEach(() => { process.env.NIGHTGATE_FEE_SPONSOR_SESSION = SPONSOR; });
+const previous = process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
+beforeEach(() => { process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = SPONSOR; });
 afterEach(() => {
-    if (previous === undefined) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
-    else process.env.NIGHTGATE_FEE_SPONSOR_SESSION = previous;
+    if (previous === undefined) delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
+    else process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = previous;
 });
 
 describe('getConfiguredFeeSponsorSessions', () => {
     it('reads a comma separated env list and trims it', () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = ' a , b ,, c ';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = ' a , b ,, c ';
         expect(getConfiguredFeeSponsorSessions()).toEqual(['a', 'b', 'c']);
     });
 
     it('falls back to the cds config, array or string', () => {
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         expect(getConfiguredFeeSponsorSessions({ feeSponsorSessions: ['x', 'y'] })).toEqual(['x', 'y']);
         expect(getConfiguredFeeSponsorSessions({ feeSponsorSessions: 'x,y' })).toEqual(['x', 'y']);
     });
 
     it('is empty when nothing is configured', () => {
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         expect(getConfiguredFeeSponsorSessions({})).toEqual([]);
     });
 
@@ -85,7 +85,7 @@ describe('isSessionExpired', () => {
     it('expires a sponsor again once it is removed from the configuration', () => {
         // The exemption follows the CONFIG, not the row: an unconfigured
         // session is an ordinary one and ages out normally.
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'someone-else';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'someone-else';
         expect(isSessionExpired(SPONSOR, past)).toBe(true);
     });
 
@@ -103,7 +103,7 @@ describe('isSessionExpired', () => {
     });
 
     it('honours an explicitly passed config instead of the ambient one', () => {
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         expect(isSessionExpired(PLAIN, past, { feeSponsorSessions: [PLAIN] })).toBe(false);
     });
 });

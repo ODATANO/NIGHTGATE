@@ -2,7 +2,7 @@ import cds from '@sap/cds';
 import { deriveIndexerWsUrl } from './indexer-url';
 import { DEFAULT_PROOF_TIMEOUT_MS } from './proof-timeout';
 import { configBool, configEnum, configInt, configList, configString, setConfigOverrideSource, setConfigWarnSink } from './config';
-import { configSpec, parseConfigValue } from './config-table';
+import { camelConfigKey, capConfigValue, configSpec, formerCapKeys, formerEnvKeys, parseConfigValue } from './config-table';
 import type { CrawlerConfig } from '../crawler/Crawler';
 
 // Lets the getters in `./config` also read `cds.requires.nightgate`, and log through cds.
@@ -11,9 +11,13 @@ setConfigWarnSink((message) => cds.log('nightgate:config').warn(message));
 
 export { deriveIndexerWsUrl };
 
-export const VALID_NIGHTGATE_NETWORKS = ['preview', 'testnet', 'preprod', 'mainnet', 'stagenet', 'undeployed'] as const;
+export const VALID_NIGHTGATE_NETWORKS = ['preview', 'preprod', 'mainnet', 'stagenet', 'undeployed'] as const;
 
 export type NightgateNetwork = (typeof VALID_NIGHTGATE_NETWORKS)[number];
+
+export function isNightgateNetwork(value: unknown): value is NightgateNetwork {
+    return (VALID_NIGHTGATE_NETWORKS as readonly unknown[]).includes(value);
+}
 
 /** Configuration under `cds.requires.nightgate`. */
 export interface NightgateConfig {
@@ -24,15 +28,10 @@ export interface NightgateConfig {
     proofServerUrl?: string;
     /** Timeout in ms for one proof server request. Default 300000. */
     proofTimeoutMs?: number | string;
-    /** Base folder of the proving keys for contracts registered by path. Default `./contracts`. */
-    zkConfigBasePath?: string;
-    privateStateBackend?: PrivateStateBackend;
     sessionTtlMs?: number;
     runtimeMode?: 'single-instance';
     /** Number of running instances. Startup fails for any value other than 1. */
     replicaCount?: number;
-    /** Allows SQLite in production. Emergency use only. */
-    allowProductionSqlite?: boolean;
     palletMap?: Record<string, { name: string; txType: string; isShielded?: boolean; isSystem?: boolean }>;
     crawler?: Partial<CrawlerConfig>;
     contracts?: Record<string, {
@@ -76,7 +75,6 @@ export const DEFAULT_NETWORK: NightgateNetwork = 'mainnet';
 // hosted ones with the token in the URL), see docs/self-hosted.md.
 export const DEFAULT_NODE_URLS: Partial<Record<NightgateNetwork, string>> = {
     preview: 'wss://rpc.preview.midnight.network/',
-    testnet: 'ws://127.0.0.1:9944',
     undeployed: 'ws://127.0.0.1:9944'
 };
 
@@ -86,10 +84,6 @@ export const DEFAULT_INDEXER_URLS: Partial<Record<NightgateNetwork, { http: stri
         ws: 'wss://indexer.preview.midnight.network/api/v4/graphql/ws'
     },
     // 127.0.0.1, not localhost: Node resolves localhost to ::1 first, which a node bound to IPv4 refuses.
-    testnet: {
-        http: 'http://127.0.0.1:8088/api/v4/graphql',
-        ws: 'ws://127.0.0.1:8088/api/v4/graphql/ws'
-    },
     // An older local indexer that serves only /api/v3 needs the indexer URLs set explicitly.
     undeployed: {
         http: 'http://127.0.0.1:8088/api/v4/graphql',
@@ -109,19 +103,6 @@ export function missingEndpointsMessage(network: NightgateNetwork, nodeUrl: stri
 }
 
 export const DEFAULT_PROOF_SERVER_URL = 'http://localhost:6300';
-export const DEFAULT_ZK_CONFIG_BASE = './contracts';
-
-export const VALID_PRIVATE_STATE_BACKENDS = ['cap-db', 'level'] as const;
-export type PrivateStateBackend = (typeof VALID_PRIVATE_STATE_BACKENDS)[number];
-export const DEFAULT_PRIVATE_STATE_BACKEND: PrivateStateBackend = 'cap-db';
-
-export function getConfiguredPrivateStateBackend(config?: NightgateConfig): PrivateStateBackend {
-    const raw = configEnum('NIGHTGATE_PRIVATE_STATE_BACKEND') || config?.privateStateBackend;
-    if (raw && (VALID_PRIVATE_STATE_BACKENDS as readonly string[]).includes(raw)) {
-        return raw as PrivateStateBackend;
-    }
-    return DEFAULT_PRIVATE_STATE_BACKEND;
-}
 
 export const VALID_GRANTEE_BINDINGS = ['wallet', 'did', 'custom'] as const;
 export type GranteeBinding = (typeof VALID_GRANTEE_BINDINGS)[number];
@@ -190,7 +171,6 @@ export interface SubmissionEndpointsConfig {
     indexerHttpUrl: string;
     indexerWsUrl: string;
     proofServerUrl: string;
-    zkConfigBasePath: string;
 }
 
 /** NIGHTGATE_PROVING_MODE if set. Otherwise `server` when a proof server URL is configured, else `wasm`. */
@@ -222,8 +202,7 @@ export function resolveSubmissionEndpoints(
     return {
         indexerHttpUrl: httpOverride || defaults?.http || '',
         indexerWsUrl: wsOverride || (httpOverride ? deriveIndexerWsUrl(httpOverride) : defaults?.ws || ''),
-        proofServerUrl: configString('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl || DEFAULT_PROOF_SERVER_URL,
-        zkConfigBasePath: process.env.NIGHTGATE_ZK_CONFIG_BASE?.trim() || config?.zkConfigBasePath || DEFAULT_ZK_CONFIG_BASE
+        proofServerUrl: configString('NIGHTGATE_PROOF_SERVER_URL') || config?.proofServerUrl || DEFAULT_PROOF_SERVER_URL
     };
 }
 
@@ -242,12 +221,44 @@ export function resolveOverrideIndexerEndpoints(
     };
 }
 
-/** Warns when the no longer supported `crawlerlessChainConfirm` option is set. */
-export function warnIfCrawlerlessChainConfirmSet(config?: NightgateConfig, warn: (msg: string) => void = (m) => cds.log('nightgate:config').warn(m)): boolean {
-    const envRaw = process.env.NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM;
-    const set = (typeof envRaw === 'string' && envRaw.trim() !== '') || config?.crawlerlessChainConfirm !== undefined;
-    if (set) warn('crawlerlessChainConfirm / NIGHTGATE_CRAWLERLESS_CHAIN_CONFIRM is no longer an option: the indexer confirmer is the only chain-evidence path and always runs; remove the setting');
-    return set;
+export const RETIRED_DEPLOY_SWITCH = 'is no longer a setting of the server: a grant with allowDeploy and budget left decides, and a caller without a token may deploy; remove it';
+
+/** Variables an older version read, each with what holds now. */
+export const RETIRED_SETTINGS: Readonly<Record<string, string>> = {
+    NIGHTGATE_SPONSOR_ALLOW_DEPLOY: RETIRED_DEPLOY_SWITCH,
+    NIGHTGATE_ALLOW_PRODUCTION_SQLITE: 'is no longer a setting: SQLite with one instance is a supported way to run; remove it',
+    NIGHTGATE_BATCH_SEGMENT_MODE: 'is no longer a setting: a batch is always ordered and checked before proving; remove it',
+    NIGHTGATE_PRIVATE_STATE_BACKEND: 'is no longer a setting: private contract state is stored encrypted in the database; remove it',
+    NIGHTGATE_ZK_CONFIG_BASE: 'is no longer a setting: nothing read it, and a relative contract path counts from the working directory; remove it',
+    NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES: 'is no longer a setting: every stored secret is bound to its column and row; remove it',
+    NIGHTGATE_ASSUME_DB_NETWORK: 'is no longer a setting: a database records its network; remove it'
+};
+
+/** The key a retired variable had under `cds.requires.nightgate`. */
+const RETIRED_CAP_KEYS: Readonly<Record<string, string>> = { NIGHTGATE_ZK_CONFIG_BASE: 'zkConfigBasePath' };
+
+/** Warns for every retired setting that is still set, as a variable or in the CDS configuration. Returns how many are. */
+export function warnIfRetiredSettingsSet(config?: NightgateConfig, warn: (msg: string) => void = (m) => cds.log('nightgate:config').warn(m)): number {
+    let found = 0;
+    for (const [name, now] of Object.entries(RETIRED_SETTINGS)) {
+        const capKey = RETIRED_CAP_KEYS[name] ?? camelConfigKey(name);
+        const set = [
+            String(process.env[name] ?? '').trim() !== '' && name,
+            capConfigValue(config as Record<string, unknown> | undefined, capKey) !== undefined && `cds.requires.nightgate.${capKey}`
+        ].filter((spelling): spelling is string => typeof spelling === 'string');
+        for (const spelling of set) warn(`${spelling} ${now}`);
+        found += set.length;
+    }
+    return found;
+}
+
+/** Warns for every setting written under a key the server does not read, and names the key it reads. */
+export function warnIfFormerConfigKeys(config?: NightgateConfig, warn: (msg: string) => void = (m) => cds.log('nightgate:config').warn(m)): number {
+    const former = formerCapKeys(config as Record<string, unknown> | undefined);
+    for (const { former: key, now } of former) warn(`cds.requires.nightgate.${key} is not read; the setting is ${now}`);
+    const renamed = formerEnvKeys(process.env);
+    for (const { former: key, now } of renamed) warn(`${key} is not read; the setting is ${now}`);
+    return former.length + renamed.length;
 }
 
 export function resolveNightgateRuntimeConfig(config: NightgateConfig = {}): {
@@ -259,8 +270,8 @@ export function resolveNightgateRuntimeConfig(config: NightgateConfig = {}): {
     invalidNetwork?: string;
 } {
     const rawCrawlerConfig = config.crawler || {};
-    const fetchConcurrencyEnv = configInt('NIGHTGATE_FETCH_CONCURRENCY');
-    const rpcBatchSizeEnv = configInt('NIGHTGATE_RPC_BATCH_SIZE');
+    const fetchConcurrencyEnv = configInt('NIGHTGATE_CRAWLER_FETCH_CONCURRENCY');
+    const rpcBatchSizeEnv = configInt('NIGHTGATE_CRAWLER_RPC_BATCH_SIZE');
     const startHeightEnv = configInt('NIGHTGATE_CRAWLER_START_HEIGHT');
     const maxBlocksPerSecondEnv = configInt('NIGHTGATE_CRAWLER_MAX_BPS');
     const crawlerEnabledOverride = configBool('NIGHTGATE_CRAWLER_ENABLED');
@@ -309,10 +320,10 @@ export function crawlerStartConfig(resolved: Pick<ReturnType<typeof resolveNight
 
 export function mainnetSubmissionBlockReason(config: NightgateConfig): string | null {
     const { network } = resolveNightgateRuntimeConfig(config);
-    if (network === 'mainnet' && config.allowMainnetSubmission !== true) {
-        return 'Mainnet submission is disabled. Set cds.requires.nightgate.allowMainnetSubmission=true ' +
-            'to enable it. Mainnet has known submission instability (1016 Immediately Dropped, ' +
-            'forum thread 1190); read-only indexing is unaffected.';
+    const allowed = configBool('NIGHTGATE_ALLOW_MAINNET_SUBMISSION') ?? config.allowMainnetSubmission === true;
+    if (network === 'mainnet' && !allowed) {
+        return 'Mainnet submission is off: a transaction on mainnet spends real NIGHT and DUST. ' +
+            'Set NIGHTGATE_ALLOW_MAINNET_SUBMISSION=true to turn it on. Indexing and reads work either way.';
     }
     return null;
 }

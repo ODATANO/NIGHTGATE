@@ -6,7 +6,7 @@ import { resolveContract, type ResolvedContract } from '../contract-registry';
 import { attesterIdForSession, SessionNotFoundError, type WalletMaterialFactory } from '../wallet-material-factory';
 import { resolveFeeSponsor, type ResolvedFeeSponsor } from '../fee-sponsor';
 import { loadCircuitArgTypes } from '../arg-coercion';
-import { resolveNightgateRuntimeConfig, type NightgateNetwork, VALID_NIGHTGATE_NETWORKS, getConfiguredPrivateStateBackend, getNightgateConfig } from '../../utils/nightgate-config';
+import { resolveNightgateRuntimeConfig, type NightgateNetwork, VALID_NIGHTGATE_NETWORKS, getNightgateConfig } from '../../utils/nightgate-config';
 import { type ContractProvidersConfig } from '../../midnight/providers';
 import { startJob } from '../background-jobs';
 import { reindexDisclosuresForContract } from '../disclosure-indexer';
@@ -48,12 +48,12 @@ export function createStateVerifiers(deps: Pick<SubmissionDeps, 'contractResolve
         contractAddress: string,
         attesterId: string,
         payloadHash: string,
-        compiledArtifactRef?: string | null,
+        contractName?: string | null,
         networkOverride?: NightgateNetwork,
         recordedArtifactDigest?: string | null
     ): Promise<boolean> {
         try {
-            const compiledRef = vaultRef(compiledArtifactRef);
+            const compiledRef = vaultRef(contractName);
             // The resolver throws if the contract files no longer match the recorded digest.
             // That returns false, so a changed contract never reports a false match.
             const resolved = await contractResolver(compiledRef, recordedArtifactDigest ?? undefined);
@@ -76,7 +76,7 @@ export function createStateVerifiers(deps: Pick<SubmissionDeps, 'contractResolve
         try {
             // Use the contract and network recorded when the proof was made.
             // A later re-registration then cannot change the result.
-            const rowRef = vaultRef(row.compiledArtifactRef);
+            const rowRef = vaultRef(row.contractName);
             const resolved = await contractResolver(rowRef, row.artifactDigest ?? undefined);
             const recordedNetwork = row.network && (VALID_NIGHTGATE_NETWORKS as readonly string[]).includes(row.network)
                 ? row.network as NightgateNetwork
@@ -98,7 +98,7 @@ export function createStateVerifiers(deps: Pick<SubmissionDeps, 'contractResolve
                 payloadHashB: docKind ? (row.payloadHashB || undefined) : undefined,
                 attesterIdB: docKind ? (row.attesterIdB || undefined) : undefined,
                 allowedMask: row.predicate === 'documentIntegrity' ? Number(row.allowedMask) : undefined,
-                k: row.predicate === 'documentDiff' ? Number(row.threshold) : undefined,
+                k: row.predicate === 'documentDiff' ? row.k ?? undefined : undefined,
                 slotWidth: vaultDims(rowRef).width,
                 artifactPath: resolved.artifactPath,
                 artifactDigest: resolved.artifactDigest,
@@ -119,8 +119,8 @@ export type StateVerifiers = ReturnType<typeof createStateVerifiers>;
 export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'contractResolver' | 'disclosureReindexer'>) {
     const { db, contractResolver, disclosureReindexer } = deps;
 
-    /** `active` is not set here. The reindex reads it from the ledger right after. */
-    function confirmedDisclosureLevel(level: number, txHash: string, changedAt: string, landedHeight: number | null): Record<string, unknown> {
+    /** `isActive` is not set here. The reindex reads it from the ledger right after. */
+    function confirmedDisclosureLevel(level: number, txHash: string | null, changedAt: string, landedHeight: number | null): Record<string, unknown> {
         return { level, pendingLevel: null, grantedTxHash: txHash, revokedTxHash: null, modifiedAt: changedAt, ...heightStamp(landedHeight) };
     }
 
@@ -160,7 +160,7 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
     }
 
     /** Reindexes after a landed grant or revoke. On failure a `reindexDisclosures` job retries it under the same session. */
-    async function reindexAfterSubmit(contractAddress: string, resolved: ResolvedContract, atHeight: number | null, origin: BackgroundJob, compiledArtifactRef: string): Promise<void> {
+    async function reindexAfterSubmit(contractAddress: string, resolved: ResolvedContract, atHeight: number | null, origin: BackgroundJob, contractName: string): Promise<void> {
         try {
             await runDisclosureReindex(contractAddress, resolved, atHeight);
             return;
@@ -174,9 +174,10 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
                 idempotencyKey: `reindex:${contractAddress.toLowerCase()}:${atHeight ?? 'tip'}:${origin.ID}`,
                 request: { contractAddress, atHeight, afterJob: origin.ID },
                 requestedBy: origin.requestedBy ?? undefined,
+                grantId: origin.grantId ?? undefined,
                 commandVersion: 1,
                 encryptCommand: false,
-                command: { op: 'reindexDisclosures', contractAddress, compiledArtifactRef, atHeight }
+                command: { op: 'reindexDisclosures', contractAddress, contractName, atHeight }
             });
         } catch (err) {
             cds.log('nightgate').error(`could not queue the reindexDisclosures retry for ${contractAddress.slice(0, 16)}; run reindexDisclosures by hand: ${errorMessage(err).slice(0, 200)}`);
@@ -184,9 +185,9 @@ export function createDisclosureProjection(deps: Pick<SubmissionDeps, 'db' | 'co
     }
 
     async function executeReindexDisclosures(raw: unknown, job: BackgroundJob): Promise<unknown> {
-        const command = raw as { op: string; contractAddress: string; compiledArtifactRef: string; atHeight: number | null; artifactDigest?: string };
+        const command = raw as { op: string; contractAddress: string; contractName: string; atHeight: number | null; artifactDigest?: string };
         if (!command || command.op !== 'reindexDisclosures') throw new Error(`Persisted command operation '${command?.op}' is incompatible with ${job.kind}`);
-        const resolved = await contractResolver(command.compiledArtifactRef, command.artifactDigest);
+        const resolved = await contractResolver(command.contractName, command.artifactDigest);
         const windowMs = configMs('NIGHTGATE_DISCLOSURE_REINDEX_RETRY_MS');
         const startedAt = Date.now();
         let lastError: unknown;
@@ -214,14 +215,14 @@ export function createSubmissionSupport(deps: Pick<SubmissionDeps, 'db' | 'attes
     const { db, attesterIdResolver } = deps;
 
     /**
-     * The attester id an issue action uses, which is the session's own unless the caller names one. A new content root can only be stored under the session's own id, because the contract keys it by caller.
+     * The attester id a prove action uses, which is the session's own unless the caller names one. A new content root can only be stored under the session's own id, because the contract keys it by caller.
      */
     async function resolveAttester(req: ActionRequest<unknown, unknown>, sessionId: string | null | undefined, requested: string | null | undefined, anchorsRoot: boolean): Promise<string | null> {
         let own: string;
         try {
             own = await attesterIdResolver({ sessionId: sessionId!, db, expectedUserId: req.user?.id });
         } catch (err) {
-            if (err instanceof SessionNotFoundError) { req.reject(401, err.message); return null; }
+            if (err instanceof SessionNotFoundError) { req.reject(err); return null; }
             throw err;
         }
         const attesterId = requested ? requested.toLowerCase() : own;
@@ -240,7 +241,6 @@ export function createSubmissionSupport(deps: Pick<SubmissionDeps, 'db' | 'attes
     ): TransactionSubmitterDeps {
         const nightgateConfig = getNightgateConfig();
         const { network, submissionEndpoints } = resolveNightgateRuntimeConfig(nightgateConfig);
-        const privateStateBackend = getConfiguredPrivateStateBackend(nightgateConfig);
 
         const contractProvidersConfig: ContractProvidersConfig = {
             indexerHttpUrl: submissionEndpoints.indexerHttpUrl,
@@ -251,7 +251,7 @@ export function createSubmissionSupport(deps: Pick<SubmissionDeps, 'db' | 'attes
 
         return {
             contractProvidersConfig,
-            walletMaterial: { ...wallet, privateStateBackend: wallet.privateStateBackend ?? privateStateBackend },
+            walletMaterial: wallet,
             db,
             network: network as NightgateNetwork,
             sponsorAccountId

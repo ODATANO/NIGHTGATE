@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-    CONFIG_TABLE, camelConfigKey, parseConfigValue, configSpec, configTableMarkdownRows, resolveConfigTable
+    CONFIG_TABLE, camelConfigKey, capConfigKey, capConfigValue, formerCapKeys, formerEnvKeys, parseConfigValue, configSpec, configTableMarkdownRows, resolveConfigTable
 } from '../../srv/utils/config-table';
 import {
     __resetConfigForTests, configMs, configNumber, configInt, configBool, configFlag, configString, configEnum, configList,
@@ -15,8 +15,8 @@ import {
 } from '../../srv/utils/config';
 
 const KEYS = ['NIGHTGATE_WORKER_RPC_TIMEOUT_MS', 'NIGHTGATE_SAVE_INTERVAL_MS', 'NIGHTGATE_CRAWLER_ENABLED', 'NIGHTGATE_PROVING_MODE',
-    'NIGHTGATE_FEE_SPONSOR_SESSION', 'NIGHTGATE_PREWARM_STALL_MS', 'NIGHTGATE_SIGNING_KEY_RATE_LIMIT', 'NIGHTGATE_WORKER_YOUNG_GEN_MB',
-    'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_PRIVATE_STATE_BACKEND', 'NIGHTGATE_INSTANCE_ID'];
+    'NIGHTGATE_FEE_SPONSOR_SESSIONS', 'NIGHTGATE_PREWARM_STALL_MS', 'NIGHTGATE_SIGNING_RATE_LIMIT', 'NIGHTGATE_WORKER_YOUNG_GEN_MB',
+    'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_INSTANCE_ID'];
 const saved: Record<string, string | undefined> = {};
 let warnings: string[] = [];
 
@@ -70,7 +70,7 @@ describe('config table: parsing rules', () => {
         expect(warnings.at(-1)).toMatch(/is not a boolean/);
         delete process.env.NIGHTGATE_CRAWLER_ENABLED;
         expect(configBool('NIGHTGATE_CRAWLER_ENABLED')).toBeUndefined();   // tri-state: unset
-        expect(configFlag('NIGHTGATE_SPONSOR_ALLOW_DEPLOY')).toBe(false);   // defaulted
+        expect(configFlag('NIGHTGATE_SPONSOR_ALLOW_SWAPS')).toBe(false);   // defaulted
     });
 
     it('enums match case-insensitively and report the canonical spelling', () => {
@@ -79,15 +79,15 @@ describe('config table: parsing rules', () => {
         process.env.NIGHTGATE_PROVING_MODE = 'gpu';
         expect(configEnum('NIGHTGATE_PROVING_MODE')).toBeUndefined();
         expect(warnings.at(-1)).toMatch(/is not one of server \| wasm/);
-        process.env.NIGHTGATE_PRIVATE_STATE_BACKEND = 'Level';
-        expect(configEnum('NIGHTGATE_PRIVATE_STATE_BACKEND')).toBe('level');
+        process.env.NIGHTGATE_PROVING_MODE = 'Server';
+        expect(configEnum('NIGHTGATE_PROVING_MODE')).toBe('server');
     });
 
     it('lists split on commas and drop blanks', () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = ' a , ,b,';
-        expect(configList('NIGHTGATE_FEE_SPONSOR_SESSION')).toEqual(['a', 'b']);
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
-        expect(configList('NIGHTGATE_FEE_SPONSOR_SESSION')).toEqual([]);
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = ' a , ,b,';
+        expect(configList('NIGHTGATE_FEE_SPONSOR_SESSIONS')).toEqual(['a', 'b']);
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
+        expect(configList('NIGHTGATE_FEE_SPONSOR_SESSIONS')).toEqual([]);
     });
 
     it('accessors refuse a key of another kind and an undeclared key', () => {
@@ -103,9 +103,9 @@ describe('config table: parsing rules', () => {
     });
 
     it('parseConfigValue handles CAP-typed values (number, boolean, array)', () => {
-        expect(parseConfigValue(configSpec('NIGHTGATE_SIGNING_KEY_RATE_LIMIT'), 25).value).toBe(25);
+        expect(parseConfigValue(configSpec('NIGHTGATE_SIGNING_RATE_LIMIT'), 25).value).toBe(25);
         expect(parseConfigValue(configSpec('NIGHTGATE_CRAWLER_ENABLED'), false).value).toBe(false);
-        expect(parseConfigValue(configSpec('NIGHTGATE_FEE_SPONSOR_SESSION'), ['x', ' y ']).value).toEqual(['x', 'y']);
+        expect(parseConfigValue(configSpec('NIGHTGATE_FEE_SPONSOR_SESSIONS'), ['x', ' y ']).value).toEqual(['x', 'y']);
     });
 });
 
@@ -114,6 +114,75 @@ describe('config table: CAP mapping', () => {
         expect(camelConfigKey('NIGHTGATE_WORKER_RPC_TIMEOUT_MS')).toBe('workerRpcTimeoutMs');
         expect(camelConfigKey('NIGHTGATE_NETWORK')).toBe('network');
         expect(camelConfigKey('ENCRYPTION_KEY_ACTIVE')).toBe('encryptionKeyActive');
+    });
+
+    it('every setting has one CDS key: the one its text names, else the camel case of its variable', () => {
+        const named = CONFIG_TABLE.filter(spec => spec.capKey !== undefined);
+        expect(named.length).toBe(13);
+        for (const spec of named) expect(spec.doc, spec.key).toContain('`' + spec.capKey + '`');
+        // A text that says which CDS key a variable overrides must agree with the key the server reads.
+        for (const spec of CONFIG_TABLE) {
+            const override = /^Override `([A-Za-z0-9_.]+)`/.exec(spec.doc)?.[1];
+            if (override) expect([spec.key, capConfigKey(spec)]).toEqual([spec.key, override]);
+        }
+        expect(new Set(CONFIG_TABLE.map(capConfigKey)).size).toBe(CONFIG_TABLE.length);
+    });
+
+    it('reads a setting from its one CDS key only, also where that key is nested', () => {
+        const read = (overrides: Record<string, unknown>) => resolveConfigTable({}, overrides).values;
+        expect(read({ crawler: { fetchConcurrency: 7, enabled: false } })).toMatchObject({ NIGHTGATE_CRAWLER_FETCH_CONCURRENCY: 7, NIGHTGATE_CRAWLER_ENABLED: false });
+        expect(read({ feeSponsorSessions: ['s1', 's2'] }).NIGHTGATE_FEE_SPONSOR_SESSIONS).toEqual(['s1', 's2']);
+        expect(read({ workerRpcTimeoutMs: 45000 }).NIGHTGATE_WORKER_RPC_TIMEOUT_MS).toBe(45000);
+        // The camel case of the variable is no second spelling of a setting that has its own key.
+        const former = read({ fetchConcurrency: 7, crawlerEnabled: false, feeSponsorSession: 's1' });
+        expect([former.NIGHTGATE_CRAWLER_FETCH_CONCURRENCY, former.NIGHTGATE_CRAWLER_ENABLED, former.NIGHTGATE_FEE_SPONSOR_SESSIONS])
+            .toEqual([undefined, undefined, undefined]);
+        expect(capConfigValue({ crawler: 'not an object' }, 'crawler.enabled')).toBeUndefined();
+        expect(capConfigValue(null, 'crawler.enabled')).toBeUndefined();
+    });
+
+    it('a renamed variable is not read under its former name, and a start can name it', () => {
+        const renamed = CONFIG_TABLE.filter(spec => spec.formerKey !== undefined);
+        expect(renamed.map(spec => [spec.formerKey, spec.key])).toEqual([
+            ['NIGHTGATE_FETCH_CONCURRENCY', 'NIGHTGATE_CRAWLER_FETCH_CONCURRENCY'], ['NIGHTGATE_RPC_BATCH_SIZE', 'NIGHTGATE_CRAWLER_RPC_BATCH_SIZE'],
+            ['NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS', 'NIGHTGATE_SUBMIT_INDEXER_VISIBLE_MS'], ['NIGHTGATE_SPONSOR_WAIT', 'NIGHTGATE_SUBMIT_WAIT'],
+            ['NIGHTGATE_FEE_SPONSOR_SESSION', 'NIGHTGATE_FEE_SPONSOR_SESSIONS'], ['NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS', 'NIGHTGATE_SPONSOR_MAX_INPUTS'],
+            ['NIGHTGATE_SIGNING_KEY_RATE_LIMIT', 'NIGHTGATE_SIGNING_RATE_LIMIT']
+        ].sort((a, b) => CONFIG_TABLE.findIndex(s => s.key === a[1]) - CONFIG_TABLE.findIndex(s => s.key === b[1])));
+        // No former name is a current name of another setting.
+        expect(renamed.filter(spec => CONFIG_TABLE.some(other => other.key === spec.formerKey))).toEqual([]);
+
+        const read = (env: Record<string, string>, overrides?: Record<string, unknown>) => resolveConfigTable(env, overrides).values;
+        expect(read({ NIGHTGATE_FEE_SPONSOR_SESSION: 's1,s2' }).NIGHTGATE_FEE_SPONSOR_SESSIONS).toBeUndefined();
+        expect(read({ NIGHTGATE_FEE_SPONSOR_SESSION: 'old', NIGHTGATE_FEE_SPONSOR_SESSIONS: 'new' }).NIGHTGATE_FEE_SPONSOR_SESSIONS).toEqual(['new']);
+        expect(read({ NIGHTGATE_SPONSOR_WAIT: 'finalized' }).NIGHTGATE_SUBMIT_WAIT).toBe('inblock');
+        expect(read({}, { sponsorWait: 'finalized' }).NIGHTGATE_SUBMIT_WAIT).toBe('inblock');
+        expect(formerCapKeys({ sponsorWait: 'finalized' })).toEqual([{ former: 'sponsorWait', now: 'submitWait' }]);
+        expect(formerEnvKeys({ NIGHTGATE_SPONSOR_WAIT: 'finalized', NIGHTGATE_SUBMIT_WAIT: 'inblock', NIGHTGATE_FETCH_CONCURRENCY: ' ' }))
+            .toEqual([{ former: 'NIGHTGATE_SPONSOR_WAIT', now: 'NIGHTGATE_SUBMIT_WAIT' }]);
+    });
+
+    it('the lifetime of a wallet session is a checked number, whatever form the configuration gives it', () => {
+        const ttl = (env: Record<string, string>, overrides?: Record<string, unknown>) => resolveConfigTable(env, overrides).values.NIGHTGATE_SESSION_TTL_MS;
+        expect(ttl({})).toBe(86_400_000);
+        // Text from the CDS configuration used to be added to the clock as text, which broke connectWallet.
+        expect(ttl({}, { sessionTtlMs: '3600000' })).toBe(3_600_000);
+        expect(ttl({ NIGHTGATE_SESSION_TTL_MS: '120000' }, { sessionTtlMs: 3_600_000 })).toBe(120_000);
+        // Below the minimum of one minute the default applies, with a warning.
+        expect(ttl({}, { sessionTtlMs: 5 })).toBe(86_400_000);
+        expect(ttl({}, { sessionTtlMs: 'soon' })).toBe(86_400_000);
+    });
+
+    it('names a setting written under a spelling the server does not read', () => {
+        expect(formerCapKeys({ crawlerEnabled: false, fetchConcurrency: 7, workerRpcTimeoutMs: 1, crawler: { enabled: true } })).toEqual([
+            { former: 'crawlerEnabled', now: 'crawler.enabled' }, { former: 'fetchConcurrency', now: 'crawler.fetchConcurrency' }
+        ]);
+        // The camel case of the renamed variable is no key of a setting that has its own key either.
+        expect(formerCapKeys({ crawlerFetchConcurrency: 7, feeSponsorSession: 's1' })).toEqual([
+            { former: 'crawlerFetchConcurrency', now: 'crawler.fetchConcurrency' }, { former: 'feeSponsorSession', now: 'feeSponsorSessions' }
+        ]);
+        expect(formerCapKeys({ crawler: { enabled: false }, feeSponsorSessions: 's1' })).toEqual([]);
+        expect(formerCapKeys(undefined)).toEqual([]);
     });
 
     it('the CAP block sets a knob; the env variable wins; secrets are env only', () => {

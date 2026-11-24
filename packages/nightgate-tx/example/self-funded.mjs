@@ -15,8 +15,8 @@ import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createTxBuilder } from '@odatano/nightgate-tx';
 import {
-    deserializeTransaction, txIdentifiers, submitFinalized,
-    isTransportFailure, isAlreadyImported, waitLanded, sealTx, openTx
+    deserializeTransaction, txIds, submitFinalized,
+    isTransportFailure, isAlreadyImported, waitLanded, sealTx, openTx, waitForWalletSync
 } from '@odatano/nightgate-tx/txbuilder';
 import { prepareAttest } from '@odatano/nightgate-tx/calls';
 import { Contract } from '@odatano/nightgate-tx/attestation-vault';
@@ -86,7 +86,7 @@ const facade = await WalletFacade.init({
 await facade.start(seeds);
 // A fee proven against a stale dust root is rejected (1010/170), so the wallet syncs to the tip first.
 console.log('syncing the fee wallet to the chain tip (a fresh seed syncs from genesis)...');
-await facade.waitForSyncedState();
+await waitForWalletSync(facade, configuration.forks);
 
 // 3. Pay the fee, submit, confirm. The wallet takes and returns transactions as sealed handles.
 //    After a reject for good, revertTransaction frees the coins the fee reserved.
@@ -97,7 +97,7 @@ const recipe = await facade.balanceFinalizedTransaction(
 );
 const handle = await facade.finalizeRecipe(recipe);
 const finalized = await openTx(handle);
-const identifier = txIdentifiers(finalized).at(-1);
+const identifier = txIds(finalized).at(-1);
 console.log(`submitting ${identifier.slice(0, 16)}... to ${NODE_URL}`);
 let landed;
 for (let attempt = 0; !landed; attempt++) {

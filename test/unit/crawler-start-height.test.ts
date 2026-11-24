@@ -28,7 +28,7 @@ describe('MidnightCrawler catch-up start height', () => {
     const crawler = new MidnightCrawler({} as any, { enabled: true });
     const getCatchUpStartHeight = (crawler as any).getCatchUpStartHeight.bind(crawler) as (state?: unknown) => number;
 
-    it('starts from block 0 when no indexed hash exists yet', () => {
+    it('answers 0, the empty index, when no indexed hash exists', () => {
         expect(getCatchUpStartHeight()).toBe(0);
         expect(getCatchUpStartHeight({ lastIndexedHeight: 0, lastIndexedHash: null })).toBe(0);
     });

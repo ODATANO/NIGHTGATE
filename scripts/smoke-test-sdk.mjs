@@ -7,7 +7,6 @@ const packages = [
     '@midnight-ntwrk/midnight-js-indexer-public-data-provider',
     '@midnight-ntwrk/midnight-js-http-client-proof-provider',
     '@midnight-ntwrk/midnight-js-node-zk-config-provider',
-    '@midnight-ntwrk/midnight-js-level-private-state-provider',
     '@midnight-ntwrk/compact-runtime',
     '@midnightntwrk/ledger-v9',
     '@midnightntwrk/wallet-sdk-facade'

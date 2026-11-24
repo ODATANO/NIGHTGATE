@@ -10,7 +10,7 @@ const { indexerQuery, IndexerHttpError, IndexerQueryError } = require('../../srv
 
 /** The client behind `api`: a connected `connect()` client, or the options to create one. */
 export function apiClientFor(api) {
-    if (api && typeof api.contractStateAt === 'function' && typeof api.transactionByIdentifier === 'function') return api;
+    if (api && typeof api.contractStateAt === 'function' && typeof api.transactionByTxId === 'function') return api;
     if (api && typeof api === 'object' && api.baseUrl) return connect(api);
     throw new Error('api must be the options for connect() ({ baseUrl, agentToken, ... }) or a connected client');
 }
@@ -93,7 +93,7 @@ export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, pr
         const deadline = Date.now() + retryMs;
         for (;;) {
             try {
-                return await client.contractStateAt({ address, height });
+                return await client.contractStateAt({ contractAddress: address, height });
             } catch (err) {
                 const status = Number(err?.status);
                 if ((status !== 503 && status !== 429) || Date.now() >= deadline) throw err;
@@ -137,14 +137,9 @@ export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, pr
     let latestPin = null;
     const noBlockYet = () => new Error('apiPublicDataProvider: the NIGHTGATE server has no indexed block yet; building through { api } needs a server whose crawler runs');
     async function readBlock(height) {
-        if (typeof client.callFunction !== 'function') throw new Error('apiPublicDataProvider: the client cannot read blocks (no callFunction)');
-        try {
-            const block = height == null ? await client.callFunction('Blocks/latest') : await client.callFunction('Blocks/byHeight', { height });
-            return block?.hash ? block : null;
-        } catch (err) {
-            if (Number(err?.status) === 404) return null;
-            throw err;
-        }
+        if (typeof client.blockAt !== 'function') throw new Error('apiPublicDataProvider: the client cannot read blocks (no blockAt)');
+        const block = await client.blockAt(height);
+        return block?.hash ? block : null;
     }
     async function blockAt(height) {
         const block = await readBlock(height);
@@ -222,7 +217,7 @@ export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, pr
 
         async watchForDeployTxData(address) {
             const deploy = await waitFor(`the deploy of contract ${address}`, () => client.contractDeploy(address));
-            const tx = await client.ledgerTransaction(deploy.txHash);
+            const tx = await client.ledgerTransaction(deploy.txHash ?? deploy.extrinsicHash);
             if (!tx) throw new Error(`the NIGHTGATE server holds no ledger transaction for the deploy of contract ${address}`);
             const deployVersion = Number.isInteger(deploy.protocolVersion) ? deploy.protocolVersion : protocolVersion;
             const era = mjProtocol.versionOfRecord({ protocolVersion: deployVersion });
@@ -232,7 +227,7 @@ export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, pr
                 status: TX_STATUS[deploy.status] ?? deploy.status ?? undefined,
                 txId: deploy.txId,
                 identifiers: deploy.identifiers,
-                txHash: deploy.ledgerTxHash ?? deploy.txHash,
+                txHash: deploy.txHash ?? deploy.extrinsicHash,
                 blockHeight: deploy.blockHeight,
                 blockHash: deploy.blockHash,
                 blockTimestamp: deploy.blockTimestamp,

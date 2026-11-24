@@ -1,15 +1,15 @@
-/** Main-thread functions that forward `sendNight` and wallet diagnostics to the wallet worker thread. */
+/** Main-thread functions that forward `sendToken` and wallet diagnostics to the wallet worker thread. */
 
 import {
-    walletTransferNight,
+    walletTransferToken,
     type SubmitIntentHook,
     walletGetBalance,
     walletEstimateTransferFee
 } from '../midnight/wallet-worker-client';
 
-// ---- sendNight ------------------------------------------------------------
+// ---- sendToken ------------------------------------------------------------
 
-export interface SendNightArgs {
+export interface SendTokenArgs {
     /** The account id. The worker keeps one wallet per account under this key. */
     cacheKey: string;
     /** Shielded (`mn_shield-addr_...`) or unshielded (`mn_addr_...`). */
@@ -20,26 +20,26 @@ export interface SendNightArgs {
     ttlIso?: string;
     syncTimeoutMs?: number;
     /** Raw token type (64 hex) to send instead of NIGHT. */
-    tokenTypeHex?: string;
+    tokenType?: string;
     /** Called before the broadcast. It saves the transaction id, and only then the worker sends. */
     onSubmitIntent?: SubmitIntentHook;
 }
 
-export interface SendNightResult {
+export interface SendTokenResult {
     txId: string;
     toLedger: 'shielded' | 'unshielded';
     amount: string;
     receiverAddress: string;
 }
 
-export async function sendNight(args: SendNightArgs): Promise<SendNightResult> {
-    return walletTransferNight({
+export async function sendToken(args: SendTokenArgs): Promise<SendTokenResult> {
+    return walletTransferToken({
         sessionId:       args.cacheKey,
         receiverAddress: args.receiverAddress,
         amount:          args.amount,
         ttlIso:          args.ttlIso,
         syncTimeoutMs:   args.syncTimeoutMs,
-        tokenTypeHex:    args.tokenTypeHex
+        tokenType:    args.tokenType
     }, args.onSubmitIntent);
 }
 
@@ -64,14 +64,14 @@ export async function getWalletBalance(args: GetWalletBalanceArgs): Promise<Wall
 
 // ---- Diagnostics: estimate fees ------------------------------------------
 
-export interface EstimateSendNightFeeArgs {
+export interface EstimateSendTokenFeeArgs {
     cacheKey: string;
     receiverAddress: string;
     amount: string;
     ttlIso?: string;
     syncTimeoutMs?: number;
     /** Raw token type (64 hex) to price instead of NIGHT. */
-    tokenTypeHex?: string;
+    tokenType?: string;
 }
 
 export interface EstimateFeeResult {
@@ -80,13 +80,13 @@ export interface EstimateFeeResult {
     toLedger: 'shielded' | 'unshielded';
 }
 
-export async function estimateSendNightFee(args: EstimateSendNightFeeArgs): Promise<EstimateFeeResult> {
+export async function estimateSendTokenFee(args: EstimateSendTokenFeeArgs): Promise<EstimateFeeResult> {
     return walletEstimateTransferFee({
         sessionId:       args.cacheKey,
         receiverAddress: args.receiverAddress,
         amount:          args.amount,
         ttlIso:          args.ttlIso,
         syncTimeoutMs:   args.syncTimeoutMs,
-        tokenTypeHex:    args.tokenTypeHex
+        tokenType:    args.tokenType
     });
 }

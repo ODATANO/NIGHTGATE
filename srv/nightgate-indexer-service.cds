@@ -1,7 +1,8 @@
 using {midnight} from '../db/schema';
+using { Network, ProvingMode, ReadinessPhase, SponsorWorkers } from '../db/types';
 
 /** Sync state, health checks and reorg history of the block indexer. Each element sets its own access rule.
- * getLiveness, getReadiness, getMetrics, getSyncStatus, getHealth, getBoardStatus and getReceiptKey are public, so health checks need no credentials.
+ * getLiveness, getReadiness, getSyncStatus, getHealth, getBoardStatus and getReceiptKey are public, so health checks need no credentials.
  * Everything else needs a signed-in user or an admin. */
 @path    : '/odata/v4/midnight-indexer'
 @requires: 'any'
@@ -9,7 +10,13 @@ service NightgateIndexerService {
 
     @readonly
     @requires: 'authenticated-user'
-    entity SyncState as projection on midnight.SyncState;
+    entity SyncState as
+        projection on midnight.SyncState
+        excluding {
+            identifiersBackfilledAt,
+            authorBackfillHeight,
+            authorsBackfilledAt
+        };
 
     @readonly
     @requires: 'authenticated-user'
@@ -39,7 +46,7 @@ service NightgateIndexerService {
     };
 
     @requires: 'authenticated-user'
-    function getReorgHistory(limit: Integer)      returns array of ReorgLog;
+    function getReorgHistory(@assert.range: [1, 100] limit: Integer) returns array of ReorgLog; // limit: optional, default 10
 
     // Public probe. Answers 200 while the process runs. Does not touch the database.
     @requires: 'any'
@@ -54,7 +61,7 @@ service NightgateIndexerService {
     @requires: 'any'
     function getReadiness()                       returns {
         ready              : Boolean;
-        phase              : String; // starting | warming | catching-up | ready | degraded | failed
+        phase              : ReadinessPhase;
         crawlerEnabled     : Boolean;
         checks             : {
             database       : Boolean;
@@ -71,8 +78,8 @@ service NightgateIndexerService {
         runtimeWarnings    : array of String;
     };
 
-    // Public probe. Prometheus text format.
-    @requires: 'any'
+    // Prometheus text format. It shows queues, pools and each wallet, so only the operator reads it.
+    @requires: 'admin'
     function getMetrics()                         returns String;
 
     // Public. Counts for the swap offer board, without ids or amounts.
@@ -101,8 +108,8 @@ service NightgateIndexerService {
     function getRuntimeInfo()                     returns {
         version      : String;
         apiVersion   : String;
-        network      : String;
-        provingMode  : String; // 'wasm' or 'server'
+        network      : Network;
+        provingMode  : ProvingMode;
         instanceId   : String;
         runtimeMode  : String;
         databaseKind : String;
@@ -131,7 +138,7 @@ service NightgateIndexerService {
     };
 
     // Health of the thread that runs the wallets. For one session use getWalletSyncProgress.
-    @requires: 'authenticated-user'
+    @requires: 'admin'
     function getWorkerStatus()                    returns {
         started       : Boolean;
         running       : Boolean;
@@ -141,11 +148,19 @@ service NightgateIndexerService {
         lastExitCode  : Integer;
         lastExitAt    : Timestamp;
         rpcTimeoutMs  : Integer;
+        pool          : { walletWorkers: Integer; sponsorWorkers: SponsorWorkers }; // as configured
+        workers       : array of {
+            id           : String;
+            running      : Boolean;
+            inFlightRpcs : Integer;
+            facadeCount  : Integer;
+            walletKeys   : array of String;
+        };
         facadeCount   : Integer;
         facades       : array of {
-            sessionId : String;
+            walletKey : String; // derived from the wallet; the same in every session of that wallet
             label     : String;
-            caughtUp  : Boolean;
+            caughtUp  : Boolean; // null = no progress reported yet
             updatedAt : Timestamp;
         };
     };

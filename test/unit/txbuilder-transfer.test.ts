@@ -1,4 +1,4 @@
-// `@odatano/nightgate/txbuilder`, plain transfers: the swap wallet builds a fee-free transfer of one
+// `@odatano/nightgate-tx/txbuilder`, plain transfers: the swap wallet builds a fee-free transfer of one
 // type to another shielded address for `sponsorTransfer`, and `readTransferShape` checks what the
 // sponsor checks. Against a fake wallet SDK; the live path is covered by the probes.
 

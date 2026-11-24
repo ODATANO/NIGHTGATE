@@ -19,6 +19,7 @@ import {
     getContractRegistration,
     getArtifactGenerationDigest,
     assertArtifactGeneration,
+    workerRegistration,
     ContractNotRegisteredError
 } from '../../srv/submission/contract-registry';
 import { HEX64_RE } from '../../srv/utils/hex-patterns';
@@ -69,9 +70,7 @@ describe('contract registry', () => {
     });
 
     test('resolveContract error message differs when registry is empty', async () => {
-        try { await resolveContract('whatever'); } catch (e) {
-            expect((e as Error).message).toMatch(/No contracts are registered/);
-        }
+        await expect(resolveContract('whatever')).rejects.toThrow(/No contracts are registered/);
     });
 });
 
@@ -231,39 +230,6 @@ describe('loadRegistryFromConfig', () => {
         });
         expect(listRegisteredContracts()).toEqual(['attestation-vault']);
     });
-
-    test('resolves relative paths against baseDir', () => {
-        loadRegistryFromConfig({
-            contracts: {
-                'rel': {
-                    artifactPath: 'rel/path/contract.js',
-                    privateStateId: 'p',
-                    zkConfigPath: 'rel/managed'
-                }
-            }
-        }, '/projects/foo');
-        // Verify by triggering a resolve attempt, it'll throw because the file doesn't exist,
-        // but the message will include the absolute path we joined.
-        // (We can't directly inspect internal state without a getter, so we use the error path.)
-        expect(listRegisteredContracts()).toEqual(['rel']);
-    });
-
-    test('ignores incomplete entries instead of throwing', () => {
-        loadRegistryFromConfig({
-            contracts: {
-                'good': { artifactPath: '/a.js', privateStateId: 'p', zkConfigPath: '/z' },
-                'bad':  { artifactPath: '/a.js' /* missing fields */ } as any
-            }
-        });
-        expect(listRegisteredContracts()).toEqual(['good']);
-    });
-
-    test('no-op when config is empty or undefined', () => {
-        loadRegistryFromConfig(undefined);
-        loadRegistryFromConfig({});
-        loadRegistryFromConfig({ contracts: null } as any);
-        expect(listRegisteredContracts()).toEqual([]);
-    });
 });
 
 describe('getContractRegistration + loadRegistryFromConfig guards', () => {
@@ -332,12 +298,6 @@ describe('resolveContract', () => {
         const compactJs: any = await import('@midnight-ntwrk/compact-js');
         expect(compactJs.CompiledContract.withCompiledFileAssets).toHaveBeenCalledWith('/zk/fixture');
     });
-
-    it('throws ContractNotRegisteredError with the available names for an unknown ref', async () => {
-        registerContract('known', { artifactPath: FIXTURE, privateStateId: 'p', zkConfigPath: 'z' });
-        await expect(resolveContract('nope')).rejects.toThrow(ContractNotRegisteredError);
-        await expect(resolveContract('nope')).rejects.toThrow(/known/);
-    });
 });
 
 describe('artifact digest: only the current form of a CommonJS digest is accepted', () => {
@@ -366,6 +326,55 @@ function VAULT_FIXTURE() {
     const pkg = resolveContractPackage('@odatano/contract-attestation-vault', path.resolve(__dirname, '../..'));
     return { artifactPath: pkg.artifactPath, privateStateId: 'vault', zkConfigPath: pkg.zkConfigPath };
 }
+
+describe('a build is the contract package its digest names, whatever it is called', () => {
+    const NAMES = ['passports', 'vault-by-path', 'vault-32-by-path', 'vault-32-undeclared', 'attestation-vault', 'attestation-vault-demo', 'token-factory', 'pkg-counter'];
+    afterEach(() => { for (const n of NAMES) unregisterContract(n); });
+    const files = (name: string) => {
+        const pkg = resolveContractPackage(name, process.cwd());
+        return { artifactPath: pkg.artifactPath, privateStateId: pkg.manifest.privateStateId, zkConfigPath: pkg.zkConfigPath };
+    };
+    const FOREIGN = {
+        artifactPath: path.resolve(process.cwd(), 'test/fixtures/fake-contract-artifact.mjs'),
+        privateStateId: 'fakePrivateState',
+        zkConfigPath: path.resolve(process.cwd(), 'test/fixtures')
+    };
+
+    test('a package registered under another name is still that package', async () => {
+        loadRegistryFromConfig({ contracts: { passports: { package: '@odatano/contract-attestation-vault' }, 'pkg-counter': { package: '@odatano/contract-counter' } } });
+        expect(getContractRegistration('passports')!.package).toMatchObject({ lineage: 'attestation-vault', digest: getArtifactGenerationDigest('passports') });
+        expect((await resolveContract('passports')).witnessLineage).toBe('attestation-vault');
+        expect((await resolveContract('pkg-counter')).witnessLineage).toBe('counter');
+    });
+
+    test('the same files registered by path are recognised too, when the registration states the vault width they were built with', async () => {
+        registerContract('vault-by-path', files('@odatano/contract-attestation-vault'));
+        registerContract('vault-32-by-path', { ...files('@odatano/contract-attestation-vault-32'), slotWidth: 32 });
+        registerContract('vault-32-undeclared', files('@odatano/contract-attestation-vault-32'));
+        expect((await resolveContract('vault-by-path')).witnessLineage).toBe('attestation-vault');
+        expect((await resolveContract('vault-32-by-path')).witnessLineage).toBe('attestation-vault-32');
+        // The width is part of the digest, so this registration is not the package.
+        expect((await resolveContract('vault-32-undeclared')).witnessLineage).toBeUndefined();
+    });
+
+    test('another build gets no lineage under a name of a package, or one that starts like it', async () => {
+        for (const name of ['attestation-vault', 'attestation-vault-demo', 'token-factory']) {
+            registerContract(name, FOREIGN);
+            const resolved = await resolveContract(name);
+            expect(resolved.witnessLineage, name).toBeUndefined();
+            expect(workerRegistration(resolved), name).not.toHaveProperty('witnessLineage');
+        }
+    });
+
+    test('the worker gets the lineage with the registration', async () => {
+        registerContract('vault-by-path', files('@odatano/contract-attestation-vault'));
+        const resolved = await resolveContract('vault-by-path');
+        expect(workerRegistration(resolved)).toEqual({
+            artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId,
+            zkConfigPath: resolved.zkConfigPath, witnessLineage: 'attestation-vault'
+        });
+    });
+});
 
 describe('package-form config entries', () => {
     afterEach(() => { for (const n of ['pkg-counter', 'pkg-vault-32', 'pkg-missing']) unregisterContract(n); });

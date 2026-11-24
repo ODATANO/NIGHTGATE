@@ -38,6 +38,14 @@ async function post(p, body, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
+
 async function get(p) {
     const r = await fetch(`${ENDPOINT}${p}`, { signal: AbortSignal.timeout(120_000) });
     const text = await r.text();
@@ -57,7 +65,7 @@ async function pollJob(sessionId, jobId, label, { expect = 'succeed', timeoutMs 
     const deadline = Date.now() + timeoutMs;
     let last = null;
     while (Date.now() < deadline) {
-        const r = await post('/getJobStatus', { jobId, sessionId });
+        const r = await jobStatus(jobId, sessionId);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) → HTTP ${r.status}: ${pretty(r.body)}`);
         const { status, result, errorCode, errorMessage } = r.body;
         if (status !== last) { process.stdout.write(`\n     [${label}] ${jobId.slice(0, 8)} status=${status}`); last = status; }
@@ -66,7 +74,7 @@ async function pollJob(sessionId, jobId, label, { expect = 'succeed', timeoutMs 
         if (status === 'succeeded') {
             process.stdout.write('\n');
             if (expect === 'fail') fail(`[${label}] expected job to FAIL but it succeeded: ${result}`);
-            return result ? JSON.parse(result) : {};
+            return result ?? {};
         }
         if (status === 'failed') {
             process.stdout.write('\n');
@@ -125,12 +133,12 @@ async function waitForServer() {
     step('2. connectWalletForSigning (+ await prewarm sync-to-tip)');
     r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
     if (r.status >= 400) fail(`connectWalletForSigning → ${r.status}: ${pretty(r.body)}`);
-    const prewarmJobId = r.body?.prewarmJobId;
+    const prewarmJobId = r.body?.jobId;
     if (prewarmJobId) { await pollJob(sessionId, prewarmJobId, 'prewarm'); console.log('OK   facade synced'); }
-    else console.log('WARN no prewarmJobId');
+    else console.log('WARN no prewarm job');
 
     step('3. deployContract(attestation-vault)');
-    r = await post('/deployContract', { compiledArtifactRef: 'attestation-vault', sessionId, initialPrivateState: '{}' });
+    r = await post('/deployContract', { contractName: 'attestation-vault', sessionId, initialPrivateState: '{}' });
     if (r.status >= 400) fail(`deployContract → ${r.status}: ${pretty(r.body)}`);
     const deployRes = await pollJob(sessionId, r.body.jobId, 'deploy');
     const contractAddress = deployRes.contractAddress;
@@ -169,7 +177,7 @@ async function waitForServer() {
 
     step('5. anchorDocument (attest the payload so the session owns it)');
     r = await post('/anchorDocument', {
-        sha256: payloadHash, storageRef: 'file:///tmp/membership-demo.json',
+        payloadHash: payloadHash, storageRef: 'file:///tmp/membership-demo.json',
         metadata: '{"type":"membership-e2e"}', sessionId, contractAddress
     });
     if (r.status >= 400) fail(`anchorDocument → ${r.status}: ${pretty(r.body)}`);
@@ -177,8 +185,8 @@ async function waitForServer() {
     await pollJob(sessionId, r.body.jobId, 'attest');
     console.log(`OK   payload attested (attester ${String(attesterId).slice(0, 12)}…)`);
 
-    step('6. issueFieldEqualityAttestation (anchors root in-flow, proves chemistry == NMC811)');
-    r = await post('/issueFieldEqualityAttestation', {
+    step('6. proveFieldEquality (anchors root in-flow, proves chemistry == NMC811)');
+    r = await post('/proveFieldEquality', {
         payloadHash, fieldKey: chem.fieldKey,
         expectedValue: 'NMC811',
         fieldSalt: chem.salt,
@@ -187,13 +195,13 @@ async function waitForServer() {
         dirs: chem.dirs,
         sessionId, contractAddress
     });
-    if (r.status >= 400) fail(`issueFieldEqualityAttestation → ${r.status}: ${pretty(r.body)}`);
+    if (r.status >= 400) fail(`proveFieldEquality → ${r.status}: ${pretty(r.body)}`);
     const eqRes = await pollJob(sessionId, r.body.jobId, 'equality');
     if (eqRes?.claim?.expectedDigest !== chem.valueDigest) fail(`equality claim digest mismatch: ${pretty(eqRes)}`);
     console.log(`OK   equality proven in tx ${eqRes.proof.proofValue.slice(0, 16)}…`);
 
-    step('7. Crawler-free verifyPredicateState (bytesEquality)');
-    const eqVerify = await pollVerify(fn('verifyPredicateState', {
+    step('7. Crawler-free verifyPredicate (bytesEquality)');
+    const eqVerify = await pollVerify(fn('verifyPredicate', {
         contractAddress, attesterId, payloadHash, fieldKey: chem.fieldKey,
         predicate: 'bytesEquality', expectedDigest: chem.valueDigest
     }), 'equality');
@@ -234,10 +242,10 @@ async function waitForServer() {
             predicate: 'bytesEquality'
         }
     ];
-    r = await post('/issueFieldPredicateAttestationBatch', {
+    r = await post('/proveClaims', {
         payloadHash, claims: batchClaims, sessionId, contractAddress
     });
-    if (r.status >= 400) fail(`issueFieldPredicateAttestationBatch → ${r.status}: ${pretty(r.body)}`);
+    if (r.status >= 400) fail(`proveClaims → ${r.status}: ${pretty(r.body)}`);
     if (r.body.droppedDuplicates !== 1) fail(`expected droppedDuplicates=1, got ${r.body.droppedDuplicates}`);
     const accepted = r.body.claims;
     if (accepted.length !== 3) fail(`expected 3 accepted claims, got ${accepted.length}`);
@@ -247,12 +255,12 @@ async function waitForServer() {
     console.log(`OK   ONE tx for numeric + membership + equality: ${batchTx.slice(0, 16)}…`);
 
     step('10. Per-claim crawler-free verification (all three kinds)');
-    const numVerify = await pollVerify(fn('verifyPredicateState', {
+    const numVerify = await pollVerify(fn('verifyPredicate', {
         contractAddress, attesterId, payloadHash, fieldKey: capacity.fieldKey,
-        predicate: 'greaterOrEqual', threshold: 100000
+        predicate: 'greaterOrEqual', threshold: '100000'
     }), 'numeric');
     if (numVerify.proven !== true) fail(`numeric: expected proven=true: ${pretty(numVerify)}`);
-    const memVerify = await pollVerify(fn('verifyPredicateState', {
+    const memVerify = await pollVerify(fn('verifyPredicate', {
         contractAddress, attesterId, payloadHash, fieldKey: origin.fieldKey,
         predicate: 'setMembership', setRoot
     }), 'membership');
@@ -260,7 +268,7 @@ async function waitForServer() {
     console.log('OK   numeric + membership + (step 7) equality all verified from live state');
 
     step('11. NEGATIVE a: value outside the allow-list → 400, no job');
-    r = await post('/issueFieldMembershipAttestation', {
+    r = await post('/proveFieldMembership', {
         payloadHash, fieldKey: origin.fieldKey, value: 'US',
         fieldSalt: origin.salt,
         allowedValues: ALLOWED,
@@ -288,7 +296,7 @@ async function waitForServer() {
         siblings: origin.siblings, dirs: origin.dirs,
         predicate: 'setMembership'
     };
-    r = await post('/issueFieldPredicateAttestationBatch', {
+    r = await post('/proveClaims', {
         payloadHash, claims: [freshNumeric, wrongMembership], sessionId, contractAddress
     });
     if (r.status >= 400) fail(`negative batch submit → ${r.status}: ${pretty(r.body)}`);
@@ -301,9 +309,9 @@ async function waitForServer() {
     console.log(`OK   wrong-set membership rejected during local execution: ${negMsg}`);
 
     step('13. Atomicity: the fresh TRUE claim of the aborted batch must NOT be on-chain');
-    const ghost = await pollVerify(fn('verifyPredicateState', {
+    const ghost = await pollVerify(fn('verifyPredicate', {
         contractAddress, attesterId, payloadHash, fieldKey: capacity.fieldKey,
-        predicate: 'greaterOrEqual', threshold: 50000
+        predicate: 'greaterOrEqual', threshold: '50000'
     }), 'ghost-claim', { expectTrue: false });
     if (ghost.verified === true) fail('aborted batch leaked a claim on-chain (atomicity violated)');
     console.log('OK   nothing from the aborted batch reached the chain');

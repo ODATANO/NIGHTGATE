@@ -8,6 +8,7 @@
  */
 
 import cds from '@sap/cds';
+import { inBlock, inTransaction } from '../fixtures/chain-position';
 import { createHash } from 'node:crypto';
 
 // The decode worker's method in production; here the facts are scripted per test.
@@ -20,7 +21,6 @@ import { IndexerHttpError, isIndexerRateLimit } from '../../srv/utils/indexer-gr
 import { rollbackIndexedDataFromHeight } from '../../srv/crawler/rollback';
 import { redecodeFromHeight } from '../../srv/crawler/redecode';
 import { readCapBinary } from '../../srv/crawler/cap-binary';
-import { backfillTransactionIdentifiers } from '../../srv/crawler/transaction-identifiers';
 import { WorkerRpcUnansweredError } from '../../srv/midnight/worker-rpc/client';
 import {
     compactStoredContractState, contractStateAt, contractStatePolicy, IndexerBudgetExhausted, IndexerBehind, type ContractStatePolicy
@@ -91,8 +91,9 @@ async function seedTransaction(blockId: string, over: Record<string, any> = {}):
     const ID = cds.utils.uuid();
     await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
         ID,
-        transactionId: over.transactionId ?? 0,
-        hash: over.hash ?? ID.slice(0, 8),
+        ...(await inBlock(db, blockId)),
+        indexInBlock: over.indexInBlock ?? 0,
+        extrinsicHash: over.extrinsicHash ?? ID.slice(0, 8),
         protocolVersion: 1,
         transactionType: 'REGULAR',
         block_ID: blockId,
@@ -111,8 +112,8 @@ async function readSync(): Promise<any> {
 }
 
 async function identifierRowsOf(txId: string): Promise<string[]> {
-    const rows = await db.run(cds.ql.SELECT.from(TX_IDENTIFIERS).columns('identifier').where({ transaction_ID: txId }).orderBy('identifier'));
-    return rows.map((r: any) => r.identifier);
+    const rows = await db.run(cds.ql.SELECT.from(TX_IDENTIFIERS).columns('txId').where({ transaction_ID: txId }).orderBy('txId'));
+    return rows.map((r: any) => r.txId);
 }
 
 const facts = (over: Record<string, any> = {}) => ({
@@ -153,7 +154,7 @@ describe('LedgerPayloadDecoder', () => {
         const blockId = await seedBlock(10, '0xd1');
         const txId = await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });
         await db.run(cds.ql.INSERT.into(CONTRACT_ACTIONS).entries({
-            ID: cds.utils.uuid(), actionIndex: 0, address: CONTRACT, actionType: 'CALL', transaction_ID: txId
+            ID: cds.utils.uuid(), ...(await inTransaction(db, txId)), actionIndex: 0, contractAddress: CONTRACT, actionType: 'CALL', transaction_ID: txId
         }));
         await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
         decodeLedgerPayload.mockResolvedValue(facts({
@@ -167,7 +168,7 @@ describe('LedgerPayloadDecoder', () => {
         expect(tx).toEqual(expect.objectContaining({
             payloadDecode: 'decoded',
             identifiers: JSON.stringify(['aa', 'bb']),
-            circuitName: 'increment',
+            circuit: 'increment',
             isShielded: true,
             hasProof: true,
             zswapInputCount: 1,
@@ -179,7 +180,7 @@ describe('LedgerPayloadDecoder', () => {
         expect(String(tx.dustConsumed)).toBe('42');
 
         const action = await db.run(cds.ql.SELECT.one.from(CONTRACT_ACTIONS).where({ transaction_ID: txId }));
-        expect(action.entryPoint).toBe('increment');
+        expect(action.circuit).toBe('increment');
         expect(Number((await readSync()).lastDecodedHeight)).toBe(10);
         expect(await identifierRowsOf(txId)).toEqual(['aa', 'bb']);
     });
@@ -198,11 +199,11 @@ describe('LedgerPayloadDecoder', () => {
 
     it('sets isShielded and hasProof from the decoded payload', async () => {
         const blockId = await seedBlock(10, '0xd6');
-        const shielded = await seedTransaction(blockId, { transactionId: 0, raw: midnightExtrinsicBase64(20) });
-        const call = await seedTransaction(blockId, { transactionId: 1, raw: midnightExtrinsicBase64(21) });
+        const shielded = await seedTransaction(blockId, { indexInBlock: 0, raw: midnightExtrinsicBase64(20) });
+        const call = await seedTransaction(blockId, { indexInBlock: 1, raw: midnightExtrinsicBase64(21) });
         // A pallet-map flag: the decoded payload overrules it.
         const transfer = await seedTransaction(blockId, {
-            transactionId: 2, raw: midnightExtrinsicBase64(22), isShielded: true, hasProof: true
+            indexInBlock: 2, raw: midnightExtrinsicBase64(22), isShielded: true, hasProof: true
         });
         await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
         const none = { zswapInputCount: 0, zswapOutputCount: 0, zswapTransientCount: 0 };
@@ -222,10 +223,10 @@ describe('LedgerPayloadDecoder', () => {
 
     it('replaces the pallet default type of a call-free transaction, and only that', async () => {
         const blockId = await seedBlock(10, '0xd7');
-        const swap = await seedTransaction(blockId, { transactionId: 0, raw: midnightExtrinsicBase64(20), txType: 'contract_call' });
-        const transfer = await seedTransaction(blockId, { transactionId: 1, raw: midnightExtrinsicBase64(21), txType: 'night_transfer' });
-        const call = await seedTransaction(blockId, { transactionId: 2, raw: midnightExtrinsicBase64(22), txType: 'contract_call' });
-        const feeOnly = await seedTransaction(blockId, { transactionId: 3, raw: midnightExtrinsicBase64(23), txType: 'contract_call' });
+        const swap = await seedTransaction(blockId, { indexInBlock: 0, raw: midnightExtrinsicBase64(20), txType: 'contract_call' });
+        const transfer = await seedTransaction(blockId, { indexInBlock: 1, raw: midnightExtrinsicBase64(21), txType: 'night_transfer' });
+        const call = await seedTransaction(blockId, { indexInBlock: 2, raw: midnightExtrinsicBase64(22), txType: 'contract_call' });
+        const feeOnly = await seedTransaction(blockId, { indexInBlock: 3, raw: midnightExtrinsicBase64(23), txType: 'contract_call' });
         await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
         const none = { zswapInputCount: 0, zswapOutputCount: 0, zswapTransientCount: 0 };
         decodeLedgerPayload.mockImplementation(async (bytes: Uint8Array) => {
@@ -250,7 +251,7 @@ describe('LedgerPayloadDecoder', () => {
         const txId = await seedTransaction(blockId, { raw: midnightExtrinsicBase64(20) });
         for (const i of [0, 1]) {
             await db.run(cds.ql.INSERT.into(CONTRACT_ACTIONS).entries({
-                ID: cds.utils.uuid(), actionIndex: i, address: CONTRACT, actionType: 'CALL', transaction_ID: txId
+                ID: cds.utils.uuid(), ...(await inTransaction(db, txId)), actionIndex: i, contractAddress: CONTRACT, actionType: 'CALL', transaction_ID: txId
             }));
         }
         await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
@@ -265,14 +266,14 @@ describe('LedgerPayloadDecoder', () => {
         // Paired in action order, not sorted into agreement.
         const entryPoints = (await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).where({ transaction_ID: txId })))
             .sort((a: any, b: any) => a.actionIndex - b.actionIndex)
-            .map((a: any) => a.entryPoint);
+            .map((a: any) => a.circuit);
         expect(entryPoints).toEqual(['first', 'second']);
     });
 
     it('records a transaction without a payload as absent and a failure as failed', async () => {
         const blockId = await seedBlock(10, '0xd3');
-        const inherent = await seedTransaction(blockId, { transactionId: 0, raw: inherentBase64() });
-        const broken = await seedTransaction(blockId, { transactionId: 1, raw: midnightExtrinsicBase64(20) });
+        const inherent = await seedTransaction(blockId, { indexInBlock: 0, raw: inherentBase64() });
+        const broken = await seedTransaction(blockId, { indexInBlock: 1, raw: midnightExtrinsicBase64(20) });
         await setSync({ lastIndexedHeight: 20, lastDecodedHeight: null });
         decodeLedgerPayload.mockRejectedValue(new Error('no marker combination fits'));
 
@@ -325,9 +326,9 @@ describe('LedgerPayloadDecoder', () => {
 
     it('a replayed regular row that does not decode goes from "no" to unknown; a system row keeps its no', async () => {
         const blockId = await seedBlock(10, '0xd7');
-        const regular = await seedTransaction(blockId, { transactionId: 0, raw: midnightExtrinsicBase64(20), isShielded: false, hasProof: false });
-        const noPayload = await seedTransaction(blockId, { transactionId: 1, raw: inherentBase64(), isShielded: false, hasProof: false });
-        const system = await seedTransaction(blockId, { transactionId: 2, transactionType: 'SYSTEM', raw: inherentBase64(), isShielded: false, hasProof: false });
+        const regular = await seedTransaction(blockId, { indexInBlock: 0, raw: midnightExtrinsicBase64(20), isShielded: false, hasProof: false });
+        const noPayload = await seedTransaction(blockId, { indexInBlock: 1, raw: inherentBase64(), isShielded: false, hasProof: false });
+        const system = await seedTransaction(blockId, { indexInBlock: 2, transactionType: 'SYSTEM', raw: inherentBase64(), isShielded: false, hasProof: false });
         await setSync({ lastIndexedHeight: 30, lastDecodedHeight: null });
         decodeLedgerPayload.mockRejectedValue(new Error('does not decode'));
         const warn = vi.spyOn(cds.log('nightgate:crawler'), 'warn').mockImplementation(() => {});
@@ -471,14 +472,14 @@ describe('IndexerSupplement', () => {
 
     it('fills segments, contract state, balances and both event streams', async () => {
         const blockId = await seedBlock(10, '0xs1');
-        const txId = await seedTransaction(blockId, { ledgerTxHash: 'abc' });
+        const txId = await seedTransaction(blockId, { txHash: 'abc' });
         const resultId = cds.utils.uuid();
         await db.run(cds.ql.INSERT.into(TX_RESULTS).entries({
             ID: resultId, status: 'PARTIAL_SUCCESS', transaction_ID: txId
         }));
         const actionId = cds.utils.uuid();
         await db.run(cds.ql.INSERT.into(CONTRACT_ACTIONS).entries({
-            ID: actionId, actionIndex: 0, address: CONTRACT, actionType: 'CALL', transaction_ID: txId
+            ID: actionId, ...(await inTransaction(db, txId)), actionIndex: 0, contractAddress: CONTRACT, actionType: 'CALL', transaction_ID: txId
         }));
         // The crawler writes a zero fee from the envelope.
         await db.run(cds.ql.INSERT.into('midnight.TransactionFees').entries({
@@ -491,8 +492,7 @@ describe('IndexerSupplement', () => {
                 height: 10,
                 ledgerParameters: null,
                 transactions: [{
-                    ledgerTxHash: 'abc',
-                    status: 'PARTIAL_SUCCESS',
+                    txHash: 'abc',
                     fee: '7',
                     estimatedFee: '6',
                     segments: [{ segmentId: 0, success: true }, { segmentId: 3283, success: false }],
@@ -533,11 +533,11 @@ describe('IndexerSupplement', () => {
 
     it('gives two calls on one contract their own state, not the first one twice', async () => {
         const blockId = await seedBlock(10, '0xs6');
-        const txId = await seedTransaction(blockId, { ledgerTxHash: 'abc' });
+        const txId = await seedTransaction(blockId, { txHash: 'abc' });
         const ids = [cds.utils.uuid(), cds.utils.uuid()];
         for (const [i, ID] of ids.entries()) {
             await db.run(cds.ql.INSERT.into(CONTRACT_ACTIONS).entries({
-                ID, actionIndex: i, address: CONTRACT, actionType: 'CALL', transaction_ID: txId
+                ID, ...(await inTransaction(db, txId)), actionIndex: i, contractAddress: CONTRACT, actionType: 'CALL', transaction_ID: txId
             }));
         }
         await setSync({ lastIndexedHeight: 20, lastSupplementedHeight: null });
@@ -552,7 +552,7 @@ describe('IndexerSupplement', () => {
             10: {
                 height: 10, ledgerParameters: null,
                 transactions: [{
-                    ledgerTxHash: 'abc', status: 'SUCCESS', fee: null, segments: [],
+                    txHash: 'abc', fee: null, segments: [],
                     contractActions: [call('first', '1'), call('second', '2')],
                     zswapEvents: [], dustEvents: [], dustRegisteredOutputs: []
                 }]
@@ -581,9 +581,9 @@ describe('IndexerSupplement', () => {
 
     it('assigns no state when the two sides disagree on how many actions there were', async () => {
         const blockId = await seedBlock(10, '0xs7');
-        const txId = await seedTransaction(blockId, { ledgerTxHash: 'abc' });
+        const txId = await seedTransaction(blockId, { txHash: 'abc' });
         await db.run(cds.ql.INSERT.into(CONTRACT_ACTIONS).entries({
-            ID: cds.utils.uuid(), actionIndex: 0, address: CONTRACT, actionType: 'CALL', transaction_ID: txId
+            ID: cds.utils.uuid(), ...(await inTransaction(db, txId)), actionIndex: 0, contractAddress: CONTRACT, actionType: 'CALL', transaction_ID: txId
         }));
         await setSync({ lastIndexedHeight: 20, lastSupplementedHeight: null });
 
@@ -596,7 +596,7 @@ describe('IndexerSupplement', () => {
             10: {
                 height: 10, ledgerParameters: null,
                 transactions: [{
-                    ledgerTxHash: 'abc', status: 'PARTIAL_SUCCESS', fee: null, segments: [],
+                    txHash: 'abc', fee: null, segments: [],
                     contractActions: [declared, declared],
                     zswapEvents: [], dustEvents: [], dustRegisteredOutputs: []
                 }]
@@ -615,9 +615,9 @@ describe('IndexerSupplement', () => {
 
     it('turns the DUST registration flag on for the named outputs', async () => {
         const blockId = await seedBlock(10, '0xs2');
-        const txId = await seedTransaction(blockId, { ledgerTxHash: 'abc' });
+        const txId = await seedTransaction(blockId, { txHash: 'abc' });
         await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
-            ID: cds.utils.uuid(), owner: 'mn_addr_x', tokenType: '00', value: '5',
+            ID: cds.utils.uuid(), ...(await inTransaction(db, txId)), owner: 'mn_addr_x', tokenType: '00', value: '5',
             intentHash: 'i1', outputIndex: 0, initialNonce: 'n1', createdAtTransaction_ID: txId
         }));
         await setSync({ lastIndexedHeight: 20, lastSupplementedHeight: null });
@@ -627,7 +627,7 @@ describe('IndexerSupplement', () => {
                 height: 10,
                 ledgerParameters: null,
                 transactions: [{
-                    ledgerTxHash: 'abc', status: 'SUCCESS', fee: null, segments: [], contractActions: [],
+                    txHash: 'abc', fee: null, segments: [], contractActions: [],
                     zswapEvents: [], dustEvents: [],
                     dustRegisteredOutputs: [{ intentHash: 'i1', outputIndex: 0 }]
                 }]
@@ -692,14 +692,14 @@ describe('IndexerSupplement', () => {
 
     it('re-running a block replaces its rows instead of doubling them', async () => {
         const blockId = await seedBlock(10, '0xs5');
-        const txId = await seedTransaction(blockId, { ledgerTxHash: 'abc' });
+        const txId = await seedTransaction(blockId, { txHash: 'abc' });
         await setSync({ lastIndexedHeight: 20, lastSupplementedHeight: null });
         const answer = {
             10: {
                 height: 10,
                 ledgerParameters: null,
                 transactions: [{
-                    ledgerTxHash: 'abc', status: 'SUCCESS', fee: null, segments: [], contractActions: [],
+                    txHash: 'abc', fee: null, segments: [], contractActions: [],
                     zswapEvents: [{ eventId: 1, maxId: 2, raw: null }], dustEvents: [],
                     dustRegisteredOutputs: []
                 }]
@@ -923,7 +923,7 @@ describe('a rollback that leaves the cursor where it was', () => {
     it('the supplement writes nothing for a transaction a rollback removed while the indexer answered', async () => {
         for (const h of [5, 6]) await seedBlock(h, `0xk${h}`);
         const blockId = await seedBlock(10, '0xk10');
-        const txId = await seedTransaction(blockId, { ledgerTxHash: 'f1' });
+        const txId = await seedTransaction(blockId, { txHash: 'f1' });
         await setSync({ lastIndexedHeight: 30, lastSupplementedHeight: 5, reorgGeneration: 1 });
 
         let rolledBack = false;
@@ -937,7 +937,7 @@ describe('a rollback that leaves the cursor where it was', () => {
                 return {
                     height, ledgerParameters: height === 10 ? 'cGFyYW1z' : null,
                     transactions: height === 10 ? [{
-                        ledgerTxHash: 'f1', status: 'SUCCESS', fee: '7', estimatedFee: '6', segments: [], contractActions: [],
+                        txHash: 'f1', fee: '7', estimatedFee: '6', segments: [], contractActions: [],
                         zswapEvents: [{ eventId: 3, maxId: 9, raw: null }], dustEvents: [], dustRegisteredOutputs: []
                     }] : []
                 };
@@ -965,7 +965,7 @@ describe('a rollback that leaves the cursor where it was', () => {
     it('the supplement stops at a block whose hash the indexer names differently, and goes on once they agree', async () => {
         const first = await seedBlock(10, '0xaa10');
         const second = await seedBlock(11, '0xaa11');
-        const txId = await seedTransaction(second, { ledgerTxHash: 'f2' });
+        const txId = await seedTransaction(second, { txHash: 'f2' });
         await setSync({ lastIndexedHeight: 30, lastSupplementedHeight: 9 });
 
         const foreign = { hash: 'ee11' };
@@ -974,7 +974,7 @@ describe('a rollback that leaves the cursor where it was', () => {
             11: {
                 height: 11, ledgerParameters: 'cGFyYW1zLTEx', ...foreign,
                 transactions: [{
-                    ledgerTxHash: 'f2', status: 'SUCCESS', fee: null, estimatedFee: null, segments: [], contractActions: [],
+                    txHash: 'f2', fee: null, estimatedFee: null, segments: [], contractActions: [],
                     zswapEvents: [{ eventId: 1, maxId: 1, raw: null }], dustEvents: [], dustRegisteredOutputs: []
                 }]
             }
@@ -1192,7 +1192,7 @@ describe('rollback', () => {
         const kept = await seedTransaction(await seedBlock(10, '0xr5'), { identifiers: JSON.stringify(['a1']) });
         const gone = await seedTransaction(await seedBlock(11, '0xr6'), { identifiers: JSON.stringify(['b1', 'b2']) });
         await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries([
-            { identifier: 'a1', transaction_ID: kept }, { identifier: 'b1', transaction_ID: gone }, { identifier: 'b2', transaction_ID: gone }
+            { txId: 'a1', transaction_ID: kept }, { txId: 'b1', transaction_ID: gone }, { txId: 'b2', transaction_ID: gone }
         ]));
         await setSync({ lastIndexedHeight: 11 });
 
@@ -1202,65 +1202,6 @@ describe('rollback', () => {
 
         expect(await identifierRowsOf(kept)).toEqual(['a1']);
         expect(await identifierRowsOf(gone)).toEqual([]);
-    });
-});
-
-describe('backfillTransactionIdentifiers', () => {
-    it('fills the rows for decoded transactions that have none and skips the ones that have', async () => {
-        await setSync({ lastIndexedHeight: 10 });
-        const blockId = await seedBlock(10, '0xbf1');
-        const fresh = await seedTransaction(blockId, { transactionId: 0, identifiers: JSON.stringify(['f1', 'f2']) });
-        const done = await seedTransaction(blockId, { transactionId: 1, identifiers: JSON.stringify(['d1', 'stale']) });
-        await seedTransaction(blockId, { transactionId: 2, identifiers: null });
-        await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries({ identifier: 'd1', transaction_ID: done }));
-
-        const report = await backfillTransactionIdentifiers(db, 1);
-        expect(report).toEqual({ transactions: 1, identifiers: 2 });
-        expect(await identifierRowsOf(fresh)).toEqual(['f1', 'f2']);
-        // Rows that exist are not rewritten.
-        expect(await identifierRowsOf(done)).toEqual(['d1']);
-
-        // The finished run is marked, so the next start does not scan again.
-        expect((await readSync()).identifiersBackfilledAt).toBeTruthy();
-        const later = await seedTransaction(blockId, { transactionId: 3, identifiers: JSON.stringify(['l1']) });
-        expect(await backfillTransactionIdentifiers(db)).toEqual({ transactions: 0, identifiers: 0 });
-        expect(await identifierRowsOf(later)).toEqual([]);
-    });
-
-    it('rows that disappear during the run do not make it skip others', async () => {
-        await setSync({ lastIndexedHeight: 10, identifiersBackfilledAt: null });
-        const blockId = await seedBlock(10, '0xbf3');
-        const ids: string[] = [];
-        for (let i = 0; i < 6; i++) ids.push(await seedTransaction(blockId, { transactionId: i, identifiers: JSON.stringify([`k${i}`]) }));
-        ids.sort();
-
-        // After the first page of two, a rollback removes the first row. With an offset the third row would be skipped.
-        const run = db.run.bind(db);
-        let pages = 0;
-        const spy = vi.spyOn(db, 'run').mockImplementation(async (query: any, ...rest: any[]) => {
-            const result = await run(query, ...rest);
-            if (query?.SELECT?.from?.ref?.[0] === TRANSACTIONS && query.SELECT.limit && ++pages === 1) {
-                await run(cds.ql.DELETE.from(TRANSACTIONS).where({ ID: ids[0] }));
-            }
-            return result;
-        });
-        try {
-            await backfillTransactionIdentifiers(db, 2);
-        } finally {
-            spy.mockRestore();
-        }
-        expect(await db.run(cds.ql.SELECT.one.from(TRANSACTIONS).columns('ID').where({ ID: ids[0] }))).toBeFalsy();
-        for (const id of ids.slice(1)) expect(await identifierRowsOf(id), id).toHaveLength(1);
-    });
-
-    it('an interrupted run resumes: without the marker the rows that exist are kept and the rest filled', async () => {
-        await setSync({ lastIndexedHeight: 10, identifiersBackfilledAt: null });
-        const blockId = await seedBlock(10, '0xbf2');
-        const done = await seedTransaction(blockId, { transactionId: 0, identifiers: JSON.stringify(['d1']) });
-        const rest = await seedTransaction(blockId, { transactionId: 1, identifiers: JSON.stringify(['r1']) });
-        await db.run(cds.ql.INSERT.into(TX_IDENTIFIERS).entries({ identifier: 'd1', transaction_ID: done }));
-        expect(await backfillTransactionIdentifiers(db)).toEqual({ transactions: 1, identifiers: 1 });
-        expect(await identifierRowsOf(rest)).toEqual(['r1']);
     });
 });
 
@@ -1279,13 +1220,13 @@ describe('contract state storage', () => {
     /** One block at `height` whose transaction carries one CALL per address. */
     async function seedCalls(height: number, addresses: string[]): Promise<string[]> {
         const blockId = await seedBlock(height, `0xcs${height}`);
-        const txId = await seedTransaction(blockId, { ledgerTxHash: `tx${height}` });
+        const txId = await seedTransaction(blockId, { txHash: `tx${height}` });
         const ids: string[] = [];
         for (const [i, address] of addresses.entries()) {
             const ID = cds.utils.uuid();
             ids.push(ID);
             await db.run(cds.ql.INSERT.into(CONTRACT_ACTIONS).entries({
-                ID, actionIndex: i, address, actionType: 'CALL', transaction_ID: txId
+                ID, ...(await inTransaction(db, txId)), actionIndex: i, contractAddress: address, actionType: 'CALL', transaction_ID: txId
             }));
         }
         return ids;
@@ -1295,7 +1236,7 @@ describe('contract state storage', () => {
         return {
             height, ledgerParameters: null,
             transactions: [{
-                ledgerTxHash: `tx${height}`, status: 'SUCCESS', fee: null, segments: [],
+                txHash: `tx${height}`, fee: null, segments: [],
                 contractActions: calls.map(c => ({
                     actionType: 'CALL', address: c.address, state: b64(c.state), zswapState: null, balances: []
                 })),
@@ -1305,9 +1246,9 @@ describe('contract state storage', () => {
     }
 
     async function storedStates(): Promise<Record<string, string | undefined>> {
-        const rows = await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).columns('address', 'state'));
+        const rows = await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).columns('contractAddress', 'state'));
         const out: Record<string, string | undefined> = {};
-        for (const r of rows) out[r.address] = (await readCapBinary(r.state))?.toString('utf8');
+        for (const r of rows) out[r.contractAddress] = (await readCapBinary(r.state))?.toString('utf8');
         return out;
     }
 
@@ -1355,8 +1296,8 @@ describe('contract state storage', () => {
         await db.tx(async (tx: any) => {
             await rollbackIndexedDataFromHeight(tx, 11, { syncStatus: 'syncing' });
         });
-        const rows = await db.run(cds.ql.SELECT.from(CONTRACT_STATES).columns('address'));
-        expect(rows.map((r: any) => r.address)).toEqual([CONTRACT]);
+        const rows = await db.run(cds.ql.SELECT.from(CONTRACT_STATES).columns('contractAddress'));
+        expect(rows.map((r: any) => r.contractAddress)).toEqual([CONTRACT]);
     });
 
     describe('contractStateAt', () => {
@@ -1577,7 +1518,7 @@ describe('contract state storage', () => {
             expect(await storedStates()).toEqual({ [CONTRACT]: undefined, [OTHER]: undefined });
             const hashes = (await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).columns('stateHash'))).map((r: any) => r.stateHash).sort();
             expect(hashes).toEqual([sha256('x'), sha256('y'), sha256('z')].sort());
-            const current = await db.run(cds.ql.SELECT.one.from(CONTRACT_STATES).columns('height', 'state').where({ address: CONTRACT }));
+            const current = await db.run(cds.ql.SELECT.one.from(CONTRACT_STATES).columns('height', 'state').where({ contractAddress: CONTRACT }));
             expect(Number(current.height)).toBe(12);
             expect((await readCapBinary(current.state))?.toString('utf8')).toBe('y');
 

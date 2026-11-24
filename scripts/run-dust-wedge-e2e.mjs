@@ -40,12 +40,20 @@ async function post(path, body, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
+
 /** Poll until the job reaches a terminal state; returns { status, result, errorCode, errorMessage }. */
 async function pollJobTerminal(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS, intervalMs = JOB_POLL_MS } = {}) {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = null;
     while (Date.now() < deadline) {
-        const r = await post('/getJobStatus', { jobId, sessionId });
+        const r = await jobStatus(jobId, sessionId);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) → HTTP ${r.status}: ${pretty(r.body)}`);
         const { status, result, errorCode, errorMessage } = r.body;
         if (status !== lastStatus) {
@@ -56,7 +64,7 @@ async function pollJobTerminal(sessionId, jobId, label, { timeoutMs = PREWARM_TI
         }
         if (status === 'succeeded' || status === 'failed') {
             process.stdout.write('\n');
-            return { status, result: result ? JSON.parse(result) : {}, errorCode, errorMessage };
+            return { status, result: result ?? {}, errorCode, errorMessage };
         }
         await new Promise(res => setTimeout(res, intervalMs));
     }
@@ -105,8 +113,8 @@ async function waitForServer() {
     console.log(`OK   sessionId = ${sessionId}`);
     r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
     if (r.status !== 200 && r.status !== 201) fail(`connectWalletForSigning → HTTP ${r.status}: ${pretty(r.body)}`);
-    if (r.body?.prewarmJobId) {
-        const pw = await pollJobTerminal(sessionId, r.body.prewarmJobId, 'prewarm');
+    if (r.body?.jobId) {
+        const pw = await pollJobTerminal(sessionId, r.body.jobId, 'prewarm');
         if (pw.status !== 'succeeded') fail(`prewarm failed: ${pw.errorCode}: ${pw.errorMessage}`);
     }
 
@@ -122,10 +130,10 @@ async function waitForServer() {
     if (before.dustUtxoCount === 0) fail('no dust UTXO tracked; wallet not in the single-note shape this test needs');
     if (typeof before.dustRestoreCount !== 'number') fail('server does not report dustRestoreCount; needs @odatano/nightgate >= 0.15.2');
 
-    step(`4. sendNight with a ttl only ${TTL_OFFSET_MS}ms ahead → expires during proving → must die pre-mempool`);
-    const ttlIso = new Date(Date.now() + TTL_OFFSET_MS).toISOString();
-    r = await post('/sendNight', { sessionId, receiverAddress: nightAddress, amount: AMOUNT, ttlIso });
-    if (r.status !== 200 && r.status !== 201) fail(`sendNight(short-ttl) → HTTP ${r.status}: ${pretty(r.body)}`);
+    step(`4. sendToken with a ttl only ${TTL_OFFSET_MS}ms ahead → expires during proving → must die pre-mempool`);
+    const expiresAt = new Date(Date.now() + TTL_OFFSET_MS).toISOString();
+    r = await post('/sendToken', { sessionId, receiverAddress: nightAddress, amount: AMOUNT, expiresAt });
+    if (r.status !== 200 && r.status !== 201) fail(`sendToken(short-ttl) → HTTP ${r.status}: ${pretty(r.body)}`);
     const doomed = await pollJobTerminal(sessionId, r.body.jobId, 'doomed-send');
     if (doomed.status !== 'failed') {
         fail(`expected the short-ttl send to FAIL pre-mempool (proving finished under ${TTL_OFFSET_MS}ms? lower DUST_E2E_TTL_OFFSET_MS), got: ${pretty(doomed)}`);
@@ -151,10 +159,10 @@ async function waitForServer() {
     }
     console.log('OK   dust note survived the abort');
 
-    step(`6. sendNight ${AMOUNT} atoms → own address (normal ttl) → must SUCCEED`);
+    step(`6. sendToken ${AMOUNT} atoms → own address (normal ttl) → must SUCCEED`);
     const tSend = Date.now();
-    r = await post('/sendNight', { sessionId, receiverAddress: nightAddress, amount: AMOUNT });
-    if (r.status !== 200 && r.status !== 201) fail(`sendNight → HTTP ${r.status}: ${pretty(r.body)}`);
+    r = await post('/sendToken', { sessionId, receiverAddress: nightAddress, amount: AMOUNT });
+    if (r.status !== 200 && r.status !== 201) fail(`sendToken → HTTP ${r.status}: ${pretty(r.body)}`);
     const send = await pollJobTerminal(sessionId, r.body.jobId, 'proof-send');
     if (send.status !== 'succeeded' || !send.result?.txId) {
         fail(`follow-up send did not succeed (wallet wedged?): ${pretty(send)}`);

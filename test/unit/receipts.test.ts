@@ -40,7 +40,7 @@ describe('receipts', () => {
 
     it('receiptForJob covers only a landed sponsored swap or transfer and repeats its terms', () => {
         const job = (over: Record<string, unknown>) => ({
-            ID: 'job-1', kind: 'sponsorSwap', chainStatus: 'success', txHash: 'ab'.repeat(32), chainBlockHeight: 42, chainBlockHash: 'cd'.repeat(32),
+            ID: 'job-1', kind: 'sponsorSwap', chainStatus: 'success', txId: `00${'ab'.repeat(32)}`, blockHeight: 42, blockHash: 'cd'.repeat(32),
             chainFinalizedAt: '2026-10-28T20:00:00.000Z',
             result: JSON.stringify({ swap: { gives: { tokenType: 'a1', amount: '5' }, wants: { tokenType: 'b2', amount: '7' } } }),
             ...over
@@ -48,19 +48,22 @@ describe('receipts', () => {
         const receipt = receiptForJob(job({}), 'ef'.repeat(32), 'preprod');
         expect(receipt).not.toBeNull();
         expect(JSON.parse(receipt!.payload)).toEqual({
-            v: 1, kind: 'swap', jobId: 'job-1', network: 'preprod', txHash: 'ab'.repeat(32), transactionHash: 'ef'.repeat(32),
+            v: 2, kind: 'swap', jobId: 'job-1', network: 'preprod', txId: `00${'ab'.repeat(32)}`, txHash: 'ef'.repeat(32),
             blockHeight: 42, blockHash: 'cd'.repeat(32), finalizedAt: '2026-10-28T20:00:00.000Z',
             swap: { gives: { tokenType: 'a1', amount: '5' }, wants: { tokenType: 'b2', amount: '7' } }
         });
         expect(verifyReceipt(receipt!)).toBe(true);
+        // The database gives the height as text. The signed payload keeps it a number.
+        expect(JSON.parse(receiptForJob(job({ blockHeight: '42' }), 'ef'.repeat(32), 'preprod')!.payload).blockHeight).toBe(42);
+        expect(JSON.parse(receiptForJob(job({ blockHeight: null }), 'ef'.repeat(32), 'preprod')!.payload).blockHeight).toBeNull();
         const transfer = receiptForJob(job({ kind: 'sponsorTransfer', result: JSON.stringify({ transfer: { tokenType: 'a1', amount: '5' } }) }), null, 'preprod');
-        expect(JSON.parse(transfer!.payload)).toMatchObject({ kind: 'transfer', declared: true, transfer: { tokenType: 'a1', amount: '5' }, transactionHash: null });
+        expect(JSON.parse(transfer!.payload)).toMatchObject({ kind: 'transfer', declared: true, transfer: { tokenType: 'a1', amount: '5' }, txHash: null });
         // an unshielded transfer names its recipient: its terms were read from the transaction, not declared
         const terms = { tokenType: '00'.repeat(32), amount: '5', to: 'mn_addr_preview1x' };
         const unshielded = receiptForJob(job({ kind: 'sponsorTransfer', result: JSON.stringify({ transfer: terms }) }), null, 'preprod');
         expect(JSON.parse(unshielded!.payload)).toMatchObject({ kind: 'transfer', declared: false, transfer: terms });
         expect(receiptForJob(job({ chainStatus: 'pending' }), null, 'preprod')).toBeNull();
-        expect(receiptForJob(job({ kind: 'sponsorUnboundTransaction' }), null, 'preprod')).toBeNull();
+        expect(receiptForJob(job({ kind: 'sponsorUnbound' }), null, 'preprod')).toBeNull();
         expect(receiptForJob(job({ result: '{}' }), null, 'preprod')).toBeNull();
         expect(receiptForJob(job({ result: 'not json' }), null, 'preprod')).toBeNull();
     });

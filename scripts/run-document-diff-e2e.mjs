@@ -35,6 +35,14 @@ async function post(p, body, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
+
 async function get(p) {
     const r = await fetch(`${ENDPOINT}${p}`, { signal: AbortSignal.timeout(120_000) });
     const text = await r.text();
@@ -54,7 +62,7 @@ async function pollJob(sessionId, jobId, label, { expect = 'succeed', timeoutMs 
     const deadline = Date.now() + timeoutMs;
     let last = null;
     while (Date.now() < deadline) {
-        const r = await post('/getJobStatus', { jobId, sessionId });
+        const r = await jobStatus(jobId, sessionId);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) → HTTP ${r.status}: ${pretty(r.body)}`);
         const { status, result, errorCode, errorMessage } = r.body;
         if (status !== last) { process.stdout.write(`\n     [${label}] ${jobId.slice(0, 8)} status=${status}`); last = status; }
@@ -63,7 +71,7 @@ async function pollJob(sessionId, jobId, label, { expect = 'succeed', timeoutMs 
         if (status === 'succeeded') {
             process.stdout.write('\n');
             if (expect === 'fail') fail(`[${label}] expected job to FAIL but it succeeded: ${result}`);
-            return result ? JSON.parse(result) : {};
+            return result ?? {};
         }
         if (status === 'failed') {
             process.stdout.write('\n');
@@ -147,12 +155,12 @@ async function prepare(document, label) {
     step('2. connectWalletForSigning (+ await prewarm sync-to-tip)');
     r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
     if (r.status >= 400) fail(`connectWalletForSigning → ${r.status}: ${pretty(r.body)}`);
-    const prewarmJobId = r.body?.prewarmJobId;
+    const prewarmJobId = r.body?.jobId;
     if (prewarmJobId) { await pollJob(sessionId, prewarmJobId, 'prewarm'); console.log('OK   facade synced'); }
-    else console.log('WARN no prewarmJobId');
+    else console.log('WARN no prewarm job');
 
     step('3. deployContract(attestation-vault)');
-    r = await post('/deployContract', { compiledArtifactRef: 'attestation-vault', sessionId, initialPrivateState: '{}' });
+    r = await post('/deployContract', { contractName: 'attestation-vault', sessionId, initialPrivateState: '{}' });
     if (r.status >= 400) fail(`deployContract → ${r.status}: ${pretty(r.body)}`);
     const deployRes = await pollJob(sessionId, r.body.jobId, 'deploy');
     const contractAddress = deployRes.contractAddress;
@@ -182,7 +190,7 @@ async function prepare(document, label) {
     let attesterId;
     for (const [doc, label] of [[v1, 'v1'], [v2, 'v2']]) {
         r = await post('/anchorDocument', {
-            sha256: doc.payloadHash, storageRef: `file:///tmp/${stamp}-${label}.json`,
+            payloadHash: doc.payloadHash, storageRef: `file:///tmp/${stamp}-${label}.json`,
             metadata: `{"type":"document-diff-e2e","version":"${label}"}`, sessionId, contractAddress
         });
         if (r.status >= 400) fail(`anchorDocument(${label}) → ${r.status}: ${pretty(r.body)}`);
@@ -191,41 +199,41 @@ async function prepare(document, label) {
     }
     console.log('OK   both payloads attested');
 
-    step('6. issueDocumentIntegrityAttestation (anchors both roots in-flow, mask covers the changes)');
-    r = await post('/issueDocumentIntegrityAttestation', {
+    step('6. proveDocumentIntegrity (anchors both roots in-flow, mask covers the changes)');
+    r = await post('/proveDocumentIntegrity', {
         payloadHashA: v1.payloadHash, payloadHashB: v2.payloadHash,
         allowedMask: ALLOWED_MASK,
         schema: v1.schema, openingA: v1.opening, openingB: v2.opening,
         contentRootA: v1.contentRoot, contentRootB: v2.contentRoot, schemaId: v1.schemaId,
         sessionId, contractAddress
     });
-    if (r.status >= 400) fail(`issueDocumentIntegrityAttestation → ${r.status}: ${pretty(r.body)}`);
+    if (r.status >= 400) fail(`proveDocumentIntegrity → ${r.status}: ${pretty(r.body)}`);
     const integRes = await pollJob(sessionId, r.body.jobId, 'integrity');
     if (integRes?.claim?.allowedMask !== ALLOWED_MASK) fail(`integrity claim mask mismatch: ${pretty(integRes)}`);
     console.log(`OK   unchanged-except proven in tx ${integRes.proof.proofValue.slice(0, 16)}…`);
 
-    step('7. Crawler-free verifyPredicateState (documentIntegrity)');
-    const integVerify = await pollVerify(fn('verifyPredicateState', {
+    step('7. Crawler-free verifyPredicate (documentIntegrity)');
+    const integVerify = await pollVerify(fn('verifyPredicate', {
         contractAddress, attesterId, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
         predicate: 'documentIntegrity', allowedMask: ALLOWED_MASK
     }), 'integrity');
     if (integVerify.proven !== true) fail(`integrity: expected proven=true: ${pretty(integVerify)}`);
     console.log('OK   integrity claim verified from live state');
 
-    step('8. issueDocumentDiffAttestation (k = actual difference count; roots already anchored)');
-    r = await post('/issueDocumentDiffAttestation', {
+    step('8. proveDocumentDiff (k = actual difference count; roots already anchored)');
+    r = await post('/proveDocumentDiff', {
         payloadHashA: v1.payloadHash, payloadHashB: v2.payloadHash,
         k: DIFF_COUNT,
         schema: v1.schema, openingA: v1.opening, openingB: v2.opening,
         sessionId, contractAddress
     });
-    if (r.status >= 400) fail(`issueDocumentDiffAttestation → ${r.status}: ${pretty(r.body)}`);
+    if (r.status >= 400) fail(`proveDocumentDiff → ${r.status}: ${pretty(r.body)}`);
     const diffRes = await pollJob(sessionId, r.body.jobId, 'diff');
     if (diffRes?.claim?.k !== DIFF_COUNT) fail(`diff claim k mismatch: ${pretty(diffRes)}`);
     console.log(`OK   ${DIFF_COUNT}-of-16 distinctness proven in tx ${diffRes.proof.proofValue.slice(0, 16)}…`);
 
-    step('9. Crawler-free verifyPredicateState (documentDiff)');
-    const diffVerify = await pollVerify(fn('verifyPredicateState', {
+    step('9. Crawler-free verifyPredicate (documentDiff)');
+    const diffVerify = await pollVerify(fn('verifyPredicate', {
         contractAddress, attesterId, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
         predicate: 'documentDiff', k: DIFF_COUNT
     }), 'diff');
@@ -245,14 +253,14 @@ async function prepare(document, label) {
             schema: v1.schema, openingA: v1.opening, openingB: v2.opening
         }
     ];
-    r = await post('/issueFieldPredicateAttestationBatch', {
+    r = await post('/proveClaims', {
         payloadHash: v1.payloadHash, claims: batchClaims, sessionId, contractAddress
     });
-    if (r.status >= 400) fail(`issueFieldPredicateAttestationBatch → ${r.status}: ${pretty(r.body)}`);
+    if (r.status >= 400) fail(`proveClaims → ${r.status}: ${pretty(r.body)}`);
     const batchRes = await pollJob(sessionId, r.body.jobId, 'batch+');
     const batchTx = batchRes?.proof?.proofValue;
     if (!batchTx) fail(`batch result has no proof.proofValue: ${pretty(batchRes)}`);
-    const k1Verify = await pollVerify(fn('verifyPredicateState', {
+    const k1Verify = await pollVerify(fn('verifyPredicate', {
         contractAddress, attesterId, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
         predicate: 'documentDiff', k: 1
     }), 'batch-diff');
@@ -260,7 +268,7 @@ async function prepare(document, label) {
     console.log(`OK   ONE tx for numeric + documentDiff: ${batchTx.slice(0, 16)}…`);
 
     step('11. NEGATIVE a: mask missing the dropped field → local proving abort');
-    r = await post('/issueDocumentIntegrityAttestation', {
+    r = await post('/proveDocumentIntegrity', {
         payloadHashA: v1.payloadHash, payloadHashB: v2.payloadHash,
         allowedMask: 4, // covers only the capacity change, NOT the dropped origin
         schema: v1.schema, openingA: v1.opening, openingB: v2.opening,
@@ -273,7 +281,7 @@ async function prepare(document, label) {
     if (/timed out|stalled|sync/i.test(negIntegMsg)) {
         fail(`negative integrity failed on a SYNC issue, not the mask: ${negIntegMsg} :: re-run when the public indexer is healthy`);
     }
-    const ghostInteg = await pollVerify(fn('verifyPredicateState', {
+    const ghostInteg = await pollVerify(fn('verifyPredicate', {
         contractAddress, attesterId, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
         predicate: 'documentIntegrity', allowedMask: 4
     }), 'ghost-integrity', { expectTrue: false });
@@ -281,7 +289,7 @@ async function prepare(document, label) {
     console.log(`OK   presence change outside the mask rejected locally: ${negIntegMsg}`);
 
     step('12. NEGATIVE b: k above the actual count → local proving abort');
-    r = await post('/issueDocumentDiffAttestation', {
+    r = await post('/proveDocumentDiff', {
         payloadHashA: v1.payloadHash, payloadHashB: v2.payloadHash,
         k: DIFF_COUNT + 1,
         schema: v1.schema, openingA: v1.opening, openingB: v2.opening,
@@ -294,7 +302,7 @@ async function prepare(document, label) {
     if (/timed out|stalled|sync/i.test(negDiffMsg)) {
         fail(`negative diff failed on a SYNC issue, not the count: ${negDiffMsg} :: re-run when the public indexer is healthy`);
     }
-    const ghostDiff = await pollVerify(fn('verifyPredicateState', {
+    const ghostDiff = await pollVerify(fn('verifyPredicate', {
         contractAddress, attesterId, payloadHash: v1.payloadHash, payloadHashB: v2.payloadHash,
         predicate: 'documentDiff', k: DIFF_COUNT + 1
     }), 'ghost-diff', { expectTrue: false });

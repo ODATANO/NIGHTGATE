@@ -7,7 +7,6 @@ import { resolveContract } from './contract-registry';
 import { buildWalletMaterialForSession, attesterIdForSession, type WalletMaterialFactory } from './wallet-material-factory';
 import { refuseSponsorAsActor } from '../utils/session-expiry';
 import { loadCircuitArgTypes } from './arg-coercion';
-import { deriveRawTokenType, SHIELDED_TEST_TOKEN_AMOUNT } from './token-type';
 import { registerBackgroundJobProcessor, registerBackgroundJobReconciliationFinalizer } from './background-jobs';
 import type { BackgroundJobProcessor, BackgroundJobReconciliationFinalizer } from './background-jobs';
 import { JOB_KINDS, type JobExecutor, type JobFinalizer } from './job-kinds';
@@ -85,14 +84,6 @@ export function registerSubmissionHandlers(
 
     const executors: Record<Exclude<JobExecutor, 'wallet'>, BackgroundJobProcessor> = {
         contract: executeContractCommand,
-        // Add the token type to the result. Without it the minted coin cannot be spent.
-        mintShieldedTestToken: async (raw, job) => {
-            const result = await executeContractCommand(raw, job) as Record<string, unknown> | undefined;
-            // The executor already rejected any op but 'call' for this kind.
-            const command = raw as Extract<ContractCommandV1, { op: 'call' }>;
-            const token = await deriveRawTokenType(String(command?.contractAddress ?? ''));
-            return { ...(result ?? {}), tokenTypeHex: token.tokenTypeHex, amount: SHIELDED_TEST_TOKEN_AMOUNT.toString() };
-        },
         // Record the confirmed mint, so its token type is known to the server
         // and the minting grant may get swap offers in it sponsored.
         mintFactoryToken: async (raw, job) => {

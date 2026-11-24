@@ -139,12 +139,12 @@ try {
     const stateA = Buffer.from('midnight:contract-state[v6]:A');
     const stateB = Buffer.from('midnight:contract-state[v6]:B-longer');
     const stateRow = (bytes, height) => ({
-        address: 'ab'.repeat(32), height, state: bytes.toString('base64'), zswapState: bytes.toString('base64'),
+        contractAddress: 'ab'.repeat(32), height, state: bytes.toString('base64'), zswapState: bytes.toString('base64'),
         stateHash: 'h'.repeat(64), zswapStateHash: 'z'.repeat(64), contractActionId: actions[0].ID
     });
     await upsertCurrentState(db, stateRow(stateA, 9));
     await upsertCurrentState(db, stateRow(stateB, 10));
-    const csRow = await db.run(cds.ql.SELECT.one.from('midnight.ContractStates').columns('state', 'zswapState').where({ address: 'ab'.repeat(32) }));
+    const csRow = await db.run(cds.ql.SELECT.one.from('midnight.ContractStates').columns('state', 'zswapState').where({ contractAddress: 'ab'.repeat(32) }));
     const csBytes = await readCapBinary(csRow?.state);
     ok('postgres: ContractStates.state written by UPDATE reads back as the bytes', csBytes?.equals(stateB) === true, csBytes ? csBytes.subarray(0, 32).toString() : 'null');
     const csLen = await db.run("SELECT octet_length(state) AS n FROM midnight_contractstates");
@@ -157,6 +157,14 @@ try {
     const lpLen = await db.run("SELECT octet_length(ledgerparameters) AS n FROM midnight_blocks WHERE ledgerparameters IS NOT NULL");
     ok('postgres: Blocks.ledgerParameters written by UPDATE holds the bytes', Number(lpLen[0]?.n) === stateA.length, `octet_length=${lpLen[0]?.n}`);
 
+    // ---- 2c. Rows in old formats --------------------------------------------
+    const { findOldStoredFormats } = require('./srv/utils/old-stored-formats.js');
+    const base64Rows = async () => (await findOldStoredFormats(db, 'postgres')).find(f => f.name === 'postgres-base64-binary')?.rows ?? 0;
+    ok('postgres: binary columns written as bytes count as migrated', await base64Rows() === 0);
+    await db.run(`UPDATE midnight_blocks SET ledgerparameters = convert_to('${stateA.toString('base64')}', 'UTF8') WHERE ID = '${blockRow.ID}'`);
+    ok('postgres: a binary column holding base64 text counts as one row to migrate', await base64Rows() === 1);
+    await db.run(cds.ql.UPDATE.entity('midnight.Blocks').set({ ledgerParameters: capBinaryInput(stateA.toString('base64')) }).where({ ID: blockRow.ID }));
+
     // ---- 3. Secondary indexes ---------------------------------------------
     const { ensureIndexes, NIGHTGATE_INDEXES } = require('./srv/utils/db-indexes.js');
     const warnings = [];
@@ -166,36 +174,38 @@ try {
     ok('postgres: pg_indexes lists them', idx.length === NIGHTGATE_INDEXES.length, `${idx.length}`);
     const again = await ensureIndexes(db, 'postgres', (m) => warnings.push(m));
     ok('postgres: ensureIndexes is idempotent', again === NIGHTGATE_INDEXES.length && warnings.length === 0);
-
-    // ---- 3b. Hashes stored with the node's 0x prefix are rewritten --------
-    const { dropStoredHexPrefix } = require('./srv/crawler/stored-hex-prefix.js');
-    await db.run("UPDATE midnight_blocks SET hash = '0x' || hash, stateroot = '0x' || stateroot");
-    await db.run("UPDATE midnight_transactions SET hash = '0x' || hash");
-    await db.run("UPDATE midnight_syncstate SET lastindexedhash = '0x' || lastindexedhash");
-    const indexDefinitions = async () => JSON.stringify(await db.run(`
-        SELECT 'index' AS kind, indexname AS name, indexdef AS definition FROM pg_indexes
-         WHERE tablename IN ('midnight_blocks', 'midnight_transactions')
-        UNION ALL
-        SELECT 'constraint', conname, pg_get_constraintdef(oid) FROM pg_constraint
-         WHERE conrelid IN ('midnight_blocks'::regclass, 'midnight_transactions'::regclass)
-        ORDER BY 1, 2`));
-    const indexesBefore = await indexDefinitions();
-    // A foreign key on the primary key refuses its drop, so the rewrite fails after it has dropped other indexes.
-    await db.run('CREATE TABLE ng_lane_ref (block_id varchar(36) REFERENCES midnight_blocks (id))');
-    const refused = await dropStoredHexPrefix(db).then(() => null, err => err);
-    await db.run('DROP TABLE ng_lane_ref');
-    const stillPrefixed = await db.run("SELECT count(*) AS n FROM midnight_blocks WHERE hash LIKE '0x%'");
-    ok('postgres: a rewrite that fails leaves rows and indexes as they were',
-        refused !== null && Number(stillPrefixed[0]?.n) === 1 && indexesBefore === await indexDefinitions(), refused?.message ?? 'no error');
-    const rewritten = await dropStoredHexPrefix(db);
-    ok('postgres: stored hashes lose the 0x prefix', rewritten.blocks === 1 && rewritten.transactions === 1, JSON.stringify(rewritten));
-    const spelled = await db.run("SELECT b.hash AS block, b.stateroot AS root, t.hash AS tx, s.lastindexedhash AS tip FROM midnight_blocks b, midnight_transactions t, midnight_syncstate s");
-    ok('postgres: the values are the old ones without the prefix',
-        spelled[0]?.block === 'rawbytes-pg' && spelled[0]?.root === 'state-pg' && /^[0-9a-f]{64}$/.test(spelled[0]?.tx) && spelled[0]?.tip === 'rawbytes-pg',
-        JSON.stringify(spelled[0]));
-    ok('postgres: the rewrite builds every index and constraint again as it was', indexesBefore === await indexDefinitions(), `${JSON.parse(indexesBefore).length} definitions`);
-    const rewrittenAgain = await dropStoredHexPrefix(db);
-    ok('postgres: a second run rewrites nothing', rewrittenAgain.blocks === 0 && rewrittenAgain.transactions === 0, JSON.stringify(rewrittenAgain));
+    const unspentIndex = (await db.run("SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'ng_unshieldedutxos_unspent_position'"))[0]?.indexdef ?? '';
+    ok('postgres: the index of the unspent UTXOs holds only those rows, newest first',
+        /\(blockheight DESC, indexinblock DESC, outputindex DESC\) WHERE \(spentattransaction_id IS NULL\)$/.test(unspentIndex), unspentIndex);
+    // The two reads these indexes serve. One contract has only the newest actions, so walking the table by position would pass every other row first.
+    await db.run(`INSERT INTO midnight_contractactions (id, blockheight, indexinblock, actionindex, contractaddress, actiontype, transaction_id, createdat)
+        SELECT 'lane-' || i, i, 0, 0, md5((i % 40)::text), 'CALL', 'lane-tx', now() FROM generate_series(1, 4000) AS i`);
+    await db.run(`INSERT INTO midnight_contractactions (id, blockheight, indexinblock, actionindex, contractaddress, actiontype, transaction_id, createdat)
+        SELECT 'lane-new-' || i, 5000 + i, 0, 0, md5('newest'), 'CALL', 'lane-tx', now() FROM generate_series(1, 20) AS i`);
+    await db.run(`INSERT INTO midnight_unshieldedutxos (id, blockheight, indexinblock, owner, tokentype, value, intenthash, outputindex, initialnonce, createdattransaction_id, spentattransaction_id, createdat)
+        SELECT 'lane-' || i, i, 0, 'mn_addr_lane', '00', 1, md5(i::text), 0, md5('n' || i::text), 'lane-tx', CASE WHEN i % 3 = 0 THEN NULL ELSE 'lane-spend' END, now()
+        FROM generate_series(1, 4000) AS i`);
+    await db.run('ANALYZE midnight_contractactions');
+    await db.run('ANALYZE midnight_unshieldedutxos');
+    const planner = pgClient();
+    await planner.connect();
+    const planOf = async (sql) => (await planner.query(`EXPLAIN ${sql}`)).rows.map(r => r['QUERY PLAN']).join(' | ');
+    // The ORDER BY is what an OData read sends: the position, then the key CAP appends.
+    const actionsPlan = await planOf("SELECT id FROM midnight_contractactions WHERE contractaddress = md5('newest') ORDER BY blockheight ASC, indexinblock ASC, actionindex ASC, id ASC LIMIT 10");
+    ok('postgres: the oldest actions of a contract come from its index, read backwards',
+        actionsPlan.includes('Index Scan Backward using ng_contractactions_address_position') && !actionsPlan.includes('Seq Scan'), actionsPlan);
+    const newestActionsPlan = await planOf("SELECT id FROM midnight_contractactions WHERE contractaddress = md5('newest') ORDER BY blockheight DESC, indexinblock DESC, actionindex DESC, id ASC LIMIT 10");
+    ok('postgres: the newest actions of a contract come from the same index, read forwards',
+        newestActionsPlan.includes('Index Scan using ng_contractactions_address_position') && !newestActionsPlan.includes('Seq Scan'), newestActionsPlan);
+    const unspentPlan = await planOf('SELECT id FROM midnight_unshieldedutxos WHERE spentattransaction_id IS NULL ORDER BY blockheight DESC, indexinblock DESC, outputindex DESC, id ASC LIMIT 10');
+    ok('postgres: the newest unspent UTXOs come from their index',
+        unspentPlan.includes('Index Scan using ng_unshieldedutxos_unspent_position') && !unspentPlan.includes('Seq Scan'), unspentPlan);
+    const ownerPlan = await planOf("SELECT id FROM midnight_unshieldedutxos WHERE owner = 'mn_addr_lane' ORDER BY blockheight DESC, indexinblock DESC, outputindex DESC, id ASC LIMIT 10");
+    ok('postgres: the newest UTXOs of an owner come from their index',
+        ownerPlan.includes('Index Scan using ng_unshieldedutxos_owner_position') && !ownerPlan.includes('Seq Scan'), ownerPlan);
+    await planner.end();
+    await db.run("DELETE FROM midnight_contractactions WHERE id LIKE 'lane-%'");
+    await db.run("DELETE FROM midnight_unshieldedutxos WHERE id LIKE 'lane-%'");
 
     // ---- 4. Lock-contention classification on REAL errors -----------------
     const retry = require('./srv/submission/db-write-retry.js');
@@ -285,8 +295,50 @@ try {
     ok('postgres: the tag filter of the offer board keeps the rows that hold the quoted tag', byTag.carbon === '1' && byTag.car === '2', JSON.stringify(byTag));
     ok('postgres: % and _ in a tag are plain characters, not wildcards', byTag.wind === '3' && byTag.wildcard === '', JSON.stringify(byTag));
 
+    // The start-up step that retires the open offers posted for one taker.
+    await db.run(INSERT.into('midnight.SwapOffers').entries([
+        { ...offer(4, []), takerSecretHash: 'ef'.repeat(32) },
+        { ...offer(5, []), takerSecretHash: 'ef'.repeat(32), status: 'filled' }
+    ]));
+    const { retireOffersForOneTaker } = require('./srv/submission/swap-offers.js');
+    const retiredCount = await retireOffersForOneTaker(db);
+    const statuses = (await db.run(SELECT.from('midnight.SwapOffers').columns('ID', 'status')))
+        .map(r => `${String(r.ID).slice(-1)}=${r.status}`).sort().join(',');
+    ok('postgres: only the open offers posted for one taker are retired at start',
+        retiredCount === 1 && statuses === '1=open,2=open,3=open,4=retired,5=filled', `${retiredCount} ${statuses}`);
+
+    // The start-up step that gives proof and grant rows the owner of the job that wrote them.
+    const old = '2026-01-10T10:00:00.000Z';
+    const proof = (n, userId) => ({
+        ID: `55555555-0000-4000-8000-00000000000${n}`, payloadHash: 'ab'.repeat(32), contractAddress: 'cd'.repeat(32),
+        predicate: 'greaterOrEqual', op: 1, threshold: '5', userId, createdAt: old, modifiedAt: old
+    });
+    await db.run(INSERT.into('midnight.PredicateAttestations').entries([proof(1, null), proof(2, null), proof(3, 'kept')]));
+    const proofJob = (n, createdAt) => ({
+        ID: `66666666-0000-4000-8000-00000000000${n}`, kind: 'proveFieldPredicate', status: 'succeeded', requestedBy: 'lane-user',
+        sessionId: `33333333-0000-4000-8000-00000000000${n}`, request: JSON.stringify({ predicateAttestationId: proof(n).ID }), createdAt, modifiedAt: createdAt
+    });
+    await db.run(INSERT.into('midnight.BackgroundJobs').entries([proofJob(1, old), proofJob(2, '2026-01-11T10:00:00.000Z'), proofJob(3, old)]));
+    const { backfillRowOwners, moveStoredDiffCounts } = require('./srv/submission/job-store.js');
+    const filledCount = await backfillRowOwners(db);
+    const ownersNow = (await db.run(SELECT.from('midnight.PredicateAttestations').columns('ID', 'userId', 'sessionId')))
+        .map(r => `${String(r.ID).slice(-1)}=${r.userId ?? '-'}/${r.sessionId ? String(r.sessionId).slice(-1) : '-'}`).sort().join(',');
+    ok('postgres: a proof row without an owner gets the user and session of its job, within the time bound',
+        filledCount === 1 && ownersNow === '1=lane-user/1,2=-/-,3=kept/-', `${filledCount} ${ownersNow}`);
+
+    // The start-up step that gives the k of a stored document diff its own column.
+    const LARGEST = '18446744073709551615';
+    await db.run(INSERT.into('midnight.PredicateAttestations').entries([
+        { ...proof(4, 'kept'), predicate: 'documentDiff', op: null, threshold: '3' }, { ...proof(5, 'kept'), threshold: LARGEST }
+    ]));
+    const movedCount = await moveStoredDiffCounts(db);
+    const countsNow = (await db.run(SELECT.from('midnight.PredicateAttestations').columns('ID', 'threshold', 'k').where({ ID: { in: [proof(4).ID, proof(5).ID] } })))
+        .map(r => `${String(r.ID).slice(-1)}=${r.threshold ?? '-'}/${r.k ?? '-'}`).sort().join(',');
+    ok('postgres: a stored document diff gets its k in its own column, and a threshold of 2^64-1 is kept exactly',
+        movedCount === 1 && countsNow === `4=-/3,5=${LARGEST}/-`, `${movedCount} ${countsNow}`);
+
     // The same filter as a READ of PendingSubmissions by a user: the user's sessions as a subquery.
-    const session = (n, userId) => ({ ID: `22222222-0000-4000-8000-00000000000${n}`, sessionId: `33333333-0000-4000-8000-00000000000${n}`, userId, connectedAt: new Date().toISOString() });
+    const session = (n, userId) => ({ sessionId: `33333333-0000-4000-8000-00000000000${n}`, userId, connectedAt: new Date().toISOString() });
     await db.run(INSERT.into('midnight.WalletSessions').entries([session(1, 'lane-user'), session(2, 'lane-user'), session(3, 'someone-else')]));
     const pending = (n) => ({ ID: `44444444-0000-4000-8000-00000000000${n}`, sessionId: `33333333-0000-4000-8000-00000000000${n}`, actionType: 'CALL', submittedAt: new Date().toISOString() });
     await db.run(INSERT.into('midnight.PendingSubmissions').entries([pending(1), pending(2), pending(3)]));
@@ -294,6 +346,174 @@ try {
         .where({ sessionId: { in: SELECT.from('midnight.WalletSessions').columns('sessionId').where({ userId: 'lane-user' }) } }));
     const ownIds = own.map(r => String(r.ID).slice(-1)).sort().join(',');
     ok('postgres: pending submissions are narrowed to the sessions of one user by a subquery', ownIds === '1,2', ownIds);
+
+    // ---- A database of the last release with the older names ----------------
+    // The released model goes into its own schema. The tool and a deploy of the current model bring it forward.
+    const { CHAIN_POSITION_COLUMNS, COLUMN_RENAMES, COLUMNS_TO_TEXT, KEY_CHANGES } = require('./srv/utils/db-indexes.js');
+    const upgradeSchema = 'nightgate_upgrade_lane';
+    await db.run(`DROP SCHEMA IF EXISTS ${upgradeSchema} CASCADE`);
+    await db.run(`CREATE SCHEMA ${upgradeSchema}`);
+    const upgradeDb = { ...cfg.requires.db, credentials: { ...creds, schema: upgradeSchema } };
+    const upgradeEnv = { ...process.env, CDS_CONFIG: JSON.stringify({ ...cfg, requires: { ...cfg.requires, db: upgradeDb } }) };
+    const upgrade = await cds.connect.to('upgrade-lane', upgradeDb);
+    const released = path.join(repoRoot, 'test/fixtures/model-0.46.3');
+    await cds.deploy(await cds.load([path.join(released, 'db'), path.join(released, 'srv')])).to(upgrade);
+    const oldJobId = '77777777-0000-4000-8000-000000000001';
+    const oldSessionId = '99999999-0000-4000-8000-000000000001';
+    await upgrade.run(`INSERT INTO midnight_backgroundjobs (id, kind, status, txhash, indexertxhash) VALUES ('${oldJobId}', 'sponsorUnboundTransaction', 'succeeded', '00${'ab'.repeat(32)}', '${'cd'.repeat(32)}')`);
+    await upgrade.run("INSERT INTO midnight_blocks (id, hash, height, protocolversion, timestamp) VALUES ('88888888-0000-4000-8000-000000000001', 'b10c', 7, 1, 1)");
+    await upgrade.run("INSERT INTO midnight_transactions (id, transactionid, hash, ledgertxhash, protocolversion, transactiontype, block_id) VALUES ('88888888-0000-4000-8000-000000000002', 3, 'e0e0', 'f1f1', 1, 'REGULAR', '88888888-0000-4000-8000-000000000001')");
+    await upgrade.run(`INSERT INTO midnight_walletsessions (id, sessionid, userid, connectedat, isactive, label) VALUES ('88888888-0000-4000-8000-000000000003', '${oldSessionId}', 'lane-user', now(), true, 'kept')`);
+    await upgrade.run("INSERT INTO midnight_predicateattestations (id, payloadhash, contractaddress, predicate, threshold) VALUES ('88888888-0000-4000-8000-000000000004', 'aa', 'cc', 'greaterOrEqual', 9223372036854775807)");
+    await upgrade.run("INSERT INTO midnight_contractactions (id, actionindex, address, actiontype, entrypoint, transaction_id) VALUES ('88888888-0000-4000-8000-000000000005', 1, 'c0', 'CALL', '5:0', '88888888-0000-4000-8000-000000000002')");
+    await upgrade.run("INSERT INTO midnight_contractactions (id, actionindex, address, actiontype, entrypoint, transaction_id) VALUES ('88888888-0000-4000-8000-000000000007', 2, 'c0', 'CALL', 'attest', '88888888-0000-4000-8000-000000000002')");
+    await upgrade.run("UPDATE midnight_transactions SET circuitname = '5:0' WHERE id = '88888888-0000-4000-8000-000000000002'");
+    await upgrade.run("INSERT INTO midnight_unshieldedutxos (id, owner, tokentype, value, intenthash, outputindex, initialnonce, createdattransaction_id) VALUES ('88888888-0000-4000-8000-000000000006', 'mn_addr_x', '00', '5', 'i1', 0, 'n1', '88888888-0000-4000-8000-000000000002')");
+    const columnsOf = async (table) => (await upgrade.run(`SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '${table}'`)).map(r => r.column_name);
+    const oldJobs = await columnsOf('midnight_backgroundjobs');
+    const oldView = await columnsOf('nightgateservice_transactions');
+    const typeOf = async (table, column) => (await upgrade.run(`SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '${table}' AND column_name = '${column}'`))[0]?.data_type;
+    const WIDENED = [['midnight_blocks', 'timestamp'], ['midnight_unshieldedutxos', 'ctime'], ['midnight_backgroundjobs', 'chainblockheight'], ['midnight_pendingsubmissions', 'chainblockheight']];
+    const oldTypes = await Promise.all(WIDENED.map(([table, column]) => typeOf(table, column)));
+    ok('postgres: the released schema keeps block times and job block heights in 32 bit', oldTypes.every(t => t === 'integer'), oldTypes.join(','));
+    ok('postgres: the released schema is in place, tables and views', oldJobs.includes('indexertxhash') && !oldJobs.includes('txid') && oldView.includes('hash'), `${oldJobs.join(',')} | ${oldView.join(',')}`);
+
+    const tool = path.join(repoRoot, 'scripts/apply-schema-delta.mjs');
+    const firstRun = execFileSync(process.execPath, [tool, '--postgres'], { cwd: repoRoot, env: upgradeEnv }).toString();
+    ok('postgres: the tool renames every column, moves every key and retypes every number column that became text',
+        firstRun.includes(`${COLUMN_RENAMES.length} column(s) renamed, ${KEY_CHANGES.length} key(s) moved, ${COLUMNS_TO_TEXT.length} column(s) text now, ${CHAIN_POSITION_COLUMNS.length} position column(s) filled`), firstRun.trim().split('\n').at(-1));
+    const placed = (await upgrade.run(`SELECT 't' AS row, blockheight, indexinblock FROM midnight_transactions WHERE id = '88888888-0000-4000-8000-000000000002'
+        UNION ALL SELECT 'a', blockheight, indexinblock FROM midnight_contractactions WHERE id = '88888888-0000-4000-8000-000000000005'
+        UNION ALL SELECT 'u', blockheight, indexinblock FROM midnight_unshieldedutxos WHERE id = '88888888-0000-4000-8000-000000000006' ORDER BY 1`))
+        .map(r => `${r.row}=${r.blockheight}.${r.indexinblock}`).join(',');
+    ok('postgres: a transaction, its action and its UTXO carry their place in the chain after the tool', placed === 'a=7.3,t=7.3,u=7.3', placed);
+    const circuits = (await upgrade.run(`SELECT 't' AS row, circuit FROM midnight_transactions WHERE id = '88888888-0000-4000-8000-000000000002'
+        UNION ALL SELECT 'a' || actionindex, circuit FROM midnight_contractactions WHERE transaction_id = '88888888-0000-4000-8000-000000000002' ORDER BY 1`))
+        .map(r => `${r.row}=${r.circuit}`).join(',');
+    ok('postgres: a pallet call index kept as the circuit is cleared, a circuit name stays', circuits === 'a1=null,a2=attest,t=null', circuits);
+    const nullable = (await upgrade.run(`SELECT count(*) AS n FROM information_schema.columns WHERE table_schema = current_schema() AND is_nullable = 'YES'
+        AND (table_name, column_name) IN (${CHAIN_POSITION_COLUMNS.map(c => `('${c.table.toLowerCase()}', '${c.column.toLowerCase()}')`).join(', ')})`))[0].n;
+    ok('postgres: every position column is NOT NULL after the tool', Number(nullable) === 0, String(nullable));
+    const thresholdType = await typeOf('midnight_predicateattestations', 'threshold');
+    const keptThreshold = (await upgrade.run("SELECT threshold FROM midnight_predicateattestations WHERE id = '88888888-0000-4000-8000-000000000004'"))[0];
+    ok('postgres: the threshold of a proof is text after the tool and keeps its value',
+        thresholdType === 'character varying' && keptThreshold?.threshold === '9223372036854775807', `${thresholdType} ${JSON.stringify(keptThreshold)}`);
+    const jobCols = await columnsOf('midnight_backgroundjobs');
+    const txCols = await columnsOf('midnight_transactions');
+    const idCols = await columnsOf('midnight_transactionidentifiers');
+    ok('postgres: the tables carry the new names, the old ones are gone',
+        ['txid', 'txhash'].every(c => jobCols.includes(c)) && !jobCols.includes('indexertxhash')
+            && ['indexinblock', 'extrinsichash', 'txhash'].every(c => txCols.includes(c)) && !['transactionid', 'hash', 'ledgertxhash'].some(c => txCols.includes(c))
+            && idCols.includes('txid') && !idCols.includes('identifier'),
+        `${jobCols.join(',')} | ${txCols.join(',')} | ${idCols.join(',')}`);
+    const movedJob = (await upgrade.run(`SELECT txid, txhash FROM midnight_backgroundjobs WHERE id = '${oldJobId}'`))[0];
+    ok('postgres: a job keeps its identifier and its hash through the rename', movedJob?.txid === `00${'ab'.repeat(32)}` && movedJob?.txhash === 'cd'.repeat(32), JSON.stringify(movedJob));
+    const sessionCols = await columnsOf('midnight_walletsessions');
+    const sessionKey = (await upgrade.run("SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = to_regclass('midnight_walletsessions') AND contype IN ('p', 'u')")).map(r => r.def).join(' | ');
+    ok('postgres: a wallet session is keyed by its session id, the former key column and the unique constraint are gone',
+        !sessionCols.includes('id') && sessionKey === 'PRIMARY KEY (sessionid)', `${sessionCols.join(',')} | ${sessionKey}`);
+    const storedModel = JSON.parse((await upgrade.run('SELECT csn FROM cds_model'))[0].csn).definitions;
+    const storedSessionKeys = Object.entries(storedModel['midnight.WalletSessions'].elements).filter(([, e]) => e.key).map(([name]) => name).join(',');
+    ok('postgres: the stored model names the columns and the key as the tables do, and has forgotten the dropped views',
+        'txId' in storedModel['midnight.BackgroundJobs'].elements && !('indexerTxHash' in storedModel['midnight.BackgroundJobs'].elements)
+            && storedSessionKeys === 'sessionId' && !('NightgateService.WalletSessions' in storedModel) && !('NightgateAdminService.WalletSessions' in storedModel),
+        `${Object.keys(storedModel['midnight.BackgroundJobs'].elements).join(',')} | key ${storedSessionKeys}`);
+
+    let redeploy = null;
+    try { await cds.deploy(csn).to(upgrade); } catch (err) { redeploy = err; }
+    ok('postgres: the deploy after the tool goes through', redeploy === null, redeploy?.message);
+    const newTypes = await Promise.all(WIDENED.map(([table, column]) => typeOf(table, column.replace('chainblockheight', 'blockheight'))));
+    ok('postgres: block times and job block heights are 64 bit after the upgrade', newTypes.every(t => t === 'bigint'), newTypes.join(','));
+    const keptBlock = (await upgrade.run("SELECT timestamp FROM midnight_blocks WHERE id = '88888888-0000-4000-8000-000000000001'"))[0];
+    ok('postgres: a block keeps its time through the wider column', String(keptBlock?.timestamp) === '1', JSON.stringify(keptBlock));
+    const txView = await columnsOf('nightgateservice_transactions');
+    const sessionView = await columnsOf('nightgateservice_walletsessions');
+    ok('postgres: the views carry the new names after the deploy',
+        ['indexinblock', 'extrinsichash', 'txhash'].every(c => txView.includes(c)) && !['transactionid', 'hash', 'ledgertxhash'].some(c => txView.includes(c))
+            && sessionView.includes('sessionid') && !sessionView.includes('id'),
+        `${txView.join(',')} | ${sessionView.join(',')}`);
+    const viewedTx = (await upgrade.run('SELECT indexinblock, extrinsichash, txhash FROM nightgateservice_transactions'))[0];
+    ok('postgres: a transaction keeps its position and both hashes, read through its view',
+        Number(viewedTx?.indexinblock) === 3 && viewedTx?.extrinsichash === 'e0e0' && viewedTx?.txhash === 'f1f1', JSON.stringify(viewedTx));
+    const chainIndexes = (await upgrade.run("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename IN ('midnight_transactions', 'midnight_contractactions', 'midnight_unshieldedutxos')")).map(r => r.indexname);
+    ok('postgres: the position indexes are there after the upgrade and none sorts a chain table by its insert time',
+        chainIndexes.filter(n => n.endsWith('_position')).length === 8 && !chainIndexes.some(n => n.includes('createdat')), chainIndexes.join(','));
+    const actionKey = (await upgrade.run("SELECT is_nullable FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'midnight_contractactions' AND column_name = 'actionindex'"))[0];
+    ok('postgres: the index of an action in its transaction is NOT NULL after the deploy', actionKey?.is_nullable === 'NO', JSON.stringify(actionKey));
+    const viewedProof = (await upgrade.run('SELECT threshold, k FROM nightgateservice_predicateattestations'))[0];
+    ok('postgres: a proof keeps its threshold, read through its view, and has a column for k',
+        viewedProof?.threshold === '9223372036854775807' && viewedProof?.k === null, JSON.stringify(viewedProof));
+    const viewedSession = (await upgrade.run('SELECT sessionid, userid, label FROM nightgateservice_walletsessions'))[0];
+    ok('postgres: a wallet session keeps its session id, read through its view',
+        viewedSession?.sessionid === oldSessionId && viewedSession?.userid === 'lane-user' && viewedSession?.label === 'kept', JSON.stringify(viewedSession));
+    const secondRun = execFileSync(process.execPath, [tool, '--postgres'], { cwd: repoRoot, env: upgradeEnv }).toString();
+    ok('postgres: a second run of the tool changes nothing', secondRun.includes('0 column(s) renamed, 0 key(s) moved, 0 column(s) text now, 0 position column(s) filled'), secondRun.trim().split('\n').at(-1));
+    let secondDeploy = null;
+    try { await cds.deploy(csn).to(upgrade); } catch (err) { secondDeploy = err; }
+    ok('postgres: a second deploy goes through', secondDeploy === null, secondDeploy?.message);
+    await upgrade.disconnect?.();
+    await db.run(`DROP SCHEMA ${upgradeSchema} CASCADE`);
+
+    // The start-up step that sorts values an older version kept under one name.
+    await db.run(INSERT.into('midnight.BackgroundJobs').entries([
+        { ID: '77777777-0000-4000-8000-000000000001', kind: 'sponsorUnbound', status: 'succeeded', txId: `00${'ab'.repeat(32)}`, txHash: 'cd'.repeat(32) },
+        { ID: '77777777-0000-4000-8000-000000000002', kind: 'submitContractCall', status: 'succeeded', txId: 'ef'.repeat(32), txHash: null }
+    ]));
+    const { sortStoredTxValues } = require('./srv/submission/job-store.js');
+    const sorted = await sortStoredTxValues(db);
+    const sortedJob = (await db.run("SELECT txid, txhash FROM midnight_backgroundjobs WHERE id = '77777777-0000-4000-8000-000000000002'"))[0];
+    ok('postgres: a ledger hash an older version kept as the identifier moves to txHash',
+        sorted === 1 && sortedJob?.txid === null && sortedJob?.txhash === 'ef'.repeat(32), `${sorted} ${JSON.stringify(sortedJob)}`);
+    // The start-up step that gives stored jobs and grants the current action names.
+    await db.run(INSERT.into('midnight.BackgroundJobs').entries([
+        { ID: '77777777-0000-4000-8000-000000000003', kind: 'issueFieldPredicateAttestation', status: 'succeeded' },
+        { ID: '77777777-0000-4000-8000-000000000004', kind: 'retract', status: 'succeeded', request: JSON.stringify({ mode: 1, key: 'ab' }) }
+    ]));
+    await db.run(INSERT.into('midnight.AgentGrants').entries({
+        ID: '77777777-0000-4000-8000-000000000005', userId: 'lane', sessionId: '77777777-0000-4000-8000-000000000006',
+        tokenHash: '7'.repeat(64), allowedActions: JSON.stringify(['sponsorUnboundTransaction', 'sponsorSwap'])
+    }));
+    const { renameStoredActions } = require('./srv/submission/job-store.js');
+    const renamedRows = await renameStoredActions(db);
+    const renamedKinds = (await db.run("SELECT kind FROM midnight_backgroundjobs WHERE id IN ('77777777-0000-4000-8000-000000000003', '77777777-0000-4000-8000-000000000004') ORDER BY id"))
+        .map(r => r.kind).join(',');
+    const renamedGrant = (await db.run("SELECT allowedactions FROM midnight_agentgrants WHERE id = '77777777-0000-4000-8000-000000000005'"))[0];
+    ok('postgres: stored jobs and grants take the current action names',
+        renamedRows >= 3 && renamedKinds === 'proveFieldPredicate,purgeExpired' && renamedGrant?.allowedactions === '["sponsorUnbound","sponsorSwap"]',
+        `${renamedRows} ${renamedKinds} ${renamedGrant?.allowedactions}`);
+    ok('postgres: a second run renames nothing', await renameStoredActions(db) === 0);
+
+    // ---- A read that takes too long is stopped ------------------------------
+    // A lock on the table makes the read wait, so it reaches its time limit at a known moment.
+    cds.env.requires.auth = { kind: 'dummy' };
+    cds.model ??= cds.compile.for.nodejs(csn);
+    const app = require('express')();
+    await cds.serve('all').in(app);
+    const server = require('node:http').createServer(app);
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const readBlocks = async () => {
+        const started = Date.now();
+        const res = await fetch(`http://127.0.0.1:${server.address().port}/odata/v4/midnight/Blocks?$top=1`);
+        return { status: res.status, error: (await res.json().catch(() => ({}))).error, ms: Date.now() - started };
+    };
+    const blocker = pgClient();
+    await blocker.connect();
+    process.env.NIGHTGATE_QUERY_TIMEOUT_MS = '300';
+    try {
+        await blocker.query('BEGIN');
+        // Without a mode PostgreSQL takes the strongest lock, which also blocks reads.
+        await blocker.query('LOCK TABLE midnight_blocks');
+        const stopped = await readBlocks();
+        ok('postgres: a read past its time limit answers 504 QUERY_TIMEOUT',
+            stopped.status === 504 && stopped.error?.code === 'QUERY_TIMEOUT' && stopped.ms < 5000, `${stopped.status} ${JSON.stringify(stopped.error)} after ${stopped.ms} ms`);
+        await blocker.query('ROLLBACK');
+        const after = await readBlocks();
+        ok('postgres: the read after it runs as usual', after.status === 200, `${after.status} ${JSON.stringify(after.error)}`);
+    } finally {
+        delete process.env.NIGHTGATE_QUERY_TIMEOUT_MS;
+        await blocker.end();
+        server.close();
+    }
 } catch (err) {
     console.error(`FAIL lane aborted: ${err?.stack ?? err}`);
     failures++;

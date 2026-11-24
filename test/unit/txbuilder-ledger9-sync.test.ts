@@ -26,6 +26,34 @@ const outcome = (p: Promise<unknown>) => Promise.race([
     new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 20))
 ]);
 
+describe('waitForWalletSync', () => {
+    const ready = () => {
+        const w = fakeWallet();
+        w.wallet.state.subscribe = (o: Observer) => { o.next({ protocolVersion: 2_000_000n, progress: { isCompleteWithin: () => true } }); return { unsubscribe() { /* nothing */ } }; };
+        return w.wallet;
+    };
+
+    it('waits for every sub-wallet of the facade, the slowest one included', async () => {
+        const { waitForWalletSync } = await importWalletTx();
+        const dust = fakeWallet();
+        const synced = waitForWalletSync({ shielded: ready(), unshielded: ready(), dust: dust.wallet }, FORKS);
+        await tick();
+        // The dust wallet caught up but has not learned yet that the chain runs ledger 9.
+        dust.emit(true, 1_000_000n);
+        expect(await outcome(synced)).toBe('pending');
+        dust.emit(true, 2_000_000n);
+        expect(await outcome(synced)).toBe('resolved');
+    });
+
+    it('waits only for the wallets it is given and names a wallet the facade lacks', async () => {
+        const { waitForWalletSync } = await importWalletTx();
+        expect(await outcome(waitForWalletSync({ shielded: ready() }, FORKS, ['shielded']))).toBe('resolved');
+        expect(await outcome(waitForWalletSync({ shielded: ready() }, FORKS))).toBe('rejected: waitForWalletSync: the facade has no unshielded wallet');
+        expect(await outcome(waitForWalletSync({ shielded: ready() }, FORKS, ['night' as never]))).toMatch(/^rejected: waitForWalletSync: 'night' is no wallet of a facade/);
+        expect(await outcome(waitForWalletSync(undefined as never, FORKS))).toBe('rejected: waitForWalletSync: the facade has no shielded wallet');
+    });
+});
+
 describe('syncedAtLedger9', () => {
     it('waits until the wallet caught up and reads the chain at ledger 9', async () => {
         const { syncedAtLedger9 } = await importWalletTx();

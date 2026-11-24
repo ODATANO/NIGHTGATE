@@ -28,10 +28,10 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
     const { srv, db, walletFactory, contractResolver, argTypesLoader, resolveSponsorForRequest } = ctx;
 
     srv.on(deployContract, async (req) => {
-        const { compiledArtifactRef, sessionId, initialPrivateState, idempotencyKey, sponsorSessionId } = req.data;
+        const { contractName, sessionId, initialPrivateState, idempotencyKey, sponsorSessionId } = req.data;
         const recoveryId = req.data.recoveryId ? req.data.recoveryId.toLowerCase() : undefined;
 
-        if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
+        if (!contractName) return req.reject(400, 'contractName is required');
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         if (rejectIfMainnetBlocked(req)) return;
@@ -42,7 +42,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            await contractResolver(compiledArtifactRef);
+            await contractResolver(contractName);
             await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             const sponsor = await resolveSponsorForRequest(req, sponsorSessionId);
 
@@ -50,26 +50,26 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                 kind: 'deployContract',
                 sessionId,
                 idempotencyKey,
-                request: { compiledArtifactRef, sessionId, hasInitialState: !!initialPrivateState, feeSponsor: sponsor?.sponsorSessionId ?? null, ...(recoveryId ? { recoveryId } : {}) },
+                request: { contractName, sessionId, hasInitialState: !!initialPrivateState, feeSponsor: sponsor?.sponsorSessionId ?? null, ...(recoveryId ? { recoveryId } : {}) },
                 idempotencyPayload: {
-                    compiledArtifactRef, sessionId, initialPrivateState: parsedInitialState,
+                    contractName, sessionId, initialPrivateState: parsedInitialState,
                     feeSponsor: sponsor?.sponsorSessionId ?? null, ...(recoveryId ? { recoveryId } : {})
                 },
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
-                command: { op: 'deploy', compiledArtifactRef, initialPrivateState: parsedInitialState, sponsorSessionId: sponsor?.sponsorSessionId, ...(recoveryId ? { recoveryId } : {}) }
+                command: { op: 'deploy', contractName, initialPrivateState: parsedInitialState, sponsorSessionId: sponsor?.sponsorSessionId, ...(recoveryId ? { recoveryId } : {}) }
             });
         });
     });
 
     srv.on(submitContractCall, async (req) => {
-        const { contractAddress, circuit, compiledArtifactRef, sessionId, args, idempotencyKey, initialPrivateState, sponsorSessionId } = req.data;
+        const { contractAddress, circuit, contractName, sessionId, args, idempotencyKey, initialPrivateState, sponsorSessionId } = req.data;
 
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
         if (!circuit) return req.reject(400, 'circuit is required');
-        if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
+        if (!contractName) return req.reject(400, 'contractName is required');
         if (!sessionId) return req.reject(400, 'sessionId is required');
 
         if (rejectIfMainnetBlocked(req)) return;
@@ -84,7 +84,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            const resolved = await contractResolver(compiledArtifactRef);
+            const resolved = await contractResolver(contractName);
 
             const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
             const coercedArgs = coerceCircuitArgs(parsedArgs, argTypes);
@@ -96,9 +96,9 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                 kind: 'submitContractCall',
                 sessionId,
                 idempotencyKey,
-                request: { contractAddress, circuit, compiledArtifactRef, sessionId, argCount: coercedArgs.length, feeSponsor: sponsor?.sponsorSessionId ?? null },
+                request: { contractAddress, circuit, contractName, sessionId, argCount: coercedArgs.length, feeSponsor: sponsor?.sponsorSessionId ?? null },
                 idempotencyPayload: {
-                    contractAddress, circuit, compiledArtifactRef, sessionId,
+                    contractAddress, circuit, contractName, sessionId,
                     args: parsedArgs, initialPrivateState: parsedInitialPrivateState,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
@@ -106,18 +106,18 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                 grantId: req.agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
-                command: { op: 'call', contractAddress, circuit, compiledArtifactRef, args: parsedArgs, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId }
+                command: { op: 'call', contractAddress, circuit, contractName, args: parsedArgs, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId }
             });
         });
     });
 
     // Builds and signs the transaction with the caller's wallet but pays no fee.
-    // A sponsor pays the fee later through sponsorFinalizedTransaction.
+    // A sponsor pays the fee later through sponsorFinalized.
     srv.on(buildSponsorable, async (req) => {
-        const { contractAddress, circuit, compiledArtifactRef, sessionId, args } = req.data;
+        const { contractAddress, circuit, contractName, sessionId, args } = req.data;
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
         if (!circuit) return req.reject(400, 'circuit is required');
-        if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
+        if (!contractName) return req.reject(400, 'contractName is required');
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (rejectIfMainnetBlocked(req)) return;
         if (!checkRateClass('prove', sessionId, req)) return;
@@ -126,25 +126,25 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            const resolved = await contractResolver(compiledArtifactRef);
+            const resolved = await contractResolver(contractName);
             const argTypes = argTypesLoader(resolved.zkConfigPath, circuit);
             coerceCircuitArgs(parsedArgs, argTypes); // validate now -> 400
             await walletFactory({ sessionId, db, facadeConfig: facadeCfg, expectedUserId: req.user?.id });
             return startJob({
-                kind: 'buildSponsorableTx', sessionId,
-                request: { contractAddress, circuit, compiledArtifactRef, sessionId },
+                kind: 'buildSponsorable', sessionId,
+                request: { contractAddress, circuit, contractName, sessionId },
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
-                command: { op: 'buildSponsorable', contractAddress, circuit, compiledArtifactRef, args: parsedArgs }
+                command: { op: 'buildSponsorable', contractAddress, circuit, contractName, args: parsedArgs }
             });
         });
     });
 
     srv.on(submitContractCallBatch, async (req) => {
-        const { contractAddress, calls, compiledArtifactRef, sessionId, idempotencyKey, initialPrivateState, sponsorSessionId, independentCalls } = req.data;
+        const { contractAddress, calls, contractName, sessionId, idempotencyKey, initialPrivateState, sponsorSessionId, independentCalls } = req.data;
 
         if (!contractAddress) return req.reject(400, 'contractAddress is required');
-        if (!compiledArtifactRef) return req.reject(400, 'compiledArtifactRef is required');
+        if (!contractName) return req.reject(400, 'contractName is required');
         if (!sessionId) return req.reject(400, 'sessionId is required');
         if (!calls) return req.reject(400, 'calls is required');
 
@@ -153,7 +153,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         // The batch size is limited: each call carries a proof,
         // and one rejected call fails the whole batch.
-        const { depth: rawBatchDepth, width: rawBatchWidth } = vaultDims(compiledArtifactRef);
+        const { depth: rawBatchDepth, width: rawBatchWidth } = vaultDims(contractName);
         let parsedCalls: Array<{ circuit: string; args: unknown[]; merkleProof?: MerkleProofBundle }>;
         try {
             const v = JSON.parse(calls);
@@ -227,7 +227,7 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
 
         return runSubmission(req, async () => {
             const facadeCfg = facadeConfigFromEnv();
-            const resolved = await contractResolver(compiledArtifactRef);
+            const resolved = await contractResolver(contractName);
 
             // Check every call now, so a bad argument is a 400 and not a failed job.
             // The raw args are saved. The executor converts them again.
@@ -244,17 +244,17 @@ export function registerContractActions(ctx: Pick<SubmissionContext, 'srv' | 'db
                 kind: 'submitContractCallBatch',
                 sessionId,
                 idempotencyKey,
-                request: { contractAddress, circuits, compiledArtifactRef, sessionId, callCount: parsedCalls.length, feeSponsor: sponsor?.sponsorSessionId ?? null },
+                request: { contractAddress, circuits, contractName, sessionId, callCount: parsedCalls.length, feeSponsor: sponsor?.sponsorSessionId ?? null },
                 idempotencyPayload: {
-                    contractAddress, circuits, compiledArtifactRef, sessionId,
-                    calls: parsedCalls, initialPrivateState: parsedInitialPrivateState,
+                    contractAddress, circuits, contractName, sessionId,
+                    calls: parsedCalls, initialPrivateState: parsedInitialPrivateState, independentCalls: independentCalls === true,
                     feeSponsor: sponsor?.sponsorSessionId ?? null
                 },
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID,
                 commandVersion: 1,
                 encryptCommand: true,
-                command: { op: 'callBatch', contractAddress, calls: parsedCalls, compiledArtifactRef, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId, ...(independentCalls === true ? { independentCalls: true } : {}) }
+                command: { op: 'callBatch', contractAddress, calls: parsedCalls, contractName, initialPrivateState: parsedInitialPrivateState, sponsorSessionId: sponsor?.sponsorSessionId, ...(independentCalls === true ? { independentCalls: true } : {}) }
             });
         });
     });

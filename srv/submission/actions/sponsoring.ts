@@ -12,14 +12,17 @@ import { rejectIfMainnetBlocked, runSubmission, takeValueBudget, type SponsorJob
 import { NightgateError, isNightgateError } from '../../utils/errors';
 import { walletDescribeSwapHalf, walletDescribeTransaction, walletDescribeTransfer } from '../../midnight/wallet-worker-client';
 import { transactionBytesOf } from '../../utils/offer-file';
-import { expireSwapOffers, isSwapOfferOpen, loadSwapOffer, takerSecretMatches } from '../swap-offers';
+import { expireSwapOffers, isSwapOfferOpen, loadSwapOffer } from '../swap-offers';
 
 import { HEX64_RE } from '../../utils/hex';
 import type { SubmissionContext } from './context';
-import type { Request } from '@sap/cds';
-import { sponsorFinalizedTransaction, sponsorSwap, sponsorTransfer, sponsorUnboundTransaction } from '#cds-models/NightgateService';
-import { toBigInt } from '../../utils/numbers';
+import cds, { type Request } from '@sap/cds';
+import { BackgroundJobs } from '#cds-models/midnight';
+import { sponsorFinalized, sponsorSwap, sponsorTransfer, sponsorUnbound } from '#cds-models/NightgateService';
+import { toBigInt, UINT128_MAX } from '../../utils/numbers';
 import { checkRateClass } from '../../utils/rate-classes';
+
+const { SELECT } = cds.ql;
 
 /** True when the worker refused the bytes themselves, not the call. */
 function isRefusal(e: unknown): boolean {
@@ -51,7 +54,7 @@ function sponsorSessionFor(req: Request): string | undefined {
     const pinned = req.agentGrant?.sponsorSessionId;
     if (pinned && pinned !== PLATFORM_POOL_SENTINEL) return String(pinned);
     if (getConfiguredFeeSponsorSessions(getNightgateConfig()).length === 0) {
-        req.reject(503, 'no fee sponsor is configured on this server (NIGHTGATE_FEE_SPONSOR_SESSION)');
+        req.reject(503, 'no fee sponsor is configured on this server (NIGHTGATE_FEE_SPONSOR_SESSIONS)');
         return undefined;
     }
     return PLATFORM_POOL_SENTINEL;
@@ -65,24 +68,36 @@ function contentHash(...partsB64: string[]): string {
 export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | 'db'>): void {
     const { srv, db } = ctx;
 
+    const hashed = (...parts: string[]): string => bytesToHex(sha256(Buffer.from(parts.join('\u0000'), 'utf8')));
+
+    /** The key a sponsor job is stored under. Sponsors are shared, so the user is part of it, and for a token its grant. */
+    async function scopedKey(caller: string, grantId: string | undefined, sponsor: string, kind: string, key: string): Promise<string> {
+        const perUser = hashed(caller, key);
+        if (!grantId) return perUser;
+        // A job this grant started while its user's grants shared one key keeps that key, so a retry still finds it.
+        const earlier = await db.run(SELECT.one.from(BackgroundJobs).columns('ID')
+            .where({ sessionId: sponsor, kind, idempotencyKey: perUser, grantId }));
+        return earlier ? perUser : hashed('grant', caller, grantId, key);
+    }
+
     /** What every sponsor job starts from: a checked pinned sponsor, the grant, the caller and its scoped idempotency key. */
-    async function sponsorJobBase(req: Request, effectiveSponsor: string, idempotencyKey: string | null | undefined) {
+    async function sponsorJobBase(req: Request, effectiveSponsor: string, kind: string, idempotencyKey: string | null | undefined) {
         // A pinned sponsor is checked here only against its database row. Loading its wallet is slow
         // and happens when the job runs. Pool jobs skip this, so one broken pool wallet cannot block requests.
         if (effectiveSponsor !== PLATFORM_POOL_SENTINEL) {
             await resolveFeeSponsor({ db, sponsorSessionId: effectiveSponsor, requestingUserId: req.user?.id, config: getNightgateConfig() });
         }
         const caller = String(req.user?.id ?? 'anonymous');
+        // A deploy stores the new contract address on this grant.
+        const grantId = req.agentGrant?.ID ? String(req.agentGrant.ID) : undefined;
         return {
             caller,
-            // A deploy stores the new contract address on this grant.
-            grantId: req.agentGrant?.ID ? String(req.agentGrant.ID) : undefined,
-            // Sponsors are shared by many callers, so the caller is mixed into the key.
-            idempotencyKey: idempotencyKey ? bytesToHex(sha256(Buffer.from(`${caller}\u0000${idempotencyKey}`, 'utf8'))) : undefined
+            grantId,
+            idempotencyKey: idempotencyKey ? await scopedKey(caller, grantId, effectiveSponsor, kind, idempotencyKey) : undefined
         };
     }
 
-    srv.on(sponsorFinalizedTransaction, async (req) => {
+    srv.on(sponsorFinalized, async (req) => {
         const { finalizedTxB64, idempotencyKey } = req.data;
         if (!finalizedTxB64) return req.reject(400, 'finalizedTxB64 is required');
         // A pool job picks its wallet when it runs, so another wallet can take over if one fails.
@@ -93,12 +108,12 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (!await rejectUnlessProven(req, () => walletDescribeTransaction({ txB64: finalizedTxB64 }))) return;
 
         return runSubmission(req, async () => {
-            const { caller, grantId, idempotencyKey: scopedIdempotencyKey } = await sponsorJobBase(req, effectiveSponsor, idempotencyKey);
+            const { caller, grantId, idempotencyKey: scopedIdempotencyKey } = await sponsorJobBase(req, effectiveSponsor, 'sponsorFinalized', idempotencyKey);
             // The server policy, narrowed by the agent grant. Refuses here, before a job exists.
             const policy = policyFieldsFor(req);
             const job = await startJob({
-                kind: 'sponsorFinalizedTransaction', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
-                request: { feeSponsor: effectiveSponsor, caller, bytes: finalizedTxB64.length, txHash: contentHash(finalizedTxB64) },
+                kind: 'sponsorFinalized', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
+                request: { feeSponsor: effectiveSponsor, caller, bytes: finalizedTxB64.length, contentHash: contentHash(finalizedTxB64) },
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
                 command: { op: 'sponsorFinalized', finalizedTxB64, sponsorSessionId: effectiveSponsor, ...policy, grantId } satisfies SponsorJobCommand
@@ -108,7 +123,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         });
     });
 
-    srv.on(sponsorUnboundTransaction, async (req) => {
+    srv.on(sponsorUnbound, async (req) => {
         const { unboundTxB64, idempotencyKey } = req.data;
         if (!unboundTxB64) return req.reject(400, 'unboundTxB64 is required');
         const effectiveSponsor = sponsorSessionFor(req);
@@ -118,11 +133,11 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (!await rejectUnlessProven(req, () => walletDescribeTransaction({ txB64: unboundTxB64 }))) return;
 
         return runSubmission(req, async () => {
-            const { caller, grantId, idempotencyKey: scopedIdempotencyKey } = await sponsorJobBase(req, effectiveSponsor, idempotencyKey);
+            const { caller, grantId, idempotencyKey: scopedIdempotencyKey } = await sponsorJobBase(req, effectiveSponsor, 'sponsorUnbound', idempotencyKey);
             const policy = policyFieldsFor(req);
             const job = await startJob({
-                kind: 'sponsorUnboundTransaction', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
-                request: { feeSponsor: effectiveSponsor, caller, bytes: unboundTxB64.length, txHash: contentHash(unboundTxB64) },
+                kind: 'sponsorUnbound', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
+                request: { feeSponsor: effectiveSponsor, caller, bytes: unboundTxB64.length, contentHash: contentHash(unboundTxB64) },
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
                 command: { op: 'sponsorUnbound', unboundTxB64, sponsorSessionId: effectiveSponsor, ...policy, grantId } satisfies SponsorJobCommand
@@ -138,6 +153,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (!HEX64_RE.test(tokenType)) return req.reject(400, 'tokenType must be 64 hex characters (a raw token type)');
         const amount = String(req.data.amount ?? '').trim();
         if (!/^[1-9]\d*$/.test(amount)) return req.reject(400, 'amount must be a positive integer in atoms');
+        if (BigInt(amount) > UINT128_MAX) return req.reject(400, 'amount exceeds Uint<128>, the largest amount a token can have');
         let txB64: string;
         try { txB64 = Buffer.from(await transactionBytesOf(transferTxB64)).toString('base64'); }
         catch (e) { return req.reject(400, `transferTxB64: ${(e as Error).message}`); }
@@ -155,7 +171,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (!await takeValueBudget(req, db, tokenType, BigInt(amount))) return;
 
         return runSubmission(req, async () => {
-            const { caller, grantId, idempotencyKey: scopedIdempotencyKey } = await sponsorJobBase(req, effectiveSponsor, idempotencyKey);
+            const { caller, grantId, idempotencyKey: scopedIdempotencyKey } = await sponsorJobBase(req, effectiveSponsor, 'sponsorTransfer', idempotencyKey);
             const policy = resolveSponsorPolicyForRequest(req);
             if (policy.allowTransfers !== true) {
                 throw new NightgateError('SPONSOR_POLICY_EMPTY', 'transfers are not sponsored here (NIGHTGATE_SPONSOR_ALLOW_TRANSFERS or policy file allowTransfers, and sponsorTransfer in the grant)');
@@ -172,7 +188,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
             }
             const job = await startJob({
                 kind: 'sponsorTransfer', sessionId: effectiveSponsor, idempotencyKey: scopedIdempotencyKey,
-                request: { feeSponsor: effectiveSponsor, caller, tokenType, amount, bytes: txB64.length, txHash: contentHash(txB64) },
+                request: { feeSponsor: effectiveSponsor, caller, tokenType, amount, bytes: txB64.length, contentHash: contentHash(txB64) },
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,
                 command: { op: 'sponsorUnbound', transfer: { txB64, tokenType, amount }, sponsorSessionId: effectiveSponsor, allowedTokenTypes: policy.allowedTokenTypes, grantId } satisfies SponsorJobCommand
@@ -182,7 +198,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
     });
 
     srv.on(sponsorSwap, async (req) => {
-        const { takerHalfB64, idempotencyKey, offerId, takerSecret } = req.data;
+        const { takerHalfB64, idempotencyKey, offerId } = req.data;
         let makerHalfB64 = req.data.makerHalfB64 as string | undefined;
         if (offerId && makerHalfB64) return req.reject(400, 'makerHalfB64 and offerId: one or the other');
         // The value the caller moves out: what the maker wants, since the caller takes the offer.
@@ -192,9 +208,6 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
             const row = await loadSwapOffer(db, String(offerId));
             if (!row) return req.reject(404, 'swap offer not found');
             if (!isSwapOfferOpen(row)) return req.reject(409, `swap offer is ${row.status === 'open' ? 'expired' : row.status}`);
-            if (row.takerSecretHash && !takerSecretMatches(row, takerSecret)) {
-                return req.reject(403, 'this offer is directed: sponsoring it needs the taker secret its poster handed out');
-            }
             makerHalfB64 = row.offer;
             callerGives = { tokenType: row.wantsType, amount: row.wantsAmount };
         }
@@ -218,7 +231,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
         if (callerGives && !await takeValueBudget(req, db, callerGives.tokenType, toBigInt(callerGives.amount))) return;
 
         return runSubmission(req, async () => {
-            const { caller, grantId, idempotencyKey: scopedIdempotencyKey } = await sponsorJobBase(req, effectiveSponsor, idempotencyKey);
+            const { caller, grantId, idempotencyKey: scopedIdempotencyKey } = await sponsorJobBase(req, effectiveSponsor, 'sponsorSwap', idempotencyKey);
             const policy = resolveSponsorPolicyForRequest(req);
             if (policy.allowSwaps !== true) {
                 throw new NightgateError('SPONSOR_POLICY_EMPTY', 'swaps are not sponsored here (NIGHTGATE_SPONSOR_ALLOW_SWAPS or policy file allowSwaps)');
@@ -231,7 +244,7 @@ export function registerSponsoringActions(ctx: Pick<SubmissionContext, 'srv' | '
                 request: {
                     feeSponsor: effectiveSponsor, caller,
                     bytes: halves.makerHalfB64.length + halves.takerHalfB64.length,
-                    txHash: contentHash(halves.makerHalfB64, halves.takerHalfB64)
+                    contentHash: contentHash(halves.makerHalfB64, halves.takerHalfB64)
                 },
                 requestedBy: req.user?.id,
                 grantId: req.agentGrant?.ID, commandVersion: 1, encryptCommand: true,

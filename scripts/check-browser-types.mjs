@@ -1,20 +1,20 @@
-// Typechecks the browser declarations as a consumer does: skipLibCheck off, resolved by package name through exports.
-// Run: npm run check:browser-types
+// Typechecks the declarations of @odatano/nightgate-tx as a consumer does: skipLibCheck off, resolved through its exports.
+// Run after `npm run build:slim`: npm run check:browser-types
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-const dir = resolve('.ng-types-probe');
+const dir = resolve('packages/nightgate-tx/.ng-types-probe');
 rmSync(dir, { recursive: true, force: true });
 mkdirSync(dir);
 
 // Exercises the public surface a TS consumer actually touches: witnesses (single + BATCH mode),
-// the provider assembly, and the deep providers path.
+// and the provider assembly.
 writeFileSync(
     join(dir, 'probe.ts'),
-    `import { buildAttestationVaultWitnesses, createNightgateConnectorProviders } from '@odatano/nightgate/browser';
-import type { MerkleProof, MerkleProofHolder, PreparedCall } from '@odatano/nightgate/browser';
-import { buildProofProvider } from '@odatano/nightgate/browser/providers.mjs';
+    `import { buildAttestationVaultWitnesses, createNightgateConnectorProviders } from '@odatano/nightgate-tx/calls';
+import type { MerkleProof, MerkleProofHolder, PreparedCall } from '@odatano/nightgate-tx/calls';
+import { buildProofProvider } from '@odatano/nightgate-tx/calls';
 
 const proof: MerkleProof = { fieldValue: '1', siblings: [], dirs: [] };
 const holder: MerkleProofHolder = { current: proof };
@@ -32,7 +32,7 @@ void buildProofProvider;
 // Width variant (0.19): slotWidth must be typeable on the witness builder,
 // the proof-prepare helpers, the PreparedCall passthrough and the CONTRACTS
 // metadata; a consumer targeting attestation-vault-32 writes exactly this.
-import { prepareProveFieldEquality, prepareProveFieldsUnchangedExcept, CONTRACTS } from '@odatano/nightgate/browser';
+import { prepareProveFieldEquality, prepareProveFieldsUnchangedExcept, CONTRACTS } from '@odatano/nightgate-tx/calls';
 void buildAttestationVaultWitnesses({ merkleProof: proof, slotWidth: 32 });
 const eq = prepareProveFieldEquality({ recordKey: 'p', fieldKey: 'f', expectedDigest: 'd', merkleProof: proof, slotWidth: 32 });
 const rebound: MerkleProof | undefined = eq.merkleProof;
@@ -44,7 +44,7 @@ const dims: [number, number] = [meta.slotWidth, meta.merkleDepth];
 void dims;
 
 // The default bound build keeps finalizedTxB64 a plain string; bind:false narrows to unboundTxB64.
-import type { TxBuilder } from '@odatano/nightgate/txbuilder';
+import type { TxBuilder } from '@odatano/nightgate-tx/txbuilder';
 async function txb(b: TxBuilder, call: PreparedCall) {
     const bound = await b.buildSponsorable({ contractAddress: 'c', call });
     const s1: string = bound.finalizedTxB64;

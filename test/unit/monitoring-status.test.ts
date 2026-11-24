@@ -74,6 +74,7 @@ vi.mock('../../srv/utils/nightgate-config', () => ({
     getNightgateConfig: mockConfig,
     resolveNightgateRuntimeConfig: mockRuntimeConfig,
     getConfiguredNightgateNetwork: () => 'preprod',
+    isNightgateNetwork: (value: unknown) => value === 'preprod',
     resolveEffectiveProvingMode: () => 'wasm'
 }));
 
@@ -230,7 +231,7 @@ describe('buildReadiness', () => {
         // path plus the driver's SQL.
         const warnings = (readiness.runtimeWarnings as string[]).join(' ');
         expect(warnings).toContain('schema is not deployed');
-        expect(warnings).toContain('nightgate-schema-delta');
+        expect(warnings).toContain('scripts/apply-schema-delta.mjs');
         expect(warnings).not.toContain('/data/nightgate.db');
         expect(warnings).not.toContain('SELECT');
         expect(warnings).not.toContain('label');
@@ -271,9 +272,9 @@ describe('buildReadiness', () => {
         expect((readiness.runtimeWarnings as string[]).join(' ')).toContain('submission pipeline');
     });
 
-    it('reports the phase: catching-up while the crawler syncs, ready once it is synced', async () => {
+    it('reports the phase: catching_up while the crawler syncs, ready once it is synced', async () => {
         mockDbRun.mockResolvedValueOnce({ syncStatus: 'syncing', lastIndexedAt: new Date().toISOString() });
-        expect(await buildReadiness(db)).toMatchObject({ ready: true, phase: 'catching-up' });
+        expect(await buildReadiness(db)).toMatchObject({ ready: true, phase: 'catching_up' });
         mockDbRun.mockResolvedValueOnce({ syncStatus: 'synced', lastIndexedAt: new Date().toISOString() });
         expect(await buildReadiness(db)).toMatchObject({ ready: true, phase: 'ready' });
         mockGetStatus.mockReturnValue({ initialized: false, mode: 'idle' } as any);
@@ -504,29 +505,30 @@ describe('buildWorkerStatus', () => {
 
     it('passes the worker client state through, exit history included', () => {
         mockWorkerStatus.mockReturnValue(withFacade);
-        const status = buildWorkerStatus(true);
+        const status = buildWorkerStatus();
         expect(status).toMatchObject({ running: false, exitCount: 3, lastExitCode: 137 });
-        expect((status.facades as any[])[0].label).toBe('prewarm');
+        expect(status.facades[0].label).toBe('prewarm');
     });
 
-    it('withholds the per-facade wallet ids from a non-admin caller', () => {
-        // facades[].sessionId is the wallet cacheKey, an accountId derived
-        // from wallet material and stable across sessions. Handing it to every
-        // authenticated caller would leak which wallets this process holds,
-        // across tenants.
+    it('names a wallet by its key, which is no session id', () => {
         mockWorkerStatus.mockReturnValue(withFacade);
-        const status = buildWorkerStatus(false);
-        expect(status.facades).toEqual([]);
-        // The operational signal survives the redaction.
+        const status = buildWorkerStatus();
         expect(status.facadeCount).toBe(1);
-        expect(status).toMatchObject({ running: false, exitCount: 3 });
+        expect(status.facades).toEqual([{ walletKey: 'acct-1', label: 'prewarm', caughtUp: false, updatedAt: 'now' }]);
     });
 
-    it('gives an admin the full list and the same count', () => {
-        mockWorkerStatus.mockReturnValue(withFacade);
-        const status = buildWorkerStatus(true);
-        expect(status.facadeCount).toBe(1);
-        expect((status.facades as any[])[0].sessionId).toBe('acct-1');
+    it('carries the pool as configured and one entry per worker with the keys of its wallets', () => {
+        mockWorkerStatus.mockReturnValue({
+            ...withFacade,
+            pool: { walletWorkers: 2, sponsorWorkers: 'dedicated' },
+            workers: [{ id: 'wallet-0', running: true, inFlightRpcs: 1, facades: ['acct-1', 'acct-2'] }, { id: 'sponsor-0', running: false, inFlightRpcs: 0, facades: [] }]
+        });
+        const status = buildWorkerStatus();
+        expect(status.pool).toEqual({ walletWorkers: 2, sponsorWorkers: 'dedicated' });
+        expect(status.workers).toEqual([
+            { id: 'wallet-0', running: true, inFlightRpcs: 1, facadeCount: 2, walletKeys: ['acct-1', 'acct-2'] },
+            { id: 'sponsor-0', running: false, inFlightRpcs: 0, facadeCount: 0, walletKeys: [] }
+        ]);
     });
 
     it('counts a resident facade that never reported progress', () => {
@@ -537,9 +539,9 @@ describe('buildWorkerStatus', () => {
         mockWorkerStatus.mockReturnValue({ ...WORKER, facades: [] });
         mockListFacades.mockReturnValue(['acct-restored']);
         try {
-            const status = buildWorkerStatus(true);
+            const status = buildWorkerStatus();
             expect(status.facadeCount).toBe(1);
-            expect((status.facades as any[])[0]).toMatchObject({ sessionId: 'acct-restored', caughtUp: null });
+            expect(status.facades[0]).toMatchObject({ walletKey: 'acct-restored', caughtUp: null });
         } finally {
             mockListFacades.mockReturnValue([]);
         }
@@ -549,9 +551,9 @@ describe('buildWorkerStatus', () => {
         mockWorkerStatus.mockReturnValue(withFacade);
         mockListFacades.mockReturnValue(['acct-1']);
         try {
-            const status = buildWorkerStatus(true);
+            const status = buildWorkerStatus();
             expect(status.facadeCount).toBe(1);
-            expect((status.facades as any[])[0].label).toBe('prewarm');
+            expect(status.facades[0].label).toBe('prewarm');
         } finally {
             mockListFacades.mockReturnValue([]);
         }

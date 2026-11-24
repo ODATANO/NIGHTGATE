@@ -4,7 +4,7 @@
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
 
-export const RATE_CLASS_NAMES = ['prove', 'deploy', 'sponsor', 'compute', 'read', 'verify', 'wallet', 'signing', 'admin', 'public-verify'] as const;
+export const RATE_CLASS_NAMES = ['prove', 'deploy', 'sponsor', 'compute', 'read', 'query', 'verify', 'wallet', 'signing', 'admin', 'public-verify'] as const;
 export type RateClass = typeof RATE_CLASS_NAMES[number];
 
 export interface RateClassSpec {
@@ -19,14 +19,15 @@ export interface RateClassSpec {
 }
 
 export const RATE_CLASSES: Readonly<Record<RateClass, RateClassSpec>> = {
-    prove: { windowMs: HOUR, envKey: 'NIGHTGATE_PROVE_RATE_LIMIT', grantVisible: true, doc: 'calls that prove and submit on the caller\'s session: contract calls and batches, token operations, the issue* attestations, anchoring, document registry, disclosure, buildSponsorable; per session' },
+    prove: { windowMs: HOUR, envKey: 'NIGHTGATE_PROVE_RATE_LIMIT', grantVisible: true, doc: 'calls that prove and submit on the caller\'s session: contract calls and batches, token operations, the `prove*` actions, anchoring, document registry, disclosure, buildSponsorable; per session' },
     deploy: { windowMs: HOUR, envKey: 'NIGHTGATE_DEPLOY_RATE_LIMIT', grantVisible: true, doc: '`deployContract`; per session' },
-    sponsor: { windowMs: HOUR, envKey: 'NIGHTGATE_SPONSOR_RATE_LIMIT', grantVisible: true, doc: 'calls the pool or a pinned sponsor pays for: `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorSwap`, `mintFactoryToken`; per principal' },
+    sponsor: { windowMs: HOUR, envKey: 'NIGHTGATE_SPONSOR_RATE_LIMIT', grantVisible: true, doc: 'calls the pool or a pinned sponsor pays for: `sponsorFinalized`, `sponsorUnbound`, `sponsorSwap`, `sponsorTransfer`, `mintFactoryToken`; per principal' },
     compute: { windowMs: HOUR, envKey: 'NIGHTGATE_COMPUTE_RATE_LIMIT', grantVisible: true, doc: 'calls that compute or write on the server without a transaction: `prepareDocumentProof`, `prepareMembershipSet`, `claimDisclosure`, `grantDisclosureToHolders`, `revokeHolderDisclosure`, `postSwapOffer`, `retireSwapOffer`, `reindexDisclosures` (per contract); per principal' },
-    read: { windowMs: MINUTE, envKey: 'NIGHTGATE_READ_RATE_LIMIT', grantVisible: true, doc: 'read functions: the offer board, `getBoardStatus`, `verifyDocument`, `verifyPredicateAttestation`, `getRuntimeInfo`, wallet balance, sync progress, sponsor pool status, fee estimate; per principal' },
-    verify: { windowMs: MINUTE, envKey: 'NIGHTGATE_VERIFY_RATE_LIMIT', grantVisible: true, doc: 'state verification with credentials: `verifyAttestationState`, `verifyPredicateState`, `verifyDisclosureState`; per principal' },
-    wallet: { windowMs: MINUTE, envKey: 'NIGHTGATE_WALLET_RATE_LIMIT', grantVisible: false, doc: 'wallet lifecycle: `connectWallet`, `sendNight`, dust registration; per principal, never grantable' },
-    signing: { windowMs: HOUR, envKey: 'NIGHTGATE_SIGNING_KEY_RATE_LIMIT', grantVisible: false, doc: '`connectWalletForSigning` and `deriveWalletInfo`: a guard against guessing mnemonics; per principal' },
+    read: { windowMs: MINUTE, envKey: 'NIGHTGATE_READ_RATE_LIMIT', grantVisible: true, doc: 'read functions: the offer board, `getBoardStatus`, `getReceiptKey`, `verifyDocument`, `verifyPredicateAttestation`, `getRuntimeInfo`, wallet balance, sync progress, sponsor pool status, fee estimate, grant usage, `getHealth`, `getSyncStatus`; per principal' },
+    query: { windowMs: MINUTE, envKey: 'NIGHTGATE_QUERY_RATE_LIMIT', grantVisible: true, doc: 'reads of the index: every entity read, each part of a `$batch` on its own, the bound read functions, `getJobStatus` and the analytics functions; per principal' },
+    verify: { windowMs: MINUTE, envKey: 'NIGHTGATE_VERIFY_RATE_LIMIT', grantVisible: true, doc: 'state verification with credentials: `verifyAttestation`, `verifyPredicate`, `verifyDisclosure`; per principal' },
+    wallet: { windowMs: MINUTE, envKey: 'NIGHTGATE_WALLET_RATE_LIMIT', grantVisible: false, doc: 'wallet lifecycle: `connectWallet`, `sendToken`, dust registration; per principal, never grantable' },
+    signing: { windowMs: HOUR, envKey: 'NIGHTGATE_SIGNING_RATE_LIMIT', grantVisible: false, doc: '`connectWalletForSigning` and `deriveWalletInfo`: a guard against guessing mnemonics; per principal' },
     admin: { windowMs: HOUR, envKey: 'NIGHTGATE_ADMIN_RATE_LIMIT', grantVisible: false, doc: 'grant administration: create, update, rotate, revoke; per principal' },
     'public-verify': { windowMs: MINUTE, envKey: 'NIGHTGATE_PUBLIC_VERIFY_RATE_LIMIT', maxKeys: 20000, grantVisible: false, doc: 'the credential-free verify service; per client address' }
 };

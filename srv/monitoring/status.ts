@@ -12,6 +12,7 @@ import {
     getNightgateConfig,
     resolveNightgateRuntimeConfig,
     getConfiguredNightgateNetwork,
+    isNightgateNetwork,
     resolveEffectiveProvingMode
 } from '../utils/nightgate-config';
 import {
@@ -33,7 +34,9 @@ import { absorbedCrawlerFaults } from '../crawler/crawler-fault-guard';
 import { getActiveNodeProvider } from '../crawler/index';
 import { readNodeInfo } from './node-info';
 import type { DbRunner } from '../utils/db-types';
-import type { getReadiness, getRuntimeInfo } from '#cds-models/NightgateIndexerService';
+import type { getReadiness, getRuntimeInfo, getWorkerStatus } from '#cds-models/NightgateIndexerService';
+
+type WorkerStatus = NonNullable<Awaited<ReturnType<typeof getWorkerStatus>>>;
 
 export const metricPrefix = 'odatano_nightgate';
 
@@ -113,7 +116,7 @@ export async function buildHealth(db: DbRunner): Promise<Record<string, unknown>
     };
 }
 
-export type ReadinessPhase = 'starting' | 'warming' | 'catching-up' | 'ready' | 'degraded' | 'failed';
+export type ReadinessPhase = 'starting' | 'warming' | 'catching_up' | 'ready' | 'degraded' | 'failed';
 
 /** Answers in bounded time. The database read has its own timeout, all other checks read memory.
  *  While the sponsor pool warms, memory checks alone make it `ready`, so a slow start is not restarted. */
@@ -164,7 +167,7 @@ export async function buildReadiness(db: DbRunner): Promise<NonNullable<Awaited<
         : !initialisationOk ? 'failed'
         : warming ? 'warming'
         : !ready ? 'degraded'
-        : crawlerEnabled && syncStatus === 'syncing' ? 'catching-up'
+        : crawlerEnabled && syncStatus === 'syncing' ? 'catching_up'
         : 'ready';
 
     return {
@@ -192,7 +195,7 @@ function summariseInitFailure(runtime: { mode?: string; lastError?: string } | n
     }
     const raw = runtime.lastError ?? '';
     if (/schema is not deployed/i.test(raw)) {
-        return 'not initialized: database schema is not deployed or out of date, run nightgate-schema-delta';
+        return 'not initialized: database schema is not deployed or out of date, run scripts/apply-schema-delta.mjs';
     }
     if (/submission pipeline/i.test(raw)) {
         return 'not initialized: the submission pipeline did not start';
@@ -417,10 +420,11 @@ export async function buildRuntimeInfo(): Promise<NonNullable<Awaited<ReturnType
         };
     });
 
+    const configured = getConfiguredNightgateNetwork(config);
     return {
         version,
         apiVersion: version.split('.').slice(0, 2).join('.'),
-        network: getConfiguredNightgateNetwork(config) ?? null,
+        network: isNightgateNetwork(configured) ? configured : null,
         provingMode: resolveEffectiveProvingMode(config),
         instanceId: topology.instanceId,
         runtimeMode: topology.runtimeMode,
@@ -432,14 +436,18 @@ export async function buildRuntimeInfo(): Promise<NonNullable<Awaited<ReturnType
 }
 
 /** Wallet worker health. On purpose not part of readiness, which would take the server out of service whenever the worker is only busy. */
-export function buildWorkerStatus(isAdmin = false): Record<string, unknown> {
+export function buildWorkerStatus(): WorkerStatus {
     const worker = getWalletWorkerStatus();
     // The main thread's list is the truth. The worker's progress data fills in later.
-    const bySession = new Map(worker.facades.map(f => [f.sessionId, f]));
-    const facades = listWalletFacades().map(sessionId => bySession.get(sessionId)
-        ?? { sessionId, label: null, caughtUp: null, updatedAt: null });
+    const reported = new Map(worker.facades.map(f => [f.sessionId, f]));
+    const facades: WorkerStatus['facades'] = listWalletFacades().map((walletKey) => {
+        const f = reported.get(walletKey);
+        return { walletKey, label: f?.label ?? null, caughtUp: f?.caughtUp ?? null, updatedAt: f?.updatedAt ?? null };
+    });
     // Keep wallets that only the worker still reports. They show a mismatch worth seeing.
-    for (const f of worker.facades) if (!facades.some(x => x.sessionId === f.sessionId)) facades.push(f);
+    for (const f of worker.facades) {
+        if (!facades.some(x => x.walletKey === f.sessionId)) facades.push({ walletKey: f.sessionId, label: f.label, caughtUp: f.caughtUp, updatedAt: f.updatedAt });
+    }
     return {
         started: worker.started,
         running: worker.running,
@@ -450,11 +458,8 @@ export function buildWorkerStatus(isAdmin = false): Record<string, unknown> {
         lastExitAt: worker.lastExitAt,
         rpcTimeoutMs: worker.rpcTimeoutMs,
         pool: worker.pool ?? null,
-        // Wallet keys stay admin only, like the facade list below.
-        workers: (worker.workers ?? []).map(w => ({ id: w.id, running: w.running, inFlightRpcs: w.inFlightRpcs, facadeCount: w.facades.length, ...(isAdmin ? { facades: w.facades } : {}) })),
+        workers: (worker.workers ?? []).map(w => ({ id: w.id, running: w.running, inFlightRpcs: w.inFlightRpcs, facadeCount: w.facades.length, walletKeys: w.facades })),
         facadeCount: facades.length,
-        // Admin only. The sessionId here is derived from the wallet and stays the same across sessions,
-        // so the list would reveal which wallets this server holds.
-        facades: isAdmin ? facades : []
+        facades
     };
 }

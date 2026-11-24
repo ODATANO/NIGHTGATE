@@ -3,15 +3,15 @@
 
 import crypto from 'crypto';
 import cds from '@sap/cds';
-const { SELECT, INSERT, UPDATE } = cds.ql;
-import { WalletSyncStates } from '#cds-models/midnight';
-import { StorageEncryption, decryptWithPasswordAsync, extractEncryptedComponents } from '../utils/storage-encryption';
-import { getEncryptionKey, deriveBoundSecret, type KeyRing } from '../utils/crypto';
+const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
+import { WalletSyncStates, type WalletSyncState } from '#cds-models/midnight';
+import { StorageEncryption, extractEncryptedComponents } from '../utils/storage-encryption';
+import { getEncryptionKey } from '../utils/crypto';
 import { resolveAccountDek, syncStatePassphraseFromDek, clearAllAccountDeks, DEK_SCHEME } from './account-keys';
-import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { withLockContentionRetry } from './db-write-retry';
 import { configFlag } from '../utils/config';
 import { errorMessage } from '../utils/errors';
+import type { DbRunner } from '../utils/db-types';
 const log = cds.log('nightgate:sync');
 
 const DEBUG_SYNC = configFlag('NIGHTGATE_DEBUG_WALLET_SYNC');
@@ -53,7 +53,6 @@ let dbPromise: Promise<cds.DatabaseService> | null = null;
 async function getDb(): Promise<cds.DatabaseService> {
     if (!dbPromise) {
         dbPromise = (async () => {
-            await ensureNightgateModelLoaded();
             return cds.connect.to('db');
         })();
     }
@@ -72,33 +71,16 @@ interface EncryptionCacheEntry {
 
 const encryptionCache = new Map<string, EncryptionCacheEntry>();
 
-// New snapshots are encrypted with a passphrase from the account's data key (account-keys.ts).
-// Snapshots in the two older formats stay readable and are re-encrypted at the next save.
-const SYNC_STATE_INFO = 'nightgate/sync-state/v2';
-const SALT_LABEL_V1 = 'nightgate-wallet-sync-salt-v1';
-const SALT_LABEL_V2 = 'nightgate-wallet-sync-salt-v2';
+// Snapshots are encrypted with a passphrase from the account's data key (account-keys.ts).
 /** Salt label for snapshots under the account data key. Such rows have `keyScheme = 'dek1'`. */
 export const SALT_LABEL_DEK = 'nightgate-wallet-sync-salt-dek1';
 
-function boundPassphrase(ring: KeyRing, keyId: string, passphrase: string): string {
-    return deriveBoundSecret(ring, keyId, passphrase, SYNC_STATE_INFO).toString('hex');
-}
-
-/** The salt stored in a snapshot's header. It tells which key derivation wrote the snapshot. */
-export function deriveStableSalt(accountId: string, passphrase: string, label: string = SALT_LABEL_V2): Buffer {
+/** The salt stored in a snapshot's header. */
+export function deriveStableSalt(accountId: string, passphrase: string, label: string = SALT_LABEL_DEK): Buffer {
     return crypto
         .createHash('sha256')
         .update(`${passphrase}|${accountId}|${label}`)
         .digest();
-}
-
-/** Older passphrases a snapshot may be encrypted with, for reading only. The re-encryption tool uses it too. */
-export function syncStatePassphraseCandidates(ring: KeyRing, passphrase: string): Array<{ keyId: string | null; passphrase: string; label: string; legacy: boolean }> {
-    const out = [ring.activeId, ...ring.ids().filter(i => i !== ring.activeId)].map(id => ({
-        keyId: id as string | null, passphrase: boundPassphrase(ring, id, passphrase), label: SALT_LABEL_V2, legacy: false
-    }));
-    out.push({ keyId: null, passphrase, label: SALT_LABEL_V1, legacy: true });
-    return out;
 }
 
 function getEncryption(accountId: string, passphrase: string): Promise<StorageEncryption> {
@@ -198,8 +180,8 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
     const carry = async (blob: string | null | undefined): Promise<string | null> => {
         if (!blob) return null;
         if (saltOf(blob)?.equals(enc.salt)) return blob;
-        const plain = await decryptSyncBlob(accountId, blob, passphrase, ring, dekPassphrase);
-        return plain === null ? null : enc.encrypt(plain.text);
+        const plain = await decryptSyncBlob(accountId, blob, dekPassphrase);
+        return plain === null ? null : enc.encrypt(plain);
     };
 
     const persistOnce = async (): Promise<void> => {
@@ -222,7 +204,7 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
                         dustStateBlob: dustCipher ?? await kept(existing.dustStateBlob),
                         keyScheme: DEK_SCHEME,
                         sdkVersion,
-                        networkId: networkId ?? existing.networkId,
+                        network: networkId ?? existing.network,
                         seedFingerprint: seedFingerprint ?? existing.seedFingerprint,
                         updatedAt: now
                     })
@@ -237,7 +219,7 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
                     dustStateBlob: dustCipher,
                     keyScheme: DEK_SCHEME,
                     sdkVersion,
-                    networkId: networkId ?? null,
+                    network: networkId ?? null,
                     seedFingerprint: seedFingerprint ?? null,
                     createdAt: now,
                     updatedAt: now
@@ -259,25 +241,15 @@ async function saveSyncStateInner(args: SaveSyncStateArgs): Promise<void> {
     await next;
 }
 
-// Snapshots of an earlier SDK that the running SDK was shown to restore with the same state.
-// The next save writes them under the running version.
-const RESTORABLE_EARLIER_SDK: Readonly<Record<string, readonly string[]>> = {
-    'wallet-sdk-facade@5.0.1': ['wallet-sdk-facade@5.0.0', 'wallet-sdk-facade@4.1.0']
-};
-
-export function isRestorableEarlierSdk(stored: string, running: string): boolean {
-    return RESTORABLE_EARLIER_SDK[running]?.includes(stored) ?? false;
-}
-
-type SnapshotLabels = { sdkVersion?: string | null; networkId?: string | null; seedFingerprint?: string | null };
+type SnapshotLabels = { sdkVersion?: string | null; network?: string | null; seedFingerprint?: string | null };
 
 /** Why a stored snapshot row must not be used under these labels, or null. Loading refuses such a row, saving carries none of its blobs. */
 function labelMismatch(row: SnapshotLabels, sdkVersion: string, networkId?: string | null, seedFingerprint?: string | null): string | null {
     const stored = String(row.sdkVersion ?? '');
     // An unknown version says nothing about the format of the blobs, so it matches nothing, not even itself.
     if (stored.endsWith('@unknown') || sdkVersion.endsWith('@unknown')) return `sdkVersion is unknown (stored '${stored}', running '${sdkVersion}')`;
-    if (stored !== sdkVersion && !isRestorableEarlierSdk(stored, sdkVersion)) return `stored sdkVersion '${stored}' != expected '${sdkVersion}'`;
-    if (networkId && row.networkId && row.networkId !== networkId) return `stored networkId '${row.networkId}' != expected '${networkId}'`;
+    if (stored !== sdkVersion) return `stored sdkVersion '${stored}' != expected '${sdkVersion}'`;
+    if (networkId && row.network && row.network !== networkId) return `stored network '${row.network}' != expected '${networkId}'`;
     if (seedFingerprint && row.seedFingerprint && row.seedFingerprint !== seedFingerprint) return "stored seed fingerprint does not match the session's seed";
     return null;
 }
@@ -300,16 +272,13 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
         log.warn(`refusing restore for ${accountId.slice(0, 16)}: ${mismatch} (cold start)`);
         return null;
     }
-    if (row.sdkVersion !== expectedSdkVersion) {
-        log.info(`restoring ${accountId.slice(0, 16)} from a '${row.sdkVersion}' snapshot under '${expectedSdkVersion}'`);
-    }
-
     const ring = getEncryptionKey();
     // Loading never creates the account data key.
     let dekPassphrase: string | undefined;
     try {
         const dek = await resolveAccountDek({ db, ring, accountId, storagePassword: passphrase, create: false });
-        if (dek) dekPassphrase = syncStatePassphraseFromDek(dek, accountId);
+        if (!dek) return null;
+        dekPassphrase = syncStatePassphraseFromDek(dek, accountId);
     } catch (err) {
         log.warn(`sync state for ${accountId.slice(0, 16)}: ${errorMessage(err)}; starting from a cold sync`);
         return null;
@@ -322,14 +291,13 @@ export async function loadSyncState(args: LoadSyncStateArgs): Promise<LoadedSync
     ];
     for (const [name, blob] of blobs) {
         if (!blob) continue;
-        const plain = await decryptSyncBlob(accountId, blob, passphrase, ring, dekPassphrase);
+        const plain = await decryptSyncBlob(accountId, blob, dekPassphrase);
         if (plain === null) return null;
-        result[name] = plain.text;
+        result[name] = plain;
     }
     return result;
 }
 
-const legacyBlobNoted = new Set<string>();
 const unreadableBlobNoted = new Set<string>();
 
 function saltOf(blob: string): Buffer | null {
@@ -340,35 +308,53 @@ function saltOf(blob: string): Buffer | null {
     }
 }
 
-// Decrypts one snapshot with the key the salt in its header picks. Null when unreadable. `underDek` means it already has the current format.
+// Decrypts one snapshot with the account's data key. Null when unreadable, and that sub-wallet syncs again.
 // Key derivation never runs on the event loop, because snapshots are megabytes and saved every minute.
-async function decryptSyncBlob(accountId: string, blob: string, passphrase: string, ring: KeyRing, dekPassphrase?: string): Promise<{ text: string; underDek: boolean } | null> {
+async function decryptSyncBlob(accountId: string, blob: string, dekPassphrase?: string): Promise<string | null> {
     const salt = saltOf(blob);
     if (!salt) return null;
-    if (dekPassphrase && deriveStableSalt(accountId, dekPassphrase, SALT_LABEL_DEK).equals(salt)) {
+    if (dekPassphrase && deriveStableSalt(accountId, dekPassphrase).equals(salt)) {
         try {
-            const enc = await getEncryption(accountId, dekPassphrase);
-            return { text: enc.decrypt(blob), underDek: true };
+            return (await getEncryption(accountId, dekPassphrase)).decrypt(blob);
         } catch { return null; }
-    }
-    for (const c of syncStatePassphraseCandidates(ring, passphrase)) {
-        if (!deriveStableSalt(accountId, c.passphrase, c.label).equals(salt)) continue;
-        try {
-            const plain = await decryptWithPasswordAsync(blob, c.passphrase);
-            if (!legacyBlobNoted.has(accountId)) {
-                legacyBlobNoted.add(accountId);
-                log.info(`sync state for ${accountId.slice(0, 16)} predates the account key; it is rewritten under it at the next save`);
-            }
-            return { text: plain, underDek: false };
-        } catch {
-            return null;
-        }
     }
     if (!unreadableBlobNoted.has(accountId)) {
         unreadableBlobNoted.add(accountId);
         log.warn(`sync state for ${accountId.slice(0, 16)} was written under an encryption key that is not in the ring; starting from a cold sync`);
     }
     return null;
+}
+
+/** What opens an account's snapshots: the passphrase from its data key. */
+export interface SnapshotKeys { accountId: string; dekPassphrase?: string }
+
+/** Moves an account's snapshots to another account and encrypts them with its data key. Of two rows the newer one is kept.
+ *  An unreadable snapshot is dropped, and that sub-wallet syncs again. */
+export async function moveSyncState(db: DbRunner, from: SnapshotKeys, to: { accountId: string; dekPassphrase: string }): Promise<void> {
+    const row: WalletSyncState | null = await db.run(SELECT.one.from(WalletSyncStates).where({ accountId: from.accountId }));
+    if (!row) return;
+    const own: Pick<WalletSyncState, 'updatedAt'> | null = await db.run(
+        SELECT.one.from(WalletSyncStates).columns('updatedAt').where({ accountId: to.accountId }));
+    const savedAt = (r: Pick<WalletSyncState, 'updatedAt'>): number => new Date(String(r.updatedAt ?? 0)).getTime() || 0;
+    if (!own || savedAt(own) < savedAt(row)) {
+        const enc = await getEncryption(to.accountId, to.dekPassphrase);
+        const carry = async (blob: string | null | undefined): Promise<string | null> => {
+            const plain = blob ? await decryptSyncBlob(from.accountId, blob, from.dekPassphrase) : null;
+            return plain ? enc.encrypt(plain) : null;
+        };
+        const moved = {
+            ...row,
+            accountId: to.accountId,
+            keyScheme: DEK_SCHEME,
+            shieldedStateBlob: await carry(row.shieldedStateBlob),
+            unshieldedStateBlob: await carry(row.unshieldedStateBlob),
+            dustStateBlob: await carry(row.dustStateBlob)
+        };
+        if (own) await db.run(DELETE.from(WalletSyncStates).where({ accountId: to.accountId }));
+        await db.run(INSERT.into(WalletSyncStates).entries(moved));
+    }
+    await db.run(DELETE.from(WalletSyncStates).where({ accountId: from.accountId }));
+    await evictEncryptionKey(from.accountId);
 }
 
 let resolvedSdkVersion: string | undefined;

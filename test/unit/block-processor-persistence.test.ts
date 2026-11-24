@@ -305,7 +305,7 @@ describe('BlockProcessor persistence paths', () => {
         expect(blockRow).toEqual(expect.objectContaining({
             hash: 'new',
             protocolVersion: 77,
-            timestamp: 1_700_000_000,
+            timestamp: '1700000000',
             // The digest names no AURA slot, so no validator is stored.
             author: null,
             slot: null,
@@ -318,7 +318,7 @@ describe('BlockProcessor persistence paths', () => {
 
         // --- Transactions (ordered by index within block) ---
         const txRows = (await db.run(cds.ql.SELECT.from(TRANSACTIONS)))
-            .sort((a: any, b: any) => a.transactionId - b.transactionId);
+            .sort((a: any, b: any) => a.indexInBlock - b.indexInBlock);
         expect(txRows).toHaveLength(5);
         expect(txRows.map((t: any) => t.txType)).toEqual([
             'system', 'contract_call', 'contract_deploy', 'contract_update', 'shielded_transfer'
@@ -330,12 +330,13 @@ describe('BlockProcessor persistence paths', () => {
         expect(txRows.map((t: any) => t.isShielded)).toEqual([false, null, null, null, true]);
         expect(txRows.map((t: any) => t.size)).toEqual([4, 4, 4, 4, 4]);
         expect(txRows.map((t: any) => t.hasProof)).toEqual([false, null, null, null, true]);
-        expect(txRows.map((t: any) => t.circuitName)).toEqual(['0:0', '10:0', '10:1', '10:2', '15:0']);
+        // A circuit name comes from the decoded payload. The pallet call is no circuit.
+        expect(txRows.map((t: any) => t.circuit)).toEqual([null, null, null, null, null]);
         // No contract address is minted from the extrinsic hash: the ledger
         // payload is not decoded, so the column is null for every row.
         expect(txRows.every((t: any) => t.contractAddress === null)).toBe(true);
         expect(txRows.every((t: any) => t.block_ID === blockId)).toBe(true);
-        expect(txRows.every((t: any) => /^[0-9a-f]{64}$/.test(t.hash))).toBe(true);
+        expect(txRows.every((t: any) => /^[0-9a-f]{64}$/.test(t.extrinsicHash))).toBe(true);
 
         // --- Transaction results: one SUCCESS per tx, linked to the tx ---
         const txIds = new Set(txRows.map((t: any) => t.ID));
@@ -352,13 +353,12 @@ describe('BlockProcessor persistence paths', () => {
         expect(feeRows.every((f: any) => txIds.has(f.transaction_ID))).toBe(true);
 
         // --- Contract actions: CALL/DEPLOY/UPDATE for the three Contracts txs ---
-        const actionRows = (await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS)));
+        const actionRows = (await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).orderBy('blockHeight', 'indexInBlock', 'actionIndex')));
         expect(actionRows).toHaveLength(3);
-        // Order by the circuit entryPoint to make the assertion deterministic.
-        const actionsByEntry = actionRows.sort((a: any, b: any) => a.entryPoint.localeCompare(b.entryPoint));
-        expect(actionsByEntry.map((a: any) => a.entryPoint)).toEqual(['10:0', '10:1', '10:2']);
-        expect(actionsByEntry.map((a: any) => a.actionType)).toEqual(['CALL', 'DEPLOY', 'UPDATE']);
-        expect(actionRows.every((a: any) => a.address === null)).toBe(true);
+        // In the order of the chain. No circuit name until the payload is decoded.
+        expect(actionRows.map((a: any) => a.circuit)).toEqual([null, null, null]);
+        expect(actionRows.map((a: any) => a.actionType)).toEqual(['CALL', 'DEPLOY', 'UPDATE']);
+        expect(actionRows.every((a: any) => a.contractAddress === null)).toBe(true);
         expect(actionRows.every((a: any) => txIds.has(a.transaction_ID))).toBe(true);
 
         // --- SyncState advanced to the new tip ---
@@ -417,7 +417,7 @@ describe('BlockProcessor persistence paths', () => {
         const processor = makeProcessor(provider);
         await expect(processor.processBlockByHash('0xnoevents')).rejects.toThrow(/System.Events/);
         expect(await db.run(cds.ql.SELECT.one.from(BLOCKS).where({ hash: 'noevents' }))).toBeFalsy();
-        expect(await db.run(cds.ql.SELECT.from(TRANSACTIONS).where({ hash: { like: '%' } }))).toHaveLength(0);
+        expect(await db.run(cds.ql.SELECT.from(TRANSACTIONS).where({ extrinsicHash: { like: '%' } }))).toHaveLength(0);
     });
 
     // ------------------------------------------------------------------------

@@ -121,6 +121,28 @@ describe('getSyncStatus', () => {
         expect(Number(result.chainHeight)).toBe(50);
     });
 
+    it('the markers of the background passes show in the admin service only', async () => {
+        await setSyncState({
+            syncStatus: 'synced', lastIndexedHeight: 42, chainHeight: 50, consecutiveErrors: 0,
+            identifiersBackfilledAt: '2026-11-01T00:00:00.000Z', authorBackfillHeight: 40, authorsBackfilledAt: '2026-11-02T00:00:00.000Z', reindexTargetHeight: 7
+        });
+        const markers = ['identifiersBackfilledAt', 'authorBackfillHeight', 'authorsBackfilledAt'];
+
+        const answered = await srv.send('getSyncStatus');
+        const [listed]: any[] = await srv.run(cds.ql.SELECT.from('NightgateIndexerService.SyncState'));
+        for (const shown of [answered, listed]) {
+            for (const marker of markers) expect(shown, marker).not.toHaveProperty(marker);
+            expect(Number(shown.reindexTargetHeight)).toBe(7);
+        }
+
+        const admin = await cds.connect.to('NightgateAdminService');
+        const ops = new (cds as any).User({ id: 'ops', roles: ['admin'] });
+        const [full]: any[] = await cds.tx({ user: ops } as any, () => admin.run(cds.ql.SELECT.from('NightgateAdminService.SyncState')));
+        expect(Number(full.authorBackfillHeight)).toBe(40);
+        expect(full.identifiersBackfilledAt).toBeTruthy();
+        expect(full.authorsBackfilledAt).toBeTruthy();
+    });
+
     it('returns stopped defaults when SyncState is absent', async () => {
         await db.run(cds.ql.DELETE.from(SYNC_STATE));
 
@@ -128,8 +150,8 @@ describe('getSyncStatus', () => {
         expect(result).toEqual(expect.objectContaining({
             ID: 'SINGLETON',
             syncStatus: 'stopped',
-            lastIndexedHeight: 0,
-            chainHeight: 0,
+            lastIndexedHeight: '0',
+            chainHeight: '0',
             consecutiveErrors: 0
         }));
     });
@@ -144,11 +166,11 @@ describe('getHealth', () => {
         const result = await srv.send('getHealth');
         expect(result).toEqual(expect.objectContaining({
             status: 'unknown',
-            chainHeight: 0,
-            indexedHeight: 0,
-            finalizedHeight: 0,
-            lag: 0,
-            finalizedLag: 0,
+            chainHeight: '0',
+            indexedHeight: '0',
+            finalizedHeight: '0',
+            lag: '0',
+            finalizedLag: '0',
             blocksPerSecond: 0,
             syncStatus: 'stopped',
             runtimeMode: 'single-instance',
@@ -169,8 +191,8 @@ describe('getHealth', () => {
         const result = await srv.send('getHealth');
         expect(result).toEqual(expect.objectContaining({
             status: 'healthy',
-            lag: 0,
-            finalizedLag: 0,
+            lag: '0',
+            finalizedLag: '0',
             syncStatus: 'stopped'
         }));
     });
@@ -187,8 +209,8 @@ describe('getHealth', () => {
         const result = await srv.send('getHealth');
         expect(result).toEqual(expect.objectContaining({
             status: 'degraded',
-            lag: 13,
-            finalizedLag: 5,
+            lag: '13',
+            finalizedLag: '5',
             blocksPerSecond: 1.5
         }));
     });
@@ -205,8 +227,8 @@ describe('getHealth', () => {
         const result = await srv.send('getHealth');
         expect(result).toEqual(expect.objectContaining({
             status: 'unhealthy',
-            lag: 150,
-            finalizedLag: 100,
+            lag: '150',
+            finalizedLag: '100',
             syncStatus: 'error'
         }));
     });
@@ -563,8 +585,8 @@ describe('reindexFromHeight', () => {
         expect(result).toEqual({
             status: 'ok',
             message: 'Reindex prepared',
-            requestedHeight: 10,
-            effectiveStartHeight: 10,
+            requestedHeight: '10',
+            effectiveStartHeight: '10',
             blocksRolledBack: 0,
             transactionsRolledBack: 0,
             crawlerResumed: false
@@ -591,8 +613,9 @@ describe('reindexFromHeight', () => {
         const txId = cds.utils.uuid();
         await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
             ID: txId,
-            transactionId: 0,
-            hash: '0xtx10',
+            blockHeight: 10,
+            indexInBlock: 0,
+            extrinsicHash: '0xtx10',
             protocolVersion: 1,
             transactionType: 'Regular',
             block_ID: blockIds[10]
@@ -604,8 +627,8 @@ describe('reindexFromHeight', () => {
         const result = await srv.send({ event: 'reindexFromHeight', data: { height: 10 } });
         expect(result).toMatchObject({
             status: 'ok',
-            requestedHeight: 10,
-            effectiveStartHeight: 10, // fork block height 9 + 1
+            requestedHeight: '10',
+            effectiveStartHeight: '10', // fork block height 9 + 1
             blocksRolledBack: 2,      // heights 10 and 11
             transactionsRolledBack: 1,
             crawlerResumed: false
@@ -676,8 +699,9 @@ describe('reindexFromHeight', () => {
             txIds[h] = id;
             await db.run(cds.ql.INSERT.into(TRANSACTIONS).entries({
                 ID: id,
-                transactionId: 0,
-                hash: `0xtx${h}`,
+                blockHeight: h,
+                indexInBlock: 0,
+                extrinsicHash: `0xtx${h}`,
                 protocolVersion: 1,
                 transactionType: 'Regular',
                 block_ID: blockIds[h],
@@ -685,6 +709,8 @@ describe('reindexFromHeight', () => {
             }));
             await db.run(cds.ql.INSERT.into(UNSHIELDED_UTXOS).entries({
                 ID: cds.utils.uuid(),
+                blockHeight: h,
+                indexInBlock: 0,
                 owner: 'addr_b',
                 tokenType: '0'.repeat(64),
                 value: (fields as any).nightAmount,
@@ -767,19 +793,53 @@ describe('authorization', () => {
         }
     });
 
-    // 0.24.2: an explicit 'any'. Without an annotation the probes inherited the
+    // An explicit 'any'. Without an annotation the probes inherited the
     // service's implicit authenticated-user under NODE_ENV=production (CAP checks
     // the service before the operation), so they were never actually reachable
     // anonymously on a production container. The service is 'any' now and every
     // element says what it needs.
-    it('leaves read-only probes (liveness/readiness/metrics) unrestricted for K8s and Prometheus', () => {
+    it('leaves the health probes open and keeps the metrics for the operator', () => {
         const model: any = cds.model;
         expect(model.definitions['NightgateIndexerService']?.['@requires']).toBe('any');
-        for (const fn of ['getLiveness', 'getReadiness', 'getMetrics', 'getSyncStatus', 'getHealth']) {
+        for (const fn of ['getLiveness', 'getReadiness', 'getSyncStatus', 'getHealth']) {
             const def = actionDef(fn);
             expect(def).toBeTruthy();
             expect(def['@requires']).toBe('any');
         }
+        expect(actionDef('getMetrics')['@requires']).toBe('admin');
+        expect(actionDef('getWorkerStatus')['@requires']).toBe('admin');
+    });
+
+    it('the worker status answers exactly the fields the model declares', async () => {
+        const declared = (elements: Record<string, any>): Record<string, unknown> => Object.fromEntries(Object.entries(elements)
+            .map(([name, e]) => [name, e.elements ? declared(e.elements) : e.items?.elements ? declared(e.items.elements) : true]));
+        const answer = await srv.send('getWorkerStatus');
+        const model = declared(actionDef('getWorkerStatus').returns.elements);
+        expect(Object.keys(answer).sort()).toEqual(Object.keys(model).sort());
+        expect(Object.keys(model.pool as object).sort()).toEqual(['sponsorWorkers', 'walletWorkers']);
+        expect(Object.keys(answer.pool).sort()).toEqual(['sponsorWorkers', 'walletWorkers']);
+        expect(Object.keys((model.facades as object)).sort()).toEqual(['caughtUp', 'label', 'updatedAt', 'walletKey']);
+        expect(Object.keys((model.workers as object)).sort()).toEqual(['facadeCount', 'id', 'inFlightRpcs', 'running', 'walletKeys']);
+    });
+
+    describe('the open probes that read the database are counted', () => {
+        pinEnv({ NIGHTGATE_READ_RATE_LIMIT: '2' });
+        // The booted server counts in its own copy of the module.
+        const rateClasses = require('../../srv/utils/rate-classes');
+        beforeEach(() => rateClasses.__resetRateLimitersForTests());
+        afterEach(() => rateClasses.__resetRateLimitersForTests());
+        const status = async (fn: string) => (await cap.GET(`/odata/v4/midnight-indexer/${fn}()`).catch((e: any) => e.response ?? e)).status;
+
+        it.each(['getHealth', 'getSyncStatus'])('%s answers 429 past the limit of the class read', async (fn) => {
+            expect([await status(fn), await status(fn), await status(fn)]).toEqual([200, 200, 429]);
+        });
+
+        it('getReadiness and getLiveness are never refused', async () => {
+            for (const fn of ['getReadiness', 'getLiveness']) {
+                const answers = [await status(fn), await status(fn), await status(fn), await status(fn)];
+                expect(answers).not.toContain(429);
+            }
+        });
     });
 });
 
@@ -926,7 +986,7 @@ describe('reindexFromHeight: slices and the reindex lock', () => {
             mockStartCrawler.mockResolvedValue(undefined);
 
             const reply = await srv.send({ event: 'reindexFromHeight', data: { height: 10 } });
-            expect(reply).toMatchObject({ status: 'running', requestedHeight: 10, effectiveStartHeight: null, crawlerResumed: false });
+            expect(reply).toMatchObject({ status: 'running', requestedHeight: '10', effectiveStartHeight: null, crawlerResumed: false });
             expect(reindexNative.reindexInProgress()).toMatchObject({ requestedHeight: 10 });
 
             for (const event of ['resumeCrawler', 'pauseCrawler']) {

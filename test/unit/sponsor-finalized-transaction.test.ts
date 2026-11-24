@@ -1,5 +1,5 @@
 /**
- * `sponsorFinalizedTransaction`: the sponsor pays for whatever bytes
+ * `sponsorFinalized`: the sponsor pays for whatever bytes
  * it is handed, so the two things that must hold are (a) an idempotency key
  * dedupes on the TRANSACTION, not on its size, and (b) the allow-list travels
  * with the job.
@@ -18,7 +18,9 @@ const finalizers = vi.hoisted(() => new Map<string, (command: any, job: any, evi
 // on every job of that kind while unit tests that ignore the version stay green.
 const processorVersions = vi.hoisted(() => new Map<string, number>());
 const workerCalls = vi.hoisted(() => [] as any[]);
-const workerImpl = vi.hoisted(() => ({ fn: async (_args: any): Promise<any> => ({ txHash: '00aa', circuits: ['attest'], contractAddress: 'c' }) }));
+/** The ledger hash the fixtures give a transaction, so a test can tell it from the identifier. */
+const H = (txId: string): string => `hash-of-${txId}`;
+const workerImpl = vi.hoisted(() => ({ fn: async (_args: any): Promise<any> => ({ txId: '00aa', txHash: H('00aa'), circuits: ['attest'], contractAddress: 'c' }) }));
 vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
     // the real error class + marker: the processor throws it, the runner persists its code
     SponsorAttemptBookkeepingPendingError: (await importOriginal<any>()).SponsorAttemptBookkeepingPendingError,
@@ -29,7 +31,7 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
     registerBackgroundJobReconciliationFinalizer: vi.fn((kind: string, v: number, fn: any) => { finalizers.set(kind, fn); })
 }));
 const unboundWorkerCalls = vi.hoisted(() => [] as any[]);
-const unboundWorkerImpl = vi.hoisted(() => ({ fn: async (_args: any): Promise<any> => ({ txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' }) }));
+const unboundWorkerImpl = vi.hoisted(() => ({ fn: async (_args: any): Promise<any> => ({ txId: '00bb', txHash: H('00bb'), circuits: ['attest'], contractAddress: 'c', note: 'b' }) }));
 const unboundIntentHooks = vi.hoisted(() => [] as any[]);
 // The request-path byte check: ok by default, a test makes it refuse or fail.
 const describeImpl = vi.hoisted(() => ({
@@ -57,6 +59,7 @@ vi.mock('../../srv/submission/job-execution-context', async (importOriginal) => 
 }));
 const grantBudget = vi.hoisted(() => ({
     reserve: vi.fn(async (_db: any, _grantId: string, _n: number) => true),
+    reserveMaintenance: vi.fn(async (_db: any, _grantId: string, _n: number) => true),
     release: vi.fn(async () => undefined),
     record: vi.fn(async () => undefined),
     minted: vi.fn(async () => undefined)
@@ -65,6 +68,7 @@ const platform = vi.hoisted(() => ({ policy: { allowedContracts: [], allowedCirc
 vi.mock('../../srv/sessions/agent-grants', async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
     reserveDeployBudget: (...a: any[]) => (grantBudget.reserve as any)(...a),
+    reserveMaintenanceBudget: (...a: any[]) => (grantBudget.reserveMaintenance as any)(...a),
     releaseDeployBudget: (...a: any[]) => (grantBudget.release as any)(...a),
     recordDeployedContracts: (...a: any[]) => (grantBudget.record as any)(...a),
     recordMintedTokenTypes: (...a: any[]) => (grantBudget.minted as any)(...a),
@@ -111,6 +115,7 @@ import {
 import { resolveFeeSponsor } from '../../srv/submission/fee-sponsor';
 import { reportBroadcastOn, reportSubmissionRejectedOn } from '../../srv/submission/job-execution-context';
 import { runFinalizer } from '../fixtures/run-finalizer';
+import { NightgateError } from '../../srv/utils/errors';
 
 function makeFakeService() {
     const handlers: Record<string, (req: any) => Promise<unknown>> = {};
@@ -152,54 +157,54 @@ function setup() {
 const TX_A = Buffer.from(new Uint8Array(600).fill(0xa1)).toString('base64');
 const TX_B = Buffer.from(new Uint8Array(600).fill(0xb2)).toString('base64');
 
-describe('sponsorFinalizedTransaction', () => {
+describe('sponsorFinalized', () => {
     beforeEach(() => {
         startJobCalls.length = 0;
         workerCalls.length = 0;
         __resetSponsorPoolForTests();
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
-        workerImpl.fn = async () => ({ txHash: '00aa', circuits: ['attest'], contractAddress: 'c' });
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
+        workerImpl.fn = async () => ({ txId: '00aa', txHash: H('00aa'), circuits: ['attest'], contractAddress: 'c' });
         describeImpl.tx = async () => ({ bytes: 600, bound: true });
     });
 
     test('rejects without finalizedTxB64', async () => {
         const srv = setup();
         const r1 = makeReq({});
-        await srv.handlers['sponsorFinalizedTransaction'](r1);
+        await srv.handlers['sponsorFinalized'](r1);
         expect(r1.reject).toHaveBeenCalledWith(400, expect.stringMatching(/finalizedTxB64/));
     });
 
     test('bytes that are not a proven transaction answer 400 before a job exists, a worker outage 503', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1';
         const srv = setup();
         const junk = makeReq({ finalizedTxB64: 'AAAA' });
         describeImpl.tx = async () => { throw new Error('refusing to sponsor: not a proven transaction (expected header)'); };
-        await srv.handlers['sponsorFinalizedTransaction'](junk);
+        await srv.handlers['sponsorFinalized'](junk);
         expect(junk.reject).toHaveBeenCalledWith(400, expect.stringMatching(/not a proven transaction/));
         expect(startJobCalls).toHaveLength(0);
 
         const down = makeReq({ finalizedTxB64: TX_A });
         describeImpl.tx = async () => { throw new Error('wallet worker is not running'); };
-        await srv.handlers['sponsorFinalizedTransaction'](down);
+        await srv.handlers['sponsorFinalized'](down);
         expect(down.reject).toHaveBeenCalledWith(503, expect.stringMatching(/could not check the transaction/));
         expect(startJobCalls).toHaveLength(0);
 
         describeImpl.tx = async () => ({ bytes: 600, bound: true });
-        await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A }));
+        await srv.handlers['sponsorFinalized'](makeReq({ finalizedTxB64: TX_A }));
         expect(startJobCalls).toHaveLength(1);
     });
 
     test('the request names no payer: the pool pays, a grant pinned to a wallet session pays from it', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1';
         const srv = setup();
-        const pool: any = await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A }));
+        const pool: any = await srv.handlers['sponsorFinalized'](makeReq({ finalizedTxB64: TX_A }));
         expect(pool.sessionId).toBe(PLATFORM_POOL_SENTINEL);
 
-        const pinned: any = await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A }, 'sponsor-1'));
+        const pinned: any = await srv.handlers['sponsorFinalized'](grantReq({ finalizedTxB64: TX_A }, 'sponsor-1'));
         expect(pinned.sessionId).toBe('sponsor-1');
         expect(startJobCalls[1].command).toMatchObject({ sponsorSessionId: 'sponsor-1' });
 
-        const pinnedToPool: any = await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A }, PLATFORM_POOL_SENTINEL));
+        const pinnedToPool: any = await srv.handlers['sponsorFinalized'](grantReq({ finalizedTxB64: TX_A }, PLATFORM_POOL_SENTINEL));
         expect(pinnedToPool.sessionId).toBe(PLATFORM_POOL_SENTINEL);
     });
 
@@ -211,25 +216,67 @@ describe('sponsorFinalizedTransaction', () => {
         expect(TX_A).not.toBe(TX_B);
 
         const srv = setup();
-        await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A, idempotencyKey: 'same-key' }));
-        await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_B, idempotencyKey: 'same-key' }));
+        await srv.handlers['sponsorFinalized'](grantReq({ finalizedTxB64: TX_A, idempotencyKey: 'same-key' }));
+        await srv.handlers['sponsorFinalized'](grantReq({ finalizedTxB64: TX_B, idempotencyKey: 'same-key' }));
 
         expect(startJobCalls).toHaveLength(2);
         expect(startJobCalls[0].request).not.toEqual(startJobCalls[1].request);
-        expect(startJobCalls[0].request.txHash).toBe(bytesToHex(sha256(Buffer.from(TX_A, 'base64'))));
-        expect(startJobCalls[1].request.txHash).toBe(bytesToHex(sha256(Buffer.from(TX_B, 'base64'))));
+        expect(startJobCalls[0].request.contentHash).toBe(bytesToHex(sha256(Buffer.from(TX_A, 'base64'))));
+        expect(startJobCalls[1].request.contentHash).toBe(bytesToHex(sha256(Buffer.from(TX_B, 'base64'))));
     });
 
     test('the same transaction under the same key keeps one fingerprint', async () => {
         const srv = setup();
-        await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A, idempotencyKey: 'same-key' }));
-        await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A, idempotencyKey: 'same-key' }));
+        await srv.handlers['sponsorFinalized'](grantReq({ finalizedTxB64: TX_A, idempotencyKey: 'same-key' }));
+        await srv.handlers['sponsorFinalized'](grantReq({ finalizedTxB64: TX_A, idempotencyKey: 'same-key' }));
         expect(startJobCalls[0].request).toEqual(startJobCalls[1].request);
+    });
+
+    describe('the key a sponsor job is stored under', () => {
+        const keyOf = (...parts: string[]) => bytesToHex(sha256(Buffer.from(parts.join('\u0000'), 'utf8')));
+        /** The lookups of an earlier job since `from`, as text. `dbWrites` grows over the tests of this file. */
+        const jobLookups = (from: number) => dbWrites.slice(from)
+            .filter(q => JSON.stringify(q?.SELECT?.from ?? '').includes('BackgroundJobs')).map(q => JSON.stringify(q.SELECT.where));
+        const underGrant = (grantId: string) => {
+            const req = grantReq({ finalizedTxB64: TX_A, idempotencyKey: 'order-1' });
+            req.agentGrant.ID = grantId;
+            return req;
+        };
+
+        test('two grants of one user do not share a key', async () => {
+            const srv = setup();
+            await srv.handlers['sponsorFinalized'](underGrant('g1'));
+            await srv.handlers['sponsorFinalized'](underGrant('g2'));
+            expect(startJobCalls.map(job => job.idempotencyKey)).toEqual([
+                keyOf('grant', 'test-user', 'g1', 'order-1'), keyOf('grant', 'test-user', 'g2', 'order-1')
+            ]);
+        });
+
+        test('a caller without a token keeps the key of its user', async () => {
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
+            const srv = setup();
+            const from = dbWrites.length;
+            await srv.handlers['sponsorFinalized'](makeReq({ finalizedTxB64: TX_A, idempotencyKey: 'order-1' }));
+            expect(startJobCalls[0].idempotencyKey).toBe(keyOf('test-user', 'order-1'));
+            expect(jobLookups(from)).toEqual([]);
+        });
+
+        test('a grant that started a job under the key of its user keeps that key, so a retry finds the job', async () => {
+            const srv = setup();
+            const from = dbWrites.length;
+            fakeDbRows.next = { ID: 'earlier-job' };
+            await srv.handlers['sponsorFinalized'](underGrant('g1'));
+            expect(startJobCalls[0].idempotencyKey).toBe(keyOf('test-user', 'order-1'));
+            const [asked] = jobLookups(from);
+            expect(asked).toContain(keyOf('test-user', 'order-1'));
+            expect(asked).toContain('"g1"');
+            expect(asked).toContain('sponsorFinalized');
+        });
     });
 
     test('returns the SPONSOR session the job is keyed by', async () => {
         const srv = setup();
-        const out: any = await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A }));
+        const out: any = await srv.handlers['sponsorFinalized'](grantReq({ finalizedTxB64: TX_A }));
         expect(out).toMatchObject({ jobId: 'job-1', status: 'pending', sessionId: 'sponsor-1' });
     });
 
@@ -237,10 +284,10 @@ describe('sponsorFinalizedTransaction', () => {
         // Keying under whichever member is free would make a retry with the
         // same idempotencyKey land under a DIFFERENT session and start a
         // second job.
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
         const srv = setup();
-        const out1: any = await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A, idempotencyKey: 'k1' }));
-        const out2: any = await srv.handlers['sponsorFinalizedTransaction'](makeReq({ finalizedTxB64: TX_A, idempotencyKey: 'k1' }));
+        const out1: any = await srv.handlers['sponsorFinalized'](makeReq({ finalizedTxB64: TX_A, idempotencyKey: 'k1' }));
+        const out2: any = await srv.handlers['sponsorFinalized'](makeReq({ finalizedTxB64: TX_A, idempotencyKey: 'k1' }));
         expect(out1.sessionId).toBe(PLATFORM_POOL_SENTINEL);
         expect(out2.sessionId).toBe(PLATFORM_POOL_SENTINEL);
         expect(startJobCalls[0].sessionId).toBe(PLATFORM_POOL_SENTINEL);
@@ -249,11 +296,11 @@ describe('sponsorFinalizedTransaction', () => {
     });
 
     test('a broken pool member does not block ADMISSION (no resolve before startJob)', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'dead-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'dead-1,pool-2';
         const srv = setup();
         const callsBefore = (resolveFeeSponsor as any).mock.calls.length;
         const req = makeReq({ finalizedTxB64: TX_A });
-        const out: any = await srv.handlers['sponsorFinalizedTransaction'](req);
+        const out: any = await srv.handlers['sponsorFinalized'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(out.sessionId).toBe(PLATFORM_POOL_SENTINEL);
         // deferred to the processor: admission resolved NO sponsor
@@ -263,33 +310,33 @@ describe('sponsorFinalizedTransaction', () => {
     test('without a pool and without a pinned grant nothing can pay: 503', async () => {
         const srv = setup();
         const req = makeReq({ finalizedTxB64: TX_A });
-        await srv.handlers['sponsorFinalizedTransaction'](req);
+        await srv.handlers['sponsorFinalized'](req);
         expect(req.reject).toHaveBeenCalledWith(503, expect.stringMatching(/no fee sponsor is configured/));
         expect(startJobCalls).toHaveLength(0);
     });
 
     test('a fully busy pool QUEUES until a lease frees up instead of failing instantly', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
         setup();
         await acquireSponsor(['pool-1'], 0);
         await acquireSponsor(['pool-2'], 0);
         setTimeout(() => releaseSponsor('pool-2'), 400);
-        const processor = processors.get('sponsorFinalizedTransaction')!;
+        const processor = processors.get('sponsorFinalized')!;
         const out: any = await processor(
             { op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL },
             { ID: 'j', sessionId: PLATFORM_POOL_SENTINEL, requestedBy: 'test-user', commandVersion: 1 }
         );
-        expect(out.txHash).toBe('00aa');
+        expect(out.txId).toBe('00aa');
     });
 
 
     test('the LAST failing sponsor is benched too, so the next job skips it', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1';
         process.env.NIGHTGATE_SPONSOR_LEASE_WAIT_MS = '0';
         try {
             setup();
-            const processor = processors.get('sponsorFinalizedTransaction')!;
-            workerImpl.fn = async () => { throw new Error('wallet not genuinely synced within 180000ms'); };
+            const processor = processors.get('sponsorFinalized')!;
+            workerImpl.fn = async () => { throw new NightgateError('WALLET_NOT_SYNCED', 'wallet not genuinely synced within 180000ms'); };
             await expect(processor(
                 { op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL },
                 { ID: 'j', sessionId: PLATFORM_POOL_SENTINEL, requestedBy: 'test-user', commandVersion: 1 }
@@ -301,42 +348,40 @@ describe('sponsorFinalizedTransaction', () => {
     });
 
     test('a pool member whose RESOLUTION fails (FeeSponsorError) fails over too', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'dead-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'dead-1,pool-2';
         setup();
         (resolveFeeSponsor as any).mockImplementationOnce(async () => {
-            const e: any = new Error('Sponsor session has no signing key.');
-            e.name = 'FeeSponsorError';
-            throw e;
+            throw new NightgateError('FEE_SPONSOR_UNUSABLE', 'Sponsor session has no signing key.', { status: 412 });
         });
-        const processor = processors.get('sponsorFinalizedTransaction')!;
+        const processor = processors.get('sponsorFinalized')!;
         const out: any = await processor(
             { op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL },
             { ID: 'j', sessionId: PLATFORM_POOL_SENTINEL, requestedBy: 'test-user', commandVersion: 1 }
         );
-        expect(out.txHash).toBe('00aa'); // second member landed
+        expect(out.txId).toBe('00aa'); // second member landed
     });
 
     test('the processor fails over to the next pool sponsor on a retryable failure', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
         setup();
-        const processor = processors.get('sponsorFinalizedTransaction')!;
+        const processor = processors.get('sponsorFinalized')!;
         let calls = 0;
         workerImpl.fn = async () => {
-            if (++calls === 1) throw new Error('wallet not genuinely synced within 180000ms');
-            return { txHash: '00bb', circuits: ['attest'], contractAddress: 'c' };
+            if (++calls === 1) throw new NightgateError('WALLET_NOT_SYNCED', 'wallet not genuinely synced within 180000ms');
+            return { txId: '00bb', txHash: H('00bb'), circuits: ['attest'], contractAddress: 'c' };
         };
         const out: any = await processor(
             { op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL },
             { ID: 'j', sessionId: 'pool-1', requestedBy: 'test-user', commandVersion: 1 }
         );
-        expect(out.txHash).toBe('00bb');
+        expect(out.txId).toBe('00bb');
         expect(calls).toBe(2); // first candidate failed retryably, second landed
     });
 
     test('a NON-retryable failure does not burn the rest of the pool', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
         setup();
-        const processor = processors.get('sponsorFinalizedTransaction')!;
+        const processor = processors.get('sponsorFinalized')!;
         let calls = 0;
         workerImpl.fn = async () => { calls++; throw new Error("refusing to sponsor: circuit 'evil' is not sponsorable"); };
         await expect(processor(
@@ -347,11 +392,11 @@ describe('sponsorFinalizedTransaction', () => {
     });
 
     test('an explicit sponsor stays exact: no failover across the pool', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
         setup();
-        const processor = processors.get('sponsorFinalizedTransaction')!;
+        const processor = processors.get('sponsorFinalized')!;
         let calls = 0;
-        workerImpl.fn = async () => { calls++; throw new Error('wallet not genuinely synced within 180000ms'); };
+        workerImpl.fn = async () => { calls++; throw new NightgateError('WALLET_NOT_SYNCED', 'wallet not genuinely synced within 180000ms'); };
         await expect(processor(
             { op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: 'pool-1' },
             { ID: 'j', sessionId: 'pool-1', requestedBy: 'test-user', commandVersion: 1 }
@@ -364,7 +409,7 @@ describe('sponsorFinalizedTransaction', () => {
         process.env.NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS = 'attest';
         try {
             const srv = setup();
-            await srv.handlers['sponsorFinalizedTransaction'](grantReq({ finalizedTxB64: TX_A }));
+            await srv.handlers['sponsorFinalized'](grantReq({ finalizedTxB64: TX_A }));
             expect(startJobCalls[0].command).toMatchObject({
                 op: 'sponsorFinalized',
                 allowedContracts: ['0xVAULT', '0xOTHER'],
@@ -392,7 +437,7 @@ describe('per-grant sponsor policy', () => {
         const srv = setup();
         const req: any = grantReq({ finalizedTxB64: TX_A });
         req.agentGrant = { ...req.agentGrant, allowedContracts: ['0xOTHER'], allowedCircuits: ['attest'] };
-        await srv.handlers['sponsorFinalizedTransaction'](req);
+        await srv.handlers['sponsorFinalized'](req);
         expect(startJobCalls[0].command).toMatchObject({ allowedContracts: ['0xOTHER'], allowedCircuits: ['attest'] });
     });
 
@@ -400,7 +445,7 @@ describe('per-grant sponsor policy', () => {
         const srv = setup();
         const req: any = grantReq({ unboundTxB64: TX_B });
         req.agentGrant = { ...req.agentGrant, allowedContracts: ['0xCUSTOMER'], allowedCircuits: [] };
-        await srv.handlers['sponsorUnboundTransaction'](req);
+        await srv.handlers['sponsorUnbound'](req);
         expect(startJobCalls[0].command).toMatchObject({ op: 'sponsorUnbound', allowedContracts: ['0xCUSTOMER'], allowedCircuits: [] });
     });
 
@@ -409,17 +454,17 @@ describe('per-grant sponsor policy', () => {
         const srv = setup();
         const req: any = grantReq({ finalizedTxB64: TX_A });
         req.agentGrant = { ...req.agentGrant, allowedContracts: ['0xELSEWHERE'], allowedCircuits: [] };
-        await srv.handlers['sponsorFinalizedTransaction'](req);
+        await srv.handlers['sponsorFinalized'](req);
         expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 403, code: 'SPONSOR_POLICY_EMPTY' }));
         expect(startJobCalls).toHaveLength(0);
     });
 });
 
-describe('sponsorUnboundTransaction (parallel channel)', () => {
+describe('sponsorUnbound (parallel channel)', () => {
     beforeEach(() => {
         startJobCalls.length = 0;
         __resetSponsorPoolForTests();
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
     });
 
     test('starts its job under the command version its processor is registered with', async () => {
@@ -429,19 +474,19 @@ describe('sponsorUnboundTransaction (parallel channel)', () => {
         // registered".
         const srv = setup();
         const req = grantReq({ unboundTxB64: TX_A });
-        await srv.handlers['sponsorUnboundTransaction'](req);
+        await srv.handlers['sponsorUnbound'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(startJobCalls).toHaveLength(1);
-        expect(startJobCalls[0].kind).toBe('sponsorUnboundTransaction');
-        expect(processorVersions.get('sponsorUnboundTransaction')).toBe(startJobCalls[0].commandVersion);
+        expect(startJobCalls[0].kind).toBe('sponsorUnbound');
+        expect(processorVersions.get('sponsorUnbound')).toBe(startJobCalls[0].commandVersion);
         expect(startJobCalls[0].commandVersion).toBe(1);
     });
 
     test('every replayable job any handler starts has a processor under that exact version', async () => {
         const srv = setup();
         for (const [action, data] of [
-            ['sponsorFinalizedTransaction', { finalizedTxB64: TX_A }],
-            ['sponsorUnboundTransaction', { unboundTxB64: TX_A }]
+            ['sponsorFinalized', { finalizedTxB64: TX_A }],
+            ['sponsorUnbound', { unboundTxB64: TX_A }]
         ] as const) {
             await srv.handlers[action](grantReq(data));
         }
@@ -453,31 +498,31 @@ describe('sponsorUnboundTransaction (parallel channel)', () => {
     });
 });
 
-describe('sponsorUnboundTransaction pool spread', () => {
+describe('sponsorUnbound pool spread', () => {
     beforeEach(() => {
         startJobCalls.length = 0;
         unboundWorkerCalls.length = 0;
         __resetSponsorPoolForTests();
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-a,pool-b,pool-c,pool-d';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-a,pool-b,pool-c,pool-d';
         vi.mocked(resolveFeeSponsor).mockImplementation(async ({ sponsorSessionId }: any) => ({ sponsorSessionId, accountId: `acct-${sponsorSessionId}` } as any));
     });
 
     test('concurrent pool jobs go to DIFFERENT wallets (LRU touch happens before the first await)', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         // The worker holds each sponsoring for a while, like a real prove+submit.
-        unboundWorkerImpl.fn = async () => { await new Promise((r) => setTimeout(r, 30)); return { txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' }; };
+        unboundWorkerImpl.fn = async () => { await new Promise((r) => setTimeout(r, 30)); return { txId: '00bb', txHash: H('00bb'), circuits: ['attest'], contractAddress: 'c', note: 'b' }; };
         const command = { op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL, allowedContracts: [], allowedCircuits: [] };
         const job = { ID: 'j', requestedBy: 'u' } as any;
         await Promise.all([proc(command, job), proc(command, job), proc(command, job), proc(command, job)]);
         const used = unboundWorkerCalls.map((c) => c.sponsorSessionId);
         expect(new Set(used).size).toBe(4);
         expect(used.sort()).toEqual(['acct-pool-a', 'acct-pool-b', 'acct-pool-c', 'acct-pool-d']);
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
     });
 });
 
-describe('sponsorUnboundTransaction external-effect boundary', () => {
+describe('sponsorUnbound external-effect boundary', () => {
     beforeEach(() => {
         boundaryCalls.length = 0; unboundIntentHooks.length = 0; dbWrites.length = 0; unboundWorkerCalls.length = 0;
         __resetSponsorPoolForTests();
@@ -491,18 +536,18 @@ describe('sponsorUnboundTransaction external-effect boundary', () => {
 
     test('the pre-broadcast submit-intent hook records external_execution + the txHash BEFORE the worker sends', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         // The worker would call the hook with the identifier right before broadcasting.
         unboundWorkerImpl.fn = async () => {
             const hook = unboundIntentHooks.at(-1);
-            await hook('00deadbeef'.padEnd(64, '0'));
-            return { txHash: '00deadbeef'.padEnd(64, '0'), circuits: ['attest'], contractAddress: 'c', note: 'b' };
+            await hook({ txId: '00deadbeef'.padEnd(64, '0'), txHash: H('00deadbeef'.padEnd(64, '0')) });
+            return { txId: '00deadbeef'.padEnd(64, '0'), txHash: H('00deadbeef'.padEnd(64, '0')), circuits: ['attest'], contractAddress: 'c', note: 'b' };
         };
         await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [] }, { ID: 'j', requestedBy: 'u' } as any);
         expect(boundaryCalls[0][0]).toBe('external_execution');
         expect(boundaryCalls[0][1].submissionId).toMatch(/[0-9a-f-]{36}/);
         expect(boundaryCalls[1][0]).toBe('submitted');
-        expect(boundaryCalls[1][1]).toMatchObject({ txHash: '00deadbeef'.padEnd(64, '0'), submissionId: boundaryCalls[0][1].submissionId });
+        expect(boundaryCalls[1][1]).toMatchObject({ txId: '00deadbeef'.padEnd(64, '0'), submissionId: boundaryCalls[0][1].submissionId });
         expect(inserts().length).toBe(1); // one PendingSubmissions row for the one attempt
     });
 
@@ -513,34 +558,34 @@ describe('sponsorUnboundTransaction external-effect boundary', () => {
         // reported once (markJobExternalExecution is not re-entrant); every
         // attempt reports submitted with its identifier.
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         let n = 0;
         unboundWorkerImpl.fn = async () => {
             n++;
             const hook = unboundIntentHooks.at(-1);
-            await hook(`00attempt${n}`.padEnd(64, '0'));
+            await hook({ txId: `00attempt${n}`.padEnd(64, '0'), txHash: H(`00attempt${n}`.padEnd(64, '0')) });
             if (n === 1) throw new Error('Transaction submission error <- RpcError: 1010: Invalid Transaction: Custom error: 196');
-            return { txHash: `00attempt${n}`.padEnd(64, '0'), circuits: ['attest'], contractAddress: 'c', note: 'b' };
+            return { txId: `00attempt${n}`.padEnd(64, '0'), txHash: H(`00attempt${n}`.padEnd(64, '0')), circuits: ['attest'], contractAddress: 'c', note: 'b' };
         };
         const out: any = await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [] }, { ID: 'j', requestedBy: 'u' } as any);
-        expect(out.txHash).toBe('00attempt2'.padEnd(64, '0'));
+        expect(out.txId).toBe('00attempt2'.padEnd(64, '0'));
         expect(boundaryCalls.filter((c) => c[0] === 'external_execution').length).toBe(1);
-        const submitted = boundaryCalls.filter((c) => c[0] === 'submitted').map((c) => c[1].txHash);
+        const submitted = boundaryCalls.filter((c) => c[0] === 'submitted').map((c) => c[1].txId);
         expect(submitted).toEqual(['00attempt1'.padEnd(64, '0'), '00attempt2'.padEnd(64, '0')]);
         expect(inserts().length).toBe(2); // one PendingSubmissions row per attempt
         // a 196 is a pre-inclusion reject: the attempt row is REJECTED and the
         // job's hash was taken off (reportSubmissionRejected) before the rebuild
         expect(JSON.stringify(updates())).toMatch(/REJECTED/);
-        expect(boundaryCalls.filter((c) => c[0] === 'rejected').map((c) => c[1].txHash)).toEqual(['00attempt1'.padEnd(64, '0')]);
+        expect(boundaryCalls.filter((c) => c[0] === 'rejected').map((c) => c[1].txId)).toEqual(['00attempt1'.padEnd(64, '0')]);
     });
 
     test('an exhausted run of pre-inclusion rejects ends with the hash removed (plain failed, not reconciliation)', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         let n = 0;
         unboundWorkerImpl.fn = async () => {
             n++;
-            await unboundIntentHooks.at(-1)(`00rej${n}`.padEnd(64, '0'));
+            await unboundIntentHooks.at(-1)({ txId: `00rej${n}`.padEnd(64, '0'), txHash: H(`00rej${n}`.padEnd(64, '0')) });
             throw new Error('Transaction submission error <- RpcError: 1010: Invalid Transaction: Custom error: 196');
         };
         await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [] }, { ID: 'j', requestedBy: 'u' } as any))
@@ -553,11 +598,11 @@ describe('sponsorUnboundTransaction external-effect boundary', () => {
 
     test('an AMBIGUOUS outcome (watch timed out, indexer silent) is NOT rebuilt: it propagates with the hash in place for reconciliation', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         let n = 0;
         unboundWorkerImpl.fn = async () => {
             n++;
-            await unboundIntentHooks.at(-1)('00ambiguous'.padEnd(64, '0'));
+            await unboundIntentHooks.at(-1)({ txId: '00ambiguous'.padEnd(64, '0'), txHash: H('00ambiguous'.padEnd(64, '0')) });
             throw new Error('submit watch timed out after 60000ms without a Finalized status');
         };
         await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [] }, { ID: 'j', requestedBy: 'u' } as any))
@@ -572,11 +617,11 @@ describe('sponsorUnboundTransaction external-effect boundary', () => {
         // same caller bytes cannot help: every rebuild retry would be
         // rejected at admission with 1010.
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         let n = 0;
         unboundWorkerImpl.fn = async () => {
             n++;
-            await unboundIntentHooks.at(-1)(`00partial${n}`.padEnd(64, '0'));
+            await unboundIntentHooks.at(-1)({ txId: `00partial${n}`.padEnd(64, '0'), txHash: H(`00partial${n}`.padEnd(64, '0')) });
             throw new Error('sponsored transaction 00partial1 is in block 42 but its contract call did NOT apply (ledger result PARTIAL_SUCCESS, failed segment 7); the sponsor paid the fee, the call must be rebuilt against the current contract state');
         };
         await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [] }, { ID: 'j', requestedBy: 'u' } as any))
@@ -586,7 +631,7 @@ describe('sponsorUnboundTransaction external-effect boundary', () => {
     });
 });
 
-describe('sponsorUnboundTransaction dust-retry policy', () => {
+describe('sponsorUnbound dust-retry policy', () => {
     beforeEach(() => {
         unboundWorkerCalls.length = 0;
         __resetSponsorPoolForTests();
@@ -598,7 +643,7 @@ describe('sponsorUnboundTransaction dust-retry policy', () => {
 
     test('a coded dust race that outlives the retries fails the job WITHOUT benching the sponsor', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         unboundWorkerImpl.fn = async () => { throw new Error('Transaction submission error <- RpcError: 1010: Invalid Transaction: Custom error: 196'); };
         await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [] }, { ID: 'j', requestedBy: 'u' } as any))
             .rejects.toThrow(/Custom error: 196/);
@@ -609,7 +654,7 @@ describe('sponsorUnboundTransaction dust-retry policy', () => {
 
     test('a GENERIC pool Invalid gets at most one rebuild (proof-cost bound), then fails without benching', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         unboundWorkerImpl.fn = async () => { throw new Error('Transaction submission error <- SubmissionError: Transaction submission failed <- TransactionInvalidError: Transaction is invalid and was rejected by the node'); };
         await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [] }, { ID: 'j', requestedBy: 'u' } as any))
             .rejects.toThrow(/TransactionInvalidError/);
@@ -618,45 +663,45 @@ describe('sponsorUnboundTransaction dust-retry policy', () => {
     });
 });
 
-describe('sponsorFinalizedTransaction external-effect boundary', () => {
+describe('sponsorFinalized external-effect boundary', () => {
     beforeEach(() => {
         boundaryCalls.length = 0; boundIntentHooks.length = 0; dbWrites.length = 0; workerCalls.length = 0;
         __resetSponsorPoolForTests();
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         vi.mocked(resolveFeeSponsor).mockImplementation(async ({ sponsorSessionId }: any) => ({ sponsorSessionId, accountId: `acct-${sponsorSessionId}` } as any));
     });
 
     test('the BOUND sponsor path announces its identifier before broadcasting: external_execution + submitted + a PendingSubmissions row', async () => {
         setup();
-        const proc = processors.get('sponsorFinalizedTransaction')!;
+        const proc = processors.get('sponsorFinalized')!;
         workerImpl.fn = async () => {
             const hook = boundIntentHooks.at(-1);
             expect(typeof hook).toBe('function'); // the processor passes the hook
-            await hook('00bound'.padEnd(64, '0'));
-            return { txHash: '00bound'.padEnd(64, '0'), circuits: ['attest'], contractAddress: 'c' };
+            await hook({ txId: '00bound'.padEnd(64, '0'), txHash: H('00bound'.padEnd(64, '0')) });
+            return { txId: '00bound'.padEnd(64, '0'), txHash: H('00bound'.padEnd(64, '0')), circuits: ['attest'], contractAddress: 'c' };
         };
         const out: any = await proc({ op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [] }, { ID: 'j', sessionId: 'sponsor-1', requestedBy: 'u', commandVersion: 1 } as any);
-        expect(out.txHash).toBe('00bound'.padEnd(64, '0'));
+        expect(out.txId).toBe('00bound'.padEnd(64, '0'));
         expect(boundaryCalls.map((c) => c[0])).toEqual(['external_execution', 'submitted']);
-        expect(boundaryCalls[1][1]).toMatchObject({ txHash: '00bound'.padEnd(64, '0') });
+        expect(boundaryCalls[1][1]).toMatchObject({ txId: '00bound'.padEnd(64, '0') });
         expect(dbWrites.filter((q) => q?.INSERT).length).toBe(1);
     });
 
     test('a bound failover after a pre-inclusion reject closes the attempt row REJECTED and clears the hash before trying the next sponsor', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
         setup();
-        const proc = processors.get('sponsorFinalizedTransaction')!;
+        const proc = processors.get('sponsorFinalized')!;
         let n = 0;
         workerImpl.fn = async () => {
             n++;
-            await boundIntentHooks.at(-1)(`00b${n}`.padEnd(64, '0'));
+            await boundIntentHooks.at(-1)({ txId: `00b${n}`.padEnd(64, '0'), txHash: H(`00b${n}`.padEnd(64, '0')) });
             if (n === 1) throw new Error('1010: Invalid Transaction: Custom error: 170');
-            return { txHash: `00b${n}`.padEnd(64, '0'), circuits: ['attest'], contractAddress: 'c' };
+            return { txId: `00b${n}`.padEnd(64, '0'), txHash: H(`00b${n}`.padEnd(64, '0')), circuits: ['attest'], contractAddress: 'c' };
         };
         const out: any = await proc({ op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL }, { ID: 'j', sessionId: 'pool-1', requestedBy: 'u', commandVersion: 1 } as any);
-        expect(out.txHash).toBe('00b2'.padEnd(64, '0'));
+        expect(out.txId).toBe('00b2'.padEnd(64, '0'));
         expect(boundaryCalls.filter((c) => c[0] === 'external_execution').length).toBe(1);
-        expect(boundaryCalls.filter((c) => c[0] === 'rejected').map((c) => c[1].txHash)).toEqual(['00b1'.padEnd(64, '0')]);
+        expect(boundaryCalls.filter((c) => c[0] === 'rejected').map((c) => c[1].txId)).toEqual(['00b1'.padEnd(64, '0')]);
         expect(JSON.stringify(dbWrites.filter((q) => q?.UPDATE))).toMatch(/REJECTED/);
     });
 });
@@ -669,42 +714,42 @@ describe('submit-intent persistence', () => {
         process.env.NIGHTGATE_SPONSOR_DUST_BACKOFF_MS = '0';
         vi.mocked(resolveFeeSponsor).mockImplementation(async ({ sponsorSessionId }: any) => ({ sponsorSessionId, accountId: `acct-${sponsorSessionId}` } as any));
     });
-    afterEach(() => { delete process.env.NIGHTGATE_SPONSOR_DUST_RETRIES; delete process.env.NIGHTGATE_SPONSOR_DUST_BACKOFF_MS; delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION; syncGate.atGate = () => false; });
+    afterEach(() => { delete process.env.NIGHTGATE_SPONSOR_DUST_RETRIES; delete process.env.NIGHTGATE_SPONSOR_DUST_BACKOFF_MS; delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS; syncGate.atGate = () => false; });
 
     test('pool jobs go to a member at the sync gate before a lagging one, on both sponsoring paths', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
         syncGate.atGate = (id) => id === 'pool-2';
-        workerImpl.fn = async () => ({ txHash: '00aa', circuits: ['attest'], contractAddress: 'c' });
-        unboundWorkerImpl.fn = async () => ({ txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' });
+        workerImpl.fn = async () => ({ txId: '00aa', txHash: H('00aa'), circuits: ['attest'], contractAddress: 'c' });
+        unboundWorkerImpl.fn = async () => ({ txId: '00bb', txHash: H('00bb'), circuits: ['attest'], contractAddress: 'c', note: 'b' });
         setup();
-        const unbound = processors.get('sponsorUnboundTransaction')!;
+        const unbound = processors.get('sponsorUnbound')!;
         vi.mocked(resolveFeeSponsor).mockClear();
         await unbound({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL, allowedContracts: [], allowedCircuits: [] }, { ID: 'j1', sessionId: PLATFORM_POOL_SENTINEL, requestedBy: 'u' } as any);
         expect(vi.mocked(resolveFeeSponsor).mock.calls[0][0]).toMatchObject({ sponsorSessionId: 'pool-2' });
 
         __resetSponsorPoolForTests(); // pool-1 is least recently used again
-        const bound = processors.get('sponsorFinalizedTransaction')!;
+        const bound = processors.get('sponsorFinalized')!;
         vi.mocked(resolveFeeSponsor).mockClear();
         await bound({ op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL }, { ID: 'j2', sessionId: PLATFORM_POOL_SENTINEL, requestedBy: 'u', commandVersion: 1 } as any);
         expect(vi.mocked(resolveFeeSponsor).mock.calls[0][0]).toMatchObject({ sponsorSessionId: 'pool-2' });
     });
 
     test('the attempt row stores the WORKER-inspected coordinates and the CONCRETE sponsor (not the pool sentinel)', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         unboundWorkerImpl.fn = async () => {
-            await unboundIntentHooks.at(-1)('00coords'.padEnd(64, '0'), {
-                txHash: '00coords'.padEnd(64, '0'), contractAddress: 'dd'.repeat(32), circuits: ['anchorContentRoot'], note: 'backing-Q', sponsorAccountId: 'acct-pool-1'
+            await unboundIntentHooks.at(-1)({
+                txId: '00coords'.padEnd(64, '0'), txHash: H('00coords'.padEnd(64, '0')), contractAddress: 'dd'.repeat(32), circuits: ['anchorContentRoot'], note: 'backing-Q', sponsorAccountId: 'acct-pool-1'
             });
-            return { txHash: '00coords'.padEnd(64, '0'), circuits: ['anchorContentRoot'], contractAddress: 'dd'.repeat(32), note: 'backing-Q' };
+            return { txId: '00coords'.padEnd(64, '0'), txHash: H('00coords'.padEnd(64, '0')), circuits: ['anchorContentRoot'], contractAddress: 'dd'.repeat(32), note: 'backing-Q' };
         };
         // allow-list names a DIFFERENT contract/circuit first: the row must carry what was inspected, not the list head
         await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: PLATFORM_POOL_SENTINEL, allowedContracts: ['aa'.repeat(32), 'dd'.repeat(32)], allowedCircuits: ['attest', 'anchorContentRoot'] }, { ID: 'j', sessionId: PLATFORM_POOL_SENTINEL, requestedBy: 'u' } as any);
         const insert: any = dbWrites.find((q) => q?.INSERT);
         const row = insert.INSERT.entries[0];
         expect(row.contractAddress).toBe('dd'.repeat(32));
-        expect(row.circuitName).toBe('anchorContentRoot');
+        expect(row.circuit).toBe('anchorContentRoot');
         expect(row.finalizedTxData).toBeUndefined(); // public snapshot field untouched
         const coords = JSON.parse(row.submitIntentData);
         expect(coords).toMatchObject({ feeSponsor: 'pool-1', sponsorAccountId: 'acct-pool-1', circuits: ['anchorContentRoot'], contractAddress: 'dd'.repeat(32), note: 'backing-Q' });
@@ -715,11 +760,11 @@ describe('submit-intent persistence', () => {
         // Row, reservation and job transition are one transaction: a lost lease rolls the row
         // back, no pending row to close, no rejected identifier to report, the job failed before its first boundary.
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         vi.mocked(reportBroadcastOn as any).mockRejectedValueOnce(new Error('Lease lost before markJobBroadcastOn(j)'));
         unboundWorkerImpl.fn = async () => {
             // the worker: announce -> the hook throws -> the worker nacks and does not broadcast
-            await unboundIntentHooks.at(-1)('00nack'.padEnd(64, '0'), { txHash: '00nack'.padEnd(64, '0') });
+            await unboundIntentHooks.at(-1)({ txId: '00nack'.padEnd(64, '0'), txHash: H('00nack'.padEnd(64, '0')) });
             throw new Error('unreachable: the hook must have thrown');
         };
         await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [] }, { ID: 'j', sessionId: 'sponsor-1', requestedBy: 'u' } as any))
@@ -737,14 +782,14 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
     const NEW_ADDR = 'cc'.repeat(32);
     const withDeployIntent = (n: number, address = NEW_ADDR) => async () => {
         const hook = unboundIntentHooks.at(-1);
-        const txHash = `00deploy${n}`.padEnd(64, '0');
+        const txId = `00deploy${n}`.padEnd(64, '0');
         try {
-            await hook(txHash, { txHash, contractAddress: address, circuits: ['<deploy>'], note: 'b', sponsorAccountId: 'acct-sponsor-1', deployed: [address] });
+            await hook({ txId, txHash: H(txId), contractAddress: address, circuits: ['<deploy>'], note: 'b', sponsorAccountId: 'acct-sponsor-1', deployed: [address] });
         } catch (e) {
             // a nack: no broadcast, the reason travels
             throw new Error(`submit-intent rejected by the main thread: ${(e as Error).message}`);
         }
-        return { txHash, circuits: ['<deploy>'], contractAddress: address, note: 'b', deployed: [address] };
+        return { txId, txHash: H(txId), circuits: ['<deploy>'], contractAddress: address, note: 'b', deployed: [address] };
     };
     beforeEach(() => {
         boundaryCalls.length = 0; unboundIntentHooks.length = 0; dbWrites.length = 0; unboundWorkerCalls.length = 0;
@@ -761,7 +806,7 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
 
     test('the attempt row and the reservation are ONE transaction; the row carries grant + deployed addresses', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         unboundWorkerImpl.fn = withDeployIntent(1);
         await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any);
         expect(fakeDb.tx).toHaveBeenCalledTimes(1);
@@ -780,7 +825,7 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
     // The deploy is on chain. Closing its attempt row or building again would lose it or pay twice.
     test('a failure of the bookkeeping after a landed deploy is not handled as a failed attempt', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         const worker = vi.fn(withDeployIntent(1));
         unboundWorkerImpl.fn = worker;
         grantBudget.record.mockRejectedValueOnce(new Error('database is locked'));
@@ -792,27 +837,61 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
 
     test('the reconciliation finalizer records the deployed address from the attempt row (no process memory needed)', async () => {
         setup();
-        const finalize = finalizers.get('sponsorUnboundTransaction')!;
-        expect(finalizers.get('sponsorFinalizedTransaction')).toBe(finalize);
+        const finalize = finalizers.get('sponsorUnbound')!;
+        expect(finalizers.get('sponsorFinalized')).toBe(finalize);
         fakeDbRows.next = {
-            ID: 'sub-1', txHash: '00late'.padEnd(64, '0'), contractAddress: NEW_ADDR,
+            ID: 'sub-1', txId: '00late'.padEnd(64, '0'), contractAddress: NEW_ADDR,
             submitIntentData: JSON.stringify({ feeSponsor: 'sponsor-1', circuits: ['<deploy>'], contractAddress: NEW_ADDR, deployed: [NEW_ADDR], deployReservation: { grantId: 'grant-1', count: 1 } })
         };
         const out: any = await runFinalizer(finalize, { op: 'sponsorUnbound', grantId: 'grant-1', sponsorSessionId: 'sponsor-1' }, { ID: 'j', sessionId: 'sponsor-1' } as any,
-            { submissionId: 'sub-1', txHash: '00late'.padEnd(64, '0'), contractAddress: NEW_ADDR, finalizedAt: null }, fakeDb);
+            { submissionId: 'sub-1', txId: '00late'.padEnd(64, '0'), txHash: H('00late'.padEnd(64, '0')), contractAddress: NEW_ADDR, finalizedAt: null }, fakeDb);
         expect(grantBudget.record).toHaveBeenCalledWith(expect.anything(), 'grant-1', [NEW_ADDR]);
         expect(out).toMatchObject({ reconciled: true, status: 'finalized', deployed: [NEW_ADDR], contractAddress: NEW_ADDR, feeSponsor: 'sponsor-1', circuits: ['<deploy>'] });
         // a plain call reconciles without touching any grant
         grantBudget.record.mockClear();
         fakeDbRows.next = { ID: 'sub-2', submitIntentData: JSON.stringify({ circuits: ['attest'], contractAddress: 'dd'.repeat(32) }) };
-        const plain: any = await runFinalizer(finalize, { op: 'sponsorUnbound', grantId: 'grant-1' }, { ID: 'j2', sessionId: 'sponsor-1' } as any, { submissionId: 'sub-2', txHash: '00plain'.padEnd(64, '0'), contractAddress: null, finalizedAt: null }, fakeDb);
+        const plain: any = await runFinalizer(finalize, { op: 'sponsorUnbound', grantId: 'grant-1' }, { ID: 'j2', sessionId: 'sponsor-1' } as any, { submissionId: 'sub-2', txId: '00plain'.padEnd(64, '0'), txHash: H('00plain'.padEnd(64, '0')), contractAddress: null, finalizedAt: null }, fakeDb);
         expect(grantBudget.record).not.toHaveBeenCalled();
         expect(plain.deployed).toBeUndefined();
     });
 
+    // A maintenance update reserves its own budget in the same transaction as its attempt row.
+    const withMaintenanceIntent = (address = NEW_ADDR) => async () => {
+        const hook = unboundIntentHooks.at(-1);
+        const txId = '00maint'.padEnd(64, '0');
+        try {
+            await hook({ txId, txHash: H(txId), contractAddress: address, circuits: ['<maintenance>'], note: 'b', sponsorAccountId: 'acct-sponsor-1', maintained: [address] });
+        } catch (e) {
+            throw new Error(`submit-intent rejected by the main thread: ${(e as Error).message}`);
+        }
+        return { txId, txHash: H(txId), circuits: ['<maintenance>'], contractAddress: address, note: 'b', maintained: [address] };
+    };
+
+    test('a maintenance update reserves the maintenance budget, not the deploy budget, and the row names it', async () => {
+        setup();
+        const proc = processors.get('sponsorUnbound')!;
+        grantBudget.reserveMaintenance.mockReset().mockResolvedValue(true);
+        unboundWorkerImpl.fn = withMaintenanceIntent();
+        await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any);
+        expect(grantBudget.reserveMaintenance).toHaveBeenCalledWith(expect.anything(), 'grant-1', 1);
+        expect(grantBudget.reserve).not.toHaveBeenCalled();
+        const row = (dbWrites.find((q) => q?.INSERT) as any).INSERT.entries[0];
+        expect(JSON.parse(row.submitIntentData)).toMatchObject({ maintained: [NEW_ADDR], maintenanceReservation: { grantId: 'grant-1', count: 1 } });
+    });
+
+    test('an exhausted maintenance budget nacks the intent', async () => {
+        setup();
+        const proc = processors.get('sponsorUnbound')!;
+        grantBudget.reserveMaintenance.mockReset().mockResolvedValue(false);
+        unboundWorkerImpl.fn = withMaintenanceIntent();
+        await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any))
+            .rejects.toThrow(/maintenance budget of the grant is exhausted/);
+        expect(boundaryCalls.filter((c) => c[0] === 'submitted').length).toBe(0);
+    });
+
     test('reserves BEFORE the boundary is crossed and records the address after inclusion', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         const order: string[] = [];
         grantBudget.reserve.mockImplementation(async () => { order.push('reserve'); return true; });
         vi.mocked(reportBroadcastOn).mockImplementationOnce(async (_runner: any, h: any) => { order.push('submitted'); boundaryCalls.push(['submitted', h]); });
@@ -826,10 +905,10 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
     });
 
     test('an exhausted budget nacks the intent: nothing broadcast, no attempt row, no failover, no record', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
         try {
             setup();
-            const proc = processors.get('sponsorUnboundTransaction')!;
+            const proc = processors.get('sponsorUnbound')!;
             grantBudget.reserve.mockResolvedValue(false);
             let attempts = 0;
             unboundWorkerImpl.fn = async () => { attempts++; return withDeployIntent(attempts)(); };
@@ -841,13 +920,13 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
             expect(grantBudget.record).not.toHaveBeenCalled();
             expect(grantBudget.release).not.toHaveBeenCalled();
         } finally {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         }
     });
 
     test('a pre-inclusion reject after the reservation gives the budget back', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         unboundWorkerImpl.fn = async () => {
             await withDeployIntent(1)();
             throw new Error('Transaction submission error <- RpcError: 1010: Invalid Transaction: Custom error: 196');
@@ -861,7 +940,7 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
 
     test('row, reservation and job transition are one transaction: a lost lease rolls all of it back', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         vi.mocked(reportBroadcastOn as any).mockRejectedValueOnce(new Error('Lease lost before markJobBroadcastOn(j)'));
         unboundWorkerImpl.fn = withDeployIntent(1);
         await expect(proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any))
@@ -876,7 +955,7 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
 
     test('closing a rejected attempt refunds in the SAME transaction as the row update', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         unboundWorkerImpl.fn = async () => {
             await withDeployIntent(1)();
             throw new Error('Transaction submission error <- RpcError: 1010: Invalid Transaction: Custom error: 196');
@@ -891,7 +970,7 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
 
     test('row close, refund and the job hash-CAS commit in ONE transaction', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         unboundWorkerImpl.fn = async () => {
             await withDeployIntent(1)();
             throw new Error('Transaction submission error <- RpcError: 1010: Invalid Transaction: Custom error: 196');
@@ -903,13 +982,13 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
         // the hash-CAS ran on the same staged runner as the refund, not on the service
         expect(rejected[0][1].runner).not.toBe(fakeDb);
         expect((grantBudget.release.mock.calls as any[])[0][0]).toBe(rejected[0][1].runner);
-        expect(rejected[0][1].txHash).toBe('00deploy1'.padEnd(64, '0'));
+        expect(rejected[0][1].txId).toBe('00deploy1'.padEnd(64, '0'));
     });
 
     test('when closing a rejected attempt fails for good, the retry loop STOPS instead of rebuilding on an open attempt', async () => {
         process.env.NIGHTGATE_SPONSOR_DUST_RETRIES = '2';
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         vi.mocked(reportSubmissionRejectedOn as any).mockRejectedValue(new Error('Lease lost (or hash already moved) before markJobSubmissionRejectedOn(j)'));
         let attempts = 0;
         unboundWorkerImpl.fn = async () => {
@@ -922,7 +1001,7 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
         expect(failure.message).toMatch(/could not be committed/);
         // the persisted marker the settle pass looks for, with its details
         expect(failure.code).toBe('REJECTED_ATTEMPT_BOOKKEEPING_PENDING');
-        expect(failure.details).toMatchObject({ txHash: '00deploy1'.padEnd(64, '0'), grantId: 'grant-1', refund: 1 });
+        expect(failure.details).toMatchObject({ txId: '00deploy1'.padEnd(64, '0'), grantId: 'grant-1', refund: 1 });
         expect(failure.details.submissionId).toMatch(/[0-9a-f-]{36}/);
         expect(attempts).toBe(1); // no rebuild after a failed close
         // the close transaction was rolled back: no REJECTED row update reached the database
@@ -932,11 +1011,11 @@ describe('sponsored deploy budget is reserved at the submit-intent', () => {
 
     test('a plain call under a deploy-capable grant reserves nothing', async () => {
         setup();
-        const proc = processors.get('sponsorUnboundTransaction')!;
+        const proc = processors.get('sponsorUnbound')!;
         unboundWorkerImpl.fn = async () => {
             const hook = unboundIntentHooks.at(-1);
-            await hook('00call'.padEnd(64, '0'), { txHash: '00call'.padEnd(64, '0'), contractAddress: 'dd'.repeat(32), circuits: ['attest'], note: 'b', deployed: [] });
-            return { txHash: '00call'.padEnd(64, '0'), circuits: ['attest'], contractAddress: 'dd'.repeat(32), note: 'b', deployed: [] };
+            await hook({ txId: '00call'.padEnd(64, '0'), txHash: H('00call'.padEnd(64, '0')), contractAddress: 'dd'.repeat(32), circuits: ['attest'], note: 'b', deployed: [] });
+            return { txId: '00call'.padEnd(64, '0'), txHash: H('00call'.padEnd(64, '0')), circuits: ['attest'], contractAddress: 'dd'.repeat(32), note: 'b', deployed: [] };
         };
         await proc({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', allowedContracts: [], allowedCircuits: [], allowDeploy: true, grantId: 'grant-1' }, { ID: 'j', requestedBy: 'u' } as any);
         expect(grantBudget.reserve).not.toHaveBeenCalled();
@@ -956,17 +1035,17 @@ describe('sponsorSwap', () => {
         unboundWorkerCalls.length = 0;
         grantBudget.minted.mockClear();
         __resetSponsorPoolForTests();
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1';
         // The action reads the floor from the environment, the executor through the policy module.
         process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS = 'true';
         process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = `${T1},${T2}`;
         platform.policy = { ...closed, allowedTokenTypes: [T1, T2], allowSwaps: true };
-        unboundWorkerImpl.fn = async () => ({ txHash: '00cc', circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms });
+        unboundWorkerImpl.fn = async () => ({ txId: '00cc', txHash: H('00cc'), circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms });
         describeImpl.half = async () => ({ gives: { tokenType: T1, amount: '10' }, wants: { tokenType: T2, amount: '3' }, bound: false, inputs: 1, nullifiers: [] });
     });
     afterEach(() => {
         platform.policy = closed;
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         delete process.env.NIGHTGATE_SPONSOR_ALLOW_SWAPS;
         delete process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES;
     });
@@ -1015,7 +1094,7 @@ describe('sponsorSwap', () => {
         // keyed on both halves: the same maker half with another taker half is another job
         const other = makeReq({ ...HALVES, takerHalfB64: TX_A });
         await srv.handlers['sponsorSwap'](other);
-        expect(startJobCalls[1].request.txHash).not.toBe(startJobCalls[0].request.txHash);
+        expect(startJobCalls[1].request.contentHash).not.toBe(startJobCalls[0].request.contentHash);
     });
 
     test('takes a half as offer file text or as base64; the job carries base64 either way', async () => {
@@ -1027,7 +1106,7 @@ describe('sponsorSwap', () => {
         expect(startJobCalls[0].command.swap).toEqual({ makerHalfB64: TX_A, takerHalfB64: TX_B });
         // the same halves in the other form are the same job
         await srv.handlers['sponsorSwap'](makeReq(HALVES));
-        expect(startJobCalls[1].request.txHash).toBe(startJobCalls[0].request.txHash);
+        expect(startJobCalls[1].request.contentHash).toBe(startJobCalls[0].request.contentHash);
     });
 
     test('a damaged offer file is 400 naming the half, before anything else', async () => {
@@ -1087,15 +1166,15 @@ describe('sponsorSwap', () => {
         board.closed.length = 0; board.byNullifier.length = 0;
         board.row = { ID: 'offer-1', status: 'open' };
         const N = ['11'.repeat(32), '22'.repeat(32)];
-        unboundWorkerImpl.fn = async () => ({ txHash: '00ee', circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms, nullifiers: N });
+        unboundWorkerImpl.fn = async () => ({ txId: '00ee', txHash: H('00ee'), circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms, nullifiers: N });
         const proc = processors.get('sponsorSwap')!;
         await proc({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B, offerId: 'offer-1' }, sponsorSessionId: 'sponsor-1' }, { ID: 'j', kind: 'sponsorSwap', requestedBy: 'u' } as any);
-        expect(board.closed).toEqual([{ id: 'offer-1', status: 'filled', txHash: '00ee' }]);
-        expect(board.byNullifier).toEqual([{ nullifiers: N, txHash: '00ee' }]);
+        expect(board.closed).toEqual([{ id: 'offer-1', status: 'filled', txHash: H('00ee') }]);
+        expect(board.byNullifier).toEqual([{ nullifiers: N, txHash: H('00ee') }]);
         // the intent carries them too, so a reconciled attempt closes the same rows
         const intentCall = unboundIntentHooks.at(-1);
         dbWrites.length = 0;
-        await intentCall('00ee', { circuits: ['<swap>'], nullifiers: N });
+        await intentCall({ txId: '00ee', txHash: H('00ee'), circuits: ['<swap>'], nullifiers: N });
         const row = dbWrites.find((q: any) => q?.INSERT)?.INSERT?.entries?.[0];
         expect(JSON.parse(row.submitIntentData)).toMatchObject({ nullifiers: N, offerId: 'offer-1' });
         board.row = null;
@@ -1121,8 +1200,8 @@ describe('sponsorSwap', () => {
         unboundWorkerImpl.fn = async () => {
             board.row = { ID: 'offer-1', status: 'retired' };
             dbWrites.length = 0;
-            await unboundIntentHooks.at(-1)('00ff', { circuits: ['<swap>'] });
-            return { txHash: '00ff', circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms };
+            await unboundIntentHooks.at(-1)({ txId: '00ff', txHash: H('00ff'), circuits: ['<swap>'] });
+            return { txId: '00ff', txHash: H('00ff'), circuits: ['<swap>'], contractAddress: '', note: 'b', swap: swapTerms };
         };
         try {
             await expect(proc({ op: 'sponsorUnbound', swap: { makerHalfB64: TX_A, takerHalfB64: TX_B, offerId: 'offer-1' }, sponsorSessionId: 'sponsor-1' }, { ID: 'j-l', kind: 'sponsorSwap', requestedBy: 'u' } as any))
@@ -1141,7 +1220,7 @@ describe('sponsorSwap', () => {
         expect(unboundWorkerCalls).toHaveLength(1);
         expect(unboundWorkerCalls[0]).toMatchObject({ swap: { makerHalfB64: TX_A, takerHalfB64: TX_B }, allowSwaps: true, allowedTokenTypes: [T1, T2] });
         expect(unboundWorkerCalls[0]).not.toHaveProperty('unboundTxB64');
-        expect(out).toMatchObject({ txHash: '00cc', swap: swapTerms, feeSponsor: 'sponsor-1' });
+        expect(out).toMatchObject({ txId: '00cc', swap: swapTerms, feeSponsor: 'sponsor-1' });
 
         // closed after the job was queued: the worker is told so and refuses
         platform.policy = { ...closed, allowedTokenTypes: [T1, T2] };
@@ -1165,7 +1244,7 @@ describe('sponsorTransfer', () => {
         startJobCalls.length = 0;
         unboundWorkerCalls.length = 0;
         __resetSponsorPoolForTests();
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1';
         process.env.NIGHTGATE_SPONSOR_ALLOW_TRANSFERS = 'true';
         process.env.NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES = T1;
         platform.policy = { ...closed, allowedTokenTypes: [T1], allowTransfers: true };
@@ -1187,6 +1266,17 @@ describe('sponsorTransfer', () => {
         await srv.handlers['sponsorTransfer'](unlisted);
         expect(unlisted.reject).toHaveBeenCalledWith(expect.objectContaining({ code: 'SPONSOR_POLICY_EMPTY', message: expect.stringMatching(/not in allowedTokenTypes/) }));
         expect(startJobCalls).toHaveLength(1);
+    });
+
+    test('an amount above what a token can hold is refused before a job exists', async () => {
+        const srv = setup();
+        const most = send(T1, String(2n ** 128n - 1n));
+        await srv.handlers['sponsorTransfer'](most);
+        expect(most.reject).not.toHaveBeenCalledWith(400, expect.stringMatching(/Uint<128>/));
+        const over = send(T1, String(2n ** 128n));
+        await srv.handlers['sponsorTransfer'](over);
+        expect(over.reject).toHaveBeenCalledWith(400, 'amount exceeds Uint<128>, the largest amount a token can have');
+        expect(startJobCalls.filter(job => job.request?.amount === String(2n ** 128n))).toHaveLength(0);
     });
 
     test('an unshielded transfer shows its terms: a declaration that differs is 400 before a job exists', async () => {
@@ -1245,12 +1335,12 @@ describe('sponsorTransfer', () => {
         setup();
         platform.policy = { ...closed, allowTransfers: true, allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [CREDIT] };
         const terms = { tokenType: NIGHT, amount: '10', to: 'mn_addr_preview1x' };
-        unboundWorkerImpl.fn = async () => ({ txHash: '00dd', circuits: ['<transfer>'], contractAddress: '', note: 'b', transfer: terms });
+        unboundWorkerImpl.fn = async () => ({ txId: '00dd', txHash: H('00dd'), circuits: ['<transfer>'], contractAddress: '', note: 'b', transfer: terms });
         const proc = processors.get('sponsorTransfer')!;
         const command = { op: 'sponsorUnbound', transfer: { txB64: TX_A, tokenType: NIGHT, amount: '10' }, sponsorSessionId: 'sponsor-1' };
         const out: any = await proc(command, { ID: 'j', kind: 'sponsorTransfer', requestedBy: 'u' } as any);
         expect(unboundWorkerCalls[0]).toMatchObject({ transfer: command.transfer, allowTransfers: true, allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [CREDIT] });
-        expect(out).toMatchObject({ txHash: '00dd', transfer: terms, feeSponsor: 'sponsor-1' });
+        expect(out).toMatchObject({ txId: '00dd', transfer: terms, feeSponsor: 'sponsor-1' });
 
         platform.policy = { ...closed, allowTransfers: true };
         await proc(command, { ID: 'j2', kind: 'sponsorTransfer', requestedBy: 'u' } as any);
@@ -1265,46 +1355,46 @@ describe('minted token types are recorded on the grant', () => {
         grantBudget.minted.mockClear();
         grantBudget.record.mockClear();
         __resetSponsorPoolForTests();
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
     });
 
     test('after a landed mint, on both channels; a job without a grant records nothing', async () => {
         setup();
-        unboundWorkerImpl.fn = async () => ({ txHash: '00dd', circuits: ['mint'], contractAddress: 'c', note: 'b', minted: [M] });
-        await processors.get('sponsorUnboundTransaction')!({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', grantId: 'grant-1' }, { ID: 'j', kind: 'sponsorUnboundTransaction', requestedBy: 'u' } as any);
+        unboundWorkerImpl.fn = async () => ({ txId: '00dd', txHash: H('00dd'), circuits: ['mint'], contractAddress: 'c', note: 'b', minted: [M] });
+        await processors.get('sponsorUnbound')!({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', grantId: 'grant-1' }, { ID: 'j', kind: 'sponsorUnbound', requestedBy: 'u' } as any);
         expect(grantBudget.minted).toHaveBeenCalledWith(expect.anything(), 'grant-1', [M]);
         expect(unboundWorkerCalls[0]).toMatchObject({ unboundTxB64: TX_A });
         expect(unboundWorkerCalls[0]).not.toHaveProperty('swap');
 
         grantBudget.minted.mockClear();
-        workerImpl.fn = async () => ({ txHash: '00ee', circuits: ['mint'], contractAddress: 'c', minted: [M] });
-        await processors.get('sponsorFinalizedTransaction')!({ op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1', grantId: 'grant-1' }, { ID: 'j2', kind: 'sponsorFinalizedTransaction', requestedBy: 'u' } as any);
+        workerImpl.fn = async () => ({ txId: '00ee', txHash: H('00ee'), circuits: ['mint'], contractAddress: 'c', minted: [M] });
+        await processors.get('sponsorFinalized')!({ op: 'sponsorFinalized', finalizedTxB64: TX_A, sponsorSessionId: 'sponsor-1', grantId: 'grant-1' }, { ID: 'j2', kind: 'sponsorFinalized', requestedBy: 'u' } as any);
         expect(grantBudget.minted).toHaveBeenCalledWith(expect.anything(), 'grant-1', [M]);
 
         grantBudget.minted.mockClear();
-        await processors.get('sponsorUnboundTransaction')!({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1' }, { ID: 'j3', kind: 'sponsorUnboundTransaction', requestedBy: 'u' } as any);
+        await processors.get('sponsorUnbound')!({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1' }, { ID: 'j3', kind: 'sponsorUnbound', requestedBy: 'u' } as any);
         expect(grantBudget.minted).not.toHaveBeenCalled();
-        workerImpl.fn = async () => ({ txHash: '00aa', circuits: ['attest'], contractAddress: 'c' });
-        unboundWorkerImpl.fn = async () => ({ txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' });
+        workerImpl.fn = async () => ({ txId: '00aa', txHash: H('00aa'), circuits: ['attest'], contractAddress: 'c' });
+        unboundWorkerImpl.fn = async () => ({ txId: '00bb', txHash: H('00bb'), circuits: ['attest'], contractAddress: 'c', note: 'b' });
     });
 
     test('the attempt row carries the types, and the reconciliation finalizer records them from it', async () => {
         setup();
         dbWrites.length = 0;
         unboundWorkerImpl.fn = async () => {
-            await unboundIntentHooks.at(-1)('00ff'.padEnd(64, '0'), { contractAddress: 'c', circuits: ['mint'], minted: [M] });
-            return { txHash: '00ff'.padEnd(64, '0'), circuits: ['mint'], contractAddress: 'c', note: 'b', minted: [M] };
+            await unboundIntentHooks.at(-1)({ txId: '00ff'.padEnd(64, '0'), txHash: H('00ff'.padEnd(64, '0')), contractAddress: 'c', circuits: ['mint'], minted: [M] });
+            return { txId: '00ff'.padEnd(64, '0'), txHash: H('00ff'.padEnd(64, '0')), circuits: ['mint'], contractAddress: 'c', note: 'b', minted: [M] };
         };
-        await processors.get('sponsorUnboundTransaction')!({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', grantId: 'grant-1' }, { ID: 'j', kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', requestedBy: 'u' } as any);
+        await processors.get('sponsorUnbound')!({ op: 'sponsorUnbound', unboundTxB64: TX_A, sponsorSessionId: 'sponsor-1', grantId: 'grant-1' }, { ID: 'j', kind: 'sponsorUnbound', sessionId: 'sponsor-1', requestedBy: 'u' } as any);
         const row = dbWrites.map((q: any) => q?.INSERT?.entries?.[0]).find((e: any) => e?.submitIntentData);
         expect(JSON.parse(row.submitIntentData)).toMatchObject({ minted: [M], circuits: ['mint'] });
-        unboundWorkerImpl.fn = async () => ({ txHash: '00bb', circuits: ['attest'], contractAddress: 'c', note: 'b' });
+        unboundWorkerImpl.fn = async () => ({ txId: '00bb', txHash: H('00bb'), circuits: ['attest'], contractAddress: 'c', note: 'b' });
 
         grantBudget.minted.mockClear();
         const finalize = finalizers.get('sponsorSwap')!;
-        expect(finalize).toBe(finalizers.get('sponsorUnboundTransaction'));
+        expect(finalize).toBe(finalizers.get('sponsorUnbound'));
         fakeDbRows.next = { ID: 'sub-1', submitIntentData: JSON.stringify({ circuits: ['mint'], contractAddress: 'c', minted: [M] }) };
-        await runFinalizer(finalize, { op: 'sponsorUnbound', grantId: 'grant-1' }, { ID: 'j', sessionId: 'sponsor-1' } as any, { submissionId: 'sub-1', txHash: '00ff'.padEnd(64, '0'), contractAddress: null, finalizedAt: null }, fakeDb);
+        await runFinalizer(finalize, { op: 'sponsorUnbound', grantId: 'grant-1' }, { ID: 'j', sessionId: 'sponsor-1' } as any, { submissionId: 'sub-1', txId: '00ff'.padEnd(64, '0'), txHash: H('00ff'.padEnd(64, '0')), contractAddress: null, finalizedAt: null }, fakeDb);
         expect(grantBudget.minted).toHaveBeenCalledWith(expect.anything(), 'grant-1', [M]);
     });
 });

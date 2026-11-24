@@ -21,8 +21,11 @@ using {
     BackgroundJobKind,
     BackgroundJobChainStatus,
     CommandEncoding,
-    DisclosureRole,
-    SwapOfferStatus
+    SwapOfferStatus,
+    ClaimPredicate,
+    ContentHashKind,
+    GranteeBinding,
+    ReorgStatus
 } from './types.cds';
 
 @assert.unique.hash: [hash]
@@ -30,7 +33,7 @@ entity Blocks : cuid, managed {
     hash             : HexEncoded not null;
     height           : Integer64 not null;
     protocolVersion  : Integer not null;
-    timestamp        : Integer not null;
+    timestamp        : Integer64 not null; // UNIX seconds
     author           : HexEncoded; // null = not known; AURA public key of the validator that produced the block
     slot             : Integer64; // null = the header names none; AURA slot of the block
     stateRoot        : HexEncoded;
@@ -43,18 +46,18 @@ entity Blocks : cuid, managed {
 // The extrinsic hash can repeat across blocks. The position in the block is unique.
 @assert.unique.blockPosition: [
     block,
-    transactionId
+    indexInBlock
 ]
+// Chain order of rows: blockHeight, indexInBlock, then the row's own index. Transactions, ContractActions and
+// UnshieldedUtxos carry the position themselves, so a sorted read needs no join.
 entity Transactions : cuid, managed {
-    transactionId            : Integer not null;
-    hash                     : HexEncoded not null;
-    ledgerTxHash             : HexEncoded;
+    blockHeight              : Integer64 not null; // the height of `block`
+    indexInBlock             : Integer not null;
+    extrinsicHash            : HexEncoded not null; // the hash of the node's extrinsic
+    txHash                   : HexEncoded; // the ledger hash, as explorers show it
     protocolVersion          : Integer not null;
     raw                      : LargeBinary;
     transactionType          : TransactionType not null;
-    merkleTreeRoot           : HexEncoded;
-    startIndex               : Integer64;
-    endIndex                 : Integer64;
     identifiers              : LargeString;
     txType                   : TxType;
     isShielded               : Boolean;
@@ -64,7 +67,7 @@ entity Transactions : cuid, managed {
     dustConsumed             : BigInt;
     hasProof                 : Boolean;
     contractAddress          : HexEncoded;
-    circuitName              : String(100);
+    circuit              : String(100);
     size                     : Integer;
     payloadDecode            : PayloadDecodeState;
     zswapInputCount          : Integer;
@@ -72,6 +75,10 @@ entity Transactions : cuid, managed {
     zswapTransientCount      : Integer;
     dustSpendCount           : Integer;
     dustRegistrationCount    : Integer;
+    // Unused. CAP's deploy cannot drop a column, so these three stay in the model and no service shows them.
+    merkleTreeRoot           : HexEncoded;
+    startIndex               : Integer64;
+    endIndex                 : Integer64;
     block                    : Association to Blocks not null;
     transactionResult        : Composition of one TransactionResults
                                    on transactionResult.transaction = $self;
@@ -91,7 +98,7 @@ entity Transactions : cuid, managed {
 
 /** One row per ledger identifier of a transaction, so a transaction can be found by one of them. */
 entity TransactionIdentifiers {
-    key identifier  : HexEncoded;
+    key txId        : HexEncoded;
     key transaction : Association to Transactions;
 }
 
@@ -117,8 +124,10 @@ entity TransactionFees : cuid {
 }
 
 entity ContractActions : cuid, managed {
-    actionIndex        : Integer; // order of action in tx
-    address            : HexEncoded;
+    blockHeight        : Integer64 not null; // of `transaction`
+    indexInBlock       : Integer not null; // of `transaction`
+    actionIndex        : Integer not null; // order of action in tx
+    contractAddress    : HexEncoded;
     state              : LargeBinary;
     zswapState         : LargeBinary;
     stateHash          : HexEncoded;
@@ -126,7 +135,7 @@ entity ContractActions : cuid, managed {
     zswapStateHash     : HexEncoded;
     zswapStateSize     : Integer;
     actionType         : ContractActionType not null;
-    entryPoint         : String(256);
+    circuit            : String(256);
     transaction        : Association to Transactions not null;
     deploy             : Association to ContractActions; // null = not a CALL;
     unshieldedBalances : Composition of many ContractBalances
@@ -141,7 +150,7 @@ entity ContractBalances : cuid {
 
 /** The newest known state of each contract. */
 entity ContractStates : managed {
-    key address        : HexEncoded;
+    key contractAddress : HexEncoded;
         height         : Integer64 not null;
         state          : LargeBinary;
         zswapState     : LargeBinary;
@@ -157,12 +166,14 @@ entity ContractStates : managed {
     outputIndex
 ]
 entity UnshieldedUtxos : cuid, managed {
+    blockHeight                 : Integer64 not null; // of `createdAtTransaction`
+    indexInBlock                : Integer not null; // of `createdAtTransaction`
     owner                       : UnshieldedAddr not null;
     tokenType                   : HexEncoded not null;
     value                       : BigInt not null;
     intentHash                  : HexEncoded not null;
     outputIndex                 : Integer not null;
-    ctime                       : Integer; // UNIX seconds; creation time
+    ctime                       : Integer64; // UNIX seconds; creation time
     initialNonce                : HexEncoded not null;
     registeredForDustGeneration : Boolean default false;
 
@@ -188,16 +199,15 @@ entity DustLedgerEvents : cuid {
 }
 
 /** A user's connected wallet. Every session action checks `userId`. */
-@assert.unique.sessionId: [sessionId]
-entity WalletSessions : cuid, managed {
+entity WalletSessions : managed {
+    key sessionId       : UUID;
     userId              : String(200);
     label               : String(100);
     viewingKeyHash      : String(64);
     encryptedViewingKey : LargeString;
     encryptedSeedKey    : LargeString; // null = viewing only
     accountIndex        : Integer;
-    sessionId           : UUID not null;
-    connectedAt         : Timestamp not null;
+    connectedAt        : Timestamp not null;
     disconnectedAt      : Timestamp;
     expiresAt           : Timestamp;
     isActive            : Boolean default true;
@@ -209,7 +219,7 @@ entity WalletSessions : cuid, managed {
 @assert.unique.tokenHash: [tokenHash]
 entity AgentGrants : cuid, managed {
     userId            : String(200) not null;
-    agentLabel        : String(100);
+    label        : String(100);
     sessionId         : UUID not null;
     tokenHash         : String(64) not null;
     allowedActions    : LargeString not null; // JSON array of strings; action names
@@ -225,6 +235,9 @@ entity AgentGrants : cuid, managed {
     allowDeploy       : Boolean default false;
     maxDeploys        : Integer; // default 1 when allowDeploy
     deploysUsed       : Integer default 0;
+    allowMaintenance  : Boolean default false;
+    maxMaintenanceUpdates  : Integer; // default 8 when allowMaintenance
+    maintenanceUpdatesUsed : Integer default 0;
     deployedContracts : LargeString; // JSON array of strings; always allowed
     allowedTokenTypes : LargeString; // JSON array of strings; null = platform list
     mintedTokenTypes  : LargeString; // JSON array of strings; always allowed
@@ -255,7 +268,7 @@ entity SwapOffers : cuid, managed {
     posterUserId  : String(200) not null;
     posterGrantId : UUID; // null = no agent grant
     sessionId     : UUID;
-    takerSecretHash : HexEncoded; // sha256 of the taker secret; null = anyone may take
+    takerSecretHash : HexEncoded; // null on every listed offer; an open row with a value is retired at start
     filledTxHash  : HexEncoded;
     closedAt      : Timestamp;
 }
@@ -269,10 +282,10 @@ entity HolderDisclosureGrants : cuid, managed {
     grantorUserId   : String(200) not null;
     grantorGrantId  : UUID; // null = no agent grant
     contentType     : String(100);
-    contentHashKind : String(20); // 'blake2b-256' or 'sha256'; hash of the text that equals payloadHash
+    contentHashKind : ContentHashKind; // null = no content stored; hash of the text that equals payloadHash
     content         : LargeString; // encrypted with the server key
     expiresAt       : Timestamp;
-    active          : Boolean default true;
+    isActive        : Boolean default true;
     revokedAt       : Timestamp;
 }
 
@@ -293,14 +306,14 @@ entity ContractRegistrations : managed {
         zkConfigPath   : String(1000) not null; // absolute path inside NIGHTGATE_CONTRACTS_DIR; folder with keys/ and zkir/
         privateStateId : String(200) not null;
         slotWidth      : Integer; // null = 16
-        networkId      : String(30);
+        network        : String(30);
         registeredBy   : String(200);
 }
 
 /** Progress of the block indexer. Exactly one row. */
 entity SyncState {
     key ID                      : String(10) default 'SINGLETON';
-        networkId               : String(30);
+        network                 : String(30);
         lastIndexedHeight       : Integer64 default 0;
         lastIndexedHash         : HexEncoded;
         lastIndexedAt           : Timestamp;
@@ -317,9 +330,10 @@ entity SyncState {
         lastError               : String(500);
         lastErrorAt             : Timestamp;
         consecutiveErrors       : Integer default 0;
-        identifiersBackfilledAt : Timestamp; // null = rows decoded before TransactionIdentifiers existed are not filled in yet
-        authorBackfillHeight    : Integer64; // null = not started; blocks up to this height carry the validator in author
-        authorsBackfilledAt     : Timestamp; // null = blocks stored with the slot in author are not all rewritten yet
+        // Unused. CAP's deploy cannot drop a column, so these three stay in the model and no service shows them.
+        identifiersBackfilledAt : Timestamp;
+        authorBackfillHeight    : Integer64;
+        authorsBackfilledAt     : Timestamp;
         reindexTargetHeight     : Integer64; // null = no reindex open; a rollback must reach this height before the crawler runs
 }
 
@@ -330,23 +344,23 @@ entity ReorgLog : cuid, managed {
     newTipHash       : HexEncoded not null;
     blocksRolledBack : Integer default 0;
     blocksReIndexed  : Integer default 0;
-    status           : String(20); // 'in_progress', 'completed' or 'failed'; failed = the new branch was not indexed in that run
+    status           : ReorgStatus; // failed = the new branch was not indexed in that run
 }
 
 /** Transactions submitted through this server.
- *  `txHash` and, for deploys, `contractAddress` stay null until the SDK returns them. */
+ *  `txId`, `txHash` and, for deploys, `contractAddress` stay null until the transaction is built. */
 entity PendingSubmissions : cuid, managed {
-    txHash           : HexEncoded;
+    txId             : HexEncoded; // a ledger identifier of the transaction
+    txHash           : HexEncoded; // the ledger hash, as explorers show it
     contractAddress  : HexEncoded;
-    circuitName      : String(100);
+    circuit      : String(100);
     actionType       : ContractActionType not null;
     submittedAt      : Timestamp not null;
     status           : PendingSubmissionStatus not null default 'pending';
     finalizedAt      : Timestamp;
     finalizedTxData  : LargeString; // JSON
-    chainBlockHeight : Integer;
-    chainBlockHash   : HexEncoded;
-    indexerTxHash    : HexEncoded; // the Midnight indexer's hash
+    blockHeight : Integer64;
+    blockHash   : HexEncoded;
     submitIntentData : LargeString;
     errorCode        : String(50);
     errorMessage     : String(500);
@@ -387,12 +401,12 @@ entity BackgroundJobs : cuid, managed {
     leaseExpiresAt      : Timestamp;
     heartbeatAt         : Timestamp;
     submissionId        : UUID;
-    txHash              : HexEncoded;
+    txId                : HexEncoded; // a ledger identifier of the transaction
+    txHash              : HexEncoded; // the ledger hash, as explorers show it
     chainStatus         : BackgroundJobChainStatus; // null = nothing submitted
     chainFinalizedAt    : Timestamp;
-    chainBlockHeight    : Integer;
-    chainBlockHash      : HexEncoded;
-    indexerTxHash       : HexEncoded; // the Midnight indexer's hash, differs from txHash
+    blockHeight    : Integer64;
+    blockHash      : HexEncoded;
     chainSegments       : LargeString; // JSON; batches only; which calls of each segment applied
 }
 
@@ -434,26 +448,36 @@ entity WalletSyncStates {
         dustStateBlob       : LargeString;
         keyScheme           : String(16); // 'dek1'
         sdkVersion          : String(64) not null;
-        networkId           : String(32);
+        network             : String(32);
         seedFingerprint     : String(64);
         createdAt           : Timestamp;
         updatedAt           : Timestamp;
 }
 
+// Unused tables. CAP's deploy cannot drop a table, so they stay in the model without a service or code.
 entity Attestations : cuid, managed {
-    attestationId   : HexEncoded not null; // blake2b-256; the payload hash
+    attestationId   : HexEncoded not null;
     contractAddress : HexEncoded not null;
     attester        : HexEncoded not null;
-    publicMetadata  : LargeString; // JSON
+    publicMetadata  : LargeString;
     payloadCipher   : LargeBinary;
     anchoredTxHash  : HexEncoded;
     anchoredAt      : Timestamp;
 }
 
+entity DisclosureRoles : cuid, managed {
+    userId     : String(200) not null;
+    role       : String(30) not null;
+    scope      : String(500);
+    grantedBy  : String(200);
+    validFrom  : Timestamp;
+    validUntil : Timestamp;
+}
+
 /** Documents whose hash was written to an attestation contract.
  *  Agent tokens see only rows of their own session. Rows with a null `sessionId` are visible to the owner only. */
 entity Documents : cuid, managed {
-    sha256              : HexEncoded not null;
+    payloadHash         : HexEncoded not null;
     contentType         : String(100);
     size                : Integer64;
     storageRef          : String(500); // file://, s3:// or ipfs:// URL
@@ -462,7 +486,7 @@ entity Documents : cuid, managed {
     userId              : String(200);
     contractAddress     : HexEncoded;
     network             : String(30);
-    compiledArtifactRef : String(200); // contract name; may later point to a newer build
+    contractName        : String(200); // may later point to a newer build
     artifactDigest      : HexEncoded;
     sessionId           : UUID;
     attesterId          : HexEncoded;
@@ -473,9 +497,10 @@ entity PredicateAttestations : cuid, managed {
     payloadHash         : HexEncoded not null;
     attesterId          : HexEncoded;
     contractAddress     : HexEncoded not null;
-    predicate           : String(20) not null; // 'lessOrEqual', 'greaterOrEqual', 'bytesEquality', 'setMembership', 'documentIntegrity' or 'documentDiff'
+    predicate           : ClaimPredicate not null;
     op                  : Integer; // 0 or 1; null = not a numeric predicate
-    threshold           : Integer64; // scaled integer for numeric predicates; for documentDiff the minimum number of differing fields
+    threshold           : BigInt; // null = not a numeric predicate; scaled like the value, at most 2^64-1
+    k                   : Integer; // null = not a documentDiff; minimum number of differing fields
     unit                : String(50);
     fieldKey            : HexEncoded; // null = proof not tied to one field
     expectedDigest      : HexEncoded;
@@ -486,17 +511,10 @@ entity PredicateAttestations : cuid, managed {
     provenTxHash        : HexEncoded;
     provenAt            : Timestamp;
     network             : String(30);
-    compiledArtifactRef : String(200); // contract name
+    contractName        : String(200);
     artifactDigest      : HexEncoded;
-}
-
-entity DisclosureRoles : cuid, managed {
-    userId     : String(200) not null;
-    role       : DisclosureRole not null;
-    scope      : String(500); // null = global; contract address or attestation id
-    grantedBy  : String(200);
-    validFrom  : Timestamp;
-    validUntil : Timestamp;
+    userId              : String(200); // null = only an admin reads the row
+    sessionId           : UUID;
 }
 
 /** Who may read an attested document, mirrored from the attestation contract. The contract decides access.
@@ -516,21 +534,23 @@ entity DisclosureGrants : cuid, managed {
     contractAddress : HexEncoded not null;
     grantedTxHash   : HexEncoded;
     revokedTxHash   : HexEncoded;
-    active          : Boolean default false; // granted on chain and not revoked
+    isActive        : Boolean default false; // granted on chain and not revoked
     changedAtHeight : Integer64; // block of the last applied change
+    userId          : String(200); // null = read from the chain, only an admin reads the row
+    sessionId       : UUID;
 }
 
 /** Links a user to the grantee id the attestation contract checks. A row with a scope wins over a global one. */
 entity GranteeIdentities : cuid, managed {
     userId      : String(200) not null;
     granteeId   : HexEncoded not null;
-    bindingKind : String(20) not null; // 'wallet', 'did' or 'custom'
+    bindingKind : GranteeBinding not null;
     scope       : String(500); // null = global; contract address or attestation id
 }
 
 /** Unshielded NIGHT balance per address. */
 entity NightBalances {
-    key address            : String(256);
+    key address            : UnshieldedAddr;
         balance            : Decimal(20, 0) default 0;
         utxoCount          : Integer default 0;
         firstSeenHeight    : Integer64;
@@ -541,6 +561,7 @@ entity NightBalances {
         txReceivedCount    : Integer default 0;
         totalSent          : Decimal(20, 0) default 0;
         totalReceived      : Decimal(20, 0) default 0;
+        // Unused. CAP's deploy cannot drop a column, so these two stay in the model and no service shows them.
         dustAddress        : DustAddr;
         isDustRegistered   : Boolean default false;
         lastUpdatedHeight  : Integer64;

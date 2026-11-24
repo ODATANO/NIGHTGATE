@@ -10,7 +10,6 @@
  */
 import cds from '@sap/cds';
 import path from 'node:path';
-import { attachDisclosureRole } from '../../srv/middleware/disclosure-role';
 
 const registeredProcessors = vi.hoisted(() => new Map<string, (command: unknown, row: any) => Promise<unknown>>());
 const registeredFinalizers = vi.hoisted(() => new Map<string, (command: unknown, row: any, evidence: any) => Promise<unknown>>());
@@ -85,7 +84,7 @@ function makeReq(user: string, level: number) {
 function grantCommand(disclosureGrantId: string, level: number) {
     return {
         op: 'grantDisclosure', disclosureGrantId, payloadHash: PAYLOAD, attesterId: ATTESTER, grantee: GRANTEE, level,
-        contractAddress: CONTRACT, compiledArtifactRef: VAULT, artifactDigest: getArtifactGenerationDigest(VAULT)
+        contractAddress: CONTRACT, contractName: VAULT, artifactDigest: getArtifactGenerationDigest(VAULT)
     };
 }
 
@@ -94,7 +93,7 @@ async function seedActiveGrant(level: number): Promise<string> {
     const now = new Date().toISOString();
     await db.run(cds.ql.INSERT.into(GRANTS).entries({
         ID, contractAddress: CONTRACT, payloadHash: PAYLOAD, attesterId: ATTESTER, grantee: GRANTEE, level, pendingLevel: null,
-        grantedTxHash: '0x01', revokedTxHash: null, active: true, createdAt: now, modifiedAt: now
+        grantedTxHash: '0x01', revokedTxHash: null, isActive: true, createdAt: now, modifiedAt: now
     }));
     return ID;
 }
@@ -144,7 +143,7 @@ describe('level request on an existing active grant', () => {
         expect(admitted).toHaveLength(1);
 
         const pending = await grantRow(ID);
-        expect(pending).toMatchObject({ level: 1, pendingLevel: 2, active: true });
+        expect(pending).toMatchObject({ level: 1, pendingLevel: 2, isActive: true });
 
         const finalizer = registeredFinalizers.get('grantDisclosure\x001')!;
         await runFinalizer(finalizer, grantCommand(ID, 2), { ID: 'job-1', kind: 'grantDisclosure' }, {
@@ -152,7 +151,7 @@ describe('level request on an existing active grant', () => {
         }, db);
 
         const confirmed = await grantRow(ID);
-        expect(confirmed).toMatchObject({ level: 2, pendingLevel: null, grantedTxHash: '0xincluded', active: true });
+        expect(confirmed).toMatchObject({ level: 2, pendingLevel: null, grantedTxHash: '0xincluded', isActive: true });
     });
 
     test('a refused submission drops the request and leaves the confirmed level', async () => {
@@ -166,7 +165,7 @@ describe('level request on an existing active grant', () => {
             ID: 'job-1', kind: 'grantDisclosure', sessionId: SESSION, requestedBy: OWNER, commandVersion: 1
         })).rejects.toThrow(/not attester/);
 
-        expect(await grantRow(ID)).toMatchObject({ level: 1, pendingLevel: null, active: true });
+        expect(await grantRow(ID)).toMatchObject({ level: 1, pendingLevel: null, isActive: true });
     });
 
     test('a caller who does not hold the session is refused and the row is untouched', async () => {
@@ -174,11 +173,11 @@ describe('level request on an existing active grant', () => {
         const before = await grantRow(ID);
 
         await expect(handlers.grantDisclosure(makeReq('someone-else', 2))).rejects.toSatisfy((err: any) =>
-            err.status === 401 || err.code === 401);
+            err.status === 404 && err.code === 'SESSION_NOT_FOUND');
 
         expect(admitted).toHaveLength(0);
         const after = await grantRow(ID);
-        expect(after).toMatchObject({ level: 1, pendingLevel: null, active: true, modifiedAt: before.modifiedAt });
+        expect(after).toMatchObject({ level: 1, pendingLevel: null, isActive: true, modifiedAt: before.modifiedAt });
     });
 
     test('a failed admission leaves no request behind', async () => {
@@ -198,23 +197,41 @@ describe('level request on an existing active grant', () => {
 
         admissionFailure.error = null;
         const result: any = await handlers.grantDisclosure(makeReq(OWNER, 2));
-        expect(await grantRow(result.disclosureGrantId)).toMatchObject({ level: 2, pendingLevel: null, active: false });
+        expect(await grantRow(result.disclosureGrantId)).toMatchObject({ level: 2, pendingLevel: null, isActive: false, userId: OWNER, sessionId: SESSION });
+    });
+
+    test('a row read from the chain gets the caller as owner on the first request; a row with an owner keeps it', async () => {
+        const fromChain = await seedActiveGrant(1);
+        expect(await grantRow(fromChain)).toMatchObject({ userId: null, sessionId: null });
+        await handlers.grantDisclosure(makeReq(OWNER, 2));
+        expect(await grantRow(fromChain)).toMatchObject({ userId: OWNER, sessionId: SESSION, pendingLevel: 2 });
+
+        await db.run(cds.ql.UPDATE.entity(GRANTS).set({ userId: 'first-owner', sessionId: null }).where({ ID: fromChain }));
+        await handlers.grantDisclosure(makeReq(OWNER, 1));
+        expect(await grantRow(fromChain)).toMatchObject({ userId: 'first-owner', sessionId: null });
     });
 });
 
-describe('disclosure role while a level request is pending', () => {
-    test('resolves the confirmed level, not the requested one', async () => {
-        const ID = await seedActiveGrant(1);
-        await db.run(cds.ql.UPDATE.entity(GRANTS).set({ pendingLevel: 2 }).where({ ID }));
-        const now = new Date().toISOString();
-        await db.run(cds.ql.INSERT.into(IDENTITIES).entries({
-            ID: cds.utils.uuid(), userId: 'recipient', granteeId: GRANTEE, bindingKind: 'custom', scope: CONTRACT,
-            createdAt: now, modifiedAt: now
-        }));
+describe('retracting an attestation (mode 0) ends its disclosure grants', () => {
+    const retractCommand = () => ({
+        op: 'retract', mode: 0, key: PAYLOAD, attesterId: ATTESTER, contractAddress: CONTRACT,
+        contractName: VAULT, artifactDigest: getArtifactGenerationDigest(VAULT)
+    });
 
-        const req = new cds.Request({ event: 'READ' });
-        req.user = new cds.User({ id: 'recipient' } as any);
-        const role = await attachDisclosureRole(req, db, { contractAddress: CONTRACT, payloadHash: PAYLOAD, attesterId: ATTESTER });
-        expect(role).toBe('legitimate_interest');
+    test('the executor marks the grants inactive with the retract transaction', async () => {
+        const ID = await seedActiveGrant(1);
+        submitterBehaviour = { call: async () => ({ txHash: 'ab'.repeat(32) }) };
+        const processor = registeredProcessors.get('retractAttestation\x001')!;
+        await processor(retractCommand(), { ID: 'job-r', kind: 'retractAttestation', sessionId: SESSION, requestedBy: OWNER, commandVersion: 1 });
+        expect(await grantRow(ID)).toMatchObject({ isActive: false, revokedTxHash: 'ab'.repeat(32) });
+    });
+
+    test('the reconciliation finalizer does the same for a landed retract', async () => {
+        const ID = await seedActiveGrant(1);
+        const finalizer = registeredFinalizers.get('retractAttestation\x001')!;
+        await runFinalizer(finalizer, retractCommand(), { ID: 'job-r', kind: 'retractAttestation' }, {
+            submissionId: null, txHash: 'cd'.repeat(32), contractAddress: CONTRACT, finalizedAt: null, blockHeight: 0
+        }, db);
+        expect(await grantRow(ID)).toMatchObject({ isActive: false, revokedTxHash: 'cd'.repeat(32) });
     });
 });

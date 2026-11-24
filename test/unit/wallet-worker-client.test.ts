@@ -82,7 +82,7 @@ import {
     walletInit,
     walletEvict,
     walletGetBalance,
-    walletTransferNight,
+    walletTransferToken,
     walletEstimateTransferFee,
     walletRegisterDustGeneration,
     walletDeregisterDustGeneration,
@@ -198,7 +198,7 @@ describe('wallet-worker-client', () => {
             const read = walletGetBalance({ sessionId: 's1' });
             // settle the rejection as it happens: an unobserved rejection between the
             // exit event and the assertion is reported as an unhandled promise
-            const submit = walletTransferNight({ sessionId: 's1', receiverAddress: 'r', amount: '1' }).then(() => null, (e: Error) => e);
+            const submit = walletTransferToken({ sessionId: 's1', receiverAddress: 'r', amount: '1' }).then(() => null, (e: Error) => e);
             await new Promise(r => setImmediate(r));
             w1.emit('message', { kind: 'rotation-done', generations: 32 });
             await expect(read).resolves.toEqual({ balance: 'fresh' });
@@ -300,7 +300,9 @@ describe('wallet-worker-client', () => {
             } }));
             const err: any = await walletEvict('s1').then(() => null, e => e);
             expect(isNightgateError(err)).toBe(true);
-            expect(err).toMatchObject({ code: 'WALLET_NOT_SYNCED', status: 503, retryable: true, message: 'wallet not synced to tip after 1000ms <- inner' });
+            // The error keeps its own text. The text with the causes of the worker side travels as its cause.
+            expect(err).toMatchObject({ code: 'WALLET_NOT_SYNCED', status: 503, retryable: true, message: 'wallet not synced to tip after 1000ms' });
+            expect((err as Error).cause).toMatchObject({ message: 'wallet not synced to tip after 1000ms <- inner' });
         });
 
         it('a classified failure keeps its coded error as cause', async () => {
@@ -352,7 +354,7 @@ describe('wallet-worker-client', () => {
         it.each([
             ['evict',          () => walletEvict('s1'),                                                'evict'],
             ['getBalance',     () => walletGetBalance({ sessionId: 's1' }),                            'getBalance'],
-            ['transferNight',  () => walletTransferNight({ sessionId: 's1', receiverAddress: 'r', amount: '1' }), 'transferNight'],
+            ['transferToken',  () => walletTransferToken({ sessionId: 's1', receiverAddress: 'r', amount: '1' }), 'transferToken'],
             ['estimateTransferFee', () => walletEstimateTransferFee({ sessionId: 's1', receiverAddress: 'r', amount: '1' }), 'estimateTransferFee'],
             ['registerDust',   () => walletRegisterDustGeneration({ sessionId: 's1' }),                'registerDustGeneration'],
             ['deregisterDust', () => walletDeregisterDustGeneration({ sessionId: 's1' }),              'deregisterDustGeneration'],
@@ -368,7 +370,7 @@ describe('wallet-worker-client', () => {
             await startWithResponder((msg) => {
                 // worker: announce first, reply only after the ack
                 msg.port.on('message', (m: any) => { if (m?.kind === 'submit-intent-ack') { acks.push(m); msg.port.postMessage({ ok: true, result: { txHash: 'h1', onChainStatus: 'ok' } }); } });
-                msg.port.postMessage({ kind: 'submit-intent', txHash: 'h1', contractAddress: 'c', circuits: ['increment'], ttl: '2026-09-10T06:31:34.000Z' });
+                msg.port.postMessage({ kind: 'submit-intent', txId: 'id-h1', txHash: 'h1', contractAddress: 'c', circuits: ['increment'], ttl: '2026-09-10T06:31:34.000Z' });
                 return undefined;
             });
             const persisted: any[] = [];
@@ -376,18 +378,18 @@ describe('wallet-worker-client', () => {
                 sessionId: 's1', proxyId: 'p', contractName: 'counter', contractAddress: 'c', circuit: 'increment', args: [],
                 registration: { artifactPath: '/a', privateStateId: 'p', zkConfigPath: '/zk' },
                 indexerHttpUrl: '', indexerWsUrl: '', proofServerUrl: '', networkId: 'preprod'
-            } as any, async (txHash, intent) => { persisted.push({ txHash, intent }); });
+            } as any, async (intent) => { persisted.push(intent); });
             expect(result).toEqual({ txHash: 'h1', onChainStatus: 'ok' });
             // the ttl rides along: the confirmer's deadline for a broadcast that never lands
-            expect(persisted).toEqual([{ txHash: 'h1', intent: expect.objectContaining({ txHash: 'h1', contractAddress: 'c', circuits: ['increment'], ttl: '2026-09-10T06:31:34.000Z' }) }]);
-            expect(acks).toEqual([{ kind: 'submit-intent-ack', txHash: 'h1', ok: true }]);
+            expect(persisted).toEqual([expect.objectContaining({ txId: 'id-h1', txHash: 'h1', contractAddress: 'c', circuits: ['increment'], ttl: '2026-09-10T06:31:34.000Z' })]);
+            expect(acks).toEqual([{ kind: 'submit-intent-ack', txId: 'id-h1', ok: true }]);
         });
 
         it('a worker answer that arrives while the intent is still being persisted settles after the hook, and no ack follows', async () => {
             const acks: any[] = [];
             await startWithResponder((msg) => {
                 msg.port.on('message', (m: any) => { if (m?.kind === 'submit-intent-ack') acks.push(m); });
-                msg.port.postMessage({ kind: 'submit-intent', txHash: 'h-late', contractAddress: 'c', circuits: ['attest'] });
+                msg.port.postMessage({ kind: 'submit-intent', txId: 'id-h-late', txHash: 'h-late', contractAddress: 'c', circuits: ['attest'] });
                 // the worker gave up waiting for the ack: it answers without broadcasting
                 setImmediate(() => msg.port.postMessage({ ok: false, error: {
                     name: 'Error', message: 'submit-intent was not acknowledged by the main thread within 120000ms; not broadcasting',
@@ -414,7 +416,7 @@ describe('wallet-worker-client', () => {
 
         it('a worker exit while the intent is being persisted rejects the call only after the hook settled', async () => {
             const w = await startWithResponder((msg) => {
-                msg.port.postMessage({ kind: 'submit-intent', txHash: 'h-exit', contractAddress: 'c', circuits: ['attest'] });
+                msg.port.postMessage({ kind: 'submit-intent', txId: 'id-h-exit', txHash: 'h-exit', contractAddress: 'c', circuits: ['attest'] });
                 return undefined;
             });
             const events: string[] = [];
@@ -435,7 +437,7 @@ describe('wallet-worker-client', () => {
             process.env.NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS = '1000';
             try {
                 await startWithResponder((msg) => {
-                    msg.port.postMessage({ kind: 'submit-intent', txHash: 'h-stuck', contractAddress: 'c', circuits: ['attest'] });
+                    msg.port.postMessage({ kind: 'submit-intent', txId: 'id-h-stuck', txHash: 'h-stuck', contractAddress: 'c', circuits: ['attest'] });
                     setImmediate(() => msg.port.postMessage({ ok: false, error: { name: 'Error', message: 'not broadcasting' } }));
                     return undefined;
                 });

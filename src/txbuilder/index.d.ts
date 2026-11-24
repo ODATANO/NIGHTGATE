@@ -1,6 +1,7 @@
-// Types for `@odatano/nightgate/txbuilder`. It builds a transaction on your machine,
+// Types for `@odatano/nightgate-tx/txbuilder`. It builds a transaction on your machine,
 // with your own key, for a NIGHTGATE server to pay the fee and submit.
 import type { ConnectOptions, NightgateClient } from '../sdk/client';
+import type { ContractDeploy, MaintenanceUpdate } from '@midnightntwrk/ledger-v9';
 
 /** A started shielded wallet of the SDK, as a swap wallet hands it out and a builder takes it. */
 export interface ShieldedWalletInstance {
@@ -44,6 +45,7 @@ export interface ZkAssetResult {
 export interface EnsureZkAssetsInput {
     /** A server's `/zk-config/<contract>` URL. Required unless `package` is given. */
     zkConfigBaseUrl?: string;
+    /** Where the downloaded files are kept; default `~/.cache/nightgate-txbuilder/<contractName>`. */
     cacheDir?: string;
     /**
      * An installed contract package (`@odatano/contract-<name>`).
@@ -57,7 +59,7 @@ export interface EnsureZkAssetsInput {
     /** All circuits of the contract. Verifier keys are needed for every one of them. */
     verifierCircuits?: string[];
     fetchFn?: typeof fetch;
-    onProgress?: (e: Record<string, unknown>) => void;
+    onProgress?: (e: ZkAssetProgress) => void;
 }
 
 export interface CreateTxBuilderInput {
@@ -122,6 +124,10 @@ export interface CreateTxBuilderInput {
     contractClass?: Function;
     contractName?: string;
     privateStateId?: string;
+    /**
+     * Where files from `zkConfigBaseUrl` are kept; default `~/.cache/nightgate-txbuilder/<contractName>`.
+     * Give each process its own when they build at the same time against servers with different versions of one contract.
+     */
     cacheDir?: string;
     /** Circuits you will call. Defaults to all circuits of the contract. */
     circuits?: string[];
@@ -144,10 +150,36 @@ export interface CreateTxBuilderInput {
      */
     shieldedWallet?: ShieldedWalletInstance;
     /** Asset download, wallet start, build phases and, while a wallet syncs, a `SyncProgressEvent` per wallet. */
-    onProgress?: (e: Record<string, unknown> | SyncProgressEvent) => void;
+    onProgress?: (e: BuilderProgressEvent) => void;
 }
 
 /** Where a syncing sub-wallet stands, at most once a second per wallet and once more when it reaches the tip. */
+/** The check of the contract's proving files starts. */
+export interface ZkAssetsProgress { phase: 'zk-assets'; }
+/** A proving file of the contract was downloaded. The counts are the totals of the run so far; `circuit` is absent for the compiler manifest. */
+export interface ZkAssetProgress { phase: 'zk-asset'; circuit?: string; file: string; fetched: number; cached: number; refreshed: number; }
+/** The wallet starts. */
+export interface WalletProgress { phase: 'wallet'; }
+/** A file of the wallet's own proving material was read from disk or downloaded. */
+export interface ProverMaterialProgress { phase: 'prover-material'; file: string; source: 'local' | 'remote'; bytes: number; }
+/** A build starts. `circuit` names the calls joined by `+`, or `<deploy>`. */
+export interface BuildProgress { phase: 'build'; circuit: string; }
+/** The calls of a batch were put in order. `before` and `after` list each call with its segment and stage. */
+export interface BatchOrderProgress { phase: 'batch-order'; before: string; after: string; stageGrouped: boolean; }
+/** The gas check of a batch could not decide, and the build goes on. */
+export interface BatchGasCheckProgress { phase: 'batch-gas-check'; outcome: 'skipped' | 'other-failure'; detail: string; }
+/** The gas a transcript declares, as decimal strings. */
+export interface GasFigures { readTime: string; computeTime: string; bytesWritten: string; bytesDeleted: string; }
+/** The declared gas of a single call was raised by `factor`, which can be below `requested`. A call without a stage has no figures for it. */
+export interface GasHeadroomProgress { phase: 'gas-headroom'; factor: number; requested: number; guaranteed?: GasFigures; fallible?: GasFigures; }
+/** A build is done. `contractAddress` is set for a deploy. */
+export interface BuiltProgress { phase: 'built'; bytes: number; bound: boolean; contractAddress?: string; }
+/** What a builder reports through `onProgress`. Check `phase` to read an event's fields. */
+export type BuilderProgressEvent =
+    | ZkAssetsProgress | ZkAssetProgress | WalletProgress | SyncProgressEvent | ProverMaterialProgress
+    | BuildProgress | BatchOrderProgress | BatchGasCheckProgress | GasHeadroomProgress | BuiltProgress;
+
+/** A sub-wallet's position while it syncs: at most once a second per wallet, and once at the tip. */
 export interface SyncProgressEvent {
     phase: 'sync';
     wallet: 'shielded' | 'unshielded' | 'dust';
@@ -190,22 +222,15 @@ export interface Identity {
     shieldedKeys: ShieldedPublicKeys;
 }
 
-/** Remembers the sockets a `ws` class opens. `closeAll()` ends them. */
-export interface TrackingWebSocket {
-    WebSocket: Function;
-    readonly size: number;
-    closeAll(): void;
-}
-
 export interface BuildSponsorableInput {
     contractAddress: string;
     /** A single call. Use either `call` or `calls`. */
     call?: PreparedCall;
     /**
      * Up to 8 calls in one transaction, run in array order.
-     * If the ledger would reject the order, it fails before proving with `code: 'BatchCausalityViolation'`.
+     * If the ledger would reject the order, it fails before proving with `code: 'BATCH_CAUSALITY_VIOLATION'`.
      * Putting the most expensive call last usually helps.
-     * A call that would run out of gas fails before proving with `code: 'BatchGasBudgetExceeded'`.
+     * A call that would run out of gas fails before proving with `code: 'BATCH_GAS_BUDGET_EXCEEDED'`.
      * Every circuit must be allowed by the sponsor.
      */
     calls?: PreparedCall[];
@@ -234,29 +259,37 @@ export interface BuildSponsorableInput {
      * Without their keys the build fails, because the coin cannot be encrypted for them.
      */
     recipients?: ShieldedPublicKeys[];
+    /**
+     * The contract's private state before the call; default `{}`. The builder keeps none between builds:
+     * pass the `nextPrivateState` of the last build whose transaction landed.
+     */
     initialPrivateState?: unknown;
     /**
-     * `true` (default) returns a sealed transaction for sponsorFinalizedTransaction.
-     * `false` returns an unsealed one for sponsorUnboundTransaction, which lets a sponsor pay for several at once.
+     * `true` (default) returns a sealed transaction for sponsorFinalized.
+     * `false` returns an unsealed one for sponsorUnbound, which lets a sponsor pay for several at once.
      */
     bind?: boolean;
 }
 export interface BuildSponsorableBoundInput extends BuildSponsorableInput { bind?: true; }
 export interface BuildSponsorableUnboundInput extends BuildSponsorableInput { bind: false; }
 
-/** A sealed transaction without a fee, as base64. Send it to sponsorFinalizedTransaction. */
+/** A sealed transaction without a fee, as base64. Send it to sponsorFinalized. */
 export interface BuiltBoundTransaction {
     finalizedTxB64: string;
     unboundTxB64?: undefined;
     serializedBytes: number;
     bound: true;
+    /** The contract's private state after the call, the last call of a batch or the constructor. It counts once the transaction landed. */
+    nextPrivateState: unknown;
 }
-/** A signed but unsealed transaction without a fee, as base64. Send it to sponsorUnboundTransaction. */
+/** A signed but unsealed transaction without a fee, as base64. Send it to sponsorUnbound. */
 export interface BuiltUnboundTransaction {
     unboundTxB64: string;
     finalizedTxB64?: undefined;
     serializedBytes: number;
     bound: false;
+    /** The contract's private state after the call, the last call of a batch or the constructor. It counts once the transaction landed. */
+    nextPrivateState: unknown;
 }
 export type BuiltTransaction = BuiltBoundTransaction | BuiltUnboundTransaction;
 
@@ -280,11 +313,20 @@ export interface TxBuilder {
     buildSponsorable(input: BuildSponsorableInput): Promise<BuiltTransaction>;
     /**
      * Builds, proves and signs a contract deploy without submitting it. A sponsor pays the fee.
-     * The server must allow sponsored deploys, and an agent token needs `allowDeploy` with budget left.
+     * An agent token needs `allowDeploy` on its grant with budget left.
      */
+    buildDeploySponsorable(input: BuildDeployFromLedgerInput & { bind: false }): Promise<BuiltUnboundMaintenance>;
+    buildDeploySponsorable(input: BuildDeployFromLedgerInput): Promise<BuiltMaintenance>;
     buildDeploySponsorable(input: BuildDeploySponsorableUnboundInput): Promise<BuiltUnboundDeploy>;
     buildDeploySponsorable(input?: BuildDeploySponsorableBoundInput): Promise<BuiltBoundDeploy>;
     buildDeploySponsorable(input: BuildDeploySponsorableInput): Promise<BuiltDeploy>;
+    /**
+     * Proves a signed maintenance update and returns it without a fee. A sponsor pays and submits it.
+     * An agent token needs `allowMaintenance` on its grant, and the contract must be one it deployed sponsored.
+     */
+    buildMaintenanceSponsorable(input: BuildMaintenanceSponsorableUnboundInput): Promise<BuiltUnboundMaintenance>;
+    buildMaintenanceSponsorable(input: BuildMaintenanceSponsorableBoundInput): Promise<BuiltBoundMaintenance>;
+    buildMaintenanceSponsorable(input: BuildMaintenanceSponsorableInput): Promise<BuiltMaintenance>;
     /**
      * Releases the coins a built transaction reserved in this builder's wallets, a shared shielded wallet included,
      * when it will not land: offer file, base64 or bytes, bound or not.
@@ -294,9 +336,14 @@ export interface TxBuilder {
     close(): Promise<void>;
 }
 
+/** A signing key of the ledger: its kind and the key as hex. */
+export interface ContractSigningKey { tag: string; value: string }
+
 export interface BuildDeploySponsorableInput {
-    /** Stays in this process only. */
+    /** The contract's private state before the constructor; default `{}`. Stays in this process. */
     initialPrivateState?: unknown;
+    /** The key that may maintain the contract later; default a new random one. The result carries it either way. */
+    signingKey?: ContractSigningKey;
     /** The contract's constructor arguments, in order. */
     constructorArgs?: unknown[];
     /** Witnesses the constructor needs, if any. */
@@ -307,15 +354,40 @@ export interface BuildDeploySponsorableInput {
 }
 export interface BuildDeploySponsorableBoundInput extends BuildDeploySponsorableInput { bind?: true; }
 export interface BuildDeploySponsorableUnboundInput extends BuildDeploySponsorableInput { bind: false; }
-export interface BuiltBoundDeploy extends BuiltBoundTransaction { contractAddress: string; }
-export interface BuiltUnboundDeploy extends BuiltUnboundTransaction { contractAddress: string; }
+/** What a deploy build adds. `signingKey` is a secret: only its holder can maintain the contract, and the sponsor never sees it. */
+export interface BuiltDeployKeys { contractAddress: string; signingKey: ContractSigningKey; }
+export interface BuiltBoundDeploy extends BuiltBoundTransaction, BuiltDeployKeys {}
+export interface BuiltUnboundDeploy extends BuiltUnboundTransaction, BuiltDeployKeys {}
 export type BuiltDeploy = BuiltBoundDeploy | BuiltUnboundDeploy;
+/** A deploy the caller made itself, for example the first step of a contract too large for one block. Its maintenance key stays with the caller. */
+export interface BuildDeployFromLedgerInput {
+    deploy: ContractDeploy;
+    bind?: boolean;
+}
+
+export interface BuildMaintenanceSponsorableInput {
+    /** The update, signed by enough members of the contract's maintenance authority. One update per transaction. */
+    update: MaintenanceUpdate;
+    bind?: boolean;
+}
+export interface BuildMaintenanceSponsorableBoundInput extends BuildMaintenanceSponsorableInput { bind?: true; }
+export interface BuildMaintenanceSponsorableUnboundInput extends BuildMaintenanceSponsorableInput { bind: false; }
+export interface BuiltBoundMaintenance extends BuiltBoundTransaction { contractAddress: string; }
+export interface BuiltUnboundMaintenance extends BuiltUnboundTransaction { contractAddress: string; }
+export type BuiltMaintenance = BuiltBoundMaintenance | BuiltUnboundMaintenance;
 /** Seals a ledger transaction for a wallet SDK call. `forks` is the `forks` of the wallet's resolved configuration. */
 export declare function sealTx(stage: 'Unproven' | 'Unbound' | 'Finalized', tx: { serialize(): Uint8Array }, forks?: { v9: bigint }): Promise<unknown>;
+/** A sub-wallet of a wallet SDK facade, as far as the sync wait reads it. */
+export interface SyncingWallet { state: { subscribe(observer: { next?(state: unknown): void; error?(e: unknown): void }): { unsubscribe(): void } } }
+/**
+ * Resolves once the sub-wallets of your own wallet SDK facade caught up and read the chain at ledger 9; default all three.
+ * Use it in place of the facade's `waitForSyncedState()`, which is done a moment before a fresh wallet knows the chain's ledger.
+ */
+export declare function waitForWalletSync(
+    facade: Partial<Record<'shielded' | 'unshielded' | 'dust', SyncingWallet>>, forks?: { v9: bigint }, wallets?: Array<'shielded' | 'unshielded' | 'dust'>
+): Promise<void>;
 /** Reads the proven ledger transaction out of a handle the wallet SDK returned. */
-export declare function openTx(handle: unknown): Promise<any>;
-/** Options for the SDK's proof provider. Undefined without `proofTimeoutMs`. */
-export declare function proofProviderConfig(opts: { proofTimeoutMs?: number } | undefined): { timeout: number } | undefined;
+export declare function openTx(handle: unknown): Promise<LedgerTransaction>;
 /** What the wallet SDK's wasm prover asks for: the standard circuits' keys by location, the BLS parameters by size. */
 export interface ProverMaterialProvider {
     /** The directory the files are kept in. */
@@ -329,7 +401,7 @@ export interface ProverMaterialOptions {
     /** The host the files are downloaded from, laid out as the wallet SDK's default host. Defaults to that host. */
     baseUrl?: string;
     /** `{ phase: 'prover-material', file, source: 'local' | 'remote', bytes }`. */
-    onProgress?: (e: Record<string, unknown>) => void;
+    onProgress?: (e: ProverMaterialProgress) => void;
 }
 /**
  * Keeps the files the wasm prover needs on disk. The wallet SDK downloads a missing or damaged one and checks it against its ledger release.
@@ -351,7 +423,7 @@ export interface LedgerTransaction {
 /** Decodes a transaction from bytes or base64. Accepts sealed and unsealed transactions. */
 export declare function deserializeTransaction(bytesOrB64: Uint8Array | string): Promise<LedgerTransaction>;
 /** The transaction's identifiers. Use the last one to look it up in the indexer. */
-export declare function txIdentifiers(tx: LedgerTransaction): string[];
+export declare function txIds(tx: LedgerTransaction): string[];
 
 export interface SubmitOptions {
     /** Node WebSocket RPC URL (`ws://` or `wss://`), your own node or a hosted one with its token in the URL. */
@@ -432,16 +504,12 @@ export declare function runtimeVersionProblem(manifest: { compactRuntime?: strin
 export declare function gatewayIndexerUrls(api: unknown): { indexerHttpUrl: string; indexerWsUrl: string } | null;
 
 /** Asks the indexer or the NIGHTGATE server whether a transaction landed. Returns null while this is not known yet. */
-export declare function probeLanded(identifier: string, opts: LandedProbeSource & { timeoutMs?: number }): Promise<LandedProbeResult | null>;
+export declare function probeLanded(txId: string, opts: LandedProbeSource & { timeoutMs?: number }): Promise<LandedProbeResult | null>;
 /** Calls `probeLanded` until the transaction is found or `timeoutMs` has passed. Use it when a resend is rejected. */
-export declare function waitLanded(identifier: string, opts: LandedProbeSource & { timeoutMs?: number, pollMs?: number }): Promise<LandedProbeResult | null>;
+export declare function waitLanded(txId: string, opts: LandedProbeSource & { timeoutMs?: number, pollMs?: number }): Promise<LandedProbeResult | null>;
 
-/** A midnight-js `PublicDataProvider` that reads contract state and deploys through the NIGHTGATE API. */
-export declare function apiPublicDataProvider(input: { client: NightgateClient; mjTypes: object; mjUtils: object; mjProtocol: object; protocolVersion: number; pollMs?: number; watchTimeoutMs?: number; maxLagBlocks?: number; stateRetryMs?: number }): object;
 /** The client behind an `api` option: a connected client, or `connect()` on the options. */
 export declare function apiClientFor(api: ConnectOptions | NightgateClient): NightgateClient;
-/** A wallet facade submission service that never dials a node. The builder hands its transaction to a sponsor instead. */
-export declare function buildOnlySubmissionService(): (configuration: object) => { submitTransaction(): Promise<never>; close(): Promise<void> };
 
 export declare const ATTESTATION_VAULT_CIRCUITS: string[];
 export declare function ensureZkAssets(input: EnsureZkAssetsInput & {
@@ -457,6 +525,10 @@ export interface BuilderPackage {
     zkConfigDir: string;
     /** All circuits of the contract. */
     circuits: string[];
+    /** Whether the package was compiled for the ledger before the fork. */
+    ledger8: boolean;
+    /** Content slots of a vault package; absent for any other contract. */
+    slotWidth?: number;
 }
 export declare function resolveBuilderPackage(input: { package: string; from?: string }): Promise<BuilderPackage>;
 /** Checks that a local directory has all proving files. Downloads nothing. */
@@ -466,13 +538,10 @@ export declare function isLedger8ZkDir(zkConfigDir: string): Promise<boolean>;
 export declare function createTxBuilder(opts: CreateTxBuilderInput): Promise<TxBuilder>;
 /** Derives the attester id, attestation secret and addresses of a seed. Needs no network. */
 export declare function deriveIdentity(opts: DeriveIdentityInput): Promise<Identity>;
-/** The key under which the vault stores an attester's attestation of a payload, as hex. */
-export declare function computeRecordKey(attesterId: string, payloadHash: string): string;
-export declare function trackingWebSocket(WebSocketImpl: Function): TrackingWebSocket;
+/** The key under which the vault stores an attester's attestation of a payload, as hex. Both arguments are 64 hex characters. */
+export declare function computeRecordKey(attesterId: string, payloadHash: string): Promise<string>;
 /** Derives the night, zswap and dust seeds from a BIP39 seed. These are secret keys. */
 export declare function deriveRoleSeeds(seedHex: string, accountIndex?: number): Promise<{ night: Uint8Array; zswap: Uint8Array; dust: Uint8Array }>;
-/** Converts `recipients` into the SDK's key map. Undefined when empty. */
-export declare function recipientKeyMap(recipients: ShieldedPublicKeys[] | undefined | null): Map<string, string> | undefined;
 
 // ---- private token swaps
 
@@ -533,7 +602,7 @@ export interface CreateSwapWalletInput {
     /** Wasm proving. Where the standard circuits' keys and the BLS parameters are kept, see `CreateTxBuilderInput`. */
     proverMaterialDir?: string;
     /** Downloads of proving material. */
-    onProgress?: (e: Record<string, unknown>) => void;
+    onProgress?: (e: ProverMaterialProgress) => void;
     /** Saved state from `serializeState()`, to skip a full sync. */
     walletState?: string;
     /**
@@ -546,7 +615,7 @@ export interface CreateSwapWalletInput {
 export interface BuiltSwapHalf {
     /** The half as base64, for `sponsorSwap`. */
     halfB64: string;
-    /** The deserialized half, for `SwapWallet.revert` or `txIdentifiers`. */
+    /** The deserialized half, for `SwapWallet.revert` or `txIds`. */
     tx: LedgerTransaction;
     /** Offer file text. Only for a sealed half. */
     offer?: string;
@@ -572,7 +641,7 @@ export interface TakenOffer {
 export interface BuiltTransfer {
     /** The transfer as base64, for `sponsorTransfer({ transferTxB64 })`. */
     txB64: string;
-    /** The deserialized transfer, for the wallet's `revert` or `txIdentifiers`. */
+    /** The deserialized transfer, for the wallet's `revert` or `txIds`. */
     tx: LedgerTransaction;
     bound: boolean;
     serializedBytes: number;
@@ -635,11 +704,6 @@ export interface SwapWallet {
 /** Default limit of coins one half may spend. */
 export declare const SWAP_MAX_INPUTS: 4;
 /** A coin as the wallet SDK lists it. */
-export interface SwapCoin { type: string; value: bigint; }
-/** The sum of the `maxInputs` largest coins of a token type. */
-export declare function spendableWithin(coins: readonly SwapCoin[], tokenType: string, maxInputs?: number): bigint;
-/** Picks the next coin for a half: the smallest that still lets the remaining slots cover the rest. Updates `plan`. */
-export declare function chooseSwapCoin<C extends SwapCoin>(coins: readonly C[], tokenType: string, plan: { remaining: bigint; slots: number }): C | undefined;
 
 /** Creates a wallet for swapping. It syncs only the private coins of the seed. */
 export declare function createSwapWallet(opts: CreateSwapWalletInput): Promise<SwapWallet>;
@@ -661,10 +725,19 @@ export interface CreateUnshieldedWalletInput {
 }
 
 /** What a plain unshielded transfer moves. `to` is the recipient's raw address (64 hex). */
-export interface UnshieldedTransferTerms { tokenType: string; amount: bigint; to: string; inputs: number; outputs: number }
+export interface UnshieldedTransferTerms {
+    tokenType: string;
+    amount: bigint;
+    /** The recipient as wallets show it (`mn_addr_...`), the same form as `buildTransfer().terms.to` and the receipt's `transfer.to`. */
+    to: string;
+    /** The recipient as raw hex. */
+    toHex: string;
+    inputs: number;
+    outputs: number;
+}
 
-/** Reads type, amount and recipient of a plain unshielded transfer, by the sponsor's rule. Throws for anything else. */
-export declare function readUnshieldedTransfer(tx: LedgerTransaction): Promise<UnshieldedTransferTerms>;
+/** Reads type, amount and recipient of a plain unshielded transfer, by the sponsor's rule. Throws for anything else. `networkId` defaults to `mainnet`. */
+export declare function readUnshieldedTransfer(tx: LedgerTransaction, opts?: { networkId?: string }): Promise<UnshieldedTransferTerms>;
 
 export interface UnshieldedWallet {
     /** Unshielded address (`mn_addr_...`). */

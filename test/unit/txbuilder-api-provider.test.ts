@@ -29,9 +29,9 @@ const stateRead = (state: string, params: string) => ({ protocolVersion: V9, con
 
 function fakeClient(over: Record<string, any> = {}) {
     return {
-        contractStateAt: vi.fn(async () => ({ address: ADDRESS, height: 12, state: b64('s12'), zswapState: b64('z12'), ledgerParameters: b64('p12'), blockHash: '0xb12' })),
-        transactionByIdentifier: vi.fn(async () => null),
-        contractDeploy: vi.fn(async () => ({ txHash: '0xdeploy', blockHeight: 7, blockHash: '0xb7', status: 'SUCCESS', failedSegments: [], identifiers: ['id0', 'id1'], txId: 'id1' })),
+        contractStateAt: vi.fn(async () => ({ contractAddress: ADDRESS, height: 12, state: b64('s12'), zswapState: b64('z12'), ledgerParameters: b64('p12'), blockHash: '0xb12' })),
+        transactionByTxId: vi.fn(async () => null),
+        contractDeploy: vi.fn(async () => ({ extrinsicHash: '0xdeploy', blockHeight: 7, blockHash: '0xb7', status: 'SUCCESS', failedSegments: [], identifiers: ['id0', 'id1'], txId: 'id1' })),
         ledgerTransaction: vi.fn(async () => b64('tx')),
         ...over
     };
@@ -42,7 +42,7 @@ describe('apiPublicDataProvider: contract state', () => {
         const { apiPublicDataProvider } = await importProvider();
         const behind = Object.assign(new Error('the indexer has not reached the action'), { status: 503 });
         const budget = Object.assign(new Error('indexer budget'), { status: 429, retryAfterSeconds: 0 });
-        const ok = { address: ADDRESS, height: 12, state: b64('s12'), zswapState: b64('z12'), ledgerParameters: b64('p12'), blockHash: '0xb12' };
+        const ok = { contractAddress: ADDRESS, height: 12, state: b64('s12'), zswapState: b64('z12'), ledgerParameters: b64('p12'), blockHash: '0xb12' };
         const contractStateAt = vi.fn().mockRejectedValueOnce(behind).mockRejectedValueOnce(budget).mockResolvedValueOnce(ok);
         const provider: any = apiPublicDataProvider({ client: fakeClient({ contractStateAt }), mjTypes, mjUtils, mjProtocol, protocolVersion: V9, pollMs: 1 });
         expect(await provider.queryContractState(ADDRESS)).toEqual(stateRead('s12', 'p12'));
@@ -60,7 +60,7 @@ describe('apiPublicDataProvider: contract state', () => {
     it('watchForContractState retries a 503 for its whole timeout, past stateRetryMs', async () => {
         const { apiPublicDataProvider } = await importProvider();
         const behind = Object.assign(new Error('the indexer has not reached the action'), { status: 503 });
-        const ok = { address: ADDRESS, height: 12, state: b64('s12'), zswapState: b64('z12'), ledgerParameters: b64('p12'), blockHash: '0xb12' };
+        const ok = { contractAddress: ADDRESS, height: 12, state: b64('s12'), zswapState: b64('z12'), ledgerParameters: b64('p12'), blockHash: '0xb12' };
         let calls = 0;
         const started = Date.now();
         const contractStateAt = vi.fn(async () => {
@@ -79,10 +79,10 @@ describe('apiPublicDataProvider: contract state', () => {
         const provider: any = apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion: V9 });
 
         expect(await provider.queryContractState(ADDRESS)).toEqual(stateRead('s12', 'p12'));
-        expect(client.contractStateAt).toHaveBeenLastCalledWith({ address: ADDRESS, height: null });
+        expect(client.contractStateAt).toHaveBeenLastCalledWith({ contractAddress: ADDRESS, height: null });
 
         await provider.queryContractState(ADDRESS, { type: 'blockHeight', blockHeight: 9 });
-        expect(client.contractStateAt).toHaveBeenLastCalledWith({ address: ADDRESS, height: 9 });
+        expect(client.contractStateAt).toHaveBeenLastCalledWith({ contractAddress: ADDRESS, height: 9 });
     });
 
     it('answers null for a contract the server does not know', async () => {
@@ -118,9 +118,8 @@ describe('apiPublicDataProvider: contract state', () => {
 
     it('queryBlock pins the newest block and a state read by its hash asks for that height', async () => {
         const { apiPublicDataProvider } = await importProvider();
-        const callFunction = vi.fn(async (name: string, params?: any) =>
-            name === 'Blocks/latest' ? { hash: '0xAB20', height: 20 } : { hash: `ab${params.height}`, height: params.height });
-        const client = fakeClient({ callFunction });
+        const blockAt = vi.fn(async (height?: number | null) => (height == null ? { hash: '0xAB20', height: 20 } : { hash: `ab${height}`, height }));
+        const client = fakeClient({ blockAt });
         const provider: any = apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion: V9 });
 
         // The server answers 0x-prefixed upper or lower case. midnight-js needs the bare hex.
@@ -129,25 +128,24 @@ describe('apiPublicDataProvider: contract state', () => {
         expect(await provider.queryBlock({ type: 'blockHash', blockHash: 'ab20' })).toEqual({ hash: 'ab20', height: 20, protocolVersion: V9 });
         // The newest pin reads the current state, so the server needs no indexer for it.
         await provider.queryZSwapAndContractState(ADDRESS, { type: 'blockHash', blockHash: 'ab20' });
-        expect(client.contractStateAt).toHaveBeenLastCalledWith({ address: ADDRESS, height: null });
+        expect(client.contractStateAt).toHaveBeenLastCalledWith({ contractAddress: ADDRESS, height: null });
 
         expect(await provider.queryBlock({ type: 'blockHeight', blockHeight: 9 })).toEqual({ hash: 'ab9', height: 9, protocolVersion: V9 });
-        expect(callFunction).toHaveBeenLastCalledWith('Blocks/byHeight', { height: 9 });
+        expect(blockAt).toHaveBeenLastCalledWith(9);
         expect(await provider.queryBlock({ type: 'blockHash', blockHash: 'ab9' })).toEqual({ hash: 'ab9', height: 9, protocolVersion: V9 });
         await provider.queryContractState(ADDRESS, { type: 'blockHash', blockHash: 'ab9' });
-        expect(client.contractStateAt).toHaveBeenLastCalledWith({ address: ADDRESS, height: 9 });
+        expect(client.contractStateAt).toHaveBeenLastCalledWith({ contractAddress: ADDRESS, height: 9 });
 
         // A newer pin replaces the old one, which then reads at its own height.
-        callFunction.mockImplementationOnce(async () => ({ hash: 'ab21', height: 21 }));
+        blockAt.mockImplementationOnce(async () => ({ hash: 'ab21', height: 21 }));
         await provider.queryBlock();
         await provider.queryContractState(ADDRESS, { type: 'blockHash', blockHash: 'ab20' });
-        expect(client.contractStateAt).toHaveBeenLastCalledWith({ address: ADDRESS, height: 20 });
+        expect(client.contractStateAt).toHaveBeenLastCalledWith({ contractAddress: ADDRESS, height: 20 });
     });
 
     it('queryBlock answers null for an unknown height and names the missing crawler when the server has no block at all', async () => {
         const { apiPublicDataProvider } = await importProvider();
-        const missing = Object.assign(new Error('not found'), { status: 404 });
-        const provider: any = apiPublicDataProvider({ client: fakeClient({ callFunction: vi.fn(async () => { throw missing; }) }), mjTypes, mjUtils, mjProtocol, protocolVersion: V9 });
+        const provider: any = apiPublicDataProvider({ client: fakeClient({ blockAt: vi.fn(async () => null) }), mjTypes, mjUtils, mjProtocol, protocolVersion: V9 });
         expect(await provider.queryBlock({ type: 'blockHeight', blockHeight: 9 })).toBeNull();
         await expect(provider.queryBlock()).rejects.toThrow(/no indexed block yet.*crawler runs/);
     });
@@ -159,12 +157,12 @@ describe('apiPublicDataProvider: the deploy', () => {
         const client = fakeClient();
         const provider: any = apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion: V9 });
         expect(await provider.queryDeployContractState(ADDRESS)).toEqual(stateRead('s12', 'p12'));
-        expect(client.contractStateAt).toHaveBeenLastCalledWith({ address: ADDRESS, height: 7 });
+        expect(client.contractStateAt).toHaveBeenLastCalledWith({ contractAddress: ADDRESS, height: 7 });
     });
 
     it('watchForDeployTxData maps the server\'s result status to the SDK\'s names and waits for an unindexed deploy', async () => {
         const { apiPublicDataProvider } = await importProvider();
-        const deploy = { txHash: '0xdeploy', ledgerTxHash: 'de01', blockHeight: 7, blockHash: '0xb7', status: 'PARTIAL_SUCCESS', failedSegments: [1], identifiers: ['id0'], txId: 'id0' };
+        const deploy = { extrinsicHash: '0xdeploy', txHash: 'de01', blockHeight: 7, blockHash: '0xb7', status: 'PARTIAL_SUCCESS', failedSegments: [1], identifiers: ['id0'], txId: 'id0' };
         const contractDeploy = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(deploy);
         const provider: any = apiPublicDataProvider({ client: fakeClient({ contractDeploy }), mjTypes, mjUtils, mjProtocol, protocolVersion: V9, pollMs: 1 });
         const data = await provider.watchForDeployTxData(ADDRESS);
@@ -174,7 +172,7 @@ describe('apiPublicDataProvider: the deploy', () => {
 
     it('watchForDeployTxData falls back to the stored hash while the ledger hash is unknown', async () => {
         const { apiPublicDataProvider } = await importProvider();
-        const deploy = { txHash: '0xdeploy', ledgerTxHash: null, blockHeight: 7, blockHash: '0xb7', status: 'SUCCESS', failedSegments: [], identifiers: ['id0'], txId: 'id0' };
+        const deploy = { extrinsicHash: '0xdeploy', txHash: null, blockHeight: 7, blockHash: '0xb7', status: 'SUCCESS', failedSegments: [], identifiers: ['id0'], txId: 'id0' };
         const provider: any = apiPublicDataProvider({ client: fakeClient({ contractDeploy: vi.fn(async () => deploy) }), mjTypes, mjUtils, mjProtocol, protocolVersion: V9, pollMs: 1 });
         expect(await provider.watchForDeployTxData(ADDRESS)).toEqual(expect.objectContaining({ txHash: '0xdeploy' }));
     });
@@ -187,11 +185,11 @@ describe('apiPublicDataProvider: the deploy', () => {
 
     it('names the ledger of a deploy from before the fork, and of its states from their bytes', async () => {
         const { apiPublicDataProvider } = await importProvider();
-        const deploy = { txHash: '0xdeploy', blockHeight: 7, blockHash: '0xb7', status: 'SUCCESS', failedSegments: [], identifiers: ['id0'], txId: 'id0', protocolVersion: V8 };
+        const deploy = { extrinsicHash: '0xdeploy', blockHeight: 7, blockHash: '0xb7', status: 'SUCCESS', failedSegments: [], identifiers: ['id0'], txId: 'id0', protocolVersion: V8 };
         const client = fakeClient({
             contractDeploy: vi.fn(async () => deploy),
             ledgerTransaction: vi.fn(async () => b64('v8tx')),
-            contractStateAt: vi.fn(async () => ({ address: ADDRESS, height: 7, state: b64('v8state'), zswapState: b64('z'), ledgerParameters: b64('v8params'), blockHash: '0xb7' }))
+            contractStateAt: vi.fn(async () => ({ contractAddress: ADDRESS, height: 7, state: b64('v8state'), zswapState: b64('z'), ledgerParameters: b64('v8params'), blockHash: '0xb7' }))
         });
         const provider: any = apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion: V9 });
         expect(await provider.watchForDeployTxData(ADDRESS)).toEqual(expect.objectContaining({ era: 'v8', protocolVersion: V8, tx: { era: 'v8', stage: 'Finalized', text: 'v8tx' } }));
@@ -207,7 +205,7 @@ describe('apiPublicDataProvider: the deploy', () => {
 
     it('reads a translated state as ledger 9 even at a height from before the fork', async () => {
         const { apiPublicDataProvider } = await importProvider();
-        const deploy = { txHash: '0xdeploy', blockHeight: 7, blockHash: '0xb7', status: 'SUCCESS', failedSegments: [], identifiers: ['id0'], txId: 'id0', protocolVersion: V8 };
+        const deploy = { extrinsicHash: '0xdeploy', blockHeight: 7, blockHash: '0xb7', status: 'SUCCESS', failedSegments: [], identifiers: ['id0'], txId: 'id0', protocolVersion: V8 };
         const provider: any = apiPublicDataProvider({ client: fakeClient({ contractDeploy: vi.fn(async () => deploy) }), mjTypes, mjUtils, mjProtocol, protocolVersion: V9 });
         expect((await provider.queryDeployContractState(ADDRESS)).contractState.era).toBe('v9');
     });

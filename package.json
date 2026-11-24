@@ -1,6 +1,7 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.46.3",
+  "version": "0.47.0",
+  "private": true,
   "description": "Midnight blockchain indexer and transaction service with an OData V4 API, built on SAP CAP",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",
   "repository": {
@@ -8,116 +9,13 @@
     "url": "git+https://github.com/ODATANO/NIGHTGATE.git"
   },
   "license": "Apache-2.0",
-  "publishConfig": {
-    "access": "public"
-  },
   "author": "Max Weber <max@maxalexweber.de>",
-  "keywords": [
-    "sap",
-    "cap",
-    "midnight",
-    "cardano",
-    "blockchain",
-    "indexer",
-    "odata",
-    "enterprise",
-    "crawler",
-    "substrate"
-  ],
-  "main": "src/index.js",
-  "types": "src/index.d.ts",
   "type": "commonjs",
   "engines": {
     "node": ">=22.12"
   },
   "imports": {
     "#cds-models/*": "./@cds-models/*/index.js"
-  },
-  "exports": {
-    ".": {
-      "types": "./src/index.d.ts",
-      "default": "./src/index.js"
-    },
-    "./package.json": "./package.json",
-    "./types": {
-      "types": "./srv/types/index.d.ts",
-      "default": "./srv/types/index.js"
-    },
-    "./set-root": {
-      "types": "./srv/submission/set-root.d.ts",
-      "default": "./srv/submission/set-root.js"
-    },
-    "./sdk/AttestationService": {
-      "types": "./src/sdk/AttestationService.d.ts",
-      "default": "./src/sdk/AttestationService.js"
-    },
-    "./sdk/AttestationService.cds": "./src/sdk/AttestationService.cds",
-    "./browser": {
-      "types": "./src/browser/index.d.ts",
-      "import": "./src/browser/index.mjs",
-      "default": "./src/browser/index.mjs"
-    },
-    "./browser/providers.mjs": {
-      "types": "./src/browser/providers.d.mts",
-      "import": "./src/browser/providers.mjs",
-      "default": "./src/browser/providers.mjs"
-    },
-    "./browser/attestation-vault": {
-      "types": "./src/browser/attestation-vault.d.mts",
-      "import": "./src/browser/attestation-vault.mjs",
-      "default": "./src/browser/attestation-vault.mjs"
-    },
-    "./browser/attestation-vault-32": {
-      "types": "./src/browser/attestation-vault-32.d.mts",
-      "import": "./src/browser/attestation-vault-32.mjs",
-      "default": "./src/browser/attestation-vault-32.mjs"
-    },
-    "./txbuilder": {
-      "types": "./src/txbuilder/index.d.ts",
-      "import": "./src/txbuilder/index.mjs",
-      "default": "./src/txbuilder/index.mjs"
-    },
-    "./client": {
-      "types": "./src/sdk/client.d.ts",
-      "import": "./src/sdk/client.mjs",
-      "default": "./src/sdk/client.mjs"
-    },
-    "./sdk": {
-      "types": "./src/sdk/index.d.ts",
-      "import": "./src/sdk/index.mjs",
-      "default": "./src/sdk/index.mjs"
-    }
-  },
-  "files": [
-    "db/schema.cds",
-    "db/types.cds",
-    "src/**/*.cds",
-    "src/**/*.js",
-    "src/**/*.mjs",
-    "src/**/*.d.ts",
-    "src/**/*.d.mts",
-    "srv/**/*.cds",
-    "srv/**/*.js",
-    "srv/**/*.d.ts",
-    "@cds-models/**/*.js",
-    "@cds-models/**/*.d.ts",
-    "scripts/apply-schema-delta.mjs",
-    "scripts/check-server.mjs",
-    "scripts/fetch-contract-keys.mjs",
-    "scripts/migrate-sqlite-to-postgres.mjs",
-    "scripts/migrate-values.mjs",
-    "scripts/rewrap-encryption-keys.mjs",
-    "scripts/compact-contract-state.mjs",
-    "docker/cds-config.mjs",
-    "README.md",
-    "LICENSE"
-  ],
-  "bin": {
-    "nightgate-schema-delta": "scripts/apply-schema-delta.mjs",
-    "nightgate-fetch-keys": "scripts/fetch-contract-keys.mjs",
-    "nightgate-db-migrate": "scripts/migrate-sqlite-to-postgres.mjs",
-    "nightgate-rewrap-keys": "scripts/rewrap-encryption-keys.mjs",
-    "nightgate-compact-contract-state": "scripts/compact-contract-state.mjs"
   },
   "scripts": {
     "clean": "node scripts/clean-build-artifacts.js",
@@ -146,11 +44,9 @@
     "integration:contract-registry": "node scripts/integration-test-contract-registry.mjs",
     "integration:connector-routes": "node scripts/integration-test-connector-routes.mjs",
     "check:browser": "node scripts/check-browser-bundle.mjs",
-    "check:exports": "node scripts/check-package-exports.mjs",
     "check:browser-types": "node scripts/check-browser-types.mjs",
-    "check:job-idempotency": "node scripts/check-job-idempotency.mjs",
-    "check:server": "node --env-file=.env scripts/check-server.mjs",
-    "check:server:hosted": "node --env-file=.env scripts/check-server.mjs https://api.nightgate.dev",
+    "check:server": "node --env-file-if-exists=.env scripts/check-server.mjs",
+    "check:server:hosted": "node --env-file-if-exists=.env scripts/check-server.mjs https://api.nightgate.dev",
     "integration:schema-delta": "node scripts/integration-test-schema-delta.mjs",
     "integration:postgres": "node scripts/integration-test-postgres.mjs",
     "deploy:e2e": "node --env-file=.env scripts/run-deploy-e2e.mjs",
@@ -167,10 +63,8 @@
     "wasm-zswap:e2e": "node --env-file=.env scripts/run-wasm-zswap-e2e.mjs",
     "test:pg-idempotency": "node scripts/test-postgres-idempotency.mjs",
     "lint": "eslint . && node scripts/check-any-baseline.mjs",
-    "check:release": "node scripts/release-stamp.mjs start && npm run build && npm run lint && npm run typecheck && npm test && npm run integration:schema-delta && npm run check:browser && npm run check:browser-types && npm run check:slim && npm run check:exports && node scripts/release-stamp.mjs pass",
+    "check:release": "npm run build && npm run lint && npm run typecheck && npm test && npm run integration:schema-delta && npm run check:browser && npm run check:slim && npm run check:browser-types",
     "check:release:full": "npm run check:release && npm run integration:postgres",
-    "prepack": "npm run build",
-    "prepublishOnly": "(node scripts/release-stamp.mjs verified || npm run check:release) && npm run build",
     "integration:derive-wallet-info": "node --env-file=.env scripts/integration-test-derive-wallet-info.mjs",
     "integration:utxo-identity": "node scripts/integration-test-utxo-identity.mjs",
     "check:fresh-tree": "bash scripts/check-fresh-tree.sh",
@@ -182,9 +76,12 @@
     "mint-token:e2e": "node --env-file=.env scripts/run-mint-token-e2e.mjs",
     "width32:e2e": "node --env-file=.env scripts/run-width32-e2e.mjs",
     "config:table": "node scripts/print-config-table.mjs --write",
-    "errors:table": "node scripts/print-error-codes.mjs --write"
+    "errors:table": "node scripts/print-error-codes.mjs --write",
+    "client:types": "node scripts/print-client-types.mjs --write"
   },
   "dependencies": {
+    "@cap-js/postgres": "^3.0.1",
+    "@cap-js/sqlite": "^3",
     "@midnight-ntwrk/compact-js": "3.0.2",
     "@midnight-ntwrk/compact-runtime": "0.21.0",
     "@midnight-ntwrk/midnight-js-contracts": "5.0.1",
@@ -192,12 +89,10 @@
     "@midnight-ntwrk/midnight-js-fetch-zk-config-provider": "5.0.1",
     "@midnight-ntwrk/midnight-js-http-client-proof-provider": "5.0.1",
     "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "5.0.1",
-    "@midnight-ntwrk/midnight-js-level-private-state-provider": "5.0.1",
     "@midnight-ntwrk/midnight-js-node-zk-config-provider": "5.0.1",
     "@midnight-ntwrk/midnight-js-protocol": "5.0.1",
     "@midnight-ntwrk/midnight-js-types": "5.0.1",
     "@midnight-ntwrk/midnight-js-utils": "5.0.1",
-    "@midnight-ntwrk/wallet-sdk-address-format": "npm:@midnightntwrk/wallet-sdk-address-format@4.0.1",
     "@midnightntwrk/ledger-v8": "8.1.3",
     "@midnightntwrk/ledger-v9": "1.0.2",
     "@midnightntwrk/wallet-sdk-abstractions": "3.0.0",
@@ -219,38 +114,25 @@
     "@odatano/contract-counter": "0.2.0",
     "@odatano/contract-holder-registry": "0.2.0",
     "@odatano/contract-kit": "0.2.2",
-    "@odatano/contract-shielded-token": "0.2.0",
     "@odatano/contract-token-factory": "0.2.0",
     "@polkadot/types": "^16.5.6",
     "@polkadot/wasm-crypto": "^7.5.4",
+    "@sap/cds": "^10",
+    "@sap/cds-dk": "^10",
     "@scure/base": "^2.2.0",
+    "better-sqlite3": "^12.6.2",
     "bip39": "^3.1.0",
     "effect": "^3.21.4",
     "generic-pool": "^3.9.0",
     "rxjs": "^7.8.2",
+    "superjson": "^2.2.7",
     "ws": "^8"
-  },
-  "peerDependencies": {
-    "@midnight-ntwrk/dapp-connector-api": "^4.0.0",
-    "@polkadot/api": ">=14",
-    "@sap/cds": ">=10 <11"
-  },
-  "peerDependenciesMeta": {
-    "@midnight-ntwrk/dapp-connector-api": {
-      "optional": true
-    },
-    "@polkadot/api": {
-      "optional": true
-    }
   },
   "devDependencies": {
     "@cap-js/cds-test": "^1",
     "@cap-js/cds-typer": "^0.40.0",
     "@cap-js/cds-types": "^0.18.0",
-    "@cap-js/postgres": "^3.0.1",
-    "@cap-js/sqlite": "^3",
-    "@sap/cds": "^10",
-    "@sap/cds-dk": "^10",
+    "@odatano/contract-shielded-token": "0.2.0",
     "@types/node": "^22",
     "@types/ws": "^8",
     "@vitest/coverage-v8": "^4.1.10",
@@ -285,9 +167,6 @@
           "attestation-vault-32": {
             "package": "@odatano/contract-attestation-vault-32"
           },
-          "shielded-token": {
-            "package": "@odatano/contract-shielded-token"
-          },
           "holder-registry": {
             "package": "@odatano/contract-holder-registry"
           },
@@ -297,10 +176,20 @@
         }
       }
     },
+    "features": {
+      "use_generic_pool": true
+    },
     "[development]": {
       "requires": {
         "auth": {
           "kind": "dummy"
+        },
+        "nightgate": {
+          "contracts": {
+            "shielded-token": {
+              "package": "@odatano/contract-shielded-token"
+            }
+          }
         }
       }
     },
@@ -325,10 +214,6 @@
       "propertiesOptional": false,
       "IEEE754Compatible": true
     }
-  },
-  "directories": {
-    "doc": "docs",
-    "test": "test"
   },
   "bugs": {
     "url": "https://github.com/ODATANO/NIGHTGATE/issues"

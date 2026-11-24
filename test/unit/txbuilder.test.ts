@@ -1,4 +1,4 @@
-// `@odatano/nightgate/txbuilder`: the parts that do NOT need the SDK.
+// `@odatano/nightgate-tx/txbuilder`: the parts that do NOT need the SDK.
 // The live path (build + prove + sponsor) is covered by scripts/run-txbuilder-e2e.mjs.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -21,6 +21,7 @@ vi.mock('../../src/txbuilder/api-provider.mjs', async (importOriginal) => ({
 }));
 
 const importTxBuilder = () => import('../../src/txbuilder/index.mjs' as string);
+const importInternals = () => import('../../src/txbuilder/internals.mjs' as string);
 
 const COMPILER_MANIFEST = 'compiler/contract-manifest.json';
 
@@ -330,9 +331,12 @@ describe('txbuilder: a lineage package as the asset source', () => {
         const { ensureZkAssets } = await importTxBuilder();
         const zk = await writePackage();
         const seen: string[] = [];
-        const first = await ensureZkAssets({ package: PKG, from: root, fetchFn: assetFetch(seen) });
+        const events: Array<{ fetched: number; cached: number }> = [];
+        const first = await ensureZkAssets({ package: PKG, from: root, fetchFn: assetFetch(seen), onProgress: (e: { fetched: number; cached: number }) => events.push(e) });
         expect(seen.sort()).toEqual([`${ASSETS}/burn.prover`, `${ASSETS}/mint.prover`]);
         expect(first).toMatchObject({ cacheDir: zk, fetched: 2, cached: 4, refreshed: 0, source: 'package' });
+        // The last progress event counts files the same way the result does.
+        expect(events.at(-1)).toMatchObject({ phase: 'zk-asset', fetched: 2, cached: 4 });
         expect((await readFile(join(zk, 'keys', 'mint.prover'))).equals(proverBody('mint'))).toBe(true);
         // second run: nothing to fetch
         const again: string[] = [];
@@ -425,6 +429,13 @@ describe('txbuilder: createTxBuilder input validation', () => {
         }
     });
 
+    it('refuses a time to live that is no positive number', async () => {
+        const { createTxBuilder } = await importTxBuilder();
+        for (const ttlMinutes of [0, -5, Number.NaN, 'soon']) {
+            await expect(createTxBuilder({ ...base, ttlMinutes })).rejects.toThrow(`createTxBuilder: ttlMinutes must be a positive number (got ${String(ttlMinutes)})`);
+        }
+    });
+
     it('requires both indexer URLs, the node URL, the zk-config base and the contract class', async () => {
         const { createTxBuilder } = await importTxBuilder();
         await expect(createTxBuilder({ ...base, indexerWsUrl: '' })).rejects.toThrow(/indexerHttpUrl and indexerWsUrl/);
@@ -463,7 +474,7 @@ describe('txbuilder: createTxBuilder input validation', () => {
     });
 
     it('proofTimeoutMs reaches the SDK proof provider as { timeout }; unset keeps the SDK default', async () => {
-        const { proofProviderConfig } = await importTxBuilder();
+        const { proofProviderConfig } = await importInternals();
         expect(proofProviderConfig({ proofTimeoutMs: 900_000 })).toEqual({ timeout: 900_000 });
         expect(proofProviderConfig({})).toBeUndefined();
         expect(proofProviderConfig(undefined)).toBeUndefined();
@@ -488,7 +499,7 @@ describe('txbuilder: createTxBuilder input validation', () => {
 describe('txbuilder: unbound handover refuses a recipe that carries a balancing transaction', () => {
     const FORKS = { v9: 2_000_000n };
     it('bind:false releases the reserved coins and throws when signRecipe returns a balancingTransaction; bind:true finalizes it', async () => {
-        const { buildOnlyWalletProvider } = await importTxBuilder();
+        const { buildOnlyWalletProvider } = await importInternals();
         const recipe: any = { type: 'UNBOUND_TRANSACTION', baseTransaction: { base: true }, balancingTransaction: { balancing: true } };
         const facade = {
             balanceUnboundTransaction: vi.fn(async (): Promise<any> => recipe),
@@ -535,11 +546,137 @@ describe('txbuilder: readDeployAddress requires exactly one deploy action', () =
 });
 
 // A call can declare more gas than measured so it still fits after a parallel caller grew a map.
+describe('txbuilder: a single call build hands out the private state after the call', () => {
+    it('keeps the state the SDK computed and submits the transaction the SDK built, or the adjusted one', async () => {
+        const { buildSingleCall } = await importInternals();
+        const data = { private: { nextPrivateState: { counter: 1 }, unprovenTx: { id: 'built' } } };
+        const contracts = { createUnprovenCallTx: vi.fn(async () => data), submitTx: vi.fn(async () => { throw new Error('BUILD_ONLY_STOP'); }) };
+        const built: { nextPrivateState?: unknown } = {};
+        const options = { circuitId: 'inc' };
+        await expect(buildSingleCall(contracts, 'providers', options, 'inc', built)).rejects.toThrow('BUILD_ONLY_STOP');
+        expect(contracts.createUnprovenCallTx).toHaveBeenCalledWith('providers', options);
+        expect(built.nextPrivateState).toEqual({ counter: 1 });
+        expect(contracts.submitTx).toHaveBeenCalledWith('providers', { unprovenTx: { id: 'built' }, circuitId: 'inc' });
+
+        const adjusted = { id: 'more gas' };
+        const adjust = vi.fn(async () => adjusted);
+        await expect(buildSingleCall(contracts, 'providers', options, 'inc', built, adjust)).rejects.toThrow('BUILD_ONLY_STOP');
+        expect(adjust).toHaveBeenCalledWith(data);
+        expect(contracts.submitTx).toHaveBeenLastCalledWith('providers', { unprovenTx: adjusted, circuitId: 'inc' });
+    });
+
+    it('a call that fails to build hands out no state and submits nothing', async () => {
+        const { buildSingleCall } = await importInternals();
+        const contracts = { createUnprovenCallTx: vi.fn(async () => { throw new Error('assert failed'); }), submitTx: vi.fn() };
+        const built: { nextPrivateState?: unknown } = {};
+        await expect(buildSingleCall(contracts, 'providers', {}, 'inc', built)).rejects.toThrow('assert failed');
+        expect(built).toEqual({});
+        expect(contracts.submitTx).not.toHaveBeenCalled();
+    });
+});
+
+describe('txbuilder: the module exports what its types declare', () => {
+    it('has no export without a declaration and no declaration without an export', async () => {
+        const { readFileSync } = await import('node:fs');
+        const dts = readFileSync('src/txbuilder/index.d.ts', 'utf8');
+        const declared = new Set<string>();
+        for (const m of dts.matchAll(/export declare (?:function|const|class) ([A-Za-z0-9_]+)/g)) declared.add(m[1]);
+        for (const m of dts.matchAll(/export \{([^}]+)\}/g)) {
+            for (const entry of m[1].split(',').map(e => e.trim()).filter(e => e && !e.startsWith('type '))) declared.add(entry.split(/\s+as\s+/).pop()!);
+        }
+        const exported = Object.keys(await importTxBuilder()).sort();
+        expect(exported).toEqual([...declared].sort());
+        // The helpers of the unit tests live in a file the package does not export.
+        expect(exported).not.toContain('buildOnlyWalletProvider');
+        expect(Object.keys(await importInternals())).toContain('buildOnlyWalletProvider');
+    });
+});
+
+describe('txbuilder: every progress event has a type', () => {
+    it('the phases the builder reports are the phases `BuilderProgressEvent` declares', async () => {
+        const { readFileSync, readdirSync } = await import('node:fs');
+        const reported = new Set<string>();
+        for (const file of readdirSync('src/txbuilder').filter(f => f.endsWith('.mjs'))) {
+            for (const m of readFileSync(`src/txbuilder/${file}`, 'utf8').matchAll(/phase: '([a-z-]+)'/g)) reported.add(m[1]);
+        }
+        const dts = readFileSync('src/txbuilder/index.d.ts', 'utf8');
+        const union = /export type BuilderProgressEvent =([^;]+);/.exec(dts)![1].match(/[A-Za-z]+/g)!;
+        const declared = union.map(name => new RegExp(`export interface ${name} \\{\\s*phase: '([a-z-]+)'`).exec(dts)?.[1]);
+        expect(declared).not.toContain(undefined);
+        expect([...reported].sort()).toEqual([...declared].sort());
+        expect(declared).toHaveLength(10);
+        expect(dts).not.toMatch(/onProgress\?: \(e: Record<string, unknown>/);
+    });
+});
+
+describe('txbuilder: the vault is recognised by its contract class, not by a name', () => {
+    it('finds the class of an installed vault package, and no other', async () => {
+        const { vaultLineageOf } = await importInternals();
+        const vault = await import('@odatano/contract-attestation-vault' as string);
+        const vault32 = await import('@odatano/contract-attestation-vault-32' as string);
+        const counter = await import('@odatano/contract-counter' as string);
+        expect(await vaultLineageOf(vault.Contract, null)).toBe('attestation-vault');
+        expect(await vaultLineageOf(vault32.Contract, null)).toBe('attestation-vault-32');
+        expect(await vaultLineageOf(counter.Contract, null)).toBeNull();
+        expect(await vaultLineageOf(class Contract { }, null)).toBeNull();
+    });
+
+    it('a class that came with a package counts by what that package is', async () => {
+        const { vaultLineageOf } = await importInternals();
+        const fromAlias = { contractClass: class Older { }, contractName: 'attestation-vault' };
+        const none = async () => { throw new Error('not installed'); };
+        // A vault package installed under another name, such as the one compiled for the ledger before the fork.
+        expect(await vaultLineageOf(fromAlias.contractClass, fromAlias, none)).toBe('attestation-vault');
+        const other = { contractClass: class Mine { }, contractName: 'counter' };
+        expect(await vaultLineageOf(other.contractClass, other, none)).toBeNull();
+        // An own class given next to a package is not that package's contract.
+        expect(await vaultLineageOf(class Own { }, fromAlias, none)).toBeNull();
+        expect(await vaultLineageOf(class Own { }, null, none)).toBeNull();
+    });
+});
+
+describe('txbuilder: computeRecordKey', () => {
+    const ATTESTER = '11'.repeat(32);
+    const PAYLOAD = '22'.repeat(32);
+
+    it('is the contract kit\'s record key, in either letter case', async () => {
+        const { computeRecordKey } = await importTxBuilder();
+        const kit = await import('@odatano/contract-kit' as string);
+        const key = await computeRecordKey(ATTESTER, PAYLOAD);
+        expect(key).toMatch(/^[0-9a-f]{64}$/);
+        expect(key).toBe(await kit.computeRecordKey(ATTESTER, PAYLOAD));
+        expect(await computeRecordKey('AB'.repeat(32), PAYLOAD)).toBe(await computeRecordKey('ab'.repeat(32), PAYLOAD));
+        expect(await computeRecordKey(PAYLOAD, ATTESTER)).not.toBe(key);
+    });
+
+    it('refuses a value that is not 32 bytes of hex, also one the kit would pad', async () => {
+        const { computeRecordKey } = await importTxBuilder();
+        for (const bad of ['11'.repeat(31), '11'.repeat(33), '0x' + ATTESTER, 'zz'.repeat(32), undefined, 42]) {
+            await expect(computeRecordKey(bad, PAYLOAD)).rejects.toThrow('attesterId must be 64 hex chars (32 bytes)');
+            await expect(computeRecordKey(ATTESTER, bad)).rejects.toThrow('payloadHash must be 64 hex chars (32 bytes)');
+        }
+    });
+});
+
+describe('txbuilder: a deploy build hands out the private state after the constructor', () => {
+    it('builds with the options it was given and submits the transaction the SDK built', async () => {
+        const { buildDeploy } = await importInternals();
+        const data = { private: { initialPrivateState: { seeded: true }, unprovenTx: { id: 'deploy' }, signingKey: 'not read' }, public: { contractAddress: 'ab' } };
+        const contracts = { createUnprovenDeployTx: vi.fn(async () => data), submitTx: vi.fn(async () => { throw new Error('BUILD_ONLY_STOP'); }) };
+        const built: { nextPrivateState?: unknown } = {};
+        const options = { compiledContract: 'c', signingKey: { tag: 'schnorr', value: 'ab' }, privateStateId: 'ps', initialPrivateState: {} };
+        await expect(buildDeploy(contracts, 'providers', options, built)).rejects.toThrow('BUILD_ONLY_STOP');
+        expect(contracts.createUnprovenDeployTx).toHaveBeenCalledWith('providers', options);
+        expect(built.nextPrivateState).toEqual({ seeded: true });
+        expect(contracts.submitTx).toHaveBeenCalledWith('providers', { unprovenTx: { id: 'deploy' } });
+    });
+});
+
 describe('txbuilder: gasHeadroom raises the declared gas of a single call before proving', () => {
     const gas = { readTime: 1000n, computeTime: 10n, bytesWritten: 3n, bytesDeleted: 7n };
 
     it('validates the factor and scales every field but bytesDeleted, rounding up', async () => {
-        const { gasHeadroomFactor, scaleTranscriptGas } = await importTxBuilder();
+        const { gasHeadroomFactor, scaleTranscriptGas } = await importInternals();
         expect(gasHeadroomFactor(undefined)).toBeUndefined();
         expect(gasHeadroomFactor(1.5)).toBe(1.5);
         for (const bad of [0.9, 11, 'x', NaN]) expect(() => gasHeadroomFactor(bad)).toThrow(/gasHeadroom must be a number from 1 to 10/);
@@ -583,7 +720,7 @@ describe('txbuilder: gasHeadroom raises the declared gas of a single call before
     }
 
     it('rebuilds the one call with scaled gas, the chain state\'s verifier key and the SDK key location, and writes the intent back', async () => {
-        const { applyGasHeadroom } = await importTxBuilder();
+        const { applyGasHeadroom } = await importInternals();
         const { protos, ledger, mjTypes, data, call, contractState, intent } = fakes();
         const d = data([call()], new Map([[7, intent({ actions: [{ old: true }], ttl: 't' })]]));
         const { unprovenTx, declared } = applyGasHeadroom({ ledger, mjTypes }, d, 1.5, { contractAddress: 'ab'.repeat(32), circuitId: 'approve', contractState });
@@ -602,7 +739,7 @@ describe('txbuilder: gasHeadroom raises the declared gas of a single call before
     });
 
     it('keeps the runtime\'s communication commitment randomness when the call has one', async () => {
-        const { applyGasHeadroom } = await importTxBuilder();
+        const { applyGasHeadroom } = await importInternals();
         const { protos, ledger, mjTypes, data, call, contractState, intent } = fakes();
         const d = data([call({ _tag: 'Some', value: { commCommRand: 'bound-rand' } })], new Map([[1, intent({})]]));
         applyGasHeadroom({ ledger, mjTypes }, d, 2, { contractAddress: 'cd'.repeat(32), circuitId: 'approve', contractState });
@@ -610,7 +747,7 @@ describe('txbuilder: gasHeadroom raises the declared gas of a single call before
     });
 
     it('refuses a call tree with several contracts, a missing or keyless chain state and a transaction without one intent', async () => {
-        const { applyGasHeadroom } = await importTxBuilder();
+        const { applyGasHeadroom } = await importInternals();
         const { ledger, mjTypes, data, call, contractState, intent } = fakes();
         const at = { contractAddress: 'ab'.repeat(32), circuitId: 'approve', contractState };
         expect(() => applyGasHeadroom({ ledger, mjTypes }, data([call(), call()], new Map([[1, intent({})]])), 1.5, at)).toThrow(/one contract.*has 2 calls/);
@@ -624,7 +761,7 @@ describe('txbuilder: gasHeadroom raises the declared gas of a single call before
     const printed = (text: string) => ({ toString: () => text });
 
     it('reads the two limits on the time to dismiss from the printed parameters, in picoseconds', async () => {
-        const { timeToDismissLimits } = await importTxBuilder();
+        const { timeToDismissLimits } = await importInternals();
         expect(timeToDismissLimits(printed(LIMITS_TEXT))).toEqual({ perByte: 2e6, min: 15e9 });
         expect(timeToDismissLimits(printed('time_to_dismiss_per_byte:\n  750.000ns,\n min_time_to_dismiss: 0.020s,'))).toEqual({ perByte: 750e3, min: 20e9 });
         expect(timeToDismissLimits(printed('time_to_dismiss_per_byte: 2.000µs, min_time_to_dismiss: 15000.000us'))).toEqual({ perByte: 2e6, min: 15e9 });
@@ -634,7 +771,7 @@ describe('txbuilder: gasHeadroom raises the declared gas of a single call before
     });
 
     it('lowers a factor to what fits under the time to dismiss once a sponsor added its dust spend', async () => {
-        const { headroomThatFits } = await importTxBuilder();
+        const { headroomThatFits } = await importInternals();
         const limits = { perByte: 2e6, min: 15e9 };
         // A heavy call of 6382 bytes: 13.277 ms as built, of which 8.455 ms are its guaranteed gas.
         const heavy = { cost: { readTime: 6_783_000_000n, computeTime: 13_276_541_286n, blockUsage: 6382n }, guaranteed: { readTime: 3_978_000_000n, computeTime: 8_454_852_966n }, limits };
@@ -649,7 +786,7 @@ describe('txbuilder: gasHeadroom raises the declared gas of a single call before
     });
 
     it('counts only what the node must do before it can dismiss: the fallible gas is left out, a call without guaranteed gas has no limit', async () => {
-        const { headroomThatFits } = await importTxBuilder();
+        const { headroomThatFits } = await importInternals();
         const limits = { perByte: 2e6, min: 15e9 };
         const cost = { readTime: 4_000_000_000n, computeTime: 16_000_000_000n, blockUsage: 3000n };
         const guaranteed = { readTime: 500_000_000n, computeTime: 2_000_000_000n };
@@ -660,7 +797,7 @@ describe('txbuilder: gasHeadroom raises the declared gas of a single call before
     });
 
     it('applies the lowered factor to both transcripts and reports it; without parameters or limits the factor stays as asked', async () => {
-        const { applyGasHeadroom } = await importTxBuilder();
+        const { applyGasHeadroom } = await importInternals();
         const { protos, ledger, mjTypes, call, contractState, intent } = fakes();
         const at = { contractAddress: 'ab'.repeat(32), circuitId: 'approve', contractState };
         // As built the transaction takes 10 ms, 2 ms of it guaranteed gas: 15 - 3.6 - 10 leaves 1.4 ms, a factor of 0.7 more.
@@ -698,7 +835,7 @@ describe('txbuilder: trackingWebSocket lets close() end the indexer sockets the 
     }
 
     it('subclass passes the graphql-ws implementation check and tracks open sockets until they close', async () => {
-        const { trackingWebSocket } = await importTxBuilder();
+        const { trackingWebSocket } = await importInternals();
         const tracked = trackingWebSocket(FakeWs);
         const W: any = tracked.WebSocket;
         expect(typeof W).toBe('function');
@@ -715,7 +852,7 @@ describe('txbuilder: trackingWebSocket lets close() end the indexer sockets the 
     });
 
     it('closeAll falls back to close() and survives a socket that throws', async () => {
-        const { trackingWebSocket } = await importTxBuilder();
+        const { trackingWebSocket } = await importInternals();
         class NoTerminate { static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3; closed = false; close() { this.closed = true; } }
         class Throws { static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3; terminate() { throw new Error('gone'); } }
         const t1 = trackingWebSocket(NoTerminate);
@@ -741,7 +878,7 @@ describe('txbuilder: deriveIdentity validates the seed before touching the SDK',
 
 describe('txbuilder: wallet sync modes', () => {
     it('only a wallet that does not sync gets a fixed start version, so a synced one can read the history before the fork', async () => {
-        const { walletConfiguration, syncedWallets } = await importTxBuilder();
+        const { walletConfiguration, syncedWallets } = await importInternals();
         const configuration = { networkId: 'preview' };
         const of = (wallet: string, mode: string) => walletConfiguration(wallet, syncedWallets(mode), configuration, 9n);
         for (const wallet of ['shielded', 'unshielded', 'dust']) {
@@ -757,7 +894,7 @@ describe('txbuilder: wallet sync modes', () => {
     });
 
     it('walletSyncMode accepts true, false, shielded and coins; syncedWallets names the sub-wallets each starts', async () => {
-        const { walletSyncMode, syncedWallets } = await importTxBuilder();
+        const { walletSyncMode, syncedWallets } = await importInternals();
         expect(walletSyncMode(undefined)).toBe('all');
         expect(walletSyncMode(true)).toBe('all');
         expect(walletSyncMode(false)).toBe('none');
@@ -771,7 +908,7 @@ describe('txbuilder: wallet sync modes', () => {
     });
 
     it("sharedShieldedWallet: start and stop leave the owner's wallet alone, the rest reaches it bound", async () => {
-        const { sharedShieldedWallet, isShieldedWallet } = await importTxBuilder();
+        const { sharedShieldedWallet, isShieldedWallet } = await importInternals();
         const calls: string[] = [];
         class Wallet {
             #secret = 'inside';
@@ -800,7 +937,7 @@ describe('txbuilder: wallet sync modes', () => {
     });
 
     it('syncProgressEvent reads ledger-event and transaction counters alike, null when unreadable', async () => {
-        const { syncProgressEvent } = await importTxBuilder();
+        const { syncProgressEvent } = await importInternals();
         expect(syncProgressEvent('shielded', { progress: { appliedIndex: 10n, highestIndex: 25n, isConnected: true } }))
             .toEqual({ phase: 'sync', wallet: 'shielded', appliedIndex: '10', highestIndex: '25', isConnected: true });
         expect(syncProgressEvent('unshielded', { progress: { appliedId: 3n, highestTransactionId: 3n } }))
@@ -810,7 +947,7 @@ describe('txbuilder: wallet sync modes', () => {
     });
 
     it('watchSync reports a change at most once a second per wallet and the tip always; unsubscribes on stop', async () => {
-        const { watchSync } = await importTxBuilder();
+        const { watchSync } = await importInternals();
         let t = 0;
         const listeners: Array<(s: unknown) => void> = [];
         const unsubscribed: string[] = [];

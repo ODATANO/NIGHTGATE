@@ -7,15 +7,13 @@ import { bareHex } from '../utils/hex-patterns';
 const { SELECT, INSERT, UPDATE } = cds.ql;
 import { MidnightNodeProvider, RpcBatchRefusedError, BlockHeader } from '../providers/MidnightNodeProvider';
 import { BlockProcessor, ProcessResult, type PreparedBlock } from './BlockProcessor';
-import { ensureNightgateModelLoaded } from '../utils/cds-model';
 import { isTransientError, calcBackoff } from '../utils/retry';
-import { ensureSyncStateSingleton } from '../utils/sync-state';
+import { ensureSyncStateSingleton, SyncStateChainMismatchError } from '../utils/sync-state';
 const log = cds.log('nightgate:crawler');
 import { rollbackIndexedDataFromHeight } from './rollback';
 import { LedgerPayloadDecoder } from './LedgerPayloadDecoder';
 import { decodeLedgerPayloadInWorker } from '../midnight/decode-worker-client';
 import { IndexerSupplement } from './IndexerSupplement';
-import { BlockAuthorBackfill } from './BlockAuthorBackfill';
 import { contractStatePolicy } from './contract-state';
 import { SyncState, ReorgLog, Blocks, type Block } from '#cds-models/midnight';
 
@@ -81,7 +79,6 @@ export class MidnightCrawler {
     private decoder: LedgerPayloadDecoder | null = null;
     private supplement: IndexerSupplement | null = null;
     /** Rewrites blocks stored with the slot in `author`. Ends itself once none is left. */
-    private authorBackfill: BlockAuthorBackfill | null = null;
 
     private config: Required<CrawlerConfig>;
 
@@ -122,7 +119,6 @@ export class MidnightCrawler {
         this.startTime = Date.now();
 
         try {
-            await ensureNightgateModelLoaded();
             this.db = await cds.connect.to('db');
 
             await ensureSyncStateSingleton(this.db, this.config.nodeUrl);
@@ -166,9 +162,6 @@ export class MidnightCrawler {
 
     /** No pass blocks indexing, and a failure in one leaves the indexed blocks untouched. */
     private async startTrailingPasses(): Promise<void> {
-        this.authorBackfill = new BlockAuthorBackfill(this.nodeProvider, { batchSize: 200, intervalMs: 250, retryMs: 30_000 });
-        await this.authorBackfill.init(this.db);
-        this.authorBackfill.start();
         if (this.config.decodePayloads) {
             // The crawler stores only finalized blocks, so the pass can decode up to the indexed tip.
             this.decoder = new LedgerPayloadDecoder({ batchSize: 25, intervalMs: 1000, lagBlocks: 0, decode: decodeLedgerPayloadInWorker });
@@ -266,10 +259,9 @@ export class MidnightCrawler {
         this.isRunning = false;
         if (this.redriveTimer) { clearTimeout(this.redriveTimer); this.redriveTimer = null; }
 
-        await Promise.allSettled([this.decoder?.stop(), this.supplement?.stop(), this.authorBackfill?.stop()]);
+        await Promise.allSettled([this.decoder?.stop(), this.supplement?.stop()]);
         this.decoder = null;
         this.supplement = null;
-        this.authorBackfill = null;
 
         const inflight = [this.ingestPromise, this.liveProcessing].filter((p): p is Promise<void> => !!p);
         if (inflight.length > 0) {
@@ -336,8 +328,13 @@ export class MidnightCrawler {
                 startHeight = seeded ?? startHeight;
             }
 
+            await this.assertNodeServesIndexedChain(syncState, tipHeight, finalizedHash);
+
             if (startHeight > tipHeight) {
-                log.info(`Already synced to finalized head (height ${tipHeight})`);
+                const behind = startHeight - 1 - tipHeight;
+                log.info(behind > 0
+                    ? `The node's finalized head (${tipHeight}) is ${behind} block(s) behind the index; waiting for it`
+                    : `Already synced to finalized head (height ${tipHeight})`);
                 return 0;
             }
 
@@ -748,6 +745,21 @@ export class MidnightCrawler {
     private haltAt(height: number, message: string): void {
         this.poisonBlock = { height, message };
         log.error(`Block ${height} does not index; halting until pauseCrawler + resumeCrawler, reindexFromHeight or a restart retries it`);
+    }
+
+    /** Compares the index with the node's finalized chain at the lower of their two heads. A node that is behind is on the same chain there. */
+    private async assertNodeServesIndexedChain(syncState: SyncState | undefined, tipHeight: number, tipHash: string): Promise<void> {
+        if (!syncState?.lastIndexedHash) return;
+        const indexed = Number(syncState.lastIndexedHeight ?? 0);
+        const height = Math.min(indexed, tipHeight);
+        const local: Pick<Block, 'hash'> | undefined = height === indexed
+            ? { hash: syncState.lastIndexedHash }
+            : await this.db.run(SELECT.one.from(Blocks).columns('hash').where({ height }));
+        if (!local?.hash) return;
+        const onNode = bareHex(height === tipHeight
+            ? tipHash
+            : await this.withRetry('Block hash at the indexed head', () => this.nodeProvider.getBlockHash(height)));
+        if (onNode && onNode !== local.hash) throw new SyncStateChainMismatchError(height, local.hash, onNode);
     }
 
     private async checkForReorg(header: BlockHeader): Promise<ReorgInfo | null> {

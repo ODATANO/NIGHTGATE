@@ -53,8 +53,9 @@ function expectServiceAnyElementAuth(defs: Record<string, Def>, svc: string, ano
 describe('service auth annotations (anonymous liveness and verify lane)', () => {
     it('NightgateIndexerService: service any, every element annotated, only the read-only probes anonymous', async () => {
         const defs = await definitionsOf('nightgate-indexer-service.cds');
-        const probes = ['getLiveness', 'getReadiness', 'getMetrics', 'getSyncStatus', 'getHealth', 'getBoardStatus', 'getReceiptKey'].map((f) => `NightgateIndexerService.${f}`);
+        const probes = ['getLiveness', 'getReadiness', 'getSyncStatus', 'getHealth', 'getBoardStatus', 'getReceiptKey'].map((f) => `NightgateIndexerService.${f}`);
         expectServiceAnyElementAuth(defs, 'NightgateIndexerService', probes);
+        expect(defs['NightgateIndexerService.getMetrics']?.['@requires']).toBe('admin');
         expect(defs['NightgateIndexerService.pauseCrawler']?.['@requires']).toBe('admin');
         expect(defs['NightgateIndexerService.resumeCrawler']?.['@requires']).toBe('admin');
         expect(defs['NightgateIndexerService.reindexFromHeight']?.['@requires']).toBe('admin');

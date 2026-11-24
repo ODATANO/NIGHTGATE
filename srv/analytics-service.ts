@@ -4,13 +4,17 @@ const { SELECT } = cds.ql;
 import { Transactions, ContractActions, Blocks } from '#cds-models/midnight';
 import { normalizeHttpError } from './utils/http-errors';
 import { attachHexInput } from './utils/hex-input';
+import { attachInt64Results } from './utils/numbers';
+import { attachReadLimits } from './utils/runtime-gate';
 
 export default class NightgateAnalyticsService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
 
     async init(): Promise<void> {
         this.on('error', normalizeHttpError);
+        attachReadLimits(this, ['getBlockCount', 'getTransactionCount', 'getContractCount', 'getAverageTransactionsPerBlock']);
         attachHexInput(this);
+        attachInt64Results(this);
         this.db = await cds.connect.to('db');
 
         this.on('getBlockCount', async () => {
@@ -30,7 +34,7 @@ export default class NightgateAnalyticsService extends cds.ApplicationService {
         this.on('getContractCount', async () => {
             const result = await this.db.run(
                 SELECT.one.from(ContractActions)
-                    .columns('count(distinct address) as count')
+                    .columns('count(distinct contractAddress) as count')
             );
             return result?.count ?? 0;
         });

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Copies a NIGHTGATE SQLite database into a deployed, empty PostgreSQL. Stop every writer first; a row-count mismatch exits 1.
-// Run: nightgate-db-migrate --from /data/nightgate.db --to postgres://user:pw@host:5432/db [--dry-run] [--force] [--ignore-unknown] [--batch 500]
+// Run: node scripts/migrate-sqlite-to-postgres.mjs --from /data/nightgate.db --to postgres://user:pw@host:5432/db [--dry-run] [--force] [--ignore-unknown] [--batch 500]
 // SPDX-License-Identifier: Apache-2.0
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
@@ -8,14 +8,6 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 
-function requireFromHost(name, hint) {
-    const candidates = [require, createRequire(path.join(process.cwd(), 'package.json'))];
-    for (const r of candidates) {
-        try { return r(name); } catch (e) { if (e?.code !== 'MODULE_NOT_FOUND' || !String(e.message).includes(name)) throw e; }
-    }
-    console.error(`'${name}' is not installed (neither next to @odatano/nightgate nor in ${process.cwd()}). ${hint}`);
-    process.exit(2);
-}
 
 function arg(name, fallback) {
     const i = process.argv.indexOf(name);
@@ -31,15 +23,14 @@ const BATCH = Math.max(1, Number(arg('--batch', '500')) || 500);
 if (!fs.existsSync(FROM)) { console.error(`source SQLite file not found: ${FROM}`); process.exit(2); }
 if (!TO || !/^postgres(ql)?:\/\//i.test(TO)) { console.error('a postgres:// target is required (--to or NIGHTGATE_DB_URL)'); process.exit(2); }
 
-const cds = requireFromHost('@sap/cds', 'Run this from a CAP project that has @sap/cds installed.');
+const cds = require('@sap/cds');
 const { postgresCredentials, postgresKind } = await import(new URL('../docker/cds-config.mjs', import.meta.url).href);
 // Under NODE_ENV=production CAP does not load the devDependency plugin that
 // registers the `postgres` kind; inject its definition like the image does.
-requireFromHost('@cap-js/postgres/package.json', 'Install it in the host: npm i @cap-js/postgres');
 cds.env.requires.kinds = { ...(cds.env.requires.kinds ?? {}), postgres: postgresKind() };
 cds.env.requires.db = { kind: 'postgres', credentials: postgresCredentials(TO) };
 
-const Database = requireFromHost('better-sqlite3', 'Install it in the host: npm i better-sqlite3 (@cap-js/sqlite brings it along).');
+const Database = require('better-sqlite3');
 const src = new Database(FROM, { readonly: true });
 const srcTables = new Set(src.prepare("select name from sqlite_master where type='table'").all().map(r => r.name));
 

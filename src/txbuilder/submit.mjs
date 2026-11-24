@@ -36,9 +36,9 @@ export async function deserializeTransaction(bytesOrB64) {
 
 /** Returns the transaction's identifiers. Use the last one to look the transaction up in the indexer.
  *  Resend the same bytes only after `probeLanded` says the first send did not land. */
-export function txIdentifiers(tx) {
+export function txIds(tx) {
     if (typeof tx?.identifiers !== 'function') {
-        throw new Error('txIdentifiers: expected a deserialized ledger Transaction (see deserializeTransaction)');
+        throw new Error('txIds: expected a deserialized ledger Transaction (see deserializeTransaction)');
     }
     return Array.from(tx.identifiers(), String);
 }
@@ -167,7 +167,7 @@ export function submitExtrinsic(extrinsicHex, { nodeUrl, timeoutMs = 30_000, Web
 }
 
 /** Submits a sealed transaction with its fee paid and returns the extrinsic hash.
- *  Needs the optional dependency `@polkadot/api`. To look the transaction up in the indexer, use `txIdentifiers`. */
+ *  Needs the optional dependency `@polkadot/api`. To look the transaction up in the indexer, use `txIds`. */
 export async function submitFinalized(tx, { nodeUrl, nodeHttpUrl, timeoutMs = 30_000, WebSocketImpl } = {}) {
     if (!nodeUrl) throw new Error('submitFinalized: nodeUrl is required (the node WebSocket RPC: your own node, or a hosted one with its token in the URL)');
     const bytes = typeof tx?.serialize === 'function' ? new Uint8Array(tx.serialize()) : toBytes(tx);
@@ -190,12 +190,12 @@ export async function submitFinalized(tx, { nodeUrl, nodeHttpUrl, timeoutMs = 30
 
 /** Asks the indexer whether a transaction landed, or null while not known. `applied: false` means the call failed but the fee was spent.
  *  Always check by identifier. Watching the contract address could pick up someone else's call. */
-export async function probeLanded(identifier, { indexerHttpUrl, api, fetchFn, timeoutMs = 15_000 } = {}) {
-    if (!identifier) throw new Error('probeLanded: identifier is required (txIdentifiers(tx).at(-1))');
-    if (api) return probeLandedOnApi(identifier, api);
+export async function probeLanded(txId, { indexerHttpUrl, api, fetchFn, timeoutMs = 15_000 } = {}) {
+    if (!txId) throw new Error('probeLanded: txId is required (txIds(tx).at(-1))');
+    if (api) return probeLandedOnApi(txId, api);
     if (!indexerHttpUrl) throw new Error('probeLanded: indexerHttpUrl or api is required');
     try {
-        const data = await indexerQuery(indexerHttpUrl, TX_LANDED_QUERY, { variables: { offset: { identifier: String(identifier) } }, timeoutMs, fetchFn });
+        const data = await indexerQuery(indexerHttpUrl, TX_LANDED_QUERY, { variables: { offset: { identifier: String(txId) } }, timeoutMs, fetchFn });
         const t = data?.transactions?.[0];
         const height = t?.block?.height;
         if (height == null) return null;
@@ -218,12 +218,12 @@ const REFUSED_STATUSES = new Set([400, 401, 403]);
 const INDEXER_NEVER_ANSWERS = new Set([...REFUSED_STATUSES, 404, 410]);
 
 /** The same question to a NIGHTGATE server. An outage or a busy server reads as unknown, a refusal is thrown. */
-async function probeLandedOnApi(identifier, api) {
+async function probeLandedOnApi(txId, api) {
     const { apiClientFor } = await import('./api-provider.mjs');
     const client = apiClientFor(api);
     let found;
     try {
-        found = await client.transactionByIdentifier(identifier);
+        found = await client.transactionByTxId(txId);
     } catch (err) {
         if (REFUSED_STATUSES.has(Number(err?.status))) throw err;
         return null;
@@ -231,16 +231,16 @@ async function probeLandedOnApi(identifier, api) {
     // The server knows the transaction before its result; without the result nothing is settled.
     if (!found || found.status == null || found.blockHeight == null) return null;
     const failedSegments = Array.isArray(found.failedSegments) ? found.failedSegments.map(Number) : [];
-    return { height: String(found.blockHeight), status: String(found.status), failedSegments, applied: found.status === 'SUCCESS', txHash: found.ledgerTxHash ?? undefined };
+    return { height: String(found.blockHeight), status: String(found.status), failedSegments, applied: found.status === 'SUCCESS', txHash: found.txHash ?? undefined };
 }
 
 /** Calls `probeLanded` at least once, until the transaction is found or `timeoutMs` has passed.
  *  Use it when a resend is rejected. The first send may already be on chain while the indexer lags behind. */
-export async function waitLanded(identifier, { indexerHttpUrl, api, timeoutMs = 30_000, pollMs = 5_000, fetchFn } = {}) {
+export async function waitLanded(txId, { indexerHttpUrl, api, timeoutMs = 30_000, pollMs = 5_000, fetchFn } = {}) {
     const deadline = Date.now() + timeoutMs;
     for (; ;) {
         const probeMs = Math.max(1, Math.min(15_000, deadline - Date.now()));
-        const found = await probeLanded(identifier, { indexerHttpUrl, api, fetchFn, timeoutMs: probeMs });
+        const found = await probeLanded(txId, { indexerHttpUrl, api, fetchFn, timeoutMs: probeMs });
         if (found) return found;
         const left = deadline - Date.now();
         if (left <= 0) return null;

@@ -1,4 +1,4 @@
-# Headless transaction builder (`@odatano/nightgate/txbuilder`)
+# Headless transaction builder (`@odatano/nightgate-tx/txbuilder`)
 
 The builder builds, proves and signs a Midnight contract transaction on your
 own machine, with your own key. A sponsor pays the fee and submits.
@@ -12,14 +12,11 @@ process, and the on-chain attestation carries your attester id.
 ## Install
 
 ```bash
-npm install @odatano/nightgate-tx     # the caller side alone
-npm install @odatano/nightgate        # the server package, which ships the same builder
+npm install @odatano/nightgate-tx
 ```
 
-Both ship the same builder. In `@odatano/nightgate-tx`, `/browser` is
-`/calls` and `/browser/attestation-vault` is `/attestation-vault`. The other
-paths keep their name. The package ships the vault modules it builds calls
-for, so use a release that matches the vault you call.
+The vault contract comes from `/attestation-vault` and `/attestation-vault-32`,
+at the version the builder uses. Use a release that matches the vault you call.
 
 In a browser, where a connected wallet pays, use `connectContract`. See
 [browser.md](browser.md).
@@ -27,10 +24,10 @@ In a browser, where a connected wallet pays, use `connectContract`. See
 ## Use
 
 ```js
-import { createTxBuilder } from '@odatano/nightgate/txbuilder';
-import { connect } from '@odatano/nightgate/client';
-import { prepareAttest } from '@odatano/nightgate/browser';
-import { Contract } from '@odatano/nightgate/browser/attestation-vault';
+import { createTxBuilder } from '@odatano/nightgate-tx/txbuilder';
+import { connect } from '@odatano/nightgate-tx/client';
+import { prepareAttest } from '@odatano/nightgate-tx/calls';
+import { Contract } from '@odatano/nightgate-tx/attestation-vault';
 
 const api = { baseUrl: 'https://sponsor.example', agentToken };
 const builder = await createTxBuilder({
@@ -71,7 +68,7 @@ carries `jobId` and `sessionId`.
 | option | required | meaning |
 | --- | --- | --- |
 | `seedHex` | yes | 128 hex chars, a 64-byte BIP39 seed. HD derivation matches Lace |
-| `api` | yes, unless indexer URLs and `nodeUrl` | a NIGHTGATE server to read the chain through. Takes the `connect()` options or a connected client. Contract state, deploys and `probeLanded` then come from `ContractStates/stateAt`, `ContractActions` and `Transactions/byIdentifier`. The server's crawler must run, because every build pins its newest indexed block (`Blocks/latest`). A wallet sync still needs the indexer URLs, unless `api` is the options object with a gateway key (`token: 'oda_…'`). Then the wallet syncs through the gateway's indexer lane. A connected client carries no key and never takes the lane |
+| `api` | yes, unless indexer URLs and `nodeUrl` | a NIGHTGATE server to read the chain through. Takes the `connect()` options or a connected client. Contract state, deploys and `probeLanded` then come from `ContractStates/stateAt`, `ContractActions` and `Transactions/byTxId`. The server's crawler must run, because every build pins the newest block in `Blocks`. A wallet sync still needs the indexer URLs, unless `api` is the options object with a gateway key (`token: 'oda_…'`). Then the wallet syncs through the gateway's indexer lane. A connected client carries no key and never takes the lane |
 | `maxLagBlocks` | no | with `api`, default 60. A contract state from a server further behind the chain is refused, because a build on a stale state can fail on chain with the fee spent |
 | `indexerHttpUrl`, `indexerWsUrl` | yes, unless `api` | a Midnight indexer you can reach. With `api` only needed for a wallet sync |
 | `nodeUrl` | yes, unless `api` | Substrate RPC URL. With `api` the builder dials no node |
@@ -84,7 +81,7 @@ carries `jobId` and `sessionId`.
 | `privateStateId` | no | default `attestationVaultPrivateState` |
 | `networkId` | no | default `mainnet` |
 | `accountIndex` | no | BIP32 account, default `0` |
-| `cacheDir` | no | default `~/.cache/nightgate-txbuilder/<contractName>` |
+| `cacheDir` | no | default `~/.cache/nightgate-txbuilder/<contractName>`. Every run checks the cached files against the server's checksums and fetches what differs. Processes that build at the same time against servers with different versions of one contract each need their own folder |
 | `proverMaterialDir` | no | keys of the wallet's own circuits and the BLS parameters, default `~/.cache/nightgate-txbuilder/prover-material` |
 | `circuits` | no | circuits to fetch prover keys and zkir for. Default every circuit of `contractClass`, else the vault's 11 |
 | `ttlMinutes` | no | transaction TTL, default 30. The sponsor must submit within it |
@@ -96,7 +93,7 @@ carries `jobId` and `sessionId`.
 | `walletState` | no | from `serializeWalletState()`. The sub-wallets in it resume instead of syncing from genesis |
 | `shieldedWallet` | no | a started shielded wallet of the same seed, such as `swap.shieldedWallet`. The builder balances from it and never starts or stops it. Excludes `walletState.shielded` |
 | `fetchFn` | no | fetch for the contract's proving files, default the global `fetch` |
-| `onProgress` | no | callback for asset download, wallet start and build phases. While a wallet syncs it gets `{ phase: 'sync', wallet, appliedIndex, highestIndex, isConnected }` at most once a second per wallet and once at the tip |
+| `onProgress` | no | callback for asset download, wallet start and build phases. Every event carries `phase`: `zk-assets`, `zk-asset`, `wallet`, `sync`, `prover-material`, `build`, `batch-order`, `batch-gas-check`, `gas-headroom` or `built`. The type `BuilderProgressEvent` names the fields of each. While a wallet syncs it gets `{ phase: 'sync', wallet, appliedIndex, highestIndex, isConnected }` at most once a second per wallet and once at the tip |
 
 The 32-slot vault takes `.../attestation-vault-32` as `contractClass`,
 `contractName: 'attestation-vault-32'`, its `/zk-config/attestation-vault-32`
@@ -148,7 +145,7 @@ encryptionPublicKey }`, what another builder lists under `recipients`.
 `deriveRoleSeeds(seedHex, accountIndex?)` returns the per-role seeds, which
 are secret keys.
 
-## `buildSponsorable(input) -> { finalizedTxB64 | unboundTxB64, serializedBytes, bound }`
+## `buildSponsorable(input) -> { finalizedTxB64 | unboundTxB64, serializedBytes, bound, nextPrivateState }`
 
 Input: `{ contractAddress, call | calls, witnesses?, initialPrivateState?,
 bind?, attestationSecret?, independentCalls?, orderedPrefix?, gasHeadroom?,
@@ -158,9 +155,10 @@ Builds, proves, balances your side, signs and finalizes one `call` or up to 8
 `calls` in one transaction. Nothing is submitted. The transaction carries no
 dust, which makes it sponsorable.
 
-- `bind: true` (default) returns `finalizedTxB64` for `sponsorFinalizedTransaction` (client `sponsorFinalized`).
-- `bind: false` returns `unboundTxB64` for `sponsorUnboundTransaction` (client `sponsorUnbound`). The sponsor merges its dust spend and binds, so one sponsor wallet pays for many callers at once.
+- `bind: true` (default) returns `finalizedTxB64` for `sponsorFinalized` (client `sponsorFinalized`).
+- `bind: false` returns `unboundTxB64` for `sponsorUnbound` (client `sponsorUnbound`). The sponsor merges its dust spend and binds, so one sponsor wallet pays for many callers at once.
 - `bind: false` refuses a call that needs a balancing transaction because it moves value. Use the bound handover for it.
+- The builder keeps no private state between builds. A build starts from `initialPrivateState` (default `{}`) and returns `nextPrivateState`, the contract's private state after the call, after the last call of a batch. Store it once the transaction landed and pass it as `initialPrivateState` of the next build. The contracts of the `@odatano/contract-*` packages leave their private state unchanged.
 - `recipients: [{ coinPublicKey, encryptionPublicKey }]` lists the wallets a call creates a shielded coin for, such as a mint to a third party. Without them the build fails with `Unable to resolve encryption public key for recipient`.
 
 ### Batches
@@ -170,13 +168,14 @@ calls on one vault belong in one batch. Parallel single transactions can
 refuse each other with `1010/104`.
 
 - Calls apply in array order. The ledger runs all guaranteed stages before any fallible one.
-- A causality violation is caught before proving and throws `code: 'BatchCausalityViolation'`, with `calls: [{ name, segId, stages }]` in apply order.
-- Before proving the builder applies the batch to a local ledger. A call that runs out of gas throws `code: 'BatchGasBudgetExceeded'`. Split the batch.
+- A causality violation is caught before proving and throws `code: 'BATCH_CAUSALITY_VIOLATION'`, with `calls: [{ name, segId, stages }]` in apply order.
+- Before proving the builder applies the batch to a local ledger. A call that runs out of gas throws `code: 'BATCH_GAS_BUDGET_EXCEEDED'`. Split the batch.
+- The builder writes nothing to the console. `onProgress` gets `{ phase: 'batch-order', before, after, stageGrouped }` with each call's segment and stage, and `{ phase: 'batch-gas-check', outcome, detail }` when the gas check could not decide.
 - `independentCalls: true` groups the calls after `orderedPrefix` by stage, guaranteed first. Use it for a proof cart with distinct claim keys. `orderedPrefix: 1` keeps an in-batch `anchorContentRoot` first.
 - A contract instance binds its witnesses once. Pass one shared `witnesses` object, or give every call the same one. Per-call `before` hooks set what varies.
-- Vault batches without shared witnesses get them from the builder's attestation secret, or `attestationSecret`. Prepare every batched call with the same secret.
+- Vault batches without shared witnesses get them from the builder's attestation secret, or `attestationSecret`. Prepare every batched call with the same secret. The builder knows the vault by its contract class, the one of an installed vault package, under any `contractName`; for any other contract pass the witnesses.
 - `attest` and its `anchorContentRoot` stay in the guaranteed stage as the vault grows. `bindDocument` is fallible and goes last.
-- A landed batch can finalize partially, fee spent. Verify each claim with `verifyAttestationState` or `verifyPredicateState`, never the batch.
+- A landed batch can finalize partially, fee spent. Verify each claim with `verifyAttestation` or `verifyPredicate`, never the batch.
 
 ### Stale state and gas headroom
 
@@ -225,21 +224,44 @@ const builder = await createTxBuilder({ package: 'vault-ledger8', circuits: ['at
 - `buildDeploySponsorable` is refused. A new deploy uses the current package.
 - A circuit that spends a shielded coin the contract already holds is refused by midnight-js.
 - With the current package, such a contract fails with a message that names this section's cause.
-- The server's own contract actions, such as `submitContractCall` or `issue*`, use the current packages and refuse such a contract with a message that names this path. Build the call here and hand it to `sponsorUnboundTransaction`. The server's reads keep working.
+- The server's own contract actions, such as `submitContractCall` or `prove*`, use the current packages and refuse such a contract with a message that names this path. Build the call here and hand it to `sponsorUnbound`. The server's reads keep working.
 
-## `buildDeploySponsorable({ initialPrivateState?, constructorArgs?, witnesses?, recipients?, bind? })`
+## `buildDeploySponsorable({ initialPrivateState?, constructorArgs?, witnesses?, recipients?, signingKey?, deploy?, bind? })`
 
 Builds, proves and signs a deploy with your key. Returns the same shape as
-`buildSponsorable` plus `contractAddress`. The build fails unless the
-transaction carries exactly one deploy. The vault constructors take
+`buildSponsorable` plus `contractAddress` and `signingKey`. The build fails
+unless the transaction carries exactly one deploy. The vault constructors take
 `[registrarId, recoveryId]`, both `Uint8Array(32)`.
 
-- The sponsor pays when its policy allows deploys (`NIGHTGATE_SPONSOR_ALLOW_DEPLOY` or `allowDeploy` in the policy file).
-- A token caller also needs a grant with `allowDeploy` and budget left (`maxDeploys`, default 1).
+- A token caller needs a grant with `allowDeploy` and budget left (`maxDeploys`, default 1). A caller without a token is the operator and needs none.
 - Byte ceiling: `NIGHTGATE_SPONSOR_MAX_DEPLOY_BYTES`, default 40960.
 - The landed address is recorded on the grant (`deployedContracts`). Its calls are sponsorable beyond the platform contract and circuit lists.
-- Maintenance updates are never sponsored.
-- The builder keeps the initial private state in memory only. Persist it yourself.
+- Its maintenance updates are sponsored with `buildMaintenanceSponsorable`, below.
+- `deploy`, a `ContractDeploy` of `@midnightntwrk/ledger-v9` the caller made, replaces the contract build. Use it for a contract too large for one block: deploy part of its verifier keys, then insert the rest with `buildMaintenanceSponsorable`. The maintenance key stays with the caller, so the result carries no `signingKey`.
+- `signingKey` in the result is the key that may maintain the contract later, as the ledger's `{ tag, value }`. Keep it secret and keep it: nobody else has it, the sponsor never sees it, and without it the contract can never be maintained. Pass your own as `signingKey` to deploy under a key you already hold.
+- `nextPrivateState` is the private state after the constructor. The builder keeps none: pass it as `initialPrivateState` of the first call.
+
+## `buildMaintenanceSponsorable({ update, bind? })`
+
+Proves a signed maintenance update and returns it without a fee, in the same
+shape as `buildSponsorable` plus `contractAddress`. `update` is a
+`MaintenanceUpdate` of `@midnightntwrk/ledger-v9`, signed over its
+`dataToSign` by enough members of the contract's maintenance authority. The
+builder never holds a maintenance key.
+
+```js
+import { MaintenanceUpdate, VerifierKeyInsert, ContractOperationVersionedVerifierKey, signData } from '@midnightntwrk/ledger-v9';
+
+let update = new MaintenanceUpdate(contractAddress, [new VerifierKeyInsert(circuit, new ContractOperationVersionedVerifierKey('v4', vkBytes))], counter);
+update = update.addSignature(0n, signData(signingKey, update.dataToSign));
+const { unboundTxB64 } = await builder.buildMaintenanceSponsorable({ update, bind: false });
+await connect(api).sponsorUnbound({ unboundTxB64 });
+```
+
+- A token caller needs `allowMaintenance` on its grant with budget left (`maxMaintenanceUpdates`, default 8), and the contract must be one its grant deployed sponsored. A caller without a token is the operator and needs none.
+- `counter` is the authority's counter on chain, `state.maintenanceAuthority.counter`. Every landed update moves it, so updates go one after the other.
+- One update per transaction. Byte ceiling: `NIGHTGATE_SPONSOR_MAX_MAINTENANCE_BYTES`, default 40960.
+- `update` must come from the copy of `@midnightntwrk/ledger-v9` this package uses. `npm ls @midnightntwrk/ledger-v9` shows one.
 
 ## Proving files
 
@@ -251,7 +273,7 @@ in a container build. `createTxBuilder` calls it.
 - A `404` for a circuit the contract lacks is tolerated. Any other error is fatal.
 - With `package` the package is the cache. Missing prover keys come from `contract.json#zkAssetUrl` (`source: 'package'`).
 - `resolveBuilderPackage({ package, from? })` returns what the builder reads from a package, after checking it against the digest in `contract.json`.
-- The wallet's own circuits and the BLS parameters live under `proverMaterialDir`. A missing or damaged file is downloaded by the wallet SDK, which checks it against the hash its ledger release declares. `createProverMaterialProvider({ dir })` returns this provider for the SDK's `makeWasmProvingService`.
+- The wallet's own circuits and the BLS parameters live under `proverMaterialDir`. A missing or damaged file is downloaded by the wallet SDK, which checks it against the hash its ledger release declares. `createProverMaterialProvider({ dir })` returns this provider for the SDK's `makeV9WasmProvingService`.
 
 ## Shielded swaps
 
@@ -261,8 +283,8 @@ merge into one transaction that settles both legs or none. A sponsor pays the
 fee with `sponsorSwap`, so neither party needs NIGHT or dust.
 
 ```js
-import { connect } from '@odatano/nightgate/client';
-import { createSwapWallet } from '@odatano/nightgate/txbuilder';
+import { connect } from '@odatano/nightgate-tx/client';
+import { createSwapWallet } from '@odatano/nightgate-tx/txbuilder';
 
 const give = { tokenType: CREDIT, amount: 1000n };
 const want = { tokenType: DATA, amount: 300n };
@@ -290,7 +312,7 @@ const { txHash } = await connect({ baseUrl, agentToken }).sponsorSwap({ makerHal
 | `proofServerUrl` | with `server` | sees the coins you spend. Use only one you run |
 | `proverMaterialDir` | no | as for `createTxBuilder` |
 | `walletState` | no | from `serializeState()`. Resumes instead of syncing from genesis |
-| `maxInputs` | no | most coins one half spends, default 4, the sponsor's default `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS` |
+| `maxInputs` | no | most coins one half spends, default 4, the sponsor's default `NIGHTGATE_SPONSOR_MAX_INPUTS` |
 | `onProgress` | no | as for `createTxBuilder` |
 
 Only the shielded wallet syncs. The saved state holds the coins, so store it
@@ -322,13 +344,13 @@ const { txHash } = await ng.sponsorTransfer({ transferTxB64: built.txB64, tokenT
 - The recipient gets one coin, the wallet its change.
 - A transfer nets to zero and shows no token type. The server records `tokenType` and `amount` as the caller's declaration (`declared: true` in the receipt). It checks the shape with the rule of `readTransferShape(tx)`.
 - `getJobStatus` of a landed swap or transfer carries `receipt`, once the chain confirmed the job. `sponsorSwap` and `sponsorTransfer` return the `jobId` for that call, and `receipt` when it is already there. It usually is not yet, because they return when the job succeeded and the chain confirms later.
-- `ng.waitForReceipt({ jobId })` waits for the receipt and throws when the job fails or can have none. A server before 0.43.1 also needs the returned `sessionId`. It holds a call on the server where it can, and otherwise polls from 10 s up to 60 s. A metered gateway may bill each call.
+- `ng.waitForReceipt({ jobId })` waits for the receipt and throws when the job fails or can have none. It holds a call on the server where it can, and otherwise polls from 10 s up to 60 s. A metered gateway may bill each call.
 - `verifyReceipt(receipt, publicKey)` from the client checks a receipt against the key `ng.getReceiptKey()` publishes.
 
 ### Unshielded transfers
 
 ```js
-import { createUnshieldedWallet } from '@odatano/nightgate/txbuilder';
+import { createUnshieldedWallet } from '@odatano/nightgate-tx/txbuilder';
 
 const wallet = await createUnshieldedWallet({ seedHex, indexerHttpUrl, indexerWsUrl });
 await wallet.sync();
@@ -343,7 +365,7 @@ const { txHash } = await ng.sponsorTransfer({ transferTxB64: built.txB64, tokenT
 - The recipient gets one coin, the wallet its change. A transfer to the wallet's own address is refused.
 - Await `sync()` before the first `buildTransfer`. It resolves once the wallet caught up and reads the chain at ledger 9. Before that `buildTransfer` refuses.
 - The wallet asks the indexer for its newest block before it starts. An indexer that does not answer fails `createUnshieldedWallet` with the reason it gave, for example `HTTP 410`, because the wallet SDK would wait on it without an error. `createSwapWallet` and a builder that syncs wallets do the same.
-- An unshielded transfer shows type, amount and recipient. The server reads them from the transaction and refuses a `tokenType` or `amount` that differs. `readUnshieldedTransfer(tx)` reads them by the same rule.
+- An unshielded transfer shows type, amount and recipient. The server reads them from the transaction and refuses a `tokenType` or `amount` that differs. `readUnshieldedTransfer(tx, { networkId })` reads them by the same rule. Its `to` is the address as wallets show it, as in `buildTransfer().terms.to` and the receipt; `toHex` is the raw one.
 - The receipt carries the recipient as `transfer.to` and `declared: false`.
 - A built transfer is valid for `ttlMinutes`, default 30. `revert(input)` releases the coins of one that did not land, from its base64 or bytes.
 
@@ -406,8 +428,8 @@ list. `prepareBurn` and `tokenFactoryWitnesses` are exported too.
 
 A NIGHTGATE server with a funded, dust-registered wallet session runs it.
 
-- `sponsorFinalizedTransaction(finalizedTxB64, idempotencyKey?)` checks the contract and circuit allow-list, pays dust from the sponsor pool and submits.
-- `sponsorUnboundTransaction(unboundTxB64, idempotencyKey?)` pays from a locked dust backing. Parallel capacity is the number of NIGHT UTxOs registered for dust generation.
+- `sponsorFinalized(finalizedTxB64, idempotencyKey?)` checks the contract and circuit allow-list, pays dust from the sponsor pool and submits.
+- `sponsorUnbound(unboundTxB64, idempotencyKey?)` pays from a locked dust backing. Parallel capacity is the number of NIGHT UTxOs registered for dust generation.
 - The policy is described under [cross-server fee sponsoring](actions.md#cross-server-fee-sponsoring).
 
 `npm run txbuilder:e2e` runs the real split.
@@ -418,7 +440,7 @@ A NIGHTGATE server with a funded, dust-registered wallet session runs it.
 - Ledger assembly, wallet sync and wasm proving all run on the calling thread. In a server, host the builder in a `worker_threads` worker.
 - `provingMode: 'server'` proves several times faster. Start a proof server with `docker run -d -p 6300:6300 midnightntwrk/proof-server:<version> midnight-proof-server`. It receives the witnesses, so never use the sponsor's.
 - After wasm proving the wallet SDK keeps a 10 minute timer per proof. A script calls `process.exit()` after `close()` to end at once.
-- Proving memory follows the circuit's k, about 1.8 GB RSS at k=17 and 3.5 GB at k=18. Wasm memory never shrinks and `--max-old-space-size` does not bound it. `Zkir.deserialize(bzkir).getK()` from `@midnightntwrk/zkir-v2` reads k.
+- Proving memory follows the circuit's k, about 1.8 GB RSS at k=17 and 3.5 GB at k=18. Wasm memory never shrinks and `--max-old-space-size` does not bound it. `Zkir.deserialize(bzkir).getK()` reads k, from `@midnightntwrk/zkir-v3` for a ledger 9 circuit and from `@midnightntwrk/zkir-v2` for a contract compiled before the ledger 9 change.
 - The TTL is real. After `ttlMinutes` the node rejects the transaction.
 - Fetch `zkConfigBaseUrl` from the sponsor that serves the vault you target, so the artifact generation matches.
 - Content roots, schema ids, set roots and claim keys use the circuit's `transientHash`, which may change with a compiler generation. `payloadHash` is stable. Keep the `opening` of every anchored document, so you can re-anchor on a redeployed vault.
@@ -430,10 +452,15 @@ A caller that pays its own dust submits to the node with the helpers of
 `@polkadot/api`. `facade` and `configuration` below are your own wallet SDK
 facade and its resolved configuration. `sealTx` wraps a ledger transaction
 into the SDK's sealed handle, and `openTx` reads one back.
+`waitForWalletSync(facade, configuration.forks)` waits until every sub-wallet
+caught up and reads the chain at ledger 9. Use it in place of the facade's
+`waitForSyncedState()`: a fresh wallet is done there a moment before it knows
+the chain's ledger, and a fee balanced then is refused.
 
 ```js
-import { deserializeTransaction, txIdentifiers, submitFinalized, waitLanded, sealTx, openTx } from '@odatano/nightgate-tx/txbuilder';
+import { deserializeTransaction, txIds, submitFinalized, waitLanded, sealTx, openTx, waitForWalletSync } from '@odatano/nightgate-tx/txbuilder';
 
+await waitForWalletSync(facade, configuration.forks);
 const built = await builder.buildSponsorable({ contractAddress, calls, witnesses });
 const tx = await deserializeTransaction(built.finalizedTxB64);
 const recipe = await facade.balanceFinalizedTransaction(
@@ -442,9 +469,9 @@ const recipe = await facade.balanceFinalizedTransaction(
 );
 const handle = await facade.finalizeRecipe(recipe);
 const finalized = await openTx(handle);
-const identifier = txIdentifiers(finalized).at(-1);
+const txId = txIds(finalized).at(-1);
 await submitFinalized(finalized, { nodeUrl });
-const landed = await waitLanded(identifier, { indexerHttpUrl, timeoutMs: 240_000, pollMs: 6_000 });
+const landed = await waitLanded(txId, { indexerHttpUrl, timeoutMs: 240_000, pollMs: 6_000 });
 ```
 
 [`example/self-funded.mjs`](../packages/nightgate-tx/example/self-funded.mjs)
@@ -460,4 +487,4 @@ runs the full flow with the resend loop the rules below describe.
 - `isPreMempoolReject(err)` is true for 1010, 1014 and 1016. No fee was spent, but the fee's coins stay reserved until `facade.revertTransaction(handle)`.
 - `isTransportFailure(err)` means the transaction may be in the mempool. Probe, then resend the same bytes. A rebuild can land a second transaction.
 - `isAlreadyImported(err)` (1013) on a resend means the first send is in the pool. Any other refused resend may mean it landed, so run a bounded `waitLanded` before you revert.
-- `probeLanded(identifier, opts)` and `waitLanded(identifier, opts)` ask an indexer (`indexerHttpUrl`) or a NIGHTGATE server (`api`). Confirm by identifier, never by the contract address. An indexer that answers 400, 401, 403, 404 or 410 will never know the transaction, so the probe throws; an outage reads as `null`. `applied: false` means in a block, call failed, fee spent.
+- `probeLanded(txId, opts)` and `waitLanded(txId, opts)` ask an indexer (`indexerHttpUrl`) or a NIGHTGATE server (`api`). Confirm by identifier, never by the contract address. An indexer that answers 400, 401, 403, 404 or 410 will never know the transaction, so the probe throws; an outage reads as `null`. `applied: false` means in a block, call failed, fee spent.

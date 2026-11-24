@@ -14,6 +14,10 @@ vi.mock('../../srv/submission/contract-registry', () => ({
     getContractRegistration: () => ({ slotWidth: 16 }),
     slotWidthOf: () => 16
 }));
+vi.mock('../../srv/midnight/public-data-provider', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../../srv/midnight/public-data-provider')>()),
+    indexerTipHeight: vi.fn(async () => 900)
+}));
 vi.mock('../../srv/utils/nightgate-config', async () => {
     const actual: any = await vi.importActual('../../srv/utils/nightgate-config');
     return {
@@ -35,7 +39,7 @@ function makeReq(data: Record<string, unknown> = {}, ip = '203.0.113.7', user: a
     return {
         data,
         user,
-        event: 'verifyAttestationState',
+        event: 'verifyAttestation',
         reject: vi.fn((a: any, b?: any) => ({ __rejected: true, a, b })),
         http: { req: { ip }, res }
     } as any;
@@ -100,7 +104,7 @@ describe('registerVerifyStateHandlers: one implementation behind both services',
         const readers = { attestationStateReader: vi.fn(), predicateStateReader: vi.fn(), disclosureLevelReader: vi.fn() };
         const { srv, handlers } = stubService();
         registerVerifyStateHandlers(srv, { ...(readers as any), contractResolver, gate: async (req: any) => { req.reject(404, 'off'); return false; } });
-        expect(Object.keys(handlers).sort()).toEqual(['verifyAttestationState', 'verifyDisclosureState', 'verifyPredicateState']);
+        expect(Object.keys(handlers).sort()).toEqual(['verifyAttestation', 'verifyDisclosure', 'verifyPredicate']);
         for (const name of Object.keys(handlers)) {
             const req = makeReq({ ...args, grantee: 'd'.repeat(64), predicate: 'gte', fieldKey: 'f', threshold: 1 });
             expect(await handlers[name](req)).toBeUndefined();
@@ -117,10 +121,10 @@ describe('registerVerifyStateHandlers: one implementation behind both services',
             const plain = stubService();
             registerVerifyStateHandlers(gated.srv, { attestationStateReader: attestationStateReader as any, contractResolver, gate: async () => true });
             registerVerifyStateHandlers(plain.srv, { attestationStateReader: attestationStateReader as any, contractResolver });
-            const a = await gated.handlers.verifyAttestationState(makeReq(args));
-            const b = await plain.handlers.verifyAttestationState(makeReq(args, '10.0.0.1', { id: 'nightgate' }));
+            const a = await gated.handlers.verifyAttestation(makeReq(args));
+            const b = await plain.handlers.verifyAttestation(makeReq(args, '10.0.0.1', { id: 'nightgate' }));
             expect(a).toEqual(b);
-            expect(a).toEqual({ verified: true, attested: true, contentRootOk: false, schemaOk: false, attesterId: 'att' });
+            expect(a).toEqual({ verified: true, attested: true, contentRootOk: false, schemaOk: false, attesterId: 'att', blockHeight: 900 });
             expect(attestationStateReader).toHaveBeenCalledTimes(2);
         } finally {
             delete process.env.NIGHTGATE_INDEXER_HTTP_URL;
@@ -138,19 +142,19 @@ describe('registerVerifyStateHandlers: one implementation behind both services',
 
             failing.mockRejectedValueOnce(new NightgateError('BAD_GATEWAY', 'indexer could not serve the state of contract aa: fetch failed'));
             const down = makeReq(args);
-            await handlers.verifyAttestationState(down);
+            await handlers.verifyAttestation(down);
             expect(down.reject).toHaveBeenCalledWith({ status: 502, code: 'BAD_GATEWAY', message: expect.stringContaining('indexer could not serve'), $sanitize: false });
             expect(down.http.res.set).toHaveBeenCalledWith('Retry-After', '10');
 
             failing.mockRejectedValueOnce(new NightgateError('CONFLICT', 'contract state written by ledger v8: this server reads ledger 9 states only'));
             const old = makeReq(args);
-            await handlers.verifyAttestationState(old);
+            await handlers.verifyAttestation(old);
             expect(old.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 409, code: 'CONFLICT', message: expect.stringContaining('ledger v8') }));
             expect(old.http.res.set).not.toHaveBeenCalledWith('Retry-After', expect.anything());
 
             failing.mockRejectedValueOnce(new Error('boom'));
             const other = makeReq(args);
-            await handlers.verifyAttestationState(other);
+            await handlers.verifyAttestation(other);
             expect(other.reject).toHaveBeenCalledWith(500, 'boom');
         } finally {
             delete process.env.NIGHTGATE_INDEXER_HTTP_URL;
@@ -167,7 +171,7 @@ describe('registerVerifyStateHandlers: one implementation behind both services',
             registerVerifyStateHandlers(srv, { attestationStateReader: attestationStateReader as any, contractResolver, gate: async () => true });
             for (let i = 0; i < 3; i++) {
                 const req = makeReq(args);
-                await handlers.verifyAttestationState(req);
+                await handlers.verifyAttestation(req);
                 expect(req.reject).not.toHaveBeenCalled();
             }
         } finally {
@@ -181,7 +185,7 @@ describe('registerVerifyStateHandlers: one implementation behind both services',
         const { srv, handlers } = stubService();
         registerVerifyStateHandlers(srv, { attestationStateReader: attestationStateReader as any, contractResolver, gate: async () => true });
         const req = makeReq({ contractAddress: 'c', attesterId: 'b'.repeat(64) });
-        await handlers.verifyAttestationState(req);
+        await handlers.verifyAttestation(req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('payloadHash'));
         expect(attestationStateReader).not.toHaveBeenCalled();
     });

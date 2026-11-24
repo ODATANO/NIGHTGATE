@@ -450,12 +450,12 @@ export function setStateSaveSink(sink: StateSaveSink | undefined): void {
 
 /** A tx the worker is about to send. The hook stores it first. If the hook throws, the worker does not send. */
 export interface SubmitIntentInfo {
-    txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string;
+    txId: string; txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string;
     segments?: Array<{ segment: number; calls: string[] }>;
     /** Raw token types the calls mint. */
     minted?: string[];
 }
-export type SubmitIntentHook = (txHash: string, intent: SubmitIntentInfo) => Promise<void>;
+export type SubmitIntentHook = (intent: SubmitIntentInfo) => Promise<void>;
 
 async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIMEOUT_MS, onSubmitIntent?: SubmitIntentHook): Promise<T> {
     assertSameWorker(method, args);
@@ -564,22 +564,22 @@ async function rpcOnce<T>(slot: WorkerSlot, method: string, args: unknown, timeo
             if (answered) return;
             if (msg?.kind === 'submit-intent') {
                 // Store, then ack or nack. Once the worker answered it gave up and did not send, so no ack.
-                const intent: SubmitIntentInfo = { txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId, ...(Array.isArray(msg.deployed) ? { deployed: msg.deployed.map(String) } : {}), ...(typeof msg.ttl === 'string' ? { ttl: msg.ttl } : {}), ...(Array.isArray(msg.minted) && msg.minted.length ? { minted: msg.minted.map(String) } : {}) };
+                const intent: SubmitIntentInfo = { txId: String(msg.txId), txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId, ...(Array.isArray(msg.deployed) ? { deployed: msg.deployed.map(String) } : {}), ...(typeof msg.ttl === 'string' ? { ttl: msg.ttl } : {}), ...(Array.isArray(msg.minted) && msg.minted.length ? { minted: msg.minted.map(String) } : {}) };
                 const startedAt = Date.now();
                 const tracked: Promise<void> = Promise.resolve()
-                    .then(() => onSubmitIntent?.(intent.txHash, intent))
+                    .then(() => onSubmitIntent?.(intent))
                     .then(
                         () => {
                             const ms = Date.now() - startedAt;
                             if (answered) {
-                                log.warn(`submit-intent ${intent.txHash.slice(0, 16)}: persisted after ${ms}ms, after the worker had answered; not acknowledged (the worker did not broadcast)`);
+                                log.warn(`submit-intent ${intent.txId.slice(0, 16)}: persisted after ${ms}ms, after the worker had answered; not acknowledged (the worker did not broadcast)`);
                                 return;
                             }
-                            if (ms > INTENT_PERSIST_WARN_MS) log.warn(`submit-intent ${intent.txHash.slice(0, 16)}: persisting the boundary took ${ms}ms`);
-                            postAck({ txHash: msg.txHash, ok: true });
+                            if (ms > INTENT_PERSIST_WARN_MS) log.warn(`submit-intent ${intent.txId.slice(0, 16)}: persisting the boundary took ${ms}ms`);
+                            postAck({ txId: msg.txId, ok: true });
                         },
                         (e) => {
-                            if (!answered) postAck({ txHash: msg.txHash, ok: false, error: errorMessage(e) });
+                            if (!answered) postAck({ txId: msg.txId, ok: false, error: errorMessage(e) });
                         }
                     )
                     .finally(() => { intentsInFlight.delete(tracked); });
@@ -594,7 +594,7 @@ async function rpcOnce<T>(slot: WorkerSlot, method: string, args: unknown, timeo
                 const payload = msg?.error;
                 if (payload && typeof payload === 'object' && typeof payload.message === 'string') {
                     const coded = payload.nightgate
-                        ? nightgateErrorFromPayload({ ...payload.nightgate, name: payload.name, message: payload.message })
+                        ? nightgateErrorFromPayload(payload.nightgate, { name: payload.name, message: payload.message })
                         : undefined;
                     const code = payload.code;
                     if (isSubmitFailureCode(code)) {
@@ -788,6 +788,7 @@ export function walletRegisterDustGeneration(args: {
 export interface RegisterDustGenerationOutcome {
     /** Null when nothing was registered. */
     txId: string | null;
+    txHash: string | null;
     changed: boolean;
     reason: 'already-registered' | 'no-night-utxos' | null;
     registeredCount: number;
@@ -815,28 +816,30 @@ export function walletDeregisterDustGeneration(args: {
     sponsorSessionId?: string;
 }, onSubmitIntent?: SubmitIntentHook): Promise<{
     txId: string | null;
+    txHash: string | null;
     deregisteredCount: number;
     totalNightUtxos: number;
 }> {
     return rpc('deregisterDustGeneration', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
-/** Sends NIGHT, or the token `tokenTypeHex`. The receiver address decides shielded or unshielded. `amount` is in atoms as a decimal string. */
-export function walletTransferNight(args: {
+/** Sends NIGHT, or the token `tokenType`. The receiver address decides shielded or unshielded. `amount` is in atoms as a decimal string. */
+export function walletTransferToken(args: {
     sessionId: string;
     receiverAddress: string;
     amount: string;
     ttlIso?: string;
     syncTimeoutMs?: number;
     /** Raw token type (64 hex) to send instead of NIGHT. */
-    tokenTypeHex?: string;
+    tokenType?: string;
 }, onSubmitIntent?: SubmitIntentHook): Promise<{
     txId: string;
+    txHash: string;
     toLedger: 'shielded' | 'unshielded';
     amount: string;
     receiverAddress: string;
 }> {
-    return rpc('transferNight', args, RPC_TIMEOUT_MS, onSubmitIntent);
+    return rpc('transferToken', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
 /** A wallet's balances as the worker reports them. Amounts are decimal strings in atoms. */
@@ -867,14 +870,14 @@ export function walletGetBalance(args: {
     return rpc('getBalance', rest, rpcTimeoutMs);
 }
 
-/** Fee estimate for `walletTransferNight` without proving or sending. Dust atoms as a decimal string. */
+/** Fee estimate for `walletTransferToken` without proving or sending. Dust atoms as a decimal string. */
 export function walletEstimateTransferFee(args: {
     sessionId: string;
     receiverAddress: string;
     amount: string;
     ttlIso?: string;
     syncTimeoutMs?: number;
-    tokenTypeHex?: string;
+    tokenType?: string;
 }): Promise<{ fee: string; toLedger: 'shielded' | 'unshielded' }> {
     return rpc('estimateTransferFee', args);
 }
@@ -924,6 +927,7 @@ export interface WalletSubmitContractCallArgs {
 
 /** Private state goes through the provider registered under `proxyId`. */
 export function walletDeployContract(args: WalletDeployContractArgs, onSubmitIntent?: SubmitIntentHook): Promise<{
+    txId: string;
     txHash: string;
     contractAddress: string;
     onChainStatus: string;
@@ -932,6 +936,7 @@ export function walletDeployContract(args: WalletDeployContractArgs, onSubmitInt
 }
 
 export function walletSubmitContractCall(args: WalletSubmitContractCallArgs, onSubmitIntent?: SubmitIntentHook): Promise<{
+    txId: string;
     txHash: string;
     onChainStatus: string;
     /** Height of the block the transaction landed in; null when the node did not report it. */
@@ -952,7 +957,7 @@ export function walletSponsorFinalizedTx(args: SponsorPolicyArgs & {
     sponsorSessionId: string;
     finalizedTxB64: string;
     networkId: WalletSubmitContractCallArgs['networkId'];
-}, onSubmitIntent?: SubmitIntentHook): Promise<{ txHash: string; circuits: string[]; contractAddress: string; deployed?: string[]; minted?: string[]; unshielded?: UnshieldedMove[] }> {
+}, onSubmitIntent?: SubmitIntentHook): Promise<{ txId: string; txHash: string; circuits: string[]; contractAddress: string; deployed?: string[]; minted?: string[]; unshielded?: UnshieldedMove[] }> {
     return rpc('sponsorFinalizedTx', args, RPC_TIMEOUT_MS, onSubmitIntent);
 }
 
@@ -965,6 +970,7 @@ export interface WalletSubmitContractCallBatchArgs extends Omit<WalletSubmitCont
 }
 
 export function walletSubmitContractCallBatch(args: WalletSubmitContractCallBatchArgs, onSubmitIntent?: SubmitIntentHook): Promise<{
+    txId: string;
     txHash: string;
     onChainStatus: string;
     circuits: string[];
@@ -1010,7 +1016,7 @@ export function walletSponsorUnboundTx(args: SponsorPolicyArgs & {
     allowTransfers?: boolean;
     networkId: WalletSubmitContractCallArgs['networkId'];
 }, onSubmitIntent?: SubmitIntentHook): Promise<{
-    txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[]; minted?: string[];
+    txId: string; txHash: string; circuits: string[]; contractAddress: string; note: string; deployed?: string[]; minted?: string[];
     swap?: SponsoredSwapTerms; transfer?: DeclaredTransfer; unshielded?: UnshieldedMove[]; nullifiers?: string[];
 }> {
     return rpc('sponsorUnboundTx', args, RPC_TIMEOUT_MS, onSubmitIntent);

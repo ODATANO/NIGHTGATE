@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Loads wallet states from presync-wallets.mjs into WalletSyncStates. Stop the server first; exits 1 if a file is refused.
 // Run: node scripts/import-wallet-state.mjs [--dry-run] <export.json>...
-// Env: the server's database, ENCRYPTION_KEY or ENCRYPTION_KEYS, and NIGHTGATE_FEE_SPONSOR_SESSION.
+// Env: the server's database, ENCRYPTION_KEY or ENCRYPTION_KEYS, and NIGHTGATE_FEE_SPONSOR_SESSIONS.
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -64,8 +64,8 @@ try {
         } catch (err) { log(`! ${name}: sponsor ${exp.sessionId.slice(0, 8)}: ${err?.message ?? err}`); refused++; continue; }
         if (seedFingerprintOf(sponsor.seedHex) !== exp.seedFingerprint) { log(`! ${name}: seed fingerprint differs from the sponsor's seed`); refused++; continue; }
         if ((sponsor.accountIndex ?? 0) !== (exp.accountIndex ?? 0)) { log(`! ${name}: accountIndex ${exp.accountIndex ?? 0} != the session's ${sponsor.accountIndex ?? 0}`); refused++; continue; }
-        const row = await db.run(SELECT.one.from(WalletSyncStates).columns('updatedAt', 'networkId', 'sdkVersion').where({ accountId: sponsor.accountId }));
-        const have = row ? `current row saved ${row.updatedAt} (${row.sdkVersion}, ${row.networkId})` : 'no row yet';
+        const row = await db.run(SELECT.one.from(WalletSyncStates).columns('updatedAt', 'network', 'sdkVersion').where({ accountId: sponsor.accountId }));
+        const have = row ? `current row saved ${row.updatedAt} (${row.sdkVersion}, ${row.network})` : 'no row yet';
         const sizes = `sh=${exp.states.shielded.length} un=${exp.states.unshielded.length} du=${exp.states.dust.length}`;
         log(`${name}: sponsor ${exp.sessionId.slice(0, 8)} account ${sponsor.accountId.slice(0, 16)}: file saved ${exp.savedAt}, dust appliedIndex=${exp.reached?.dustAppliedIndex ?? '?'} of ${exp.reached?.streamTip ?? '?'}, ${sizes}; ${have}`);
         if (DRY) continue;

@@ -18,7 +18,7 @@ import {
     type ReadPredicateResultDeps
 } from '@odatano/contract-kit';
 import { importArtifact } from './artifact-import';
-import { buildPublicDataProvider, queryLedger9ContractState } from '../midnight/public-data-provider';
+import { buildPublicDataProvider, queryLedger9ContractStateAtTip } from '../midnight/public-data-provider';
 
 export {
     CLAIM_TAG,
@@ -73,6 +73,8 @@ export interface ReadPredicateStateForContractArgs {
     /** Build of the artifact to load. Without it the module at `artifactPath` is imported as is. */
     artifactDigest?: string;
     contractProvidersConfig: import('../midnight/providers').ContractProvidersConfig;
+    /** The indexer's newest block, to read the state at. Without it the latest state is read. */
+    tipHeight?: number;
     computeFieldClaimKey?: typeof computeFieldPredicateClaimKey;
     nowSeconds?: number;
 }
@@ -94,7 +96,7 @@ async function claimStateOf(args: ReadPredicateStateForContractArgs): Promise<bo
     const publicData = await buildPublicDataProvider(args.contractProvidersConfig);
     const artifact = await importArtifact(args.artifactPath, args.artifactDigest) as ContractArtifact<PredicateLedger>;
 
-    const state = await queryLedger9ContractState(publicData, args.contractAddress.toLowerCase());
+    const state = await queryLedger9ContractStateAtTip(publicData, args.contractAddress.toLowerCase(), args.tipHeight);
     if (!state) return null;
     const led = artifact.ledger(state.data);
     // An artifact without these maps is not a vault.

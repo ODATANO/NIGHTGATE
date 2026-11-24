@@ -152,7 +152,7 @@ export function parseBatchCallStages(text: string): BatchCallStage[] {
 
 /** The message repeats `calls` because the SDK may pass on only the message. */
 export class BatchCausalityError extends Error {
-    readonly code = 'BatchCausalityViolation';
+    readonly code = 'BATCH_CAUSALITY_VIOLATION';
     readonly calls: BatchCallStage[];
     constructor(message: string, calls: BatchCallStage[]) {
         super(message);
@@ -177,6 +177,11 @@ export function describeBatchSegments(tx: IntentsTx): string {
     }
 }
 
+/** What the batch code tells its caller while it orders and checks a batch. `before` and `after` list each call with its segment and stage. */
+export type BatchReport =
+    | { step: 'ordered'; before: string; after: string; stageGrouped: boolean }
+    | { step: 'gas-check'; outcome: 'skipped' | 'other-failure'; detail: string };
+
 export interface BatchOrderOptions {
     // Calls after `orderedPrefix` do not depend on each other, so they may be grouped by stage.
     independentCalls?: boolean;
@@ -185,6 +190,8 @@ export interface BatchOrderOptions {
     // The segment id each call got when it was built, in call order.
     // Calls of the same circuit are matched by it, because the merged intents come back in no fixed order.
     segmentIds?: number[];
+    // Gets what the batch code would otherwise keep to itself. Without it nothing is reported or written.
+    report?: (event: BatchReport) => void;
 }
 
 /** The intents in call order, matched by build-time segment id. Null when the ids do not fit the calls. */
@@ -290,8 +297,7 @@ export function withOrderedBatchSegments<P extends Pick<ProofProvider, 'proveTx'
                     'aborting before proving (nothing submitted) because the deterministic apply order cannot be guaranteed'
                 );
             }
-            // eslint-disable-next-line no-console -- shipped in the slim txbuilder, which has no logger
-            console.log(`[nightgate:batch-segments] rewrite${opts.independentCalls ? ' (stage-grouped)' : ''}: ${before} -> ${describeBatchSegments(tx)}`);
+            opts.report?.({ step: 'ordered', before, after: describeBatchSegments(tx), stageGrouped: opts.independentCalls === true });
             const violation = findCausalityViolation(tx);
             if (violation) {
                 const calls = batchCallStages(tx);
@@ -310,16 +316,3 @@ export function withOrderedBatchSegments<P extends Pick<ProofProvider, 'proveTx'
     return wrapped;
 }
 
-/** Wraps a proof provider so it only logs the segment ids and changes nothing. */
-export function withObservedBatchSegments<P extends Pick<ProofProvider, 'proveTx'>>(
-    proofProvider: P,
-    circuitsInOrder: string[]
-): P {
-    const wrapped: P = Object.create(proofProvider);
-    wrapped.proveTx = async (handle, ...rest) => {
-        // eslint-disable-next-line no-console -- shipped in the slim txbuilder, which has no logger
-        console.log(`[nightgate:batch-segments] OBSERVE (no rewrite) for [${circuitsInOrder.join('+')}]: ${describeBatchSegments(await ledger9Tx(handle))}`);
-        return proofProvider.proveTx(handle, ...rest);
-    };
-    return wrapped;
-}

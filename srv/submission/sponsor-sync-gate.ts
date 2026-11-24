@@ -8,7 +8,7 @@ import { configMs, configNumber } from '../utils/config';
 /**
  * How long a report stays valid: two report intervals, or the stale threshold if that is longer.
  */
-function syncReadingMaxAgeMs(): number {
+export function syncReadingMaxAgeMs(): number {
     return Math.max(configMs('NIGHTGATE_PROGRESS_WATCH_MS') * 2, configNumber('NIGHTGATE_SYNC_PROGRESS_STALE_S') * 1000);
 }
 

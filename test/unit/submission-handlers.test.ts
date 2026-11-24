@@ -28,9 +28,9 @@ const mockStartJob = vi.hoisted(() => (vi.fn(async (args: any) => {
         if (args.command) {
             let command = args.command;
             if (command && typeof command === 'object'
-                && typeof command.compiledArtifactRef === 'string'
+                && typeof command.contractName === 'string'
                 && command.artifactDigest === undefined) {
-                command = { ...command, artifactDigest: getArtifactGenerationDigest(command.compiledArtifactRef) };
+                command = { ...command, artifactDigest: getArtifactGenerationDigest(command.contractName) };
             }
             const processor = registeredProcessors.get(`${args.kind}\0${args.commandVersion}`);
             await processor?.(command, {
@@ -75,9 +75,9 @@ vi.mock('../../srv/submission/background-jobs', async (importOriginal) => ({
         // the real startJob in production).
         let command = args.command;
         if (command && typeof command === 'object'
-            && typeof command.compiledArtifactRef === 'string'
+            && typeof command.contractName === 'string'
             && command.artifactDigest === undefined) {
-            command = { ...command, artifactDigest: getArtifactGenerationDigest(command.compiledArtifactRef) };
+            command = { ...command, artifactDigest: getArtifactGenerationDigest(command.contractName) };
         }
         return processor(command, {
             ID: `child-${args.step}`, kind: args.kind, sessionId: args.parent.sessionId,
@@ -93,6 +93,7 @@ import { registerSubmissionHandlers } from '../../srv/submission/handlers';
 import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
 import { computeRecordKey } from '../../srv/submission/predicate-state';
 import { JobAdmissionBusyError } from '../../srv/submission/background-jobs';
+import { currentCommand } from '../../srv/submission/job-registry';
 import {
     SubmissionError,
     type TransactionSubmitter
@@ -100,7 +101,7 @@ import {
 import { ContractNotRegisteredError, registerContract, unregisterContract, getArtifactGenerationDigest } from '../../srv/submission/contract-registry';
 
 // Provenance stamping: startJob resolves the command's
-// compiledArtifactRef through the REGISTRY to stamp the artifact-generation
+// contractName through the REGISTRY to stamp the artifact-generation
 // digest, so the aliases the fixtures use must be registered (the resolver
 // itself stays the injected fake). The fixture artifact is any real file;
 // the digest only reads bytes.
@@ -125,10 +126,8 @@ import {
     WalletMaterialUnavailable
 } from '../../srv/submission/wallet-material-factory';
 import {
-    coerceCircuitArgs,
     loadCircuitArgTypes,
     __clearArgTypeCacheForTests,
-    CoercionError,
     type CircuitArgType
 } from '../../srv/submission/arg-coercion';
 import path from 'path';
@@ -162,7 +161,7 @@ function makeReq(data: Record<string, unknown>) {
 }
 
 const VALID_DEPLOY_ARGS = {
-    compiledArtifactRef: 'attestation-vault',
+    contractName: 'attestation-vault',
     sessionId: 'session-abc',
     initialPrivateState: { counter: 0 }
 };
@@ -170,7 +169,7 @@ const VALID_DEPLOY_ARGS = {
 const VALID_CALL_ARGS = {
     contractAddress: '0xCONTRACT',
     circuit: 'increment',
-    compiledArtifactRef: 'attestation-vault',
+    contractName: 'attestation-vault',
     sessionId: 'session-abc',
     args: '[]'
 };
@@ -214,13 +213,13 @@ describe('deployContract: argument validation', () => {
         return srv.handlers['deployContract'](req).then(() => req);
     }
 
-    test('rejects missing compiledArtifactRef', async () => {
+    test('rejects missing contractName', async () => {
         const req = await setupAndCallDeploy({ sessionId: 's', initialPrivateState: {} });
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/compiledArtifactRef/));
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractName/));
     });
 
     test('rejects missing sessionId', async () => {
-        const req = await setupAndCallDeploy({ compiledArtifactRef: 'a', initialPrivateState: {} });
+        const req = await setupAndCallDeploy({ contractName: 'a', initialPrivateState: {} });
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sessionId/));
     });
 
@@ -269,7 +268,7 @@ describe('submitContractCallBatch: argument validation', () => {
     const VALID_BATCH_ARGS = {
         contractAddress: '0xCONTRACT',
         calls: JSON.stringify([{ circuit: 'attest', args: [] }, { circuit: 'bindPassport', args: [] }]),
-        compiledArtifactRef: 'attestation-vault',
+        contractName: 'attestation-vault',
         sessionId: 'session-batch-validation'
     };
 
@@ -377,7 +376,7 @@ describe('mintFactoryToken', () => {
         });
         return { srv, tokenFactory };
     }
-    const valid = { contractAddress: FACTORY, name: 'CREDIT', amount: '1000', recipientCoinPublicKey: RECIPIENT, sessionId: 'mint-f1' };
+    const valid = { contractAddress: FACTORY, name: 'CREDIT', amount: '1000', receiverCoinPublicKey: RECIPIENT, sessionId: 'mint-f1' };
 
     beforeEach(() => { recordLearnedSpy.mockClear(); recordMintedSpy.mockClear(); });
 
@@ -391,7 +390,7 @@ describe('mintFactoryToken', () => {
             [{ ...valid, amount: '0' }, /positive/],
             [{ ...valid, amount: '1.5' }, /integer/],
             [{ ...valid, amount: '18446744073709551616' }, /Uint<64>/],
-            [{ ...valid, recipientCoinPublicKey: 'abc' }, /recipientCoinPublicKey/],
+            [{ ...valid, receiverCoinPublicKey: 'abc' }, /receiverCoinPublicKey/],
             [{ ...valid, sessionId: undefined }, /sessionId/]
         ];
         for (const [data, re] of cases) {
@@ -417,9 +416,9 @@ describe('mintFactoryToken', () => {
         const call = mockStartJob.mock.calls.at(-1)?.[0];
         expect(call).toMatchObject({
             kind: 'mintFactoryToken', sessionId: 'mint-f1', requestedBy: 'test-user', encryptCommand: true,
-            request: { contractAddress: FACTORY, name: 'CREDIT', amount: '1000', recipientCoinPublicKey: RECIPIENT, tokenType: TOKEN.tokenType },
+            request: { contractAddress: FACTORY, name: 'CREDIT', amount: '1000', receiverCoinPublicKey: RECIPIENT, tokenType: TOKEN.tokenType },
             command: {
-                op: 'call', circuit: 'mint', compiledArtifactRef: 'token-factory', contractAddress: FACTORY, mintedTokenType: TOKEN.tokenType,
+                op: 'call', circuit: 'mint', contractName: 'token-factory', contractAddress: FACTORY, mintedTokenType: TOKEN.tokenType,
                 args: [{ $bytes: Buffer.from('CREDIT').toString('hex').padEnd(64, '0') }, { $uint: '1000' }, { bytes: { $bytes: RECIPIENT } }]
             }
         });
@@ -428,7 +427,7 @@ describe('mintFactoryToken', () => {
 
     test('the pool never issues a token: a pool grant is refused, and no session is taken from the pool', async () => {
         const { srv, tokenFactory } = setup();
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1';
         try {
             // As the grant hook leaves it: the grant's session filled in, the pool placeholder as the sponsor.
             const poolGrant = makeReq({ ...valid, sponsorSessionId: PLATFORM_POOL_SENTINEL });
@@ -443,7 +442,7 @@ describe('mintFactoryToken', () => {
             expect(sessionless.reject).toHaveBeenCalledWith(400, 'sessionId is required');
             expect(tokenFactory.issuerKeyForSession).not.toHaveBeenCalled();
         } finally {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         }
     });
 
@@ -453,7 +452,7 @@ describe('mintFactoryToken', () => {
             ensureFacade: vi.fn(async () => undefined)
         }));
         const { srv, tokenFactory } = setup({ walletMaterialFactory });
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
         try {
             const asSponsor = makeReq({ ...valid, sessionId: 'pool-2' });
             await srv.handlers['mintFactoryToken'](asSponsor);
@@ -464,7 +463,7 @@ describe('mintFactoryToken', () => {
             // A job that was queued while the wallet was no sponsor yet is refused when it runs.
             const queued = registeredProcessors.get(`mintFactoryToken\0${1}`)!;
             const command = {
-                op: 'call', contractAddress: FACTORY, circuit: 'mint', compiledArtifactRef: 'token-factory',
+                op: 'call', contractAddress: FACTORY, circuit: 'mint', contractName: 'token-factory',
                 args: [{ $bytes: '00'.repeat(32) }, { $uint: '1' }, { bytes: { $bytes: RECIPIENT } }],
                 mintedTokenType: TOKEN.tokenType, artifactDigest: getArtifactGenerationDigest('token-factory')
             };
@@ -472,7 +471,7 @@ describe('mintFactoryToken', () => {
                 .rejects.toThrow(/is a fee sponsor: it pays fees and does nothing else/);
             expect(walletMaterialFactory).not.toHaveBeenCalled();
         } finally {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         }
     });
 
@@ -491,7 +490,7 @@ describe('mintFactoryToken', () => {
         const processor = registeredProcessors.get('mintFactoryToken\u00001');
         expect(processor).toBeTypeOf('function');
         const command = {
-            op: 'call', contractAddress: FACTORY, circuit: 'mint', compiledArtifactRef: 'token-factory',
+            op: 'call', contractAddress: FACTORY, circuit: 'mint', contractName: 'token-factory',
             args: [{ $bytes: '00'.repeat(32) }, { $uint: '1' }, { bytes: { $bytes: RECIPIENT } }],
             mintedTokenType: TOKEN.tokenType, artifactDigest: getArtifactGenerationDigest('token-factory')
         };
@@ -523,9 +522,59 @@ describe('mintFactoryToken', () => {
             GRANT_ROW.allowedCircuits = JSON.stringify(['mint']);
         }
     });
+
+    const burn = { contractAddress: FACTORY, name: 'CREDIT', amount: '250', sessionId: 'mint-f1' };
+
+    test('burn validates address, name, amount, issuer key and session before any wallet work', async () => {
+        const { srv, tokenFactory } = setup();
+        const cases: Array<[Record<string, unknown>, RegExp]> = [
+            [{ ...burn, contractAddress: 'zz' }, /64 hex/],
+            [{ ...burn, name: '' }, /name/],
+            [{ ...burn, amount: '0' }, /positive/],
+            [{ ...burn, issuerKey: 'abc' }, /issuerKey must be 64 hex/],
+            [{ ...burn, sessionId: undefined }, /sessionId is required/]
+        ];
+        for (const [data, re] of cases) {
+            const req = makeReq(data);
+            await srv.handlers['burnFactoryToken'](req);
+            expect(req.reject, JSON.stringify(data)).toHaveBeenCalledWith(400, expect.stringMatching(re));
+        }
+        expect(tokenFactory.describeToken).not.toHaveBeenCalled();
+        expect(mockStartJob).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'burnFactoryToken' }));
+    });
+
+    test('burn sends a fresh coin of the token to the contract, under the issuer key the caller names', async () => {
+        const { srv, tokenFactory } = setup();
+        const req = makeReq({ ...burn, issuerKey: ISSUER.toUpperCase() });
+        const out = await srv.handlers['burnFactoryToken'](req);
+        expect(req.reject).not.toHaveBeenCalled();
+        expect(tokenFactory.issuerKeyForSession).not.toHaveBeenCalled();
+        expect(tokenFactory.describeToken).toHaveBeenCalledWith({ issuerKey: ISSUER, name: 'CREDIT', contractAddress: FACTORY });
+        expect(out).toMatchObject({ name: 'CREDIT', amount: '250', issuerKey: ISSUER, domain: TOKEN.domain, tokenType: TOKEN.tokenType });
+        const call = mockStartJob.mock.calls.at(-1)?.[0];
+        expect(call).toMatchObject({
+            kind: 'burnFactoryToken', sessionId: 'mint-f1', encryptCommand: true,
+            request: { contractAddress: FACTORY, amount: '250', issuerKey: ISSUER, tokenType: TOKEN.tokenType },
+            command: { op: 'call', circuit: 'burn', contractName: 'token-factory', contractAddress: FACTORY }
+        });
+        const [domain, coin] = call.command.args;
+        expect(domain).toEqual({ $bytes: TOKEN.domain });
+        expect(coin.color).toEqual({ $bytes: TOKEN.tokenType });
+        expect(coin.value).toEqual({ $uint: '250' });
+        expect(coin.nonce.$bytes).toMatch(HEX64_RE);
+        // The nonce is new for every burn and never part of what an idempotency key compares.
+        expect(JSON.stringify(call.idempotencyPayload)).not.toContain(coin.nonce.$bytes);
+    });
+
+    test('burn without an issuer key burns a token the session itself issued', async () => {
+        const { srv, tokenFactory } = setup();
+        await srv.handlers['burnFactoryToken'](makeReq(burn));
+        expect(tokenFactory.issuerKeyForSession).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'mint-f1', expectedUserId: 'test-user' }));
+        expect(mockStartJob.mock.calls.at(-1)?.[0]).toMatchObject({ kind: 'burnFactoryToken', request: { issuerKey: ISSUER } });
+    });
 });
 
-describe('mintShieldedTestToken + deriveTokenType', () => {
+describe('deriveTokenType', () => {
     const ADDRESS = 'c8f426c52a5418f3b0acda284ee04d530a38f68ab3c701116fa42fae0e90cfd6';
 
     function setup(overrides: any = {}) {
@@ -542,51 +591,13 @@ describe('mintShieldedTestToken + deriveTokenType', () => {
         return srv;
     }
 
-    test('rejects a missing contractAddress or sessionId', async () => {
-        const srv = setup();
-        const r1 = makeReq({ sessionId: 'mint-s1' });
-        await srv.handlers['mintShieldedTestToken'](r1);
-        expect(r1.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress/));
-
-        const r2 = makeReq({ contractAddress: ADDRESS });
-        await srv.handlers['mintShieldedTestToken'](r2);
-        expect(r2.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sessionId/));
-    });
-
-    test('enqueues mint() with no arguments and defaults the artifact ref', async () => {
-        const srv = setup();
-        const req = makeReq({ contractAddress: ADDRESS, sessionId: 'mint-s2' });
-        const result = await srv.handlers['mintShieldedTestToken'](req);
-        expect(req.reject).not.toHaveBeenCalled();
-        expect(result).toEqual({ jobId: 'job-mintShieldedTestToken-test', status: 'pending' });
-        expect(mockStartJob.mock.calls.at(-1)?.[0]).toMatchObject({
-            kind: 'mintShieldedTestToken', requestedBy: 'test-user', encryptCommand: true,
-            command: { op: 'call', circuit: 'mint', compiledArtifactRef: 'shielded-token', args: [], contractAddress: ADDRESS }
-        });
-    });
-
-    test('rejects a foreign artifact ref (the result enrichment is fixture-specific)', async () => {
-        // The processor stamps the FIXTURE's domain separator and amount onto
-        // the result; a foreign mint contract would execute fine and then be
-        // reported with a wrong tokenTypeHex. Explicitly repeating the bundled
-        // name stays allowed.
-        const srv = setup();
-        const req = makeReq({ contractAddress: ADDRESS, sessionId: 'mint-s3', compiledArtifactRef: 'my-token' });
-        await srv.handlers['mintShieldedTestToken'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/only mints the bundled/));
-
-        const ok = makeReq({ contractAddress: ADDRESS, sessionId: 'mint-s4', compiledArtifactRef: 'shielded-token' });
-        await srv.handlers['mintShieldedTestToken'](ok);
-        expect(ok.reject).not.toHaveBeenCalled();
-    });
-
     test('deriveTokenType returns the token type without touching a wallet', async () => {
         const walletMaterialFactory = vi.fn();
         const srv = setup({ walletMaterialFactory });
-        const req = makeReq({ contractAddress: ADDRESS });
+        const req = makeReq({ contractAddress: ADDRESS, domainSeparator: 'example:token' });
         const out = await srv.handlers['deriveTokenType'](req) as any;
         expect(req.reject).not.toHaveBeenCalled();
-        expect(out.tokenTypeHex).toMatch(HEX64_RE);
+        expect(out.tokenType).toMatch(HEX64_RE);
         expect(out.contractAddress).toBe(ADDRESS);
         expect(walletMaterialFactory).not.toHaveBeenCalled();
     });
@@ -597,9 +608,13 @@ describe('mintShieldedTestToken + deriveTokenType', () => {
         await srv.handlers['deriveTokenType'](r1);
         expect(r1.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress/));
 
-        const r2 = makeReq({ contractAddress: 'not-an-address' });
+        const r2 = makeReq({ contractAddress: 'not-an-address', domainSeparator: 'example:token' });
         await srv.handlers['deriveTokenType'](r2);
-        expect(r2.reject).toHaveBeenCalledWith(400, expect.any(String));
+        expect(r2.reject).toHaveBeenCalledWith(400, expect.stringMatching(/rawTokenType failed/));
+
+        const r4 = makeReq({ contractAddress: ADDRESS });
+        await srv.handlers['deriveTokenType'](r4);
+        expect(r4.reject).toHaveBeenCalledWith(400, 'domainSeparator is required');
 
         const r3 = makeReq({ contractAddress: ADDRESS, domainSeparator: 'x'.repeat(40) });
         await srv.handlers['deriveTokenType'](r3);
@@ -683,7 +698,7 @@ describe('error translation to OData status codes', () => {
         const req = makeReq({
             contractAddress: '0xCONTRACT',
             calls: JSON.stringify(calls),
-            compiledArtifactRef: 'attestation-vault',
+            contractName: 'attestation-vault',
             sessionId: 'session-happy-batch'
         });
         const result = await srv.handlers['submitContractCallBatch'](req);
@@ -708,6 +723,20 @@ describe('error translation to OData status codes', () => {
         });
     });
 
+    test('submitContractCallBatch puts the call order into the idempotency payload, so a retry that changes it is a conflict', async () => {
+        const srv = setupHandlers({ submitterFactory: () => makeSuccessfulSubmitter() });
+        const payloadOf = async (independentCalls: boolean | undefined) => {
+            const req = makeReq({ contractAddress: '0xCONTRACT', calls: JSON.stringify([{ circuit: 'attest', args: [] }, { circuit: 'bindPassport', args: [] }]),
+                contractName: 'attestation-vault', sessionId: 'session-order', ...(independentCalls === undefined ? {} : { independentCalls }) });
+            await srv.handlers['submitContractCallBatch'](req);
+            return mockStartJob.mock.calls.at(-1)?.[0].idempotencyPayload;
+        };
+        const ordered = await payloadOf(undefined);
+        expect(ordered.independentCalls).toBe(false);
+        expect(await payloadOf(false)).toEqual(ordered);
+        expect((await payloadOf(true)).independentCalls).toBe(true);
+    });
+
     test('submitContractCallBatch forwards a per-call merkleProof to the submitter and the persisted command', async () => {
         const submitter = makeSuccessfulSubmitter();
         const srv = setupHandlers({ submitterFactory: () => submitter });
@@ -720,7 +749,7 @@ describe('error translation to OData status codes', () => {
                 { circuit: 'anchorContentRoot', args: [] },
                 { circuit: 'proveFieldPredicate', args: [], merkleProof: { ...proof, fieldSalt: proof.fieldSalt.toUpperCase() } }
             ]),
-            compiledArtifactRef: 'attestation-vault',
+            contractName: 'attestation-vault',
             sessionId: 'session-happy-batch-proof'
         });
         await srv.handlers['submitContractCallBatch'](req);
@@ -744,7 +773,7 @@ describe('error translation to OData status codes', () => {
         const req = makeReq({
             contractAddress: '0xCONTRACT',
             calls: JSON.stringify([{ circuit: 'proveDocumentComparison', args: [], merkleProof: { docPair } }]),
-            compiledArtifactRef: 'attestation-vault',
+            contractName: 'attestation-vault',
             sessionId: 'session-happy-batch-docpair'
         });
         await srv.handlers['submitContractCallBatch'](req);
@@ -762,7 +791,7 @@ describe('error translation to OData status codes', () => {
         expect(finalizer).toBeDefined();
         const result: any = await finalizer!(
             {
-                op: 'callBatch', contractAddress: '0xCONTRACT', compiledArtifactRef: 'attestation-vault',
+                op: 'callBatch', contractAddress: '0xCONTRACT', contractName: 'attestation-vault',
                 calls: [{ circuit: 'attest', args: [] }, { circuit: 'bindPassport', args: [] }],
                 sponsorSessionId: 'sponsor-1', artifactDigest: getArtifactGenerationDigest('attestation-vault')
             },
@@ -785,7 +814,7 @@ describe('error translation to OData status codes', () => {
         const processor = registeredProcessors.get(`submitContractCallBatch\0${1}`);
         expect(processor).toBeDefined();
         await expect(processor!(
-            { op: 'call', contractAddress: '0xC', circuit: 'attest', compiledArtifactRef: 'attestation-vault', args: [] },
+            { op: 'call', contractAddress: '0xC', circuit: 'attest', contractName: 'attestation-vault', args: [] },
             { ID: 'job-x', kind: 'submitContractCallBatch', sessionId: 's', requestedBy: 'u', commandVersion: 1 }
         )).rejects.toThrow(/incompatible with submitContractCallBatch/);
     });
@@ -801,7 +830,7 @@ describe('error translation to OData status codes', () => {
         });
         const processor = registeredProcessors.get(`submitContractCall\0${1}`);
         await expect(processor!(
-            { op: 'call', contractAddress: '0xC', circuit: 'attest', compiledArtifactRef: 'attestation-vault', args: [], artifactDigest: getArtifactGenerationDigest('attestation-vault') },
+            { op: 'call', contractAddress: '0xC', circuit: 'attest', contractName: 'attestation-vault', args: [], artifactDigest: getArtifactGenerationDigest('attestation-vault') },
             { ID: 'job-g', kind: 'submitContractCall', sessionId: 's', requestedBy: 'u', commandVersion: 1, grantId: 'grant-1' }
         )).rejects.toMatchObject({ code: 'AGENT_GRANT_REVOKED', retryable: false });
         expect(submitter.call).not.toHaveBeenCalled();
@@ -818,7 +847,7 @@ describe('error translation to OData status codes', () => {
         });
         const processor = registeredProcessors.get(`submitContractCall\0${1}`);
         await expect(processor!(
-            { op: 'call', contractAddress: '0xC', circuit: 'attest', compiledArtifactRef: 'attestation-vault', args: [], artifactDigest: getArtifactGenerationDigest('attestation-vault') },
+            { op: 'call', contractAddress: '0xC', circuit: 'attest', contractName: 'attestation-vault', args: [], artifactDigest: getArtifactGenerationDigest('attestation-vault') },
             { ID: 'job-g2', kind: 'submitContractCall', sessionId: 's', requestedBy: 'u', commandVersion: 1, grantId: 'grant-1' }
         )).rejects.toMatchObject({ code: 'AGENT_GRANT_SCOPE', retryable: false });
         expect(submitter.call).not.toHaveBeenCalled();
@@ -851,13 +880,13 @@ describe('error translation to OData status codes', () => {
         expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'CONTRACT_NOT_REGISTERED', message: expect.stringMatching(/not registered/) }));
     });
 
-    test('SessionNotFoundError → 401', async () => {
+    test('SessionNotFoundError → 404', async () => {
         const srv = setupHandlers({
             walletMaterialFactory: vi.fn(async () => { throw new SessionNotFoundError('s'); })
         });
-        const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-401' });
+        const req = makeReq({ ...VALID_DEPLOY_ARGS, sessionId: 'session-404' });
         await srv.handlers['deployContract'](req);
-        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 401, code: 'SESSION_NOT_FOUND', message: expect.stringMatching(/not found/) }));
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'SESSION_NOT_FOUND', message: expect.stringMatching(/not found/) }));
     });
 
     test('WalletMaterialUnavailable → 501', async () => {
@@ -956,14 +985,14 @@ describe('rate limiting', () => {
 describe('anchorDocument', () => {
     const VALID_SHA256 = 'a'.repeat(64);
     const VALID_ANCHOR_ARGS = () => ({
-        sha256: VALID_SHA256,
+        payloadHash: VALID_SHA256,
         contentType: 'application/pdf',
         size: 1024,
         storageRef: 'file:///tmp/doc.pdf',
         metadata: '{"type":"demo"}',
         sessionId: `anchor-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
+        contractName: 'attestation-vault'
     });
 
     function makeFakeDb() {
@@ -988,11 +1017,11 @@ describe('anchorDocument', () => {
         return { srv, db };
     }
 
-    test('rejects missing sha256', async () => {
+    test('rejects missing payloadHash', async () => {
         const { srv } = setupHandlersWithDb();
-        const req = makeReq({ ...VALID_ANCHOR_ARGS(), sha256: undefined });
+        const req = makeReq({ ...VALID_ANCHOR_ARGS(), payloadHash: undefined });
         await srv.handlers['anchorDocument'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sha256/));
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash/));
     });
 
     test('rejects missing storageRef', async () => {
@@ -1034,12 +1063,15 @@ describe('anchorDocument', () => {
         const result: any = await srv.handlers['anchorDocument'](req);
 
         expect(req.reject).not.toHaveBeenCalled();
-        expect(result).toEqual({ jobId: 'job-anchorDocument-test', status: 'pending', documentId: expect.any(String), attesterId: ATTESTER_ID });
+        expect(result).toEqual({ jobId: 'job-anchorDocument-test', status: 'pending', anchorId: expect.any(String), attesterId: ATTESTER_ID });
         const started = mockStartJob.mock.calls.at(-1)![0];
         expect(started.kind).toBe('anchorDocument');
         expect(started.command).toMatchObject({ op: 'anchorDocument', attesterId: ATTESTER_ID, payloadHash: VALID_SHA256 });
         expect(started.request).toMatchObject({ attesterId: ATTESTER_ID });
         expect(started.request).not.toHaveProperty('producedAt');
+        // What the row stores belongs to the request, so a retry that changes it is a conflict, not the first job.
+        const args = VALID_ANCHOR_ARGS();
+        expect(started.idempotencyPayload).toMatchObject({ storageRef: args.storageRef, contentType: args.contentType ?? null, size: args.size ?? null });
 
         // INSERT with the attester id (sync) + anchoredTxHash UPDATE (executor) = 2 db.run calls.
         expect(db.run).toHaveBeenCalledTimes(2);
@@ -1065,20 +1097,35 @@ describe('anchorDocument', () => {
         db.run.mockClear();
         const finalizer = registeredFinalizers.get('anchorDocument\0' + '1')!;
         const result = await runFinalizer(finalizer, {
-            op: 'anchorDocument', documentId: 'doc-reconciled', payloadHash: VALID_SHA256,
-            metadataHash: 'b'.repeat(64), contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            op: 'anchorDocument', anchorId: 'doc-reconciled', payloadHash: VALID_SHA256,
+            metadataHash: 'b'.repeat(64), contractAddress: '0xVAULT', contractName: 'attestation-vault',
             artifactDigest: getArtifactGenerationDigest('attestation-vault')
         }, {}, { txHash: '0xanchor', finalizedAt: '2026-07-22T10:00:00Z' }, db);
 
         expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('doc-reconciled');
         expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('0xanchor');
-        expect(result).toMatchObject({ reconciled: true, documentId: 'doc-reconciled', txHash: '0xanchor' });
+        expect(result).toMatchObject({ reconciled: true, anchorId: 'doc-reconciled', txHash: '0xanchor' });
     });
 
-    test('defaults compiledArtifactRef to attestation-vault when omitted', async () => {
+    test('a command stored by an older version names the anchor documentId and is settled the same way', async () => {
+        const { db } = setupHandlersWithDb();
+        db.run.mockClear();
+        const finalizer = registeredFinalizers.get('anchorDocument\0' + '1')!;
+        const result = await runFinalizer(finalizer, currentCommand({
+            op: 'anchorDocument', documentId: 'doc-stored', payloadHash: VALID_SHA256,
+            metadataHash: 'b'.repeat(64), contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            artifactDigest: getArtifactGenerationDigest('attestation-vault')
+        }), {}, { txHash: '0xanchor', finalizedAt: '2026-07-22T10:00:00Z' }, db);
+
+        expect(JSON.stringify(db.run.mock.calls[0][0])).toContain('doc-stored');
+        expect(result).toMatchObject({ reconciled: true, anchorId: 'doc-stored' });
+        expect(result).not.toHaveProperty('documentId');
+    });
+
+    test('defaults contractName to attestation-vault when omitted', async () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
-        const req = makeReq({ ...VALID_ANCHOR_ARGS(), compiledArtifactRef: undefined });
+        const req = makeReq({ ...VALID_ANCHOR_ARGS(), contractName: undefined });
         await srv.handlers['anchorDocument'](req);
         expect(req.reject).not.toHaveBeenCalled();
         const callArgs = (submitter.call as Mock).mock.calls[0][0];
@@ -1160,34 +1207,34 @@ describe('verifyDocument', () => {
         return srv;
     }
 
-    test('rejects missing documentId', async () => {
+    test('rejects missing anchorId', async () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([]));
-        const req = makeReq({ providedSha256: VALID_SHA });
+        const req = makeReq({ payloadHash: VALID_SHA });
         await srv.handlers['verifyDocument'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/documentId/));
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/anchorId/));
     });
 
-    test('rejects missing providedSha256', async () => {
+    test('rejects missing payloadHash', async () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([]));
-        const req = makeReq({ documentId: DOC_ID });
+        const req = makeReq({ anchorId: DOC_ID });
         await srv.handlers['verifyDocument'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/providedSha256/));
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash/));
     });
 
     test('404 when document not found', async () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([undefined]));
-        const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: VALID_SHA });
         await srv.handlers['verifyDocument'](req);
         expect(req.reject).toHaveBeenCalledWith(404, expect.stringMatching(/not found/));
     });
 
     test('hash matches + anchored + tx status SUCCESS without a live read: included, not verified', async () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([
-            { ID: DOC_ID, sha256: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' },
+            { ID: DOC_ID, payloadHash: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' },
             { ID: TX_ID, hash: TX_HASH },
             { status: 'SUCCESS', outcomeSource: 'substrate-system-events' }
         ]));
-        const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: VALID_SHA });
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(req.reject).not.toHaveBeenCalled();
         // No recorded vault, no caller vault: nothing to read live state for.
@@ -1198,19 +1245,19 @@ describe('verifyDocument', () => {
             stateChecked: false,
             anchoredTxHash: TX_HASH,
             anchoredAt: '2026-05-19T12:00:00Z',
-            originalSha256: VALID_SHA
+            payloadHash: VALID_SHA
         });
     });
 
     test('verified: false when provided hash differs (tampered)', async () => {
         const tampered = 'b'.repeat(64);
         const srv = setupHandlersWithDb(makeDbWithSequence([
-            { ID: DOC_ID, sha256: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' }
+            { ID: DOC_ID, payloadHash: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' }
         ]));
-        const req = makeReq({ documentId: DOC_ID, providedSha256: tampered });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: tampered });
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(result.verified).toBe(false);
-        expect(result.originalSha256).toBe('');
+        expect(result.payloadHash).toBe('');
         // Skips the tx lookup when hash mismatched: only 1 db.run, not 3.
         // (We can't easily assert call count without exposing the db here,
         //  but the result coming back is enough proof the short-circuit fired.)
@@ -1218,9 +1265,9 @@ describe('verifyDocument', () => {
 
     test('verified: false when not yet anchored (no txHash)', async () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([
-            { ID: DOC_ID, sha256: VALID_SHA, anchoredTxHash: null, anchoredAt: null }
+            { ID: DOC_ID, payloadHash: VALID_SHA, anchoredTxHash: null, anchoredAt: null }
         ]));
-        const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: VALID_SHA });
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(result).toEqual({
             verified: false,
@@ -1228,41 +1275,41 @@ describe('verifyDocument', () => {
             stateChecked: false,
             anchoredTxHash: '',
             anchoredAt: null,
-            originalSha256: VALID_SHA
+            payloadHash: VALID_SHA
         });
     });
 
     test('verified: false when tx exists but status is not SUCCESS', async () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([
-            { ID: DOC_ID, sha256: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' },
+            { ID: DOC_ID, payloadHash: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' },
             { ID: TX_ID, hash: TX_HASH },
             { status: 'FAILURE' }
         ]));
-        const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: VALID_SHA });
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(result.verified).toBe(false);
     });
 
     test('verified: false when tx is not yet indexed (crawler lag)', async () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([
-            { ID: DOC_ID, sha256: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' },
+            { ID: DOC_ID, payloadHash: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' },
             undefined // no Transactions row yet
         ]));
-        const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: VALID_SHA });
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(result.verified).toBe(false);
     });
 
     test('hash comparison is case-insensitive', async () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([
-            { ID: DOC_ID, sha256: VALID_SHA.toLowerCase(), anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' },
+            { ID: DOC_ID, payloadHash: VALID_SHA.toLowerCase(), anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z' },
             { ID: TX_ID, hash: TX_HASH },
             { status: 'SUCCESS', outcomeSource: 'substrate-system-events' }
         ]));
-        const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA.toUpperCase() });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: VALID_SHA.toUpperCase() });
         const result: any = await srv.handlers['verifyDocument'](req);
         // The upper-cased hash still matches: the tx lookup ran and reported inclusion.
-        expect(result).toMatchObject({ included: true, originalSha256: VALID_SHA.toLowerCase() });
+        expect(result).toMatchObject({ included: true, payloadHash: VALID_SHA.toLowerCase() });
     });
 
     // Evidence binding: the recorded anchoring vault is
@@ -1270,9 +1317,9 @@ describe('verifyDocument', () => {
     // same public hash must not turn the document verified.
     test('rejects a caller contractAddress that differs from the recorded anchoring vault', async () => {
         const srv = setupHandlersWithDb(makeDbWithSequence([
-            { ID: DOC_ID, sha256: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z', contractAddress: 'aa'.repeat(32) }
+            { ID: DOC_ID, payloadHash: VALID_SHA, anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z', contractAddress: 'aa'.repeat(32) }
         ]));
-        const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA, contractAddress: 'bb'.repeat(32) });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: VALID_SHA, contractAddress: 'bb'.repeat(32) });
         await srv.handlers['verifyDocument'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/does not match the vault/));
     });
@@ -1280,11 +1327,11 @@ describe('verifyDocument', () => {
     test('accepts a caller contractAddress that CONFIRMS the recorded vault (case-insensitive)', async () => {
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'x' }));
         const srv = setupHandlersWithDb(makeDbWithSequence([
-            { ID: DOC_ID, sha256: VALID_SHA, attesterId: 'ab'.repeat(32), anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z', contractAddress: 'aa'.repeat(32) },
+            { ID: DOC_ID, payloadHash: VALID_SHA, attesterId: 'ab'.repeat(32), anchoredTxHash: TX_HASH, anchoredAt: '2026-05-19T12:00:00Z', contractAddress: 'aa'.repeat(32) },
             { ID: TX_ID, hash: TX_HASH },
             { status: 'SUCCESS', outcomeSource: 'substrate-system-events' }
         ]), { attestationStateReader: reader, resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })) });
-        const req = makeReq({ documentId: DOC_ID, providedSha256: VALID_SHA, contractAddress: 'AA'.repeat(32) });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: VALID_SHA, contractAddress: 'AA'.repeat(32) });
         const result: any = await srv.handlers['verifyDocument'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toMatchObject({ verified: true, included: true, stateChecked: true });
@@ -1312,7 +1359,7 @@ describe('verifyPredicateAttestation', () => {
         return srv;
     }
     const provenRow = () => ({
-        ID: PA_ID, predicate: 'lessOrEqual', threshold: 50000, unit: 'kgCO2e/kWh',
+        ID: PA_ID, predicate: 'lessOrEqual', threshold: '50000', unit: 'kgCO2e/kWh',
         valueCommitment: 'c'.repeat(64), provenTxHash: TX_HASH, provenAt: '2026-05-29T10:00:00Z'
     });
 
@@ -1340,7 +1387,7 @@ describe('verifyPredicateAttestation', () => {
         const result: any = await srv.handlers['verifyPredicateAttestation'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toMatchObject({
-            verified: false, included: true, stateChecked: false, predicate: 'lessOrEqual', threshold: 50000,
+            verified: false, included: true, stateChecked: false, predicate: 'lessOrEqual', threshold: '50000',
             unit: 'kgCO2e/kWh', provenTxHash: TX_HASH
         });
     });
@@ -1377,7 +1424,7 @@ describe('grantDisclosure', () => {
         level: 1,
         sessionId: `disc-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
+        contractName: 'attestation-vault'
     });
 
     function makeFakeDb() {
@@ -1499,10 +1546,10 @@ describe('grantDisclosure', () => {
         expect(where).not.toContain('"<"');
     });
 
-    test('defaults compiledArtifactRef to attestation-vault', async () => {
+    test('defaults contractName to attestation-vault', async () => {
         const resolveContractImpl = vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE }));
         const { srv } = setupHandlersWithDb({ resolveContractImpl });
-        await srv.handlers['grantDisclosure'](makeReq({ ...VALID_ARGS(), compiledArtifactRef: undefined }));
+        await srv.handlers['grantDisclosure'](makeReq({ ...VALID_ARGS(), contractName: undefined }));
         expect(resolveContractImpl).toHaveBeenCalledWith('attestation-vault');
     });
 
@@ -1522,7 +1569,7 @@ describe('grantDisclosure', () => {
         reindexer.mockClear();
         const result = await runFinalizer(registeredFinalizers.get('grantDisclosure\0' + '1')!, {
             op: 'grantDisclosure', disclosureGrantId: 'grant-reconciled', payloadHash: VALID_PAYLOAD,
-            grantee: VALID_GRANTEE, level: 2, contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            grantee: VALID_GRANTEE, level: 2, contractAddress: '0xVAULT', contractName: 'attestation-vault',
             artifactDigest: getArtifactGenerationDigest('attestation-vault')
         }, {}, { txHash: '0xgrant', finalizedAt: null }, db);
 
@@ -1627,7 +1674,7 @@ describe('grantDisclosure', () => {
                 sessionId: expect.any(String),
                 idempotencyKey: expect.stringMatching(/^reindex:0xvault:tip:job-test$/),
                 encryptCommand: false,
-                command: { op: 'reindexDisclosures', contractAddress: expect.stringMatching(/^0xvault$/i), compiledArtifactRef: 'attestation-vault', atHeight: null }
+                command: { op: 'reindexDisclosures', contractAddress: expect.stringMatching(/^0xvault$/i), contractName: 'attestation-vault', atHeight: null }
             });
         } finally {
             delete process.env.NIGHTGATE_DISCLOSURE_REINDEX_RETRY_MS;
@@ -1643,7 +1690,7 @@ describe('grantDisclosure', () => {
             setupHandlersWithDb({ disclosureReindexer: reindexer });
             const processor = registeredProcessors.get(`reindexDisclosures\0${1}`);
             const result = await processor!(
-                { op: 'reindexDisclosures', contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault', atHeight: 700, artifactDigest: getArtifactGenerationDigest('attestation-vault') },
+                { op: 'reindexDisclosures', contractAddress: '0xVAULT', contractName: 'attestation-vault', atHeight: 700, artifactDigest: getArtifactGenerationDigest('attestation-vault') },
                 { ID: 'job-r', kind: 'reindexDisclosures', sessionId: 's', requestedBy: 'u', commandVersion: 1 }
             );
             expect(result).toEqual({ reindexed: true, attempts: 2, indexed: 3, deactivated: 1, snapshotHeight: 700 });
@@ -1661,7 +1708,7 @@ describe('grantDisclosure', () => {
             setupHandlersWithDb({ disclosureReindexer: reindexer });
             const processor = registeredProcessors.get(`reindexDisclosures\0${1}`);
             await expect(processor!(
-                { op: 'reindexDisclosures', contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault', atHeight: null, artifactDigest: getArtifactGenerationDigest('attestation-vault') },
+                { op: 'reindexDisclosures', contractAddress: '0xVAULT', contractName: 'attestation-vault', atHeight: null, artifactDigest: getArtifactGenerationDigest('attestation-vault') },
                 { ID: 'job-r2', kind: 'reindexDisclosures', sessionId: 's', requestedBy: 'u', commandVersion: 1 }
             )).rejects.toMatchObject({ code: 'DISCLOSURE_REINDEX_FAILED', retryable: false });
             expect(reindexer).toHaveBeenCalledTimes(1);
@@ -1700,7 +1747,7 @@ describe('revokeDisclosure', () => {
         grantee: VALID_GRANTEE,
         sessionId: `revk-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
+        contractName: 'attestation-vault'
     });
 
     function setupHandlersWithDb(overrides: any = {}) {
@@ -1727,7 +1774,7 @@ describe('revokeDisclosure', () => {
         db.run.mockClear();
         const result = await runFinalizer(registeredFinalizers.get('revokeDisclosure\0' + '1')!, {
             op: 'revokeDisclosure', payloadHash: VALID_PAYLOAD, grantee: VALID_GRANTEE,
-            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            contractAddress: '0xVAULT', contractName: 'attestation-vault',
             artifactDigest: getArtifactGenerationDigest('attestation-vault')
         }, {}, { txHash: '0xrevoke', finalizedAt: null }, db);
 
@@ -1767,17 +1814,17 @@ describe('revokeDisclosure', () => {
     });
 });
 
-// ---- registerPassport (registrar passport pre-registration) ---------------
+// ---- registerDocument: the registrar assigns a document id to an owner ----
 
-describe('registerPassport', () => {
+describe('registerDocument', () => {
     const VALID_PASSPORT = 'c'.repeat(64);
     const VALID_OWNER = 'd'.repeat(64);
     const VALID_ARGS = () => ({
-        passportId: VALID_PASSPORT,
+        documentId: VALID_PASSPORT,
         ownerId: VALID_OWNER,
         sessionId: `regp-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
+        contractName: 'attestation-vault'
     });
 
     function setupHandlersWithDb(overrides: any = {}) {
@@ -1800,26 +1847,26 @@ describe('registerPassport', () => {
     test('rejects missing ownerId', async () => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ARGS(), ownerId: undefined });
-        await srv.handlers['registerPassport'](req);
+        await srv.handlers['registerDocument'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/ownerId is required/));
     });
 
     test('rejects missing sessionId', async () => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ARGS(), sessionId: undefined });
-        await srv.handlers['registerPassport'](req);
+        await srv.handlers['registerDocument'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/sessionId is required/));
     });
 
-    test('happy path: single registerPassport call, no projection writes; returns { jobId, status }', async () => {
+    test('happy path: single registerDocument call, no projection writes; returns { jobId, status }', async () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS());
 
-        const result: any = await srv.handlers['registerPassport'](req);
+        const result: any = await srv.handlers['registerDocument'](req);
 
         expect(req.reject).not.toHaveBeenCalled();
-        expect(result).toEqual({ jobId: 'job-registerPassport-test', status: 'pending' });
+        expect(result).toEqual({ jobId: 'job-registerDocument-test', status: 'pending' });
 
         // No DB projection for passport ownership; the chain is the source of truth.
         expect(db.run).not.toHaveBeenCalled();
@@ -1835,14 +1882,28 @@ describe('registerPassport', () => {
 
     test('reconciliation finalizer rebuilds the documented result from evidence', async () => {
         setupHandlersWithDb();
-        const result = await registeredFinalizers.get('registerPassport\0' + '1')!({
-            op: 'registerPassport', passportId: VALID_PASSPORT, ownerId: VALID_OWNER,
-            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+        const result = await registeredFinalizers.get('registerDocument\0' + '1')!({
+            op: 'registerDocument', documentId: VALID_PASSPORT, ownerId: VALID_OWNER,
+            contractAddress: '0xVAULT', contractName: 'attestation-vault',
             artifactDigest: getArtifactGenerationDigest('attestation-vault')
         }, {}, { txHash: '0xregister', finalizedAt: null });
 
         expect(result).toEqual({
-            reconciled: true, passportId: VALID_PASSPORT, documentId: VALID_PASSPORT, ownerId: VALID_OWNER, mode: 0,
+            reconciled: true, documentId: VALID_PASSPORT, ownerId: VALID_OWNER, mode: 0,
+            contractAddress: '0xVAULT', txHash: '0xregister'
+        });
+    });
+
+    test('a command stored by an older version names the id passportId and gives the same result', async () => {
+        setupHandlersWithDb();
+        const result = await registeredFinalizers.get('registerDocument\0' + '1')!(currentCommand({
+            op: 'registerPassport', passportId: VALID_PASSPORT, ownerId: VALID_OWNER,
+            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            artifactDigest: getArtifactGenerationDigest('attestation-vault')
+        }), {}, { txHash: '0xregister', finalizedAt: null });
+
+        expect(result).toEqual({
+            reconciled: true, documentId: VALID_PASSPORT, ownerId: VALID_OWNER, mode: 0,
             contractAddress: '0xVAULT', txHash: '0xregister'
         });
     });
@@ -1851,9 +1912,9 @@ describe('registerPassport', () => {
         const reindexer = vi.fn().mockResolvedValue({ indexed: 0, deactivated: 0 });
         const { db } = setupHandlersWithDb({ disclosureReindexer: reindexer });
         const payload = 'e'.repeat(64);
-        const result = await runFinalizer(registeredFinalizers.get('retract\0' + '1')!, {
+        const result = await runFinalizer(registeredFinalizers.get('retractAttestation\0' + '1')!, {
             op: 'retract', mode: 0, key: payload,
-            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            contractAddress: '0xVAULT', contractName: 'attestation-vault',
             artifactDigest: getArtifactGenerationDigest('attestation-vault')
         }, {}, { txHash: '0xretract', finalizedAt: null, blockHeight: 700 }, db);
         expect(result).toEqual({ reconciled: true, mode: 0, key: payload, contractAddress: '0xVAULT', txHash: '0xretract' });
@@ -1861,7 +1922,7 @@ describe('registerPassport', () => {
         const q: any = (db.run as Mock).mock.calls[0][0];
         expect(q.UPDATE).toBeDefined();
         const json = JSON.stringify(q.UPDATE);
-        expect(json).toContain('"active":false');
+        expect(json).toContain('"isActive":false');
         expect(json).toContain('0xretract');
         expect(json).toContain(payload);
         // The projection follows the ledger, whatever the guarded write could touch.
@@ -1870,13 +1931,72 @@ describe('registerPassport', () => {
 
     test('retract finalizer for an expired-claim purge (mode 1) writes nothing', async () => {
         const { db } = setupHandlersWithDb();
-        const result = await registeredFinalizers.get('retract\0' + '1')!({
+        const result = await registeredFinalizers.get('purgeExpired\0' + '1')!({
             op: 'retract', mode: 1, key: 'f'.repeat(64),
-            contractAddress: '0xVAULT', compiledArtifactRef: 'attestation-vault',
+            contractAddress: '0xVAULT', contractName: 'attestation-vault',
             artifactDigest: getArtifactGenerationDigest('attestation-vault')
         }, {}, { txHash: '0xpurge', finalizedAt: null });
         expect(result).toMatchObject({ reconciled: true, mode: 1 });
         expect(db.run).not.toHaveBeenCalled();
+    });
+
+    test('a mode outside 0 to 4 is refused before any wallet work', async () => {
+        const walletMaterialFactory = vi.fn();
+        const { srv } = setupHandlersWithDb({ walletMaterialFactory });
+        const req = makeReq({ ...VALID_ARGS(), mode: 5 });
+        await srv.handlers['registerDocument'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/^mode must be 0 \(register\)/));
+        expect(walletMaterialFactory).not.toHaveBeenCalled();
+    });
+
+    test('an unregister sends no owner and a registrar change sends no document id, both as zeros', async () => {
+        const { srv } = setupHandlersWithDb();
+        await srv.handlers['registerDocument'](makeReq({ ...VALID_ARGS(), mode: 1, ownerId: undefined }));
+        expect(mockStartJob.mock.calls.at(-1)?.[0].command).toMatchObject({ mode: 1, documentId: VALID_PASSPORT, ownerId: '00'.repeat(32) });
+        await srv.handlers['registerDocument'](makeReq({ ...VALID_ARGS(), mode: 2, documentId: undefined, ownerId: 'AB'.repeat(32) }));
+        expect(mockStartJob.mock.calls.at(-1)?.[0]).toMatchObject({
+            kind: 'registerDocument',
+            request: { mode: 2, documentId: '00'.repeat(32), ownerId: 'ab'.repeat(32), contractAddress: '0xvault' }
+        });
+    });
+
+    test('retractAttestation needs the payload hash and removes the session\'s own record', async () => {
+        // Only the stored job matters here; the processor stops at the submit.
+        const { srv } = setupHandlersWithDb({ submitterFactory: () => ({ ...makeSuccessfulSubmitter(), call: vi.fn(async () => { throw new Error('not sent in this test'); }) }) });
+        const missing = makeReq({ sessionId: 's1', contractAddress: '0xVAULT' });
+        await srv.handlers['retractAttestation'](missing);
+        expect(missing.reject).toHaveBeenCalledWith(400, 'payloadHash is required');
+
+        const noVault = makeReq({ sessionId: 's1', payloadHash: 'EE'.repeat(32) });
+        await srv.handlers['retractAttestation'](noVault);
+        expect(noVault.reject).toHaveBeenCalledWith(400, 'contractAddress is required');
+
+        await srv.handlers['retractAttestation'](makeReq({ sessionId: 's1', payloadHash: 'EE'.repeat(32), contractAddress: '0xVAULT' }));
+        expect(mockStartJob.mock.calls.at(-1)?.[0]).toMatchObject({
+            kind: 'retractAttestation',
+            request: { mode: 0, key: 'ee'.repeat(32), contractAddress: '0xvault' },
+            command: { op: 'retract', mode: 0, key: 'ee'.repeat(32), attesterId: ATTESTER_ID }
+        });
+    });
+
+    test('purgeExpired takes only claims, needs a key and names no attester', async () => {
+        const { srv } = setupHandlersWithDb();
+        const wrongKind = makeReq({ kind: 'attestation', key: 'f'.repeat(64), sessionId: 's1', contractAddress: '0xVAULT' });
+        await srv.handlers['purgeExpired'](wrongKind);
+        expect(wrongKind.reject).toHaveBeenCalledWith(400, "kind must be 'claim'");
+
+        const noKey = makeReq({ kind: 'claim', sessionId: 's1', contractAddress: '0xVAULT' });
+        await srv.handlers['purgeExpired'](noKey);
+        expect(noKey.reject).toHaveBeenCalledWith(400, 'key is required');
+
+        const noSession = makeReq({ kind: 'claim', key: 'f'.repeat(64), contractAddress: '0xVAULT' });
+        await srv.handlers['purgeExpired'](noSession);
+        expect(noSession.reject).toHaveBeenCalledWith(400, 'sessionId is required');
+
+        await srv.handlers['purgeExpired'](makeReq({ kind: 'claim', key: 'F'.repeat(64), sessionId: 's1', contractAddress: '0xVAULT' }));
+        const call = mockStartJob.mock.calls.at(-1)?.[0];
+        expect(call).toMatchObject({ kind: 'purgeExpired', request: { mode: 1, key: 'f'.repeat(64) }, command: { op: 'retract', mode: 1 } });
+        expect(call.command.attesterId).toBeUndefined();
     });
 });
 
@@ -1982,79 +2102,6 @@ describe('registerGranteeIdentity', () => {
 // contract-info.json introspection (against the real shipped artifact), and the
 // handler wiring + 400s.
 
-describe('arg-coercion: coerceCircuitArgs (pure)', () => {
-    const BYTES32: CircuitArgType = { name: 'h', kind: 'Bytes', length: 32 };
-    const UINT8: CircuitArgType = { name: 'n', kind: 'Uint', maxval: 255 };
-
-    test('hex string → Uint8Array(32) when param is Bytes<32>', () => {
-        const hex = 'ab'.repeat(32);
-        const [out] = coerceCircuitArgs([hex], [BYTES32]);
-        expect(out).toBeInstanceOf(Uint8Array);
-        expect((out as Uint8Array).length).toBe(32);
-        expect((out as Uint8Array)[0]).toBe(0xab);
-    });
-
-    test('0x-prefixed hex is accepted', () => {
-        const [out] = coerceCircuitArgs(['0x' + 'cd'.repeat(32)], [BYTES32]);
-        expect((out as Uint8Array).length).toBe(32);
-        expect((out as Uint8Array)[0]).toBe(0xcd);
-    });
-
-    test('number[] → Uint8Array when param is Bytes<N>', () => {
-        const arr = Array.from({ length: 32 }, (_, i) => i);
-        const [out] = coerceCircuitArgs([arr], [BYTES32]);
-        expect(out).toBeInstanceOf(Uint8Array);
-        expect(Array.from(out as Uint8Array)).toEqual(arr);
-    });
-
-    test('number → BigInt when param is Uint', () => {
-        const [out] = coerceCircuitArgs([7], [UINT8]);
-        expect(out).toBe(7n);
-    });
-
-    test('decimal string → BigInt when param is Uint', () => {
-        const [out] = coerceCircuitArgs(['200'], [UINT8]);
-        expect(out).toBe(200n);
-    });
-
-    test('tagged { $bytes } → Uint8Array even with no metadata', () => {
-        const [out] = coerceCircuitArgs([{ $bytes: 'ff'.repeat(4) }], undefined);
-        expect(out).toBeInstanceOf(Uint8Array);
-        expect(Array.from(out as Uint8Array)).toEqual([255, 255, 255, 255]);
-    });
-
-    test('tagged { $uint } → BigInt even with no metadata', () => {
-        const [out] = coerceCircuitArgs([{ $uint: '47300' }], undefined);
-        expect(out).toBe(47300n);
-    });
-
-    test('no metadata + untagged → CoercionError (strict, no silent passthrough)', () => {
-        expect(() => coerceCircuitArgs([5], undefined)).toThrow(/could not determine the circuit parameter type/);
-        // …but tagged values and empty arg lists still work without metadata.
-        expect(coerceCircuitArgs([], undefined)).toEqual([]);
-        expect(coerceCircuitArgs([{ $uint: '5' }], undefined)).toEqual([5n]);
-    });
-
-    test('invalid hex → CoercionError with index', () => {
-        expect(() => coerceCircuitArgs(['zz'.repeat(32)], [BYTES32])).toThrow(CoercionError);
-        try { coerceCircuitArgs(['aa'.repeat(32), 'zz'.repeat(32)], [BYTES32, BYTES32]); }
-        catch (e) { expect((e as CoercionError).index).toBe(1); }
-    });
-
-    test('wrong byte length → CoercionError', () => {
-        expect(() => coerceCircuitArgs(['ab'.repeat(16)], [BYTES32]))
-            .toThrow(/expected 32 bytes/);
-    });
-
-    test('Uint over declared maxval → CoercionError', () => {
-        expect(() => coerceCircuitArgs([256], [UINT8])).toThrow(/exceeds maximum 255/);
-    });
-
-    test('negative Uint → CoercionError', () => {
-        expect(() => coerceCircuitArgs([-1], [UINT8])).toThrow(/non-negative/);
-    });
-});
-
 describe('arg-coercion: loadCircuitArgTypes (real attestation-vault artifact)', () => {
     const VAULT_ZK = resolveContractPackage('@odatano/contract-attestation-vault', path.resolve(__dirname, '..', '..')).zkConfigPath;
 
@@ -2072,14 +2119,6 @@ describe('arg-coercion: loadCircuitArgTypes (real attestation-vault artifact)', 
         const types = loadCircuitArgTypes(VAULT_ZK, 'grantDisclosure');
         expect(types?.map((t) => t.kind)).toEqual(['Bytes', 'Bytes', 'Uint']);
         expect(types?.[2].maxval).toBe(255);
-    });
-
-    test('unknown circuit is refused and the message names the real ones', () => {
-        expect(() => loadCircuitArgTypes(VAULT_ZK, 'noSuchCircuit')).toThrow(/"noSuchCircuit" is not a circuit of this contract; it has: .*\battest\b/);
-    });
-
-    test('missing contract-info.json → undefined (no throw)', () => {
-        expect(loadCircuitArgTypes('/tmp/does-not-exist', 'attest')).toBeUndefined();
     });
 });
 
@@ -2115,7 +2154,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
         const passportId = '11'.repeat(32);
         const payloadHash = '22'.repeat(32);
         const req = makeReq({
-            contractAddress: '0xC', circuit: 'bindPassport', compiledArtifactRef: 'x',
+            contractAddress: '0xC', circuit: 'bindPassport', contractName: 'x',
             sessionId: `bind-${Date.now()}`, args: JSON.stringify([passportId, payloadHash])
         });
         await srv.handlers['submitContractCall'](req);
@@ -2136,7 +2175,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
             resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE, zkConfigPath: VAULT_ZK }))
         });
         const req = makeReq({
-            contractAddress: '0xVAULT', circuit: 'attest', compiledArtifactRef: 'attestation-vault',
+            contractAddress: '0xVAULT', circuit: 'attest', contractName: 'attestation-vault',
             sessionId: `attest-${Date.now()}`, args: JSON.stringify(['aa'.repeat(32), 'bb'.repeat(32)])
         });
         await srv.handlers['submitContractCall'](req);
@@ -2152,7 +2191,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
             circuitArgTypesLoader: () => [{ name: 'level', kind: 'Uint', maxval: 255 }] as CircuitArgType[]
         });
         const req = makeReq({
-            contractAddress: '0xC', circuit: 'setLevel', compiledArtifactRef: 'x',
+            contractAddress: '0xC', circuit: 'setLevel', contractName: 'x',
             sessionId: `uint-${Date.now()}`, args: JSON.stringify([2])
         });
         await srv.handlers['submitContractCall'](req);
@@ -2163,7 +2202,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
     test('invalid hex → 400, not a deep circuit error', async () => {
         const { srv } = setup();
         const req = makeReq({
-            contractAddress: '0xC', circuit: 'bindPassport', compiledArtifactRef: 'x',
+            contractAddress: '0xC', circuit: 'bindPassport', contractName: 'x',
             sessionId: `badhex-${Date.now()}`, args: JSON.stringify(['zz'.repeat(32), '22'.repeat(32)])
         });
         await srv.handlers['submitContractCall'](req);
@@ -2173,7 +2212,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
     test('wrong byte length → 400', async () => {
         const { srv } = setup();
         const req = makeReq({
-            contractAddress: '0xC', circuit: 'bindPassport', compiledArtifactRef: 'x',
+            contractAddress: '0xC', circuit: 'bindPassport', contractName: 'x',
             sessionId: `badlen-${Date.now()}`, args: JSON.stringify(['11'.repeat(16), '22'.repeat(32)])
         });
         await srv.handlers['submitContractCall'](req);
@@ -2184,7 +2223,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
         // Loader returns undefined → no contract-info.json found for the circuit.
         const { srv } = setup({ circuitArgTypesLoader: () => undefined });
         const req = makeReq({
-            contractAddress: '0xC', circuit: 'mystery', compiledArtifactRef: 'x',
+            contractAddress: '0xC', circuit: 'mystery', contractName: 'x',
             sessionId: `nometa-${Date.now()}`, args: JSON.stringify(['aa'.repeat(32)])
         });
         await srv.handlers['submitContractCall'](req);
@@ -2194,7 +2233,7 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
     test('strict: tagged values still work with no circuit metadata', async () => {
         const { srv, submitter } = setup({ circuitArgTypesLoader: () => undefined });
         const req = makeReq({
-            contractAddress: '0xC', circuit: 'mystery', compiledArtifactRef: 'x',
+            contractAddress: '0xC', circuit: 'mystery', contractName: 'x',
             sessionId: `tagged-${Date.now()}`,
             args: JSON.stringify([{ $bytes: 'aa'.repeat(32) }, { $uint: '5' }])
         });
@@ -2206,9 +2245,9 @@ describe('submitContractCall: Bytes/Uint arg coercion reaches the submitter', ()
     });
 });
 
-// ---- issueFieldPredicateAttestation (field-bound ZK predicate) -------------
+// ---- proveFieldPredicate (field-bound ZK predicate) -------------
 
-describe('issueFieldPredicateAttestation', () => {
+describe('proveFieldPredicate', () => {
     const VALID_PAYLOAD = 'a'.repeat(64);
     const VALID_FIELD_KEY = 'f'.repeat(64);
     const VALID_ROOT = 'd'.repeat(64);
@@ -2223,11 +2262,11 @@ describe('issueFieldPredicateAttestation', () => {
         siblings: SIBLINGS,
         dirs: [true, false, true, false],
         predicate: 'lessOrEqual',
-        threshold: 50000,
+        threshold: '50000',
         unit: 'kgCO2e/kWh',
         sessionId: `fieldpred-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
+        contractName: 'attestation-vault'
     });
 
     function setupHandlersWithDb(overrides: any = {}) {
@@ -2257,7 +2296,10 @@ describe('issueFieldPredicateAttestation', () => {
         [{ fieldSalt: undefined }, /fieldSalt .*is required/],
         [{ threshold: undefined }, /threshold is required/],
         [{ threshold: 'abc' }, /threshold must be an integer/],
-        [{ threshold: '9223372036854775808' }, /threshold exceeds the recorded range/],
+        [{ threshold: '18446744073709551616' }, /threshold exceeds Uint<64>/],
+        [{ threshold: 2 ** 53 }, /threshold is above 2\^53 as a JSON number/],
+        [{ value: 2 ** 53 + 2 }, /value is above 2\^53 as a JSON number/],
+        [{ value: '0x10' }, /value must be an integer \(decimal string\)/],
         [{ predicate: 'between' }, /lessOrEqual.*greaterOrEqual/],
         [{ siblings: SIBLINGS.slice(0, 2) }, /array of 4 hashes/],
         [{ dirs: [true] }, /array of 4 booleans/],
@@ -2268,7 +2310,7 @@ describe('issueFieldPredicateAttestation', () => {
     ])('rejects %o', async (patch, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ARGS(), ...patch });
-        await srv.handlers['issueFieldPredicateAttestation'](req);
+        await srv.handlers['proveFieldPredicate'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
     });
 
@@ -2278,7 +2320,7 @@ describe('issueFieldPredicateAttestation', () => {
         try {
             const { srv } = setupHandlersWithDb();
             const req = makeReq(VALID_ARGS());
-            await srv.handlers['issueFieldPredicateAttestation'](req);
+            await srv.handlers['proveFieldPredicate'](req);
             expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/mainnet/i));
         } finally {
             if (prev === undefined) delete process.env.NIGHTGATE_NETWORK;
@@ -2292,16 +2334,20 @@ describe('issueFieldPredicateAttestation', () => {
         try {
             vi.setSystemTime(new Date('2026-11-20T12:00:00Z'));
             const { srv } = setupHandlersWithDb({ submitterFactory: () => makeSuccessfulSubmitter() });
-            await srv.handlers['issueFieldPredicateAttestation'](makeReq(VALID_ARGS()));
+            await srv.handlers['proveFieldPredicate'](makeReq(VALID_ARGS()));
             const started = mockStartJob.mock.calls.at(-1)?.[0];
             const expected = Math.floor(Date.parse('2026-11-20T12:00:00Z') / 1000) + 365 * 24 * 60 * 60;
             expect(started.command.validUntil).toBe(expected);
+            // The fingerprint holds the caller's expiry, not the default, so a retry later still matches the first job.
+            expect(started.idempotencyPayload).toMatchObject({ validUntil: null, unit: VALID_ARGS().unit });
+            await srv.handlers['proveFieldPredicate'](makeReq({ ...VALID_ARGS(), validUntil: '2027-01-01T00:00:00Z', unit: 'kWh' }));
+            expect(mockStartJob.mock.calls.at(-1)?.[0].idempotencyPayload).toMatchObject({ validUntil: Date.parse('2027-01-01T00:00:00Z') / 1000, unit: 'kWh' });
 
             const stepsOfRun = async () => {
                 childCommandLog.length = 0;
-                const processor = registeredProcessors.get(`issueFieldPredicateAttestation\0${started.commandVersion}`);
+                const processor = registeredProcessors.get(`proveFieldPredicate\0${started.commandVersion}`);
                 await processor!({ ...started.command, artifactDigest: getArtifactGenerationDigest('attestation-vault') }, {
-                    ID: 'job-rerun', kind: 'issueFieldPredicateAttestation', sessionId: started.sessionId, requestedBy: 'test-user', commandVersion: 1
+                    ID: 'job-rerun', kind: 'proveFieldPredicate', sessionId: started.sessionId, requestedBy: 'test-user', commandVersion: 1
                 } as any);
                 return childCommandLog.map(c => c.command);
             };
@@ -2321,10 +2367,10 @@ describe('issueFieldPredicateAttestation', () => {
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS());
 
-        const result: any = await srv.handlers['issueFieldPredicateAttestation'](req);
+        const result: any = await srv.handlers['proveFieldPredicate'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            jobId: 'job-issueFieldPredicateAttestation-test',
+            jobId: 'job-proveFieldPredicate-test',
             status: 'pending',
             predicateAttestationId: expect.any(String)
         });
@@ -2362,7 +2408,7 @@ describe('issueFieldPredicateAttestation', () => {
         const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq({ ...VALID_ARGS(), contentRoot: undefined });
 
-        await srv.handlers['issueFieldPredicateAttestation'](req);
+        await srv.handlers['proveFieldPredicate'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(submitter.call).toHaveBeenCalledTimes(1);
         expect((submitter.call as Mock).mock.calls[0][0].circuit).toBe('proveFieldPredicate');
@@ -2371,16 +2417,16 @@ describe('issueFieldPredicateAttestation', () => {
     test('persists the fieldKey (lowercased) so the crawler-free fallback can recompute the claim key', async () => {
         const { srv, db } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ARGS(), fieldKey: VALID_FIELD_KEY.toUpperCase() });
-        await srv.handlers['issueFieldPredicateAttestation'](req);
+        await srv.handlers['proveFieldPredicate'](req);
         expect(req.reject).not.toHaveBeenCalled();
         const inserted = (db.run as Mock).mock.calls[0][0];
         expect(JSON.stringify(inserted)).toContain(VALID_FIELD_KEY);
     });
 });
 
-// ---- issueFieldPredicateAttestationBatch (N proofs, ONE transaction) -------
+// ---- proveClaims (N proofs, ONE transaction) -------
 
-describe('issueFieldPredicateAttestationBatch', () => {
+describe('proveClaims', () => {
     const VALID_PAYLOAD = 'a'.repeat(64);
     const VALID_ROOT = 'd'.repeat(64);
     const SIBLINGS = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
@@ -2402,7 +2448,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         claims: [makeClaim(1), makeClaim(2)],
         sessionId: `fieldpredbatch-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault',
+        contractName: 'attestation-vault',
         ...patch
     });
 
@@ -2442,7 +2488,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
     ])('rejects %o', async (patch, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq(VALID_ARGS(patch));
-        await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        await srv.handlers['proveClaims'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
     });
 
@@ -2452,11 +2498,11 @@ describe('issueFieldPredicateAttestationBatch', () => {
         const eight = Array.from({ length: 8 }, (_, i) => makeClaim(i + 1));
 
         const reqNine = makeReq(VALID_ARGS({ contentRoot: undefined, claims: nine }));
-        await srv.handlers['issueFieldPredicateAttestationBatch'](reqNine);
+        await srv.handlers['proveClaims'](reqNine);
         expect(reqNine.reject).toHaveBeenCalledWith(400, expect.stringMatching(/at most 8 entries/));
 
         const reqEightWithAnchor = makeReq(VALID_ARGS({ claims: eight }));
-        await srv.handlers['issueFieldPredicateAttestationBatch'](reqEightWithAnchor);
+        await srv.handlers['proveClaims'](reqEightWithAnchor);
         expect(reqEightWithAnchor.reject).toHaveBeenCalledWith(400, expect.stringMatching(/at most 7 entries.*anchor/));
     });
 
@@ -2466,7 +2512,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         try {
             const { srv } = setupHandlersWithDb();
             const req = makeReq(VALID_ARGS());
-            await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+            await srv.handlers['proveClaims'](req);
             expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/mainnet/i));
         } finally {
             if (prev === undefined) delete process.env.NIGHTGATE_NETWORK;
@@ -2479,10 +2525,10 @@ describe('issueFieldPredicateAttestationBatch', () => {
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS());
 
-        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        const result: any = await srv.handlers['proveClaims'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            jobId: 'job-issueFieldPredicateAttestationBatch-test',
+            jobId: 'job-proveClaims-test',
             status: 'pending',
             claims: expect.any(Array),
             droppedDuplicates: 0
@@ -2543,7 +2589,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS({ contentRoot: undefined }));
 
-        await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        await srv.handlers['proveClaims'](req);
         expect(req.reject).not.toHaveBeenCalled();
         const batchArgs = (submitter.callBatch as Mock).mock.calls[0][0];
         expect(batchArgs.calls.map((c: any) => c.circuit)).toEqual(['proveFieldPredicate', 'proveFieldPredicate']);
@@ -2555,7 +2601,7 @@ describe('issueFieldPredicateAttestationBatch', () => {
         const dupe = makeClaim(1);
         const req = makeReq(VALID_ARGS({ claims: [dupe, makeClaim(2), { ...dupe }] }));
 
-        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        const result: any = await srv.handlers['proveClaims'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.droppedDuplicates).toBe(1);
         expect(result.claims).toHaveLength(2);
@@ -2573,26 +2619,26 @@ describe('issueFieldPredicateAttestationBatch', () => {
         const eight = Array.from({ length: 8 }, (_, i) => makeClaim(i + 1));
 
         const first = makeReq(VALID_ARGS({ contentRoot: undefined, claims: eight, sessionId }));
-        await srv.handlers['issueFieldPredicateAttestationBatch'](first);
+        await srv.handlers['proveClaims'](first);
         expect(first.reject).not.toHaveBeenCalled();
 
         // 8 of the 10 per hour consumed; a 3-claim follow-up must trip 429.
         const second = makeReq(VALID_ARGS({ contentRoot: undefined, claims: [makeClaim(11), makeClaim(12), makeClaim(13)], sessionId }));
-        await srv.handlers['issueFieldPredicateAttestationBatch'](second);
+        await srv.handlers['proveClaims'](second);
         expect(second.reject).toHaveBeenCalledWith(429, expect.stringMatching(/Rate limited/));
 
         // All-or-nothing: the rejected batch consumed NOTHING, so the 2
         // remaining slots are still available.
         const third = makeReq(VALID_ARGS({ contentRoot: undefined, claims: [makeClaim(14), makeClaim(15)], sessionId }));
-        await srv.handlers['issueFieldPredicateAttestationBatch'](third);
+        await srv.handlers['proveClaims'](third);
         expect(third.reject).not.toHaveBeenCalled();
         delete process.env.NIGHTGATE_PROVE_RATE_LIMIT;
     });
 });
 
-// ---- issueFieldEqualityAttestation (bytes equality) ------------------------
+// ---- proveFieldEquality (bytes equality) ------------------------
 
-describe('issueFieldEqualityAttestation', () => {
+describe('proveFieldEquality', () => {
     const VALID_PAYLOAD = 'a'.repeat(64);
     const VALID_FIELD_KEY = 'f'.repeat(64);
     const VALID_ROOT = 'd'.repeat(64);
@@ -2609,7 +2655,7 @@ describe('issueFieldEqualityAttestation', () => {
         dirs: [true, false, true, false],
         sessionId: `fieldeq-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
+        contractName: 'attestation-vault'
     });
 
     function setupHandlersWithDb(overrides: any = {}) {
@@ -2640,7 +2686,7 @@ describe('issueFieldEqualityAttestation', () => {
     ])('rejects %o', async (patch, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ARGS(), ...patch });
-        await srv.handlers['issueFieldEqualityAttestation'](req);
+        await srv.handlers['proveFieldEquality'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
     });
 
@@ -2650,7 +2696,7 @@ describe('issueFieldEqualityAttestation', () => {
         try {
             const { srv } = setupHandlersWithDb();
             const req = makeReq(VALID_ARGS());
-            await srv.handlers['issueFieldEqualityAttestation'](req);
+            await srv.handlers['proveFieldEquality'](req);
             expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/mainnet/i));
         } finally {
             if (prev === undefined) delete process.env.NIGHTGATE_NETWORK;
@@ -2663,10 +2709,10 @@ describe('issueFieldEqualityAttestation', () => {
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS());
 
-        const result: any = await srv.handlers['issueFieldEqualityAttestation'](req);
+        const result: any = await srv.handlers['proveFieldEquality'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            jobId: 'job-issueFieldEqualityAttestation-test',
+            jobId: 'job-proveFieldEquality-test',
             status: 'pending',
             predicateAttestationId: expect.any(String)
         });
@@ -2691,7 +2737,7 @@ describe('issueFieldEqualityAttestation', () => {
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq({ ...VALID_ARGS(), expectedDigest: undefined, expectedValue: ' NMC811 ' });
 
-        await srv.handlers['issueFieldEqualityAttestation'](req);
+        await srv.handlers['proveFieldEquality'](req);
         expect(req.reject).not.toHaveBeenCalled();
         const { blake2b256Hex } = await import('../../srv/submission/document-proof.js');
         const digest = blake2b256Hex(' NMC811 ');
@@ -2701,9 +2747,9 @@ describe('issueFieldEqualityAttestation', () => {
     });
 });
 
-// ---- issueFieldMembershipAttestation (set membership) ----------------------
+// ---- proveFieldMembership (set membership) ----------------------
 
-describe('issueFieldMembershipAttestation', () => {
+describe('proveFieldMembership', () => {
     const VALID_PAYLOAD = 'a'.repeat(64);
     const VALID_FIELD_KEY = 'f'.repeat(64);
     const SIBLINGS = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
@@ -2722,7 +2768,7 @@ describe('issueFieldMembershipAttestation', () => {
         dirs: [true, false, true, false],
         sessionId: `fieldmem-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
+        contractName: 'attestation-vault'
     });
 
     /** Fake pure circuits for the allowedValues lane (set-root builder). */
@@ -2772,7 +2818,7 @@ describe('issueFieldMembershipAttestation', () => {
     ])('rejects %o', async (patch, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ARGS(), ...patch });
-        await srv.handlers['issueFieldMembershipAttestation'](req);
+        await srv.handlers['proveFieldMembership'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
     });
 
@@ -2781,10 +2827,10 @@ describe('issueFieldMembershipAttestation', () => {
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS());
 
-        const result: any = await srv.handlers['issueFieldMembershipAttestation'](req);
+        const result: any = await srv.handlers['proveFieldMembership'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            jobId: 'job-issueFieldMembershipAttestation-test',
+            jobId: 'job-proveFieldMembership-test',
             status: 'pending',
             predicateAttestationId: expect.any(String)
         });
@@ -2826,7 +2872,7 @@ describe('issueFieldMembershipAttestation', () => {
             setRoot: undefined, setSiblings: undefined, setDirs: undefined,
             allowedValues: list
         });
-        await srv.handlers['issueFieldMembershipAttestation'](ok);
+        await srv.handlers['proveFieldMembership'](ok);
         expect(ok.reject).not.toHaveBeenCalled();
         const prove = (submitter.call as Mock).mock.calls[0][0];
         expect(Buffer.from(prove.args[2]).toString('hex')).toBe(buildMembershipSet(list, fakeSetPure).setRoot);
@@ -2838,7 +2884,7 @@ describe('issueFieldMembershipAttestation', () => {
             setRoot: undefined, setSiblings: undefined, setDirs: undefined,
             allowedValues: list
         });
-        await srv.handlers['issueFieldMembershipAttestation'](notInList);
+        await srv.handlers['proveFieldMembership'](notInList);
         expect(notInList.reject).toHaveBeenCalledWith(400, expect.stringMatching(/not in the allowed list/));
         expect(db.run).not.toHaveBeenCalled(); // no row, no job, no budget spent
     });
@@ -2846,7 +2892,7 @@ describe('issueFieldMembershipAttestation', () => {
 
 // ---- Mixed batch (numeric + equality + membership in ONE tx) ---------------
 
-describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
+describe('proveClaims: mixed claim kinds', () => {
     const VALID_PAYLOAD = 'a'.repeat(64);
     const VALID_ROOT = 'd'.repeat(64);
     const SIBLINGS = ['1'.repeat(64), '2'.repeat(64), '3'.repeat(64), '4'.repeat(64)];
@@ -2877,7 +2923,7 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
         claims: [numericClaim, equalityClaim, membershipClaim],
         sessionId: `mixedbatch-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault',
+        contractName: 'attestation-vault',
         ...patch
     });
 
@@ -2908,7 +2954,7 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
     ])('rejects %o', async (patch, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq(VALID_ARGS(patch));
-        await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        await srv.handlers['proveClaims'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
     });
 
@@ -2917,7 +2963,7 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS());
 
-        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        const result: any = await srv.handlers['proveClaims'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.droppedDuplicates).toBe(0);
         const claims = result.claims;
@@ -2967,7 +3013,7 @@ describe('issueFieldPredicateAttestationBatch: mixed claim kinds', () => {
             ]
         }));
 
-        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        const result: any = await srv.handlers['proveClaims'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.droppedDuplicates).toBe(2);
         const batchArgs = (submitter.callBatch as Mock).mock.calls[0][0];
@@ -3002,7 +3048,7 @@ const DOC_OPENING_B = {
     ]
 };
 
-describe('issueDocumentIntegrityAttestation', () => {
+describe('proveDocumentIntegrity', () => {
     const PAYLOAD_A = 'a'.repeat(64);
     const PAYLOAD_B = 'b'.repeat(64);
     const ROOT_A = 'd'.repeat(64);
@@ -3020,7 +3066,7 @@ describe('issueDocumentIntegrityAttestation', () => {
         schemaId: SCHEMA_ID,
         sessionId: `docinteg-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
+        contractName: 'attestation-vault'
     });
 
     function setupHandlersWithDb(overrides: any = {}) {
@@ -3061,7 +3107,7 @@ describe('issueDocumentIntegrityAttestation', () => {
     ])('rejects %o', async (patch, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ARGS(), ...patch });
-        await srv.handlers['issueDocumentIntegrityAttestation'](req);
+        await srv.handlers['proveDocumentIntegrity'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
     });
 
@@ -3071,7 +3117,7 @@ describe('issueDocumentIntegrityAttestation', () => {
         try {
             const { srv } = setupHandlersWithDb();
             const req = makeReq(VALID_ARGS());
-            await srv.handlers['issueDocumentIntegrityAttestation'](req);
+            await srv.handlers['proveDocumentIntegrity'](req);
             expect(req.reject).toHaveBeenCalledWith(403, expect.stringMatching(/mainnet/i));
         } finally {
             if (prev === undefined) delete process.env.NIGHTGATE_NETWORK;
@@ -3084,10 +3130,10 @@ describe('issueDocumentIntegrityAttestation', () => {
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS());
 
-        const result: any = await srv.handlers['issueDocumentIntegrityAttestation'](req);
+        const result: any = await srv.handlers['proveDocumentIntegrity'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            jobId: 'job-issueDocumentIntegrityAttestation-test',
+            jobId: 'job-proveDocumentIntegrity-test',
             status: 'pending',
             predicateAttestationId: expect.any(String)
         });
@@ -3131,14 +3177,14 @@ describe('issueDocumentIntegrityAttestation', () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq({ ...VALID_ARGS(), contentRootA: undefined, contentRootB: undefined });
-        await srv.handlers['issueDocumentIntegrityAttestation'](req);
+        await srv.handlers['proveDocumentIntegrity'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(submitter.call).toHaveBeenCalledTimes(1);
         expect((submitter.call as Mock).mock.calls[0][0].circuit).toBe('proveDocumentComparison');
     });
 });
 
-describe('issueDocumentDiffAttestation', () => {
+describe('proveDocumentDiff', () => {
     const PAYLOAD_A = 'a'.repeat(64);
     const PAYLOAD_B = 'b'.repeat(64);
     const VALID_ARGS = () => ({
@@ -3150,7 +3196,7 @@ describe('issueDocumentDiffAttestation', () => {
         openingB: DOC_OPENING_B,
         sessionId: `docdiff-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
+        contractName: 'attestation-vault'
     });
 
     function setupHandlersWithDb(overrides: any = {}) {
@@ -3185,19 +3231,19 @@ describe('issueDocumentDiffAttestation', () => {
     ])('rejects %o', async (patch, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq({ ...VALID_ARGS(), ...patch });
-        await srv.handlers['issueDocumentDiffAttestation'](req);
+        await srv.handlers['proveDocumentDiff'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
     });
 
-    test('happy path: proveDocumentComparison (diff mode) with k as BigInt and docPair openings; k lands in the threshold column', async () => {
+    test('happy path: proveDocumentComparison (diff mode) with k as BigInt and docPair openings; k lands in its own column', async () => {
         const submitter = makeSuccessfulSubmitter();
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS());
 
-        const result: any = await srv.handlers['issueDocumentDiffAttestation'](req);
+        const result: any = await srv.handlers['proveDocumentDiff'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result).toEqual({
-            jobId: 'job-issueDocumentDiffAttestation-test',
+            jobId: 'job-proveDocumentDiff-test',
             status: 'pending',
             predicateAttestationId: expect.any(String)
         });
@@ -3205,6 +3251,7 @@ describe('issueDocumentDiffAttestation', () => {
         const inserted = JSON.stringify((db.run as Mock).mock.calls[0][0]);
         expect(inserted).toContain('documentDiff');
         expect(inserted).toContain(PAYLOAD_B);
+        expect((db.run as Mock).mock.calls[0][0].INSERT.entries[0]).toMatchObject({ k: 2, threshold: null });
 
         expect(submitter.call).toHaveBeenCalledTimes(1);
         const prove = (submitter.call as Mock).mock.calls[0][0];
@@ -3220,7 +3267,7 @@ describe('issueDocumentDiffAttestation', () => {
     });
 });
 
-describe('issueFieldPredicateAttestationBatch: cross-root document claims', () => {
+describe('proveClaims: cross-root document claims', () => {
     const PAYLOAD_A = 'a'.repeat(64);
     const PAYLOAD_B = 'b'.repeat(64);
     const FIELD_KEY = 'f'.repeat(64);
@@ -3236,7 +3283,7 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
         claims: claims,
         sessionId: `docbatch-${Math.random().toString(36).slice(2)}`,
         contractAddress: '0xVAULT',
-        compiledArtifactRef: 'attestation-vault'
+        contractName: 'attestation-vault'
     });
 
     function setupHandlersWithDb(overrides: any = {}) {
@@ -3267,7 +3314,7 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
     ])('rejects %o', async (claims, msg) => {
         const { srv } = setupHandlersWithDb();
         const req = makeReq(VALID_ARGS(claims as unknown[]));
-        await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        await srv.handlers['proveClaims'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
     });
 
@@ -3276,7 +3323,7 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS([numericClaim, integrityClaim, diffClaim]));
 
-        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        const result: any = await srv.handlers['proveClaims'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.droppedDuplicates).toBe(0);
         const claims = result.claims;
@@ -3304,7 +3351,11 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
         expect(diff.args[4]).toBe(1n);
         expect(diff.merkleProof).toEqual({ docPair: { schema: DOC_SCHEMA, openingA: DOC_OPENING_A, openingB: DOC_OPENING_B } });
 
-        // Rows: documentDiff stores k in threshold; both carry payloadHashB.
+        // Rows: only the numeric claim has a threshold, only the diff a k; both document kinds carry payloadHashB.
+        const rows: Array<Record<string, unknown>> = (db.run as Mock).mock.calls[0][0].INSERT.entries;
+        expect(rows.map(r => [r.predicate, r.threshold, r.k])).toEqual([
+            ['greaterOrEqual', '1000', null], ['documentIntegrity', null, null], ['documentDiff', null, 1]
+        ]);
         const inserted = JSON.stringify((db.run as Mock).mock.calls[0][0]);
         expect(inserted).toContain('documentIntegrity');
         expect(inserted).toContain('documentDiff');
@@ -3317,7 +3368,7 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
         const req = makeReq(VALID_ARGS([
             integrityClaim, { ...integrityClaim }, diffClaim, { ...diffClaim, k: 2 }
         ]));
-        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        const result: any = await srv.handlers['proveClaims'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.droppedDuplicates).toBe(1);
         const batch = (submitter.callBatch as Mock).mock.calls[0][0];
@@ -3331,7 +3382,7 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
         const submitter = makeSuccessfulSubmitter();
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS([integrityClaim, { ...integrityClaim, attesterIdB: ATTESTER_ID.toUpperCase() }]));
-        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        const result: any = await srv.handlers['proveClaims'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.droppedDuplicates).toBe(1);
         expect((submitter.callBatch as Mock).mock.calls[0][0].calls).toHaveLength(1);
@@ -3345,7 +3396,7 @@ describe('issueFieldPredicateAttestationBatch: cross-root document claims', () =
         const submitter = makeSuccessfulSubmitter();
         const { srv, db } = setupHandlersWithDb({ submitterFactory: () => submitter });
         const req = makeReq(VALID_ARGS([integrityClaim, { ...integrityClaim, attesterIdB: OTHER }]));
-        const result: any = await srv.handlers['issueFieldPredicateAttestationBatch'](req);
+        const result: any = await srv.handlers['proveClaims'](req);
         expect(req.reject).not.toHaveBeenCalled();
         expect(result.droppedDuplicates).toBe(0);
         const rows = (db.run as Mock).mock.calls[0][0].INSERT.entries;
@@ -3371,12 +3422,12 @@ describe('artifact-generation provenance', () => {
             submitterFactory: vi.fn(() => submitter)
         });
         const parentDigest = getArtifactGenerationDigest('attestation-vault');
-        const processor = registeredProcessors.get(procKey('issueFieldPredicateAttestation', 1));
+        const processor = registeredProcessors.get(procKey('proveFieldPredicate', 1));
         expect(processor).toBeTruthy();
         await processor!({
             op: 'fieldPredicateWorkflow', predicateAttestationId: 'pa-prov-1',
             payloadHash: 'aa'.repeat(32), attesterId: ATTESTER_ID, fieldKey: 'bb'.repeat(32),
-            contractAddress: '0xV', compiledArtifactRef: 'attestation-vault',
+            contractAddress: '0xV', contractName: 'attestation-vault',
             predicate: 'lessOrEqual', threshold: '42', opCode: 0,
             value: '41', salt: 'cc'.repeat(32),
             siblings: ['dd'.repeat(32), 'dd'.repeat(32), 'dd'.repeat(32), 'dd'.repeat(32)],
@@ -3384,7 +3435,7 @@ describe('artifact-generation provenance', () => {
             contentRoot: 'ee'.repeat(32), schemaId: 'ff'.repeat(32),
             artifactDigest: parentDigest
         }, {
-            ID: 'job-prov-parent', kind: 'issueFieldPredicateAttestation',
+            ID: 'job-prov-parent', kind: 'proveFieldPredicate',
             sessionId: 'sess-prov', requestedBy: 'test-user', commandVersion: 1
         } as any);
         // anchorContentRoot child + proveFieldPredicate child, both carrying
@@ -3395,13 +3446,50 @@ describe('artifact-generation provenance', () => {
         }
     });
 
+    it('a parent that runs again an hour later hands its steps the same commands', async () => {
+        // A step is found again by its key and its payload. A step command that changed between runs would conflict.
+        const db = { run: vi.fn().mockResolvedValue(undefined) };
+        registerSubmissionHandlers(makeFakeService() as any, db as any, {
+            attesterIdResolver: vi.fn(async () => ATTESTER_ID),
+            resolveContractImpl: vi.fn(async () => ({ ...RESOLVED_CONTRACT_FIXTURE })),
+            walletMaterialFactory: vi.fn(async () => ({
+                accountId: 'acc', privateStoragePasswordProvider: () => '0123456789ABCDEFG', walletAndMidnightProvider: { getCoinPublicKey: () => '', getEncryptionPublicKey: () => '' }
+            })),
+            submitterFactory: vi.fn(() => makeSuccessfulSubmitter())
+        });
+        const processor = registeredProcessors.get(procKey('proveFieldPredicate', 1))!;
+        const parentCommand = {
+            op: 'fieldPredicateWorkflow', predicateAttestationId: 'pa-rerun-1', validUntil: 1_900_000_000,
+            payloadHash: 'aa'.repeat(32), attesterId: ATTESTER_ID, fieldKey: 'bb'.repeat(32),
+            contractAddress: '0xV', contractName: 'attestation-vault',
+            predicate: 'lessOrEqual', threshold: '42', opCode: 0, value: '41', salt: 'cc'.repeat(32),
+            siblings: ['dd'.repeat(32), 'dd'.repeat(32), 'dd'.repeat(32), 'dd'.repeat(32)], dirs: [true, false, true, false],
+            contentRoot: 'ee'.repeat(32), schemaId: 'ff'.repeat(32), artifactDigest: getArtifactGenerationDigest('attestation-vault')
+        };
+        const parentRow = { ID: 'job-rerun-parent', kind: 'proveFieldPredicate', sessionId: 'sess-rerun', requestedBy: 'test-user', commandVersion: 1 } as any;
+        vi.useFakeTimers({ toFake: ['Date'] });
+        try {
+            vi.setSystemTime(new Date('2026-11-24T10:00:00Z'));
+            childCommandLog.length = 0;
+            await processor(parentCommand, parentRow);
+            const firstRun = childCommandLog.map(c => ({ ...c }));
+            vi.setSystemTime(new Date('2026-11-24T11:00:00Z'));
+            childCommandLog.length = 0;
+            await processor(parentCommand, parentRow);
+            expect(firstRun.length).toBeGreaterThan(0);
+            expect(childCommandLog).toEqual(firstRun);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it('reconciliation finalizer fails closed on a missing or mismatched digest', async () => {
         const finalize = registeredFinalizers.get(procKey('anchorDocument', 1));
         expect(finalize).toBeTruthy();
         const evidence: any = { txHash: '0xtx', finalizedAt: '2026-08-16T00:00:00Z' };
         const base = {
-            op: 'anchorDocument', documentId: 'doc-prov-1', payloadHash: 'aa'.repeat(32),
-            metadataHash: 'bb'.repeat(32), contractAddress: '0xV', compiledArtifactRef: 'attestation-vault'
+            op: 'anchorDocument', anchorId: 'doc-prov-1', payloadHash: 'aa'.repeat(32),
+            metadataHash: 'bb'.repeat(32), contractAddress: '0xV', contractName: 'attestation-vault'
         };
         await expect(finalize!(base, { ID: 'job-prov-r1' } as any, evidence))
             .rejects.toThrow(/no artifact-generation digest/);

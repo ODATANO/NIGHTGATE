@@ -35,7 +35,7 @@ const call = prepareAttest({ payloadHash, metadataHash, attestationSecret: build
 const { unboundTxB64 } = await builder.buildSponsorable({ contractAddress: VAULT, call, bind: false });
 const job = await connect(api).sponsorUnbound({ unboundTxB64, idempotencyKey: `anchor-${payloadHash}` });
 await builder.close();
-// job.txHash is the ledger identifier, job.transactionHash the hash explorers show
+// job.txId is a ledger identifier, job.txHash the hash explorers show
 ```
 
 - With `api`, the server's crawler must run. Every build pins its newest indexed block.
@@ -49,14 +49,17 @@ await builder.close();
 import { connect } from '@odatano/nightgate-tx';
 
 const verify = connect({ baseUrl: 'https://gateway.example', servicePath: '/odata/v4/midnight-verify' });
-const state = await verify.verifyAttestation({ contractAddress, attesterId, payloadHash, compiledArtifactRef: 'attestation-vault-32' });
+const state = await verify.verifyAttestation({ contractAddress, attesterId, payloadHash, contractName: 'attestation-vault-32' });
 
 const ng = connect({ baseUrl: 'https://gateway.example', token: 'oda_...' });
 const proof = await ng.prepareDocumentProof({ document: doc, proofFields: [{ field: 'battery.capacity_kwh' }] });
 ```
 
-- One method per server action, such as `anchorDocument`, `proveFieldPredicate`, `grantDisclosure`, `sendNight`, `sponsorSwap` and `sponsorTransfer`. `callFunction` and `callAction` reach any other.
-- Write actions submit the job and wait for its result. They long-poll `getJobStatus`. `longPollMs: 0` polls instead.
+- One method per server action, such as `anchorDocument`, `proveFieldPredicate`, `grantDisclosure`, `sendToken`, `sponsorSwap` and `sponsorTransfer`. `callFunction` and `callAction` reach any other.
+- `read(table, { filter, orderby, top, skip, select })` returns the rows of a table, such as `ng.read('Transactions', { filter: 'blockHeight eq 5', orderby: 'indexInBlock' })`. `filter` and `orderby` are OData. A read returns at most the server's page size, 1000 rows by default: page with `skip` until a read is empty. `service: 'indexer'` reads a table of the indexer service.
+- In TypeScript the read methods return the server's answer as a type, for example `VerifyAttestationAnswer` and `GetWalletBalanceAnswer`. The types are written from the server's model. `callFunction<T>` and `callAction<T>` take the answer type you expect and return `unknown` without one.
+- Write actions submit the job and wait for its result. They long-poll `getJobStatus`. `longPollMs: 0` polls instead. A job can succeed before the chain answered: the result carries `chainStatus` and `blockHeight`.
+- A 409 `IDEMPOTENCY_KEY_CONFLICT` carries `err.job` with `{ jobId, status, chainStatus }` for the caller that started the job under that key.
 - Auth is one of `agentToken` (`ngat_...`, sent as `x-agent-token`), `token` (Bearer) or `username` with `password` (Basic). The public verify route needs none.
 - A refused call throws `NightgateApiError` with `status`, `code` and, on 429 and retryable 503, `retryAfterSeconds`. `isRetryable(err)` says whether to repeat it. A write that got no answer is sent once more under the same key. When that gets no answer either, the error carries `idempotencyKey`: repeat the call with that key, so a job the server did start is not started twice.
 
@@ -69,7 +72,7 @@ import { Contract } from './managed/counter/contract/index.js';
 const connector = await window.midnight.mnLace.connect('preprod');
 const counter = await connectContract({
     connector,
-    contract: 'counter',            // its name in the server's manifest
+    contractName: 'counter',        // its name in the server's manifest
     contractClass: Contract,
     manifestUrl: 'https://gateway.example/contract-manifest',
     contractAddress: COUNTER
@@ -90,7 +93,7 @@ The reference is [`docs/txbuilder.md`](https://github.com/ODATANO/NIGHTGATE/blob
 - [Unshielded transfers](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#unshielded-transfers): `createUnshieldedWallet` pays NIGHT to an address, a sponsor pays the fee.
 - [Token factory](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#token-factory): mint named tokens from your own seed.
 - [Holder registry](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#holder-registry): register a token holding with `holderClaimKey`.
-- Your own contract: `createTxBuilder({ package: '@odatano/contract-<name>' })` or `{ contractClass, zkConfigDir }`. `buildDeploySponsorable()` builds a sponsored deploy.
+- Your own contract: `createTxBuilder({ package: '@odatano/contract-<name>' })` or `{ contractClass, zkConfigDir }`. `buildDeploySponsorable()` builds a sponsored deploy. `buildMaintenanceSponsorable({ update })` a sponsored maintenance update of it.
 - [Contracts deployed before ledger 9](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#contracts-deployed-before-ledger-9): build with the contract package tagged `ledger8`.
 - `ng.waitForReceipt({ jobId, sessionId })` waits for the receipt of a sponsored transfer or swap.
 - [Self-funded submission](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/txbuilder.md#self-funded-submission): pay your own dust and submit to the node. Runnable: [`example/self-funded.mjs`](./example/self-funded.mjs).
@@ -120,8 +123,8 @@ The reference is [`docs/txbuilder.md`](https://github.com/ODATANO/NIGHTGATE/blob
 
 ## Related
 
-Generated from the [`@odatano/nightgate`](https://www.npmjs.com/package/@odatano/nightgate)
-tree, so call builders and witnesses are the code the server runs. The indexer,
+Generated from the [NIGHTGATE](https://github.com/ODATANO/NIGHTGATE) repository,
+so call builders and witnesses are the code the server runs. The indexer,
 the OData services and the sponsor side are the NIGHTGATE server, see
 [self-hosted](https://github.com/ODATANO/NIGHTGATE/blob/main/docs/self-hosted.md). For MCP clients:
 [`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP).

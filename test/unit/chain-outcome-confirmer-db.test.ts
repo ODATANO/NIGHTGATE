@@ -46,8 +46,8 @@ afterEach(() => {
 
 test('advances both a pending and a legacy NULL-chainStatus leaf (real SQL NULL semantics)', async () => {
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'job-pending', kind: 'submitContractCall', status: 'succeeded', txHash: '0xpending', chainStatus: 'pending' },
-        { ID: 'job-legacy',  kind: 'submitContractCall', status: 'succeeded', txHash: '0xlegacy',  chainStatus: null }
+        { ID: 'job-pending', kind: 'submitContractCall', status: 'succeeded', txId: '0xpending', chainStatus: 'pending' },
+        { ID: 'job-legacy',  kind: 'submitContractCall', status: 'succeeded', txId: '0xlegacy',  chainStatus: null }
     ));
     registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
 
@@ -66,7 +66,7 @@ test('a reorg rollback during the indexer lookup refuses the commit; the next ti
     await db.run(cds.ql.DELETE.from(SYNC));
     await db.run(cds.ql.INSERT.into(SYNC).entries({ ID: 'SINGLETON', syncStatus: 'synced', reorgGeneration: 3 }));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'job-race', kind: 'submitContractCall', status: 'succeeded', txHash: '00race', chainStatus: 'pending' }
+        { ID: 'job-race', kind: 'submitContractCall', status: 'succeeded', txId: '00race', chainStatus: 'pending' }
     ));
     // The lookup answers with the OLD fork's block while a rollback bumps the generation.
     registerChainOutcomeConfirmer(async () => {
@@ -75,18 +75,18 @@ test('a reorg rollback during the indexer lookup refuses the commit; the next ti
     });
     expect(await confirmChainOutcomesViaIndexer(db)).toBe(0);
     let row = await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'job-race' }));
-    expect(row).toMatchObject({ chainStatus: 'pending', chainBlockHeight: null });
+    expect(row).toMatchObject({ chainStatus: 'pending', blockHeight: null });
     // Same generation from here on: the fresh outcome commits.
     registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 901, blockHash: '0xnewfork' }));
     expect(await confirmChainOutcomesViaIndexer(db)).toBe(1);
     row = await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'job-race' }));
-    expect(row).toMatchObject({ chainStatus: 'success', chainBlockHeight: 901, chainBlockHash: '0xnewfork' });
+    expect(row).toMatchObject({ chainStatus: 'success', blockHeight: '901', blockHash: '0xnewfork' });
     await db.run(cds.ql.DELETE.from(SYNC));
 });
 
 test('CAS no-op: does not overwrite a chainStatus already resolved since the scan', async () => {
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'job-resolved', kind: 'submitContractCall', status: 'succeeded', txHash: '0xresolved', chainStatus: 'success' }
+        { ID: 'job-resolved', kind: 'submitContractCall', status: 'succeeded', txId: '0xresolved', chainStatus: 'success' }
     ));
     // A confirmer that would (wrongly) report failure; the scan excludes resolved
     // rows, and even if it did not the CAS on the read value guards the write.
@@ -101,13 +101,13 @@ test('CAS no-op: does not overwrite a chainStatus already resolved since the sca
 
 test('resolves reconciliation_required rows of identifier-keyed sponsor kinds via the indexer (success -> succeeded, failure -> failed), others untouched', async () => {
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'sp-ok',   kind: 'sponsorUnboundTransaction',   status: 'reconciliation_required', txHash: '00id-ok' },
-        { ID: 'sp-bad',  kind: 'sponsorFinalizedTransaction', status: 'reconciliation_required', txHash: '00id-bad' },
-        { ID: 'sp-wait', kind: 'sponsorUnboundTransaction',   status: 'reconciliation_required', txHash: '00id-wait' },
-        { ID: 'other',   kind: 'submitContractCall',          status: 'reconciliation_required', txHash: '0xother' }
+        { ID: 'sp-ok',   kind: 'sponsorUnbound',   status: 'reconciliation_required', txId: '00id-ok' },
+        { ID: 'sp-bad',  kind: 'sponsorFinalized', status: 'reconciliation_required', txId: '00id-bad' },
+        { ID: 'sp-wait', kind: 'sponsorUnbound',   status: 'reconciliation_required', txId: '00id-wait' },
+        { ID: 'other',   kind: 'submitContractCall',          status: 'reconciliation_required', txId: '0xother' }
     ));
-    registerChainOutcomeConfirmer(async (txHash: string) =>
-        txHash === '00id-ok' ? { status: 'success', blockHeight: 4711 } : txHash === '00id-bad' ? { status: 'failure', blockHeight: 4711 } : null);
+    registerChainOutcomeConfirmer(async ({ txId }) =>
+        txId === '00id-ok' ? { status: 'success', blockHeight: 4711 } : txId === '00id-bad' ? { status: 'failure', blockHeight: 4711 } : null);
 
     await confirmChainOutcomesViaIndexer(db);
 
@@ -115,7 +115,7 @@ test('resolves reconciliation_required rows of identifier-keyed sponsor kinds vi
     const byId = Object.fromEntries(rows.map((r: any) => [r.ID, r]));
     expect(byId['sp-ok'].status).toBe('succeeded');
     expect(byId['sp-ok'].chainStatus).toBe('success');
-    expect(JSON.parse(byId['sp-ok'].result)).toMatchObject({ reconciled: true, txHash: '00id-ok' });
+    expect(JSON.parse(byId['sp-ok'].result)).toMatchObject({ reconciled: true, txId: '00id-ok' });
     expect(byId['sp-bad'].status).toBe('failed');
     expect(byId['sp-bad'].chainStatus).toBe('failure');
     expect(byId['sp-bad'].errorCode).toBe('CHAIN_EXECUTION_FAILED');
@@ -127,21 +127,21 @@ test('reconcile-by-identifier also finalizes the attempt PendingSubmissions row 
     const PS = 'midnight.PendingSubmissions';
     await db.run(cds.ql.DELETE.from(PS));
     await db.run(cds.ql.INSERT.into(PS).entries(
-        { ID: 'sub-ok',  txHash: '00id-ok2',  contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 'sp-sess' },
-        { ID: 'sub-bad', txHash: '00id-bad2', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'pending',  sessionId: 'sp-sess' }
+        { ID: 'sub-ok',  txId: '00id-ok2',  contractAddress: 'c8f4'.padEnd(64, '0'), circuit: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 'sp-sess' },
+        { ID: 'sub-bad', txId: '00id-bad2', contractAddress: 'c8f4'.padEnd(64, '0'), circuit: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'pending',  sessionId: 'sp-sess' }
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-ok',  kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', txHash: '00id-ok2',  submissionId: 'sub-ok' },
-        { ID: 'j-bad', kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', txHash: '00id-bad2', submissionId: 'sub-bad' }
+        { ID: 'j-ok',  kind: 'sponsorUnbound', sessionId: 'sp-sess', status: 'reconciliation_required', txId: '00id-ok2',  submissionId: 'sub-ok' },
+        { ID: 'j-bad', kind: 'sponsorUnbound', sessionId: 'sp-sess', status: 'reconciliation_required', txId: '00id-bad2', submissionId: 'sub-bad' }
     ));
     // the attempt row carries the coordinates the worker announced (JSON in the internal submitIntentData)
     await db.run(cds.ql.UPDATE.entity(PS).set({ submitIntentData: JSON.stringify({ feeSponsor: 'concrete-sponsor', sponsorAccountId: 'acct-1', circuits: ['attest', 'anchorContentRoot'], contractAddress: 'c8f4'.padEnd(64, '0'), note: 'backing-Z' }) }).where({ ID: 'sub-ok' }));
-    registerChainOutcomeConfirmer(async (txHash: string) => txHash === '00id-ok2' ? { status: 'success', blockHeight: 4711 } : { status: 'failure', blockHeight: 4711 });
+    registerChainOutcomeConfirmer(async ({ txId }) => txId === '00id-ok2' ? { status: 'success', blockHeight: 4711 } : { status: 'failure', blockHeight: 4711 });
     await confirmChainOutcomesViaIndexer(db);
     const jobs = Object.fromEntries((await db.run(cds.ql.SELECT.from(BG).columns('ID', 'status', 'result'))).map((r: any) => [r.ID, r]));
     expect(jobs['j-ok'].status).toBe('succeeded');
     // canonical shape: what the action documents, from the announced coordinates (concrete sponsor, not the job's pool-sentinel session)
-    expect(JSON.parse(jobs['j-ok'].result)).toEqual({ txHash: '00id-ok2', circuits: ['attest', 'anchorContentRoot'], contractAddress: 'c8f4'.padEnd(64, '0'), note: 'backing-Z', feeSponsor: 'concrete-sponsor', reconciled: true });
+    expect(JSON.parse(jobs['j-ok'].result)).toEqual({ txId: '00id-ok2', txHash: null, circuits: ['attest', 'anchorContentRoot'], contractAddress: 'c8f4'.padEnd(64, '0'), note: 'backing-Z', feeSponsor: 'concrete-sponsor', reconciled: true });
     expect(jobs['j-bad'].status).toBe('failed');
     const subs = Object.fromEntries((await db.run(cds.ql.SELECT.from(PS).columns('ID', 'status', 'finalizedAt', 'errorCode'))).map((r: any) => [r.ID, r]));
     expect(subs['sub-ok'].status).toBe('finalized');
@@ -154,10 +154,10 @@ test('the normal succeeded-confirm pass ALSO finalizes the sponsor attempt row',
     const PS = 'midnight.PendingSubmissions';
     await db.run(cds.ql.DELETE.from(PS));
     await db.run(cds.ql.INSERT.into(PS).entries(
-        { ID: 'sub-inc', txHash: '00id-inc', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 'sp-sess' }
+        { ID: 'sub-inc', txId: '00id-inc', contractAddress: 'c8f4'.padEnd(64, '0'), circuit: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 'sp-sess' }
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-inc', kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'succeeded', txHash: '00id-inc', submissionId: 'sub-inc', chainStatus: 'pending', result: '{"txHash":"00id-inc"}' }
+        { ID: 'j-inc', kind: 'sponsorUnbound', sessionId: 'sp-sess', status: 'succeeded', txId: '00id-inc', submissionId: 'sub-inc', chainStatus: 'pending', result: '{"txHash":"00id-inc"}' }
     ));
     registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
     const updated = await confirmChainOutcomesViaIndexer(db);
@@ -172,8 +172,8 @@ test('the normal succeeded-confirm pass ALSO finalizes the sponsor attempt row',
 
 test('the succeeded-pass confirms every kind with a hash, identifier-keyed or not', async () => {
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'sp',    kind: 'sponsorUnboundTransaction', status: 'succeeded', txHash: '00id-sp', chainStatus: 'pending' },
-        { ID: 'call',  kind: 'submitContractCall',        status: 'succeeded', txHash: '0xcall',  chainStatus: 'pending' }
+        { ID: 'sp',    kind: 'sponsorUnbound', status: 'succeeded', txId: '00id-sp', chainStatus: 'pending' },
+        { ID: 'call',  kind: 'submitContractCall',        status: 'succeeded', txId: '0xcall',  chainStatus: 'pending' }
     ));
     registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
     const updated = await confirmChainOutcomesViaIndexer(db);
@@ -188,23 +188,23 @@ test('records the inclusion coordinates on the job and the attempt row (what a r
     const PS = 'midnight.PendingSubmissions';
     await db.run(cds.ql.DELETE.from(PS));
     await db.run(cds.ql.INSERT.into(PS).entries(
-        { ID: 'sub-ev', txHash: '00id-ev', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's' },
-        { ID: 'sub-ev-recon', txHash: '00id-ev2', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's' }
+        { ID: 'sub-ev', txId: '00id-ev', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's' },
+        { ID: 'sub-ev-recon', txId: '00id-ev2', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's' }
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-ev', kind: 'submitContractCall', status: 'succeeded', txHash: '00id-ev', submissionId: 'sub-ev', chainStatus: 'pending' },
-        { ID: 'j-ev-recon', kind: 'sponsorUnboundTransaction', sessionId: 's', status: 'reconciliation_required', txHash: '00id-ev2', submissionId: 'sub-ev-recon' }
+        { ID: 'j-ev', kind: 'submitContractCall', status: 'succeeded', txId: '00id-ev', submissionId: 'sub-ev', chainStatus: 'pending' },
+        { ID: 'j-ev-recon', kind: 'sponsorUnbound', sessionId: 's', status: 'reconciliation_required', txId: '00id-ev2', submissionId: 'sub-ev-recon' }
     ));
-    registerChainOutcomeConfirmer(async (txHash: string) => ({
-        status: 'success', blockHeight: txHash === '00id-ev' ? 2415919 : 2415920, blockHash: `0xblock-${txHash}`, indexerTxHash: `0xindexer-${txHash}`
+    registerChainOutcomeConfirmer(async ({ txId }) => ({
+        status: 'success', blockHeight: txId === '00id-ev' ? 2415919 : 2415920, blockHash: `0xblock-${txId}`, txHash: `0xindexer-${txId}`
     }));
     await confirmChainOutcomesViaIndexer(db);
-    const jobs = Object.fromEntries((await db.run(cds.ql.SELECT.from(BG).columns('ID', 'status', 'chainStatus', 'chainBlockHeight', 'chainBlockHash', 'indexerTxHash'))).map((r: any) => [r.ID, r]));
-    expect(jobs['j-ev']).toMatchObject({ chainStatus: 'success', chainBlockHeight: 2415919, chainBlockHash: '0xblock-00id-ev', indexerTxHash: '0xindexer-00id-ev' });
-    expect(jobs['j-ev-recon']).toMatchObject({ status: 'succeeded', chainBlockHeight: 2415920, chainBlockHash: '0xblock-00id-ev2' });
-    const subs = Object.fromEntries((await db.run(cds.ql.SELECT.from(PS).columns('ID', 'status', 'chainBlockHeight', 'indexerTxHash'))).map((r: any) => [r.ID, r]));
-    expect(subs['sub-ev']).toMatchObject({ status: 'finalized', chainBlockHeight: 2415919, indexerTxHash: '0xindexer-00id-ev' });
-    expect(subs['sub-ev-recon']).toMatchObject({ status: 'finalized', chainBlockHeight: 2415920 });
+    const jobs = Object.fromEntries((await db.run(cds.ql.SELECT.from(BG).columns('ID', 'status', 'chainStatus', 'blockHeight', 'blockHash', 'txHash'))).map((r: any) => [r.ID, r]));
+    expect(jobs['j-ev']).toMatchObject({ chainStatus: 'success', blockHeight: '2415919', blockHash: '0xblock-00id-ev', txHash: '0xindexer-00id-ev' });
+    expect(jobs['j-ev-recon']).toMatchObject({ status: 'succeeded', blockHeight: '2415920', blockHash: '0xblock-00id-ev2' });
+    const subs = Object.fromEntries((await db.run(cds.ql.SELECT.from(PS).columns('ID', 'status', 'blockHeight', 'txHash'))).map((r: any) => [r.ID, r]));
+    expect(subs['sub-ev']).toMatchObject({ status: 'finalized', blockHeight: '2415919', txHash: '0xindexer-00id-ev' });
+    expect(subs['sub-ev-recon']).toMatchObject({ status: 'finalized', blockHeight: '2415920' });
 });
 
 test('a broadcast the indexer never shows ends failed/BROADCAST_NOT_INCLUDED once the tip is past its ttl; a live ttl, a lagging tip, a bookkeeping-pending row and a workflow parent stay parked', async () => {
@@ -213,8 +213,8 @@ test('a broadcast the indexer never shows ends failed/BROADCAST_NOT_INCLUDED onc
     const H = 60 * 60 * 1000;
     const now = Date.now();
     const lostTtl = new Date(now - 2 * H).toISOString();
-    const sub = (ID: string, txHash: string, submittedAt: number, intent: Record<string, unknown>) => ({
-        ID, txHash, contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL',
+    const sub = (ID: string, txId: string, submittedAt: number, intent: Record<string, unknown>) => ({
+        ID, txId, contractAddress: 'c8f4'.padEnd(64, '0'), circuit: 'attest', actionType: 'CALL',
         submittedAt: new Date(submittedAt).toISOString(), status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify(intent)
     });
     await db.run(cds.ql.INSERT.into(PS).entries(
@@ -225,12 +225,12 @@ test('a broadcast the indexer never shows ends failed/BROADCAST_NOT_INCLUDED onc
         sub('sub-book',   '00book',   now - 3 * H, { circuits: ['attest'], ttl: lostTtl })
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-lost',   kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', errorMessage: 'Broadcast of 00lost is unconfirmed: no status', txHash: '00lost',   submissionId: 'sub-lost' },
-        { ID: 'j-live',   kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00live',   submissionId: 'sub-live' },
-        { ID: 'j-legacy', kind: 'submitContractCall',        sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'EXTERNAL_EXECUTION_FAILED', txHash: '00legacy', submissionId: 'sub-legacy' },
-        { ID: 'j-lag',    kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00lag',    submissionId: 'sub-lag' },
-        { ID: 'j-book',   kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING', txHash: '00book', submissionId: 'sub-book' },
-        { ID: 'j-parent', kind: 'issueFieldPredicateAttestation',     sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'CHILD_RECONCILIATION_REQUIRED', txHash: '00parent' }
+        { ID: 'j-lost',   kind: 'sponsorUnbound', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', errorMessage: 'Broadcast of 00lost is unconfirmed: no status', txId: '00lost',   submissionId: 'sub-lost' },
+        { ID: 'j-live',   kind: 'sponsorUnbound', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txId: '00live',   submissionId: 'sub-live' },
+        { ID: 'j-legacy', kind: 'submitContractCall',        sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'EXTERNAL_EXECUTION_FAILED', txId: '00legacy', submissionId: 'sub-legacy' },
+        { ID: 'j-lag',    kind: 'sponsorUnbound', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txId: '00lag',    submissionId: 'sub-lag' },
+        { ID: 'j-book',   kind: 'sponsorUnbound', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING', txId: '00book', submissionId: 'sub-book' },
+        { ID: 'j-parent', kind: 'proveFieldPredicate',     sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'CHILD_RECONCILIATION_REQUIRED', txId: '00parent' }
     ));
     // the indexer has none of them (ABSENT, not merely unconfirmable); the answer's own tip is "now" (4 min past j-lag's ttl: inside the 5 min margin)
     registerChainOutcomeConfirmer(async () => chainAbsent(now));
@@ -273,15 +273,15 @@ test('a succeeded job whose transaction the indexer never shows gets chainStatus
     await db.run(cds.ql.DELETE.from(PS));
     const H = 60 * 60 * 1000;
     const now = Date.now();
-    const sub = (ID: string, txHash: string, ttl: number) => ({
-        ID, txHash, contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL',
+    const sub = (ID: string, txId: string, ttl: number) => ({
+        ID, txId, contractAddress: 'c8f4'.padEnd(64, '0'), circuit: 'attest', actionType: 'CALL',
         submittedAt: new Date(now - 3 * H).toISOString(), status: 'pending', sessionId: 'sp-sess',
         submitIntentData: JSON.stringify({ circuits: ['attest'], ttl: new Date(ttl).toISOString() })
     });
     await db.run(cds.ql.INSERT.into(PS).entries(sub('sub-gone', '00gone', now - 2 * H), sub('sub-fresh', '00fresh', now + 10 * 60_000)));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-gone',  kind: 'sendNight', sessionId: 'sp-sess', status: 'succeeded', chainStatus: 'pending', txHash: '00gone',  submissionId: 'sub-gone' },
-        { ID: 'j-fresh', kind: 'sendNight', sessionId: 'sp-sess', status: 'succeeded', chainStatus: null,      txHash: '00fresh', submissionId: 'sub-fresh' }
+        { ID: 'j-gone',  kind: 'sendToken', sessionId: 'sp-sess', status: 'succeeded', chainStatus: 'pending', txId: '00gone',  submissionId: 'sub-gone' },
+        { ID: 'j-fresh', kind: 'sendToken', sessionId: 'sp-sess', status: 'succeeded', chainStatus: null,      txId: '00fresh', submissionId: 'sub-fresh' }
     ));
     registerChainOutcomeConfirmer(async () => chainAbsent(now));
 
@@ -301,10 +301,10 @@ test('an indexed but not yet confirmable transaction (null lookup: unknown statu
     await db.run(cds.ql.DELETE.from(PS));
     const old = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
     await db.run(cds.ql.INSERT.into(PS).entries(
-        { ID: 'sub-future', txHash: '00future', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ circuits: ['attest'], ttl: old }) }
+        { ID: 'sub-future', txId: '00future', contractAddress: 'c8f4'.padEnd(64, '0'), circuit: 'attest', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ circuits: ['attest'], ttl: old }) }
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-future', kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00future', submissionId: 'sub-future' }
+        { ID: 'j-future', kind: 'sponsorUnbound', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txId: '00future', submissionId: 'sub-future' }
     ));
     // the indexer HAS the transaction, with a status this build cannot classify (a future status / no block height yet)
     registerChainOutcomeConfirmer(async () => null);
@@ -321,11 +321,11 @@ test("a lost sponsored DEPLOY refunds the grant's deploy reservation exactly onc
     await db.run(cds.ql.INSERT.into(AG).entries(GRANT_ROW('grant-deploy', { allowDeploy: true, maxDeploys: 1, deploysUsed: 1 })));
     const old = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
     await db.run(cds.ql.INSERT.into(PS).entries(
-        { ID: 'sub-deploy', txHash: '00deploy', contractAddress: null, circuitName: null, actionType: 'DEPLOY', submittedAt: old, status: 'pending', sessionId: 'sp-sess',
+        { ID: 'sub-deploy', txId: '00deploy', contractAddress: null, circuit: null, actionType: 'DEPLOY', submittedAt: old, status: 'pending', sessionId: 'sp-sess',
           submitIntentData: JSON.stringify({ circuits: [], deployed: ['d1'.padEnd(64, '0')], deployReservation: { grantId: 'grant-deploy', count: 1 }, ttl: old }) }
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-deploy', kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00deploy', submissionId: 'sub-deploy' }
+        { ID: 'j-deploy', kind: 'sponsorUnbound', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txId: '00deploy', submissionId: 'sub-deploy' }
     ));
     registerChainOutcomeConfirmer(async () => chainAbsent(Date.now()));
     await confirmChainOutcomesViaIndexer(db);
@@ -341,14 +341,14 @@ test('a workflow parent whose child broadcast was lost ends failed/CHILD_FAILED 
     await db.run(cds.ql.DELETE.from(PS));
     const old = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
     await db.run(cds.ql.INSERT.into(PS).entries(
-        { ID: 'sub-child', txHash: '00child', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'proveFieldPredicate', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ channel: 'bound', circuits: ['proveFieldPredicate'], ttl: old }) }
+        { ID: 'sub-child', txId: '00child', contractAddress: 'c8f4'.padEnd(64, '0'), circuit: 'proveFieldPredicate', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ channel: 'bound', circuits: ['proveFieldPredicate'], ttl: old }) }
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-parent2', kind: 'issueFieldPredicateAttestation', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'CHILD_RECONCILIATION_REQUIRED' },
-        { ID: 'j-commit',  kind: 'fieldAnchorRoot', sessionId: 'sp-sess', status: 'succeeded', parentJobId: 'j-parent2', workflowStep: 'commit', txHash: '00commit' },
-        { ID: 'j-reveal',  kind: 'fieldPredicateProof', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', parentJobId: 'j-parent2', workflowStep: 'reveal', txHash: '00child', submissionId: 'sub-child' }
+        { ID: 'j-parent2', kind: 'proveFieldPredicate', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'CHILD_RECONCILIATION_REQUIRED' },
+        { ID: 'j-commit',  kind: 'fieldAnchorRoot', sessionId: 'sp-sess', status: 'succeeded', parentJobId: 'j-parent2', workflowStep: 'commit', txId: '00commit' },
+        { ID: 'j-reveal',  kind: 'fieldPredicateProof', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', parentJobId: 'j-parent2', workflowStep: 'reveal', txId: '00child', submissionId: 'sub-child' }
     ));
-    registerChainOutcomeConfirmer(async (txHash: string) => txHash === '00child' ? chainAbsent(Date.now()) : { status: 'success', blockHeight: 1 });
+    registerChainOutcomeConfirmer(async ({ txId }) => txId === '00child' ? chainAbsent(Date.now()) : { status: 'success', blockHeight: 1 });
     await confirmChainOutcomesViaIndexer(db);
     expect(await db.run(cds.ql.SELECT.one.from(BG).where({ ID: 'j-reveal' }))).toMatchObject({ status: 'failed', errorCode: 'BROADCAST_NOT_INCLUDED' });
     // the parent reconciler propagates the terminal child failure
@@ -365,10 +365,10 @@ test('an absence whose answer carried no tip gives no verdict: the never-indexed
     await db.run(cds.ql.DELETE.from(PS));
     const old = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
     await db.run(cds.ql.INSERT.into(PS).entries(
-        { ID: 'sub-notip', txHash: '00notip', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ circuits: ['attest'], ttl: old }) }
+        { ID: 'sub-notip', txId: '00notip', contractAddress: 'c8f4'.padEnd(64, '0'), circuit: 'attest', actionType: 'CALL', submittedAt: old, status: 'pending', sessionId: 'sp-sess', submitIntentData: JSON.stringify({ circuits: ['attest'], ttl: old }) }
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-notip', kind: 'sponsorUnboundTransaction', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00notip', submissionId: 'sub-notip' }
+        { ID: 'j-notip', kind: 'sponsorUnbound', sessionId: 'sp-sess', status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txId: '00notip', submissionId: 'sub-notip' }
     ));
     registerChainOutcomeConfirmer(async () => CHAIN_ABSENT);
     await confirmChainOutcomesViaIndexer(db);
@@ -387,14 +387,14 @@ test('a batch records which of its calls applied, from the announced segments an
     await db.run(cds.ql.DELETE.from(PS));
     const segments = [{ segment: 1, calls: ['attest'] }, { segment: 2, calls: ['bindDocument'] }];
     await db.run(cds.ql.INSERT.into(PS).entries(
-        { ID: 'sub-batch', txHash: '00batch', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's',
+        { ID: 'sub-batch', txId: '00batch', contractAddress: 'c8f4'.padEnd(64, '0'), circuit: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's',
           submitIntentData: JSON.stringify({ circuits: ['attest', 'bindDocument'], segments }) },
-        { ID: 'sub-single', txHash: '00single', contractAddress: 'c8f4'.padEnd(64, '0'), circuitName: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's',
+        { ID: 'sub-single', txId: '00single', contractAddress: 'c8f4'.padEnd(64, '0'), circuit: 'attest', actionType: 'CALL', submittedAt: new Date().toISOString(), status: 'included', sessionId: 's',
           submitIntentData: JSON.stringify({ circuits: ['attest'] }) }
     ));
     await db.run(cds.ql.INSERT.into(BG).entries(
-        { ID: 'j-batch', kind: 'submitContractCallBatch', sessionId: 's', status: 'succeeded', txHash: '00batch', submissionId: 'sub-batch', chainStatus: 'pending' },
-        { ID: 'j-single', kind: 'submitContractCall', sessionId: 's', status: 'succeeded', txHash: '00single', submissionId: 'sub-single', chainStatus: 'pending' }
+        { ID: 'j-batch', kind: 'submitContractCallBatch', sessionId: 's', status: 'succeeded', txId: '00batch', submissionId: 'sub-batch', chainStatus: 'pending' },
+        { ID: 'j-single', kind: 'submitContractCall', sessionId: 's', status: 'succeeded', txId: '00single', submissionId: 'sub-single', chainStatus: 'pending' }
     ));
     registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 77, result: 'PARTIAL_SUCCESS', failedSegments: [2] }));
     await confirmChainOutcomesViaIndexer(db);

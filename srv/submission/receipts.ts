@@ -7,7 +7,7 @@ import type { BackgroundJob } from '#cds-models/midnight';
 import { HEX64_RE } from '../utils/hex-patterns';
 
 export const RECEIPT_ALGORITHM = 'ed25519';
-const RECEIPT_VERSION = 1;
+const RECEIPT_VERSION = 2;
 const DERIVE_INFO = 'nightgate/receipt-signing/v1';
 const RECEIPT_KINDS: ReadonlySet<string> = new Set(['sponsorSwap', 'sponsorTransfer']);
 // PKCS#8 header of a raw Ed25519 seed, so Node's key API takes it.
@@ -81,8 +81,8 @@ export function verifyReceipt(receipt: Receipt, publicKeyHex = receipt.publicKey
 }
 
 /** The receipt of a job, or null: only a sponsored swap or transfer that succeeded on chain gets one. */
-export function receiptForJob(job: BackgroundJob, transactionHash: string | null, network: string): Receipt | null {
-    if (!RECEIPT_KINDS.has(String(job.kind)) || job.chainStatus !== 'success' || !job.txHash) return null;
+export function receiptForJob(job: BackgroundJob, txHash: string | null, network: string): Receipt | null {
+    if (!RECEIPT_KINDS.has(String(job.kind)) || job.chainStatus !== 'success' || !(job.txId || txHash)) return null;
     let result: Record<string, unknown> = {};
     try { result = job.result ? JSON.parse(job.result) as Record<string, unknown> : {}; } catch { return null; }
     const terms = job.kind === 'sponsorSwap' ? result.swap : result.transfer;
@@ -92,10 +92,11 @@ export function receiptForJob(job: BackgroundJob, transactionHash: string | null
         kind: job.kind === 'sponsorSwap' ? 'swap' : 'transfer',
         jobId: job.ID,
         network,
-        txHash: job.txHash,
-        transactionHash: transactionHash ?? null,
-        blockHeight: job.chainBlockHeight ?? null,
-        blockHash: job.chainBlockHash ?? null,
+        txId: job.txId ?? null,
+        txHash: txHash ?? null,
+        // A number, as in every receipt signed so far. The database gives the height as text.
+        blockHeight: job.blockHeight === null || job.blockHeight === undefined ? null : Number(job.blockHeight),
+        blockHash: job.blockHash ?? null,
         finalizedAt: job.chainFinalizedAt ?? null,
         // An unshielded transfer names its recipient, and its terms were read from the transaction.
         ...(job.kind === 'sponsorSwap' ? { swap: terms } : { transfer: terms, declared: !('to' in terms) })

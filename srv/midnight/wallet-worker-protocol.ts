@@ -14,6 +14,10 @@ export interface SponsorPolicyArgs {
     allowDeploy?: boolean;
     /** Contracts deployed under this grant. Calls on them skip `allowedCircuits`. */
     ownContracts?: string[];
+    /** Both the server rules and the grant allow one maintenance update in this tx. */
+    allowMaintenance?: boolean;
+    /** The contracts such an update may change. Unset means any. */
+    maintainableContracts?: string[];
     /** Shielded token types whose zswap offers the sponsor pays for. Unset means none. */
     allowedTokenTypes?: string[];
     /** Also pay for the offer of a token that a call in this tx mints. */
@@ -28,7 +32,7 @@ export interface SponsorPolicyArgs {
 export const SUBMIT_METHODS: ReadonlySet<string> = new Set([
     'deployContract', 'submitContractCall', 'submitContractCallBatch',
     'registerDustGeneration', 'deregisterDustGeneration',
-    'transferNight', 'buildSponsorableTx', 'sponsorFinalizedTx'
+    'transferToken', 'buildSponsorableTx', 'sponsorFinalizedTx'
 ]);
 
 /** Methods that may send a tx. A worker restart waits for these calls and never repeats them. */

@@ -1,5 +1,686 @@
 # Changelog
 
+## 0.47.0 - 2026-11-24
+
+The last 0.x release. `@odatano/nightgate-tx` 0.25.0 ships with it; the bullets that name it are its changes.
+
+### Breaking
+
+- This version updates a database of 0.46.x only. The start refuses a
+  database that still holds rows in a format it does not read, and names
+  each with its fix: rows encrypted before the per-account data key or
+  without the bound `v3` envelope (run `nightgate-rewrap-keys` of 0.46.x
+  first), contract addresses of private states and signing keys not in
+  lowercase hex, contract states stored on every action, and base64 text
+  in PostgreSQL binary columns. docs/operations.md has the steps.
+- The start no longer rewrites stored hashes with a `0x` prefix, no longer
+  fills `TransactionIdentifiers` and block validators for older rows, and
+  no longer deletes `TransactionResults` without an outcome source.
+  `nightgate-schema-delta` no longer repairs databases from before 0.25.
+- The server reads only the stored formats of 0.46: values in the bound
+  `v3` envelope and rows under the account data key.
+  `scripts/rewrap-encryption-keys.mjs` only rotates the key ring;
+  `--drop-legacy-sync-state` is gone.
+- `NIGHTGATE_ACCEPT_UNBOUND_ENVELOPES` and `NIGHTGATE_ASSUME_DB_NETWORK`
+  are no longer read, and a start warns when one is set. A `SyncState` row
+  without a network refuses the start.
+- A wallet snapshot of an earlier wallet SDK no longer restores. That
+  wallet syncs again.
+- The off-chain disclosure tiers are gone: the admin actions `grantRole`
+  and `revokeRole`, the admin entity `DisclosureRoles`, the type
+  `DisclosureRole`, and the subpaths `./sdk/AttestationService` and
+  `./sdk/AttestationService.cds` with `registerAttestationServiceHandlers`
+  and `toPredicateEnvelope`. Who may read a disclosure is the grant in the
+  contract, which `verifyDisclosure` reads. The tables
+  `midnight_Attestations` and `midnight_DisclosureRoles` stay in the
+  database, and nothing reads or writes them.
+- `@odatano/nightgate` is no longer published to npm. The server runs from
+  the image or a clone, the operator tools are `node scripts/<tool>.mjs`
+  (`nightgate-schema-delta` is `scripts/apply-schema-delta.mjs` and so on).
+  The client paths are in `@odatano/nightgate-tx`: `./client` and `./sdk`
+  are `./client` and `.`, `./browser` and `./browser/providers.mjs` are
+  `./calls`, `./txbuilder` and `./set-root` keep their names, and
+  `./browser/attestation-vault` and `-32` are `./attestation-vault` and
+  `-32`. `./types` is gone.
+- In `/contract-manifest`, `artifactRef` names the package of every
+  contract registered from one, such as
+  `@odatano/contract-attestation-vault`.
+- `@odatano/nightgate-tx/calls` no longer exports `prepareRetract`. Use
+  `prepareRetractAttestation` or `preparePurgeExpired`.
+- `Transactions` no longer shows `merkleTreeRoot`, `startIndex` and
+  `endIndex`, and `NightBalances` no longer shows `dustAddress` and
+  `isDustRegistered`. The crawler never filled them. The columns stay in
+  the database.
+- A transaction's three values have one name each, the names of the Midnight
+  SDK. `txId` is a ledger identifier of the transaction, known once it is
+  built. `txHash` is the ledger hash, the one explorers and the Midnight
+  indexer show. `extrinsicHash` is the hash of the node's extrinsic. Before,
+  `txHash` meant the identifier in most job results and the ledger hash in
+  others.
+- `getJobStatus` answers `txId` and `txHash`. `transactionId` and
+  `transactionHash` are gone. `txHash` is set before the transaction is sent
+  and no longer needs the crawler.
+- Every job result that named `txHash` names `txId` and `txHash`. In the
+  results of sponsored transactions, swaps and transfers `txHash` was the
+  identifier and is now the ledger hash.
+- `Transactions`: `hash` is `extrinsicHash`, `ledgerTxHash` is `txHash`, and
+  `transactionId`, the position in the block, is `indexInBlock`.
+  `Transactions/byIdentifier(identifier)` is `Transactions/byTxId(txId)` and
+  answers `{ txId, extrinsicHash, txHash, ... }`.
+  `Transactions/ledgerTransaction` answers `extrinsicHash` in place of `hash`.
+- `PendingSubmissions` and the admin projection `BackgroundJobs`: `txHash` is
+  `txId`, `indexerTxHash` is `txHash`.
+- `anchoredTxHash`, `provenTxHash`, `grantedTxHash`, `revokedTxHash` and the
+  board's `filledTxHash` always hold the ledger hash. Rows settled from the
+  chain after a restart, and every `filledTxHash`, held the identifier.
+- Receipts carry `v: 2` with `txId` and `txHash` in place of `txHash` and
+  `transactionHash`. A receipt issued before still verifies.
+- `@odatano/nightgate-tx`: a finished job answers `txId` and `txHash`;
+  `transactionByIdentifier` is `transactionByTxId`; `contractDeploy` answers
+  `extrinsicHash` and `txHash` in place of `txHash` and `ledgerTxHash`;
+  `txIdentifiers` is `txIds`. The browser's `call`, `batch` and `deploy`
+  answer `{ txId, txHash, blockHeight }`.
+- The upgrade renames the columns in place, without rewriting a table.
+  `nightgate-schema-delta` does it on SQLite. On PostgreSQL the image runs
+  `nightgate-schema-delta --postgres` before `cds deploy`; an installation
+  that deploys by other means runs it first, else the deploy stops at a
+  dropped element. The step needs the model CAP stored in `cds_model` and
+  works on the schema of `credentials.schema` when one is set. The first start then moves a ledger hash that a job stored
+  as its identifier to `txHash`. The identifier of such a job is read from
+  the index, and is null without it.
+- The hash of a document is `payloadHash` on the document path too:
+  `anchorDocument(payloadHash, ...)`, `verifyDocument(documentId,
+  payloadHash, ...)` with `payloadHash` in its answer, and
+  `Documents.payloadHash`. It was `sha256`, `providedSha256` and
+  `originalSha256`. The value is whatever hash the caller anchors, not
+  necessarily a SHA-256. The column is renamed in place. A retry of
+  `anchorDocument` under an idempotency key used before the upgrade answers
+  409.
+- `documentId` means one thing: the id the vault contract binds to an
+  attester, as in `verifyAttestation`. The server's own id of an
+  anchored document is `anchorId`: `anchorDocument` and `attestAgentOutput`
+  answer it, `verifyDocument(anchorId, payloadHash, ...)` takes it, and the
+  result of an anchor job names it.
+- `registerPassport` is `registerDocument`, the name of the contract's
+  circuit, and takes `documentId` only. The parameter `passportId` and the
+  field `passportId` of the job result are gone. The client keeps
+  `registerDocument` and drops `registerPassport`. The browser export drops
+  `prepareRegisterPassport` and `prepareBindPassport`, whose
+  `prepareRegisterDocument` and `prepareBindDocument` stay.
+- An action has one name, the same in the client. The proof actions are
+  `proveFieldPredicate`, `proveFieldEquality`, `proveFieldMembership`,
+  `proveDocumentIntegrity`, `proveDocumentDiff` and `proveClaims` (were
+  `issueFieldPredicateAttestation`, `issueFieldEqualityAttestation`,
+  `issueFieldMembershipAttestation`, `issueDocumentIntegrityAttestation`,
+  `issueDocumentDiffAttestation`, `issueFieldPredicateAttestationBatch`).
+  The state checks are `verifyAttestation`, `verifyPredicate` and
+  `verifyDisclosure` (were `verifyAttestationState`, `verifyPredicateState`,
+  `verifyDisclosureState`), on the public verify service too. The sponsor
+  actions are `sponsorFinalized` and `sponsorUnbound` (were
+  `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`). The client's
+  `proveFieldPredicatesBatch` is `proveClaims`.
+- `sendNight` is `sendToken` and `estimateSendNightFee` is
+  `estimateSendTokenFee`, in the client too. The action sends any token,
+  NIGHT by default.
+- `getJobStatus` is a function, read with GET:
+  `getJobStatus(jobId='...',sessionId='...',waitMs=20000)`. A POST answers
+  405. The client polls that way and no longer falls back for a server that
+  lacks `waitMs` or `untilChain`.
+- Reads have limits. Every entity read, the bound read functions,
+  `getJobStatus` and the analytics functions count in the new rate class
+  `query`, 600 per minute per caller (`NIGHTGATE_QUERY_RATE_LIMIT`); a token
+  counts by its grant. Past it the answer is 429 with `Retry-After`.
+  `getGrantUsage` counts in `read`. Before, none of them was counted.
+- A `$batch` carries at most 20 requests (`NIGHTGATE_BATCH_MAX_PARTS`), and
+  each counts as one read. A larger one answers 429 `BATCH_TOO_MANY_REQ`.
+- On PostgreSQL an entity read that runs longer than 15 seconds
+  (`NIGHTGATE_QUERY_TIMEOUT_MS`, `0` = no limit) is stopped and answers 504
+  `QUERY_TIMEOUT`. SQLite has no such limit.
+- A server that checks no credentials listens on `127.0.0.1` only. That is
+  every start with `auth.kind` `dummy` or `mocked`, such as `npm run dev`
+  and `npm run serve` from a clone. Before, such a server listened on every
+  address and treated every caller as an admin. For other machines run it
+  with credentials, see the quickstart.
+- The image always checks credentials. `NIGHTGATE_AUTH` is gone, and with
+  it the image's mode without a password.
+- `getWorkerStatus` needs the admin role, before any user could call it.
+  In its `facades` the field `sessionId` is `walletKey`: it was never a
+  session id. `pool` and `workers` are declared in the model; the
+  wallets of one worker are `workers[].walletKeys`, before `facades`.
+- `FEE_SPONSOR_UNUSABLE` reaches the caller on every path. Its status says
+  why the session named by `sponsorSessionId` cannot pay: 403, 404, 410 or
+  412, as the table of error codes lists. Before, `createAgentGrant` and
+  `deregisterFromDustGeneration` answered with the generic code of the
+  status, and the table named 400, which never came. A server that cannot
+  decrypt the keys of the session answers 500 `INTERNAL`.
+- Exports of a contract's signing key and private state have the shape
+  midnight-js writes, and imports take that shape. The key inside an
+  export of `exportContractSigningKey` is `{ tag, value }`; before it was
+  the stored text, which midnight-js refused. A private state is exported
+  as the text of midnight-js' serializer. An export of an older version
+  still imports.
+- Private contract state is stored with the serializer of midnight-js,
+  which keeps big integers and bytes. Plain JSON, as stored before, threw
+  on a big integer and turned bytes into an object. Stored rows stay
+  readable. `superjson` is a dependency.
+- The server gives a contract its witnesses by what the contract is, not
+  by its name. A build gets the witnesses of an installed contract package
+  when its files have the digest that package's `contract.json` states,
+  under any name and registered by package or by path. Before, every name
+  starting with `attestation-vault` or `token-factory` got them, also a
+  foreign contract, which then received the caller's secret; and a vault
+  registered under another name got none. A changed build of a vault no
+  longer gets witnesses on the server: build its calls with the
+  transaction builder. The same rule decides whether a deploy gets the
+  vault's constructor arguments.
+- `listSwapOffers` with `since` lists the oldest change first, and a full
+  page ends with every offer changed at the same instant as its last
+  one. Before, it listed the newest first, so a feed that went on from
+  the newest `changedAt` lost the changes beyond `limit`. Without `since`
+  the order is unchanged.
+- `listSwapOffers` rows carry no `offer`. `getSwapOffer(offerId)` returns
+  the half. Before, every row held the half, up to 256 KB each.
+- A retry under the same `idempotencyKey` with a changed `validUntil`,
+  `unit` or `schemaId` of a proof action, a changed `independentCalls` of
+  `submitContractCallBatch`, or a changed `storageRef`, `contentType` or
+  `size` of `anchorDocument` answers 409 `IDEMPOTENCY_KEY_CONFLICT`.
+  Before, it returned the first job, built with the first values. A
+  retry of a job started before the upgrade answers 409 as well.
+- The compose file starts the proof server with the command of its image,
+  and `NIGHTGATE_PROOF_NETWORK` is gone. The proof server has no network
+  option, and its image 9.0.2 does not start when it is given one.
+- The network name `testnet` is gone. It had the built-in endpoints of
+  `undeployed`, the name of a local node, and no network of its own. A
+  server configured with it refuses to start and names the valid ones:
+  `preview`, `preprod`, `mainnet`, `stagenet`, `undeployed`.
+- `NIGHTGATE_PRIVATE_STATE_BACKEND` and `privateStateBackend` are gone.
+  The value `level` was accepted and every contract submission then
+  refused it. Private contract state is stored encrypted in the database.
+  The package `@midnight-ntwrk/midnight-js-level-private-state-provider`
+  is no longer a dependency.
+- `NIGHTGATE_ZK_CONFIG_BASE` and `zkConfigBasePath` are gone. Nothing read
+  them. A relative `artifactPath` or `zkConfigPath` counts from the
+  working directory.
+- `@odatano/nightgate-tx` declares no `any`. In TypeScript:
+  `callFunction` and `callAction` return `unknown` unless called with
+  the answer type, as `callFunction<T>`. Fourteen read methods return a
+  named answer type instead of `any`, among them `verifyAttestation`,
+  `verifyPredicate`, `verifyDocument`, `prepareDocumentProof`,
+  `connectWallet`, `getWalletBalance` and `getHealth`. In the browser
+  export, `connector` is a `ContractConnector`, `webSocket` a WebSocket
+  class and `proofMod` the proof provider module, and
+  `providers.d.mts` declares what `index.d.ts` declares.
+- The model marks the fields an answer always carries as `not null`, so
+  `$metadata` says `Nullable="false"` for them: all of
+  `verifyAttestation`, `verifyPredicate`, `deriveTokenType`,
+  `prepareMembershipSet`, `disconnectWallet`, `deriveWalletInfo` and
+  `getWalletBalance`, and the fixed part of `verifyDisclosure`,
+  `verifyPredicateAttestation`, `verifyDocument`, `prepareDocumentProof`,
+  `connectWallet`, `connectWalletForSigning` and `getWalletSyncProgress`.
+  No answer changed.
+- `@odatano/nightgate-tx/txbuilder`: `onProgress` is typed. Each of the
+  ten events has its own type, joined in `BuilderProgressEvent`, so the
+  fields of an event are known once its `phase` is checked. Before, an
+  event was any object.
+- The batch code of the builder and the browser export writes nothing to
+  the console any more. The builder reports through `onProgress`: phase
+  `batch-order` with `before`, `after` and `stageGrouped`, and phase
+  `batch-gas-check` when the gas check could not decide. The server logs
+  the same through its logger.
+- Browser export: `FetchZkConfigProvider` is the class of midnight-js,
+  handed on unchanged. It is built as
+  `new FetchZkConfigProvider(baseUrl, { fetchFunc })`; the own form
+  `(baseUrl, fetchFn)` is gone. `keyMaterialProvider()` is gone from the
+  result of `createNightgateConnectorProviders`: `proving: 'wallet'`
+  proves in the wallet.
+- `@odatano/nightgate-tx/txbuilder`: the builder supplies the vault's
+  witnesses for a batch and a deploy when the contract class is the one
+  of an installed attestation vault package, under any `contractName`.
+  Before, it went by a name starting with `attestation-vault`. For any
+  other contract the caller passes the witnesses.
+- `@odatano/nightgate-tx/txbuilder` exports what its types declare and no
+  more. Sixteen helpers that were importable without a declaration are
+  gone from it: `walletSyncMode`, `walletConfiguration`, `syncedWallets`,
+  `sharedShieldedWallet`, `isShieldedWallet`, `syncProgressEvent`,
+  `watchSync`, `revertBuilt`, `runSingleCall`, `buildOnlyWalletProvider`,
+  `explainPreForkMismatch`, `gasHeadroomFactor`, `scaleTranscriptGas`,
+  `timeToDismissLimits`, `headroomThatFits`, `applyGasHeadroom`. Seven
+  more that no document described are gone as well:
+  `proofProviderConfig`, `recipientKeyMap`, `trackingWebSocket`,
+  `apiPublicDataProvider`, `buildOnlySubmissionService`,
+  `spendableWithin`, `chooseSwapCoin`.
+- Browser export: `buildProofProvider` takes the proof server as
+  `proofServerUrl`, the name every other option uses. It was
+  `proverServerUri`.
+- `@odatano/nightgate-tx`: `computeRecordKey(attesterId, payloadHash)` of
+  the builder returns a Promise. It is the function of the contract kit
+  now, so the builder and the server compute the key in one place.
+- SQLite with one instance is a supported way to run, in production too.
+  `NIGHTGATE_ALLOW_PRODUCTION_SQLITE` and `allowProductionSqlite` are
+  gone, and so is the warning at every start of the image with SQLite.
+  The rule of one instance holds for every database, as before.
+- `NIGHTGATE_BATCH_SEGMENT_MODE` is gone. Its mode `observe` only logged a
+  batch and skipped the check of the call order and the gas check before
+  proving. A batch is always ordered and checked.
+- A start warns when a retired setting is still set, as a variable or as
+  a key under `cds.requires.nightgate`.
+- `NIGHTGATE_DUST_COLD_START` is marked as diagnostic in the settings
+  table: it can change or go without notice.
+- Seven environment variables have new names. The former name is not
+  read, and a start warns when it is set:
+  `NIGHTGATE_SIGNING_KEY_RATE_LIMIT` is `NIGHTGATE_SIGNING_RATE_LIMIT`,
+  `NIGHTGATE_FEE_SPONSOR_SESSION` is `NIGHTGATE_FEE_SPONSOR_SESSIONS`,
+  `NIGHTGATE_SPONSOR_WAIT` is `NIGHTGATE_SUBMIT_WAIT`,
+  `NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS` is
+  `NIGHTGATE_SUBMIT_INDEXER_VISIBLE_MS`,
+  `NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS` is `NIGHTGATE_SPONSOR_MAX_INPUTS`,
+  `NIGHTGATE_FETCH_CONCURRENCY` is `NIGHTGATE_CRAWLER_FETCH_CONCURRENCY`,
+  `NIGHTGATE_RPC_BATCH_SIZE` is `NIGHTGATE_CRAWLER_RPC_BATCH_SIZE`. The
+  CDS keys `signingKeyRateLimit`, `sponsorWait`,
+  `sponsorIndexerVisibleMs` and `sponsorSwapMaxInputs` moved with their
+  variables and are not read either.
+- A setting has one key under `cds.requires.nightgate`, the one the
+  settings table names in its new column `CDS key`. For fourteen settings
+  the camel case of the variable was read as a second, undocumented key
+  and won over the documented one: `crawlerEnabled`, `crawlerNodeUrl`,
+  `fetchConcurrency`, `rpcBatchSize`, `crawlerStartHeight`,
+  `crawlerMaxBps`, `crawlerDecodePayloads`, `crawlerIndexerSupplement`,
+  `crawlerIndexerUrl`, `crawlerContractStateHistory`,
+  `crawlerContractStateWatch`, `crawlerSupplementMaxBps`, `zkConfigBase`
+  and `feeSponsorSession`. They are no longer read. The keys are
+  `crawler.<name>`, `zkConfigBasePath` and `feeSponsorSessions`, and a
+  start warns for each former key it finds. Environment variables are
+  not affected.
+- A wallet session that does not exist, is inactive or belongs to another
+  user answers 404 `SESSION_NOT_FOUND` on every action. Before, the wallet
+  actions answered 404 `NOT_FOUND` and the proof, contract and disclosure
+  actions 401 `UNAUTHENTICATED`.
+- Every error code of this server is upper case with underscores, also
+  in `getJobStatus.errorCode`. Renamed: `TxFailed` to `TX_FAILED`,
+  `NetworkOrTimeout` to `NETWORK_OR_TIMEOUT`, `SubmitAmbiguous` to
+  `SUBMIT_AMBIGUOUS`, `PoolInvalid` to `POOL_INVALID`,
+  `SubmitIntentRejected` to `SUBMIT_INTENT_REJECTED`,
+  `SubmitIntentTimeout` to `SUBMIT_INTENT_TIMEOUT`,
+  `SponsorPolicyRefused` to `SPONSOR_REFUSED`, `BatchCausalityViolation`
+  to `BATCH_CAUSALITY_VIOLATION`, `BatchGasBudgetExceeded` to
+  `BATCH_GAS_BUDGET_EXCEEDED`, `MalformedResult` to `MALFORMED_RESULT`,
+  `WalletSigningNotAvailable` to `WALLET_SIGNING_NOT_AVAILABLE`.
+  `OnChainStatus:<status>` is `TX_FAILED` with the status in the message.
+  The three SDK error names for a wrongly configured contract call are
+  `CONTRACT_CONFIG_INVALID`. The numbers of the node, such as `1010/104`,
+  stay.
+- A job no longer ends with the name of a JavaScript error as its code.
+  A failure of this server keeps its own code, for example
+  `ARG_COERCION_FAILED`; any other failure is `UNKNOWN_ERROR` and the
+  message starts with the name of the error.
+- The two batch errors of the transaction builder and of the browser
+  export carry `code: 'BATCH_CAUSALITY_VIOLATION'` and
+  `'BATCH_GAS_BUDGET_EXCEEDED'`.
+- An instant a caller sends is a timestamp. `validUntil` of the six
+  `prove*` actions takes ISO 8601 text, before UNIX seconds; a number
+  answers 400 `ASSERT_DATA_TYPE`. `sendToken` and `estimateSendTokenFee`
+  take `expiresAt` as a timestamp in place of the text parameter
+  `ttlIso`, which answers 400.
+- A page size outside its range answers 400 `ASSERT_RANGE`. Before,
+  `getReorgHistory` and `reconcileNightBalances` cut a larger `limit`
+  down without notice, and `listSwapOffers` answered 400 with a text of
+  its own. The ranges are in the model: `getReorgHistory` 1 to 100,
+  `reconcileNightBalances` 1 to 500, `listSwapOffers` 1 to 200.
+- `circuit` of `Transactions` and `ContractActions` is a circuit name or
+  null. Before, a row whose payload was not decoded held the index of the
+  pallet call there, such as `5:0`, also for a deploy. The upgrade clears
+  those values in the pass that fills the chain position.
+- A read of `Transactions`, `ContractActions` or `UnshieldedUtxos` sorted
+  by `createdAt` has no index any more and can run into the read limit on
+  a large database. Sort by the chain position, see Changes. The indexes
+  on `createdAt` of the three tables are dropped.
+- A threshold is a decimal string, like the field value it is compared
+  with: `"threshold": "50000"` in `proveFieldPredicate`, in a claim of
+  `proveClaims` and in `verifyPredicate`, where the URL quotes it
+  (`threshold='50000'`). A JSON number answers 400 `ASSERT_DATA_TYPE`, a
+  text that is no decimal integer 400 `ASSERT_FORMAT`; the same holds for
+  `proveFieldPredicate.value`. A threshold goes up to 2^64-1 as the
+  circuit does, before the limit was 2^63-1. Answers carry the same
+  text: the claims of `proveClaims`, `verifyPredicateAttestation`, the
+  table `PredicateAttestations`.
+- `PredicateAttestations` has a column `k` for a document diff, whose
+  `threshold` is null. Before, the diff kept its `k` in `threshold`. The
+  column `threshold` is text. `nightgate-schema-delta` changes its type
+  in an older database, on PostgreSQL in the step before the deploy, on
+  SQLite by building the table again, and the server moves the `k` of
+  stored diffs at start.
+- `verifyPredicateAttestation` answers `null` for a field its predicate
+  does not use. Before, `threshold` was `0` and the texts were empty,
+  also for a proof that has no threshold. A document diff has its `k` in
+  `k`, no longer in `threshold`. New in the answer: `contractAddress`,
+  `attesterId`, `payloadHash`, `fieldKey` and `attesterIdB`, the inputs of
+  `verifyPredicate`. `provenTxHash` is `null` until the proof is on chain.
+- `getJobStatus.result` is a JSON object, before it was text that held
+  JSON. A reader drops its `JSON.parse`; parsing an object throws.
+  `chainSegments` is a list of `{ segment, calls, applied }`, empty for a
+  job that is no batch, before it was JSON text or null. `gc.byKind` of
+  `profileWorker` is an object. The client of nightgate-tx follows.
+- The main service shows what belongs to the contract, the admin service
+  the operator's tables. `PendingSubmissions` left the main service; a
+  caller follows a send with `getJobStatus`. `AgentGrants` there lost its
+  lists as JSON text and its counters (`allowedActions`,
+  `allowedContracts`, `jobsUsedToday`, `budgetWindow`, `deploysUsed` and
+  the like); the lists come back from the create and update actions, the
+  use from `getGrantUsage`. `Transactions` lost `identifiers`, for which
+  `byTxId` exists. `SyncState` and `getSyncStatus()` lost
+  `identifiersBackfilledAt`, `authorBackfillHeight` and
+  `authorsBackfilledAt`. The admin service has `AgentGrants`,
+  `PendingSubmissions` and `SyncState` in full. An agent token no longer
+  reads `PendingSubmissions`.
+- Every block height and the block time are 64-bit integers and arrive as
+  text, in a table read and in the answer of an action or function.
+  Changed from a JSON number: `getJobStatus.blockHeight`,
+  `Blocks.timestamp`, `UnshieldedUtxos.ctime`, `byTxId().blockHeight`, the
+  heights of `stateAt()`, `getHealth()` with `lag` and `finalizedLag`,
+  `getSyncStatus()`, `reindexFromHeight()`, `redecodeFromHeight()` and
+  `getReorgHistory()`, `startIndex` and `endIndex` of `byHash()`. The
+  payload of a receipt keeps `blockHeight` as a number. On PostgreSQL the
+  first start widens four columns, which rewrites `Blocks` and
+  `UnshieldedUtxos` once, before the server listens.
+- Values from a fixed list are declared as that list in the model, for
+  parameters and results. A parameter outside its list answers 400
+  `ASSERT_ENUM` before the action runs: `listSwapOffers.status` (no longer
+  case-insensitive, no empty text), `network` and `predicate` of the
+  verify functions, `grantRole.role`, `profileWorker.thread`.
+  `grantDisclosure.level` takes 0 to 2 and `registerDocument.mode` 0 to 4,
+  else 400 `ASSERT_RANGE`.
+- `getReadiness.phase` reports `catching_up`, before `catching-up`. Own
+  states are lowercase with underscores, values of the Midnight indexer
+  keep its upper case, names of checks read like action names.
+- Amounts and addresses are typed. Every `amount` parameter takes digits
+  only: a sign, a space, a decimal point, `1e3` or `0x10` answer 400
+  `ASSERT_FORMAT` with the parameter in `target`, before the action runs.
+  `receiverAddress` and `dustReceiverAddress` answer the same for a text
+  that is not an address of their kind. In the model, results that are a
+  hash, a token type, an amount or an address carry that type instead of
+  `String`.
+- `NIGHTGATE_SPONSOR_ALLOW_DEPLOY` and `allowDeploy` in the sponsor policy
+  file are gone. A deploy the caller built is sponsored for a token whose
+  grant has `allowDeploy` and budget left, and for a caller without a
+  token, who is the operator. Before, the server-wide switch had to be on
+  as well. Check the grants before the upgrade: every active grant with
+  `allowDeploy` gets deploys sponsored from the first start. A leftover
+  setting or policy file key is ignored with a warning in the log.
+  `getSponsorPolicy` no longer returns `floor.allowDeploy`.
+- A sponsor pays maintenance updates. A grant with `allowMaintenance` and
+  budget left (`maxMaintenanceUpdates`, default 8, lifetime) gets an update
+  of a contract it deployed sponsored paid, one update per transaction under
+  `NIGHTGATE_SPONSOR_MAX_MAINTENANCE_BYTES` (default 40960). An update may
+  insert or remove verifier keys and replace the authority. Other contracts
+  stay refused; a caller without a token may update any. New grant columns
+  `allowMaintenance`, `maxMaintenanceUpdates`, `maintenanceUpdatesUsed`.
+  nightgate-tx: `buildMaintenanceSponsorable({ update, bind })` proves a
+  signed `MaintenanceUpdate` and hands it over without a fee.
+- `docker/docker-compose.yml` publishes the node (9944, 30333) and the
+  indexer (8088) on `127.0.0.1` only. `NODE_BIND_ADDRESS=0.0.0.0` and
+  `INDEXER_BIND_ADDRESS=0.0.0.0` publish them on all addresses, as before.
+  The indexer has no default secret any more and does not start without
+  `INDEXER_SECRET`. An indexer that ran on the default keeps its data with
+  `INDEXER_SECRET=deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe`;
+  a new secret needs a fresh sync.
+- `getMetrics()` needs the admin role. It was readable without credentials
+  and shows queues, pools and a series per wallet. A scraper sends the
+  operator's basic auth. `getHealth()` and `getSyncStatus()` stay open and
+  count in the rate class `read` per client address. `getLiveness()` and
+  `getReadiness()` are never refused.
+- Every action answers an object. `connectWalletForSigning` answers `jobId`
+  and `status`, like every other action that starts a job (were
+  `prewarmJobId` and `prewarmStatus`). `disconnectWallet` and
+  `invalidateSession` answer `{ sessionId, isActive }`,
+  `invalidateAllSessions` answers `{ invalidated }`, `grantRole` the granted
+  role and `revokeRole` `{ revoked }` in place of a bare number.
+- A request under a former action name answers 404, and `allowedActions` of
+  a grant refuses one with 400. docs/actions.md lists the former names.
+- The `kind` of a job is the name of the action that started it:
+  `registerDocument`, `retractAttestation`, `purgeExpired` and
+  `buildSponsorable` (were `registerPassport`, `retract`, `buildSponsorableTx`).
+  The first start gives stored jobs and the `allowedActions` of every grant
+  the current names.
+- A field has one name in every action, answer and table:
+  - `tokenType`, not `tokenTypeHex`: `sendToken`, `estimateSendTokenFee`,
+    the answer of `deriveTokenType`.
+  - `contractName`, not `compiledArtifactRef`: every action and function
+    that names a registered contract, `Documents` and
+    `PredicateAttestations`. The browser's `connectContract` and
+    `createNightgateConnectorProviders` take `contractName` where they took
+    `contract`. The builder called it `contractName` before. A request that
+    still sends `compiledArtifactRef` answers 400.
+  - `circuit`, not `circuitName` (`Transactions`, `PendingSubmissions`) or
+    `entryPoint` (`ContractActions`).
+  - `contractAddress`, not `address`: `ContractActions`, `ContractStates`,
+    the parameter and the answer of `stateAt`, and the client's
+    `contractStateAt({ contractAddress })`.
+  - `blockHeight` and `blockHash`, not `chainBlockHeight` and
+    `chainBlockHash`: `getJobStatus`, `PendingSubmissions`, `BackgroundJobs`.
+  - `receiverCoinPublicKey`, not `recipientCoinPublicKey`:
+    `mintFactoryToken`.
+  - `isActive`, not `active`: `DisclosureGrants`, `HolderDisclosureGrants`,
+    the `grant` part of `getSponsorPolicy`.
+  - `network`, not `networkId`: `SyncState`, `ContractRegistrations`,
+    `WalletSyncStates`.
+  - `label`, not `agentLabel`: `createAgentGrant`, `createAgentGrants`,
+    `updateAgentGrant`, their answers and `AgentGrants`.
+- A read that a query on the entity answers has no function of its own.
+  Ten bound read functions are gone and answer 404:
+  - `Blocks/latest()` is `Blocks?$orderby=height desc&$top=1`.
+  - `Blocks/byHeight(height)` is `Blocks?$filter=height eq <height>`.
+  - `Blocks/range(startHeight, endHeight)` is
+    `Blocks?$filter=height ge <start> and height le <end>&$orderby=height`.
+  - `Transactions/byType(txType)` is `Transactions?$filter=txType eq
+    '<type>'&$orderby=blockHeight desc,indexInBlock desc`.
+  - `ContractActions/byAddress(contractAddress)` is
+    `ContractActions?$filter=contractAddress eq
+    '<address>'&$orderby=blockHeight,indexInBlock,actionIndex`. `history`
+    is the same with every column `desc`.
+  - `UnshieldedUtxos/byOwner(owner)` is `UnshieldedUtxos?$filter=owner eq
+    '<address>'&$orderby=blockHeight desc,indexInBlock desc,outputIndex desc`.
+  - `UnshieldedUtxos/unspent()` is the same sort with
+    `$filter=spentAtTransaction_ID eq null`.
+  - `NightBalances/getBalance(address)` is `NightBalances('<address>')`, 404
+    for an address without a row.
+  - `NightBalances/getTopHolders(limit)` is
+    `NightBalances?$orderby=balance desc&$top=<limit>`.
+
+  `limit` and `skip` are `$top` and `$skip`. A query returns at most 1000
+  rows and carries `@odata.nextLink` when more exist. The functions took up
+  to 5000. A query answers a list, also where the function answered one row.
+  `Transactions/byHash`, `byTxId`, `ledgerTransaction` and
+  `ContractStates/stateAt` stay.
+- `@odatano/nightgate-tx`: `blockAt(height?)` reads the block at a height,
+  default the newest. A builder created with `api` reads its blocks with it.
+- The test token is no part of the product. `mintShieldedTestToken` is gone
+  from the service and from the client. Its contract `shielded-token` is
+  registered in the development profile only, is a dev dependency, and the
+  image no longer carries its prover keys. To mint it, register the contract
+  and call its circuit `mint` with `submitContractCall`. Tokens with a name
+  of their own come from the token factory (`mintFactoryToken`).
+- `deriveTokenType` requires `domainSeparator` and answers 400 without it.
+  Before, a call without one answered the type of the test token for any
+  contract.
+- A wallet session has one id, `sessionId`. It is the key of
+  `WalletSessions`, so one session is read as `WalletSessions(<sessionId>)`.
+  The row id `ID` is gone from the entity and from the answer of
+  `connectWallet`. The upgrade moves the key and drops the column:
+  `nightgate-schema-delta` on SQLite, `nightgate-schema-delta --postgres`
+  before `cds deploy` on PostgreSQL. A start on a database that still has
+  the column is refused and names the tool.
+- The request of a sponsor job stores the hash of the submitted bytes as
+  `contentHash`, not `txHash`. A request repeated under an idempotency
+  key used before the upgrade answers 409 and names the job, when its
+  action or one of its parameters was renamed.
+- The offer board lists only offers anyone can take. `postSwapOffer` no longer
+  takes `takerSecretHash`, `sponsorSwap` no longer takes `takerSecret`, and
+  the rows of `postSwapOffer`, `listSwapOffers` and `getSwapOffer` carry no
+  `directed` field. A call that still sends one of the two parameters answers
+  400. For a deal with one partner, hand the offer file to that partner:
+  `sponsorSwap` takes it as `makerHalfB64`.
+- The first start retires every open offer that was posted with a
+  `takerSecretHash`. Its poster reads it as `retired` in `listSwapOffers`.
+- `PredicateAttestations` and `DisclosureGrants` are owner-scoped like
+  `Documents`: a caller lists the rows of its own proofs and grants, an agent
+  token those of its session, an admin all of them. Before, every user and
+  every token listed the rows of all users, with the claim in plain text and
+  with attempts that never landed. A third party checks a claim or a grant
+  with `verifyPredicate`, `verifyPredicateAttestation` and
+  `verifyDisclosure`, which read the chain.
+- Both tables gain `userId` and `sessionId` (`nightgate-schema-delta` on
+  SQLite, `cds deploy` on PostgreSQL). The first start gives each
+  existing row the user and session of the job that wrote it. A grant row
+  that only came from the chain keeps no owner and is listed for admins only,
+  until its attester calls `grantDisclosure` for it.
+
+### Changes
+
+- `verifyAttestation`, `verifyPredicate` and `verifyDisclosure` return
+  `blockHeight`: the indexer's newest block, at which the state was read.
+  Null only without a live provider.
+- `/odata/v4/midnight-verify` declares the same `not null` answer fields
+  as the main service.
+- `NIGHTGATE_ALLOW_MAINNET_SUBMISSION=true` turns on mainnet submission,
+  also in the image. It overrides `allowMainnetSubmission`. The 403 of a
+  submitting action on mainnet names it.
+- `docs/actions.md` states the versioning rule from 1.0.
+- Both package manifests no longer depend on the alias
+  `@midnight-ntwrk/wallet-sdk-address-format`, and the server no longer
+  names `@midnight-ntwrk/dapp-connector-api` as an optional peer. Nothing
+  imported either. `@sap/cds`, `@sap/cds-dk`, `@cap-js/sqlite`,
+  `@cap-js/postgres` and `better-sqlite3` are dependencies of the server.
+- The start no longer warns about `crawlerlessChainConfirm`, an option
+  without effect.
+- Compose passes `ENCRYPTION_KEYS`, `ENCRYPTION_KEY_ACTIVE`,
+  `NIGHTGATE_TRUST_PROXY`, `NIGHTGATE_DB_DEPLOY`, `NIGHTGATE_PUBLIC_VERIFY`,
+  `NIGHTGATE_FEE_SPONSOR_SESSIONS`, `NIGHTGATE_SPONSOR_POLICY_FILE`,
+  `NODE_OPTIONS` and `NIGHTGATE_NODE_FLAGS`, and with `--profile postgres`
+  starts the server once the database answers.
+- The image holds no dev packages.
+- `getWalletSyncProgress` reports `stale` once the snapshot is older than
+  `NIGHTGATE_SYNC_PROGRESS_STALE_S` or two `NIGHTGATE_PROGRESS_WATCH_MS`,
+  whichever is longer, the rule the sponsor check uses. A caught-up wallet
+  no longer shows `stale` between two reports.
+- A sponsored job whose sponsor has no free dust note ends with
+  `SPONSOR_DUST_UNAVAILABLE`, and one whose sponsor wallet is not loaded
+  with `FEE_SPONSOR_UNUSABLE` (412). Both ended with `UNKNOWN_ERROR`. A
+  later attempt may succeed; the server does not repeat the job itself.
+- The start checks every table and column of the model, not a fixed list.
+- A job keeps every code of the error table across a restart. The start
+  turned a code not marked for jobs, such as `WALLET_NOT_SYNCED`, into
+  `UNKNOWN_ERROR`.
+- `@odatano/nightgate-tx/txbuilder`: `readUnshieldedTransfer(tx, { networkId })`
+  returns the recipient as `to` in the form wallets show (`mn_addr_...`),
+  as `buildTransfer().terms.to` and the receipt do, and as raw hex in
+  `toHex`. Before, its `to` was the raw hex.
+- `@odatano/nightgate-tx`: `read(table, query)` returns the rows of a table
+  of the main or the indexer service, with `filter`, `orderby`, `top`,
+  `skip` and `select`. It is the client's way to the queries that replace
+  the read functions removed in this release.
+- `@odatano/nightgate-tx/txbuilder`: `waitForWalletSync(facade, forks)`
+  waits until the sub-wallets of an own wallet SDK facade caught up and
+  read the chain at ledger 9. The facade's `waitForSyncedState()` is done
+  a moment earlier for a fresh wallet, and a fee balanced then is refused.
+  The example `self-funded.mjs` uses it.
+- `@odatano/nightgate-tx`: `buildSponsorable` returns `nextPrivateState`,
+  the contract's private state after the call, after the last call of a
+  batch. The builder keeps none between builds: store the value once the
+  transaction landed and pass it as `initialPrivateState` of the next
+  build. A contract whose private state changes with a call can so be
+  called more than once.
+- `@odatano/nightgate-tx`: `buildDeploySponsorable` returns `signingKey`,
+  the key that may maintain the deployed contract, and `nextPrivateState`,
+  the private state after the constructor. It takes an own `signingKey`.
+  A deploy built before kept no key, so such a contract cannot be
+  maintained.
+- `@odatano/nightgate-tx`: `NightgateApiError.job` names the job that holds
+  the key on a 409 `IDEMPOTENCY_KEY_CONFLICT`, as the server sends it.
+- `@odatano/nightgate-tx`: the result of a write action and of `waitForJob`
+  carries `chainStatus` and `blockHeight`. `JobStatus` declares every field
+  of `getJobStatus`, `BoardStatus` has `version`, `BuilderPackage` has
+  `ledger8` and `slotWidth`.
+- `@odatano/nightgate-tx` declares Node 22.12 or newer, as its
+  dependencies need.
+- A JSON number above 2^53 is refused with 400 where it would enter a
+  proof: `merkleProof.fieldValue` and every `Uint` argument of a circuit.
+  JSON rounds such a number on the way, so the proof was about another
+  value than the one sent. The same value as a decimal string is taken
+  as before. A text that is no decimal integer, such as `0x10`, is
+  refused in the same places.
+- An error with a code that comes out of the wallet worker reaches the
+  caller with its own message. Before, it carried the text of the error
+  around it with every cause appended. A message a server error keeps in
+  production stays kept across the worker.
+- A job cut off by a restart of its worker ends with `WORKER_ROTATED`,
+  now a code of the table.
+- `SPONSORED_CALL_NOT_APPLIED` is gone from the table of error codes. It
+  was never raised: a sponsored call that lands and does not apply ends
+  with `TX_FAILED`.
+- `NIGHTGATE_SESSION_TTL_MS` sets the lifetime of a wallet session, next
+  to the CDS key `sessionTtlMs`. The value is checked like every setting
+  of the table: text is read as a number, and for less than a minute the
+  default applies. Before, a `sessionTtlMs` given as text made
+  `connectWallet` fail.
+- One table holds every error code: those a request is refused with and
+  those a job ends with. The table of error codes in the reference and
+  the retry list of the client are written from it by
+  `npm run errors:table`. The first start gives stored jobs and attempts
+  the current codes.
+- The order of the chain is on the row. `Transactions`, `ContractActions`
+  and `UnshieldedUtxos` carry `blockHeight` and `indexInBlock`, the place
+  of the transaction in its block; a UTXO has those of the transaction
+  that created it. `ContractActions.actionIndex` is never null. A read
+  sorted by `blockHeight`, `indexInBlock` and the row's `actionIndex` or
+  `outputIndex`, all ascending or all descending, is served by an index:
+  eight indexes named `ng_…_position` take the place of those on
+  `createdAt`. Before, the sort was the time a row was stored, which is the
+  same for every row of a block, so two actions of a contract in one block
+  came back in any order. `byHash()`, `ledgerTransaction()` and
+  `stateAt()` sort by the position too.
+- `nightgate-schema-delta` adds the position columns to an older database
+  and fills them, on PostgreSQL in the step before the deploy. It writes
+  every row of the three tables once and builds their indexes again, which
+  takes minutes on a large database: 5 minutes for 2 million transactions,
+  2 million actions and 1 million UTXOs on a developer machine. A row
+  without its transaction or block stops the step.
+- `connectWallet.viewingKey` is `Hex64`: it takes `0x` and any letter case,
+  and one key is one account in every spelling. Before, the account id was
+  derived from the text as sent, so upper case opened a second, empty account.
+- An account stored under another spelling moves to the account of the
+  lowercase spelling: private states, contract signing keys and the saved
+  wallet state, re-encrypted under that account's data key. The first start
+  does it for every session that holds a viewing key, a connect does it for
+  the spelling it was sent in and for upper case. A row the lowercase account
+  already has stays where it is, of two saved wallet states the newer one is
+  kept.
+- New error code `ACCOUNT_MOVE_BLOCKED` (409): an open session still holds
+  the wallet under another spelling. Close it, then connect again.
+- The crawler notices a node on another chain. On every catch-up it compares
+  the newest block it shares with the node's finalized chain. A different
+  hash stops indexing with `syncStatus` `error` and the new error code
+  `SYNC_STATE_CHAIN_MISMATCH` in `lastError`, naming the block and both
+  hashes. Before, such a node showed as an index gap or as a reorg deeper
+  than 100 blocks. A node behind the index is logged as that and waited for.
+- `sendToken` and `estimateSendTokenFee` take a mainnet address. They
+  looked for `mn_addr_` and `mn_shield-addr_`, and a mainnet address has
+  no network part after the kind (`mn_addr1...`), so both refused it.
+- An agent token reads only the jobs its own grant started, also when
+  `getJobStatus` names the sponsor session. Before, naming the pool opened
+  every pool job of the same user to a token that knew the job id.
+- The idempotency key of a sponsor action is per grant. Before, the grants
+  of one user shared their keys, so one token's key answered 409 to
+  another. A job a grant started under the shared form keeps its key.
+- A warning at start when `ENCRYPTION_KEY` begins or ends with whitespace.
+  The key is used as given.
+- `sponsorTransfer` refuses an `amount` above `2^128 - 1` with 400. The
+  amount stands in the signed receipt, and no token can hold more.
+- New tool `nightgate-adopt-chain` for a network that was started again
+  under its name. It finds the last block the index and the node share,
+  reports what is above it, and with `--apply` rolls the index back to that
+  block and drops the saved wallet states. It runs with the server stopped
+  and refuses while one holds the database.
+
 ## 0.46.3 - 2026-11-20
 
 ### Changes
@@ -1944,7 +2625,7 @@ Schema delta: three tables, no column change; `nightgate-schema-delta` on SQLite
   `UnshieldedUtxos/byOwner`, `unspent`, `NightBalances/getBalance`,
   `getTopHolders` (`AGENT_ALWAYS_ALLOWED_EVENTS`). They read the same public
   rows `READ` already admits, but a bound function arrives as its own event
-  and the names were not grantable either, so an ODATANO ACCESS key got 403
+  and the names were not grantable either, so a gateway key got 403
   on `Blocks/latest()` although the gateway's reference offered the call.
 
 ## 0.25.2 - 2026-09-23
@@ -2105,7 +2786,7 @@ Schema delta: three tables, no column change; `nightgate-schema-delta` on SQLite
   under `NODE_ENV=production`. CAP authorizes the service before the
   operation, and a service without a service-level `@requires` is implicitly
   `authenticated-user` in production, so the function's own `any` was never
-  reached (seen live behind ODATANO ACCESS: the gateway's credential-free
+  reached (seen live behind a gateway: its credential-free
   probe had to fall back to operator auth). The service is now `@requires:
   'any'` with the requirement on every element. The read-only probes the
   model always meant for K8s and Prometheus (getLiveness, getReadiness,
@@ -2693,7 +3374,7 @@ no SDK change, no circuit change. `@odatano/nightgate-tx` 0.4.2.
   in-batch `anchorContentRoot` pinned first. Why: a proof cart is a set of
   claims with distinct keys, and on a grown vault `partitionTranscripts`
   puts the same circuit in different stages for different keys (measured
-  on demo.zkpassport.eu, vault 4a8893cf: `proveFieldPredicate` 5.86G
+  on a hosted vault: `proveFieldPredicate` 5.86G
   guaranteed vs 6.05G fallible, budget in between), so call order alone
   failed the causality pre-check on about every second cart while a valid
   order existed. Dependent batches leave the flag unset and keep call
@@ -2765,7 +3446,7 @@ Worker GC load from the save tick. No schema change, no SDK change.
   `resourceLimits.maxYoungGenerationSizeMb` on the wallet worker; the
   old-generation limit still comes from NODE_OPTIONS (verified: a worker with
   only the young size set keeps the inherited `heap_size_limit`).
-- Hosted box: the Contabo image's hourly `drop_caches` cron was found and
+- Hosted box: the host image's hourly `drop_caches` cron was found and
   disabled (operations note); it explains the hourly IO stalls behind the
   0.21.3 pool incident.
 

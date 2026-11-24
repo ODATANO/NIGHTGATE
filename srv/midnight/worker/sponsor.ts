@@ -4,7 +4,7 @@
 // Must stay the first import. The worker modules import each other in a cycle,
 // and config is read at load time.
 import { configNumber, configMs } from '../../utils/config';
-import { errorMessage } from '../../utils/errors';
+import { errorMessage, NightgateError } from '../../utils/errors';
 import { throwIfRpcCancelled } from './cancellation';
 import { callSegments } from '../../../src/shared/batch-segment-order.mjs';
 import { SponsorRefusalError } from '../submit-error-classification';
@@ -221,7 +221,7 @@ function plainShieldedOffer(tx: InspectedTx, maxInputs: number, refuse: (why: st
     if ([...offer.inputs, ...offer.outputs].some((coin) => coin?.contractAddress !== undefined && coin?.contractAddress !== null)) {
         refuse('carries a contract-owned coin');
     }
-    if (offer.inputs.length < 1 || offer.inputs.length > maxInputs) refuse(`carries ${offer.inputs.length} inputs; 1 to ${maxInputs} are sponsored (NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS)`);
+    if (offer.inputs.length < 1 || offer.inputs.length > maxInputs) refuse(`carries ${offer.inputs.length} inputs; 1 to ${maxInputs} are sponsored (NIGHTGATE_SPONSOR_MAX_INPUTS)`);
     if (offer.outputs.length < 1 || offer.outputs.length > 2) refuse(`carries ${offer.outputs.length} outputs; ${outputsWhy}`);
     return offer;
 }
@@ -265,7 +265,7 @@ export async function describeSwapHalf(args: { halfB64: string }): Promise<SwapH
     const half = await deserializeSwapHalf(args.halfB64, 'half');
     const ledger = await loadLedger();
     const nightType = bareHex(ledger.nativeToken().raw);
-    const t = swapHalfTerms(half.tx, 'half', null, nightType, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'), 'not a swap half');
+    const t = swapHalfTerms(half.tx, 'half', null, nightType, configNumber('NIGHTGATE_SPONSOR_MAX_INPUTS'), 'not a swap half');
     return {
         gives: { tokenType: t.give[0], amount: t.give[1].toString() },
         wants: { tokenType: t.want[0], amount: t.want[1].toString() },
@@ -350,6 +350,8 @@ export function tokenTypeDeriver(ledger: Pick<typeof LedgerV9, 'rawTokenType'>):
 
 /** Stands for a sponsored deploy in the returned call list. */
 export const DEPLOY_ENTRY_POINT = '<deploy>';
+/** The entry point recorded for a maintenance update, which has no circuit. */
+export const MAINTENANCE_ENTRY_POINT = '<maintenance>';
 
 /** Unshielded tokens a sponsored call moves into a contract. Amounts in atoms. */
 export interface UnshieldedMove { type: string; amount: string; to: string }
@@ -492,6 +494,8 @@ export function checkSponsorableShape(
     allowedCircuits?: string[],
     options: {
         allowDeploy?: boolean; maxDeploys?: number; ownContracts?: string[]; allowedTokenTypes?: string[]; nightTokenType?: string;
+        /** Sponsor one maintenance update, on a listed contract when `maintainableContracts` is set. */
+        allowMaintenance?: boolean; maintainableContracts?: string[];
         /** Replaces `allowedCircuits` for calls on the listed contracts. */
         contractCircuits?: ContractCircuitRules;
         /** Set both to also pay for tokens the calls mint. */
@@ -505,6 +509,7 @@ export function checkSponsorableShape(
         || (Array.isArray(options.ownContracts) && options.ownContracts.includes(address));
     const maxDeploysPerTx = Number.isInteger(options.maxDeploys) && (options.maxDeploys as number) >= 0 ? (options.maxDeploys as number) : 1;
     let deployCount = 0;
+    let maintenanceCount = 0;
     const maxBytes = configNumber('NIGHTGATE_SPONSOR_MAX_TX_BYTES');
     if (byteLength > maxBytes) {
         throw new SponsorRefusalError(`refusing to sponsor: transaction is ${byteLength}B, over the ${maxBytes}B budget (NIGHTGATE_SPONSOR_MAX_TX_BYTES)`);
@@ -549,11 +554,26 @@ export function checkSponsorableShape(
             const name = typeof ep === 'string' ? ep : (ep instanceof Uint8Array ? new TextDecoder().decode(ep) : '');
             if (!name) {
                 const kind = String(field(field(action, 'constructor'), 'name') || typeof action);
-                // Maintenance updates change who controls a contract, so they are never sponsored.
-                // Detected by shape too, not only by class name.
+                // An update changes a contract's code or who controls it, so it is sponsored only for a
+                // contract the grant deployed itself. Detected by shape too, not only by class name.
                 const isMaintenance = kind === 'MaintenanceUpdate' || field(action, 'updates') !== undefined;
                 if (isMaintenance) {
-                    throw new SponsorRefusalError('refusing to sponsor: transaction carries a contract maintenance update (never sponsorable)');
+                    const address = String(action?.address ?? '');
+                    if (options.allowMaintenance !== true) {
+                        throw new SponsorRefusalError('refusing to sponsor: transaction carries a contract maintenance update; a token needs allowMaintenance on its grant with budget left');
+                    }
+                    if (!address) throw new SponsorRefusalError('refusing to sponsor: maintenance update carries no contract address');
+                    if (options.maintainableContracts && !options.maintainableContracts.includes(address)) {
+                        throw new SponsorRefusalError(`refusing to sponsor: maintenance update of contract ${address.slice(0, 16)}, which was not deployed under this grant`);
+                    }
+                    maintenanceCount++;
+                    if (maintenanceCount > 1) throw new SponsorRefusalError('refusing to sponsor: transaction carries more than one maintenance update; send them one per transaction');
+                    const maxMaintenanceBytes = configNumber('NIGHTGATE_SPONSOR_MAX_MAINTENANCE_BYTES');
+                    if (byteLength > maxMaintenanceBytes) {
+                        throw new SponsorRefusalError(`refusing to sponsor: maintenance transaction is ${byteLength}B, over the ${maxMaintenanceBytes}B budget (NIGHTGATE_SPONSOR_MAX_MAINTENANCE_BYTES)`);
+                    }
+                    calls.push({ address, entryPoint: MAINTENANCE_ENTRY_POINT });
+                    continue;
                 }
                 const isDeploy = kind === 'ContractDeploy' || (field(action, 'initialState') !== undefined && action?.address !== undefined);
                 if (isDeploy && options.allowDeploy === true) {
@@ -571,7 +591,7 @@ export function checkSponsorableShape(
                     calls.push({ address, entryPoint: DEPLOY_ENTRY_POINT });
                     continue;
                 }
-                throw new SponsorRefusalError(`refusing to sponsor: transaction carries a non-call action (${kind})${isDeploy ? '; deploys need allowDeploy on the grant and NIGHTGATE_SPONSOR_ALLOW_DEPLOY on the server' : ''}`);
+                throw new SponsorRefusalError(`refusing to sponsor: transaction carries a non-call action (${kind})${isDeploy ? '; a token needs allowDeploy on its grant with deploy budget left' : ''}`);
             }
             const address = String(action?.address ?? '');
             if (allowedContracts?.length && !allowedContracts.includes(address)) {
@@ -700,7 +720,7 @@ export interface TransferDescription { bound: boolean; inputs: number; outputs: 
 /** Reads a transfer's shape for the request path, before a job exists. */
 export async function describeTransfer(args: { txB64: string }): Promise<TransferDescription> {
     const { tx, bound } = await deserializeSwapHalf(args.txB64, 'transfer');
-    if (!isUnshieldedTransfer(tx)) return { bound, ...checkTransferShape(tx, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'), 'not a transfer') };
+    if (!isUnshieldedTransfer(tx)) return { bound, ...checkTransferShape(tx, configNumber('NIGHTGATE_SPONSOR_MAX_INPUTS'), 'not a transfer') };
     const ledger = await loadLedger();
     const { inputs, outputs, ...unshielded } = checkUnshieldedTransferShape(
         tx, Buffer.from(args.txB64, 'base64').length, { addressFromKey: (key) => String(ledger.addressFromKey(key)) }, 'not a transfer');
@@ -837,10 +857,10 @@ export async function acquireBacking(
         if (leased) return leased;
         // Nothing reserved means nothing comes free, so waiting would only hold up the job. Another sponsor may have the dust.
         if (!holdsBacking(sessionId)) {
-            throw new Error(`no free dust backing: this sponsor's notes do not cover ${needSpecks} specks, alone or up to ${maxNotes} together, and none is reserved`);
+            throw new NightgateError('SPONSOR_DUST_UNAVAILABLE', `no free dust backing: this sponsor's notes do not cover ${needSpecks} specks, alone or up to ${maxNotes} together, and none is reserved`);
         }
         if (Date.now() >= deadline) {
-            throw new Error(`no free dust backing with >= ${needSpecks} specks, alone or up to ${maxNotes} together, within ${waitMs}ms (all backings busy)`);
+            throw new NightgateError('SPONSOR_DUST_UNAVAILABLE', `no free dust backing with >= ${needSpecks} specks, alone or up to ${maxNotes} together, within ${waitMs}ms (all backings busy)`);
         }
         await sleep(1000);
     }
@@ -900,7 +920,7 @@ export const __noteLeaseForTests = { tryLockBacking, tryLockDust, pickNotesAcros
 export async function sponsorAndSubmitFinalized(
     sponsor: FacadeEntry, rehydrated: FinalizedLedgerTx, site: string, replyPort?: MessagePort,
     calls?: Array<{ address: string; entryPoint: string }>, minted: string[] = [], unshielded: UnshieldedMove[] = []
-): Promise<string> {
+): Promise<{ txId: string; txHash: string }> {
     await waitForGenuineSync(sponsor, BALANCE_SYNC_TIMEOUT_MS, `${site} sponsor`);
     await captureDustSnapshot(sponsor, `${site} sponsor`);
     const sponsorTtl = new Date(Date.now() + 30 * 60 * 1000);
@@ -918,9 +938,10 @@ export async function sponsorAndSubmitFinalized(
     try {
         refuseOverCost(() => finalized, tipLedgerParameters(await loadSdk(), await getIndexerTip(sponsor.indexerHttpUrl)));
         await announceSubmitIntent(replyPort, {
-            txHash: String(finalized.identifiers().at(-1)),
+            txId: String(finalized.identifiers().at(-1)), txHash: String(finalized.transactionHash()),
             contractAddress: calls?.[0]?.address, circuits: calls?.map(c => c.entryPoint), sponsorAccountId: sponsor.sessionId,
             deployed: calls?.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address) ?? [],
+            maintained: calls?.filter(c => c.entryPoint === MAINTENANCE_ENTRY_POINT).map(c => c.address) ?? [],
             ttl: sponsorTtl.toISOString(),
             segments: callSegments(finalized),
             ...(minted.length ? { minted } : {}),
@@ -930,7 +951,8 @@ export async function sponsorAndSubmitFinalized(
         await revertRecipeBestEffort(sponsor, finalized, `${site} sponsor-intent`);
         throw e;
     }
-    return String(await submitWithDustGuard(sponsor, finalized, `${site} sponsor-submit`));
+    const txId = String(await submitWithDustGuard(sponsor, finalized, `${site} sponsor-submit`));
+    return { txId, txHash: String(finalized.transactionHash()) };
 }
 
 /** Returns undefined without a sponsor id. Throws when the sponsor wallet is not loaded. */
@@ -938,10 +960,9 @@ export function resolveSponsorEntry(sponsorSessionId?: string): FacadeEntry | un
     if (!sponsorSessionId) return undefined;
     const sponsor = facades.get(sponsorSessionId);
     if (!sponsor) {
-        throw new Error(
+        throw new NightgateError('FEE_SPONSOR_UNUSABLE',
             `No facade for sponsorSessionId=${sponsorSessionId.slice(0, 16)} ` +
-            `(the sponsor session must be connected for signing and its facade initialised)`
-        );
+            `(the sponsor session must be connected for signing and its facade initialised)`, { status: 412 });
     }
     return sponsor;
 }
@@ -986,6 +1007,7 @@ function shapeOptions(sdk: WalletSdk, sponsor: FacadeEntry, args: SponsorPolicyA
     })();
     return {
         allowDeploy: args.allowDeploy === true, ownContracts: args.ownContracts, contractCircuits: args.contractCircuits,
+        allowMaintenance: args.allowMaintenance === true, maintainableContracts: args.maintainableContracts,
         allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw,
         allowContractMints: args.allowContractMints === true, deriveTokenType: tokenTypeDeriver(sdk.ledger),
         allowUnshieldedOffers: args.allowUnshieldedOffers === true, allowedUnshieldedTokenTypes: args.allowedUnshieldedTokenTypes,
@@ -1011,12 +1033,13 @@ export async function sponsorFinalizedTx(args: SponsorPolicyArgs & {
     const calls = checkSponsorableShape(tx, bytes.length, args.allowedContracts, args.allowedCircuits, shapeOptions(sdk, sponsor, args, unshielded));
     log('info', `sponsorFinalizedTx: paying dust for ${calls.map(c => c.entryPoint).join('+')} (${bytes.length}B)${unshielded.length ? `, ${unshielded.length} unshielded output(s) into the contract` : ''}`);
     const minted = mintedTypesOf(tx, args.allowContractMints, sdk.ledger);
-    if (!deserialized.bound) throw new SponsorRefusalError('refusing to sponsor: the transaction is not bound; an unbound transaction goes to sponsorUnboundTransaction');
-    const txId = await sponsorAndSubmitFinalized(sponsor, deserialized.tx, 'sponsor-endpoint', args.__replyPort, calls, minted, unshielded);
-    log('info', `sponsorFinalizedTx: LANDED txHash=${txId.slice(0, 16)}`);
+    if (!deserialized.bound) throw new SponsorRefusalError('refusing to sponsor: the transaction is not bound; an unbound transaction goes to sponsorUnbound');
+    const { txId, txHash } = await sponsorAndSubmitFinalized(sponsor, deserialized.tx, 'sponsor-endpoint', args.__replyPort, calls, minted, unshielded);
+    log('info', `sponsorFinalizedTx: LANDED txHash=${txHash.slice(0, 16)}`);
     return {
-        txHash: txId, circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '',
+        txId, txHash, circuits: calls.map(c => c.entryPoint), contractAddress: calls[0]?.address ?? '',
         deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address),
+        maintained: calls.filter(c => c.entryPoint === MAINTENANCE_ENTRY_POINT).map(c => c.address),
         ...(minted.length ? { minted } : {}),
         ...(unshielded.length ? { unshielded } : {})
     };
@@ -1178,7 +1201,7 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
             const listed = (args.allowedTokenTypes ?? []).map(bareHex);
             if (!listed.includes(tokenType)) throw new SponsorRefusalError(`refusing to sponsor: the transfer declares token type ${tokenType.slice(0, 16)}…, not in allowedTokenTypes`);
             if (tokenType === nightType) throw new SponsorRefusalError('refusing to sponsor: the transfer declares NIGHT, which is never shielded');
-            const shape = checkTransferShape(deserialized.tx, configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS'));
+            const shape = checkTransferShape(deserialized.tx, configNumber('NIGHTGATE_SPONSOR_MAX_INPUTS'));
             nullifiers = shape.nullifiers;
             transfer = { tokenType, amount: String(args.transfer.amount) };
             log('info', `sponsorUnboundTx: transfer of ${transfer.amount} ${tokenType.slice(0, 12)} declared (${shape.inputs} input(s), ${caller.bound ? 'bound' : 'unbound'})`);
@@ -1189,7 +1212,7 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
         const taker = await deserializeSwapHalf(args.swap.takerHalfB64, 'taker half');
         swap = checkSwapHalves(maker.tx, taker.tx, {
             allowedTokenTypes: args.allowedTokenTypes, nightTokenType: sdk.ledger.nativeToken().raw,
-            maxInputs: configNumber('NIGHTGATE_SPONSOR_SWAP_MAX_INPUTS')
+            maxInputs: configNumber('NIGHTGATE_SPONSOR_MAX_INPUTS')
         });
         nullifiers = [...new Set([...swapHalfNullifiers(maker.tx), ...swapHalfNullifiers(taker.tx)])];
         caller = mergeSwapHalves(maker, taker);
@@ -1272,10 +1295,12 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
         const dustProven = proven;
         log('info', `sponsorUnboundTx: dust spend proven in ${Date.now() - tProve}ms (${resolveProvingMode()})`);
         const bound = caller.bound ? dustProven.bind().merge(caller.tx) : dustProven.merge(caller.tx).bind();
+        const txHash = String(bound.transactionHash());
         await announceSubmitIntent(args.__replyPort, {
-            txHash: String(bound.identifiers().at(-1)),
+            txId: String(bound.identifiers().at(-1)), txHash,
             contractAddress, circuits: calls.map(c => c.entryPoint), note: leased.backing, sponsorAccountId: sponsor.sessionId,
             deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address),
+            maintained: calls.filter(c => c.entryPoint === MAINTENANCE_ENTRY_POINT).map(c => c.address),
             ttl: priced.ttl.toISOString(),
             segments: callSegments(bound),
             ...(minted.length ? { minted } : {}),
@@ -1285,10 +1310,11 @@ export async function sponsorUnboundTx(args: SponsorPolicyArgs & {
         });
         sent = true;
         const txId = await submitOnDedicatedClient(sponsor, bound, 'sponsor-unbound-submit');
-        log('info', `sponsorUnboundTx: LANDED txHash=${String(txId).slice(0, 16)} on backing ${leased.backing}`);
+        log('info', `sponsorUnboundTx: LANDED txHash=${txHash.slice(0, 16)} on backing ${leased.backing}`);
         return {
-            txHash: String(txId), circuits: calls.map(c => c.entryPoint), contractAddress: contractAddress ?? '', note: leased.backing,
+            txId: String(txId), txHash, circuits: calls.map(c => c.entryPoint), contractAddress: contractAddress ?? '', note: leased.backing,
             deployed: calls.filter(c => c.entryPoint === DEPLOY_ENTRY_POINT).map(c => c.address),
+            maintained: calls.filter(c => c.entryPoint === MAINTENANCE_ENTRY_POINT).map(c => c.address),
             ...(minted.length ? { minted } : {}),
             ...(swap ? { swap } : {}),
             ...(transfer ? { transfer } : {}),

@@ -6,7 +6,7 @@
  *   - the deriveWalletInfo HANDLER (rate limit, auth, validation, and the
  *     "error paths never echo the secret" guarantee; the util itself is
  *     covered in wallet-info.test.ts)
- *   - the shared per-action guards on sendNight
+ *   - the shared per-action guards on sendToken
  *     (mainnet gate, 401/429, sessionId+amount+ttl validation, session ladder
  *     404/404/412/410, decrypt failure 500)
  *   - the diagnostics handlers' guards + 500 wrapping
@@ -49,7 +49,7 @@ const mockEvictWalletFacade = vi.hoisted(() => (vi.fn()));
 const mockGetOrBuildWalletFacade = vi.hoisted(() => (vi.fn()));
 const mockDeriveAccountId = vi.hoisted(() => (vi.fn()));
 const mockGetWalletBalance = vi.hoisted(() => (vi.fn()));
-const mockEstimateSendNightFee = vi.hoisted(() => (vi.fn()));
+const mockEstimateSendTokenFee = vi.hoisted(() => (vi.fn()));
 const mockDeriveWalletInfoUtil = vi.hoisted(() => (vi.fn()));
 const mockResolveBip39SeedHex = vi.hoisted(() => (vi.fn()));
 
@@ -62,16 +62,18 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
 }));
 vi.mock('../../srv/submission/wallet-material-factory', () => ({
     deriveAccountId: mockDeriveAccountId,
-    deriveStoragePassword: vi.fn(() => 'storage-pass')
+    deriveStoragePassword: vi.fn(() => 'storage-pass'),
+    adoptFormerSpellings: vi.fn(async () => null),
+    forgetAccountKeys: vi.fn(async () => undefined)
 }));
 vi.mock('../../srv/submission/dust-registration', () => ({
     registerNightUtxosForDust: vi.fn(),
     deregisterNightUtxosFromDust: vi.fn()
 }));
 vi.mock('../../srv/submission/token-ops', () => ({
-    sendNight: vi.fn(),
+    sendToken: vi.fn(),
     getWalletBalance: mockGetWalletBalance,
-    estimateSendNightFee: mockEstimateSendNightFee
+    estimateSendTokenFee: mockEstimateSendTokenFee
 }));
 vi.mock('../../srv/submission/background-jobs', () => ({
     startJob: vi.fn(async (args: any) => ({ jobId: `job-${args.kind}`, status: 'pending' })),
@@ -125,7 +127,7 @@ function signingSessionRow(overrides: Record<string, any> = {}) {
 const NIGHTGATE_ENV_KEYS = [
     'NIGHTGATE_NETWORK', 'NIGHTGATE_NODE_URL', 'NIGHTGATE_CRAWLER_NODE_URL',
     'NIGHTGATE_CRAWLER_ENABLED', 'NIGHTGATE_INDEXER_HTTP_URL', 'NIGHTGATE_INDEXER_WS_URL',
-    'NIGHTGATE_PROOF_SERVER_URL', 'NIGHTGATE_ZK_CONFIG_BASE'
+    'NIGHTGATE_PROOF_SERVER_URL'
 ] as const;
 const originalEnv = Object.fromEntries(NIGHTGATE_ENV_KEYS.map((k) => [k, process.env[k]]));
 
@@ -219,11 +221,11 @@ describe('wallet session guard branches', () => {
     });
 
     // ------------------------------------------------------------------
-    // Token-op rejection ladder (sendNight)
+    // Token-op rejection ladder (sendToken)
     // ------------------------------------------------------------------
 
     const OPS: Array<{ op: string; base: Record<string, unknown> }> = [
-        { op: 'sendNight', base: { sessionId: 'sess-1', receiverAddress: 'mn_addr_' + 'x'.repeat(60), amount: '1000' } }
+        { op: 'sendToken', base: { sessionId: 'sess-1', receiverAddress: 'mn_addr_' + 'x'.repeat(60), amount: '1000' } }
     ];
 
     describe.each(OPS)('$op guards', ({ op, base }) => {
@@ -264,23 +266,23 @@ describe('wallet session guard branches', () => {
             expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/decimal integer/));
         });
 
-        it('rejects an invalid ttlIso with 400', async () => {
-            const req = makeReq({ ...base, ttlIso: 'not-a-date' });
+        it('rejects an invalid expiresAt with 400', async () => {
+            const req = makeReq({ ...base, expiresAt: 'not-a-date' });
             await handlers[op](req);
-            expect(req.reject).toHaveBeenCalledWith(400, 'ttlIso must be an ISO-8601 timestamp');
+            expect(req.reject).toHaveBeenCalledWith(400, 'expiresAt must be an ISO-8601 timestamp');
         });
 
-        it('rejects a past ttlIso with 400', async () => {
-            const req = makeReq({ ...base, ttlIso: new Date(Date.now() - 60_000).toISOString() });
+        it('rejects a past expiresAt with 400', async () => {
+            const req = makeReq({ ...base, expiresAt: new Date(Date.now() - 60_000).toISOString() });
             await handlers[op](req);
-            expect(req.reject).toHaveBeenCalledWith(400, 'ttlIso must be in the future');
+            expect(req.reject).toHaveBeenCalledWith(400, 'expiresAt must be in the future');
         });
 
         it('rejects an unknown session with 404', async () => {
             mockDbRun.mockResolvedValue(null);
             const req = makeReq(base);
             await handlers[op](req);
-            expect(req.reject).toHaveBeenCalledWith(404, 'Session not found or inactive');
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'SESSION_NOT_FOUND' }));
         });
 
         it('rejects a session without a viewing key with 404', async () => {
@@ -313,36 +315,36 @@ describe('wallet session guard branches', () => {
         });
     });
 
-    it('sendNight rejects a receiver address with a foreign prefix (400)', async () => {
+    it('sendToken rejects a receiver address with a foreign prefix (400)', async () => {
         const req = makeReq({ sessionId: 'sess-1', receiverAddress: 'addr_test1qq' + 'x'.repeat(50), amount: '10' });
-        await handlers['sendNight'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/must start with 'mn_shield-addr_'/));
+        await handlers['sendToken'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/must start with 'mn_shield-addr' /));
     });
 
-    it('sendNight rejects a too-short receiver address (400)', async () => {
+    it('sendToken rejects a too-short receiver address (400)', async () => {
         const req = makeReq({ sessionId: 'sess-1', receiverAddress: 'mn_addr_short', amount: '10' });
-        await handlers['sendNight'](req);
+        await handlers['sendToken'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/too short/));
     });
 
-    it('sendNight accepts a tokenTypeHex', async () => {
+    it('sendToken accepts a tokenType', async () => {
         const base = { sessionId: 'sess-1', receiverAddress: 'mn_addr_' + 'x'.repeat(60), amount: '10' };
 
         mockDbRun.mockResolvedValue(signingSessionRow());
-        const good = makeReq({ ...base, tokenTypeHex: 'ab'.repeat(32) });
-        const result = await handlers['sendNight'](good);
+        const good = makeReq({ ...base, tokenType: 'ab'.repeat(32) });
+        const result = await handlers['sendToken'](good);
         expect(good.reject).not.toHaveBeenCalled();
         expect(result).toMatchObject({ status: 'pending' });
     });
 
-    it('sendNight rejects amount 0 and an amount above the sanity bound (400)', async () => {
+    it('sendToken rejects amount 0 and an amount above the sanity bound (400)', async () => {
         const base = { sessionId: 'sess-1', receiverAddress: 'mn_addr_' + 'x'.repeat(60) };
         const zero = makeReq({ ...base, amount: '0' });
-        await handlers['sendNight'](zero);
+        await handlers['sendToken'](zero);
         expect(zero.reject).toHaveBeenCalledWith(400, 'amount must be > 0');
 
         const huge = makeReq({ ...base, amount: (10n ** 19n).toString() });
-        await handlers['sendNight'](huge);
+        await handlers['sendToken'](huge);
         expect(huge.reject).toHaveBeenCalledWith(400, 'amount exceeds sanity bound of 10^18 atoms');
     });
 
@@ -352,7 +354,7 @@ describe('wallet session guard branches', () => {
 
     const DIAG: Array<{ op: string; base: Record<string, unknown>; util: () => any }> = [
         { op: 'getWalletBalance', base: { sessionId: 'sess-1' }, util: () => mockGetWalletBalance },
-        { op: 'estimateSendNightFee', base: { sessionId: 'sess-1', receiverAddress: 'mn_shield-addr_' + 'x'.repeat(60), amount: '5' }, util: () => mockEstimateSendNightFee }
+        { op: 'estimateSendTokenFee', base: { sessionId: 'sess-1', receiverAddress: 'mn_shield-addr_' + 'x'.repeat(60), amount: '5' }, util: () => mockEstimateSendTokenFee }
     ];
 
     describe.each(DIAG)('$op guards', ({ op, base, util }) => {
@@ -366,7 +368,7 @@ describe('wallet session guard branches', () => {
             mockDbRun.mockResolvedValue(null);
             const req = makeReq(base);
             await handlers[op](req);
-            expect(req.reject).toHaveBeenCalledWith(404, 'Session not found or inactive');
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'SESSION_NOT_FOUND' }));
         });
 
         it('is NOT blocked on mainnet (read-only diagnostics) and wraps util failures in 500', async () => {
@@ -388,10 +390,10 @@ describe('wallet session guard branches', () => {
         });
     });
 
-    it('estimateSendNightFee rejects a foreign receiver prefix (400)', async () => {
+    it('estimateSendTokenFee rejects a foreign receiver prefix (400)', async () => {
         const req = makeReq({ sessionId: 'sess-1', receiverAddress: '0xabcdef' + 'x'.repeat(50), amount: '5' });
-        await handlers['estimateSendNightFee'](req);
-        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/must start with 'mn_shield-addr_'/));
+        await handlers['estimateSendTokenFee'](req);
+        expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/must start with 'mn_shield-addr' /));
     });
 
     // ------------------------------------------------------------------

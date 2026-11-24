@@ -226,6 +226,28 @@ describe('withOrderedBatchSegments', () => {
         expect(tx.intents.get(9)).toBe(bind);
     });
 
+    test('reports the order to its caller and writes nothing to the console', async () => {
+        const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => { });
+        try {
+            const provider = { proveTx: vi.fn(async () => 'proven') };
+            const reports: any[] = [];
+            const tx = txWithIntents([[9, intentFor('bindPassport')], [4, intentFor('attest')]]);
+            await withOrderedBatchSegments(provider, ['attest', 'bindPassport'], { report: (event: unknown) => reports.push(event) }).proveTx(v9(tx));
+            expect(reports).toHaveLength(1);
+            expect(reports[0]).toMatchObject({ step: 'ordered', stageGrouped: false });
+            expect(reports[0].before).toMatch(/^bindPassport=9\S* attest=4/);
+            expect(reports[0].after).toMatch(/^attest=4\S* bindPassport=9/);
+
+            // Without a callback the batch is ordered just the same, in silence.
+            const silent = txWithIntents([[9, intentFor('bindPassport')], [4, intentFor('attest')]]);
+            await withOrderedBatchSegments(provider, ['attest', 'bindPassport']).proveTx(v9(silent));
+            expect(provider.proveTx).toHaveBeenCalledTimes(2);
+            expect(consoleLog).not.toHaveBeenCalled();
+        } finally {
+            consoleLog.mockRestore();
+        }
+    });
+
     test('the preflight sees the ordered transaction and its error stops the proof', async () => {
         const attest = intentFor('attest');
         const bind = intentFor('bindPassport');
@@ -400,7 +422,7 @@ describe('withOrderedBatchSegments: grouping and the structured refusal', () => 
         let err: any;
         try { await withOrderedBatchSegments(provider, ['attest', 'anchorContentRoot']).proveTx(v9(tx)); } catch (e) { err = e; }
         expect(err).toBeInstanceOf(BatchCausalityError);
-        expect(err.code).toBe('BatchCausalityViolation');
+        expect(err.code).toBe('BATCH_CAUSALITY_VIOLATION');
         expect(err.calls).toEqual([
             { name: 'attest', segId: 10, stages: 'f:6.04G' },
             { name: 'anchorContentRoot', segId: 20, stages: 'g:5.15G' }

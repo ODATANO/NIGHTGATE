@@ -50,14 +50,14 @@ beforeAll(async () => {
         ID: blockId, hash: BLOCK_HASH, height: 7, protocolVersion: 1, timestamp: 1_700_000_000, author: AUTHOR
     }));
     await db.run(INSERT.into('midnight.Transactions').entries({
-        ID: txId, transactionId: 0, hash: TX_HASH, ledgerTxHash: LEDGER_HASH, protocolVersion: 1,
-        transactionType: 'REGULAR', circuitName: '0xAB', contractAddress: CONTRACT, block_ID: blockId
+        ID: txId, blockHeight: 7, indexInBlock: 0, extrinsicHash: TX_HASH, txHash: LEDGER_HASH, protocolVersion: 1,
+        transactionType: 'REGULAR', circuit: '0xAB', contractAddress: CONTRACT, block_ID: blockId
     }));
-    await db.run(INSERT.into('midnight.TransactionIdentifiers').entries({ identifier: IDENTIFIER, transaction_ID: txId }));
+    await db.run(INSERT.into('midnight.TransactionIdentifiers').entries({ txId: IDENTIFIER, transaction_ID: txId }));
     await db.run(INSERT.into('midnight.ContractActions').entries({
-        ID: cds.utils.uuid(), actionIndex: 0, address: CONTRACT, actionType: 'CALL', transaction_ID: txId
+        ID: cds.utils.uuid(), blockHeight: 7, indexInBlock: 0, actionIndex: 0, contractAddress: CONTRACT, actionType: 'CALL', transaction_ID: txId
     }));
-    await db.run(INSERT.into('midnight.ContractStates').entries({ address: CONTRACT, height: 7 }));
+    await db.run(INSERT.into('midnight.ContractStates').entries({ contractAddress: CONTRACT, height: 7 }));
     await db.run(INSERT.into('midnight.ReorgLog').entries({
         ID: cds.utils.uuid(), detectedAt: new Date().toISOString(), forkHeight: 7, oldTipHash: TIP, newTipHash: BLOCK_HASH
     }));
@@ -79,9 +79,10 @@ describe('a filter finds a stored hex value in either spelling', () => {
         ['startswith', 'Blocks', `startswith(hash,'0xABAB')`],
         ['contains', 'Blocks', `contains(hash,'ABAB')`],
         ['a field behind an association', 'Transactions', `block/hash eq '0x${BLOCK_HASH}'`],
-        ['a field inside any()', 'Blocks', `transactions/any(t:t/hash eq '0x${TX_HASH.toUpperCase()}')`],
-        ['the ledger hash', 'Transactions', `ledgerTxHash eq '0x${LEDGER_HASH}'`],
-        ['a contract address', 'Transactions', `contractAddress eq '0x${CONTRACT.toUpperCase()}'`]
+        ['a field inside any()', 'Blocks', `transactions/any(t:t/extrinsicHash eq '0x${TX_HASH.toUpperCase()}')`],
+        ['the ledger hash', 'Transactions', `txHash eq '0x${LEDGER_HASH}'`],
+        ['a contract address', 'Transactions', `contractAddress eq '0x${CONTRACT.toUpperCase()}'`],
+        ['the actions of a contract', 'ContractActions', `contractAddress eq '0X${CONTRACT.toUpperCase()}'`]
     ])('%s', async (_name, entity, expression) => {
         const r = await filter(entity, expression);
         expect(r.status).toBe(200);
@@ -90,21 +91,21 @@ describe('a filter finds a stored hex value in either spelling', () => {
 
     test('a filter inside $expand', async () => {
         const r = await cap.axios.get(
-            `${API}/Blocks?$expand=transactions($filter=${encodeURIComponent(`hash eq '0x${TX_HASH.toUpperCase()}'`)})`, ANY
+            `${API}/Blocks?$expand=transactions($filter=${encodeURIComponent(`extrinsicHash eq '0x${TX_HASH.toUpperCase()}'`)})`, ANY
         );
         expect(r.status).toBe(200);
-        expect(r.data.value[0].transactions.map((t: { hash: string }) => t.hash)).toEqual([TX_HASH]);
+        expect(r.data.value[0].transactions.map((t: { extrinsicHash: string }) => t.extrinsicHash)).toEqual([TX_HASH]);
     });
 
     test.each(SPELLINGS(CONTRACT))('a key, %s', async (_name, value) => {
         const r = await cap.axios.get(`${API}/ContractStates('${value}')`, ANY);
         expect(r.status).toBe(200);
-        expect(r.data.address).toBe(CONTRACT);
+        expect(r.data.contractAddress).toBe(CONTRACT);
     });
 
     test('a filter after a key', async () => {
         const r = await cap.axios.get(
-            `${API}/Blocks(${blockId})/transactions?$filter=${encodeURIComponent(`hash eq '0x${TX_HASH}'`)}`, ANY
+            `${API}/Blocks(${blockId})/transactions?$filter=${encodeURIComponent(`extrinsicHash eq '0x${TX_HASH}'`)}`, ANY
         );
         expect(r.status).toBe(200);
         expect(r.data.value).toHaveLength(1);
@@ -135,7 +136,7 @@ describe('an operand that is not hex', () => {
     });
 
     test('is left alone on a field that is not hex', async () => {
-        const r = await filter('Transactions', `circuitName eq '0xAB'`);
+        const r = await filter('Transactions', `circuit eq '0xAB'`);
         expect(r.status).toBe(200);
         expect(r.data.value).toHaveLength(1);
     });
@@ -154,26 +155,17 @@ describe('the read functions take either spelling', () => {
         expect(r.data.value.map((t: { ID: string }) => t.ID)).toEqual([txId]);
     });
 
-    test.each(SPELLINGS(CONTRACT))('byAddress and history, %s', async (_name, value) => {
-        for (const fn of ['byAddress', 'history']) {
-            const r = await cap.axios.get(`${API}/ContractActions/${fn}(address='${value}')`, ANY);
-            expect(r.status).toBe(200);
-            expect(r.data.value).toHaveLength(1);
-        }
-    });
-
-    test.each(SPELLINGS(IDENTIFIER))('byIdentifier, %s', async (_name, value) => {
-        const r = await cap.axios.get(`${API}/Transactions/byIdentifier(identifier='${value}')`, ANY);
+    test.each(SPELLINGS(IDENTIFIER))('byTxId, %s', async (_name, value) => {
+        const r = await cap.axios.get(`${API}/Transactions/byTxId(txId='${value}')`, ANY);
         expect(r.status).toBe(200);
-        expect(r.data).toMatchObject({ identifier: IDENTIFIER, hash: TX_HASH, ledgerTxHash: LEDGER_HASH, blockHash: BLOCK_HASH });
+        expect(r.data).toMatchObject({ txId: IDENTIFIER, extrinsicHash: TX_HASH, txHash: LEDGER_HASH, blockHash: BLOCK_HASH });
     });
 
     test.each([
         ['byHash', `Transactions/byHash(hash='0xnot-hex')`, 'hash'],
         ['ledgerTransaction', `Transactions/ledgerTransaction(hash='zz')`, 'hash'],
-        ['byIdentifier', `Transactions/byIdentifier(identifier='not-hex')`, 'identifier'],
-        ['byAddress', `ContractActions/byAddress(address='0xcontract-1')`, 'address'],
-        ['stateAt', `ContractStates/stateAt(address='mn_addr_x',height=null)`, 'address']
+        ['byTxId', `Transactions/byTxId(txId='not-hex')`, 'txId'],
+        ['stateAt', `ContractStates/stateAt(contractAddress='mn_addr_x',height=null)`, 'contractAddress']
     ])('%s refuses a value that is not hex', async (_name, path, target) => {
         const r = await cap.axios.get(`${API}/${path}`, ANY);
         expect(r.status).toBe(400);
@@ -187,7 +179,7 @@ describe('the hex parameters of an action or function take either spelling', () 
     const post = (action: string, body: object) => cap.axios.post(`${API}/${action}`, body, ANY);
 
     test.each(SPELLINGS(CONTRACT))('a contract address, %s', async (_name, value) => {
-        const r = await cap.axios.get(`${API}/deriveTokenType(contractAddress='${value}')`, ANY);
+        const r = await cap.axios.get(`${API}/deriveTokenType(contractAddress='${value}',domainSeparator='example:token')`, ANY);
         expect(r.status).toBe(200);
         expect(r.data.contractAddress).toBe(CONTRACT);
     });
@@ -200,34 +192,68 @@ describe('the hex parameters of an action or function take either spelling', () 
         expect(spelled.data.viewingKey).toBe(stored.data.viewingKey);
     });
 
-    // The account of a wallet is derived from the text of its viewing key, so the server must not change that text.
-    test('a viewing key is taken exactly as sent', async () => {
-        const sent = hex('9e').toUpperCase();
-        expect((await post('connectWallet', { viewingKey: sent })).status).toBe(200);
+    test('a viewing key in any spelling is one account', async () => {
+        const key = hex('9e');
+        for (const sent of [key.toUpperCase(), `0x${key}`, key]) {
+            expect((await post('connectWallet', { viewingKey: sent })).status).toBe(200);
+        }
         const db = await cds.connect.to('db');
         const accounts = (id: string) => db.run(cds.ql.SELECT.from('midnight.AccountKeys').columns('accountId').where({ accountId: id }));
-        expect(await accounts(deriveAccountId(sent))).toHaveLength(1);
-        expect(await accounts(deriveAccountId(sent.toLowerCase()))).toHaveLength(0);
+        expect(await accounts(deriveAccountId(key))).toHaveLength(1);
+        expect(await accounts(deriveAccountId(key.toUpperCase()))).toHaveLength(0);
 
-        const prefixed = await post('connectWallet', { viewingKey: `0x${sent}` });
-        expect(prefixed.status).toBe(400);
-        expect(prefixed.data.error.message).toBe('viewingKey must be hex-encoded');
+        const refused = await post('connectWallet', { viewingKey: 'not-hex' });
+        expect(refused.status).toBe(400);
+        expect(refused.data.error).toMatchObject({ code: 'ASSERT_FORMAT', target: 'viewingKey' });
+    });
+
+    // The account was stored under the caller's own spelling, which is neither lowercase nor upper case.
+    test('a connect moves the account stored under the spelling it was sent in', async () => {
+        const key = hex('7c');
+        const sent = key.slice(0, 32).toUpperCase() + key.slice(32);
+        const db = await cds.connect.to('db');
+        const now = new Date().toISOString();
+        await db.run(cds.ql.INSERT.into('midnight.WalletSyncStates').entries({
+            accountId: deriveAccountId(sent), sdkVersion: 'wallet-sdk-facade@test', keyScheme: 'dek1', createdAt: now, updatedAt: now
+        }));
+        const stored = (id: string) => db.run(cds.ql.SELECT.from('midnight.WalletSyncStates').columns('accountId').where({ accountId: id }));
+
+        expect((await post('connectWallet', { viewingKey: sent })).status).toBe(200);
+        expect(await stored(deriveAccountId(sent))).toHaveLength(0);
+        expect(await stored(deriveAccountId(key))).toHaveLength(1);
+    });
+
+    test('a connect is refused while an open session holds the wallet under another spelling', async () => {
+        const key = hex('5d');
+        const db = await cds.connect.to('db');
+        const { hashViewingKey } = require('../../srv/utils/crypto');
+        const now = new Date().toISOString();
+        await db.run(cds.ql.INSERT.into('midnight.WalletSessions').entries({
+            sessionId: '00000000-0000-4000-8000-0000000005d1', userId: 'someone', viewingKeyHash: hashViewingKey(key.toUpperCase()),
+            encryptedViewingKey: 'held', connectedAt: now, expiresAt: now, isActive: true
+        }));
+
+        const refused = await post('connectWallet', { viewingKey: key });
+        expect(refused.status).toBe(409);
+        expect(refused.data.error.code).toBe('ACCOUNT_MOVE_BLOCKED');
+        const sessions = await db.run(cds.ql.SELECT.from('midnight.WalletSessions').columns('sessionId').where({ viewingKeyHash: hashViewingKey(key) }));
+        expect(sessions).toHaveLength(0);
     });
 
     // Each handler below refuses a 64-character value with `0x` itself. Past that check it stops at the unknown session.
     test.each([
-        ['a list', 'issueFieldPredicateAttestation', (h: (pair: string) => string) => ({
-            payloadHash: h('a1'), fieldKey: h('b2'), value: '1', fieldSalt: h('c3'), threshold: 5, predicate: 'lessOrEqual',
+        ['a list', 'proveFieldPredicate', (h: (pair: string) => string) => ({
+            payloadHash: h('a1'), fieldKey: h('b2'), value: '1', fieldSalt: h('c3'), threshold: '5', predicate: 'lessOrEqual',
             siblings: [h('01'), h('02'), h('03'), h('04')], dirs: [true, false, true, false]
         })],
-        ['a list inside a list of structures', 'issueFieldPredicateAttestationBatch', (h: (pair: string) => string) => ({
+        ['a list inside a list of structures', 'proveClaims', (h: (pair: string) => string) => ({
             payloadHash: h('a1'),
             claims: [{
-                predicate: 'lessOrEqual', fieldKey: h('b2'), value: '1', salt: h('c3'), threshold: 5,
+                predicate: 'lessOrEqual', fieldKey: h('b2'), value: '1', salt: h('c3'), threshold: '5',
                 siblings: [h('01'), h('02'), h('03'), h('04')], dirs: [true, false, true, false]
             }]
         })],
-        ['a structure', 'issueDocumentIntegrityAttestation', (h: (pair: string) => string) => {
+        ['a structure', 'proveDocumentIntegrity', (h: (pair: string) => string) => {
             const slots = Array.from({ length: 16 }, () => ({ present: true, value: '1', valueDigest: h('e5') }));
             return {
                 payloadHashA: h('a1'), payloadHashB: h('b2'), allowedMask: 1,
@@ -244,7 +270,7 @@ describe('the hex parameters of an action or function take either spelling', () 
     });
 
     test.each([
-        ['a 64-character parameter', 'issueFieldPredicateAttestation', { payloadHash: `0x${'a'.repeat(63)}` }, 'payloadHash', 'must be 64 hex characters'],
+        ['a 64-character parameter', 'proveFieldPredicate', { payloadHash: `0x${'a'.repeat(63)}` }, 'payloadHash', 'must be 64 hex characters'],
         ['a seed', 'deriveWalletInfo', { seedHex: 'zz' }, 'seedHex', 'must be 128 hex characters'],
         ['a contract address', 'submitContractCall', { contractAddress: '0xVAULT', circuit: 'c' }, 'contractAddress', 'must be hex']
     ])('%s that is not hex is refused', async (_name, action, body, target, message) => {
@@ -265,7 +291,7 @@ describe('normalizeHexParams', () => {
             contractAddress: '0xAB',
             claims: [{ fieldKey: UPPER, siblings: [UPPER, BARE], schema: [{ fieldKey: UPPER }], openingA: { saltSeed: UPPER, slots: [{ valueDigest: UPPER }] } }]
         };
-        normalizeHexParams(data, operation('issueFieldPredicateAttestationBatch'));
+        normalizeHexParams(data, operation('proveClaims'));
         expect(data).toEqual({
             payloadHash: BARE,
             contractAddress: 'ab',
@@ -275,11 +301,11 @@ describe('normalizeHexParams', () => {
 
     test('leaves everything else as it is', () => {
         const data = {
-            idempotencyKey: '0xKEY', compiledArtifactRef: '0xRef', validUntil: 5, payloadHash: null,
+            idempotencyKey: '0xKEY', contractName: '0xRef', validUntil: 5, payloadHash: null,
             claims: [{ value: '0xAB', predicate: '0xP', siblings: [7, null], dirs: [true], unknown: UPPER }, null, 'text']
         };
         const before = structuredClone(data);
-        normalizeHexParams(data, operation('issueFieldPredicateAttestationBatch'));
+        normalizeHexParams(data, operation('proveClaims'));
         expect(data).toEqual(before);
     });
 

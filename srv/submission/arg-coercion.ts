@@ -64,6 +64,10 @@ function toBigInt(value: unknown, index: number, maxval?: number): bigint {
         if (!Number.isInteger(value)) {
             throw new CoercionError(index, `Uint value must be an integer (got ${value})`);
         }
+        // JSON rounds a number above 2^53 before it gets here, so only text carries such a value.
+        if (!Number.isSafeInteger(value)) {
+            throw new CoercionError(index, 'Uint value above 2^53 must be a decimal string, a JSON number is rounded on the way');
+        }
         v = BigInt(value);
     } else if (typeof value === 'string') {
         if (!/^-?\d+$/.test(value.trim())) {

@@ -21,12 +21,14 @@ import { ZK_ARTIFACT_MANIFEST_DIR, ZK_ARTIFACT_MANIFEST_FILE, hasZkArtifactManif
 
 export interface ContractRegistration {
     artifactPath: string;
-    /** The generation digest the main thread chose. */
-    artifactDigest?: string;
+    /** The generation digest the main thread chose. The worker reads module and keys only from the snapshot of this digest. */
+    artifactDigest: string;
     privateStateId: string;
     zkConfigPath: string;
     /** Number of content slots of an attestation vault contract. 16 by default, 32 for attestation-vault-32. */
     slotWidth?: number;
+    /** The contract package this build is, by digest; absent for any other build. Decides whether it gets witnesses with a caller's secret. */
+    witnessLineage?: string;
 }
 
 /** A contract compiled from Compact. The artifact is imported at run time, so its private state and witnesses are not typed. */
@@ -63,18 +65,13 @@ export function __resetScaffoldCacheForTests(): void {
 
 export async function getContractScaffold(name: string, registration: ContractRegistration): Promise<ContractScaffold> {
     // Keyed by name, path and digest, because a name can be re-registered and a file can change in place.
-    const generation = registration.artifactDigest ?? '';
+    const generation = registration.artifactDigest;
     const key = `${name}\0${registration.artifactPath}\0${generation}`;
     const cached = contractScaffolds.get(key);
     if (cached) return cached;
-    let mod: unknown;
-    if (generation) {
-        const snapshot = materializeArtifactSnapshot(name, registration);
-        mod = await importArtifactGeneration(snapshot!.modulePath, generation);
-        noteGenerationImported(generation);
-    } else {
-        mod = await importArtifactGeneration(registration.artifactPath, generation);
-    }
+    const snapshot = materializeArtifactSnapshot(name, registration);
+    const mod: unknown = await importArtifactGeneration(snapshot.modulePath, generation);
+    noteGenerationImported(generation);
     const contractClass = exportedContractClass(mod);
     if (!isContractClass(contractClass)) throw new Error(`contract '${name}': the artifact exports no contract class`);
     const scaffold: ContractScaffold = { contractClass };
@@ -182,23 +179,11 @@ export function prepareSnapshotRoot(): string {
     if (!linkOk) {
         fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
     }
-    // Remove folders named after a process id whose process is gone.
-    for (const entry of listDir(root)) {
-        const pid = Number(entry);
-        if (!Number.isInteger(pid) || pid === process.pid || processAlive(pid)) continue;
-        const full = path.join(root, entry);
-        try {
-            if (fs.lstatSync(full).isDirectory()) {
-                fs.rmSync(full, { recursive: true, force: true });
-                log('info', `artifact snapshot sweep: removed per-process root of dead process ${pid}`);
-            }
-        } catch { /* best effort */ }
-    }
     // Remove leftover temp builds, and snapshots that were not used for a while and no running process holds.
     // The folder's modified time is updated on every use.
     const cutoff = Date.now() - snapshotTtlMs();
     for (const entry of listDir(root)) {
-        if (entry === 'node_modules' || entry === SNAPSHOT_ROOT_MARKER || Number.isInteger(Number(entry))) continue;
+        if (entry === 'node_modules' || entry === SNAPSHOT_ROOT_MARKER) continue;
         const full = path.join(root, entry);
         try {
             const st = fs.lstatSync(full);
@@ -269,9 +254,10 @@ export function touchSnapshot(dir: string): void {
     try { const now = new Date(); fs.utimesSync(dir, now, now); } catch { /* best effort */ }
 }
 
-export function materializeArtifactSnapshot(name: string, registration: ContractRegistration): ArtifactSnapshot | null {
+export function materializeArtifactSnapshot(name: string, registration: ContractRegistration): ArtifactSnapshot {
     const digest = registration.artifactDigest;
-    if (!digest) return null;
+    // The message crossed a thread, so the type alone does not hold it. Without a digest nothing may be read from the registered folder.
+    if (!digest) throw new Error(`contract '${name}': the registration carries no artifact digest`);
     const root = prepareSnapshotRoot();
     const dir = path.join(root, digest);
     const snapReg = snapshotRegistration(dir, registration);
@@ -376,8 +362,8 @@ export function __evictGenerationForTests(digest: string): void {
     onGenerationEvicted(digest);
 }
 
-/** The snapshot folder, or the registered folder when there is no digest. */
+/** The snapshot folder of the registration's digest. */
 export function artifactAssetPath(name: string, registration: ContractRegistration): string {
-    return materializeArtifactSnapshot(name, registration)?.zkConfigPath ?? registration.zkConfigPath;
+    return materializeArtifactSnapshot(name, registration).zkConfigPath;
 }
 

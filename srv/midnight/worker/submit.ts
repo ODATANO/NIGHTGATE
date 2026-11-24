@@ -234,7 +234,7 @@ export async function submitWithDustGuard(entry: FacadeEntry, tx: FinalizedLedge
         try {
             // A tx that was not announced could never be traced, so refuse to send it.
             await announceSubmitIntent(intent.replyPort, {
-                txHash: String(tx.identifiers().at(-1)),
+                txId: String(tx.identifiers().at(-1)), txHash: String(tx.transactionHash()),
                 // A deploy learns its address from the tx. Without it a job settled later from the chain could not name its contract.
                 contractAddress: intent.contractAddress ?? deployedAddress(tx), circuits: intent.circuits, note: intent.note, ttl: intent.ttl,
                 segments: callSegments(tx)
@@ -455,12 +455,12 @@ export const SUBMIT_WATCH_CONFIRM_MS = 90_000;
 export function submitBackstopMs(): number { return SUBMIT_CONNECT_TIMEOUT_MS + SUBMIT_REQUEST_TIMEOUT_MS + SUBMIT_WATCH_TIMEOUT_MS + Math.min(10_000, SUBMIT_WATCH_TIMEOUT_MS); }
 // Waiting only for InBlock is safe, because a later indexer check still verifies the result.
 // A chain reorganization then shows as a failed status, not as a lost job.
-export function sponsorSubmitWaitStage(): 'InBlock' | 'Finalized' { return configEnum('NIGHTGATE_SPONSOR_WAIT') === 'finalized' ? 'Finalized' : 'InBlock'; }
+export function sponsorSubmitWaitStage(): 'InBlock' | 'Finalized' { return configEnum('NIGHTGATE_SUBMIT_WAIT') === 'finalized' ? 'Finalized' : 'InBlock'; }
 // Wait until the indexer has the tx and check its ledger result there.
 // The caller's next call reads contract state from the indexer, and the node's
 // InBlock or Finalized status does not say whether the call applied.
 export async function waitIndexerVisible(indexerHttpUrl: string, identifier: string, site: string): Promise<void> {
-    const windowMs = configMs('NIGHTGATE_SPONSOR_INDEXER_VISIBLE_MS');
+    const windowMs = configMs('NIGHTGATE_SUBMIT_INDEXER_VISIBLE_MS');
     if (windowMs === 0) return;
     const t0 = Date.now();
     while (Date.now() - t0 < windowMs) {
@@ -476,7 +476,8 @@ export async function waitIndexerVisible(indexerHttpUrl: string, identifier: str
 }
 
 export interface SubmitIntent {
-    txHash: string;
+    txId: string; // a ledger identifier of the transaction
+    txHash: string; // the ledger hash, as explorers show it
     /** Read from the caller's tx itself, not from the allow list. */
     contractAddress?: string;
     circuits?: string[];
@@ -486,6 +487,8 @@ export interface SubmitIntent {
     sponsorAccountId?: string;
     /** Contracts this tx deploys. The main thread counts them against the grant's deploy limit before it confirms. */
     deployed?: string[];
+    /** Contracts a maintenance update in this tx changes. Counted against the grant's maintenance limit the same way. */
+    maintained?: string[];
     /** When the tx expires, as ISO time. Once the chain is past it, the tx can no longer land. */
     ttl?: string;
     /** For batches: the calls in each segment, so the result can say which calls applied. */
@@ -504,17 +507,17 @@ const INTENT_ACK_WARN_MS = 10_000;
 export async function announceSubmitIntent(port: MessagePort | undefined, intent: SubmitIntent): Promise<void> {
     if (!port) return;
     markIntentAnnounced();
-    const { txHash } = intent;
+    const { txId } = intent;
     const ackTimeoutMs = configMs('NIGHTGATE_SUBMIT_INTENT_ACK_TIMEOUT_MS');
     const startedAt = Date.now();
     await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => { port.off('message', onMsg); reject(new NightgateError('SUBMIT_INTENT_TIMEOUT', `submit-intent was not acknowledged by the main thread within ${ackTimeoutMs}ms; not broadcasting`)); }, ackTimeoutMs);
-        const onMsg = (m: { kind?: unknown; txHash?: unknown; ok?: unknown; error?: unknown } | null) => {
-            if (m?.kind === 'submit-intent-ack' && m.txHash === txHash) {
+        const onMsg = (m: { kind?: unknown; txId?: unknown; ok?: unknown; error?: unknown } | null) => {
+            if (m?.kind === 'submit-intent-ack' && m.txId === txId) {
                 clearTimeout(timer); port.off('message', onMsg);
                 if (m.ok === false) { reject(new NightgateError('SUBMIT_INTENT_REJECTED', `submit-intent rejected by the main thread: ${m.error ?? 'unknown'}`)); return; }
                 const ms = Date.now() - startedAt;
-                if (ms > INTENT_ACK_WARN_MS) log('warn', `submit-intent ${txHash.slice(0, 16)}: acknowledged after ${ms}ms`);
+                if (ms > INTENT_ACK_WARN_MS) log('warn', `submit-intent ${txId.slice(0, 16)}: acknowledged after ${ms}ms`);
                 resolve();
             }
         };

@@ -1,5 +1,5 @@
 // Checks a caller-built sponsored deploy under an allowDeploy grant, a follow-up call, and refusal of a second deploy.
-// Run: node --env-file=.env scripts/run-sponsored-deploy-e2e.mjs against `npm run serve` with NIGHTGATE_SPONSOR_ALLOW_DEPLOY=true
+// Run: node --env-file=.env scripts/run-sponsored-deploy-e2e.mjs against `npm run serve`
 // SPDX-License-Identifier: Apache-2.0
 import { randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
@@ -36,7 +36,7 @@ const operator = connect({ baseUrl: BASE, timeoutMs: 60 * 60 * 1000, ...auth });
 step('0. Sponsor session (the funded wallet) + prewarm');
 const { sessionId: sponsor } = await operator.connectWallet({ viewingKey: VK });
 const conn = await operator.connectWalletForSigning({ sessionId: sponsor, mnemonic: MN });
-if (conn.prewarmJobId) { console.log('     syncing sponsor...'); await operator.waitForJob({ jobId: conn.prewarmJobId, sessionId: sponsor }); }
+if (conn.jobId) { console.log('     syncing sponsor...'); await operator.waitForJob({ jobId: conn.jobId, sessionId: sponsor }); }
 console.log(`OK   sponsor ready (${sponsor})`);
 
 step('1. Grant with the DEPLOY right (maxDeploys 1) for the sponsor session');
@@ -52,12 +52,12 @@ async function post(path, body) {
 }
 const grant = await post('/createAgentGrant', {
     sessionId: sponsor,
-    allowedActions: ['sponsorUnboundTransaction', 'sponsorFinalizedTransaction'],
+    allowedActions: ['sponsorUnbound', 'sponsorFinalized'],
     sponsorSessionId: sponsor,
     allowedContracts: EXTRA_CONTRACTS,
     allowDeploy: true,
     maxDeploys: 1,
-    agentLabel: 'e2e-sponsored-deploy'
+    label: 'e2e-sponsored-deploy'
 });
 if (!grant?.token) fail(`createAgentGrant: ${JSON.stringify(grant)}`);
 console.log(`OK   grant ${grant.grantId} allowDeploy=${grant.allowDeploy} maxDeploys=${grant.maxDeploys}`);

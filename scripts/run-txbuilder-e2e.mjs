@@ -1,5 +1,5 @@
 // Builds, proves and signs an attest locally with a throwaway key, then the server's sponsor pool pays and submits it.
-// Run: NIGHTGATE_VAULT=<vault> node --env-file=.env scripts/run-txbuilder-e2e.mjs against `npm run dev`
+// Run: NIGHTGATE_VAULT=<vault> node --env-file=.env scripts/run-txbuilder-e2e.mjs against `npm run serve:sync`
 // SPDX-License-Identifier: Apache-2.0
 
 import { randomBytes } from 'node:crypto';
@@ -38,11 +38,19 @@ async function post(path, body) {
     const t = await r.text(); let j; try { j = t ? JSON.parse(t) : null; } catch { j = t; }
     return { status: r.status, body: j };
 }
+
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
 async function poll(sessionId, jobId, label) {
     for (;;) {
-        const r = await post('/getJobStatus', { jobId, sessionId });
+        const r = await jobStatus(jobId, sessionId);
         const { status, result, errorCode, errorMessage } = r.body ?? {};
-        if (status === 'succeeded') { process.stdout.write('\n'); return result ? JSON.parse(result) : {}; }
+        if (status === 'succeeded') { process.stdout.write('\n'); return result ?? {}; }
         if (status === 'failed' || status === 'reconciliation_required') fail(`[${label}] ${status}: ${errorCode} :: ${errorMessage}`);
         process.stdout.write('.');
         await new Promise(res => setTimeout(res, 5000));
@@ -87,13 +95,13 @@ function fnCall(name, params) {
     console.log(`OK   built + proven locally in ${((Date.now() - t1) / 1000).toFixed(1)}s: ${serializedBytes} bytes`);
 
     step('3. Ship ONLY the bytes to the sponsor; it pays the dust and submits');
-    const sponsored = await post('/sponsorFinalizedTransaction', { finalizedTxB64 });
-    if (sponsored.status !== 200 && sponsored.status !== 201) fail(`sponsorFinalizedTransaction -> HTTP ${sponsored.status}: ${JSON.stringify(sponsored.body)}`);
+    const sponsored = await post('/sponsorFinalized', { finalizedTxB64 });
+    if (sponsored.status !== 200 && sponsored.status !== 201) fail(`sponsorFinalized -> HTTP ${sponsored.status}: ${JSON.stringify(sponsored.body)}`);
     const out = await poll(sponsored.body.sessionId, sponsored.body.jobId, 'sponsor');
     console.log(`OK   sponsor submitted: ${out.txHash}`);
 
     step('4. Verify on chain that the attestation is OURS');
-    const res = await fetch(`${ENDPOINT}${fnCall('verifyAttestationState', { contractAddress: VAULT, attesterId: builder.attesterId, payloadHash })}`);
+    const res = await fetch(`${ENDPOINT}${fnCall('verifyAttestation', { contractAddress: VAULT, attesterId: builder.attesterId, payloadHash })}`);
     const v = await res.json();
     const attesterOk = String(v.attesterId ?? '').toLowerCase() === builder.attesterId.toLowerCase();
     console.log(`     attested=${v.attested} attesterId=${String(v.attesterId ?? '').slice(0, 24)}…`);

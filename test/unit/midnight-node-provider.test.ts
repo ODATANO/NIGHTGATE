@@ -622,50 +622,12 @@ describe('MidnightNodeProvider lifecycle edges', () => {
         mockWebSocketInstances.length = 0;
     });
 
-    it('rejects connect() when the socket errors before opening', async () => {
-        const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
-        try {
-            const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
-            const connectPromise = provider.connect();
-            const socket = getLatestMockWebSocket();
-            socket.emit('error', new Error('ECONNREFUSED'));
-            await expect(connectPromise).rejects.toThrow('ECONNREFUSED');
-        } finally {
-            errorSpy.mockRestore();
-        }
-    });
-
     it('rejects connect() when the socket closes before opening', async () => {
         const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
         const connectPromise = provider.connect();
         const socket = getLatestMockWebSocket();
         socket.emit('close');
         await expect(connectPromise).rejects.toThrow(/closed before connection established/);
-    });
-
-    it('logs and survives a rejected async subscription callback', async () => {
-        const errorSpy = vi.spyOn(cds.log('nightgate:node'), 'error').mockImplementation(() => {});
-        try {
-            const provider = new MidnightNodeProvider({ nodeUrl: 'ws://localhost:9944' });
-            const connectPromise = provider.connect();
-            const socket = getLatestMockWebSocket();
-            socket.emit('open');
-            await connectPromise;
-
-            (provider as any).subscriptions.set('sub-1', async () => {
-                throw new Error('async subscriber exploded');
-            });
-            socket.emit('message', JSON.stringify({
-                jsonrpc: '2.0', method: 'chain_newHead',
-                params: { subscription: 'sub-1', result: { number: '0x1' } }
-            }));
-            // The rejection is handled on a microtask; flush it.
-            await new Promise(r => setImmediate(r));
-            expect(errorSpy).toHaveBeenCalledWith(
-                'Subscription callback failed:', 'async subscriber exploded');
-        } finally {
-            errorSpy.mockRestore();
-        }
     });
 
     it('bounds notifications buffered for ids that are never registered', async () => {

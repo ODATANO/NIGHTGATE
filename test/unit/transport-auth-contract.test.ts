@@ -22,6 +22,21 @@ cds.User.default = (cds.User as unknown as { Anonymous: typeof cds.User.default 
 
 const cap = cds.test(__dirname + '/../..') as unknown as { url: string };
 
+// Before the contract table, whose failed logins trip the throttle of this address.
+describe('the metrics are for the operator', () => {
+    const metrics = (headers: Record<string, string> = {}) => fetch(`${cap.url}/odata/v4/midnight-indexer/getMetrics()`, { headers });
+
+    it('a caller without credentials is asked to sign in', async () => {
+        expect((await metrics()).status).toBe(401);
+    });
+
+    it('the operator reads them', async () => {
+        const res = await metrics({ authorization: 'Basic ' + Buffer.from('nightgate:op-secret').toString('base64') });
+        expect(res.status).toBe(200);
+        expect((await res.json()).value).toContain('odatano_nightgate_');
+    });
+});
+
 runTransportAuthContract({
     url: () => cap.url,
     kind: 'basic',

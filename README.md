@@ -1,4 +1,4 @@
-# NIGHTGATE - OData for Midnight @odatano/nightgate
+# NIGHTGATE - OData for Midnight
 
 ![Header Image](/docs/readme_header.png)
 
@@ -6,14 +6,12 @@
 
 [![Tests](https://github.com/ODATANO/NIGHTGATE/actions/workflows/test.yaml/badge.svg)](https://github.com/ODATANO/NIGHTGATE/actions/workflows/test.yaml)
 [![Coverage](https://img.shields.io/codecov/c/github/ODATANO/NIGHTGATE)](https://codecov.io/gh/ODATANO/NIGHTGATE)
-[![npm](https://img.shields.io/npm/v/@odatano/nightgate)](https://www.npmjs.com/package/@odatano/nightgate)
-[![npm downloads](https://img.shields.io/npm/dt/@odatano/nightgate?logo=npm&label=downloads&color=blue)](https://www.npmjs.com/package/@odatano/nightgate)
 [![npm nightgate-tx](https://img.shields.io/npm/v/@odatano/nightgate-tx?label=nightgate-tx)](https://www.npmjs.com/package/@odatano/nightgate-tx)
 [![nightgate-tx downloads](https://img.shields.io/npm/dt/@odatano/nightgate-tx?logo=npm&label=nightgate-tx%20downloads&color=blue)](https://www.npmjs.com/package/@odatano/nightgate-tx)
 [![SAP CAP](https://img.shields.io/badge/SAP%20CAP-%40sap%2Fcds%20%5E10-0faaff?logo=sap)](https://cap.cloud.sap/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-yellow)](LICENSE)
 
-`@odatano/nightgate` is an indexer and transaction service for the [Midnight](https://midnight.network/) blockchain, built on SAP CAP. It runs as a standalone server, from the container image or from a clone of this repository. A crawler indexes blocks from a Midnight node into CAP entities. A wallet stack in worker threads builds, proves and submits transactions: Compact deploys and calls, NIGHT and custom-token transfers, dust generation and fee sponsoring. Everything is exposed as OData V4.
+NIGHTGATE is an indexer and transaction service for the [Midnight](https://midnight.network/) blockchain, built on SAP CAP. It runs as a standalone server, from the container image or from a clone of this repository. A crawler indexes blocks from a Midnight node into CAP entities. A wallet stack in worker threads builds, proves and submits transactions: Compact deploys and calls, NIGHT and custom-token transfers, dust generation and fee sponsoring. Everything is exposed as OData V4.
 
 It runs on Midnight ledger 9 networks.
 
@@ -26,7 +24,7 @@ It runs on Midnight ledger 9 networks.
 ## Run the container
 
 ```bash
-docker run -d -p 4004:4004 \
+docker run -d --init -p 127.0.0.1:4004:4004 \
   -e ENCRYPTION_KEY=$(openssl rand -hex 32) \
   -e NIGHTGATE_HTTP_PASSWORD=change-me \
   -e NIGHTGATE_NODE_URL='ws://<node-host>:9944' \
@@ -35,7 +33,7 @@ docker run -d -p 4004:4004 \
   ghcr.io/odatano/nightgate:latest
 ```
 
-The image defaults to mainnet. Every network but preview, testnet and undeployed needs `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL`. Preview has built-in public endpoints, so `NIGHTGATE_NETWORK=preview` alone is enough there. Proving runs in-process by default.
+The image defaults to mainnet. Every network but preview and undeployed, the name of a local node, needs `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL`. Preview has built-in public endpoints, so `NIGHTGATE_NETWORK=preview` alone is enough there. Proving runs in-process by default.
 
 Configuration, PostgreSQL and upgrades: [docs/docker.md](docs/docker.md). All options: [docs/reference.md#configuration](docs/reference.md#configuration).
 
@@ -57,15 +55,15 @@ Actions that write to the chain return `{ jobId, status }`. Poll `getJobStatus`.
 
 - Block indexing with reorg rollback: `Blocks`, `Transactions`, `ContractActions`, `UnshieldedUtxos`, `NightBalances`.
 - Wallet sessions: `connectWallet` with a viewing key, `connectWalletForSigning` with a BIP39 mnemonic. Keys are encrypted at rest.
-- Transfers and dust: `sendNight` with optional `tokenTypeHex`, `registerForDustGeneration`, `deregisterFromDustGeneration`.
+- Transfers and dust: `sendToken` with optional `tokenType`, `registerForDustGeneration`, `deregisterFromDustGeneration`.
 - Compact contracts: `deployContract`, `submitContractCall`, `submitContractCallBatch` on registered artifacts.
-- Fee sponsoring: `sponsorSessionId` on submit actions, `sponsorFinalizedTransaction`, `sponsorUnboundTransaction`, `sponsorTransfer`, platform sponsors in `NIGHTGATE_FEE_SPONSOR_SESSION`.
+- Fee sponsoring: `sponsorSessionId` on submit actions, `sponsorFinalized`, `sponsorUnbound`, `sponsorTransfer`, platform sponsors in `NIGHTGATE_FEE_SPONSOR_SESSIONS`.
 - Documents and proofs: `anchorDocument`, `prepareDocumentProof`, field predicate, equality and membership attestations, cross-document integrity and diff attestations.
-- Verification without the crawler: `verifyAttestationState`, `verifyPredicateState`, `verifyDisclosureState`.
+- Verification without the crawler: `verifyAttestation`, `verifyPredicate`, `verifyDisclosure`.
 - Disclosure: `grantDisclosure`, `revokeDisclosure`, `grantDisclosureToHolders`, `claimDisclosure`.
 - Agents: `createAgentGrant` issues scoped tokens for the `x-agent-token` header. MCP server: [`@odatano/nightgate-mcp`](https://github.com/ODATANO/NIGHTGATE-MCP).
 - Offer board: `postSwapOffer`, `listSwapOffers`, `sponsorSwap`, `mintFactoryToken`.
-- Browser dApps: `connectContract` in `@odatano/nightgate/browser`, `GET /zk-config/<contract>/...`, `GET /contract-manifest`.
+- Browser dApps: `connectContract` in `@odatano/nightgate-tx/calls`, `GET /zk-config/<contract>/...`, `GET /contract-manifest`.
 - Operations: liveness, readiness, Prometheus metrics, crawler pause, resume and reindex.
 
 ## Documentation

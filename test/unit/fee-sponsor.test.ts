@@ -27,7 +27,6 @@ vi.mock('../../srv/midnight/wallet-worker-client', () => ({
 import {
     resolveFeeSponsor,
     ensureFeeSponsorFacade,
-    getConfiguredFeeSponsorSessions,
     prewarmFeeSponsorPool,
     prewarmSyncBudgetMs,
     FeeSponsorError
@@ -69,30 +68,8 @@ function whereOf(db: ReturnType<typeof makeDb>): string {
 }
 
 afterEach(() => {
-    delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+    delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
     getOrBuildWalletFacadeMock.mockClear();
-});
-
-describe('getConfiguredFeeSponsorSessions', () => {
-    it('returns [] without env or config', () => {
-        expect(getConfiguredFeeSponsorSessions()).toEqual([]);
-        expect(getConfiguredFeeSponsorSessions({})).toEqual([]);
-    });
-
-    it('parses the env var, comma separated, trimmed', () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = ' s1 , s2,s3 ';
-        expect(getConfiguredFeeSponsorSessions()).toEqual(['s1', 's2', 's3']);
-    });
-
-    it('falls back to config feeSponsorSessions (string or array)', () => {
-        expect(getConfiguredFeeSponsorSessions({ feeSponsorSessions: 'a,b' })).toEqual(['a', 'b']);
-        expect(getConfiguredFeeSponsorSessions({ feeSponsorSessions: ['a', 'b'] })).toEqual(['a', 'b']);
-    });
-
-    it('env wins over config', () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'env-sponsor';
-        expect(getConfiguredFeeSponsorSessions({ feeSponsorSessions: 'cfg-sponsor' })).toEqual(['env-sponsor']);
-    });
 });
 
 describe('resolveFeeSponsor', () => {
@@ -118,7 +95,7 @@ describe('resolveFeeSponsor', () => {
             db,
             sponsorSessionId: 'sponsor-session-1',
             encryptionKey: TEST_KEY
-        })).rejects.toMatchObject({ name: 'FeeSponsorError', httpStatus: 403 });
+        })).rejects.toMatchObject({ name: 'FeeSponsorError', status: 403 });
         expect(db.run).not.toHaveBeenCalled();
     });
 
@@ -129,11 +106,11 @@ describe('resolveFeeSponsor', () => {
             sponsorSessionId: 'sponsor-session-1',
             requestingUserId: 'mallory',
             encryptionKey: TEST_KEY
-        })).rejects.toMatchObject({ httpStatus: 404 });
+        })).rejects.toMatchObject({ status: 404 });
     });
 
     it('allows a platform-listed sponsor across users (no user scope in the lookup)', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-session-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-session-1';
         const db = makeDb(sponsorRow({ userId: 'platform-operator' }));
         const sponsor = await resolveFeeSponsor({
             db,
@@ -152,11 +129,11 @@ describe('resolveFeeSponsor', () => {
             sponsorSessionId: 'sponsor-session-1',
             requestingUserId: 'alice',
             encryptionKey: TEST_KEY
-        })).rejects.toMatchObject({ httpStatus: 410 });
+        })).rejects.toMatchObject({ status: 410 });
     });
 
     it('a CONFIGURED platform sponsor does not expire (infrastructure, not a caller session)', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-session-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-session-1';
         const db = makeDb(sponsorRow({ userId: 'platform-operator', expiresAt: new Date(Date.now() - 60_000).toISOString() }));
         const sponsor = await resolveFeeSponsor({ db, sponsorSessionId: 'sponsor-session-1', requestingUserId: 'anyone', encryptionKey: TEST_KEY });
         expect(sponsor.accountId).toBe(deriveAccountId(VIEWING_KEY));
@@ -169,7 +146,7 @@ describe('resolveFeeSponsor', () => {
             sponsorSessionId: 'sponsor-session-1',
             requestingUserId: 'alice',
             encryptionKey: TEST_KEY
-        })).rejects.toMatchObject({ httpStatus: 412 });
+        })).rejects.toMatchObject({ status: 412 });
     });
 
     it('maps an undecryptable session to 500 without leaking material', async () => {
@@ -184,10 +161,10 @@ describe('resolveFeeSponsor', () => {
             sponsorSessionId: 'sponsor-session-1',
             requestingUserId: 'alice',
             encryptionKey: TEST_KEY
-        })).rejects.toMatchObject({ httpStatus: 500 });
+        })).rejects.toMatchObject({ status: 500, code: 'INTERNAL' });
     });
 
-    it('errors are FeeSponsorError instances (handlers map httpStatus)', async () => {
+    it('errors are FeeSponsorError instances (handlers map status)', async () => {
         const db = makeDb(null);
         const err = await resolveFeeSponsor({
             db, sponsorSessionId: 'x', requestingUserId: 'u', encryptionKey: TEST_KEY
@@ -226,7 +203,7 @@ describe('ensureFeeSponsorFacade', () => {
 
 describe('prewarmFeeSponsorPool (boot)', () => {
     it('warms every configured pool sponsor one after another and skips (logs) the ones that fail', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-session-1,sponsor-session-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-session-1,sponsor-session-2';
         const order: string[] = [];
         const db = {
             run: vi.fn(async (q: any) => {
@@ -256,7 +233,7 @@ describe('prewarmFeeSponsorPool (boot)', () => {
     });
 
     it('a sponsor still behind at the sync budget is logged and the loop moves on; budget 0 skips the wait', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-session-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-session-1';
         const db = { run: vi.fn(async () => sponsorRow({ sessionId: 'sponsor-session-1' })) };
         getOrBuildWalletFacadeMock.mockImplementation(async () => ({}));
         walletWaitForSyncedStateMock.mockImplementation(async () => { throw new Error('wallet sync stalled: no progress for 12 min'); });
@@ -271,7 +248,7 @@ describe('prewarmFeeSponsorPool (boot)', () => {
     });
 
     it('publishes its progress for readiness: running while sponsors warm, finished with the counts afterwards', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-session-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-session-1';
         const db = { run: vi.fn(async () => sponsorRow({ sessionId: 'sponsor-session-1' })) };
         const seen: boolean[] = [];
         getOrBuildWalletFacadeMock.mockImplementation(async () => { seen.push(readPrewarmState().running); return {}; });

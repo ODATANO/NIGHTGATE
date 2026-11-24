@@ -1,6 +1,6 @@
 // Background pass that adds data from the Midnight indexer that the node's blocks do not contain.
 // It has its own cursor. The crawler works the same whether it runs or not.
-// Rows are matched on `Transactions.ledgerTxHash`, the hash the indexer uses for transactions.
+// Rows are matched on `Transactions.txHash`, the hash the indexer uses for transactions.
 
 import cds from '@sap/cds';
 import {
@@ -209,14 +209,14 @@ export class IndexerSupplement {
         const result: SupplementRunResult = { ...EMPTY_RUN };
         if (transactions.length === 0) return result;
 
-        const hashes = transactions.map(t => t.ledgerTxHash);
+        const hashes = transactions.map(t => t.txHash);
         const rows: Transaction[] = await this.db.run(
-            SELECT.from(Transactions).columns('ID', 'ledgerTxHash').where({ ledgerTxHash: { in: hashes } })
+            SELECT.from(Transactions).columns('ID', 'txHash').where({ txHash: { in: hashes } })
         ) || [];
-        const byHash = new Map<string, string>(rows.map(r => [String(r.ledgerTxHash), String(r.ID)]));
+        const byHash = new Map<string, string>(rows.map(r => [String(r.txHash), String(r.ID)]));
 
         for (const tx of transactions) {
-            const transactionId = byHash.get(tx.ledgerTxHash);
+            const transactionId = byHash.get(tx.txHash);
             if (!transactionId) continue;
             result.transactions++;
             const written = await writeInGeneration(this.db, start, PASS, async (dbTx) => {
@@ -263,7 +263,7 @@ export class IndexerSupplement {
     private async applyContractState(dbTx: DbRunner, transactionId: string, height: number, tx: SupplementTransaction): Promise<number> {
         if (tx.contractActions.length === 0) return 0;
         const actions: ContractAction[] = await dbTx.run(
-            SELECT.from(ContractActions).columns('ID', 'actionIndex', 'address', 'actionType')
+            SELECT.from(ContractActions).columns('ID', 'actionIndex', 'contractAddress', 'actionType')
                 .where({ transaction_ID: transactionId }).orderBy('actionIndex asc')
         ) || [];
         if (actions.length === 0) return 0;
@@ -273,7 +273,7 @@ export class IndexerSupplement {
         // and no state is better than a wrong one.
         const ours = new Map<string, ContractAction[]>();
         for (const action of actions) {
-            const key = `${action.address}:${action.actionType}`;
+            const key = `${action.contractAddress}:${action.actionType}`;
             const list = ours.get(key) ?? [];
             list.push(action);
             ours.set(key, list);
@@ -303,7 +303,7 @@ export class IndexerSupplement {
                 const match = matched[i];
                 const state = digestOfBase64(match.state);
                 const zswapState = digestOfBase64(match.zswapState);
-                const keep = keepsStateHistory(this.config.contractState ?? DEFAULT_CONTRACT_STATE_POLICY, action.address);
+                const keep = keepsStateHistory(this.config.contractState ?? DEFAULT_CONTRACT_STATE_POLICY, action.contractAddress);
                 await dbTx.run(UPDATE.entity(ContractActions)
                     .set({
                         state: keep && match.state != null ? capBinaryInput(match.state) : null,
@@ -314,9 +314,9 @@ export class IndexerSupplement {
                         zswapStateSize: zswapState.size
                     })
                     .where({ ID: action.ID }));
-                if (match.state != null && action.address) {
+                if (match.state != null && action.contractAddress) {
                     await upsertCurrentState(dbTx, {
-                        address: action.address,
+                        contractAddress: action.contractAddress,
                         height,
                         state: match.state,
                         zswapState: match.zswapState,

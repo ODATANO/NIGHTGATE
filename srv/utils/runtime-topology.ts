@@ -87,16 +87,16 @@ function openAuthInProduction(): string | null {
     return `Authentication kind '${authKind()}' serves every request unauthenticated and privileged.`;
 }
 
+/** The open auth kind of this server, or undefined when its auth kind checks credentials. */
+export function openAuthKind(): string | undefined {
+    return OPEN_AUTH_KINDS.has(authKind()) ? authKind() : undefined;
+}
+
 /** The reason this server must not listen: production with an open auth kind and no explicit override. Null otherwise. */
 export function openAuthRefusal(): string | null {
     const open = openAuthInProduction();
     if (!open || configFlag('NIGHTGATE_ALLOW_UNAUTHENTICATED')) return null;
     return `${open} It is refused in production; configure basic or JWT auth, or set NIGHTGATE_ALLOW_UNAUTHENTICATED=true for a local test.`;
-}
-
-function allowProductionSqlite(config: NightgateConfig): boolean {
-    return configFlag('NIGHTGATE_ALLOW_PRODUCTION_SQLITE')
-        || config.allowProductionSqlite === true;
 }
 
 export function getRuntimeTopology(config: NightgateConfig = {}): RuntimeTopology {
@@ -120,20 +120,12 @@ export function getRuntimeTopology(config: NightgateConfig = {}): RuntimeTopolog
     if (multitenancy) {
         errors.push('CAP multitenancy is enabled, but Nightgate background work does not yet persist and restore tenant context.');
     }
-    if (isProduction() && dbKind === 'sqlite') {
-        const message = 'SQLite is unsupported in production; configure PostgreSQL or SAP HANA.';
-        if (allowProductionSqlite(config)) {
-            warnings.push(`${message} NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true is active as an emergency compatibility override.`);
-        } else {
-            errors.push(`${message} Set NIGHTGATE_ALLOW_PRODUCTION_SQLITE=true only for a temporary, single-instance migration window.`);
-        }
-    }
 
     // With an open auth kind every request is a privileged user and could even export signing keys.
     const openAuth = openAuthInProduction();
     const refusal = openAuthRefusal();
     if (refusal) errors.push(refusal);
-    else if (openAuth) warnings.push(`${openAuth} NIGHTGATE_ALLOW_UNAUTHENTICATED=true is active; keep the port off any network.`);
+    else if (openAuth) warnings.push(`${openAuth} NIGHTGATE_ALLOW_UNAUTHENTICATED=true is active; the server listens on 127.0.0.1 only.`);
 
     return {
         instanceId,

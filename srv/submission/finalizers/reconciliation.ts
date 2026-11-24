@@ -56,7 +56,7 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         const tokenType = command?.mintedTokenType;
         if (tokenType) await recordPlatformMint(tx, [tokenType], { grantId: job.grantId ?? null, sponsorSessionId: command.sponsorSessionId ?? null, txHash: evidence.txHash });
         return {
-            reconciled: true, txHash: evidence.txHash, status: 'finalized',
+            reconciled: true, txId: evidence.txId, txHash: evidence.txHash, status: 'finalized',
             contractAddress: command?.contractAddress ?? evidence.contractAddress ?? '',
             ...(tokenType ? { tokenType } : {}),
             ...(command?.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
@@ -66,9 +66,9 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
     const finalizeContractProjection: BackgroundJobReconciliationFinalizer = async (raw, job, evidence, tx, afterCommit) => {
         const command = raw as ContractCommandV1WithProvenance;
 
-        if (typeof command.compiledArtifactRef === 'string') {
+        if (typeof command.contractName === 'string') {
             assertArtifactGeneration(
-                command.compiledArtifactRef,
+                command.contractName,
                 command.artifactDigest,
                 `Reconciled '${command.op}' command of job ${job.ID}`);
         }
@@ -76,18 +76,18 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
         const landed = evidence.blockHeight;
         // The state rebuild reads through its own connection, so it runs after the commit.
         const reindexLater = (contractAddress: string) => afterCommit(async () => {
-            const resolved = await contractResolver(command.compiledArtifactRef, command.artifactDigest).catch(err => {
+            const resolved = await contractResolver(command.contractName, command.artifactDigest).catch(err => {
                 throw new Error(`disclosure reindex of ${contractAddress.slice(0, 16)} skipped, run reindexDisclosures: ${errorMessage(err)}`);
             });
-            await reindexAfterSubmit(contractAddress, resolved, landed, job, command.compiledArtifactRef);
+            await reindexAfterSubmit(contractAddress, resolved, landed, job, command.contractName);
         });
         if (command.op === 'anchorDocument') {
             await tx.run(UPDATE.entity(Documents).set({
                 anchoredTxHash: evidence.txHash, anchoredAt: changedAt, modifiedAt: changedAt
-            }).where({ ID: command.documentId }));
+            }).where({ ID: command.anchorId }));
             return {
-                reconciled: true, documentId: command.documentId,
-                attestationId: command.payloadHash, txHash: evidence.txHash, anchoredAt: changedAt,
+                reconciled: true, anchorId: command.anchorId,
+                attestationId: command.payloadHash, txId: evidence.txId, txHash: evidence.txHash, anchoredAt: changedAt,
                 ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
             };
         }
@@ -99,7 +99,7 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
                     .where({ ID: command.disclosureGrantId }), landed));
             } else {
                 await tx.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({
-                    revokedTxHash: evidence.txHash, active: false, modifiedAt: changedAt, ...heightStamp(landed)
+                    revokedTxHash: evidence.txHash, isActive: false, modifiedAt: changedAt, ...heightStamp(landed)
                 }).where({
                     contractAddress: command.contractAddress,
                     attesterId: command.attesterId,
@@ -111,25 +111,25 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
             return {
                 reconciled: true,
                 ...(isGrant ? { disclosureGrantId: command.disclosureGrantId, level: command.level } : {}),
-                payloadHash: command.payloadHash, grantee: command.grantee, txHash: evidence.txHash
+                payloadHash: command.payloadHash, grantee: command.grantee, txId: evidence.txId, txHash: evidence.txHash
             };
         }
-        if (command.op === 'registerPassport') {
+        if (command.op === 'registerDocument') {
             return {
-                reconciled: true, passportId: command.passportId, documentId: command.passportId, ownerId: command.ownerId, mode: command.mode ?? 0,
-                contractAddress: command.contractAddress, txHash: evidence.txHash,
+                reconciled: true, documentId: command.documentId, ownerId: command.ownerId, mode: command.mode ?? 0,
+                contractAddress: command.contractAddress, txId: evidence.txId, txHash: evidence.txHash,
                 ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
             };
         }
         if (command.op === 'retract') {
             if (command.mode === 0) {
                 // Same database update the executor makes after a normal submit.
-                await tx.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ active: false, revokedTxHash: evidence.txHash, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.key, active: true }), landed));
+                await tx.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ isActive: false, revokedTxHash: evidence.txHash, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.key, isActive: true }), landed));
                 reindexLater(command.contractAddress);
             }
             return {
                 reconciled: true, mode: command.mode, key: command.key,
-                contractAddress: command.contractAddress, txHash: evidence.txHash,
+                contractAddress: command.contractAddress, txId: evidence.txId, txHash: evidence.txHash,
                 ...(command.sponsorSessionId ? { feeSponsor: command.sponsorSessionId } : {})
             };
         }
@@ -137,7 +137,7 @@ export function createReconciliationFinalizers(ctx: Pick<SubmissionContext, 'db'
             return {
                 reconciled: true,
                 submissionId: evidence.submissionId,
-                txHash: evidence.txHash,
+                txId: evidence.txId, txHash: evidence.txHash,
                 contractAddress: evidence.contractAddress ?? command.contractAddress,
                 circuits: command.calls.map(c => c.circuit),
                 status: 'finalized',

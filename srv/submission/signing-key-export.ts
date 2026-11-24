@@ -6,11 +6,11 @@ import cds from '@sap/cds';
 import { decrypt, KeyRing } from '../utils/crypto';
 import { walletSessionViewingKeyBinding } from '../utils/envelope-bindings';
 import { deriveAccountId, deriveStoragePassword } from './wallet-material-factory';
-import { resolveAccountDek, privateStatePasswordFromDek, DEK_SCHEME } from './account-keys';
+import { resolveAccountDek, privateStatePasswordFromDek } from './account-keys';
 import { decryptWithPassword } from '../utils/storage-encryption';
-import { buildSigningKeyExport, SigningKeyExport } from '../midnight/CapDbPrivateStateProvider';
+import { buildSigningKeyExport, readStoredSigningKey, SigningKeyExport } from '../midnight/CapDbPrivateStateProvider';
 import type { DbRunner } from '../utils/db-types';
-import { NightgateError } from '../utils/errors';
+import { NightgateError, SessionNotFoundError } from '../utils/errors';
 
 const { SELECT } = cds.ql;
 
@@ -43,7 +43,7 @@ export async function exportContractSigningKeyForSession(
         throw new SigningKeyExportError(400, 'password must be at least 16 characters');
     }
     const session = await db.run(SELECT.one.from('midnight.WalletSessions').where({ sessionId }));
-    if (!session || !session.isActive) throw new SigningKeyExportError(404, `Session ${sessionId} not found or inactive`);
+    if (!session || !session.isActive) throw new SessionNotFoundError(sessionId);
     if (!session.encryptedViewingKey) throw new SigningKeyExportError(409, 'Session has no viewing key');
     let viewingKey: string;
     try {
@@ -57,9 +57,6 @@ export async function exportContractSigningKeyForSession(
         SELECT.one.from('midnight.ContractSigningKeys').where({ accountId, contractAddress: address })
     );
     if (!row?.ciphertext) throw new SigningKeyExportError(404, `No signing key for contract ${address} in this session's account`);
-    if (row.keyScheme !== DEK_SCHEME) {
-        throw new SigningKeyExportError(409, 'Signing key row predates the account key; run a call through this session first, it migrates the row');
-    }
     const dek = await resolveAccountDek({ db, ring, accountId, storagePassword: deriveStoragePassword(viewingKey), create: false });
     if (!dek) throw new SigningKeyExportError(409, 'Account has no data key yet');
     let signingKey: string;
@@ -70,6 +67,6 @@ export async function exportContractSigningKeyForSession(
     } finally {
         dek.fill(0);
     }
-    const envelope = buildSigningKeyExport({ [address]: signingKey }, exportPassword);
+    const envelope = buildSigningKeyExport({ [address]: readStoredSigningKey(signingKey, address) }, exportPassword);
     return { ...envelope, contractAddress: address, accountId };
 }

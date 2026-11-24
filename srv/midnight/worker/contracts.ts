@@ -5,9 +5,10 @@
 import { proofRequestTimeoutMs } from '../../utils/proof-timeout';
 import { isPreForkKeyMismatch } from '../../utils/runtime-version';
 import { throwIfRpcCancelled } from './cancellation';
-import { runBatchInScope, landedHeight } from '../batch-call-scope';
+import { runBatchInScope, landedHeight } from '../../../src/shared/batch-call-scope.mjs';
+import type { BatchReport } from '../../../src/shared/batch-segment-order.mjs';
 import { buildWasmProofProvider } from '../wasm-proof-provider';
-import { getContractWitnessFactory, type MerkleProofBundle } from '../../submission/contract-witnesses';
+import { getContractWitnessFactory, isVaultLineage, type MerkleProofBundle } from '../../submission/contract-witnesses';
 import { type MessagePort } from 'node:worker_threads';
 import { BoundedCache } from './bounded-cache';
 import { ContractsSdkBundle, FacadeEntry, facades, loadContractsSdk, loadLedger, loadSdk, log, resolveProvingMode } from './context';
@@ -21,8 +22,8 @@ import type { PrivateStateProvider, ProofProvider, PublicDataProvider, ZKConfigP
 import { DEPLOY_ENTRY_POINT, resolveSponsorEntry } from './sponsor';
 
 /** Vault constructors take attester and recovery id as plain arguments, because witness reads exceed the node's cost limit. All-zero recovery id means none. */
-export async function deployConstructorArgs(contractName: string, entry: FacadeEntry, recoveryId?: string): Promise<unknown[]> {
-    if (!contractName.startsWith('attestation-vault')) return [];
+export async function deployConstructorArgs(lineage: string | undefined, entry: FacadeEntry, recoveryId?: string): Promise<unknown[]> {
+    if (!isVaultLineage(lineage)) return [];
     const attesterId = hexToBytes32(await computeAttesterId(entry.attestationSecret));
     const recovery = recoveryId ? Uint8Array.from(Buffer.from(recoveryId, 'hex')) : new Uint8Array(32);
     return [attesterId, recovery];
@@ -37,8 +38,9 @@ export function unregisteredWitnessStub(contractName: string): Witnesses<unknown
             return () => {
                 throw new Error(
                     `contract '${contractName}' asked for the witness '${String(prop)}', which NIGHTGATE holds no material for. `
-                    + 'Registered foreign contracts can be deployed (a constructor takes no witnesses); calls into them have to be '
-                    + 'built by the caller, e.g. with @odatano/nightgate/txbuilder, and sponsored.'
+                    + 'The server supplies witnesses only to a build that is one of its installed contract packages, whatever name it is registered under. '
+                    + 'Any other contract can be deployed (a constructor takes no witnesses); calls into it have to be '
+                    + 'built by the caller, e.g. with @odatano/nightgate-tx/txbuilder, and sponsored.'
                 );
             };
         }
@@ -68,7 +70,7 @@ export async function getOrCompileContract(
         );
     }
 
-    const witnessFactory = getContractWitnessFactory(name);
+    const witnessFactory = getContractWitnessFactory(registration.witnessLineage);
     const witnesses = witnessFactory
         ? witnessFactory({
             attestationSecret: entry.attestationSecret, issuerSecret: entry.tokenFactoryIssuerSecret, merkleProof, merkleProofHolder,
@@ -279,7 +281,7 @@ export async function findContractForWallet(contracts: ContractsSdkBundle['contr
         if (!await isPreForkKeyMismatch(err, contracts.ContractTypeError, providers.publicDataProvider, a.contractAddress)) throw err;
         throw new Error(
             `contract ${a.contractAddress} was deployed before ledger 9 and keeps its ledger 8 verifier keys, so this server cannot build calls on it. ` +
-            'Build the call with @odatano/nightgate-tx and the ledger8 tag of its contract package, then hand it to sponsorUnboundTransaction.',
+            'Build the call with @odatano/nightgate-tx and the ledger8 tag of its contract package, then hand it to sponsorUnbound.',
             { cause: err }
         );
     }
@@ -320,7 +322,7 @@ export async function deployContract({
     const { contracts } = await loadContractsSdk();
     log('info', `deployContract: starting ${contractName} sess=${sessionId.slice(0, 16)}` +
         (sponsorEntry ? ` (fee sponsored by ${String(sponsorSessionId).slice(0, 16)})` : ''));
-    const constructorArgs = await deployConstructorArgs(contractName, entry, recoveryId);
+    const constructorArgs = await deployConstructorArgs(registration.witnessLineage, entry, recoveryId);
     // midnight-js reads missing constructor arguments as an empty list.
     const result = await contracts.deployContract(providers, {
         compiledContract,
@@ -330,6 +332,7 @@ export async function deployContract({
     });
     const pub = result?.deployTxData?.public;
     const out = {
+        txId: String(pub?.txId ?? ''),
         txHash: String(pub?.txHash ?? ''),
         contractAddress: String(pub?.contractAddress ?? ''),
         onChainStatus: String(pub?.status ?? '')
@@ -401,6 +404,7 @@ export async function submitContractCall({
         timer.add('callTotal', Date.now() - callRegion.start);
         const pub = result?.public;
         const out = {
+            txId: String(pub?.txId ?? ''),
             txHash: String(pub?.txHash ?? ''),
             onChainStatus: String(pub?.status ?? ''),
             blockHeight: landedHeight(pub)
@@ -490,7 +494,11 @@ export async function submitContractCallBatch({
         });
         timer.mark('findContract');
         callRegion.start = Date.now();
-        const out = await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress, { independentCalls, orderedPrefix });
+        const report = (event: BatchReport): void => {
+            if (event.step === 'ordered') log('info', `submitContractCallBatch: segments${event.stageGrouped ? ' (stage-grouped)' : ''} ${event.before} -> ${event.after}`);
+            else log('warn', `submitContractCallBatch: gas check ${event.outcome === 'skipped' ? 'skipped' : 'saw another failure and went on'} for [${circuits.join('+')}]: ${event.detail}`);
+        };
+        const out = await runBatchInScope(contracts, providers, found, scopeCalls, contractAddress, { independentCalls, orderedPrefix, report });
         timer.add('callTotal', Date.now() - callRegion.start);
         log('info', `submitContractCallBatch: done txHash=${out.txHash.slice(0, 16)} status=${out.onChainStatus} calls=${out.circuits.length}`);
         return out;

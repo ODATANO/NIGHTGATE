@@ -1,13 +1,12 @@
 import cds from '@sap/cds';
 import { NightgateError } from './errors';
 import { isUniqueViolation } from './db-errors';
-const { SELECT, INSERT, UPDATE } = cds.ql;
+const { SELECT, INSERT } = cds.ql;
 
-import { SyncState, Blocks } from '#cds-models/midnight';
+import { SyncState } from '#cds-models/midnight';
 import { getConfiguredNightgateNodeUrl, resolveNightgateRuntimeConfig, getNightgateConfig } from './nightgate-config';
 import { redactUrlCredentials } from './redact-url';
 
-import { configString } from './config';
 
 export class SyncStateNetworkMismatchError extends NightgateError {
     constructor(public readonly storedNetwork: string, public readonly configuredNetwork: string) {
@@ -21,6 +20,18 @@ export class SyncStateNetworkMismatchError extends NightgateError {
     }
 }
 
+/** The node's finalized chain has another block than the index at one height. The crawler stores only finalized blocks, so that is another chain. */
+export class SyncStateChainMismatchError extends NightgateError {
+    constructor(public readonly height: number, public readonly storedHash: string, public readonly nodeHash: string) {
+        // The text must not hold a word the retry logic reads as a passing fault.
+        super('SYNC_STATE_CHAIN_MISMATCH',
+            `The node serves another chain than this database was indexed from: block ${height} is ${nodeHash} on the node ` +
+            `and ${storedHash} in the database. Indexing stops. Check NIGHTGATE_NODE_URL. If the node is right, ` +
+            `stop the server and run scripts/adopt-chain.mjs.`
+        );
+    }
+}
+
 export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?: string): Promise<void> {
     const existing: SyncState | null | undefined = await db.run(
         SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
@@ -29,29 +40,11 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
     if (existing) {
         const nightgateConfig = getNightgateConfig();
         const { network } = resolveNightgateRuntimeConfig(nightgateConfig);
-        if (existing.networkId && existing.networkId !== network) {
-            throw new SyncStateNetworkMismatchError(existing.networkId, network);
+        if (existing.network && existing.network !== network) {
+            throw new SyncStateNetworkMismatchError(existing.network, network);
         }
-        // No network stored yet. An empty database gets the configured network.
-        // A database with blocks needs NIGHTGATE_ASSUME_DB_NETWORK, so data from another chain cannot slip in.
-        if (!existing.networkId) {
-            const anyBlock = await db.run(SELECT.one.from(Blocks));
-            const assumed = configString('NIGHTGATE_ASSUME_DB_NETWORK');
-            if (anyBlock && assumed !== network) {
-                throw new Error(
-                    `This database carries indexed chain data but no recorded network binding ` +
-                    `(pre-0.16.0). Refusing to start on '${network}': if the data was indexed from ` +
-                    `another network, mixing chains corrupts it. If you KNOW this database belongs ` +
-                    `to '${network}', confirm once with NIGHTGATE_ASSUME_DB_NETWORK=${network}; ` +
-                    `otherwise use a separate database file (NIGHTGATE_DB_PATH).`
-                );
-            }
-            await db.run(UPDATE.entity(SyncState).set({ networkId: network }).where({ ID: 'SINGLETON' }));
-        }
-        // SyncState can be read over OData, so remove credentials from the stored URL.
-        const redacted = redactUrlCredentials(existing.nodeUrl);
-        if (existing.nodeUrl && redacted !== existing.nodeUrl) {
-            await db.run(UPDATE.entity(SyncState).set({ nodeUrl: redacted }).where({ ID: 'SINGLETON' }));
+        if (!existing.network) {
+            throw new NightgateError('SYNC_STATE_NETWORK_MISMATCH', `This database records no network, so it cannot be bound to '${network}'. Index it again in an empty database.`);
         }
         return;
     }
@@ -63,7 +56,7 @@ export async function ensureSyncStateSingleton(db: cds.DatabaseService, nodeUrl?
             const configuredNodeUrl = getConfiguredNightgateNodeUrl(nightgateConfig);
             await db.run(INSERT.into(SyncState).entries({
                 ID: 'SINGLETON',
-                networkId: network,
+                network,
                 lastIndexedHeight: 0,
                 syncStatus: 'stopped',
                 // Readable over OData, so never store URL credentials.

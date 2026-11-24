@@ -38,6 +38,14 @@ async function post(path, body, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
+
 async function get(path, timeoutMs = 60_000) {
     const r = await fetch(`${ENDPOINT}${path}`, {
         headers: { Accept: 'application/json' },
@@ -53,7 +61,7 @@ async function pollJob(sessionId, jobId, label, { expect = 'succeed', timeoutMs 
     const deadline = Date.now() + timeoutMs;
     let last = null;
     while (Date.now() < deadline) {
-        const r = await post('/getJobStatus', { jobId, sessionId });
+        const r = await jobStatus(jobId, sessionId);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) → HTTP ${r.status}: ${pretty(r.body)}`);
         const { status, result, errorCode, errorMessage } = r.body;
         if (status !== last) { process.stdout.write(`\n     [${label}] ${jobId.slice(0, 8)} status=${status}`); last = status; }
@@ -62,7 +70,7 @@ async function pollJob(sessionId, jobId, label, { expect = 'succeed', timeoutMs 
         if (status === 'succeeded') {
             process.stdout.write('\n');
             if (expect === 'fail') fail(`[${label}] expected job to FAIL but it succeeded: ${result}`);
-            return result ? JSON.parse(result) : {};
+            return result ?? {};
         }
         if (status === 'failed') {
             process.stdout.write('\n');
@@ -83,7 +91,7 @@ async function pollGrantRow(contractAddress, grantee, label, predicate) {
         const r = await get(`/DisclosureGrants?$filter=${filter}`);
         if (r.status !== 200) fail(`GET DisclosureGrants → HTTP ${r.status}: ${pretty(r.body)}`);
         const row = (r.body?.value || [])[0] || null;
-        const tag = row ? `active=${row.active} level=${row.level} tx=${(row.grantedTxHash || '').slice(0, 8)}` : 'no-row';
+        const tag = row ? `active=${row.isActive} level=${row.level} tx=${(row.grantedTxHash || '').slice(0, 8)}` : 'no-row';
         if (tag !== lastSeen) { process.stdout.write(`\n     [${label}] ${tag}`); lastSeen = tag; }
         else process.stdout.write('.');
         if (predicate(row)) { process.stdout.write('\n'); return row; }
@@ -114,16 +122,16 @@ async function waitForServer() {
     step('2. connectWalletForSigning (+ await prewarm sync-to-tip)');
     r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
     if (r.status >= 400) fail(`connectWalletForSigning → ${r.status}: ${pretty(r.body)}`);
-    const prewarmJobId = r.body?.prewarmJobId;
+    const prewarmJobId = r.body?.jobId;
     if (prewarmJobId) { await pollJob(sessionId, prewarmJobId, 'prewarm'); console.log('OK   facade synced'); }
-    else console.log('WARN no prewarmJobId');
+    else console.log('WARN no prewarm job');
 
     let contractAddress = REUSE_CONTRACT;
     if (contractAddress) {
         console.log(`\n--- 3. (reusing AttestationVault ${contractAddress}) ---`);
     } else {
         step('3. deployContract(attestation-vault)');
-        r = await post('/deployContract', { compiledArtifactRef: 'attestation-vault', sessionId, initialPrivateState: '{}' });
+        r = await post('/deployContract', { contractName: 'attestation-vault', sessionId, initialPrivateState: '{}' });
         if (r.status >= 400) fail(`deployContract → ${r.status}: ${pretty(r.body)}`);
         const deployRes = await pollJob(sessionId, r.body.jobId, 'deploy');
         contractAddress = deployRes.contractAddress;
@@ -144,7 +152,7 @@ async function waitForServer() {
     const payloadHash = randomBytes(32).toString('hex');
     step(`5. anchorDocument → attest payload ${payloadHash.slice(0, 12)}… (on-chain owner for grant)`);
     r = await post('/anchorDocument', {
-        sha256: payloadHash, storageRef: 'file:///tmp/disclosure-demo.bin',
+        payloadHash: payloadHash, storageRef: 'file:///tmp/disclosure-demo.bin',
         metadata: '{"type":"battery-passport-demo"}', sessionId, contractAddress
     });
     if (r.status >= 400) fail(`anchorDocument → ${r.status}: ${pretty(r.body)}`);
@@ -158,7 +166,7 @@ async function waitForServer() {
     console.log(`OK   grant tx accepted on-chain: ${grantRes.txHash}`);
 
     step('7. GET DisclosureGrants - poll until chain-confirmed active=true (validates live ledger read-back)');
-    const grantedRow = await pollGrantRow(contractAddress, grantee, 'read+', row => row && row.active === true);
+    const grantedRow = await pollGrantRow(contractAddress, grantee, 'read+', row => row && row.isActive === true);
     if (grantedRow.level !== 1) fail(`expected level=1, got ${grantedRow.level}`);
     if (!grantedRow.grantedTxHash) fail('grantedTxHash not recorded on the indexed row');
     console.log(`OK   on-chain grant indexed: active=true level=${grantedRow.level}`);
@@ -170,13 +178,11 @@ async function waitForServer() {
     console.log(`OK   revoke tx accepted on-chain: ${revokeRes.txHash}`);
 
     step('9. GET DisclosureGrants - poll until active=false (revoke reflected)');
-    await pollGrantRow(contractAddress, grantee, 'read-', row => row && row.active === false);
+    await pollGrantRow(contractAddress, grantee, 'read-', row => row && row.isActive === false);
     console.log('OK   grant deactivated after revoke');
 
     console.log('\nDISCLOSURE E2E PASSED.');
     console.log(`Contract:  ${contractAddress}`);
     console.log(`Grantee:   ${grantee}`);
     console.log(`Payload:   ${payloadHash}`);
-    console.log('\nNote: the read GATE (attachDisclosureRole) is consumer-wired; its');
-    console.log('allowed/403 behavior is covered in test/unit/disclosure-role.test.ts.');
 })();

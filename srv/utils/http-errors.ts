@@ -2,6 +2,7 @@
 // CAP calls it synchronously for every error, also for each part of a `$batch` request.
 // SPDX-License-Identifier: Apache-2.0
 import { statusClassCode } from './errors';
+import { configMs } from './config';
 import { isProduction } from './production';
 
 type HttpErrorLike = {
@@ -22,6 +23,17 @@ const SANITIZED_KEYS = new Set(['code', 'message', 'status', 'statusCode', '$san
 
 const GENERIC_5XX: Record<number, string> ={ 502: 'Bad Gateway', 503: 'Service Unavailable', 504: 'Gateway Timeout' };
 
+/** PostgreSQL's code for a statement it stopped, here by the time limit of a read. */
+const STATEMENT_STOPPED = '57014';
+
+/** The answer for a read the database stopped. The database's own error names the statement, so only these fields stay. */
+function asQueryTimeout(err: HttpErrorLike): void {
+    for (const key of Object.keys(err)) delete (err as Record<string, unknown>)[key];
+    const ms = configMs('NIGHTGATE_QUERY_TIMEOUT_MS');
+    const limit = ms >= 1000 ? `${ms / 1000} s` : `${ms} ms`;
+    Object.assign(err, { status: 504, code: 'QUERY_TIMEOUT', message: `The read ran longer than ${limit} and was stopped. Narrow the filter or sort by an indexed column.`, $sanitize: false });
+}
+
 /** The status of a combined error, as CAP infers it: one shared sub-error status, 500 if any is a server error, else 400. */
 function statusFromDetails(details: unknown[]): number {
     const nested = [...new Set(details
@@ -32,6 +44,7 @@ function statusFromDetails(details: unknown[]): number {
 }
 
 function normalizeOne(err: HttpErrorLike): void {
+    if (err.code === STATEMENT_STOPPED) return asQueryTimeout(err);
     // `req.reject(400, text)` sets code 400 but no status.
     // Copy the status from the code before the code is replaced.
     if (err.status === undefined && err.statusCode === undefined && numericCode(err.code)) err.status = Number(err.code);

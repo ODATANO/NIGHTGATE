@@ -8,12 +8,13 @@
  */
 import cds from '@sap/cds';
 import { __resetRuntimeStateForTests, publishRuntimeState, readRuntimeState, noteCrawlerRunning } from '../../srv/utils/runtime-state';
-import { isRuntimeWriteEvent, runtimeUnavailableReason, RUNTIME_FREE_ACTIONS } from '../../srv/utils/runtime-gate';
+import { attachReadLimits, isRuntimeWriteEvent, runtimeUnavailableReason, RUNTIME_FREE_ACTIONS } from '../../srv/utils/runtime-gate';
+import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
 
 (cds as any).env.requires.auth = {
     kind: 'basic',
     impl: '@odatano/cap-auth',
-    users: { operator: { password: 'op-secret', roles: [] } }
+    users: { operator: { password: 'op-secret', roles: [] }, admin: { password: 'admin-secret', roles: ['admin'] } }
 };
 const cap = cds.test(__dirname + '/../..');
 const API = '/odata/v4/midnight';
@@ -62,14 +63,14 @@ describe('runtimeUnavailableReason', () => {
 describe('isRuntimeWriteEvent', () => {
     const srv = { name: 'NightgateService', model: { definitions: {
         'NightgateService.connectWallet': { kind: 'action' },
-        'NightgateService.sendNight': { kind: 'action' },
+        'NightgateService.sendToken': { kind: 'action' },
         'NightgateService.getWalletBalance': { kind: 'function' },
         'NightgateService.prepareDocumentProof': { kind: 'action' }
     } } } as any;
 
     test('gates unbound actions and entity writes', () => {
         expect(isRuntimeWriteEvent(srv, 'connectWallet')).toBe(true);
-        expect(isRuntimeWriteEvent(srv, 'sendNight')).toBe(true);
+        expect(isRuntimeWriteEvent(srv, 'sendToken')).toBe(true);
         expect(isRuntimeWriteEvent(srv, 'CREATE')).toBe(true);
         expect(isRuntimeWriteEvent(srv, 'UPDATE')).toBe(true);
     });
@@ -132,5 +133,94 @@ describe('offline runtime on the served API', () => {
     test('idle under SKIP_AUTO_INIT is not an outage: the action reaches its handler', async () => {
         const response = await cap.axios.post(`${API}/connectWallet`, { viewingKey: 'not-hex' }, AUTH);
         expect(response.status).not.toBe(503);
+    });
+});
+
+describe('the time limit of an entity read', () => {
+    type Hook = (req: Record<string, unknown>) => Promise<void>;
+    const hookOf = (functions: string[] = []): Hook => {
+        let hook: Hook | undefined;
+        attachReadLimits({ before: (_event: string, handler: Hook) => { hook = handler; } } as never, functions);
+        return hook!;
+    };
+    const request = (event: string) => ({ event, user: { id: 'reader' }, reject: vi.fn() });
+    const database = (cds as any).env.requires.db;
+    const savedKind = database.kind;
+    let run: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+        __resetRateLimitersForTests();
+        run = vi.spyOn(cds.db, 'run').mockResolvedValue(undefined as never);
+    });
+    afterEach(() => {
+        run.mockRestore();
+        database.kind = savedKind;
+        delete process.env.NIGHTGATE_QUERY_TIMEOUT_MS;
+    });
+
+    test('is set in the transaction of the read on PostgreSQL', async () => {
+        database.kind = 'postgres';
+        await hookOf()(request('READ'));
+        expect(run).toHaveBeenCalledWith('SET LOCAL statement_timeout = 15000');
+    });
+
+    test('is left out on SQLite, for a counted function and when switched off', async () => {
+        await hookOf()(request('READ'));
+        database.kind = 'postgres';
+        await hookOf(['getJobStatus'])(request('getJobStatus'));
+        process.env.NIGHTGATE_QUERY_TIMEOUT_MS = '0';
+        await hookOf()(request('READ'));
+        expect(run).not.toHaveBeenCalled();
+    });
+
+    test('an event that is no read is neither counted nor bounded', async () => {
+        database.kind = 'postgres';
+        const req = request('anchorDocument');
+        process.env.NIGHTGATE_QUERY_RATE_LIMIT = '1';
+        try {
+            const hook = hookOf();
+            for (let i = 0; i < 3; i++) await hook(req);
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(run).not.toHaveBeenCalled();
+        } finally {
+            delete process.env.NIGHTGATE_QUERY_RATE_LIMIT;
+        }
+    });
+
+    test('a read over the limit is refused before the database is asked', async () => {
+        database.kind = 'postgres';
+        process.env.NIGHTGATE_QUERY_RATE_LIMIT = '1';
+        try {
+            const hook = hookOf();
+            await hook(request('READ'));
+            const refused = request('READ');
+            await hook(refused);
+            expect(refused.reject).toHaveBeenCalledWith(429, expect.stringMatching(/query: 1 per minute/));
+            expect(run).toHaveBeenCalledTimes(1);
+        } finally {
+            delete process.env.NIGHTGATE_QUERY_RATE_LIMIT;
+        }
+    });
+});
+
+describe('the metrics are for the operator', () => {
+    const metrics = (username: string, password: string) =>
+        cap.axios.get('/odata/v4/midnight-indexer/getMetrics()', { auth: { username, password }, validateStatus: () => true });
+
+    test('a signed-in user without the admin role is refused', async () => {
+        expect((await metrics('operator', 'op-secret')).status).toBe(403);
+    });
+
+    test('an admin reads them', async () => {
+        const res = await metrics('admin', 'admin-secret');
+        expect(res.status).toBe(200);
+        expect(res.data.value).toContain('odatano_nightgate_');
+    });
+});
+
+describe('the address the server listens on', () => {
+    test('a server that checks credentials listens on every address', () => {
+        const { address } = (cds as any).app.server.address();
+        expect(['::', '0.0.0.0']).toContain(address);
     });
 });

@@ -193,7 +193,7 @@ export class LedgerPayloadDecoder {
             ...(txType ? { txType } : {}),
             payloadDecode: state,
             identifiers: facts.identifiers.length ? JSON.stringify(facts.identifiers) : null,
-            circuitName: firstCall?.entryPoint ?? null,
+            circuit: firstCall?.entryPoint ?? null,
             isShielded: carriesShieldedCoins(facts),
             hasProof: carriesProof(facts),
             zswapInputCount: facts.zswapInputCount,
@@ -208,18 +208,18 @@ export class LedgerPayloadDecoder {
         // The events name the contract but not the circuit, so circuit names come from the payload.
         // Names are assigned in order, and only if the call counts per contract match.
         // After a partial success the payload lists calls that never ran, and their names would be wrong.
-        const actions: Row<ContractAction, 'ID' | 'address'>[] = await tx.run(
-            SELECT.from(ContractActions).columns('ID', 'actionIndex', 'address', 'actionType')
+        const actions: Row<ContractAction, 'ID' | 'contractAddress'>[] = await tx.run(
+            SELECT.from(ContractActions).columns('ID', 'actionIndex', 'contractAddress', 'actionType')
                 .where({ transaction_ID: transactionId, actionType: 'CALL' })
                 .orderBy('actionIndex asc')
         ) || [];
         if (actions.length === 0) return;
 
-        const ours = new Map<string | null, Row<ContractAction, 'ID' | 'address'>[]>();
+        const ours = new Map<string | null, Row<ContractAction, 'ID' | 'contractAddress'>[]>();
         for (const action of actions) {
-            const list = ours.get(action.address) ?? [];
+            const list = ours.get(action.contractAddress) ?? [];
             list.push(action);
-            ours.set(action.address, list);
+            ours.set(action.contractAddress, list);
         }
         const declared = new Map<string, string[]>();
         for (const entry of facts.contractActions) {
@@ -241,7 +241,7 @@ export class LedgerPayloadDecoder {
                 continue;
             }
             for (let i = 0; i < mine.length; i++) {
-                await tx.run(UPDATE.entity(ContractActions).set({ entryPoint: names[i] }).where({ ID: mine[i].ID }));
+                await tx.run(UPDATE.entity(ContractActions).set({ circuit: names[i] }).where({ ID: mine[i].ID }));
             }
         }
     }

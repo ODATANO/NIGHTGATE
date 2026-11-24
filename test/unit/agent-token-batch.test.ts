@@ -24,7 +24,8 @@ const cap = cds.test(__dirname + '/../..');
 const API = '/odata/v4/midnight';
 const TOKEN = 'ngat_' + 'b'.repeat(64);
 const OPERATOR = 'operator-batch';
-const SESSION = 'sess-batch-1';
+const SESSION = '5e55ba7c-0000-4000-8000-000000000001';
+const OTHER_SESSION = '5e55ba7c-0000-4000-8000-000000000002';
 
 function sha256Hex(s: string): string { return crypto.createHash('sha256').update(s).digest('hex'); }
 
@@ -41,11 +42,11 @@ describe('agent token on a real $batch', () => {
         db = await cds.connect.to('db');
         const now = new Date().toISOString();
         await db.run(cds.ql.INSERT.into('midnight.WalletSessions').entries({
-            ID: cds.utils.uuid(), userId: OPERATOR, sessionId: SESSION, viewingKeyHash: 'vk-batch', encryptedViewingKey: 'cipher',
+            userId: OPERATOR, sessionId: SESSION, viewingKeyHash: 'vk-batch', encryptedViewingKey: 'cipher',
             connectedAt: now, expiresAt: new Date(Date.now() + 3_600_000).toISOString(), isActive: true, createdAt: now, modifiedAt: now
         }));
         await db.run(cds.ql.INSERT.into('midnight.WalletSessions').entries({
-            ID: cds.utils.uuid(), userId: 'someone-else', sessionId: 'sess-other-1', viewingKeyHash: 'vk-other', encryptedViewingKey: 'cipher',
+            userId: 'someone-else', sessionId: OTHER_SESSION, viewingKeyHash: 'vk-other', encryptedViewingKey: 'cipher',
             connectedAt: now, expiresAt: new Date(Date.now() + 3_600_000).toISOString(), isActive: true, createdAt: now, modifiedAt: now
         }));
         await db.run(cds.ql.INSERT.into('midnight.AgentGrants').entries({
@@ -68,8 +69,21 @@ describe('agent token on a real $batch', () => {
         expect(rows.map((r: any) => r.sessionId)).toEqual([SESSION]);
     });
 
+    it('one wallet session is read by its session id: a token reads the session of its grant and no other', async () => {
+        const read = (sessionId: string, headers: Record<string, string>) => cap.axios.get(`${API}/WalletSessions(${sessionId})`, { headers, validateStatus: () => true });
+        const own = await read(SESSION, { 'x-agent-token': TOKEN });
+        expect(own.status).toBe(200);
+        expect(own.data.sessionId).toBe(SESSION);
+        expect('ID' in own.data).toBe(false);
+        expect((await read(OTHER_SESSION, { 'x-agent-token': TOKEN })).status).toBe(404);
+
+        const operator = await read(OTHER_SESSION, { authorization: 'Basic ' + Buffer.from('nightgate:op-secret').toString('base64') });
+        expect(operator.status).toBe(200);
+        expect(operator.data.sessionId).toBe(OTHER_SESSION);
+    });
+
     it('a part naming a non-allowlisted action is refused (403); a malformed token is refused (401)', async () => {
-        const forbidden = await batch({ 'x-agent-token': TOKEN }, [{ id: 'r1', method: 'POST', url: 'sendNight', body: { sessionId: SESSION, receiverAddress: 'x', amount: '1' } }]);
+        const forbidden = await batch({ 'x-agent-token': TOKEN }, [{ id: 'r1', method: 'POST', url: 'sendToken', body: { sessionId: SESSION, receiverAddress: 'x', amount: '1' } }]);
         expect(forbidden.data.responses[0].status).toBe(403);
         const malformed = await batch({ 'x-agent-token': 'not-a-token' }, [{ id: 'r1', method: 'GET', url: 'WalletSessions' }]);
         expect(malformed.data.responses[0].status).toBe(401);

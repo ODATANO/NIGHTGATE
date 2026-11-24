@@ -162,8 +162,8 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
                         );
                         const lost = 'The job work completed but its result could not be persisted (database lock contention or a lost worker lease).';
                         // A failed job frees its idempotency key. A job with something on chain must keep it, so it is parked and settled from the chain.
-                        if (current?.txHash) {
-                            await markReconciliationRequired(jobId, { code: 'RESULT_PERSIST_FAILED', message: `${lost} The reconciler settles it from the indexer by ${current.txHash}.` });
+                        if (current?.txId) {
+                            await markReconciliationRequired(jobId, { code: 'RESULT_PERSIST_FAILED', message: `${lost} The reconciler settles it from the indexer by ${current.txId}.` });
                         } else if (await hasCompletedChild(jobId)) {
                             await markReconciliationRequired(jobId, { code: 'CHILD_RECONCILIATION_REQUIRED', message: `${lost} Its steps are done; the workflow finishes from them.` });
                         } else {
@@ -183,33 +183,33 @@ function dispatchJob(jobId: string, kind: string, legacyWork?: () => Promise<unk
             } else {
                 const classification = classifySubmissionError(err, getNetwork());
                 const current = await getJobById(jobId);
-                if (current?.txHash) {
-                    cds.log('nightgate').warn(`Job ${jobId} (${current.kind}) failed after announcing ${current.txHash.slice(0, 16)}: ${classification.code}: ${classification.message.slice(0, 300)}`);
+                if (current?.txId) {
+                    cds.log('nightgate').warn(`Job ${jobId} (${current.kind}) failed after announcing ${current.txId.slice(0, 16)}: ${classification.code}: ${classification.message.slice(0, 300)}`);
                 } else if (current?.submissionId) {
                     cds.log('nightgate').warn(`Job ${jobId} (${current.kind}) failed after an announced attempt was closed: ${classification.code}: ${classification.message.slice(0, 300)}`);
                 }
-                // Only a job with a recorded txHash can have changed the chain.
+                // Only a job with a recorded txId can have changed the chain.
                 // Without one it simply fails and needs no operator.
                 if (current?.status === 'failed' && current.errorCode === 'SUPERSEDED') {
                     cds.log('nightgate').info(
                         `Job ${jobId} errored after being superseded mid-run; keeping SUPERSEDED (dropped: ${classification.code})`
                     );
-                } else if (current?.txHash && jobKindTraits(current.kind).identifierKeyed && isCallNotAppliedFailure(err)) {
+                } else if (current?.txId && jobKindTraits(current.kind).identifierKeyed && isCallNotAppliedFailure(err)) {
                     // The indexer proved the outcome, so fail the job for good.
                     await markChainFailureAfterBroadcast(jobId, current, err);
-                } else if (err instanceof SponsorAttemptBookkeepingPendingError && current?.txHash) {
+                } else if (err instanceof SponsorAttemptBookkeepingPendingError && current?.txId) {
                     // settleRejectedSponsorAttempts looks for this code. The indexer will never resolve it.
                     await markReconciliationRequired(jobId, { code: err.code, message: err.message });
-                } else if (current?.txHash && classification.code === 'SubmitAmbiguous') {
+                } else if (current?.txId && classification.code === 'SUBMIT_AMBIGUOUS') {
                     // Not failed yet. The confirmer settles it once the tx shows up or its validity window ends.
                     await markReconciliationRequired(jobId, {
                         code: BROADCAST_UNCONFIRMED,
-                        message: `Broadcast of ${current.txHash} is unconfirmed: ${classification.message}. The job ends succeeded or failed once the indexer shows the transaction, or failed/${BROADCAST_NOT_INCLUDED} once the indexer tip is past its validity window; a new attempt needs a new idempotencyKey either way.`
+                        message: `Broadcast of ${current.txId} is unconfirmed: ${classification.message}. The job ends succeeded or failed once the indexer shows the transaction, or failed/${BROADCAST_NOT_INCLUDED} once the indexer tip is past its validity window; a new attempt needs a new idempotencyKey either way.`
                     });
-                } else if (current?.txHash) {
+                } else if (current?.txId) {
                     await markReconciliationRequired(jobId, {
                         code: 'EXTERNAL_EXECUTION_FAILED',
-                        message: `Execution failed after broadcasting ${current.txHash}; verify chain state before retrying. ${classification.message}`
+                        message: `Execution failed after broadcasting ${current.txId}; verify chain state before retrying. ${classification.message}`
                     });
                 } else {
                     await markFailed(jobId, classification);
@@ -293,7 +293,7 @@ export async function reclaimExpiredLeases(existingDb?: DbRunner): Promise<numbe
 /** Ends jobs past `running` whose owner went silent. They never run again: without an announced hash nothing was sent, with one the reconciler settles the job from the indexer. */
 async function settleSilentJobsPastRunning(db: DbRunner, cutoff: string): Promise<number> {
     const silent = await db.run(
-        SELECT.from(BackgroundJobs).columns('ID', 'kind', 'status', 'txHash', 'leaseOwner', 'heartbeatAt')
+        SELECT.from(BackgroundJobs).columns('ID', 'kind', 'status', 'txId', 'leaseOwner', 'heartbeatAt')
             .where({ status: { in: ['external_execution', 'submitted'] }, heartbeatAt: { '<': cutoff } }).limit(SCAN_PAGE_SIZE)
     ) as BackgroundJob[];
     let settled = 0;
@@ -301,15 +301,15 @@ async function settleSilentJobsPastRunning(db: DbRunner, cutoff: string): Promis
         const guard = { ID: row.ID, status: row.status, leaseOwner: row.leaseOwner ?? null, heartbeatAt: row.heartbeatAt ?? null };
         const since = `no heartbeat from ${row.leaseOwner ?? 'unknown owner'} for more than ${JOB_LEASE_TTL_MS} ms`;
         const released = { leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null };
-        const patch: Record<string, unknown> = row.txHash
-            ? { status: 'reconciliation_required', errorCode: 'LEASE_EXPIRED', errorMessage: `${since} after announcing ${row.txHash}; the reconciler settles the job from the indexer`, ...released }
+        const patch: Record<string, unknown> = row.txId
+            ? { status: 'reconciliation_required', errorCode: 'LEASE_EXPIRED', errorMessage: `${since} after announcing ${row.txId}; the reconciler settles the job from the indexer`, ...released }
             : { status: 'failed', errorCode: 'LEASE_EXPIRED', errorMessage: `${since} before a transaction was announced; nothing of it is on chain`, finishedAt: new Date().toISOString(), ...released };
         const affected = await withLockContentionRetry(`settleSilentJob(${row.ID})`, () => db.run(
             UPDATE.entity(BackgroundJobs).set(patch).where(guard)
         ));
         if (affectedRows(affected) !== 1) continue;
         settled++;
-        cds.log('nightgate').error(`${row.kind} job ${row.ID} went silent in ${row.status} (${since}): ${row.txHash ? 'parked for reconciliation' : 'failed LEASE_EXPIRED'}`);
+        cds.log('nightgate').error(`${row.kind} job ${row.ID} went silent in ${row.status} (${since}): ${row.txId ? 'parked for reconciliation' : 'failed LEASE_EXPIRED'}`);
     }
     return settled;
 }

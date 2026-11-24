@@ -4,15 +4,18 @@ const path = require('path');
 const repoRoot = path.join(__dirname, '..');
 const roots = ['src', 'srv', 'test'];
 const generatedDirs = ['@cds-models'];
-const generatedSuffixes = ['.js', '.js.map', '.d.ts', '.d.ts.map'];
+const generated = [
+    { suffixes: ['.js', '.js.map', '.d.ts', '.d.ts.map'], source: '.ts' },
+    { suffixes: ['.mjs', '.mjs.map', '.d.mts', '.d.mts.map'], source: '.mts' }
+];
 
-// A file is build output only when its .ts source sits next to it.
+// A file is build output only when its source sits next to it.
 // Hand-written declarations next to .mjs modules must survive.
 function shouldDelete(filePath) {
-    const suffix = generatedSuffixes.find((s) => filePath.endsWith(s));
-    if (!suffix) return false;
-    const source = filePath.slice(0, -suffix.length) + '.ts';
-    return fs.existsSync(source);
+    return generated.some(({ suffixes, source }) => {
+        const suffix = suffixes.find((s) => filePath.endsWith(s));
+        return suffix !== undefined && fs.existsSync(filePath.slice(0, -suffix.length) + source);
+    });
 }
 
 function walk(dirPath) {

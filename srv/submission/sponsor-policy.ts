@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import cds from '@sap/cds';
 import { configList, configFlag, configString, configIsSet } from '../utils/config';
+import { RETIRED_DEPLOY_SWITCH } from '../utils/nightgate-config';
 import { NightgateError, errorMessage } from '../utils/errors';
 import { HEX64_RE } from '../utils/hex';
 import { bareHex } from '../utils/hex-patterns';
@@ -21,10 +22,14 @@ export interface SponsorPolicy {
     allowedCircuits: string[];
     /** Per contract address, the rule that replaces `allowedCircuits` for calls on it. */
     contractCircuits?: ContractCircuitRules;
-    /** Sponsor deploys built by the caller. The platform and, for an agent, the grant must both allow it. */
+    /** Sponsor deploys built by the caller. For an agent its grant decides, a caller without a token may. */
     allowDeploy?: boolean;
     /** Contracts deployed under the grant. `allowedCircuits` names circuits of the shared contracts, so it does not apply here. The size limit still applies. */
     ownContracts?: string[];
+    /** Sponsor maintenance updates. For an agent its grant decides, a caller without a token may. */
+    allowMaintenance?: boolean;
+    /** The contracts an update may change: those deployed under the grant. Unset for a caller without a token, which may update any. */
+    maintainableContracts?: string[];
     /** Raw token types (64 hex) whose zswap offers are sponsored. Empty means none. */
     allowedTokenTypes?: string[];
     /** Also sponsor the offer of a token a sponsorable contract mints in the same transaction. */
@@ -51,6 +56,7 @@ export interface GrantPolicyInput {
     allowedContracts?: string[] | null;
     allowedCircuits?: string[] | null;
     allowDeploy?: boolean | null;
+    allowMaintenance?: boolean | null;
     /** Contracts deployed under this grant. They are sponsored in addition to the narrowed lists. */
     deployedContracts?: string[] | null;
     allowedTokenTypes?: string[] | null;
@@ -142,7 +148,6 @@ function envPolicy(): SponsorPolicy {
     return {
         allowedContracts: contractAddresses(configList('NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS')),
         allowedCircuits: configList('NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS'),
-        allowDeploy: configFlag('NIGHTGATE_SPONSOR_ALLOW_DEPLOY'),
         allowedTokenTypes,
         allowContractMints: configFlag('NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS'),
         allowSwaps: configFlag('NIGHTGATE_SPONSOR_ALLOW_SWAPS'),
@@ -173,8 +178,6 @@ export class SponsorPolicyUnavailableError extends NightgateError {
     constructor(message: string) {
         super('SPONSOR_POLICY_UNAVAILABLE', message, { exposeMessage: true });
     }
-    /** @deprecated use `status`. */
-    get httpStatus(): number { return this.status; }
 }
 
 function readPolicyFile(filePath: string): SponsorPolicy {
@@ -188,6 +191,7 @@ function readPolicyFile(filePath: string): SponsorPolicy {
     for (const flag of ['allowDeploy', 'allowContractMints', 'allowSwaps', 'allowTransfers', 'shareMintedTokenTypes', 'allowUnshieldedOffers']) {
         if (parsed[flag] !== undefined && typeof parsed[flag] !== 'boolean') throw new Error(`${flag} must be a boolean`);
     }
+    if (parsed.allowDeploy !== undefined) log.warn(`${filePath}: allowDeploy ${RETIRED_DEPLOY_SWITCH}`);
     const rateLimits = readRateLimits(parsed.rateLimits);
     const contractCircuits = validateContractCircuits('contractCircuits', parsed.contractCircuits);
     const allowedContracts = contractAddresses(validatePolicyList('allowedContracts', parsed.allowedContracts));
@@ -197,7 +201,6 @@ function readPolicyFile(filePath: string): SponsorPolicy {
         allowedContracts: allowedContracts.length === 0 ? allowedContracts : [...allowedContracts, ...ruled],
         allowedCircuits: validatePolicyList('allowedCircuits', parsed.allowedCircuits),
         ...(contractCircuits ? { contractCircuits } : {}),
-        allowDeploy: parsed.allowDeploy === true,
         allowedTokenTypes: validateTokenTypeList('allowedTokenTypes', parsed.allowedTokenTypes),
         allowContractMints: parsed.allowContractMints === true,
         allowSwaps: parsed.allowSwaps === true,
@@ -221,6 +224,7 @@ function readRateLimits(raw: unknown): Partial<Record<RateClass, number>> | unde
     return out;
 }
 
+// `allowDeploy` is still accepted and ignored, so a file from before the change does not stop sponsoring.
 const POLICY_FILE_KEYS = [
     'allowedContracts', 'allowedCircuits', 'contractCircuits', 'allowDeploy', 'allowedTokenTypes', 'allowContractMints', 'allowSwaps',
     'allowTransfers', 'shareMintedTokenTypes', 'allowUnshieldedOffers', 'allowedUnshieldedTokenTypes', 'rateLimits'
@@ -229,7 +233,7 @@ const POLICY_FILE_KEYS = [
 /** Env settings the policy file replaces while it is set. */
 const SHADOWED_ENV_KEYS = [
     'NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS', 'NIGHTGATE_SPONSOR_ALLOWED_CIRCUITS', 'NIGHTGATE_SPONSOR_ALLOWED_TOKEN_TYPES',
-    'NIGHTGATE_SPONSOR_ALLOW_DEPLOY', 'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_SWAPS',
+    'NIGHTGATE_SPONSOR_ALLOW_CONTRACT_MINTS', 'NIGHTGATE_SPONSOR_ALLOW_SWAPS',
     'NIGHTGATE_SPONSOR_ALLOW_TRANSFERS', 'NIGHTGATE_SPONSOR_SHARE_MINTED_TOKEN_TYPES',
     'NIGHTGATE_SPONSOR_ALLOW_UNSHIELDED_OFFERS', 'NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES'
 ];
@@ -319,8 +323,6 @@ export class SponsorPolicyEmptyError extends NightgateError {
     constructor(message: string) {
         super('SPONSOR_POLICY_EMPTY', message);
     }
-    /** @deprecated use `status`. */
-    get httpStatus(): number { return this.status; }
 }
 
 function emptyIntersection(what: string, grant: string[]): SponsorPolicyEmptyError {
@@ -390,8 +392,10 @@ export function effectiveSponsorPolicy(floor: SponsorPolicy, grant?: GrantPolicy
         shareMintedTokenTypes: sharing,
         ...(minted.length ? { ownTokenTypes: minted } : {}),
         ...(sharedTypes.length ? { sharedTokenTypes: sharedTypes } : {}),
-        allowDeploy: floor.allowDeploy === true && (grant ? grant.allowDeploy === true : true),
+        allowDeploy: grant ? grant.allowDeploy === true : true,
         ...(deployed.length ? { ownContracts: deployed } : {}),
+        allowMaintenance: grant ? grant.allowMaintenance === true : true,
+        ...(grant ? { maintainableContracts: deployed } : {}),
         allowUnshieldedOffers: floor.allowUnshieldedOffers === true && (grant ? grant.allowUnshieldedOffers === true : true),
         allowedUnshieldedTokenTypes: narrowUnshieldedTypes(floor.allowedUnshieldedTokenTypes ?? [], grant?.allowedUnshieldedTokenTypes)
     };

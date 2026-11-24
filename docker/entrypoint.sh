@@ -44,10 +44,10 @@ if [ -z "${ENCRYPTION_KEY:-}" ] && [ -z "${ENCRYPTION_KEYS:-}" ]; then
     exit 1
 fi
 
-# preprod and mainnet have no built-in node or indexer; without them NIGHTGATE stays offline and the
+# preprod, mainnet and stagenet have no built-in node or indexer; without them NIGHTGATE stays offline and the
 # health check would restart the container for nothing.
 case "${NIGHTGATE_NETWORK:-mainnet}" in
-    preprod|mainnet)
+    preprod|mainnet|stagenet)
         if [ -z "${NIGHTGATE_NODE_URL:-}" ] || [ -z "${NIGHTGATE_INDEXER_HTTP_URL:-}" ]; then
             echo "FATAL: network ${NIGHTGATE_NETWORK:-mainnet} has no built-in node or indexer: set NIGHTGATE_NODE_URL and NIGHTGATE_INDEXER_HTTP_URL (your own, or hosted ones with the access token in the URL; docs/self-hosted.md)." >&2
             exit 1
@@ -58,11 +58,7 @@ if [ -z "$DB_URL" ]; then
     mkdir -p "$(dirname "$DB_PATH")"
 fi
 
-AUTH_KIND="${NIGHTGATE_AUTH:-basic}"
-if [ "$AUTH_KIND" = "dummy" ]; then
-    echo "WARN: NIGHTGATE_AUTH=dummy serves UNAUTHENTICATED. Refused unless NIGHTGATE_ALLOW_UNAUTHENTICATED=true; local testing only." >&2
-fi
-# cds-config.mjs refuses a missing password, an unknown auth kind and a non-postgres URL.
+# cds-config.mjs refuses a missing password and a non-postgres URL.
 CDS_CONFIG="$(node /app/docker/cds-config.mjs)" || exit 1
 export CDS_CONFIG
 
@@ -70,13 +66,13 @@ if [ -n "$DB_URL" ]; then
     DB_LABEL="postgres ($(printf '%s' "$DB_URL" | sed -E 's#://([^:/@]*)(:[^@]*)?@#://\1:***@#'))"
     if [ "${NIGHTGATE_DB_DEPLOY:-auto}" != "never" ]; then
         echo "Deploying schema to PostgreSQL (additive evolution; NIGHTGATE_DB_DEPLOY=never skips this)"
+        # Renamed columns and moved keys must be in place before the deploy, which only adds columns.
+        node /app/scripts/apply-schema-delta.mjs --postgres
         npx cds deploy
     fi
 else
     DB_LABEL="sqlite ($DB_PATH)"
-    # SQLite under NODE_ENV=production is refused unless allowed; one container is the supported case.
-    export NIGHTGATE_ALLOW_PRODUCTION_SQLITE="${NIGHTGATE_ALLOW_PRODUCTION_SQLITE:-true}"
-    echo "NOTE: SQLite under the production profile (NIGHTGATE_ALLOW_PRODUCTION_SQLITE=$NIGHTGATE_ALLOW_PRODUCTION_SQLITE). Single instance only; set NIGHTGATE_DB_URL for PostgreSQL."
+    echo "NOTE: SQLite database. Single instance only; set NIGHTGATE_DB_URL for PostgreSQL."
     # First boot only: `cds deploy` recreates tables. Upgrades run scripts/apply-schema-delta.mjs.
     if [ ! -f "$DB_PATH" ]; then
         echo "First boot: deploying schema to $DB_PATH"
@@ -84,7 +80,7 @@ else
     fi
 fi
 
-echo "Starting NIGHTGATE (network=${NIGHTGATE_NETWORK:-mainnet}, auth=$AUTH_KIND, db=$DB_LABEL)"
+echo "Starting NIGHTGATE (network=${NIGHTGATE_NETWORK:-mainnet}, db=$DB_LABEL)"
 # node is PID 1 so SIGTERM reaches cds (an `sh -c` in between would not forward it).
 # No concurrent recompilation: a background compile can deadlock with the main
 # thread at a GC safepoint. V8 flags do not fit NODE_OPTIONS, so they go here.

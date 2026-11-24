@@ -135,7 +135,7 @@ try {
             arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
         };
     };
-    const zk = new mod.FetchZkConfigProvider('http://x/zk-config/attestation-vault', fakeFetch);
+    const zk = new mod.FetchZkConfigProvider('http://x/zk-config/attestation-vault', { fetchFunc: fakeFetch });
     const pk = await zk.getProverKey('revokeDisclosure');
     if (!(pk instanceof Uint8Array) || pk.length !== 3) fail('FetchZkConfigProvider.getProverKey wrong shape');
     if ((await zk.getArtifactRuntimeVersion()) !== '0.21.0') fail('FetchZkConfigProvider does not name the runtime version of the served manifest');

@@ -8,7 +8,8 @@ import { reportSubmissionRejectedOn, reportBroadcastOn } from '../job-execution-
 import { PendingSubmissions, type BackgroundJob } from '#cds-models/midnight';
 import { walletSponsorFinalizedTx, walletSponsorUnboundTx } from '../../midnight/wallet-worker-client';
 import { PLATFORM_POOL_SENTINEL, acquireSponsor, releaseSponsor, benchSponsor, decideSponsorFailure, sponsorCandidatesNonExclusive, touchSponsor } from '../sponsor-pool';
-import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget } from '../../sessions/agent-grants';
+import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget, reserveMaintenanceBudget } from '../../sessions/agent-grants';
+import { maintenanceRefund } from '../../sessions/deploy-refund';
 import { recordPlatformMint } from '../platform-mints';
 import { fillSwapOffer, closeSwapOffersByNullifiers, requireOpenSwapOffer } from '../swap-offers';
 import { sponsorAtSyncGate } from '../sponsor-sync-gate';
@@ -41,40 +42,44 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
     const sponsorAttemptLedger = (db: DbRunner, job: BackgroundJob, command: SponsorJobCommand, feeSponsorSessionId: () => string) => {
         let boundaryCrossed = false;
         let currentSubmissionId: string | null = null;
-        let currentTxHash: string | null = null;
+        let currentTxId: string | null = null;
         // Survives rebuilds. Refunded only when the attempt is known not to be on chain.
         let reservedDeploys = 0;
+        let reservedMaintenance = 0;
         const failPreviousAttempt = async (why: string, rejectedPreInclusion: boolean) => {
             if (!currentSubmissionId) return;
-            // Closing the row, the refund and removing the hash from the job are one transaction.
+            // Closing the row, the refund and removing the transaction from the job are one transaction.
             // If that fails, the job stops rather than rebuilding while the old attempt is open.
             const refund = rejectedPreInclusion && reservedDeploys > 0 && command?.grantId ? reservedDeploys : 0;
+            const maintenanceBack = rejectedPreInclusion && reservedMaintenance > 0 && command?.grantId ? reservedMaintenance : 0;
             const rowId = currentSubmissionId;
-            const rowHash = currentTxHash ?? undefined;
+            const rowTxId = currentTxId ?? undefined;
             try {
                 await withLockContentionRetry(`failSponsorAttempt(${job.ID})`, () => runInOneTransaction(db, async (tx) => {
                     await tx.run(UPDATE.entity(PendingSubmissions).set({ status: 'failed', errorCode: rejectedPreInclusion ? 'REJECTED' : 'REBUILT', errorMessage: why.slice(0, 500) }).where({ ID: rowId }));
                     if (refund > 0) await releaseDeployBudget(tx, String(command.grantId), refund);
-                    if (rejectedPreInclusion) await reportSubmissionRejectedOn(tx, { submissionId: rowId, txHash: rowHash });
+                    if (maintenanceBack > 0) await tx.run(maintenanceRefund(String(command.grantId), maintenanceBack));
+                    if (rejectedPreInclusion) await reportSubmissionRejectedOn(tx, { submissionId: rowId, txId: rowTxId });
                 }));
             } catch (e) {
                 cds.log('nightgate').error(`sponsor attempt ${rowId} of job ${job.ID} could not be closed as ${rejectedPreInclusion ? 'REJECTED' : 'REBUILT'}${refund > 0 ? ` (deploy reservation of ${refund} NOT refunded)` : ''}; not retrying: ${errorMessage(e)}`);
                 if (rejectedPreInclusion) {
                     // settleRejectedSponsorAttempts finishes the cleanup later, based on this error.
-                    // The normal reconciliation cannot, because the hash never reached a mempool.
+                    // The normal reconciliation cannot, because the transaction never reached a mempool.
                     throw new SponsorAttemptBookkeepingPendingError(
                         `sponsoring attempt ${rowId} was rejected before inclusion but its bookkeeping (close, refund, hash) could not be committed: ${errorMessage(e)}. Settled by the reconciler. Original failure: ${why.slice(0, 200)}`,
-                        { submissionId: rowId, txHash: rowHash, grantId: refund > 0 ? String(command.grantId) : undefined, refund });
+                        { submissionId: rowId, txId: rowTxId, grantId: refund > 0 ? String(command.grantId) : undefined, refund });
                 }
                 throw new Error(`sponsoring attempt could not be closed (${errorMessage(e)}); the job stops here for reconciliation instead of rebuilding on an open attempt. Original failure: ${why.slice(0, 200)}`);
             }
             if (refund > 0) reservedDeploys = 0;
-            currentSubmissionId = null; currentTxHash = null;
+            if (maintenanceBack > 0) reservedMaintenance = 0;
+            currentSubmissionId = null; currentTxId = null;
         };
         // Called just before the worker broadcasts. It stores what the worker chose,
         // so the result can be reconstructed from the attempt row after a crash.
-        const onSubmitIntent = () => async (txHash: string, intent?: {
-            contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string;
+        const onSubmitIntent = () => async (intent: {
+            txId: string; txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; maintained?: string[]; ttl?: string;
             segments?: Array<{ segment: number; calls: string[] }>; minted?: string[]; nullifiers?: string[];
             unshielded?: SubmitIntentCoordinates['unshielded']; transfer?: SubmitIntentCoordinates['transfer'];
         }) => {
@@ -84,6 +89,9 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
             // A deploy reserves the grant's deploy budget before the worker may broadcast.
             // The reservation is written in the same transaction as the attempt row.
             const need = grantId && deployed.length > reservedDeploys ? deployed.length - reservedDeploys : 0;
+            // A maintenance update reserves its own budget the same way.
+            const maintained = (intent?.maintained ?? []).map(String).filter(Boolean);
+            const needMaintenance = grantId && maintained.length > reservedMaintenance ? maintained.length - reservedMaintenance : 0;
             const coordinates = {
                 feeSponsor: feeSponsorSessionId(), sponsorAccountId: intent?.sponsorAccountId ?? null,
                 circuits: intent?.circuits ?? [], contractAddress: intent?.contractAddress ?? null,
@@ -91,15 +99,17 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                 ...(intent?.ttl ? { ttl: intent.ttl } : {}),
                 ...(intent?.segments?.length ? { segments: intent.segments } : {}),
                 ...(deployed.length ? { deployed } : {}),
+                ...(maintained.length ? { maintained } : {}),
                 ...(intent?.minted?.length ? { minted: intent.minted } : {}),
                 ...(intent?.nullifiers?.length ? { nullifiers: intent.nullifiers } : {}),
                 ...(intent?.unshielded?.length ? { unshielded: intent.unshielded } : {}),
                 ...(intent?.transfer ? { transfer: intent.transfer } : {}),
                 ...(command?.swap?.offerId ? { offerId: String(command.swap.offerId) } : {}),
-                ...(grantId && deployed.length ? { deployReservation: { grantId, count: deployed.length } } : {})
+                ...(grantId && deployed.length ? { deployReservation: { grantId, count: deployed.length } } : {}),
+                ...(grantId && maintained.length ? { maintenanceReservation: { grantId, count: maintained.length } } : {})
             } satisfies SubmitIntentCoordinates;
             const row = {
-                ID: submissionId, txHash, contractAddress: intent?.contractAddress ?? null, circuitName: intent?.circuits?.[0] ?? null,
+                ID: submissionId, txId: intent.txId, txHash: intent.txHash, contractAddress: intent?.contractAddress ?? null, circuit: intent?.circuits?.[0] ?? null,
                 actionType: (deployed.length ? 'DEPLOY' : 'CALL') as 'DEPLOY' | 'CALL', submittedAt: new Date().toISOString(), status: 'pending' as const, sessionId: job.sessionId,
                 submitIntentData: JSON.stringify(coordinates)
             };
@@ -120,24 +130,32 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                         throw budgetExhausted;
                     }
                 }
-                await reportBroadcastOn(tx, { submissionId, txHash, firstBoundary: !boundaryCrossed });
+                if (needMaintenance > 0) {
+                    const ok = await reserveMaintenanceBudget(tx, grantId!, needMaintenance);
+                    if (!ok) {
+                        budgetExhausted = new Error('maintenance budget of the grant is exhausted or the grant no longer allows maintenance updates; not broadcasting');
+                        throw budgetExhausted;
+                    }
+                }
+                await reportBroadcastOn(tx, { submissionId, txId: intent.txId, txHash: intent.txHash, firstBoundary: !boundaryCrossed });
             })).catch((e) => { throw offerClosed ?? budgetExhausted ?? e; });
             boundaryCrossed = true;
             if (grantId && deployed.length) reservedDeploys = deployed.length;
-            currentSubmissionId = submissionId; currentTxHash = txHash;
+            if (grantId && maintained.length) reservedMaintenance = maintained.length;
+            currentSubmissionId = submissionId; currentTxId = intent.txId;
         };
         const markIncluded = async (out: { contractAddress?: string; circuits?: string[] }) => {
             if (!currentSubmissionId) return;
-            try { await db.run(UPDATE.entity(PendingSubmissions).set({ status: 'included', contractAddress: out.contractAddress ?? null, circuitName: out.circuits?.[0] ?? null }).where({ ID: currentSubmissionId })); } catch { /* best effort */ }
+            try { await db.run(UPDATE.entity(PendingSubmissions).set({ status: 'included', contractAddress: out.contractAddress ?? null, circuit: out.circuits?.[0] ?? null }).where({ ID: currentSubmissionId })); } catch { /* best effort */ }
         };
-        return { failPreviousAttempt, onSubmitIntent, markIncluded, lastTxHash: () => currentTxHash };
+        return { failPreviousAttempt, onSubmitIntent, markIncluded, lastTxId: () => currentTxId };
     };
 
     /** Sponsor wallets to try, in order. A named sponsor is never swapped for another, since grants pin it. */
     const sponsorCandidates = (command: SponsorJobCommand, fromPool: (pool: string[]) => string[]): string[] => {
         if (command.sponsorSessionId !== PLATFORM_POOL_SENTINEL) return [String(command.sponsorSessionId)];
         const pool = getConfiguredFeeSponsorSessions(getNightgateConfig());
-        if (pool.length === 0) throw new Error('platform sponsor pool is empty (NIGHTGATE_FEE_SPONSOR_SESSION)');
+        if (pool.length === 0) throw new Error('platform sponsor pool is empty (NIGHTGATE_FEE_SPONSOR_SESSIONS)');
         return fromPool(pool);
     };
 
@@ -165,6 +183,8 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         contractCircuits: policy.contractCircuits,
         allowDeploy: policy.allowDeploy === true,
         ownContracts: policy.ownContracts,
+        allowMaintenance: policy.allowMaintenance === true,
+        maintainableContracts: policy.maintainableContracts,
         allowedTokenTypes: policy.allowedTokenTypes,
         allowContractMints: policy.allowContractMints === true,
         allowUnshieldedOffers: policy.allowUnshieldedOffers === true,
@@ -209,7 +229,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         const facadeCfg = facadeConfigFromEnv();
 
         let candidates = sponsorCandidates(command, pool => [...pool]);
-        cds.log('nightgate').info(`sponsorFinalizedTransaction job: ${command.finalizedTxB64?.length ?? 0} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
+        cds.log('nightgate').info(`sponsorFinalized job: ${command.finalizedTxB64?.length ?? 0} b64 chars, candidates ${candidates.map(c => c.slice(0, 8)).join('>')}`);
 
         const waitMs = configMs('NIGHTGATE_SPONSOR_LEASE_WAIT_MS');
         const cooldownMs = configMs('NIGHTGATE_SPONSOR_COOLDOWN_MS');
@@ -328,7 +348,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
                     if (e instanceof LandedBookkeepingError) throw e;
                     lastErr = e;
                     const verdict = decideSponsorFailure(e);
-                    const attemptHash = (ledger.lastTxHash() ?? '?').slice(0, 16);
+                    const attemptHash = (ledger.lastTxId() ?? '?').slice(0, 16);
                     if (verdict.decision === 'ambiguous') {
                         // The tx may still land, so a rebuild could pay twice.
                         // The chain confirmer settles the job later.

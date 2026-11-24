@@ -3,7 +3,7 @@
 
 import cds from '@sap/cds';
 import { classificationHaystack, ledgerErrorCode } from '../utils/format-error';
-import { findNightgateError, errorMessage } from '../utils/errors';
+import { findNightgateError, errorMessage, isJobErrorCode, isNodeRejectCode, type ErrorCode, type JobErrorCode, type NodeRejectCode } from '../utils/errors';
 import { DUST_RACE_LEDGER_CODES, dustRaceLedgerCode } from './dust-race';
 import { classifySubmitFailure } from '../midnight/submit-error-classification';
 import { carriedSubmitFailure, type BatchCallStageInfo } from '../midnight/wallet-worker-protocol';
@@ -14,7 +14,6 @@ import type { SubmitIntentHook } from '../midnight/wallet-worker-client';
 import { setTimeout as sleep } from 'node:timers/promises';
 const { INSERT, UPDATE } = cds.ql;
 import { PendingSubmissions, type PendingSubmission } from '#cds-models/midnight';
-import { ensureNightgateModelLoaded } from '../utils/cds-model';
 const log = cds.log('nightgate:submit');
 import {
     type ContractProvidersConfig,
@@ -77,6 +76,7 @@ export interface CallArgs {
 
 export interface DeployResult {
     submissionId: string;
+    txId: string;
     txHash: string;
     contractAddress: string;
     status: SubmissionStatus;
@@ -84,6 +84,7 @@ export interface DeployResult {
 
 export interface CallResult {
     submissionId: string;
+    txId: string;
     txHash: string;
     contractAddress: string;
     status: SubmissionStatus;
@@ -111,13 +112,13 @@ export interface CallBatchResult extends CallResult {
 }
 
 export interface SubmissionErrorClassification {
-    code: string;
+    code: ErrorCode | JobErrorCode | NodeRejectCode;
     retryable: boolean;
     knownIssueRef?: string;
     message: string;
     /** The dust spend was built on an outdated dust state. Nothing was sent and no fee spent, so a rebuild can succeed. */
     transient?: 'dust-race';
-    /** For `BatchCausalityViolation`: the position and stage of every call. */
+    /** For `BATCH_CAUSALITY_VIOLATION`: the position and stage of every call. */
     calls?: BatchCallStageInfo[];
 }
 
@@ -154,7 +155,7 @@ export interface TransactionSubmitterDeps {
 interface BoundAttemptLedger {
     onSubmitIntent: SubmitIntentHook;
     rejectAnnouncedAttempt: (why: string) => Promise<void>;
-    current: () => { rowId: string | null; txHash: string | null };
+    current: () => { rowId: string | null; txId: string | null };
 }
 
 export class TransactionSubmitter {
@@ -197,7 +198,7 @@ export class TransactionSubmitter {
                 } else {
                     throw err;
                 }
-                // Remove the rejected hash from the job before the rebuild records a new one.
+                // Remove the rejected transaction from the job before the rebuild records a new one.
                 // If that write fails, this throws and no rebuild happens.
                 await ledger.rejectAnnouncedAttempt(`${reason}; rebuilt`);
                 await sleep(backoffMs);
@@ -206,11 +207,11 @@ export class TransactionSubmitter {
     }
 
     // Tracks the send attempts of one submission. Each send and each reject updates row and job in one transaction.
-    // So the job's txHash is the only hash that can be on chain, and no txHash means nothing was sent.
-    private boundAttemptLedger(firstRowId: string, shape: { actionType: ActionType; contractAddress: string | null; circuitName: string | null; sessionId: string }): BoundAttemptLedger {
+    // So the job's txId names the only transaction that can be on chain, and no txId means nothing was sent.
+    private boundAttemptLedger(firstRowId: string, shape: { actionType: ActionType; contractAddress: string | null; circuit: string | null; sessionId: string }): BoundAttemptLedger {
         let rowId: string | null = firstRowId;
-        let txHash: string | null = null;
-        const onSubmitIntent: SubmitIntentHook = async (hash, intent) => {
+        let txId: string | null = null;
+        const onSubmitIntent: SubmitIntentHook = async (intent) => {
             const db = await this.getDb();
             const coordinates = {
                 channel: 'bound', circuits: intent?.circuits ?? [],
@@ -223,37 +224,37 @@ export class TransactionSubmitter {
             const reuse = rowId !== null;
             await withLockContentionRetry(`boundAttempt(${targetRow.slice(0, 8)})`, () => this.runInOneTransaction(db, async (tx) => {
                 if (reuse) {
-                    await tx.run(UPDATE.entity(PendingSubmissions).set({ txHash: hash, submitIntentData: JSON.stringify(coordinates) }).where({ ID: targetRow }));
+                    await tx.run(UPDATE.entity(PendingSubmissions).set({ txId: intent.txId, txHash: intent.txHash, submitIntentData: JSON.stringify(coordinates) }).where({ ID: targetRow }));
                 } else {
                     await tx.run(INSERT.into(PendingSubmissions).entries({
-                        ID: targetRow, txHash: hash, contractAddress: shape.contractAddress, circuitName: shape.circuitName,
+                        ID: targetRow, txId: intent.txId, txHash: intent.txHash, contractAddress: shape.contractAddress, circuit: shape.circuit,
                         actionType: shape.actionType, submittedAt: new Date().toISOString(), status: 'pending', sessionId: shape.sessionId,
                         submitIntentData: JSON.stringify(coordinates)
                     }));
                 }
-                await reportBroadcastOn(tx, { submissionId: targetRow, txHash: hash, firstBoundary: false });
+                await reportBroadcastOn(tx, { submissionId: targetRow, txId: intent.txId, txHash: intent.txHash, firstBoundary: false });
             }), msg => log.warn(msg));
-            rowId = targetRow; txHash = hash;
+            rowId = targetRow; txId = intent.txId;
         };
         const rejectAnnouncedAttempt = async (why: string): Promise<void> => {
-            if (!txHash || !rowId) return; // nothing was sent, the next attempt reuses the row
+            if (!txId || !rowId) return; // nothing was sent, the next attempt reuses the row
             const db = await this.getDb();
             const closing = rowId;
-            const hash = txHash;
+            const announced = txId;
             try {
                 await withLockContentionRetry(`rejectAttempt(${closing.slice(0, 8)})`, () => this.runInOneTransaction(db, async (tx) => {
                     await tx.run(UPDATE.entity(PendingSubmissions).set({ status: 'failed', errorCode: 'REJECTED', errorMessage: why.slice(0, 500) }).where({ ID: closing }));
-                    await reportSubmissionRejectedOn(tx, { submissionId: closing, txHash: hash });
+                    await reportSubmissionRejectedOn(tx, { submissionId: closing, txId: announced });
                 }), msg => log.warn(msg));
             } catch (e) {
                 // The job is parked. The reconciler repeats this cleanup later.
                 throw new SponsorAttemptBookkeepingPendingError(
                     `broadcast attempt ${closing} was rejected before inclusion but its bookkeeping (row, hash) could not be committed: ${errorMessage(e)}. Settled by the reconciler. Original failure: ${why.slice(0, 200)}`,
-                    { submissionId: closing, txHash: hash, refund: 0 });
+                    { submissionId: closing, txId: announced, refund: 0 });
             }
-            rowId = null; txHash = null;
+            rowId = null; txId = null;
         };
-        return { onSubmitIntent, rejectAnnouncedAttempt, current: () => ({ rowId, txHash }) };
+        return { onSubmitIntent, rejectAnnouncedAttempt, current: () => ({ rowId, txId }) };
     }
 
     /** Runs `fn` in one transaction. A test double without `tx` runs it directly. */
@@ -264,11 +265,11 @@ export class TransactionSubmitter {
 
     /** Returns the row id the SubmissionError should name. */
     private async settleFailedAttempt(ledger: BoundAttemptLedger, fallbackRowId: string, err: unknown, classification: SubmissionErrorClassification): Promise<string> {
-        const { rowId, txHash } = ledger.current();
+        const { rowId, txId } = ledger.current();
         const named = rowId ?? fallbackRowId;
-        if (txHash && rowId && isPreInclusionReject(err)) {
+        if (txId && rowId && isPreInclusionReject(err)) {
             await ledger.rejectAnnouncedAttempt(classification.message);
-        } else if (txHash && rowId) {
+        } else if (txId && rowId) {
             // The transaction may still land. Keep the row `pending` so the reconciler
             // can finish it later. A `failed` row is never finished.
             await this.noteAmbiguousFailure(named, classification);
@@ -293,23 +294,23 @@ export class TransactionSubmitter {
     async deploy<PS = unknown>(args: DeployArgs<PS>): Promise<DeployResult> {
         const deployFn = this.deps.walletDeployContractImpl ?? walletDeployContract;
         const { rowId, result, status } = await this.runSubmit({
-            shape: { actionType: 'DEPLOY', contractAddress: null, circuitName: null, sessionId: args.sessionId },
+            shape: { actionType: 'DEPLOY', contractAddress: null, circuit: null, sessionId: args.sessionId },
             label: 'deploy', worker: 'deployContract', what: 'Deploy',
             send: (proxyId, onSubmitIntent) => deployFn(this.makeDeployRpcArgs(args, proxyId), onSubmitIntent),
             contractAddressOf: r => r.contractAddress
         });
-        return { submissionId: rowId, txHash: result.txHash, contractAddress: result.contractAddress, status };
+        return { submissionId: rowId, txId: result.txId, txHash: result.txHash, contractAddress: result.contractAddress, status };
     }
 
     async call(args: CallArgs): Promise<CallResult> {
         const callFn = this.deps.walletSubmitContractCallImpl ?? walletSubmitContractCall;
         const { rowId, result, status } = await this.runSubmit({
-            shape: { actionType: 'CALL', contractAddress: args.contractAddress, circuitName: args.circuit, sessionId: args.sessionId },
+            shape: { actionType: 'CALL', contractAddress: args.contractAddress, circuit: args.circuit, sessionId: args.sessionId },
             label: `call ${args.circuit}`, worker: 'submitContractCall', what: 'Call',
             send: (proxyId, onSubmitIntent) => callFn(this.makeCallRpcArgs(args, proxyId), onSubmitIntent),
             contractAddressOf: () => args.contractAddress
         });
-        return { submissionId: rowId, txHash: result.txHash, contractAddress: args.contractAddress, status, blockHeight: result.blockHeight ?? null };
+        return { submissionId: rowId, txId: result.txId, txHash: result.txHash, contractAddress: args.contractAddress, status, blockHeight: result.blockHeight ?? null };
     }
 
     /**
@@ -317,23 +318,23 @@ export class TransactionSubmitter {
      */
     async callBatch(args: CallBatchArgs): Promise<CallBatchResult> {
         const circuits = args.calls.map(c => c.circuit);
-        // The circuitName column holds 100 characters.
+        // The circuit column holds 100 characters.
         const circuitLabel = circuits.join('+').slice(0, 100);
         const batchFn = this.deps.walletSubmitContractCallBatchImpl ?? walletSubmitContractCallBatch;
         const { rowId, result, status } = await this.runSubmit({
-            shape: { actionType: 'CALL', contractAddress: args.contractAddress, circuitName: circuitLabel, sessionId: args.sessionId },
+            shape: { actionType: 'CALL', contractAddress: args.contractAddress, circuit: circuitLabel, sessionId: args.sessionId },
             label: `batch ${circuitLabel}`, worker: 'submitContractCallBatch', what: 'Batched call',
             send: (proxyId, onSubmitIntent) => batchFn(this.makeCallBatchRpcArgs(args, proxyId), onSubmitIntent),
             contractAddressOf: () => args.contractAddress
         });
-        return { submissionId: rowId, txHash: result.txHash, contractAddress: args.contractAddress, status, circuits, blockHeight: result.blockHeight ?? null };
+        return { submissionId: rowId, txId: result.txId, txHash: result.txHash, contractAddress: args.contractAddress, status, circuits, blockHeight: result.blockHeight ?? null };
     }
 
     /**
      * One worker submit with its attempt row. Sends with rebuild retries, books a failure, checks the result and records the on-chain status. Throws a SubmissionError for every outcome but success.
      */
-    private async runSubmit<R extends { txHash: string; onChainStatus: string; blockHeight?: number | null }>(o: {
-        shape: { actionType: ActionType; contractAddress: string | null; circuitName: string | null; sessionId: string };
+    private async runSubmit<R extends { txId: string; txHash: string; onChainStatus: string; blockHeight?: number | null }>(o: {
+        shape: { actionType: ActionType; contractAddress: string | null; circuit: string | null; sessionId: string };
         /** Names the attempt in retry logs. */
         label: string;
         /** The worker method, for the malformed-result message. */
@@ -343,7 +344,7 @@ export class TransactionSubmitter {
         send: (proxyId: string, onSubmitIntent: SubmitIntentHook) => Promise<R>;
         contractAddressOf: (result: R) => string | undefined;
     }): Promise<{ rowId: string; result: R; status: SubmissionStatus }> {
-        const submissionId = await this.insertPending(o.shape.actionType, o.shape.contractAddress, o.shape.circuitName, o.shape.sessionId);
+        const submissionId = await this.insertPending(o.shape.actionType, o.shape.contractAddress, o.shape.circuit, o.shape.sessionId);
         const ledger = this.boundAttemptLedger(submissionId, o.shape);
         let release: (() => void) | null = null;
         let result: R;
@@ -355,7 +356,7 @@ export class TransactionSubmitter {
         } catch (err) {
             // A call that announced its tx cannot be cancelled. If this side gave up first, the worker may still land the tx
             // and then store the contract's private state and signing key through this proxy. So the proxy stays for a while.
-            if (release && ledger.current().txHash) setTimeout(release, configMs('NIGHTGATE_WORKER_RPC_TIMEOUT_MS')).unref?.();
+            if (release && ledger.current().txId) setTimeout(release, configMs('NIGHTGATE_WORKER_RPC_TIMEOUT_MS')).unref?.();
             else release?.();
             if (err instanceof SponsorAttemptBookkeepingPendingError) throw err;
             const classification = classifySubmissionError(err, this.deps.network);
@@ -369,7 +370,7 @@ export class TransactionSubmitter {
         const contractAddress = o.contractAddressOf(result);
         if (!txHash || !contractAddress) {
             const classification: SubmissionErrorClassification = {
-                code: 'MalformedResult',
+                code: 'MALFORMED_RESULT',
                 retryable: false,
                 message: `Worker ${o.worker} returned without txHash${o.shape.actionType === 'DEPLOY' ? '/contractAddress' : ''}`
             };
@@ -383,12 +384,12 @@ export class TransactionSubmitter {
             txHash,
             contractAddress,
             status,
-            errorCode:    status === 'failed' ? `OnChainStatus:${onChainStatus}` : undefined,
+            errorCode:    status === 'failed' ? 'TX_FAILED' : undefined,
             errorMessage: status === 'failed' ? `On-chain status was ${onChainStatus}, expected SucceedEntirely` : undefined
         });
         if (status === 'failed') {
             throw new SubmissionError(rowId, {
-                code: `OnChainStatus:${onChainStatus}`,
+                code: 'TX_FAILED',
                 retryable: false,
                 message: `${o.what} on-chain status ${onChainStatus}`
             });
@@ -398,20 +399,12 @@ export class TransactionSubmitter {
 
     // -- Internals -----------------------------------------------------------
 
-    /** Registers a private state store on the main thread for the worker. Only 'cap-db' works, because the LevelDB store cannot be shared across threads. */
+    /** Registers a private state store on the main thread for the worker. */
     private async registerPrivateStateProxy(): Promise<{ proxyId: string; release: () => void }> {
-        const backend = this.deps.walletMaterial.privateStateBackend ?? 'cap-db';
-        if (backend !== 'cap-db') {
-            throw new Error(
-                `privateStateBackend='${backend}' is not supported on the worker-routed submission path; ` +
-                `use 'cap-db' (default).`
-            );
-        }
         const db = await this.getDb();
         const provider = new CapDbPrivateStateProvider({
             accountId: this.deps.walletMaterial.accountId,
             privateStoragePasswordProvider: this.deps.walletMaterial.privateStoragePasswordProvider,
-            privateStoragePasswordFallbacks: this.deps.walletMaterial.privateStoragePasswordFallbacks,
             db
         });
         const proxyId = cds.utils.uuid();
@@ -496,7 +489,6 @@ export class TransactionSubmitter {
 
     private async getDb(): Promise<TxCapableDb> {
         if (this.db) return this.db;
-        await ensureNightgateModelLoaded();
         this.db = await cds.connect.to('db');
         return this.db;
     }
@@ -504,7 +496,7 @@ export class TransactionSubmitter {
     private async insertPending(
         actionType: ActionType,
         contractAddress: string | null,
-        circuitName: string | null,
+        circuit: string | null,
         sessionId: string
     ): Promise<string> {
         const db = await this.getDb();
@@ -513,7 +505,7 @@ export class TransactionSubmitter {
             ID: submissionId,
             txHash: null,
             contractAddress,
-            circuitName,
+            circuit,
             actionType,
             submittedAt: new Date().toISOString(),
             status: 'pending',
@@ -565,20 +557,23 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
     const name = err instanceof Error ? err.name : 'Error';
 
     const carried = carriedSubmitFailure(err);
+    // The worker marks every failure it cannot name as `internal`; a coded error among the causes names it.
+    const named = carried?.code === 'internal' ? findNightgateError(err) : undefined;
+    if (named) return { code: named.code, retryable: isJobErrorCode(named.code) && named.retryable, message };
     if (carried) return classificationFromSubmitFailure(carried, message, network);
 
     // Match on text for errors that did not come through the worker.
     if (name === 'TxFailedError' || message.includes('TxFailedError')) {
-        return { code: 'TxFailed', retryable: false, message };
+        return { code: 'TX_FAILED', retryable: false, message };
     }
 
     // Our own batch order check, matched by message because midnight-js drops the error name.
     // It must run before the 1010 checks, because its text mentions 1010/188.
     if (/violates the ledger's causality constraint/.test(message)) {
-        return { code: 'BatchCausalityViolation', retryable: false, message };
+        return { code: 'BATCH_CAUSALITY_VIOLATION', retryable: false, message };
     }
     if (/runs out of gas on the ledger/.test(message)) {
-        return { code: 'BatchGasBudgetExceeded', retryable: false, message };
+        return { code: 'BATCH_GAS_BUDGET_EXCEEDED', retryable: false, message };
     }
 
     // Node rejects are wrapped by the SDK, so search the whole inspected error. 1010 means an invalid
@@ -589,11 +584,11 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
     if (/priority is too low/i.test(haystack)) return priorityReject(message);
     if (/\b1010\s*:|invalid transaction/i.test(haystack)) {
         const raced = dustRaceLedgerCode(err);
-        if (raced) return dustRace(raced, message);
+        if (raced) return dustRace(nodeCode(raced), message);
         const custom = ledgerErrorCode(haystack);
         if (custom === '104') return { code: STALE_TRANSCRIPT_CODE, retryable: false, message: staleTranscriptMessage(message) };
         if (custom === '103') return { code: ZSWAP_INVALID_CODE, retryable: false, message: zswapInvalidMessage(message) };
-        return invalidTransaction(custom ? `1010/${custom}` : '1010', custom, message);
+        return invalidTransaction(nodeCode(custom ? `1010/${custom}` : '1010'), custom, message);
     }
     if (/\b1014\s*:/.test(haystack)) {
         return { code: '1014', retryable: false, message: `Pool reject (Substrate 1014): ${message}` };
@@ -601,30 +596,32 @@ export function classifySubmissionError(err: unknown, network: NightgateNetwork)
     if (/\b1016\s*:|Immediately\s*Dropped/i.test(haystack)) return poolDropped(network, message);
 
     if (/ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|socket hang up|timeout|disconnected from|Normal Closure|Abnormal Closure|WebSocket is not connected/i.test(haystack)) {
-        return { code: 'NetworkOrTimeout', retryable: true, message };
+        return { code: 'NETWORK_OR_TIMEOUT', retryable: true, message };
     }
 
     if (/ContractTypeError|IncompleteCallTxPrivateStateConfig|IncompleteFindContractPrivateStateConfig/.test(name)) {
-        return { code: name, retryable: false, message };
+        return { code: 'CONTRACT_CONFIG_INVALID', retryable: false, message: `${name}: ${message}` };
     }
 
     if (name === 'WalletSigningNotAvailable' || /WalletSigningNotAvailable/.test(message)) {
         return {
-            code: 'WalletSigningNotAvailable',
+            code: 'WALLET_SIGNING_NOT_AVAILABLE',
             retryable: false,
             message: `${message} (session needs encryptedSeedKey to sign/balance transactions)`
         };
     }
 
-    // These error codes are documented job codes. Every other error keeps its name.
+    // A failure that carries a code of the table keeps it. Only a code the table marks for jobs decides about a new attempt.
     const coded = findNightgateError(err);
-    if (coded && JOB_CODES_FROM_ERRORS.has(coded.code)) return { code: coded.code, retryable: coded.retryable, message };
+    if (coded) return { code: coded.code, retryable: isJobErrorCode(coded.code) && coded.retryable, message };
+    const own = (err as { code?: unknown; retryable?: unknown } | null)?.code;
+    if (isJobErrorCode(own)) return { code: own, retryable: (err as { retryable?: unknown }).retryable === true, message };
+    // The worker client names an error after the job code it stands for, such as WORKER_ROTATED.
+    if (isJobErrorCode(name)) return { code: name, retryable: false, message };
 
-    // Unknown errors are not retried, to avoid hammering the node.
-    return { code: name || 'UnknownError', retryable: false, message };
+    // Unknown errors are not retried, to avoid hammering the node. The name of the error goes into the message, never into the code.
+    return { code: 'UNKNOWN_ERROR', retryable: false, message: name && name !== 'Error' ? `${name}: ${message}` : message };
 }
-
-const JOB_CODES_FROM_ERRORS: ReadonlySet<string> = new Set(['AGENT_GRANT_REVOKED', 'SPONSOR_POLICY_UNAVAILABLE', 'SPONSOR_POLICY_EMPTY']);
 
 const ZSWAP_INVALID_CODE = '1010/103';
 const zswapInvalidMessage = (message: string): string =>
@@ -640,9 +637,11 @@ const priorityReject = (message: string): SubmissionErrorClassification =>
 const poolDropped = (network: NightgateNetwork, message: string): SubmissionErrorClassification => network === 'mainnet'
     ? { code: '1016', retryable: false, knownIssueRef: KNOWN_ISSUE_1016_MAINNET, message: `Mainnet deterministic rejection (1016 Immediately Dropped). Known issue; see ${KNOWN_ISSUE_1016_MAINNET}` }
     : { code: '1016', retryable: true, message: `Transaction pool full or immediately dropped: ${message}` };
-const invalidTransaction = (code: string, ledgerError: string | null, message: string): SubmissionErrorClassification =>
+/** A ledger code as the node's reject number. A text that is none counts as the plain 1010. */
+const nodeCode = (code: string): NodeRejectCode => (isNodeRejectCode(code) ? code : '1010');
+const invalidTransaction = (code: NodeRejectCode, ledgerError: string | null, message: string): SubmissionErrorClassification =>
     ({ code, retryable: false, message: `Invalid transaction (Substrate 1010${ledgerError ? `, ledger error ${ledgerError}` : ''}): ${message}` });
-const dustRace = (code: string, message: string): SubmissionErrorClassification => ({
+const dustRace = (code: NodeRejectCode, message: string): SubmissionErrorClassification => ({
     code, retryable: true, transient: 'dust-race',
     message: `Transient dust race (Substrate 1010, ledger error ${code.slice(5)}): the dust spend was built against a dust state the node has already moved past; nothing entered the pool and no fee was spent, rebuild and resubmit: ${message}`
 });
@@ -655,34 +654,34 @@ function classificationFromSubmitFailure(
     switch (info.code) {
         case 'dust-race':
             if (info.ledgerCode === 'pool-invalid') {
-                return { code: 'PoolInvalid', retryable: true, transient: 'dust-race', message: `Pool status Invalid (a competing transaction consumed a note first, or the transaction is invalid); rebuild and resubmit: ${message}` };
+                return { code: 'POOL_INVALID', retryable: true, transient: 'dust-race', message: `Pool status Invalid (a competing transaction consumed a note first, or the transaction is invalid); rebuild and resubmit: ${message}` };
             }
-            return dustRace(info.ledgerCode ?? '1010', message);
+            return dustRace(nodeCode(info.ledgerCode ?? '1010'), message);
         case 'pre-mempool-reject': {
             const ledger = info.ledgerCode ?? '1010';
-            if (ledger === 'intent-rejected') return { code: 'SubmitIntentRejected', retryable: false, message };
-            if (ledger === 'intent-timeout') return { code: 'SubmitIntentTimeout', retryable: false, message: `The announced transaction was not recorded in time; nothing was broadcast, a new idempotencyKey may retry: ${message}` };
+            if (ledger === 'intent-rejected') return { code: 'SUBMIT_INTENT_REJECTED', retryable: false, message };
+            if (ledger === 'intent-timeout') return { code: 'SUBMIT_INTENT_TIMEOUT', retryable: false, message: `The announced transaction was not recorded in time; nothing was broadcast, a new idempotencyKey may retry: ${message}` };
             if (ledger === '1014') return priorityReject(message);
             if (ledger === '1016') return poolDropped(network, message);
             if (ledger === STALE_TRANSCRIPT_CODE) return { code: ledger, retryable: false, message: staleTranscriptMessage(message) };
             if (ledger === ZSWAP_INVALID_CODE) return { code: ledger, retryable: false, message: zswapInvalidMessage(message) };
-            return invalidTransaction(ledger, ledger.startsWith('1010/') ? ledger.slice(5) : null, message);
+            return invalidTransaction(nodeCode(ledger), ledger.startsWith('1010/') ? ledger.slice(5) : null, message);
         }
         case 'transport':
-            return { code: 'NetworkOrTimeout', retryable: true, message };
+            return { code: 'NETWORK_OR_TIMEOUT', retryable: true, message };
         case 'ambiguous':
             // Never rebuilt, because the sent transaction may still land.
-            return { code: 'SubmitAmbiguous', retryable: false, message };
+            return { code: 'SUBMIT_AMBIGUOUS', retryable: false, message };
         case 'landed-not-applied':
-            return { code: 'TxFailed', retryable: false, message };
+            return { code: 'TX_FAILED', retryable: false, message };
         case 'policy':
-            return { code: 'SponsorPolicyRefused', retryable: false, message };
+            return { code: 'SPONSOR_REFUSED', retryable: false, message };
         case 'causality':
-            return { code: 'BatchCausalityViolation', retryable: false, message, ...(info.calls?.length ? { calls: info.calls } : {}) };
+            return { code: 'BATCH_CAUSALITY_VIOLATION', retryable: false, message, ...(info.calls?.length ? { calls: info.calls } : {}) };
         case 'gas-budget':
-            return { code: 'BatchGasBudgetExceeded', retryable: false, message };
+            return { code: 'BATCH_GAS_BUDGET_EXCEEDED', retryable: false, message };
         default:
-            return { code: 'UnknownError', retryable: false, message };
+            return { code: 'UNKNOWN_ERROR', retryable: false, message };
     }
 }
 

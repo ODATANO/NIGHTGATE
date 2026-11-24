@@ -4,7 +4,6 @@ import {
     type UnprovenTxCodec,
     parseBatchCallStages,
     unprovenTxCodec,
-    withObservedBatchSegments,
     withOrderedBatchSegments
 } from './batch-segment-order.mjs';
 import type { ProofProvider, PublicDataProvider, UnprovenTx } from '@midnight-ntwrk/midnight-js-types';
@@ -59,8 +58,14 @@ export interface BatchScopeResult {
 export interface BatchScopeOptions {
     /** Recipient keys for coins a call creates for another wallet. Passed to the SDK's scope. */
     additionalCoinEncPublicKeyMappings?: ReadonlyMap<string, string>;
-    /** `observe` only logs the segment ids, so the apply order stays random. Default `rewrite`. */
-    segmentMode?: 'observe' | 'rewrite';
+    /** Gets the contract's private state after the last call, once all calls are built and before anything is proven or sent. */
+    onPrivateState?: (nextPrivateState: unknown) => void;
+}
+
+/** The private state after the call the scope built last, or undefined before the first call. */
+function lastCallPrivateState(txCtx: unknown): unknown {
+    const ctx = txCtx as { getLastUnsubmittedCallTxDataToTransact?(): Array<{ private?: { nextPrivateState?: unknown } }> | undefined } | undefined;
+    return ctx?.getLastUnsubmittedCallTxDataToTransact?.()?.[0]?.private?.nextPrivateState;
 }
 
 /** The segment id of the call the scope built last, or NaN when it has not exactly one. */
@@ -106,18 +111,17 @@ export async function runBatchInScope(
     // Each call gets a random segment id from the SDK, and the ledger applies calls by
     // ascending id. The wrapper renumbers them into call order before proving.
     const providersAny = providers as BatchProviders | undefined;
-    const { segmentMode = 'rewrite', ...sdkScopeOpts } = scopeOpts;
-    const wrapSegments = segmentMode === 'observe' ? withObservedBatchSegments : withOrderedBatchSegments;
+    const { onPrivateState, ...sdkScopeOpts } = scopeOpts;
     // Filled while the calls are built. The wrapper reads it at proving time.
     const segmentIds: number[] = [];
     const networkId = providersAny?.config?.networkId;
     const reader = providersAny?.publicDataProvider;
     const preflight = networkId && reader && typeof reader.queryZSwapAndContractState === 'function'
-        ? (tx: Parameters<typeof checkBatchGas>[0]) => checkBatchGas(tx, reader, networkId, contractAddress, circuits)
+        ? (tx: Parameters<typeof checkBatchGas>[0]) => checkBatchGas(tx, reader, networkId, contractAddress, circuits, orderOpts.report)
         : undefined;
     const proofProvider = providersAny?.proofProvider;
     const scopedProviders = proofProvider && typeof proofProvider.proveTx === 'function'
-        ? { ...providersAny, proofProvider: wrapSegments(proofProvider, circuits, { ...orderOpts, segmentIds }, preflight) }
+        ? { ...providersAny, proofProvider: withOrderedBatchSegments(proofProvider, circuits, { ...orderOpts, segmentIds }, preflight) }
         : providers;
     const codec = await unprovenTxCodec();
 
@@ -129,6 +133,7 @@ export async function runBatchInScope(
                 await found.callTx![c.circuit]!(txCtx, ...(c.args ?? []));
                 segmentIds.push(lastCallSegmentId(txCtx, codec));
             }
+            onPrivateState?.(lastCallPrivateState(txCtx));
         },
         { scopeName: `batch:${circuits.join('+')}`, ...sdkScopeOpts }
     );
@@ -148,10 +153,10 @@ export function tagBatchError(e: unknown): unknown {
     const tagged = e as { code?: string; calls?: BatchCallStage[] };
     try {
         if (/violates the ledger's causality constraint/.test(message)) {
-            tagged.code = 'BatchCausalityViolation';
+            tagged.code = 'BATCH_CAUSALITY_VIOLATION';
             if (!Array.isArray(tagged.calls)) tagged.calls = parseBatchCallStages(message);
         } else if (/runs out of gas on the ledger/.test(message)) {
-            tagged.code = 'BatchGasBudgetExceeded';
+            tagged.code = 'BATCH_GAS_BUDGET_EXCEEDED';
         }
     } catch { /* a frozen error keeps its shape */ }
     return e;

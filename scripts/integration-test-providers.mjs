@@ -5,7 +5,6 @@ import WebSocket from 'ws';
 import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
 import { httpClientProofProvider }   from '@midnight-ntwrk/midnight-js-http-client-proof-provider';
 import { NodeZkConfigProvider }      from '@midnight-ntwrk/midnight-js-node-zk-config-provider';
-import { levelPrivateStateProvider } from '@midnight-ntwrk/midnight-js-level-private-state-provider';
 import path from 'node:path';
 import os from 'node:os';
 import { createRequire } from 'node:module';
@@ -39,20 +38,6 @@ ok('indexerPublicDataProvider', publicDataProvider);
 // 3. proofProvider, (url, zkConfigProvider)
 const proofProvider = httpClientProofProvider('http://localhost:6300', zkConfigProvider);
 ok('httpClientProofProvider', proofProvider);
-
-// 4. levelPrivateStateProvider, { accountId, privateStoragePasswordProvider }
-//    May open a LevelDB in the cwd; that's fine for a one-shot script.
-try {
-    const privateStateProvider = levelPrivateStateProvider({
-        accountId: 'integration-test-account',
-        privateStoragePasswordProvider: async () => 'integration-test-passphrase-16+chars'
-    });
-    ok('levelPrivateStateProvider', privateStateProvider);
-    ok('levelPrivateStateProvider.invalidateEncryptionCache', privateStateProvider.invalidateEncryptionCache);
-} catch (err) {
-    console.error(`FAIL levelPrivateStateProvider: ${err.message.split('\n')[0]}`);
-    failures++;
-}
 
 console.log();
 if (failures === 0) {

@@ -15,12 +15,12 @@ export async function parseMidnightAddress(af: AddressFormatModule, text: string
     return new af.MidnightBech32m(type, network, Buffer.from(bech32m.fromWords(decoded.words)));
 }
 
-/** What a receiver address pays to, by its prefix. Null for any other text. */
+/** What a receiver address pays to, by its kind. Null for any other text. The kind is followed by `_<network>`, or on mainnet by the separator `1`. */
 export function receiverKind(addr: string): 'shielded' | 'unshielded' | null {
-    if (addr.startsWith('mn_shield-addr_')) return 'shielded';
-    if (addr.startsWith('mn_addr_')) return 'unshielded';
+    if (/^mn_shield-addr[_1]/.test(addr)) return 'shielded';
+    if (/^mn_addr[_1]/.test(addr)) return 'unshielded';
     return null;
 }
 
 /** The accepted receiver prefixes, for error messages. */
-export const RECEIVER_PREFIXES = "'mn_shield-addr_' (shielded) or 'mn_addr_' (unshielded)";
+export const RECEIVER_PREFIXES = "'mn_shield-addr' (shielded) or 'mn_addr' (unshielded)";

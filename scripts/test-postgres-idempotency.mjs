@@ -48,7 +48,7 @@ async function main() {
         `);
 
         const KEY = 'race-key';
-        const row = (id) => ({ id, session_id: 's1', kind: 'sendNight', idempotency_key: KEY, status: 'pending' });
+        const row = (id) => ({ id, session_id: 's1', kind: 'sendToken', idempotency_key: KEY, status: 'pending' });
         const insert = (r) =>
             `INSERT INTO ${TABLE}(id, session_id, kind, idempotency_key, status) ` +
             `VALUES('${r.id}','${r.session_id}','${r.kind}','${r.idempotency_key}','${r.status}')`;

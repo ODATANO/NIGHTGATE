@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Request } from '@sap/cds';
-import type { DisclosureRoleValue } from '../middleware/disclosure-role';
 
 /** The agent grant a request runs under. The agent token check sets it. */
 export interface RequestAgentGrant {
@@ -14,6 +13,7 @@ export interface RequestAgentGrant {
     allowedTokenTypes: string[];
     mintedTokenTypes: string[];
     allowDeploy: boolean;
+    allowMaintenance: boolean;
     allowSwaps: boolean;
     allowTransfers: boolean;
     allowUnshieldedOffers: boolean;
@@ -24,7 +24,6 @@ export interface RequestAgentGrant {
 declare module '@sap/cds' {
     interface Request {
         agentGrant?: RequestAgentGrant;
-        disclosureRole?: DisclosureRoleValue;
         /** Settles once the agent token check has set the user. */
         agentPrincipalReady?: Promise<void>;
     }

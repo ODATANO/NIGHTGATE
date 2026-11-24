@@ -18,8 +18,8 @@ export async function readCapBinary(value: unknown): Promise<Buffer | null> {
     return null;
 }
 
-// Both drivers take a Buffer for a `LargeBinary` in INSERT and UPDATE. A base64 string reaches PostgreSQL
-// as text and is stored as the text's bytes. cds-typer types the column as a stream.
+// PostgreSQL decodes a base64 string for a `LargeBinary` in an INSERT, but an UPDATE stores the text's bytes.
+// A Buffer is right in both, on both drivers. cds-typer types the column as a stream.
 export function capBinaryInput(base64: string): Readable {
     return Buffer.from(base64, 'base64') as unknown as Readable;
 }

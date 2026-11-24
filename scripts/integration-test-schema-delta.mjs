@@ -1,17 +1,19 @@
-// Checks apply-schema-delta.mjs on an old database: new columns, relaxed NOT NULL, kept rows, indexes and triggers.
-// Run: node scripts/integration-test-schema-delta.mjs
+// Checks apply-schema-delta.mjs on a SQLite database of the last release: renamed columns, moved key, kept rows,
+// filled chain positions, operator indexes and triggers. Run: node scripts/integration-test-schema-delta.mjs
 
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-// Built-in driver (Node >= 22.5), same choice as the migration itself, so
-// this lane needs no native module on CI or anywhere else.
+import { createRequire } from 'node:module';
+// The built-in driver, the same one the tool uses.
 import { DatabaseSync } from 'node:sqlite';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
+const require = createRequire(import.meta.url);
+const cds = require('@sap/cds');
 
 let failures = 0;
 function ok(name, value, detail) {
@@ -24,479 +26,134 @@ function ok(name, value, detail) {
 }
 
 const dir = mkdtempSync(path.join(tmpdir(), 'nightgate-delta-'));
-const dbPath = path.join(dir, 'legacy.db');
+const dbPath = path.join(dir, 'released.db');
+const tool = path.join(repoRoot, 'scripts/apply-schema-delta.mjs');
 
+// ---- A database deployed from the model of the last release ----------------
+const released = path.join(repoRoot, 'test/fixtures/model-0.46.3');
+const releasedCsn = await cds.load([path.join(released, 'db'), path.join(released, 'srv')]);
 const db = new DatabaseSync(dbPath);
+for (const statement of cds.compile.to.sql(releasedCsn, { dialect: 'sqlite' })) db.exec(statement);
 db.exec(`
-CREATE TABLE midnight_PredicateAttestations (
-    ID TEXT NOT NULL PRIMARY KEY,
-    createdAt TEXT,
-    modifiedAt TEXT,
-    payloadHash TEXT NOT NULL,
-    contractAddress TEXT NOT NULL,
-    predicate TEXT NOT NULL,
-    op INTEGER NOT NULL,
-    threshold INTEGER NOT NULL
-);
 CREATE INDEX operator_pa_payload_idx ON midnight_PredicateAttestations (payloadHash);
 CREATE TRIGGER operator_pa_touch AFTER UPDATE ON midnight_PredicateAttestations
 BEGIN
     UPDATE midnight_PredicateAttestations SET modifiedAt = 'touched' WHERE ID = NEW.ID;
 END;
-INSERT INTO midnight_PredicateAttestations (ID, payloadHash, contractAddress, predicate, op, threshold)
-VALUES ('row-1', 'aa', 'bb', 'lessOrEqual', 0, 42);
-
--- A 0.23-shaped Documents: the evidence columns of 0.16, WITHOUT the 0.23.4
--- anchoring session. The row must survive with sessionId NULL (owner-
--- readable, never token-readable).
-CREATE TABLE midnight_Documents (
-    ID TEXT NOT NULL PRIMARY KEY,
-    createdAt TEXT,
-    modifiedAt TEXT,
-    sha256 TEXT NOT NULL,
-    contentType TEXT,
-    size INTEGER,
-    storageRef TEXT,
-    anchoredTxHash TEXT,
-    anchoredAt TEXT,
-    userId TEXT,
-    contractAddress TEXT,
-    network TEXT,
-    compiledArtifactRef TEXT,
-    artifactDigest TEXT
-);
-INSERT INTO midnight_Documents (ID, sha256, storageRef, userId)
-VALUES ('doc-row-1', 'cc', 'file:///legacy', 'operator-1');
-
--- A 0.19-shaped WalletSessions: everything 0.19 had, WITHOUT the 0.20 label
--- column. This is the table 0.20's startup preflight refuses on, and the
--- migration the changelog promises as not-code-only. Without it here the
--- delta would simply CREATE the table and the ALTER path would go untested.
-CREATE TABLE midnight_WalletSessions (
-    ID TEXT NOT NULL PRIMARY KEY,
-    createdAt TEXT,
-    createdBy TEXT,
-    modifiedAt TEXT,
-    modifiedBy TEXT,
-    userId TEXT,
-    viewingKeyHash TEXT,
-    encryptedViewingKey TEXT,
-    encryptedSeedKey TEXT,
-    accountIndex INTEGER,
-    sessionId TEXT NOT NULL,
-    connectedAt TEXT NOT NULL,
-    disconnectedAt TEXT,
-    expiresAt TEXT,
-    isActive INTEGER DEFAULT TRUE,
-    CONSTRAINT midnight_WalletSessions_sessionId UNIQUE (sessionId)
-);
-INSERT INTO midnight_WalletSessions (ID, userId, sessionId, connectedAt, isActive, encryptedViewingKey)
-VALUES ('sess-row-1', 'operator', 'sess-1', '2026-08-01T00:00:00.000Z', 1, 'cipher');
-
--- A 0.20-shaped AgentGrants: everything 0.20 had, WITHOUT the six 0.21 policy /
--- deploy columns. The upgrade note promises the ALTER path keeps existing
--- grants (and their tokens) working.
-CREATE TABLE midnight_AgentGrants (
-    ID TEXT NOT NULL PRIMARY KEY,
-    createdAt TEXT,
-    createdBy TEXT,
-    modifiedAt TEXT,
-    modifiedBy TEXT,
-    userId TEXT NOT NULL,
-    agentLabel TEXT,
-    sessionId TEXT NOT NULL,
-    tokenHash TEXT NOT NULL,
-    allowedActions TEXT NOT NULL,
-    maxJobsPerDay INTEGER,
-    jobsUsedToday INTEGER DEFAULT 0,
-    budgetWindow TEXT,
-    sponsorSessionId TEXT,
-    validUntil TEXT,
-    isActive INTEGER DEFAULT TRUE,
-    revokedAt TEXT,
-    CONSTRAINT midnight_AgentGrants_tokenHash UNIQUE (tokenHash)
-);
-INSERT INTO midnight_AgentGrants (ID, userId, sessionId, tokenHash, allowedActions, maxJobsPerDay, jobsUsedToday, isActive)
-VALUES ('grant-row-1', 'operator', 'sess-1', 'deadbeef', '["anchorDocument"]', 20, 3, 1);
-
--- Pre-0.23.0 crawler rows: Transactions.raw carries what CAP made of the
--- "0x..." hex text in a binary column (lossy), ContractActions.state a copy.
-CREATE TABLE midnight_Transactions (
-    ID TEXT NOT NULL PRIMARY KEY,
-    transactionId INTEGER,
-    hash TEXT,
-    protocolVersion INTEGER,
-    raw TEXT,
-    transactionType TEXT
-);
-INSERT INTO midnight_Transactions (ID, transactionId, hash, protocolVersion, raw, transactionType)
-VALUES ('tx-lossy', 0, '0xhash', 1, '0xdeadbeeQ==', 'REGULAR'),
-       ('tx-null', 1, '0xhash2', 1, NULL, 'SYSTEM');
-CREATE TABLE midnight_ContractActions (
-    ID TEXT NOT NULL PRIMARY KEY,
-    address TEXT,
-    actionType TEXT,
-    state TEXT,
-    transaction_ID TEXT
-);
-INSERT INTO midnight_ContractActions (ID, address, actionType, state, transaction_ID)
-VALUES ('ca-1', '0xaddr', 'CALL', '0xdeadbeeQ==', 'tx-lossy');
--- Pre-account-key private state and sync state (0.22 shape: no keyScheme).
--- The delta adds the nullable marker and leaves the rows as legacy rows.
-CREATE TABLE midnight_PrivateStates (
-    accountId TEXT NOT NULL,
-    contractAddress TEXT NOT NULL,
-    privateStateId TEXT NOT NULL,
-    ciphertext TEXT NOT NULL,
-    createdAt TEXT,
-    updatedAt TEXT,
-    PRIMARY KEY (accountId, contractAddress, privateStateId)
-);
-INSERT INTO midnight_PrivateStates (accountId, contractAddress, privateStateId, ciphertext)
-VALUES ('acct-legacy', '0xc1', 'ps', 'AQID');
-CREATE TABLE midnight_ContractSigningKeys (
-    accountId TEXT NOT NULL,
-    contractAddress TEXT NOT NULL,
-    ciphertext TEXT NOT NULL,
-    createdAt TEXT,
-    updatedAt TEXT,
-    PRIMARY KEY (accountId, contractAddress)
-);
-INSERT INTO midnight_ContractSigningKeys (accountId, contractAddress, ciphertext) VALUES ('acct-legacy', '0xc1', 'AQID');
-CREATE TABLE midnight_WalletSyncStates (
-    accountId TEXT NOT NULL PRIMARY KEY,
-    shieldedStateBlob TEXT,
-    unshieldedStateBlob TEXT,
-    dustStateBlob TEXT,
-    sdkVersion TEXT NOT NULL,
-    networkId TEXT,
-    seedFingerprint TEXT,
-    createdAt TEXT,
-    updatedAt TEXT
-);
-INSERT INTO midnight_WalletSyncStates (accountId, dustStateBlob, sdkVersion) VALUES ('acct-legacy', 'AQID', 'sdk@test');
-
--- Pre-0.23.0 submission rows: no inclusion coordinates yet.
-CREATE TABLE midnight_PendingSubmissions (
-    ID TEXT NOT NULL PRIMARY KEY,
-    txHash TEXT,
-    actionType TEXT NOT NULL,
-    submittedAt TEXT NOT NULL,
-    status TEXT DEFAULT 'pending'
-);
-INSERT INTO midnight_PendingSubmissions (ID, txHash, actionType, submittedAt, status)
-VALUES ('sub-legacy', '00identifier', 'CALL', '2026-09-01T00:00:00Z', 'included'),
-       ('sub-null', NULL, 'CALL', '2026-09-01T00:00:00Z', NULL);
-CREATE TABLE midnight_BackgroundJobs (
-    ID TEXT NOT NULL PRIMARY KEY,
-    kind TEXT NOT NULL,
-    status TEXT DEFAULT 'pending',
-    txHash TEXT,
-    chainStatus TEXT
-);
-INSERT INTO midnight_BackgroundJobs (ID, kind, status, txHash, chainStatus)
-VALUES ('job-legacy', 'submitContractCall', 'succeeded', '00identifier', 'pending'),
-       ('job-null', 'submitContractCall', NULL, NULL, NULL);
-
--- A 0.23-shaped DisclosureGrants: unique key without the attester.
-CREATE TABLE midnight_DisclosureGrants (
-    ID NVARCHAR(36) NOT NULL,
-    createdAt TIMESTAMP_TEXT,
-    createdBy NVARCHAR(255),
-    modifiedAt TIMESTAMP_TEXT,
-    modifiedBy NVARCHAR(255),
-    payloadHash NVARCHAR(512) NOT NULL,
-    grantee NVARCHAR(512) NOT NULL,
-    level INTEGER NOT NULL,
-    pendingLevel INTEGER,
-    contractAddress NVARCHAR(512) NOT NULL,
-    grantedTxHash NVARCHAR(512),
-    revokedTxHash NVARCHAR(512),
-    active BOOLEAN DEFAULT FALSE,
-    PRIMARY KEY(ID),
-    CONSTRAINT midnight_DisclosureGrants_logicalGrant UNIQUE (contractAddress, payloadHash, grantee)
-);
-INSERT INTO midnight_DisclosureGrants (ID, payloadHash, grantee, level, contractAddress, active)
-VALUES ('dg-legacy', 'p1', 'g1', 1, 'c1', 1);
-
--- A 0.24-shaped Blocks: the state root sits in ledgerParameters, NOT NULL.
-CREATE TABLE midnight_Blocks (
-    ID NVARCHAR(36) NOT NULL,
-    createdAt TIMESTAMP_TEXT,
-    createdBy NVARCHAR(255),
-    modifiedAt TIMESTAMP_TEXT,
-    modifiedBy NVARCHAR(255),
-    hash NVARCHAR(512) NOT NULL,
-    height BIGINT NOT NULL,
-    protocolVersion INTEGER NOT NULL,
-    timestamp INTEGER NOT NULL,
-    author NVARCHAR(512),
-    ledgerParameters NVARCHAR(512) NOT NULL,
-    parent_ID NVARCHAR(36),
-    PRIMARY KEY(ID),
-    CONSTRAINT midnight_Blocks_hash UNIQUE (hash)
-);
-INSERT INTO midnight_Blocks (ID, hash, height, protocolVersion, timestamp, ledgerParameters)
-VALUES ('block-legacy', '0xlegacy', 7, 1, 1700000000, '0xstaterootvalue');
-
--- A 0.24-shaped UnshieldedUtxos: unique key on the creating transaction.
-CREATE TABLE midnight_UnshieldedUtxos (
-    ID NVARCHAR(36) NOT NULL,
-    createdAt TIMESTAMP_TEXT,
-    createdBy NVARCHAR(255),
-    modifiedAt TIMESTAMP_TEXT,
-    modifiedBy NVARCHAR(255),
-    owner NVARCHAR(256) NOT NULL,
-    tokenType NVARCHAR(512) NOT NULL,
-    value NVARCHAR(78) NOT NULL,
-    intentHash NVARCHAR(512) NOT NULL,
-    outputIndex INTEGER NOT NULL,
-    ctime INTEGER,
-    initialNonce NVARCHAR(512) NOT NULL,
-    registeredForDustGeneration BOOLEAN DEFAULT FALSE,
-    createdAtTransaction_ID NVARCHAR(36) NOT NULL,
-    spentAtTransaction_ID NVARCHAR(36),
-    PRIMARY KEY(ID),
-    CONSTRAINT midnight_UnshieldedUtxos_createdOutput UNIQUE (createdAtTransaction_ID, outputIndex)
-);
-INSERT INTO midnight_UnshieldedUtxos
-    (ID, owner, tokenType, value, intentHash, outputIndex, initialNonce, createdAtTransaction_ID)
-VALUES ('utxo-legacy', 'mn_addr_preprod1legacy', '00', '100', 'intent-legacy', 0, 'nonce-legacy', 'tx-legacy');
+INSERT INTO midnight_Blocks (ID, hash, height, protocolVersion, timestamp) VALUES ('b-7', 'b10c', 7, 1, 1);
+INSERT INTO midnight_Transactions (ID, transactionId, hash, ledgerTxHash, protocolVersion, transactionType, circuitName, block_ID)
+VALUES ('tx-7', 2, 'e0e0', 'f1f1', 1, 'REGULAR', '5:0', 'b-7');
+INSERT INTO midnight_ContractActions (ID, actionIndex, address, actionType, entryPoint, transaction_ID)
+VALUES ('ca-index', 0, 'c0', 'CALL', '5:0', 'tx-7'), ('ca-named', 1, 'c0', 'CALL', 'attest', 'tx-7');
+INSERT INTO midnight_UnshieldedUtxos (ID, owner, tokenType, value, intentHash, outputIndex, initialNonce, createdAtTransaction_ID)
+VALUES ('utxo-7', 'mn_addr_x', '00', '5', 'i1', 0, 'n1', 'tx-7');
+INSERT INTO midnight_WalletSessions (ID, sessionId, userId, connectedAt, isActive, label)
+VALUES ('row-id', 'sess-1', 'alice', '2026-11-01T00:00:00Z', 1, 'kept');
+INSERT INTO midnight_PredicateAttestations (ID, payloadHash, contractAddress, predicate, threshold)
+VALUES ('pa-1', 'aa', 'cc', 'lessOrEqual', 42), ('pa-max', 'aa', 'cc', 'lessOrEqual', 9223372036854775807);
+INSERT INTO midnight_DisclosureGrants (ID, payloadHash, grantee, level, contractAddress, active) VALUES ('dg-1', 'p1', 'g1', 1, 'c1', 1);
+INSERT INTO midnight_BackgroundJobs (ID, kind, status, txHash, indexerTxHash) VALUES ('job-1', 'sponsorUnbound', 'succeeded', '00identifier', 'cdcd');
+INSERT INTO midnight_PendingSubmissions (ID, sessionId, actionType, submittedAt, status, txHash) VALUES ('sub-1', 'sess-1', 'CALL', '2026-11-01T00:00:00Z', 'submitted', '00identifier');
 `);
 db.close();
 
-execFileSync(process.execPath, [path.join(repoRoot, 'scripts/apply-schema-delta.mjs'), dbPath], {
-    cwd: repoRoot, stdio: 'inherit'
-});
+const firstRun = execFileSync(process.execPath, [tool, dbPath], { cwd: repoRoot }).toString();
+process.stdout.write(firstRun);
 
 const after = new DatabaseSync(dbPath, { readOnly: true });
-const cols = new Map(after.prepare('PRAGMA table_info("midnight_PredicateAttestations")').all().map(r => [r.name, r]));
-ok('delta: 0.16.0 columns added',
-    cols.has('payloadHashB') && cols.has('allowedMask') && cols.has('network') && cols.has('compiledArtifactRef'),
-    [...cols.keys()].join(','));
-ok('delta: NOT NULL relaxed on op/threshold',
-    cols.get('op')?.notnull === 0 && cols.get('threshold')?.notnull === 0);
-const row = after.prepare("SELECT * FROM midnight_PredicateAttestations WHERE ID = 'row-1'").get();
-ok('delta: data row survived the rebuild', row?.payloadHash === 'aa' && row?.threshold === 42);
-const master = after.prepare(
-    "SELECT type, name FROM sqlite_master WHERE tbl_name = 'midnight_PredicateAttestations' AND type IN ('index','trigger')"
-).all();
-ok('delta: operator index survived the rebuild', master.some(m => m.type === 'index' && m.name === 'operator_pa_payload_idx'), JSON.stringify(master));
-ok('delta: operator trigger survived the rebuild', master.some(m => m.type === 'trigger' && m.name === 'operator_pa_touch'), JSON.stringify(master));
+const columnsOf = table => new Map(after.prepare(`PRAGMA table_info("${table}")`).all().map(r => [r.name, r]));
 
-// --- WalletSessions: the label column added to an existing table ------------
-const sessionCols = new Map(
-    after.prepare('PRAGMA table_info("midnight_WalletSessions")').all().map(r => [r.name, r])
-);
-ok('delta 0.20: label added to an EXISTING WalletSessions table', sessionCols.has('label'),
-    [...sessionCols.keys()].join(','));
-// ADD COLUMN cannot introduce NOT NULL on a populated table, and the column is
-// cosmetic anyway; a nullable column is the correct outcome.
-ok('delta 0.20: the added label column is nullable', sessionCols.get('label')?.notnull === 0);
-const sessionRow = after.prepare("SELECT * FROM midnight_WalletSessions WHERE ID = 'sess-row-1'").get();
-ok('delta 0.20: the existing session row survived, keys intact',
-    sessionRow?.sessionId === 'sess-1' && sessionRow?.encryptedViewingKey === 'cipher' && sessionRow?.label === null,
-    JSON.stringify(sessionRow));
-
-// --- AgentGrants: the six policy/deploy columns on an existing table ---------
-const grantCols = new Map(
-    after.prepare('PRAGMA table_info("midnight_AgentGrants")').all().map(r => [r.name, r])
-);
-const added021 = ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts'];
-ok('delta 0.21: the six grant columns were added to an EXISTING AgentGrants table',
-    added021.every(c => grantCols.has(c)), [...grantCols.keys()].join(','));
-ok('delta 0.21: the added grant columns are nullable', added021.every(c => grantCols.get(c)?.notnull === 0));
-// --- AgentGrants: the token-type allow-list column ---------------------------
-ok('delta 0.22: allowedTokenTypes was added, nullable', grantCols.has('allowedTokenTypes') && grantCols.get('allowedTokenTypes')?.notnull === 0);
-ok('delta 0.29: mintedTokenTypes was added, nullable', grantCols.has('mintedTokenTypes') && grantCols.get('mintedTokenTypes')?.notnull === 0);
-const grantRow = after.prepare("SELECT * FROM midnight_AgentGrants WHERE ID = 'grant-row-1'").get();
-ok('delta 0.21: the existing grant survived with its token and budget intact',
-    grantRow?.tokenHash === 'deadbeef' && grantRow?.maxJobsPerDay === 20 && grantRow?.jobsUsedToday === 3 && grantRow?.isActive === 1,
-    JSON.stringify(grantRow));
-ok('delta 0.21: the existing grant inherits the floor (null lists) and has NO deploy right',
-    grantRow?.allowedContracts === null && grantRow?.allowedCircuits === null && grantRow?.deployedContracts === null
-        && !grantRow?.allowDeploy && (grantRow?.deploysUsed === 0 || grantRow?.deploysUsed === null),
-    JSON.stringify(grantRow));
-// --- Documents.sessionId added to an existing table ------------------------------
-const docCols = new Map(
-    after.prepare('PRAGMA table_info("midnight_Documents")').all().map(r => [r.name, r])
-);
-ok('delta: sessionId was added to an EXISTING Documents table, nullable',
-    docCols.has('sessionId') && docCols.get('sessionId')?.notnull === 0, [...docCols.keys()].join(','));
-const docRow = after.prepare("SELECT * FROM midnight_Documents WHERE ID = 'doc-row-1'").get();
-ok('delta: the existing document survived with a null session (owner-readable only)',
-    docRow?.sha256 === 'cc' && docRow?.storageRef === 'file:///legacy' && docRow?.sessionId === null,
-    JSON.stringify(docRow));
-// --- lossy binary rows are cleared, never re-encoded -----------------------
-const lossy = after.prepare("SELECT raw FROM midnight_Transactions WHERE ID = 'tx-lossy'").get();
-ok('delta 0.23: a pre-0.23.0 Transactions.raw value (lossy hex-through-base64) is cleared for reindexing', lossy?.raw === null, JSON.stringify(lossy));
-ok('delta 0.23: the Transactions row itself survives', after.prepare("SELECT hash FROM midnight_Transactions WHERE ID = 'tx-lossy'").get()?.hash === '0xhash');
-const stateRow = after.prepare("SELECT state FROM midnight_ContractActions WHERE ID = 'ca-1'").get();
-ok('delta 0.23: the ContractActions.state copy is cleared', stateRow?.state === null, JSON.stringify(stateRow));
-const ngIdx = after.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'ng_%'").all().map(r => r.name);
-ok('delta 0.23: secondary indexes exist after the migration', ngIdx.includes('ng_transactions_hash_createdat') && ngIdx.includes('ng_blocks_height_unique'), ngIdx.join(','));
-ok('delta: the unique height index replaced the plain one', !ngIdx.includes('ng_blocks_height'), ngIdx.join(','));
-
-const regs = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_ContractRegistrations'").get();
-ok('delta 0.21: the ContractRegistrations table exists', regs?.type === 'table');
-ok('delta 0.33: the TransactionIdentifiers table exists',
-    after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_TransactionIdentifiers'").get()?.type === 'table');
-
-// Account keys + the key-scheme marker on the three stores.
-const accountKeys = after.prepare("SELECT type FROM sqlite_master WHERE name = 'midnight_AccountKeys'").get();
-ok('delta 0.23: the AccountKeys table exists', accountKeys?.type === 'table');
-for (const table of ['midnight_PrivateStates', 'midnight_ContractSigningKeys', 'midnight_WalletSyncStates']) {
-    const tcols = new Map(after.prepare(`PRAGMA table_info("${table}")`).all().map(r => [r.name, r]));
-    ok(`delta 0.23: keyScheme added to an EXISTING ${table}, nullable`, tcols.has('keyScheme') && tcols.get('keyScheme')?.notnull === 0, [...tcols.keys()].join(','));
-    const legacy = after.prepare(`SELECT keyScheme, count(*) AS n FROM "${table}" WHERE accountId = 'acct-legacy'`).get();
-    ok(`delta 0.23: the pre-account-key row of ${table} survives as a legacy row (keyScheme null)`, legacy?.n === 1 && legacy?.keyScheme === null, JSON.stringify(legacy));
-}
-
-for (const table of ['midnight_PendingSubmissions', 'midnight_BackgroundJobs']) {
-    const evidenceCols = new Map(after.prepare(`PRAGMA table_info("${table}")`).all().map(r => [r.name, r]));
-    ok(`delta 0.23: inclusion coordinates added to an EXISTING ${table} table`,
-        ['chainBlockHeight', 'chainBlockHash', 'indexerTxHash'].every(c => evidenceCols.has(c) && evidenceCols.get(c).notnull === 0),
-        [...evidenceCols.keys()].join(','));
-}
+// ---- Renamed columns, with their values ------------------------------------
 {
-    const jobCols = new Map(after.prepare('PRAGMA table_info("midnight_BackgroundJobs")').all().map(r => [r.name, r]));
-    ok('delta 0.24: grantId added to an EXISTING BackgroundJobs table, nullable',
-        jobCols.has('grantId') && jobCols.get('grantId')?.notnull === 0, [...jobCols.keys()].join(','));
-    const grantIdx = after.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ng_backgroundjobs_grant'").get();
-    ok('delta 0.24: the per-grant usage index exists', Boolean(grantIdx));
+    const tx = columnsOf('midnight_Transactions');
+    ok('Transactions columns carry their new names, the old ones are gone',
+        ['indexInBlock', 'extrinsicHash', 'txHash', 'circuit'].every(c => tx.has(c)) && !['transactionId', 'hash', 'ledgerTxHash', 'circuitName'].some(c => tx.has(c)),
+        [...tx.keys()].join(','));
+    const moved = after.prepare("SELECT indexInBlock, extrinsicHash, txHash FROM midnight_Transactions WHERE ID = 'tx-7'").get();
+    ok('a transaction keeps its position and both hashes under the new names',
+        moved?.indexInBlock === 2 && moved?.extrinsicHash === 'e0e0' && moved?.txHash === 'f1f1', JSON.stringify(moved));
+    for (const table of ['midnight_BackgroundJobs', 'midnight_PendingSubmissions']) {
+        const cols = columnsOf(table);
+        ok(`${table}.txHash is renamed to txId and a new txHash holds the ledger hash`,
+            cols.has('txId') && cols.has('txHash') && !cols.has('indexerTxHash') && cols.has('blockHeight') && !cols.has('chainBlockHeight'), [...cols.keys()].join(','));
+    }
+    const job = after.prepare("SELECT txId, txHash FROM midnight_BackgroundJobs WHERE ID = 'job-1'").get();
+    ok('a job keeps its identifier and its hash through the rename', job?.txId === '00identifier' && job?.txHash === 'cdcd', JSON.stringify(job));
+    const sub = after.prepare("SELECT txId FROM midnight_PendingSubmissions WHERE ID = 'sub-1'").get();
+    ok('a submission keeps its identifier through the rename', sub?.txId === '00identifier', JSON.stringify(sub));
+    for (const [table, from, to] of [
+        ['midnight_ContractActions', 'address', 'contractAddress'], ['midnight_ContractActions', 'entryPoint', 'circuit'],
+        ['midnight_DisclosureGrants', 'active', 'isActive'], ['midnight_WalletSyncStates', 'networkId', 'network'],
+        ['midnight_SyncState', 'networkId', 'network'], ['midnight_AgentGrants', 'agentLabel', 'label'],
+        ['midnight_Documents', 'sha256', 'payloadHash'], ['midnight_Documents', 'compiledArtifactRef', 'contractName']
+    ]) {
+        const cols = columnsOf(table);
+        ok(`${table}.${from} is renamed to ${to}`, cols.has(to) && !cols.has(from), [...cols.keys()].join(','));
+    }
+    const grant = after.prepare("SELECT isActive FROM midnight_DisclosureGrants WHERE ID = 'dg-1'").get();
+    ok('a disclosure grant keeps its switch under the new name', Number(grant?.isActive) === 1, JSON.stringify(grant));
 }
-ok('delta 0.23: the legacy submission row survived with null coordinates',
-    after.prepare("SELECT chainBlockHeight FROM midnight_PendingSubmissions WHERE ID = 'sub-legacy'").get()?.chainBlockHeight === null);
 
+// ---- The key of WalletSessions ------------------------------------------------
 {
-    const blockCols = new Set(after.prepare('PRAGMA table_info("midnight_Blocks")').all().map(r => r.name));
-    ok('delta 0.25: Blocks gained stateRoot', blockCols.has('stateRoot'), [...blockCols].join(','));
-    const block = after.prepare("SELECT stateRoot, ledgerParameters FROM midnight_Blocks WHERE ID = 'block-legacy'").get();
-    ok('delta 0.25: the state root moved out of ledgerParameters into stateRoot',
-        block?.stateRoot === '0xstaterootvalue' && block?.ledgerParameters === null, JSON.stringify(block));
-    const blockSql = after.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='midnight_Blocks'").get()?.sql ?? '';
-    ok('delta 0.25: ledgerParameters is no longer NOT NULL',
-        !/ledgerParameters[^,]*NOT NULL/i.test(blockSql), blockSql);
-    ok('delta 0.41: Blocks gained slot', blockCols.has('slot'), [...blockCols].join(','));
+    const cols = columnsOf('midnight_WalletSessions');
+    const key = [...cols.values()].filter(c => c.pk > 0).map(c => c.name).join(',');
+    ok('a wallet session is keyed by its session id, the former key column is gone', key === 'sessionId' && !cols.has('ID'), `${key} | ${[...cols.keys()].join(',')}`);
+    const unique = after.prepare("SELECT count(*) AS n FROM pragma_index_list('midnight_WalletSessions') WHERE origin = 'u'").get()?.n;
+    ok('the unique constraint the key replaces is gone', unique === 0, String(unique));
+    const session = after.prepare("SELECT userId, label FROM midnight_WalletSessions WHERE sessionId = 'sess-1'").get();
+    ok('the session row survived with its owner and label', session?.userId === 'alice' && session?.label === 'kept', JSON.stringify(session));
 }
 
+// ---- A number column that became text, rebuilt with the operator's index and trigger ----
 {
-    const actionCols = new Set(after.prepare('PRAGMA table_info("midnight_ContractActions")').all().map(r => r.name));
-    ok('delta 0.25: ContractActions gained actionIndex on an EXISTING table',
-        actionCols.has('actionIndex'), [...actionCols].join(','));
-
-    const txCols = new Set(after.prepare('PRAGMA table_info("midnight_Transactions")').all().map(r => r.name));
-    ok('delta 0.25: the ledger tx hash and the decode columns were added to an EXISTING Transactions table',
-        ['ledgerTxHash', 'payloadDecode', 'zswapInputCount', 'zswapOutputCount', 'zswapTransientCount',
-            'dustSpendCount', 'dustRegistrationCount'].every(c => txCols.has(c)),
-        [...txCols].join(','));
-    const syncCols = new Set(after.prepare('PRAGMA table_info("midnight_SyncState")').all().map(r => r.name));
-    ok('delta 0.25: the two trailing-pass cursors were added to SyncState',
-        syncCols.has('lastDecodedHeight') && syncCols.has('lastSupplementedHeight'), [...syncCols].join(','));
-    ok('delta 0.33: the identifier backfill marker was added to SyncState', syncCols.has('identifiersBackfilledAt'), [...syncCols].join(','));
-    ok('delta 0.41: the author backfill cursor and marker were added to SyncState',
-        syncCols.has('authorBackfillHeight') && syncCols.has('authorsBackfilledAt'), [...syncCols].join(','));
-    ok('delta 0.42: the open reindex target was added to SyncState', syncCols.has('reindexTargetHeight'), [...syncCols].join(','));
+    const cols = columnsOf('midnight_PredicateAttestations');
+    const large = after.prepare("SELECT threshold, typeof(threshold) AS stored FROM midnight_PredicateAttestations WHERE ID = 'pa-max'").get();
+    ok('the threshold column is text now and keeps a large value exactly',
+        /char/i.test(cols.get('threshold')?.type ?? '') && large?.stored === 'text' && large?.threshold === '9223372036854775807', `${cols.get('threshold')?.type} ${JSON.stringify(large)}`);
+    ok('PredicateAttestations gained k and the owner columns, empty on an existing row',
+        ['k', 'userId', 'sessionId'].every(c => cols.has(c)) && after.prepare("SELECT userId FROM midnight_PredicateAttestations WHERE ID = 'pa-1'").get()?.userId === null);
+    const master = after.prepare("SELECT type, name FROM sqlite_master WHERE tbl_name = 'midnight_PredicateAttestations' AND type IN ('index','trigger')").all();
+    ok('the operator index survived the rebuild', master.some(m => m.type === 'index' && m.name === 'operator_pa_payload_idx'), JSON.stringify(master));
+    ok('the operator trigger survived the rebuild', master.some(m => m.type === 'trigger' && m.name === 'operator_pa_touch'), JSON.stringify(master));
 }
 
+// ---- The chain position ----------------------------------------------------------
 {
-    const utxoSql = after.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='midnight_UnshieldedUtxos'").get()?.sql ?? '';
-    ok('delta 0.25: the UTXO unique key is the intent output, not the transaction',
-        /UNIQUE\s*\(\s*intentHash\s*,\s*outputIndex\s*\)/i.test(utxoSql), utxoSql);
-    // This legacy database still carries a pre-0.23.0 lossy Transactions.raw,
-    // so the envelope-derived cleanup above drops its UTXO rows on purpose.
-    ok('delta 0.25: the pre-0.23.0 UTXO row was cleared for a re-index',
-        after.prepare("SELECT count(*) AS n FROM midnight_UnshieldedUtxos").get()?.n === 0);
+    const placeOf = (table, id) => { const r = after.prepare(`SELECT blockHeight, indexInBlock FROM ${table} WHERE ID = ?`).get(id); return `${r?.blockHeight}.${r?.indexInBlock}`; };
+    const places = [placeOf('midnight_Transactions', 'tx-7'), placeOf('midnight_ContractActions', 'ca-index'), placeOf('midnight_UnshieldedUtxos', 'utxo-7')];
+    ok('a transaction, its action and its UTXO carry their place in the chain', places.join(',') === '7.2,7.2,7.2', places.join(','));
+    const circuits = ['ca-index', 'ca-named'].map(id => String(after.prepare('SELECT circuit FROM midnight_ContractActions WHERE ID = ?').get(id)?.circuit)).join(',');
+    ok('a pallet call index kept as the circuit is cleared, a circuit name stays', circuits === 'null,attest', circuits);
+    const ngIdx = after.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'ng_%'").all().map(r => r.name);
+    const chainIdx = ngIdx.filter(n => /transactions|contractactions|unshieldedutxos/.test(n));
+    ok('the position indexes are there and none sorts a chain table by its insert time',
+        chainIdx.filter(n => n.endsWith('_position')).length === 8 && !chainIdx.some(n => n.includes('createdat')), chainIdx.join(','));
 }
 
+// ---- Views of the current model ---------------------------------------------------
 {
-    const notNull = (table, col) => after.prepare(`PRAGMA table_info("${table}")`).all().find(r => r.name === col)?.notnull === 1;
-    ok('delta: tightened status/attempt/maxAttempts are NOT NULL on an EXISTING BackgroundJobs table',
-        ['status', 'attempt', 'maxAttempts'].every(c => notNull('midnight_BackgroundJobs', c)));
-    const job = after.prepare("SELECT status, attempt, maxAttempts FROM midnight_BackgroundJobs WHERE ID = 'job-null'").get();
-    ok('delta: a NULL job row takes the column defaults',
-        job?.status === 'pending' && job?.attempt === 0 && job?.maxAttempts === 1, JSON.stringify(job));
-    ok('delta: a set job status survives the tightening',
-        after.prepare("SELECT status FROM midnight_BackgroundJobs WHERE ID = 'job-legacy'").get()?.status === 'succeeded');
-    ok('delta: PendingSubmissions.status is NOT NULL, a NULL row reads pending',
-        notNull('midnight_PendingSubmissions', 'status')
-        && after.prepare("SELECT status FROM midnight_PendingSubmissions WHERE ID = 'sub-null'").get()?.status === 'pending');
+    const view = after.prepare('PRAGMA table_info("NightgateService_Transactions")').all().map(r => r.name);
+    ok('the service views carry the new names', ['indexInBlock', 'extrinsicHash', 'txHash'].every(c => view.includes(c)) && !view.includes('ledgerTxHash'), view.join(','));
+    const jobsView = after.prepare('PRAGMA table_info("NightgateAdminService_BackgroundJobs")').all().map(r => r.name);
+    ok('the admin job view keeps what an operator needs and leaves the payloads out',
+        jobsView.includes('status') && jobsView.includes('txId') && !jobsView.includes('command') && !jobsView.includes('request'), jobsView.join(','));
 }
-
-const jobsView = after.prepare(
-    "SELECT type FROM sqlite_master WHERE name = 'NightgateAdminService_BackgroundJobs'"
-).get();
-ok('delta 0.20: the admin BackgroundJobs projection exists as a view', jobsView?.type === 'view');
-const jobsViewCols = after.prepare('PRAGMA table_info("NightgateAdminService_BackgroundJobs")').all().map(r => r.name);
-ok('delta 0.20: the projection excludes the payload carriers',
-    jobsViewCols.length > 0
-    && !jobsViewCols.includes('command')
-    && !jobsViewCols.includes('request')
-    && !jobsViewCols.includes('result'),
-    jobsViewCols.join(','));
-ok('delta 0.20: the projection keeps what an operator needs',
-    jobsViewCols.includes('status') && jobsViewCols.includes('errorCode') && jobsViewCols.includes('errorMessage'),
-    jobsViewCols.join(','));
-
-{
-    const dgCols = new Map(after.prepare('PRAGMA table_info("midnight_DisclosureGrants")').all().map(r => [r.name, r]));
-    ok('delta 0.24: attesterId and changedAtHeight added to an EXISTING DisclosureGrants table',
-        dgCols.has('attesterId') && dgCols.has('changedAtHeight'), [...dgCols.keys()].join(','));
-    const dgRow = after.prepare("SELECT * FROM midnight_DisclosureGrants WHERE ID = 'dg-legacy'").get();
-    ok('delta 0.24: the legacy grant survived the rebuild with a null attester',
-        dgRow?.payloadHash === 'p1' && dgRow?.level === 1 && dgRow?.attesterId === null, JSON.stringify(dgRow));
-    const dgSql = after.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='midnight_DisclosureGrants'").get()?.sql ?? '';
-    ok('delta 0.24: the unique key includes the attester', /UNIQUE\s*\(\s*contractAddress\s*,\s*attesterId\s*,\s*payloadHash\s*,\s*grantee\s*\)/i.test(dgSql), dgSql);
-}
-
 after.close();
 
+// ---- A second run changes nothing ------------------------------------------------
 {
-    const rw = new DatabaseSync(dbPath);
-    const insert = rw.prepare('INSERT INTO midnight_DisclosureGrants (ID, payloadHash, attesterId, grantee, level, contractAddress) VALUES (?, ?, ?, ?, 1, ?)');
-    let twoAttesters = true;
-    try {
-        insert.run('dg-a1', 'p2', 'a1', 'g2', 'c1');
-        insert.run('dg-a2', 'p2', 'a2', 'g2', 'c1');
-    } catch (err) {
-        twoAttesters = false;
-        console.error(err.message);
-    }
-    ok('delta 0.24: two attesters can grant the same payload to the same grantee', twoAttesters);
-    let duplicateRefused = false;
-    try { insert.run('dg-a1-dup', 'p2', 'a1', 'g2', 'c1'); } catch { duplicateRefused = true; }
-    ok('delta 0.24: the same attester cannot grant twice', duplicateRefused);
-    rw.close();
-}
-
-// A second run on the migrated database must change nothing. The cleanup above is only for rows in the old binary format.
-{
-    const rw = new DatabaseSync(dbPath);
-    rw.exec(`
-        INSERT INTO midnight_Transactions (ID, transactionId, hash, protocolVersion, transactionType, raw, contractAddress, senderAddress, receiverAddress, nightAmount)
-        VALUES ('tx-current', 7, 'c0ffee', 1, 'REGULAR', x'0c040a00', 'c1c1', 'mn_addr_preprod1sender', 'mn_addr_preprod1receiver', '5');
-        INSERT INTO midnight_ContractActions (ID, actionIndex, address, actionType, state, transaction_ID)
-        VALUES ('ca-current', 0, 'c1c1', 'CALL', x'6d69646e69676874', 'tx-current');
-        INSERT INTO midnight_UnshieldedUtxos (ID, owner, tokenType, value, intentHash, outputIndex, initialNonce, createdAtTransaction_ID)
-        VALUES ('utxo-current', 'mn_addr_preprod1current', '00', '100', 'intent-current', 0, 'nonce-current', 'tx-current');
-        INSERT INTO midnight_NightBalances (address, balance) VALUES ('mn_addr_preprod1current', 100);
-    `);
-    rw.close();
-    execFileSync(process.execPath, [path.join(repoRoot, 'scripts/apply-schema-delta.mjs'), dbPath], { cwd: repoRoot, stdio: 'inherit' });
+    const secondRun = execFileSync(process.execPath, [tool, dbPath], { cwd: repoRoot }).toString();
+    process.stdout.write(secondRun);
+    ok('a second run renames no column and rebuilds no table', secondRun.includes('0 columns renamed') && secondRun.includes(', 0 rebuilt,'), secondRun.trim().split('\n').at(-1));
     const again = new DatabaseSync(dbPath, { readOnly: true });
-    const action = again.prepare("SELECT hex(state) AS state, address FROM midnight_ContractActions WHERE ID = 'ca-current'").get();
-    ok('second run: a stored contract state and its address stay', action?.state === '6D69646E69676874' && action?.address === 'c1c1', JSON.stringify(action));
-    const tx = again.prepare("SELECT hex(raw) AS raw, contractAddress, senderAddress, receiverAddress, nightAmount FROM midnight_Transactions WHERE ID = 'tx-current'").get();
-    ok('second run: a transaction keeps its bytes, addresses and amount',
-        tx?.raw === '0C040A00' && tx?.contractAddress === 'c1c1' && tx?.senderAddress === 'mn_addr_preprod1sender'
-            && tx?.receiverAddress === 'mn_addr_preprod1receiver' && String(tx?.nightAmount) === '5', JSON.stringify(tx));
-    ok('second run: the UTXO stays', again.prepare("SELECT count(*) AS n FROM midnight_UnshieldedUtxos WHERE ID = 'utxo-current'").get()?.n === 1);
-    ok('second run: the NIGHT balance stays', again.prepare("SELECT count(*) AS n FROM midnight_NightBalances").get()?.n === 1);
+    const job = again.prepare("SELECT txId, txHash FROM midnight_BackgroundJobs WHERE ID = 'job-1'").get();
+    ok('a second run keeps the rows as they are', job?.txId === '00identifier' && job?.txHash === 'cdcd', JSON.stringify(job));
     again.close();
 }
 
 rmSync(dir, { recursive: true, force: true });
 
 console.log();
-console.log(failures === 0 ? 'Schema-delta migration verified against a synthetic legacy database.' : `${failures} failure(s).`);
+console.log(failures === 0 ? 'Schema delta verified on a database of the last release.' : `${failures} failure(s).`);
 process.exit(failures === 0 ? 0 : 1);

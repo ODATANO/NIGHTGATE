@@ -1,7 +1,7 @@
 // Runs contract jobs: deploys, circuit calls, batches and the proof steps of workflows.
 // SPDX-License-Identifier: Apache-2.0
 import cds from '@sap/cds';
-import { assertArtifactGeneration } from '../contract-registry';
+import { assertArtifactGeneration, workerRegistration } from '../contract-registry';
 import { resolveFeeSponsor, ensureFeeSponsorFacade } from '../fee-sponsor';
 import { coerceCircuitArgs } from '../arg-coercion';
 import { getNightgateConfig } from '../../utils/nightgate-config';
@@ -21,8 +21,8 @@ const { UPDATE, SELECT } = cds.ql;
 /** What a workflow reads from a finished child call. */
 type ChildCall = Pick<CallResult, 'txHash'>;
 
-function hasArtifactRef(command: unknown): command is { compiledArtifactRef: string; artifactDigest?: string } {
-    return !!command && typeof command === 'object' && typeof (command as { compiledArtifactRef?: unknown }).compiledArtifactRef === 'string';
+function hasContractName(command: unknown): command is { contractName: string; artifactDigest?: string } {
+    return !!command && typeof command === 'object' && typeof (command as { contractName?: unknown }).contractName === 'string';
 }
 
 export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' | 'walletFactory' | 'contractResolver' | 'submitterFactory' | 'argTypesLoader' | 'confirmedDisclosureLevel' | 'heightStamp' | 'notNewerThan' | 'clearPendingDisclosureLevel' | 'reindexAfterSubmit' | 'buildSubmitterDeps'>) {
@@ -41,8 +41,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         // A contract name can later point to another build. Refuse to run if the build
         // differs from the one the command was created for, or if no digest was stored.
         const provenance = command as ContractCommandV1WithProvenance;
-        if (hasArtifactRef(provenance)) {
-            assertArtifactGeneration(provenance.compiledArtifactRef, provenance.artifactDigest, `Persisted '${command.op}' command of job ${job.ID}`);
+        if (hasContractName(provenance)) {
+            assertArtifactGeneration(provenance.contractName, provenance.artifactDigest, `Persisted '${command.op}' command of job ${job.ID}`);
         }
         // Read the agent grant again when the job runs. Step jobs carry the parent's grant.
         // A grant revoked, expired or narrowed after the job was queued stops it.
@@ -66,7 +66,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         const parentArtifactDigest = provenance.artifactDigest;
         const runChild = <T,>(args: Parameters<typeof runChildCommand>[0]): Promise<T> => runChildCommand<T>({
             ...args,
-            command: hasArtifactRef(args.command) && args.command.artifactDigest === undefined
+            command: hasContractName(args.command) && args.command.artifactDigest === undefined
                 ? { ...args.command, artifactDigest: parentArtifactDigest }
                 : args.command
         });
@@ -76,14 +76,14 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 await runChild({
                     parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRoot', commandVersion: 1,
                     request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHash },
-                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', contractName: command.contractName, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
             const proof = await runChild<ChildCall>({
                 parent: job, kind: 'fieldPredicateProof', step: 'proveFieldPredicate', commandVersion: 1,
                 request: { circuit: 'proveFieldPredicate', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
-                    op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldPredicate', compiledArtifactRef: command.compiledArtifactRef,
+                    op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldPredicate', contractName: command.contractName,
                     args: [await computeRecordKey(command.attesterId, command.payloadHash), command.fieldKey, command.threshold, String(command.opCode), String(claimValidUntil(command.validUntil))],
                     merkleProof: { fieldValue: command.value, fieldSalt: command.salt, siblings: command.siblings, dirs: command.dirs }, sponsorSessionId: command.sponsorSessionId
                 }
@@ -103,7 +103,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 await runChild({
                     parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRoot', commandVersion: 1,
                     request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHash },
-                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', contractName: command.contractName, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
             // The digest is a public circuit argument. Only the Merkle path stays private.
@@ -111,7 +111,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 parent: job, kind: 'fieldEqualityProof', step: 'proveFieldEquality', commandVersion: 1,
                 request: { circuit: 'proveFieldEquality', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
-                    op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldEquality', compiledArtifactRef: command.compiledArtifactRef,
+                    op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldEquality', contractName: command.contractName,
                     args: [await computeRecordKey(command.attesterId, command.payloadHash), command.fieldKey, command.expectedDigest, String(claimValidUntil(command.validUntil))],
                     merkleProof: { fieldSalt: command.salt, siblings: command.siblings, dirs: command.dirs }, sponsorSessionId: command.sponsorSessionId
                 }
@@ -131,14 +131,14 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 await runChild({
                     parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRoot', commandVersion: 1,
                     request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHash },
-                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', contractName: command.contractName, args: [command.payloadHash, command.contentRoot, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
             const proof = await runChild<ChildCall>({
                 parent: job, kind: 'fieldMembershipProof', step: 'proveFieldMembership', commandVersion: 1,
                 request: { circuit: 'proveFieldMembership', payloadHash: command.payloadHash, fieldKey: command.fieldKey },
                 command: {
-                    op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldMembership', compiledArtifactRef: command.compiledArtifactRef,
+                    op: 'call', contractAddress: command.contractAddress, circuit: 'proveFieldMembership', contractName: command.contractName,
                     args: [await computeRecordKey(command.attesterId, command.payloadHash), command.fieldKey, command.setRoot, String(claimValidUntil(command.validUntil))],
                     merkleProof: {
                         fieldDigest: command.valueDigest, fieldSalt: command.salt,
@@ -165,14 +165,14 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 await runChild({
                     parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRootA', commandVersion: 1,
                     request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHashA },
-                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHashA, command.contentRootA, command.schemaId], sponsorSessionId: command.sponsorSessionId }
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', contractName: command.contractName, args: [command.payloadHashA, command.contentRootA, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
             if (command.contentRootB) {
                 await runChild({
                     parent: job, kind: 'fieldAnchorRoot', step: 'anchorContentRootB', commandVersion: 1,
                     request: { circuit: 'anchorContentRoot', payloadHash: command.payloadHashB },
-                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', compiledArtifactRef: command.compiledArtifactRef, args: [command.payloadHashB, command.contentRootB, command.schemaId], sponsorSessionId: command.sponsorSessionId }
+                    command: { op: 'call', contractAddress: command.contractAddress, circuit: 'anchorContentRoot', contractName: command.contractName, args: [command.payloadHashB, command.contentRootB, command.schemaId], sponsorSessionId: command.sponsorSessionId }
                 });
             }
             const recordKeyA = await computeRecordKey(command.attesterIdA, command.payloadHashA);
@@ -185,7 +185,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                     parent: job, kind: 'documentIntegrityProof', step: 'proveDocumentComparison-integrity', commandVersion: 1,
                     request: { circuit: 'proveDocumentComparison', mode: 'integrity', payloadHashA: command.payloadHashA, payloadHashB: command.payloadHashB },
                     command: {
-                        op: 'call', contractAddress: command.contractAddress, circuit: 'proveDocumentComparison', compiledArtifactRef: command.compiledArtifactRef,
+                        op: 'call', contractAddress: command.contractAddress, circuit: 'proveDocumentComparison', contractName: command.contractName,
                         args: [recordKeyA, recordKeyB, '0', String(command.allowedMask), '1', String(claimValidUntil(command.validUntil))],
                         merkleProof: { docPair: { schema: command.schema, openingA: command.openingA, openingB: command.openingB } }, sponsorSessionId: command.sponsorSessionId
                     }
@@ -194,7 +194,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                     parent: job, kind: 'documentDiffProof', step: 'proveDocumentComparison-diff', commandVersion: 1,
                     request: { circuit: 'proveDocumentComparison', mode: 'diff', payloadHashA: command.payloadHashA, payloadHashB: command.payloadHashB },
                     command: {
-                        op: 'call', contractAddress: command.contractAddress, circuit: 'proveDocumentComparison', compiledArtifactRef: command.compiledArtifactRef,
+                        op: 'call', contractAddress: command.contractAddress, circuit: 'proveDocumentComparison', contractName: command.contractName,
                         args: [recordKeyA, recordKeyB, '1', '0', String(command.k), String(claimValidUntil(command.validUntil))],
                         merkleProof: { docPair: { schema: command.schema, openingA: command.openingA, openingB: command.openingB } }, sponsorSessionId: command.sponsorSessionId
                     }
@@ -262,7 +262,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 request: { circuits: calls.map(c => c.circuit), payloadHash: command.payloadHash, claimCount: command.claims.length },
                 // The claims do not depend on each other, so their order is free.
                 // Only a contentRoot call in the batch must stay first.
-                command: { op: 'callBatch', contractAddress: command.contractAddress, calls, compiledArtifactRef: command.compiledArtifactRef, sponsorSessionId: command.sponsorSessionId, independentCalls: true, orderedPrefix: calls[0]?.circuit === 'anchorContentRoot' ? 1 : 0 }
+                command: { op: 'callBatch', contractAddress: command.contractAddress, calls, contractName: command.contractName, sponsorSessionId: command.sponsorSessionId, independentCalls: true, orderedPrefix: calls[0]?.circuit === 'anchorContentRoot' ? 1 : 0 }
             });
             // Update all rows in one statement. The transaction is on chain, so no row may be missed.
             const provenAtBatch = new Date().toISOString();
@@ -290,7 +290,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
         // The resolver checks the digest against the exact copy it loads,
         // so a parallel registerContract cannot swap the contract in between.
         const resolved = await contractResolver(
-            command.compiledArtifactRef,
+            command.contractName,
             (command as ContractCommandV1WithProvenance).artifactDigest);
         const wallet = await walletFactory({
             sessionId: job.sessionId, db, facadeConfig: facadeCfg, expectedUserId: job.requestedBy
@@ -304,13 +304,13 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
 
         if (command.op === 'deploy') {
             const result = await submitter.deploy({
-                contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                contractName: command.contractName,
+                registration: workerRegistration(resolved),
                 initialPrivateState: command.initialPrivateState,
                 sessionId: job.sessionId,
                 ...(command.recoveryId ? { recoveryId: command.recoveryId } : {})
             });
-            return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+            return { submissionId: result.submissionId, txId: result.txId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
         if (command.op === 'anchorDocument') {
@@ -318,18 +318,18 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 contractAddress: command.contractAddress,
                 circuit: 'attest',
                 args: [hexToBytes(command.payloadHash), hexToBytes(command.metadataHash)],
-                contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                contractName: command.contractName,
+                registration: workerRegistration(resolved),
                 sessionId: job.sessionId
             });
             const anchoredAt = new Date().toISOString();
-            await db.run(UPDATE.entity(Documents).set({ anchoredTxHash: result.txHash, anchoredAt, modifiedAt: anchoredAt }).where({ ID: command.documentId }));
-            return { documentId: command.documentId, attestationId: command.payloadHash, attesterId: command.attesterId ?? null, txHash: result.txHash, anchoredAt, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+            await db.run(UPDATE.entity(Documents).set({ anchoredTxHash: result.txHash, anchoredAt, modifiedAt: anchoredAt }).where({ ID: command.anchorId }));
+            return { anchorId: command.anchorId, attestationId: command.payloadHash, attesterId: command.attesterId ?? null, txId: result.txId, txHash: result.txHash, anchoredAt, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
         if (command.op === 'grantDisclosure' || command.op === 'revokeDisclosure') {
             const isGrant = command.op === 'grantDisclosure';
-            let result: { txHash: string; blockHeight?: number | null };
+            let result: { txId: string; txHash: string; blockHeight?: number | null };
             try {
                 result = await submitter.call({
                     contractAddress: command.contractAddress,
@@ -337,8 +337,8 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                     args: isGrant
                         ? [hexToBytes(command.payloadHash), hexToBytes(command.grantee), BigInt(command.level)]
                         : [hexToBytes(command.payloadHash), hexToBytes(command.grantee)],
-                    contractName: command.compiledArtifactRef,
-                    registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                    contractName: command.contractName,
+                    registration: workerRegistration(resolved),
                     sessionId: job.sessionId
                 });
             } catch (err) {
@@ -353,24 +353,24 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                     .set(confirmedDisclosureLevel(command.level, result.txHash, changedAt, landed))
                     .where({ ID: command.disclosureGrantId }), landed));
             } else {
-                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ revokedTxHash: result.txHash, active: false, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.payloadHash, grantee: command.grantee }), landed));
+                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ revokedTxHash: result.txHash, isActive: false, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.payloadHash, grantee: command.grantee }), landed));
             }
-            await reindexAfterSubmit(command.contractAddress, resolved, landed, job, command.compiledArtifactRef);
-            return { ...(isGrant ? { disclosureGrantId: command.disclosureGrantId, level: command.level } : {}), payloadHash: command.payloadHash, grantee: command.grantee, txHash: result.txHash };
+            await reindexAfterSubmit(command.contractAddress, resolved, landed, job, command.contractName);
+            return { ...(isGrant ? { disclosureGrantId: command.disclosureGrantId, level: command.level } : {}), payloadHash: command.payloadHash, grantee: command.grantee, txId: result.txId, txHash: result.txHash };
         }
 
-        if (command.op === 'registerPassport') {
+        if (command.op === 'registerDocument') {
             // Mode 0 registers the id, 1 removes it, 2 hands the registrar role to someone else.
             // In modes 3 and 4 the recovery identity sets a new registrar or a new recovery identity.
             const result = await submitter.call({
                 contractAddress: command.contractAddress,
                 circuit: 'registerDocument',
-                args: [BigInt(command.mode ?? 0), hexToBytes(command.passportId), hexToBytes(command.ownerId)],
-                contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                args: [BigInt(command.mode ?? 0), hexToBytes(command.documentId), hexToBytes(command.ownerId)],
+                contractName: command.contractName,
+                registration: workerRegistration(resolved),
                 sessionId: job.sessionId
             });
-            return { passportId: command.passportId, documentId: command.passportId, ownerId: command.ownerId, mode: command.mode ?? 0, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+            return { documentId: command.documentId, ownerId: command.ownerId, mode: command.mode ?? 0, contractAddress: command.contractAddress, txId: result.txId, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
         if (command.op === 'retract') {
@@ -378,18 +378,18 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                 contractAddress: command.contractAddress,
                 circuit: 'retract',
                 args: [BigInt(command.mode), hexToBytes(command.key)],
-                contractName: command.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                contractName: command.contractName,
+                registration: workerRegistration(resolved),
                 sessionId: job.sessionId
             });
             if (command.mode === 0) {
                 // Retracting the attestation also removed its disclosure grants on-chain.
                 const changedAt = new Date().toISOString();
                 const landed = result.blockHeight ?? null;
-                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ active: false, revokedTxHash: result.txHash, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.key, active: true }), landed));
-                await reindexAfterSubmit(command.contractAddress, resolved, landed, job, command.compiledArtifactRef);
+                await db.run(notNewerThan(UPDATE.entity(DisclosureGrants).set({ isActive: false, revokedTxHash: result.txHash, modifiedAt: changedAt, ...heightStamp(landed) }).where({ contractAddress: command.contractAddress, attesterId: command.attesterId, payloadHash: command.key, isActive: true }), landed));
+                await reindexAfterSubmit(command.contractAddress, resolved, landed, job, command.contractName);
             }
-            return { mode: command.mode, key: command.key, contractAddress: command.contractAddress, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+            return { mode: command.mode, key: command.key, contractAddress: command.contractAddress, txId: result.txId, txHash: result.txHash, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
         if (command.op === 'callBatch') {
@@ -401,7 +401,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
                         : (c.circuit === 'proveFieldEquality' || c.circuit === 'proveFieldMembership')
                             ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), hexToBytes(String(c.args[2])), BigInt(String(c.args[3]))]
                             : c.circuit === 'proveDocumentComparison'
-                                ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), expandAllowedMask(Number(c.args[3]), vaultDims(command.compiledArtifactRef).width), BigInt(String(c.args[4])), BigInt(String(c.args[5]))]
+                                ? [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), expandAllowedMask(Number(c.args[3]), vaultDims(command.contractName).width), BigInt(String(c.args[4])), BigInt(String(c.args[5]))]
                             : [hexToBytes(String(c.args[0])), hexToBytes(String(c.args[1])), BigInt(String(c.args[2])), BigInt(String(c.args[3])), BigInt(String(c.args[4]))];
                     return { circuit: c.circuit, args, merkleProof: c.merkleProof };
                 }
@@ -411,26 +411,26 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
             const result = await submitter.callBatch({
                 contractAddress: command.contractAddress,
                 calls: coercedCalls,
-                contractName: command.compiledArtifactRef,
+                contractName: command.contractName,
                 initialPrivateState: command.initialPrivateState,
                 merkleProof: command.merkleProof,
-                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                registration: workerRegistration(resolved),
                 sessionId: job.sessionId,
                 independentCalls: command.independentCalls,
                 orderedPrefix: command.orderedPrefix
             });
-            return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, circuits: result.circuits, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+            return { submissionId: result.submissionId, txId: result.txId, txHash: result.txHash, contractAddress: result.contractAddress, circuits: result.circuits, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
         }
 
         if ((command as { op: string }).op === 'buildSponsorable') {
             // Build, sign and finalize with the caller's keys. No sponsor and no submit.
-            const c = command as unknown as { contractAddress: string; circuit: string; compiledArtifactRef: string; args: unknown[] };
+            const c = command as unknown as { contractAddress: string; circuit: string; contractName: string; args: unknown[] };
             const argTypes = argTypesLoader(resolved.zkConfigPath, c.circuit);
             const coerced = coerceCircuitArgs(c.args, argTypes);
             const out = await submitter.buildSponsorable({
                 contractAddress: c.contractAddress, circuit: c.circuit, args: coerced,
-                contractName: c.compiledArtifactRef,
-                registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+                contractName: c.contractName,
+                registration: workerRegistration(resolved),
                 sessionId: job.sessionId
             });
             return { ...out, contractAddress: c.contractAddress, circuit: c.circuit };
@@ -445,7 +445,7 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
             coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), hexToBytes(String(command.args[2])), BigInt(String(command.args[3]))];
         } else if (job.kind === 'documentIntegrityProof' || job.kind === 'documentDiffProof') {
             // The circuit takes the mask as Vector<width, Boolean>, built from the integer.
-            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), expandAllowedMask(Number(command.args[3]), vaultDims(command.compiledArtifactRef).width), BigInt(String(command.args[4])), BigInt(String(command.args[5]))];
+            coercedArgs = [hexToBytes(String(command.args[0])), hexToBytes(String(command.args[1])), BigInt(String(command.args[2])), expandAllowedMask(Number(command.args[3]), vaultDims(command.contractName).width), BigInt(String(command.args[4])), BigInt(String(command.args[5]))];
         } else {
             const argTypes = argTypesLoader(resolved.zkConfigPath, command.circuit);
             coercedArgs = coerceCircuitArgs(command.args, argTypes);
@@ -454,13 +454,13 @@ export function createContractCommandExecutor(ctx: Pick<SubmissionContext, 'db' 
             contractAddress: command.contractAddress,
             circuit: command.circuit,
             args: coercedArgs,
-            contractName: command.compiledArtifactRef,
+            contractName: command.contractName,
             initialPrivateState: command.initialPrivateState,
             merkleProof: command.merkleProof,
-            registration: { artifactPath: resolved.artifactPath, artifactDigest: resolved.artifactDigest, privateStateId: resolved.privateStateId, zkConfigPath: resolved.zkConfigPath, ...(resolved.slotWidth !== undefined ? { slotWidth: resolved.slotWidth } : {}) },
+            registration: workerRegistration(resolved),
             sessionId: job.sessionId
         });
-        return { submissionId: result.submissionId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
+        return { submissionId: result.submissionId, txId: result.txId, txHash: result.txHash, contractAddress: result.contractAddress, status: result.status, ...(sponsor ? { feeSponsor: sponsor.sponsorSessionId } : {}) };
     };
     return executeContractCommand;
 }

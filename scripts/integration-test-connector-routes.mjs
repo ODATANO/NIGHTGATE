@@ -40,20 +40,9 @@ try {
 }
 
 // --- Register the same contracts the default config ships ------------------
-const { resolveContractPackage } = await import('@odatano/contract-kit/node');
-const counterPkg = resolveContractPackage('@odatano/contract-counter', repoRoot);
-const vaultPkg   = resolveContractPackage('@odatano/contract-attestation-vault', repoRoot);
 registry.clearRegistry();
-registry.registerContract('counter', {
-    artifactPath: counterPkg.artifactPath,
-    privateStateId: 'counterPrivateState',
-    zkConfigPath: counterPkg.zkConfigPath
-});
-registry.registerContract('attestation-vault', {
-    artifactPath: vaultPkg.artifactPath,
-    privateStateId: 'attestationVaultPrivateState',
-    zkConfigPath: vaultPkg.zkConfigPath
-});
+registry.registerContract('counter', registry.registrationFromPackage('@odatano/contract-counter', repoRoot));
+registry.registerContract('attestation-vault', registry.registrationFromPackage('@odatano/contract-attestation-vault', repoRoot));
 
 // --- Mount on a bare Express app + listen on an ephemeral port -------------
 const app = express();
@@ -77,8 +66,8 @@ try {
     ok('manifest: attestation-vault listed', !!byName['attestation-vault']);
 
     const vault = byName['attestation-vault'] || {};
-    ok('manifest: vault artifactRef set', vault.artifactRef === '@odatano/nightgate/browser/attestation-vault', vault.artifactRef);
-    ok('manifest: counter has NO artifactRef (not browser-exported)', byName.counter && byName.counter.artifactRef === undefined);
+    ok('manifest: vault artifactRef set', vault.artifactRef === '@odatano/contract-attestation-vault', vault.artifactRef);
+    ok('manifest: counter artifactRef names its package', byName.counter && byName.counter.artifactRef === '@odatano/contract-counter', byName.counter?.artifactRef);
     const vc = vault.circuits || [];
     for (const c of ['attest', 'grantDisclosure', 'revokeDisclosure', 'anchorContentRoot', 'proveFieldPredicate', 'proveDocumentComparison']) {
         ok(`manifest: vault circuit "${c}" present`, vc.includes(c));

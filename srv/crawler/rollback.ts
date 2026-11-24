@@ -64,8 +64,8 @@ export async function rollbackIndexedDataFromHeight(
         };
     }
 
-    const txsToDelete = await chunked<Pick<Transaction, 'ID' | 'hash' | 'senderAddress' | 'receiverAddress'>>(blockIds, ids => tx.run(
-        SELECT.from(Transactions).columns('ID', 'hash', 'senderAddress', 'receiverAddress')
+    const txsToDelete = await chunked<Pick<Transaction, 'ID' | 'senderAddress' | 'receiverAddress'>>(blockIds, ids => tx.run(
+        SELECT.from(Transactions).columns('ID', 'senderAddress', 'receiverAddress')
             .where({ block_ID: { in: ids } })
     ));
     const txIds = txsToDelete.map(t => t.ID).filter(Boolean);
@@ -167,17 +167,17 @@ async function revertSubmissionEvidence(
     tx: DbRunner,
     fromHeight: number
 ): Promise<{ submissionsReverted: number; jobsReverted: number }> {
-    const clearedEvidence = { chainBlockHeight: null, chainBlockHash: null, indexerTxHash: null };
+    const clearedEvidence = { blockHeight: null, blockHash: null };
     const submissionsReverted = affectedRows(await tx.run(
         UPDATE.entity(PendingSubmissions)
             .set({ status: 'pending', finalizedAt: null, finalizedTxData: null, ...clearedEvidence })
-            .where({ chainBlockHeight: { '>=': fromHeight }, status: { in: ['included', 'finalized'] } })
+            .where({ blockHeight: { '>=': fromHeight }, status: { in: ['included', 'finalized'] } })
     ));
 
     const failedAttemptsReverted = affectedRows(await tx.run(
         UPDATE.entity(PendingSubmissions)
             .set({ status: 'pending', finalizedAt: null, finalizedTxData: null, errorCode: null, errorMessage: null, ...clearedEvidence })
-            .where({ chainBlockHeight: { '>=': fromHeight }, status: 'failed', errorCode: 'CHAIN_EXECUTION_FAILED' })
+            .where({ blockHeight: { '>=': fromHeight }, status: 'failed', errorCode: 'CHAIN_EXECUTION_FAILED' })
     ));
     const failedReverted = affectedRows(await tx.run(
         UPDATE.entity(BackgroundJobs)
@@ -185,12 +185,12 @@ async function revertSubmissionEvidence(
                 status: 'reconciliation_required', chainStatus: 'pending', chainFinalizedAt: null,
                 errorCode: null, errorMessage: null, finishedAt: null, chainSegments: null, ...clearedEvidence
             })
-            .where({ chainBlockHeight: { '>=': fromHeight }, status: 'failed', errorCode: 'CHAIN_EXECUTION_FAILED' })
+            .where({ blockHeight: { '>=': fromHeight }, status: 'failed', errorCode: 'CHAIN_EXECUTION_FAILED' })
     ));
     const outcomesReverted = affectedRows(await tx.run(
         UPDATE.entity(BackgroundJobs)
             .set({ chainStatus: 'pending', chainFinalizedAt: null, chainSegments: null, ...clearedEvidence })
-            .where({ chainBlockHeight: { '>=': fromHeight }, chainStatus: { in: ['success', 'failure'] } })
+            .where({ blockHeight: { '>=': fromHeight }, chainStatus: { in: ['success', 'failure'] } })
     ));
     return { submissionsReverted: submissionsReverted + failedAttemptsReverted, jobsReverted: failedReverted + outcomesReverted };
 }
@@ -281,29 +281,7 @@ export async function computeNightBalance(tx: DbRunner, address: string): Promis
 export async function recomputeNightBalance(tx: DbRunner, address: string): Promise<void> {
     const figures = await computeNightBalance(tx, address);
     if (!figures) {
-        const existing = await tx.run(
-            SELECT.one.from(NightBalances)
-                .columns('address', 'dustAddress', 'isDustRegistered')
-                .where({ address })
-        );
-        if (!existing) return;
-        if (existing.dustAddress || existing.isDustRegistered) {
-            await tx.run(
-                UPDATE.entity(NightBalances).set({
-                    balance: '0',
-                    utxoCount: 0,
-                    txSentCount: 0,
-                    txReceivedCount: 0,
-                    totalSent: '0',
-                    totalReceived: '0',
-                    firstSeenHeight: null,
-                    lastActivityHeight: null,
-                    lastUpdatedAt: new Date().toISOString()
-                }).where({ address })
-            );
-        } else {
-            await tx.run(DELETE.from(NightBalances).where({ address }));
-        }
+        await tx.run(DELETE.from(NightBalances).where({ address }));
         return;
     }
 

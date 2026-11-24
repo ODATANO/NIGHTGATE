@@ -7,7 +7,7 @@ export const REJECTED_ATTEMPT_BOOKKEEPING_PENDING = 'REJECTED_ATTEMPT_BOOKKEEPIN
 
 export class SponsorAttemptBookkeepingPendingError extends Error {
     readonly code = REJECTED_ATTEMPT_BOOKKEEPING_PENDING;
-    constructor(message: string, public readonly details: { submissionId: string; txHash?: string; grantId?: string; refund: number }) {
+    constructor(message: string, public readonly details: { submissionId: string; txId?: string; grantId?: string; refund: number }) {
         super(message);
         this.name = 'SponsorAttemptBookkeepingPendingError';
     }
@@ -15,6 +15,7 @@ export class SponsorAttemptBookkeepingPendingError extends Error {
 
 export interface ExternalSubmissionHandle {
     submissionId?: string;
+    txId?: string;
     txHash?: string;
     /** Used by markBroadcastOn only. True for the job's first broadcast, false for a rebuilt retry. */
     firstBoundary?: boolean;

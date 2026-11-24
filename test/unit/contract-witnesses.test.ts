@@ -4,7 +4,7 @@
  */
 
 import type { WitnessContext } from '@midnight-ntwrk/compact-runtime';
-import { getContractWitnessFactory, deriveTokenFactoryIssuerSecret, deriveAttestationSecret } from '../../srv/submission/contract-witnesses';
+import { getContractWitnessFactory, isVaultLineage, deriveTokenFactoryIssuerSecret, deriveAttestationSecret } from '../../srv/submission/contract-witnesses';
 
 /** The context a circuit hands a witness. Only the private state matters to these witnesses. */
 function witnessContext(privateState: unknown): WitnessContext<unknown, unknown> {
@@ -17,8 +17,19 @@ describe('getContractWitnessFactory', () => {
         expect(typeof factory).toBe('function');
     });
 
-    test('returns the factory witnesses for token-factory and its aliases; mint reads the issuer secret, nothing else does', () => {
-        const factory = getContractWitnessFactory('token-factory-preprod')!;
+    test('only the two vault packages take the deployer\'s attester id in their constructor', () => {
+        expect(['attestation-vault', 'attestation-vault-32'].map(isVaultLineage)).toEqual([true, true]);
+        expect(['attestation-vault-demo', 'token-factory', 'counter', undefined].map(isVaultLineage)).toEqual([false, false, false, false]);
+    });
+
+    test('a name that only starts like a contract package gets no witnesses', () => {
+        for (const name of ['token-factory-preprod', 'attestation-vault-demo', 'attestation-vault-v2-alias', 'toString', 'constructor', undefined]) {
+            expect(getContractWitnessFactory(name), String(name)).toBeUndefined();
+        }
+    });
+
+    test('returns the factory witnesses for token-factory; mint reads the issuer secret, nothing else does', () => {
+        const factory = getContractWitnessFactory('token-factory')!;
         expect(typeof factory).toBe('function');
         const secret = new Uint8Array(32).fill(9);
         const witnesses = factory({ issuerSecret: secret });

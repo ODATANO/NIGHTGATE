@@ -3,13 +3,13 @@ import { NightgateError, errorMessage } from '../srv/utils/errors';
 
 import { startCrawler, stopCrawler } from '../srv/crawler/index';
 import { pendingReindexHeight, startReindex } from '../srv/crawler/reindex';
-import { ensureNightgateModelLoaded } from '../srv/utils/cds-model';
 import {
     isNightgateConfigured,
     resolveNightgateRuntimeConfig,
     crawlerStartConfig,
     missingEndpointsMessage,
-    warnIfCrawlerlessChainConfirmSet,
+    warnIfRetiredSettingsSet,
+    warnIfFormerConfigKeys,
     resolveEffectiveProvingMode,
     resolveProofTimeoutMs,
     VALID_NIGHTGATE_NETWORKS,
@@ -20,26 +20,25 @@ import {
 import { loadRegistryFromConfig, listRegisteredContracts } from '../srv/submission/contract-registry';
 import { loadPersistedRegistrations } from '../srv/submission/contract-registrations';
 import { refreshLearnedTokenTypes } from '../srv/submission/learned-token-types';
+import { retireOffersForOneTaker } from '../srv/submission/swap-offers';
+import { backfillRowOwners, moveStoredDiffCounts, renameStoredActions, renameStoredErrorCodes, sortStoredTxValues } from '../srv/submission/job-store';
 import { redactUrlCredentials } from '../srv/utils/redact-url';
 import { publishRuntimeState } from '../srv/utils/runtime-state';
 import { ensureSyncStateSingleton } from '../srv/utils/sync-state';
-import { closeSessionsFromPreviousProcess } from '../srv/sessions/wallet-sessions';
+import { closeSessionsFromPreviousProcess, adoptStoredSpellings } from '../srv/sessions/wallet-sessions';
 import { getConfiguredFeeSponsorSessions, prewarmFeeSponsorPool } from '../srv/submission/fee-sponsor';
-import { affectedRows } from '../srv/utils/db-types';
 import { isNodeTransportError } from '../srv/utils/retry';
 const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
 import { stopDecodeWorker } from '../srv/midnight/decode-worker-client';
 import { wireWorkerStateSaveSink } from '../srv/submission/wallet-facade-builder';
 import { clearAllEncryptionKeys } from '../srv/submission/wallet-sync-state-store';
-import { ensureIndexes } from '../srv/utils/db-indexes';
+import { ensureIndexes, modelTables, tableColumns, KEY_CHANGES } from '../srv/utils/db-indexes';
+import { findOldStoredFormats } from '../srv/utils/old-stored-formats';
 import { installPostgresOrderNulls } from '../srv/utils/pg-order-nulls';
 import { assertStoredKeyIdsKnown } from '../srv/utils/encryption-rewrap';
 import { recoverInterruptedJobs, dropPendingJobsForClosedSessions, startBackgroundJobProcessor, stopBackgroundJobProcessor, registerChainOutcomeConfirmer } from '../srv/submission/background-jobs';
 import { createHttpTxConfirmer } from '../srv/submission/chain-outcome-confirmer';
-import { TransactionResults } from '#cds-models/midnight';
-import { backfillTransactionIdentifiers } from '../srv/crawler/transaction-identifiers';
-import { dropStoredHexPrefix } from '../srv/crawler/stored-hex-prefix';
 import {
     assertSupportedRuntimeTopology,
     UnsupportedRuntimeTopologyError
@@ -110,8 +109,7 @@ export class SchemaNotDeployedError extends NightgateError {
             `missing table or column for '${missingTable}' in ${dbPath}. ` +
             `Underlying error: ${causeMsg}. ` +
             `Fix: fresh install \`npm run deploy\`; EXISTING database ` +
-            `\`node scripts/apply-schema-delta.mjs\` (installed package: ` +
-            `\`npx nightgate-schema-delta\`; additive, keeps data; pass the db ` +
+            `\`node scripts/apply-schema-delta.mjs\` (additive, keeps data; pass the db ` +
             `path or set NIGHTGATE_DB_PATH).`
         );
     }
@@ -122,45 +120,37 @@ function resolveDbPath(): string {
     return dbCfg.database || dbCfg.url || 'db.sqlite';
 }
 
-// Only checks that tables and columns exist. It never changes the schema.
+// Checks that every table and column of the model exists. It never changes the schema.
 async function ensureSchemaDeployed(): Promise<void> {
-    const requiredTables: Array<{ table: string; columns?: string[] }> = [
-        { table: 'midnight.Blocks', columns: ['slot'] },
-        { table: 'midnight.SyncState', columns: ['authorBackfillHeight', 'authorsBackfilledAt', 'reindexTargetHeight'] },
-        { table: 'midnight.PendingSubmissions', columns: ['submitIntentData'] },
-        { table: 'midnight.TransactionResults' },
-        { table: 'midnight.PrivateStates' },
-        { table: 'midnight.ContractSigningKeys' },
-        { table: 'midnight.WalletSyncStates' },
-        { table: 'midnight.Attestations' },
-        { table: 'midnight.Documents', columns: ['userId', 'contractAddress', 'network', 'compiledArtifactRef', 'artifactDigest', 'sessionId', 'attesterId'] },
-        { table: 'midnight.PredicateAttestations', columns: ['payloadHashB', 'allowedMask', 'network', 'compiledArtifactRef', 'artifactDigest', 'attesterId', 'attesterIdB'] },
-        { table: 'midnight.DisclosureRoles' },
-        { table: 'midnight.DisclosureGrants', columns: ['pendingLevel', 'attesterId', 'changedAtHeight'] },
-        { table: 'midnight.BackgroundJobs', columns: ['chainSegments'] },
-        { table: 'midnight.WalletSessions', columns: ['label'] },
-        { table: 'midnight.AgentGrants', columns: ['allowedContracts', 'allowedCircuits', 'allowDeploy', 'maxDeploys', 'deploysUsed', 'deployedContracts', 'allowedTokenTypes', 'mintedTokenTypes', 'allowUnshieldedOffers', 'allowedUnshieldedTokenTypes', 'maxValuePerDay', 'valueUsedToday', 'valueWindow'] },
-        { table: 'midnight.SwapOffers', columns: ['takerSecretHash'] },
-        { table: 'midnight.ContractRegistrations' },
-        { table: 'midnight.ContractActions', columns: ['stateHash', 'stateSize', 'zswapStateHash', 'zswapStateSize'] },
-        { table: 'midnight.ContractStates' },
-        { table: 'midnight.InstanceLeases' }
-    ];
-
     const db = cds.db || await cds.connect.to('db');
-    const { SELECT } = cds.ql;
-
-    for (const { table, columns } of requiredTables) {
-        try {
-            await db.run(columns ? SELECT.one.from(table, columns) : SELECT.one.from(table));
-        } catch (probeErr) {
-            const what = columns ? `${table} (needs columns: ${columns.join(', ')})` : table;
-            throw new SchemaNotDeployedError(what, resolveDbPath(), probeErr);
+    const kind = String(cds.env.requires?.db?.kind ?? '');
+    const model = cds.model;
+    if (!model) throw new Error('ensureSchemaDeployed: the CDS model is not loaded');
+    for (const { entity, table, columns } of modelTables(model)) {
+        // HANA has no catalog read here, so a read of one row stands in for it.
+        if (/hana/i.test(kind)) {
+            try { await db.run(cds.ql.SELECT.one.from(entity, columns)); } catch (probeErr) {
+                throw new SchemaNotDeployedError(entity, resolveDbPath(), probeErr);
+            }
+            continue;
         }
+        const present = new Set(await tableColumns(db, kind, table));
+        const missing = columns.filter(column => !present.has(column.toLowerCase()));
+        if (missing.length === 0) continue;
+        const what = present.size === 0 ? entity : `${entity} (needs columns: ${missing.join(', ')})`;
+        throw new SchemaNotDeployedError(what, resolveDbPath(), new Error(present.size === 0 ? 'the table is missing' : 'the columns are missing'));
+    }
+    for (const change of KEY_CHANGES) {
+        if (!(await tableColumns(db, kind, change.table)).includes(change.from.toLowerCase())) continue;
+        throw new SchemaNotDeployedError(`${change.entity} (its key is ${change.to})`, resolveDbPath(), new Error(`the former key column ${change.from} is still there`));
+    }
+    const old = await findOldStoredFormats(db, kind);
+    if (old.length > 0) {
+        throw new NightgateError('SCHEMA_NOT_DEPLOYED', `The database holds rows in a format this version does not read: ${old.map(o => `${o.name} (${o.rows} rows). ${o.fix}`).join(' ')}`);
     }
 
     // Lets PostgreSQL use the secondary indexes for sorted queries. See srv/utils/pg-order-nulls.ts.
-    if (/postgres/i.test(String(cds.env.requires?.db?.kind ?? ''))) installPostgresOrderNulls();
+    if (/postgres/i.test(kind)) installPostgresOrderNulls();
 
     // Stop if a stored seed was encrypted with an unknown key, instead of treating it as missing.
     await assertStoredKeyIdsKnown(db);
@@ -172,20 +162,27 @@ async function prepareDatabase(): Promise<void> {
     const created = await ensureIndexes(db, String(cds.env.requires?.db?.kind ?? ''), msg => log.warn(msg));
     log.debug(`ensured ${created} secondary index(es)`);
 
-    const removed = await db.run(
-        cds.ql.DELETE.from(TransactionResults).where({ outcomeSource: null })
-    );
-    const removedCount = affectedRows(removed);
-    if (removedCount > 0) log.warn(`Removed ${removedCount} legacy unverified TransactionResults row(s); re-crawl historical blocks to backfill canonical outcomes`);
+    const renamed = await renameStoredActions(db);
+    if (renamed > 0) log.info(`Gave ${renamed} stored job(s) and grant(s) the current action names`);
 
-    // Rows decoded before the lookup table existed. Runs in the background, the start does not wait for it.
-    void backfillTransactionIdentifiers(db).catch(err => log.warn(`transaction identifier backfill failed: ${errorMessage(err)}`));
+    const recoded = await renameStoredErrorCodes(db);
+    if (recoded > 0) log.info(`Gave ${recoded} stored job(s) and attempt(s) the current error codes`);
+
+    const sorted = await sortStoredTxValues(db);
+    if (sorted > 0) log.info(`Sorted the transaction identifier and hash of ${sorted} row(s) stored by an older version`);
+
+    const diffCounts = await moveStoredDiffCounts(db);
+    if (diffCounts > 0) log.info(`Moved the k of ${diffCounts} stored document diff(s) from threshold to its own column`);
+
+    const owned = await backfillRowOwners(db);
+    if (owned > 0) log.info(`Recorded the owner of ${owned} proof and disclosure grant row(s) from the jobs that wrote them`);
+
+    const retiredOffers = await retireOffersForOneTaker(db);
+    if (retiredOffers > 0) log.warn(`Retired ${retiredOffers} swap offer(s) posted for one taker; the board lists only offers anyone can take`);
 }
 
 /** Starts NIGHTGATE once. Status is "offline" after a failed startup step and "idle" with block indexing off. */
 export async function initialize(): Promise<NightgateIndexerStatus> {
-    await ensureNightgateModelLoaded();
-
     const nightgateConfig = getNightgateConfig();
     if (!isNightgateConfigured(nightgateConfig)) {
         setLastStatus({
@@ -334,7 +331,6 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
     // The job reconciliation and the crawler find rows by hash, so the stored hashes get one spelling first.
     try {
         await prepareDatabase();
-        await dropStoredHexPrefix(await cds.connect.to('db'));
     } catch (err) {
         const message = errorMessage(err);
         initialized = false;
@@ -349,6 +345,14 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         });
         logStartupState('offline', 'database not prepared');
         throw err;
+    }
+
+    // Before any job or wallet opens an account: the stored viewing keys get one spelling, so one key is one account.
+    try {
+        const adopted = await adoptStoredSpellings(await cds.connect.to('db'));
+        if (adopted > 0) log.info(`Rewrote ${adopted} stored viewing key(s) to lowercase and moved their accounts`);
+    } catch (err) {
+        log.error(`Stored viewing keys were not checked for their spelling: ${errorMessage(err)}`);
     }
 
     // Jobs stopped before they sent anything are queued again. The others are checked against the chain.
@@ -412,7 +416,8 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         await startBackgroundJobProcessor();
         // The only way submitted jobs learn whether they landed on chain.
         registerChainOutcomeConfirmer(createHttpTxConfirmer({ indexerHttpUrl: submissionEndpoints.indexerHttpUrl }));
-        warnIfCrawlerlessChainConfirmSet(nightgateConfig);
+        warnIfRetiredSettingsSet(nightgateConfig);
+        warnIfFormerConfigKeys(nightgateConfig);
         log.info(`Indexer chain-outcome confirmation enabled${crawlerEnabled ? ' (alongside the crawler)' : ' (crawler off)'}`);
         log.info('Wallet worker thread ready');
         const pool = getConfiguredFeeSponsorSessions(nightgateConfig);

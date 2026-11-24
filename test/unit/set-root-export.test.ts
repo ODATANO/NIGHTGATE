@@ -1,13 +1,5 @@
-/**
- * Guards the public `@odatano/nightgate/set-root` subpath: it must resolve
- * via the package exports map
- * (Node self-reference onto the in-place compiled .js) and its module graph
- * must stay dependency-clean, i.e. requiring it never drags in CAP or the
- * session-bound submission modules. Consumers use this subpath outside any
- * server context (anonymous verifiers, browser bundles, unit tests).
- *
- * Needs the in-place compiled .js twins under srv/ (npm test builds first).
- */
+// The compiled set-root module that @odatano/nightgate-tx ships as `/set-root`.
+// It must stay free of CAP and the session-bound modules, because verifiers and browsers load it.
 
 import { createRequire } from 'node:module';
 import { sha256 } from '@noble/hashes/sha256';
@@ -20,13 +12,12 @@ const fakePure: SetPureCircuits = {
     nodeHash: (l, r) => sha256(Buffer.concat([Buffer.from('node'), Buffer.from(l), Buffer.from(r)]))
 };
 
-describe('@odatano/nightgate/set-root subpath', () => {
-    it('resolves through the exports map and stays CAP-free', () => {
+describe('set-root module of the client package', () => {
+    it('loads without CAP', () => {
         const before = new Set(Object.keys(nativeRequire.cache));
-        const subpath = nativeRequire('@odatano/nightgate/set-root');
+        const subpath = nativeRequire('../../srv/submission/set-root.js');
         const loaded = Object.keys(nativeRequire.cache).filter(k => !before.has(k));
 
-        // The whole point of the subpath: no CAP, no session/submission graph.
         const dirty = loaded.filter(k => /@sap[\\/]cds|document-proof|contract-registry|rate-limiter/.test(k));
         expect(dirty).toEqual([]);
 
@@ -37,8 +28,8 @@ describe('@odatano/nightgate/set-root subpath', () => {
         expect(subpath.MAX_SET_VALUES).toBe(64);
     });
 
-    it('compiled subpath and TS source produce identical roots', () => {
-        const subpath = nativeRequire('@odatano/nightgate/set-root');
+    it('compiled module and TS source produce identical roots', () => {
+        const subpath = nativeRequire('../../srv/submission/set-root.js');
         const values = ['EEA', 'CH', 'NO', 'UK'];
         expect(subpath.buildMembershipSet(values, fakePure).setRoot)
             .toBe(buildFromSource(values, fakePure).setRoot);

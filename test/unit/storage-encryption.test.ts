@@ -142,16 +142,3 @@ describe('StorageEncryption', () => {
         expect(() => decryptWithPassword(goodBlob.toString('base64'), PASSWORD)).toThrow(/Unsupported encryption version: 99/);
     });
 });
-
-describe('cross-compat: our blob decryptable by SDK-equivalent path', () => {
-    // The SDK's import path uses decryptWithPassword-style logic. We verify
-    // an end-to-end round-trip in that exact mode without touching the SDK
-    // (unit tests never load the real ESM-only SDK; repo rule). The
-    // integration script scripts/integration-test-providers.mjs additionally
-    // exercises the live SDK.
-    test('encrypt then decryptWithPassword round-trip', () => {
-        const enc = new StorageEncryption(PASSWORD);
-        const blob = enc.encrypt(PLAINTEXT);
-        expect(decryptWithPassword(blob, PASSWORD)).toBe(PLAINTEXT);
-    });
-});

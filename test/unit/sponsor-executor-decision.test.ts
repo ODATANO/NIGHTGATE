@@ -1,11 +1,12 @@
 /**
- * The sponsoring executors (`sponsorFinalizedTransaction`, `sponsorUnboundTransaction`)
+ * The sponsoring executors (`sponsorFinalized`, `sponsorUnbound`)
  * act on the worker's failure CODE through one decision table: a dust race
  * rebuilds on the same sponsor, a policy refusal fails without touching the
  * pool, a sponsor-health failure benches the wallet and fails over.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WorkerSubmitError } from '../../srv/midnight/wallet-worker-protocol';
+import { NightgateError } from '../../srv/utils/errors';
 
 const registeredProcessors = vi.hoisted(() => new Map<string, (command: unknown, row: any) => Promise<unknown>>());
 const sponsorCalls = vi.hoisted(() => ({ finalized: vi.fn(), unbound: vi.fn() }));
@@ -41,7 +42,7 @@ function boot() {
     return { srv, db };
 }
 
-const JOB = { ID: 'job-1', sessionId: 'sp-1', requestedBy: 'user-1', kind: 'sponsorFinalizedTransaction' } as any;
+const JOB = { ID: 'job-1', sessionId: 'sp-1', requestedBy: 'user-1', kind: 'sponsorFinalized' } as any;
 
 describe('sponsor executors follow the failure code', () => {
     const env = { ...process.env };
@@ -54,13 +55,13 @@ describe('sponsor executors follow the failure code', () => {
         process.env.NIGHTGATE_SPONSOR_DUST_BACKOFF_MS = '0';
         process.env.NIGHTGATE_SPONSOR_LEASE_WAIT_MS = '1000';
         delete process.env.NIGHTGATE_SPONSOR_POLICY_FILE;
-        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+        delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
     });
     afterEach(() => { process.env = { ...env }; });
 
     it('finalized: a dust race rebuilds on the SAME sponsor and never benches it', async () => {
         boot();
-        const run = registeredProcessors.get('sponsorFinalizedTransaction\u00001')!;
+        const run = registeredProcessors.get('sponsorFinalized\u00001')!;
         sponsorCalls.finalized
             .mockRejectedValueOnce(coded('dust-race', { ledgerCode: '1010/170', retryable: true }, 'wallet not genuinely synced within 1ms <- 1010: Custom error: 170'))
             .mockResolvedValueOnce({ txHash: 'h', circuits: ['attest'], contractAddress: 'c' });
@@ -73,7 +74,7 @@ describe('sponsor executors follow the failure code', () => {
 
     it('finalized: a policy refusal fails at once, the sponsor stays usable', async () => {
         boot();
-        const run = registeredProcessors.get('sponsorFinalizedTransaction\u00001')!;
+        const run = registeredProcessors.get('sponsorFinalized\u00001')!;
         sponsorCalls.finalized.mockRejectedValueOnce(coded('policy', {}, "refusing to sponsor: circuit 'x' is not sponsorable"));
         await expect(run({ op: 'sponsorFinalized', finalizedTxB64: 'AAAA', sponsorSessionId: 'sp-1' }, JOB)).rejects.toThrow(/not sponsorable/);
         expect(sponsorCalls.finalized).toHaveBeenCalledTimes(1);
@@ -81,11 +82,11 @@ describe('sponsor executors follow the failure code', () => {
     });
 
     it('finalized: a sponsor-health failure benches the wallet and fails over inside the pool', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sp-1,sp-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sp-1,sp-2';
         boot();
-        const run = registeredProcessors.get('sponsorFinalizedTransaction\u00001')!;
+        const run = registeredProcessors.get('sponsorFinalized\u00001')!;
         sponsorCalls.finalized
-            .mockRejectedValueOnce(new Error('wallet not genuinely synced within 180000ms'))
+            .mockRejectedValueOnce(new NightgateError('WALLET_NOT_SYNCED', 'wallet not genuinely synced within 180000ms'))
             .mockResolvedValueOnce({ txHash: 'h', circuits: ['attest'], contractAddress: 'c' });
         const out: any = await run({ op: 'sponsorFinalized', finalizedTxB64: 'AAAA', sponsorSessionId: PLATFORM_POOL_SENTINEL }, { ...JOB, sessionId: PLATFORM_POOL_SENTINEL });
         expect(out.feeSponsor).toBe('sp-2');
@@ -94,24 +95,24 @@ describe('sponsor executors follow the failure code', () => {
 
     it('unbound: the generic pool Invalid gets one rebuild, then fails without benching', async () => {
         boot();
-        const run = registeredProcessors.get('sponsorUnboundTransaction\u00001')!;
+        const run = registeredProcessors.get('sponsorUnbound\u00001')!;
         sponsorCalls.unbound
             .mockRejectedValueOnce(coded('dust-race', { ledgerCode: 'pool-invalid', retryable: true }))
             .mockRejectedValueOnce(coded('dust-race', { ledgerCode: 'pool-invalid', retryable: true }));
-        await expect(run({ op: 'sponsorUnbound', unboundTxB64: 'AAAA', sponsorSessionId: 'sp-1' }, { ...JOB, kind: 'sponsorUnboundTransaction' })).rejects.toThrow(/worker failure/);
+        await expect(run({ op: 'sponsorUnbound', unboundTxB64: 'AAAA', sponsorSessionId: 'sp-1' }, { ...JOB, kind: 'sponsorUnbound' })).rejects.toThrow(/worker failure/);
         expect(sponsorCalls.unbound).toHaveBeenCalledTimes(2);
         expect(sponsorCandidatesNonExclusive(['sp-1'])).toEqual(['sp-1']);
     });
 
     it('unbound: a known dust race moves to the next sponsor after its rebuilds, without benching', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sp-1,sp-2';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sp-1,sp-2';
         boot();
-        const run = registeredProcessors.get('sponsorUnboundTransaction\u00001')!;
+        const run = registeredProcessors.get('sponsorUnbound\u00001')!;
         const race = coded('dust-race', { ledgerCode: '1010/170', retryable: true });
         sponsorCalls.unbound
             .mockRejectedValueOnce(race).mockRejectedValueOnce(race).mockRejectedValueOnce(race)
             .mockResolvedValueOnce({ txHash: 'h', circuits: ['attest'], contractAddress: 'c' });
-        const out: any = await run({ op: 'sponsorUnbound', unboundTxB64: 'AAAA', sponsorSessionId: PLATFORM_POOL_SENTINEL }, { ...JOB, kind: 'sponsorUnboundTransaction', sessionId: PLATFORM_POOL_SENTINEL });
+        const out: any = await run({ op: 'sponsorUnbound', unboundTxB64: 'AAAA', sponsorSessionId: PLATFORM_POOL_SENTINEL }, { ...JOB, kind: 'sponsorUnbound', sessionId: PLATFORM_POOL_SENTINEL });
         expect(out.feeSponsor).toBe('sp-2');
         expect(sponsorCalls.unbound).toHaveBeenCalledTimes(4);
         expect(sponsorCandidatesNonExclusive(['sp-1', 'sp-2']).sort()).toEqual(['sp-1', 'sp-2']);
@@ -119,18 +120,18 @@ describe('sponsor executors follow the failure code', () => {
 
     it('unbound: a known dust race on the only sponsor fails the job with that race', async () => {
         boot();
-        const run = registeredProcessors.get('sponsorUnboundTransaction\u00001')!;
+        const run = registeredProcessors.get('sponsorUnbound\u00001')!;
         sponsorCalls.unbound.mockRejectedValue(coded('dust-race', { ledgerCode: '1010/170', retryable: true }));
-        await expect(run({ op: 'sponsorUnbound', unboundTxB64: 'AAAA', sponsorSessionId: 'sp-1' }, { ...JOB, kind: 'sponsorUnboundTransaction' })).rejects.toThrow(/worker failure/);
+        await expect(run({ op: 'sponsorUnbound', unboundTxB64: 'AAAA', sponsorSessionId: 'sp-1' }, { ...JOB, kind: 'sponsorUnbound' })).rejects.toThrow(/worker failure/);
         expect(sponsorCalls.unbound).toHaveBeenCalledTimes(3);
         expect(sponsorCandidatesNonExclusive(['sp-1'])).toEqual(['sp-1']);
     });
 
     it('unbound: an ambiguous outcome is thrown untouched for reconciliation, no rebuild', async () => {
         boot();
-        const run = registeredProcessors.get('sponsorUnboundTransaction\u00001')!;
+        const run = registeredProcessors.get('sponsorUnbound\u00001')!;
         sponsorCalls.unbound.mockRejectedValueOnce(coded('ambiguous', {}, 'submit watch timed out'));
-        await expect(run({ op: 'sponsorUnbound', unboundTxB64: 'AAAA', sponsorSessionId: 'sp-1' }, { ...JOB, kind: 'sponsorUnboundTransaction' })).rejects.toThrow(/timed out/);
+        await expect(run({ op: 'sponsorUnbound', unboundTxB64: 'AAAA', sponsorSessionId: 'sp-1' }, { ...JOB, kind: 'sponsorUnbound' })).rejects.toThrow(/timed out/);
         expect(sponsorCalls.unbound).toHaveBeenCalledTimes(1);
     });
 });

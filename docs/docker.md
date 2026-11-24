@@ -14,18 +14,18 @@ NIGHTGATE_INDEXER_HTTP_URL='http://<indexer-host>:8088/api/v4/graphql' \
 docker compose -f docker/docker-compose.yml up -d nightgate
 ```
 
-With `docker run`, pass the same variables with `-e`, plus `-p 4004:4004 -v nightgate-data:/data --init`.
+With `docker run`, pass the same variables with `-e`, plus `-p 127.0.0.1:4004:4004 -v nightgate-data:/data --init`. Basic auth is plain text, so publish on another address only behind a TLS proxy.
 
-- On mainnet and preprod the entrypoint refuses to start without `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL`. See [self-hosted.md](self-hosted.md).
+- Node and indexer are built in for preview and undeployed only. Every other network needs `NIGHTGATE_NODE_URL` and `NIGHTGATE_INDEXER_HTTP_URL`. On mainnet and preprod the entrypoint refuses to start without them. On stagenet the server starts and stays offline. See [self-hosted.md](self-hosted.md).
 - The container runs as uid 1000. A bind-mounted `/data` must be writable by it.
-- Compose publishes port 4004 on `127.0.0.1`. `NIGHTGATE_BIND_ADDRESS=0.0.0.0` publishes it on all addresses. Basic auth is plain text without TLS, so put a TLS reverse proxy in front.
+- Compose publishes every port on `127.0.0.1`: the server (4004), the node (9944, 30333), the indexer (8088) and the proof server (6300). `NIGHTGATE_BIND_ADDRESS=0.0.0.0` publishes the server on all addresses, `NODE_BIND_ADDRESS` and `INDEXER_BIND_ADDRESS` do the same for node and indexer. Basic auth is plain text without TLS, so put a TLS reverse proxy in front.
 - Behind a reverse proxy set `NIGHTGATE_TRUST_PROXY` to the number of proxies. Without it every caller has the proxy's address, so the rate limits per address and the login throttle count all callers as one: 20 wrong passwords lock everyone out for 15 minutes. Set it only when no caller can reach the server directly.
 
 ## Authentication
 
 - HTTP basic auth through `@odatano/cap-auth`, realm `nightgate`. 20 failed attempts per 15 minutes per client address and user answer 429 with `Retry-After`.
 - Agent requests send `x-agent-token` and need no basic credentials.
-- The indexer probes `getLiveness`, `getReadiness`, `getMetrics`, `getSyncStatus` and `getHealth` answer without credentials.
+- The indexer functions `getLiveness`, `getReadiness`, `getSyncStatus`, `getHealth`, `getBoardStatus` and `getReceiptKey` answer without credentials. `getMetrics` needs the admin role, so its reader is a user with `NIGHTGATE_HTTP_ROLES=admin`.
 - `/odata/v4/midnight-verify` answers without credentials when `NIGHTGATE_PUBLIC_VERIFY=true`.
 - The request log masks `authorization`, `cookie` and `x-agent-token`.
 
@@ -37,29 +37,33 @@ With `docker run`, pass the same variables with `-e`, plus `-p 4004:4004 -v nigh
 | `NIGHTGATE_HTTP_PASSWORD` | required | Basic-auth password |
 | `NIGHTGATE_HTTP_USER` | `nightgate` | Basic-auth user |
 | `NIGHTGATE_HTTP_ROLES` | none | Comma-separated roles of that user. `admin` opens the admin service |
-| `NIGHTGATE_AUTH` | `basic` | `dummy` serves unauthenticated and privileged. In production the server does not start with it unless `NIGHTGATE_ALLOW_UNAUTHENTICATED=true` |
 | `NIGHTGATE_TRUST_PROXY` | `0` | Number of reverse proxies in front of the server, see the note above |
 | `NIGHTGATE_NETWORK` | `mainnet` | Target network |
-| `NIGHTGATE_NODE_URL` | built in on preview only | Node RPC |
-| `NIGHTGATE_INDEXER_HTTP_URL` | built in on preview only | Indexer GraphQL |
+| `NIGHTGATE_NODE_URL` | built in on preview and undeployed | Node RPC |
+| `NIGHTGATE_INDEXER_HTTP_URL` | built in on preview and undeployed | Indexer GraphQL |
 | `NIGHTGATE_CRAWLER_ENABLED` | `false` | Block crawler. Verification works without it |
 | `NIGHTGATE_PROOF_SERVER_URL` | unset | Set selects proof-server proving. Compose: `http://proof-server:6300` |
 | `NIGHTGATE_DB_PATH` | `/data/nightgate.db` | SQLite file |
 | `NIGHTGATE_DB_URL` | unset | `postgres://...` selects PostgreSQL |
 | `NODE_OPTIONS` | `--max-old-space-size=8192` | Heap. Keep the container memory limit above it |
 | `NIGHTGATE_NODE_FLAGS` | `--no-concurrent-recompilation` | V8 flags on the node command line. Empty sets none |
+| `NIGHTGATE_SQLITE_BUSY_TIMEOUT_MS` | `30000` | How long a SQLite write waits for the lock |
+| `NIGHTGATE_IMAGE_TAG` | the release | Compose only: the image tag to run |
+| `NIGHTGATE_WATCHDOG_CYCLE_GRACE` | `900` | Watchdog only: seconds a restart cycle counts as tried |
 
-All other variables: [reference.md](reference.md#environment-variables).
+Compose also passes `ENCRYPTION_KEYS`, `ENCRYPTION_KEY_ACTIVE`, `NIGHTGATE_DB_DEPLOY`, `NIGHTGATE_PUBLIC_VERIFY`, `NIGHTGATE_FEE_SPONSOR_SESSIONS` and `NIGHTGATE_SPONSOR_POLICY_FILE`. Any other variable needs an entry under `environment` in `docker/docker-compose.yml`. All variables: [reference.md](reference.md#environment-variables).
 
 ## Schema upgrades on SQLite
 
-The entrypoint deploys the schema only when the database file does not exist. The startup check refuses an older database and names the migration. After an image upgrade that adds entities or columns:
+The entrypoint deploys the schema only when the database file does not exist. The startup check refuses an older database and names the migration. After an image upgrade that adds entities or columns, run the migration with the server stopped, then start it:
 
 ```bash
-docker exec odatano-nightgate node scripts/apply-schema-delta.mjs
+docker compose -f docker/docker-compose.yml stop nightgate
+docker compose -f docker/docker-compose.yml run --rm --no-deps --entrypoint node nightgate scripts/apply-schema-delta.mjs
+docker compose -f docker/docker-compose.yml start nightgate
 ```
 
-The script reads `NIGHTGATE_DB_PATH`, adds tables, columns and indexes, and re-encodes rows of an older storage format. Manual steps: [operations.md#schema-upgrades](operations.md#schema-upgrades).
+The script reads `NIGHTGATE_DB_PATH`, renames columns, adds tables, columns and indexes, rebuilds a table whose key or constraints changed. Manual steps: [operations.md#schema-upgrades](operations.md#schema-upgrades).
 
 ## PostgreSQL
 
@@ -102,7 +106,7 @@ crontab -l | { cat; echo '* * * * * /root/nightgate-api/watchdog.sh'; } | cronta
 - Compose sets `init: true` so zombie processes are reaped. With `docker run` pass `--init`.
 - One instance per database. A second process on the same database refuses to start.
 - Without `NIGHTGATE_DB_URL` the entrypoint allows SQLite under the production profile. Use PostgreSQL in production.
-- Mainnet submission is off unless `cds.requires.nightgate.allowMainnetSubmission` is `true`. Indexing works either way.
-- The image carries the prover keys of `counter`, `shielded-token`, `token-factory`, `holder-registry`, `attestation-vault` and `attestation-vault-32`.
+- Mainnet submission is off unless `NIGHTGATE_ALLOW_MAINNET_SUBMISSION` is `true`, because a transaction there spends real NIGHT and DUST. Until then an action that submits answers 403. Indexing and reads work either way.
+- The image carries the prover keys of `counter`, `token-factory`, `holder-registry`, `attestation-vault` and `attestation-vault-32`.
 - Own contracts: mount a directory as `NIGHTGATE_CONTRACTS_DIR` and call the admin action `registerContract`. The registration persists across restarts.
 - `NIGHTGATE_SPONSOR_POLICY_FILE` holds the sponsor allow-list and is re-read on change.

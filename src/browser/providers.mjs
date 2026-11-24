@@ -2,8 +2,7 @@
 // The indexer, proof and wallet proving packages load only when used.
 // Paying the fee and submitting the transaction are left to the app.
 
-import { ZKConfigRegistry } from '@midnight-ntwrk/midnight-js-types';
-import { FetchZkConfigProvider } from './zk-config.mjs';
+import { FetchZkConfigProvider } from '@midnight-ntwrk/midnight-js-fetch-zk-config-provider';
 import { InMemoryPrivateStateProvider } from './private-state.mjs';
 
 /** Turns a manifest URL into an absolute URL. The server sends relative URLs unless a public base URL is configured. */
@@ -18,12 +17,12 @@ export function resolveManifestUrl(url, manifestUrl) {
 /** Builds the providers for one contract from a connected wallet and the parsed `/contract-manifest`.
  *  Pass `manifestUrl` when the manifest has relative URLs and the app runs on another origin. */
 export async function createNightgateConnectorProviders(opts = {}) {
-    const { connector, manifest, manifestUrl, contract, fetchFn, webSocket, proving = 'server', proofServerUrl, expectedManifestHash } = opts;
+    const { connector, manifest, manifestUrl, contractName, fetchFn, webSocket, proving = 'server', proofServerUrl, expectedManifestHash } = opts;
     if (!connector) throw new Error('createNightgateConnectorProviders: connector is required');
-    if (!contract) throw new Error('createNightgateConnectorProviders: contract is required');
+    if (!contractName) throw new Error('createNightgateConnectorProviders: contractName is required');
 
-    const found = (manifest && manifest.contracts || []).find(c => c.name === contract);
-    if (!found) throw new Error(`createNightgateConnectorProviders: contract '${contract}' not in manifest`);
+    const found = (manifest && manifest.contracts || []).find(c => c.name === contractName);
+    if (!found) throw new Error(`createNightgateConnectorProviders: contract '${contractName}' not in manifest`);
     const entry = { ...found, zkConfigBaseUrl: resolveManifestUrl(found.zkConfigBaseUrl, manifestUrl) };
 
     const cfg = await connector.getConfiguration(); // { indexerUri, indexerWsUri, substrateNodeUri, networkId, proverServerUri? }
@@ -36,15 +35,16 @@ export async function createNightgateConnectorProviders(opts = {}) {
         import('@midnight-ntwrk/midnight-js-http-client-proof-provider')
     ]);
 
-    const zkConfigProvider = new FetchZkConfigProvider(entry.zkConfigBaseUrl, fetchFn, expectedManifestHash ? { expectedManifestHash } : {});
-    // midnight-js names a circuit by contract address and verifier key hash. The registry finds its files.
-    let registry;
+    const zkConfigProvider = new FetchZkConfigProvider(entry.zkConfigBaseUrl, {
+        ...(fetchFn ? { fetchFunc: fetchFn } : {}),
+        ...(expectedManifestHash ? { expectedManifestHash } : {})
+    });
     const publicDataProvider = indexerMod.indexerPublicDataProvider(cfg.indexerUri, cfg.indexerWsUri, WS);
     const { proofProvider, provingModality } = await buildProofProvider({
         proving,
         connector,
         zkConfigProvider,
-        proverServerUri: proofServerUrl ?? cfg.proverServerUri,
+        proofServerUrl: proofServerUrl ?? cfg.proverServerUri,
         proofMod
     });
     const privateStateProvider = new InMemoryPrivateStateProvider();
@@ -66,15 +66,13 @@ export async function createNightgateConnectorProviders(opts = {}) {
             encryptionPublicKey: addrs && addrs.shieldedEncryptionPublicKey,
             shieldedAddress: addrs && addrs.shieldedAddress
         },
-        zkConfigBaseUrl: entry.zkConfigBaseUrl,
-        /** Key source for wallet proving: `connector.getProvingProvider(providers.keyMaterialProvider())`. */
-        keyMaterialProvider: () => (registry ??= new ZKConfigRegistry([zkConfigProvider])).asKeyMaterialProvider()
+        zkConfigBaseUrl: entry.zkConfigBaseUrl
     };
 }
 
 /** Creates the proof provider. 'auto' uses the wallet when it can prove, else the proof server.
  *  'wallet' throws when the wallet cannot prove, so private inputs never reach a server unasked. */
-export async function buildProofProvider({ proving = 'server', connector, zkConfigProvider, proverServerUri, proofMod }) {
+export async function buildProofProvider({ proving = 'server', connector, zkConfigProvider, proofServerUrl, proofMod }) {
     if (proving !== 'server' && proving !== 'wallet' && proving !== 'auto') {
         throw new Error(`createNightgateConnectorProviders: unknown proving modality '${proving}'`);
     }
@@ -102,10 +100,10 @@ export async function buildProofProvider({ proving = 'server', connector, zkConf
         }
     }
 
-    if (proverServerUri) {
+    if (proofServerUrl) {
         return {
             provingModality: 'server',
-            proofProvider: proofMod.httpClientProofProvider(proverServerUri, zkConfigProvider)
+            proofProvider: proofMod.httpClientProofProvider(proofServerUrl, zkConfigProvider)
         };
     }
     // No way to prove. This does not throw, because an app may only need to read.

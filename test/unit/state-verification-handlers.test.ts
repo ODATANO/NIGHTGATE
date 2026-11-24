@@ -1,7 +1,7 @@
 /**
  * Tests for the crawler-free state-verification handlers in
  * srv/submission/handlers.ts:
- *   - verifyAttestationState
+ *   - verifyAttestation
  *   - reindexDisclosures
  *   - verifyDocument / verifyPredicateAttestation state fallbacks
  *
@@ -22,6 +22,11 @@ vi.mock('../../srv/utils/nightgate-config', async () => {
         resolveNightgateRuntimeConfig: () => mockRuntimeCfg
     };
 });
+
+vi.mock('../../srv/midnight/public-data-provider', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../../srv/midnight/public-data-provider')>()),
+    indexerTipHeight: vi.fn(async () => 900)
+}));
 
 // startJob is not exercised by these read handlers, but handlers.ts imports it.
 vi.mock('../../srv/submission/background-jobs', async () => ({
@@ -97,14 +102,14 @@ describe('rate class verify', () => {
         const refusedBefore = rateLimitedTotals().get('verify') ?? 0;
 
         const first = makeReq(record);
-        await srv.handlers['verifyAttestationState'](first);
+        await srv.handlers['verifyAttestation'](first);
         const second = makeReq({ ...record, grantee: GRANTEE });
-        await srv.handlers['verifyDisclosureState'](second);
+        await srv.handlers['verifyDisclosure'](second);
         expect(first.reject).not.toHaveBeenCalled();
         expect(second.reject).not.toHaveBeenCalled();
 
         const over = makeReq({ ...record, predicate: 'gte', fieldKey: 'co2', threshold: '1' });
-        expect(await srv.handlers['verifyPredicateState'](over)).toBeUndefined();
+        expect(await srv.handlers['verifyPredicate'](over)).toBeUndefined();
         expect(over.reject).toHaveBeenCalledWith(429, expect.stringMatching(/verify: 2 per minute/));
         expect(rateLimitedTotals().get('verify')).toBe(refusedBefore + 1);
     });
@@ -113,15 +118,15 @@ describe('rate class verify', () => {
         const srv = setup();
         for (let i = 0; i < 100; i++) {
             const req = makeReq(record);
-            await srv.handlers['verifyAttestationState'](req);
+            await srv.handlers['verifyAttestation'](req);
             expect(req.reject).not.toHaveBeenCalled();
         }
     });
 });
 
-// ---- verifyAttestationState ----------------------------------------------
+// ---- verifyAttestation ----------------------------------------------
 
-describe('verifyAttestationState', () => {
+describe('verifyAttestation', () => {
     function setup(opts: any = {}, db: any = { run: vi.fn() }) {
         const srv = makeFakeService();
         registerSubmissionHandlers(srv as any, db, {
@@ -134,7 +139,7 @@ describe('verifyAttestationState', () => {
     test('rejects missing contractAddress', async () => {
         const srv = setup();
         const req = makeReq({ payloadHash: PAYLOAD });
-        await srv.handlers['verifyAttestationState'](req);
+        await srv.handlers['verifyAttestation'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress/));
     });
 
@@ -142,7 +147,7 @@ describe('verifyAttestationState', () => {
         const srv = setup();
         for (const data of [{ contractAddress: VAULT }, { contractAddress: VAULT, payloadHash: PAYLOAD }, { contractAddress: VAULT, attesterId: ATTESTER }]) {
             const req = makeReq(data);
-            await srv.handlers['verifyAttestationState'](req);
+            await srv.handlers['verifyAttestation'](req);
             expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/attesterId and payloadHash.*or documentId/));
         }
     });
@@ -151,7 +156,7 @@ describe('verifyAttestationState', () => {
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc', payloadHash: PAYLOAD, recordKey: 'rk', documentId: 'f'.repeat(64) }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, documentId: 'F'.repeat(64) });
-        const r = await srv.handlers['verifyAttestationState'](req);
+        const r = await srv.handlers['verifyAttestation'](req);
         expect(r).toMatchObject({ verified: true, attesterId: 'abc', payloadHash: PAYLOAD, recordKey: 'rk', documentId: 'f'.repeat(64) });
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({ documentId: 'f'.repeat(64), attesterId: undefined, payloadHash: undefined }));
     });
@@ -160,15 +165,15 @@ describe('verifyAttestationState', () => {
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD });
-        const r = await srv.handlers['verifyAttestationState'](req);
-        expect(r).toEqual({ verified: true, attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc' });
+        const r = await srv.handlers['verifyAttestation'](req);
+        expect(r).toEqual({ verified: true, attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc', blockHeight: 900 });
     });
 
     test('not attested → verified false', async () => {
         const reader = vi.fn(async () => ({ attested: false, contentRootOk: false, schemaOk: false, attesterId: '' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD });
-        const r = await srv.handlers['verifyAttestationState'](req);
+        const r = await srv.handlers['verifyAttestation'](req);
         expect(r.verified).toBe(false);
         expect(r.attested).toBe(false);
     });
@@ -177,7 +182,7 @@ describe('verifyAttestationState', () => {
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: true, schemaOk: false, attesterId: 'abc' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, contentRoot: ROOT });
-        const r = await srv.handlers['verifyAttestationState'](req);
+        const r = await srv.handlers['verifyAttestation'](req);
         expect(r.verified).toBe(true);
     });
 
@@ -185,7 +190,7 @@ describe('verifyAttestationState', () => {
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'abc' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, contentRoot: ROOT });
-        const r = await srv.handlers['verifyAttestationState'](req);
+        const r = await srv.handlers['verifyAttestation'](req);
         expect(r.verified).toBe(false);
         expect(r.attested).toBe(true);
     });
@@ -194,8 +199,8 @@ describe('verifyAttestationState', () => {
         const reader = vi.fn(async () => null);
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD });
-        const r = await srv.handlers['verifyAttestationState'](req);
-        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false, attesterId: '', payloadHash: '', recordKey: '', documentId: '' });
+        const r = await srv.handlers['verifyAttestation'](req);
+        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false, attesterId: '', payloadHash: '', recordKey: '', documentId: '', blockHeight: 900 });
     });
 
     test('no live provider → clean negative, reader not called', async () => {
@@ -203,15 +208,15 @@ describe('verifyAttestationState', () => {
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: true, schemaOk: false, attesterId: 'x' }));
         const srv = setup({ attestationStateReader: reader });
         const req = makeReq({ contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD });
-        const r = await srv.handlers['verifyAttestationState'](req);
-        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false, attesterId: '', payloadHash: '', recordKey: '', documentId: '' });
+        const r = await srv.handlers['verifyAttestation'](req);
+        expect(r).toEqual({ verified: false, attested: false, contentRootOk: false, schemaOk: false, bindingRegistered: false, attesterId: '', payloadHash: '', recordKey: '', documentId: '', blockHeight: null });
         expect(reader).not.toHaveBeenCalled();
     });
 });
 
-// ---- verifyPredicateState --------------------------------------------------
+// ---- verifyPredicate --------------------------------------------------
 
-describe('verifyPredicateState', () => {
+describe('verifyPredicate', () => {
     const FIELD_KEY = 'e'.repeat(64);
 
     function setup(opts: any = {}) {
@@ -230,49 +235,49 @@ describe('verifyPredicateState', () => {
     test('rejects missing contractAddress', async () => {
         const srv = setup();
         const req = makeReq({ ...VALID, contractAddress: undefined });
-        await srv.handlers['verifyPredicateState'](req);
+        await srv.handlers['verifyPredicate'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/contractAddress/));
     });
 
     test('rejects a missing attesterId', async () => {
         const srv = setup();
         const req = makeReq({ ...VALID, attesterId: '' });
-        await srv.handlers['verifyPredicateState'](req);
+        await srv.handlers['verifyPredicate'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/attesterId is required/));
     });
 
     test('rejects missing payloadHash', async () => {
         const srv = setup();
         const req = makeReq({ ...VALID, payloadHash: undefined });
-        await srv.handlers['verifyPredicateState'](req);
+        await srv.handlers['verifyPredicate'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/payloadHash/));
     });
 
     test('rejects unknown predicate string', async () => {
         const srv = setup();
         const req = makeReq({ ...VALID, predicate: 'equals' });
-        await srv.handlers['verifyPredicateState'](req);
+        await srv.handlers['verifyPredicate'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/lessOrEqual/));
     });
 
     test('rejects missing threshold', async () => {
         const srv = setup();
         const req = makeReq({ ...VALID, threshold: undefined });
-        await srv.handlers['verifyPredicateState'](req);
+        await srv.handlers['verifyPredicate'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/threshold/));
     });
 
     test('rejects negative threshold', async () => {
         const srv = setup();
         const req = makeReq({ ...VALID, threshold: -1 });
-        await srv.handlers['verifyPredicateState'](req);
+        await srv.handlers['verifyPredicate'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/non-negative/));
     });
 
     test('numeric claims are field-bound: missing fieldKey is a 400', async () => {
         const srv = setup();
         const req = makeReq({ ...VALID, fieldKey: '' });
-        await srv.handlers['verifyPredicateState'](req);
+        await srv.handlers['verifyPredicate'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/fieldKey is required/));
     });
 
@@ -280,8 +285,8 @@ describe('verifyPredicateState', () => {
         const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID });
-        const r = await srv.handlers['verifyPredicateState'](req);
-        expect(r).toEqual({ verified: true, proven: true });
+        const r = await srv.handlers['verifyPredicate'](req);
+        expect(r).toEqual({ verified: true, proven: true, blockHeight: 900 });
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD,
             fieldKey: FIELD_KEY, threshold: 1370n, op: 0
@@ -292,7 +297,7 @@ describe('verifyPredicateState', () => {
         const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID, predicate: 'greaterOrEqual' });
-        await srv.handlers['verifyPredicateState'](req);
+        await srv.handlers['verifyPredicate'](req);
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({ op: 1 }));
     });
 
@@ -300,7 +305,7 @@ describe('verifyPredicateState', () => {
         const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID, fieldKey: FIELD_KEY.toUpperCase() });
-        const r = await srv.handlers['verifyPredicateState'](req);
+        const r = await srv.handlers['verifyPredicate'](req);
         expect(r.verified).toBe(true);
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({ fieldKey: FIELD_KEY }));
     });
@@ -309,16 +314,16 @@ describe('verifyPredicateState', () => {
         const reader = vi.fn(async () => false);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID });
-        const r = await srv.handlers['verifyPredicateState'](req);
-        expect(r).toEqual({ verified: false, proven: false });
+        const r = await srv.handlers['verifyPredicate'](req);
+        expect(r).toEqual({ verified: false, proven: false, blockHeight: 900 });
     });
 
     test('reader returns null (unknown contract) → clean negative', async () => {
         const reader = vi.fn(async () => null);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID });
-        const r = await srv.handlers['verifyPredicateState'](req);
-        expect(r).toEqual({ verified: false, proven: false });
+        const r = await srv.handlers['verifyPredicate'](req);
+        expect(r).toEqual({ verified: false, proven: false, blockHeight: 900 });
     });
 
     test('no live provider → clean negative, reader not called', async () => {
@@ -326,8 +331,8 @@ describe('verifyPredicateState', () => {
         const reader = vi.fn(async () => true);
         const srv = setup({ predicateStateReader: reader });
         const req = makeReq({ ...VALID });
-        const r = await srv.handlers['verifyPredicateState'](req);
-        expect(r).toEqual({ verified: false, proven: false });
+        const r = await srv.handlers['verifyPredicate'](req);
+        expect(r).toEqual({ verified: false, proven: false, blockHeight: null });
         expect(reader).not.toHaveBeenCalled();
     });
 
@@ -343,7 +348,7 @@ describe('verifyPredicateState', () => {
         ])('rejects %o', async (patch, msg) => {
             const srv = setup();
             const req = makeReq({ contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, ...patch });
-            await srv.handlers['verifyPredicateState'](req);
+            await srv.handlers['verifyPredicate'](req);
             expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
         });
 
@@ -354,8 +359,8 @@ describe('verifyPredicateState', () => {
                 contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, fieldKey: FIELD_KEY,
                 predicate: 'bytesEquality', expectedDigest: EXPECTED.toUpperCase()
             });
-            const r = await srv.handlers['verifyPredicateState'](req);
-            expect(r).toEqual({ verified: true, proven: true });
+            const r = await srv.handlers['verifyPredicate'](req);
+            expect(r).toEqual({ verified: true, proven: true, blockHeight: 900 });
             expect(reader).toHaveBeenCalledWith(expect.objectContaining({
                 fieldKey: FIELD_KEY, expectedDigest: EXPECTED,
                 setRoot: undefined, threshold: undefined, op: undefined
@@ -369,8 +374,8 @@ describe('verifyPredicateState', () => {
                 contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, fieldKey: FIELD_KEY,
                 predicate: 'setMembership', setRoot: SET_ROOT
             });
-            const r = await srv.handlers['verifyPredicateState'](req);
-            expect(r).toEqual({ verified: true, proven: true });
+            const r = await srv.handlers['verifyPredicate'](req);
+            expect(r).toEqual({ verified: true, proven: true, blockHeight: 900 });
             expect(reader).toHaveBeenCalledWith(expect.objectContaining({
                 fieldKey: FIELD_KEY, setRoot: SET_ROOT,
                 expectedDigest: undefined, threshold: undefined, op: undefined
@@ -392,7 +397,7 @@ describe('verifyPredicateState', () => {
         ])('rejects %o', async (patch, msg) => {
             const srv = setup();
             const req = makeReq({ contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, fieldKey: '', ...patch });
-            await srv.handlers['verifyPredicateState'](req);
+            await srv.handlers['verifyPredicate'](req);
             expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(msg));
         });
 
@@ -403,8 +408,8 @@ describe('verifyPredicateState', () => {
                 contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, fieldKey: '',
                 predicate: 'documentIntegrity', payloadHashB: PAYLOAD_B.toUpperCase(), allowedMask: 5
             });
-            const r = await srv.handlers['verifyPredicateState'](req);
-            expect(r).toEqual({ verified: true, proven: true });
+            const r = await srv.handlers['verifyPredicate'](req);
+            expect(r).toEqual({ verified: true, proven: true, blockHeight: 900 });
             expect(reader).toHaveBeenCalledWith(expect.objectContaining({
                 payloadHash: PAYLOAD, payloadHashB: PAYLOAD_B, allowedMask: 5,
                 k: undefined, threshold: undefined, op: undefined, expectedDigest: undefined, setRoot: undefined
@@ -418,8 +423,8 @@ describe('verifyPredicateState', () => {
                 contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, fieldKey: '',
                 predicate: 'documentDiff', payloadHashB: PAYLOAD_B, k: 3
             });
-            const r = await srv.handlers['verifyPredicateState'](req);
-            expect(r).toEqual({ verified: true, proven: true });
+            const r = await srv.handlers['verifyPredicate'](req);
+            expect(r).toEqual({ verified: true, proven: true, blockHeight: 900 });
             expect(reader).toHaveBeenCalledWith(expect.objectContaining({
                 payloadHashB: PAYLOAD_B, k: 3, allowedMask: undefined
             }));
@@ -467,9 +472,9 @@ describe('reindexDisclosures', () => {
     });
 });
 
-// ---- verifyDisclosureState ------------------------------------------------
+// ---- verifyDisclosure ------------------------------------------------
 
-describe('verifyDisclosureState', () => {
+describe('verifyDisclosure', () => {
     const GRANTEE = 'b'.repeat(64);
     const VALID = { contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, grantee: GRANTEE };
 
@@ -486,7 +491,7 @@ describe('verifyDisclosureState', () => {
         const reader = vi.fn();
         const srv = setup({ disclosureLevelReader: reader });
         const req = makeReq({ ...VALID, [name]: undefined });
-        await srv.handlers['verifyDisclosureState'](req);
+        await srv.handlers['verifyDisclosure'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining(name));
         expect(reader).not.toHaveBeenCalled();
     });
@@ -494,8 +499,8 @@ describe('verifyDisclosureState', () => {
     test('a grant answers its level; the reader gets the ids lowercased', async () => {
         const reader = vi.fn(async () => 1);
         const srv = setup({ disclosureLevelReader: reader });
-        const r = await srv.handlers['verifyDisclosureState'](makeReq({ ...VALID, payloadHash: 'A'.repeat(64), grantee: 'B'.repeat(64) }));
-        expect(r).toEqual({ verified: true, granted: true, level: 1 });
+        const r = await srv.handlers['verifyDisclosure'](makeReq({ ...VALID, payloadHash: 'A'.repeat(64), grantee: 'B'.repeat(64) }));
+        expect(r).toEqual({ verified: true, granted: true, level: 1, blockHeight: 900 });
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             contractAddress: VAULT, attesterId: ATTESTER, payloadHash: PAYLOAD, grantee: GRANTEE, artifactPath: RESOLVED.artifactPath
         }));
@@ -503,32 +508,32 @@ describe('verifyDisclosureState', () => {
 
     test('minLevel above the granted level: granted, not verified', async () => {
         const srv = setup({ disclosureLevelReader: vi.fn(async () => 1) });
-        expect(await srv.handlers['verifyDisclosureState'](makeReq({ ...VALID, minLevel: 2 }))).toEqual({ verified: false, granted: true, level: 1 });
-        expect(await srv.handlers['verifyDisclosureState'](makeReq({ ...VALID, minLevel: 1 }))).toEqual({ verified: true, granted: true, level: 1 });
+        expect(await srv.handlers['verifyDisclosure'](makeReq({ ...VALID, minLevel: 2 }))).toEqual({ verified: false, granted: true, level: 1, blockHeight: 900 });
+        expect(await srv.handlers['verifyDisclosure'](makeReq({ ...VALID, minLevel: 1 }))).toEqual({ verified: true, granted: true, level: 1, blockHeight: 900 });
     });
 
     test('a level 0 grant is a grant', async () => {
         const srv = setup({ disclosureLevelReader: vi.fn(async () => 0) });
-        expect(await srv.handlers['verifyDisclosureState'](makeReq(VALID))).toEqual({ verified: true, granted: true, level: 0 });
+        expect(await srv.handlers['verifyDisclosure'](makeReq(VALID))).toEqual({ verified: true, granted: true, level: 0, blockHeight: 900 });
     });
 
     test('no grant answers the clean negative', async () => {
         const srv = setup({ disclosureLevelReader: vi.fn(async () => null) });
-        expect(await srv.handlers['verifyDisclosureState'](makeReq(VALID))).toEqual({ verified: false, granted: false, level: null });
+        expect(await srv.handlers['verifyDisclosure'](makeReq(VALID))).toEqual({ verified: false, granted: false, level: null, blockHeight: 900 });
     });
 
     test('no live provider → clean negative, reader not called', async () => {
         mockRuntimeCfg = NO_PROVIDER;
         const reader = vi.fn();
         const srv = setup({ disclosureLevelReader: reader });
-        expect(await srv.handlers['verifyDisclosureState'](makeReq(VALID))).toEqual({ verified: false, granted: false, level: null });
+        expect(await srv.handlers['verifyDisclosure'](makeReq(VALID))).toEqual({ verified: false, granted: false, level: null, blockHeight: null });
         expect(reader).not.toHaveBeenCalled();
     });
 
     test('rejects an unknown network', async () => {
         const srv = setup({ disclosureLevelReader: vi.fn() });
         const req = makeReq({ ...VALID, network: 'moon' });
-        await srv.handlers['verifyDisclosureState'](req);
+        await srv.handlers['verifyDisclosure'](req);
         expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/network must be one of/));
     });
 });
@@ -554,11 +559,11 @@ describe('verifyDocument crawler-free fallback', () => {
     test('tx not indexed + contractAddress + attested on-chain → verified true', async () => {
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'x' }));
         const db = makeDbWithSequence([
-            { ID: DOC_ID, sha256: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: '2026-07-06T00:00:00Z' },
+            { ID: DOC_ID, payloadHash: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: '2026-07-06T00:00:00Z' },
             undefined // Transactions lookup: not indexed (crawler off/lag)
         ]);
         const srv = setup(db, { attestationStateReader: reader });
-        const req = makeReq({ documentId: DOC_ID, providedSha256: SHA, contractAddress: VAULT });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: SHA, contractAddress: VAULT });
         const r = await srv.handlers['verifyDocument'](req);
         expect(r.verified).toBe(true);
         expect(reader).toHaveBeenCalledTimes(1);
@@ -567,11 +572,11 @@ describe('verifyDocument crawler-free fallback', () => {
     test('tx not indexed + contractAddress + NOT attested on-chain → verified false', async () => {
         const reader = vi.fn(async () => ({ attested: false, contentRootOk: false, schemaOk: false, attesterId: '' }));
         const db = makeDbWithSequence([
-            { ID: DOC_ID, sha256: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: null },
+            { ID: DOC_ID, payloadHash: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: null },
             undefined
         ]);
         const srv = setup(db, { attestationStateReader: reader });
-        const req = makeReq({ documentId: DOC_ID, providedSha256: SHA, contractAddress: VAULT });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: SHA, contractAddress: VAULT });
         const r = await srv.handlers['verifyDocument'](req);
         expect(r.verified).toBe(false);
     });
@@ -579,11 +584,11 @@ describe('verifyDocument crawler-free fallback', () => {
     test('reader failure is best-effort → verified false, never a 5xx', async () => {
         const reader = vi.fn(async () => { throw new Error('indexer unreachable'); });
         const db = makeDbWithSequence([
-            { ID: DOC_ID, sha256: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: null },
+            { ID: DOC_ID, payloadHash: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: null },
             undefined
         ]);
         const srv = setup(db, { attestationStateReader: reader });
-        const req = makeReq({ documentId: DOC_ID, providedSha256: SHA, contractAddress: VAULT });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: SHA, contractAddress: VAULT });
         const r = await srv.handlers['verifyDocument'](req);
         expect(r.verified).toBe(false);
         expect(req.reject).not.toHaveBeenCalled();
@@ -592,11 +597,11 @@ describe('verifyDocument crawler-free fallback', () => {
     test('tx not indexed + NO contractAddress → fallback skipped, verified false', async () => {
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'x' }));
         const db = makeDbWithSequence([
-            { ID: DOC_ID, sha256: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: null },
+            { ID: DOC_ID, payloadHash: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: null },
             undefined
         ]);
         const srv = setup(db, { attestationStateReader: reader });
-        const req = makeReq({ documentId: DOC_ID, providedSha256: SHA });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: SHA });
         const r = await srv.handlers['verifyDocument'](req);
         expect(r.verified).toBe(false);
         expect(reader).not.toHaveBeenCalled();
@@ -606,11 +611,11 @@ describe('verifyDocument crawler-free fallback', () => {
         mockRuntimeCfg = NO_PROVIDER;
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'x' }));
         const db = makeDbWithSequence([
-            { ID: DOC_ID, sha256: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: null },
+            { ID: DOC_ID, payloadHash: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: null },
             undefined
         ]);
         const srv = setup(db, { attestationStateReader: reader });
-        const req = makeReq({ documentId: DOC_ID, providedSha256: SHA, contractAddress: VAULT });
+        const req = makeReq({ anchorId: DOC_ID, payloadHash: SHA, contractAddress: VAULT });
         const r = await srv.handlers['verifyDocument'](req);
         expect(r.verified).toBe(false);
         expect(reader).not.toHaveBeenCalled();
@@ -762,11 +767,11 @@ describe('verifyPredicateAttestation crawler-free fallback', () => {
         }));
     });
 
-    test('documentDiff row passes payloadHashB + k (from the threshold column)', async () => {
+    test('documentDiff row passes payloadHashB + k', async () => {
         const PAYLOAD_B = 'b'.repeat(64);
         const reader = vi.fn(async () => true);
         const row = {
-            ...ROW, predicate: 'documentDiff', op: null, threshold: 3,
+            ...ROW, predicate: 'documentDiff', op: null, threshold: null, k: 3,
             fieldKey: null, expectedDigest: null, setRoot: null,
             payloadHashB: PAYLOAD_B, allowedMask: null
         };
@@ -776,11 +781,43 @@ describe('verifyPredicateAttestation crawler-free fallback', () => {
         const r = await srv.handlers['verifyPredicateAttestation'](req);
         expect(r.verified).toBe(true);
         expect(r.payloadHashB).toBe(PAYLOAD_B);
-        expect(r.threshold).toBe(3);
+        expect([r.k, r.threshold]).toEqual([3, null]);
         expect(reader).toHaveBeenCalledWith(expect.objectContaining({
             payloadHashB: PAYLOAD_B, k: 3, allowedMask: undefined,
             threshold: undefined, op: undefined
         }));
+    });
+
+    // 0 and empty text would read as a claim: "at least 0", "the empty digest".
+    test.each([
+        ['greaterOrEqual', { op: 1, threshold: '50000', unit: 'EUR' },
+            { threshold: '50000', unit: 'EUR', expectedDigest: null, setRoot: null, attesterIdB: null, payloadHashB: null, allowedMask: null, k: null }],
+        ['bytesEquality', { op: null, threshold: null, expectedDigest: 'e'.repeat(64) },
+            { threshold: null, unit: null, expectedDigest: 'e'.repeat(64), setRoot: null, attesterIdB: null, payloadHashB: null, allowedMask: null, k: null }],
+        ['setMembership', { op: null, threshold: null, setRoot: 'f'.repeat(64) },
+            { threshold: null, unit: null, expectedDigest: null, setRoot: 'f'.repeat(64), attesterIdB: null, payloadHashB: null, allowedMask: null, k: null }],
+        ['documentIntegrity', { op: null, threshold: null, fieldKey: null, payloadHashB: 'b'.repeat(64), attesterIdB: 'c'.repeat(64), allowedMask: '5' },
+            { threshold: null, unit: null, expectedDigest: null, setRoot: null, attesterIdB: 'c'.repeat(64), payloadHashB: 'b'.repeat(64), allowedMask: 5, k: null }],
+        ['documentDiff', { op: null, threshold: null, k: 3, fieldKey: null, payloadHashB: 'b'.repeat(64), attesterIdB: 'c'.repeat(64) },
+            { threshold: null, unit: null, expectedDigest: null, setRoot: null, attesterIdB: 'c'.repeat(64), payloadHashB: 'b'.repeat(64), allowedMask: null, k: 3 }]
+    ])('a %s answer carries its own fields and null for the others', async (predicate, columns, expected) => {
+        const row = { ...ROW, unit: null, expectedDigest: null, setRoot: null, payloadHashB: null, attesterIdB: null, allowedMask: null, predicate, ...columns };
+        const srv = setup(makeDbWithSequence([row, undefined]), { predicateStateReader: vi.fn(async () => true) });
+        const r = await srv.handlers['verifyPredicateAttestation'](makeReq({ predicateAttestationId: PA_ID }));
+        expect(r).toMatchObject({ predicate, ...expected });
+    });
+
+    test('the answer names what verifyPredicate needs to check the claim on chain', async () => {
+        const FIELD = 'f'.repeat(64);
+        const srv = setup(makeDbWithSequence([{ ...ROW, fieldKey: FIELD }, undefined]), { predicateStateReader: vi.fn(async () => true) });
+        const r = await srv.handlers['verifyPredicateAttestation'](makeReq({ predicateAttestationId: PA_ID }));
+        expect(r).toMatchObject({ contractAddress: ROW.contractAddress, attesterId: ROW.attesterId, payloadHash: ROW.payloadHash, fieldKey: FIELD });
+    });
+
+    test('a proof that is not on chain yet has no transaction hash, not an empty one', async () => {
+        const srv = setup(makeDbWithSequence([{ ...ROW, provenTxHash: null, provenAt: null }, undefined]), { predicateStateReader: vi.fn(async () => false) });
+        const r = await srv.handlers['verifyPredicateAttestation'](makeReq({ predicateAttestationId: PA_ID }));
+        expect([r.provenTxHash, r.provenAt]).toEqual([null, null]);
     });
 });
 
@@ -815,11 +852,11 @@ describe('verified follows the CURRENT state, the indexed inclusion is reported 
     test('verifyDocument: indexed SUCCESS but the attestation was retracted → verified false, included true', async () => {
         const reader = vi.fn(async () => ({ attested: false, contentRootOk: false, schemaOk: false, attesterId: '' }));
         const db = makeDbWithSequence([
-            { ID: DOC_ID, sha256: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: '2026-07-06T00:00:00Z', contractAddress: VAULT },
+            { ID: DOC_ID, payloadHash: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: '2026-07-06T00:00:00Z', contractAddress: VAULT },
             ...indexedSuccess
         ]);
         const srv = setup(db, { attestationStateReader: reader });
-        const r = await srv.handlers['verifyDocument'](makeReq({ documentId: DOC_ID, providedSha256: SHA }));
+        const r = await srv.handlers['verifyDocument'](makeReq({ anchorId: DOC_ID, payloadHash: SHA }));
         expect(r).toMatchObject({ verified: false, included: true, stateChecked: true });
         expect(reader).toHaveBeenCalledTimes(1);
     });
@@ -827,18 +864,18 @@ describe('verified follows the CURRENT state, the indexed inclusion is reported 
     test('verifyDocument: indexed SUCCESS and the attestation stands → verified true', async () => {
         const reader = vi.fn(async () => ({ attested: true, contentRootOk: false, schemaOk: false, attesterId: 'x' }));
         const db = makeDbWithSequence([
-            { ID: DOC_ID, sha256: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: '2026-07-06T00:00:00Z', contractAddress: VAULT },
+            { ID: DOC_ID, payloadHash: SHA, attesterId: ATTESTER, anchoredTxHash: TX_HASH, anchoredAt: '2026-07-06T00:00:00Z', contractAddress: VAULT },
             ...indexedSuccess
         ]);
         const srv = setup(db, { attestationStateReader: reader });
-        const r = await srv.handlers['verifyDocument'](makeReq({ documentId: DOC_ID, providedSha256: SHA }));
+        const r = await srv.handlers['verifyDocument'](makeReq({ anchorId: DOC_ID, payloadHash: SHA }));
         expect(r).toMatchObject({ verified: true, included: true, stateChecked: true });
     });
 
     test('verifyPredicateAttestation: indexed SUCCESS but the claim expired or lost its anchor → verified false, included true', async () => {
         const reader = vi.fn(async () => false);
         const db = makeDbWithSequence([
-            { ID: PRED_ID, provenTxHash: TX_HASH, contractAddress: VAULT, attesterId: ATTESTER, payloadHash: SHA, predicate: 'greaterOrEqual', threshold: 5, op: 1, fieldKey: 'c'.repeat(64), compiledArtifactRef: 'attestation-vault' },
+            { ID: PRED_ID, provenTxHash: TX_HASH, contractAddress: VAULT, attesterId: ATTESTER, payloadHash: SHA, predicate: 'greaterOrEqual', threshold: 5, op: 1, fieldKey: 'c'.repeat(64), contractName: 'attestation-vault' },
             ...indexedSuccess
         ]);
         const srv = setup(db, { predicateStateReader: reader });
@@ -850,7 +887,7 @@ describe('verified follows the CURRENT state, the indexed inclusion is reported 
     test('verifyPredicateAttestation: indexed SUCCESS and the claim stands → verified true', async () => {
         const reader = vi.fn(async () => true);
         const db = makeDbWithSequence([
-            { ID: PRED_ID, provenTxHash: TX_HASH, contractAddress: VAULT, attesterId: ATTESTER, payloadHash: SHA, predicate: 'greaterOrEqual', threshold: 5, op: 1, fieldKey: 'c'.repeat(64), compiledArtifactRef: 'attestation-vault' },
+            { ID: PRED_ID, provenTxHash: TX_HASH, contractAddress: VAULT, attesterId: ATTESTER, payloadHash: SHA, predicate: 'greaterOrEqual', threshold: 5, op: 1, fieldKey: 'c'.repeat(64), contractName: 'attestation-vault' },
             ...indexedSuccess
         ]);
         const srv = setup(db, { predicateStateReader: reader });

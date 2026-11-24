@@ -80,7 +80,7 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
             const grantorUserId = String(req.user?.id ?? 'anonymous');
             const grantorGrantId = req.agentGrant?.ID ?? null;
             // One row per grantor. An agent of the same user can never overwrite the user's row or another agent's.
-            const existing: HolderDisclosureGrant | null = await db.run(SELECT.one.from(HolderDisclosureGrants).where({ payloadHash, tokenType, registryAddress, grantorUserId, grantorGrantId, active: true }));
+            const existing: HolderDisclosureGrant | null = await db.run(SELECT.one.from(HolderDisclosureGrants).where({ payloadHash, tokenType, registryAddress, grantorUserId, grantorGrantId, isActive: true }));
             const ID = existing?.ID ?? cds.utils.uuid();
             const now = new Date().toISOString();
             const stored = content ? encrypt(content, getEncryptionKey(), contentBinding(ID)) : null;
@@ -89,7 +89,7 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
                 contentType: data.contentType ? String(data.contentType).slice(0, 100) : (existing?.contentType ?? (content ? 'text/plain' : null)),
                 // An update without content keeps the stored content. Only expiry or type change.
                 ...(content || !existing ? { contentHashKind: hashKind, content: stored } : {}),
-                expiresAt: expiry, active: true, revokedAt: null, modifiedAt: now
+                expiresAt: expiry, isActive: true, revokedAt: null, modifiedAt: now
             };
             if (existing) await db.run(UPDATE.entity(HolderDisclosureGrants).set(fields).where({ ID }));
             else await db.run(INSERT.into(HolderDisclosureGrants).entries({ ID, ...fields, createdAt: now }));
@@ -106,7 +106,7 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
             if (!row) throw new NightgateError('NOT_FOUND', 'holder disclosure grant not found');
             const mine = req.agentGrant ? row.grantorGrantId === req.agentGrant.ID : row.grantorUserId === String(req.user?.id ?? '') && !row.grantorGrantId;
             if (!mine) throw new NightgateError('FORBIDDEN', 'only the grantor revokes a holder disclosure');
-            if (row.active) await db.run(UPDATE.entity(HolderDisclosureGrants).set({ active: false, revokedAt: new Date().toISOString() }).where({ ID: row.ID }));
+            if (row.isActive) await db.run(UPDATE.entity(HolderDisclosureGrants).set({ isActive: false, revokedAt: new Date().toISOString() }).where({ ID: row.ID }));
             return { holderGrantId: row.ID, status: 'revoked' };
         });
     });
@@ -123,7 +123,7 @@ export function registerHolderDisclosureActions(ctx: Pick<SubmissionContext, 'sr
         if (!checkRateClass('compute', 'compute', req)) return;
 
         return runSubmission(req, async () => {
-            const grants: HolderDisclosureGrant[] = await db.run(SELECT.from(HolderDisclosureGrants).where({ payloadHash, tokenType, active: true })) ?? [];
+            const grants: HolderDisclosureGrant[] = await db.run(SELECT.from(HolderDisclosureGrants).where({ payloadHash, tokenType, isActive: true })) ?? [];
             const now = Date.now();
             const live = grants.filter(g => !g.expiresAt || Date.parse(g.expiresAt) > now);
             if (live.length === 0) {

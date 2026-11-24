@@ -357,22 +357,6 @@ describe('wallet-facade-builder', () => {
         });
     });
 
-    describe('__clearAllFacadesForTests / __getCacheSizeForTests', () => {
-        it('drops every registry entry when cleared', async () => {
-            const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});
-            try {
-                await getOrBuildWalletFacade('k1', baseArgs);
-                await getOrBuildWalletFacade('k2', baseArgs);
-                expect(__getCacheSizeForTests()).toBe(2);
-
-                __clearAllFacadesForTests();
-                expect(__getCacheSizeForTests()).toBe(0);
-            } finally {
-                logSpy.mockRestore();
-            }
-        });
-    });
-
     describe('wireWorkerStateSaveSink', () => {
         it('saves blobs via the sync-state store when a state-save event arrives', async () => {
             const logSpy = vi.spyOn(cds.log('nightgate:facade'), 'info').mockImplementation(() => {});

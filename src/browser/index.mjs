@@ -1,5 +1,5 @@
 // Entry point for browser apps that use a Midnight wallet. Nothing here depends on CAP or Node.
-// Each compiled contract has its own import path, for example `@odatano/nightgate/browser/attestation-vault`.
+// `CONTRACTS[name].artifactSubpath` names the import path of each compiled contract.
 
 export {
     deriveAttestationSecret,
@@ -10,7 +10,7 @@ export {
     buildAttestationVaultWitnesses
 } from './witnesses.mjs';
 
-export { FetchZkConfigProvider } from './zk-config.mjs';
+export { FetchZkConfigProvider } from '@midnight-ntwrk/midnight-js-fetch-zk-config-provider';
 export { InMemoryPrivateStateProvider } from './private-state.mjs';
 export { createNightgateConnectorProviders, buildProofProvider, resolveManifestUrl } from './providers.mjs';
 export { connectContract } from './contract.mjs';
@@ -20,10 +20,7 @@ export {
     prepareAttest,
     recordKeyOf,
     prepareRegisterDocument,
-    prepareRegisterPassport,
     prepareBindDocument,
-    prepareBindPassport,
-    prepareRetract,
     prepareRetractAttestation,
     preparePurgeExpired,
     DEFAULT_CLAIM_LIFETIME_S,
@@ -40,7 +37,7 @@ export {
 export const CONTRACTS = {
     'attestation-vault': {
         name: 'attestation-vault',
-        artifactSubpath: '@odatano/nightgate/browser/attestation-vault',
+        artifactSubpath: '@odatano/nightgate-tx/attestation-vault',
         circuits: ['attest', 'retract', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
         // Circuits that need the attester's secret key.
         // The proof circuits are not listed, because a document holder can prove without it.
@@ -57,7 +54,7 @@ export const CONTRACTS = {
     // A proof that compares two documents only works when both use the same width.
     'attestation-vault-32': {
         name: 'attestation-vault-32',
-        artifactSubpath: '@odatano/nightgate/browser/attestation-vault-32',
+        artifactSubpath: '@odatano/nightgate-tx/attestation-vault-32',
         circuits: ['attest', 'retract', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'bindDocument', 'anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],
         attesterGated: ['attest', 'retract', 'grantDisclosure', 'revokeDisclosure', 'registerDocument', 'bindDocument', 'anchorContentRoot'],
         merkleWitnessed: ['proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison'],

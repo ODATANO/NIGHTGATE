@@ -1,7 +1,7 @@
 /**
  * The fee sum of a grant's usage finds the transaction of a job by its
- * identifier, its extrinsic hash or its ledger hash, and counts each
- * transaction once. Runs against a real in-memory database.
+ * ledger hash or by one of its identifiers, and counts each transaction
+ * once. Runs against a real in-memory database.
  */
 import cds from '@sap/cds';
 import { sumIndexedFees } from '../../srv/sessions/agent-grants';
@@ -31,32 +31,35 @@ describe('sumIndexedFees', () => {
         for (const [i, paid] of fees.entries()) {
             const ID = cds.utils.uuid();
             await db.run(INSERT.into('midnight.Transactions').entries({
-                ID, transactionId: i, hash: EXTRINSIC[i], ledgerTxHash: LEDGER[i], protocolVersion: 1, transactionType: 'REGULAR', block_ID: blockId
+                ID, blockHeight: 1, indexInBlock: i, extrinsicHash: EXTRINSIC[i], txHash: LEDGER[i], protocolVersion: 1, transactionType: 'REGULAR', block_ID: blockId
             }));
             for (const paidFees of paid) {
                 await db.run(INSERT.into('midnight.TransactionFees').entries({ ID: cds.utils.uuid(), paidFees, estimatedFees: paidFees, transaction_ID: ID }));
             }
-            if (i === 2) await db.run(INSERT.into('midnight.TransactionIdentifiers').entries({ identifier: IDENTIFIER, transaction_ID: ID }));
+            if (i === 2) await db.run(INSERT.into('midnight.TransactionIdentifiers').entries({ txId: IDENTIFIER, transaction_ID: ID }));
         }
     });
 
     test.each([
-        ['the extrinsic hash', [EXTRINSIC[0]], '100'],
-        ['the ledger hash', [LEDGER[1]], '50'],
-        ['an identifier', [IDENTIFIER], '10'],
-        ['all three ways', [EXTRINSIC[0], LEDGER[1], IDENTIFIER], '160'],
-        ['a hash nothing has', [hex('ff')], '0'],
-        ['no hash', [], '0']
-    ])('finds the fee by %s', async (_name, hashes, total) => {
-        expect(await sumIndexedFees(db, hashes)).toBe(total);
+        ['the ledger hash', [LEDGER[1]], [], '50'],
+        ['an identifier', [], [IDENTIFIER], '10'],
+        ['hashes and an identifier', [LEDGER[0], LEDGER[1]], [IDENTIFIER], '160'],
+        ['a hash nothing has', [hex('ff')], [], '0'],
+        ['nothing', [], [], '0']
+    ])('finds the fee by %s', async (_name, txHashes, txIds, total) => {
+        expect(await sumIndexedFees(db, txHashes, txIds)).toBe(total);
     });
 
-    test('counts a transaction once when a job names it twice', async () => {
-        expect(await sumIndexedFees(db, [EXTRINSIC[2], LEDGER[2], IDENTIFIER])).toBe('10');
+    test('an extrinsic hash names no transaction of a job', async () => {
+        expect(await sumIndexedFees(db, [EXTRINSIC[0]], [EXTRINSIC[0]])).toBe('0');
+    });
+
+    test('counts a transaction once when a job names it by hash and by identifier', async () => {
+        expect(await sumIndexedFees(db, [LEDGER[2]], [IDENTIFIER])).toBe('10');
     });
 
     test('counts a transaction once across two chunks of hashes', async () => {
         const filler = Array.from({ length: 500 }, (_, i) => i.toString(16).padStart(64, '0'));
-        expect(await sumIndexedFees(db, [EXTRINSIC[0], ...filler, LEDGER[0]])).toBe('100');
+        expect(await sumIndexedFees(db, [LEDGER[0], ...filler, LEDGER[0]])).toBe('100');
     });
 });

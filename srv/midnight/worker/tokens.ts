@@ -20,10 +20,10 @@ const strictSyncMs = (timeoutMs?: number): number => (timeoutMs && timeoutMs > 0
 
 /** The SDK outputs of one payment, to a shielded or an unshielded address. The ttl defaults to ten minutes. */
 async function transferOutputs(
-    sdk: WalletSdk, networkId: string, a: { receiverAddress: string; amount: string; tokenTypeHex?: string; ttlIso?: string }
+    sdk: WalletSdk, networkId: string, a: { receiverAddress: string; amount: string; tokenType?: string; ttlIso?: string }
 ): Promise<{ receiver: ReceiverParsed; outputs: CombinedTokenTransfer[]; ttl: Date }> {
     const receiver = await parseReceiverAddress(a.receiverAddress, networkId);
-    const type = a.tokenTypeHex || sdk.ledger.nativeToken().raw;
+    const type = a.tokenType || sdk.ledger.nativeToken().raw;
     const amount = BigInt(a.amount);
     const outputs: CombinedTokenTransfer[] = receiver.kind === 'shielded'
         ? [{ type: 'shielded', outputs: [{ type, receiverAddress: receiver.addr, amount }] }]
@@ -75,6 +75,7 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
         log(dustReceiverAddress ? 'warn' : 'info', `dust-register: ${message}`);
         return {
             txId: null,
+            txHash: null,
             changed: false,
             reason,
             registeredCount: 0,
@@ -139,6 +140,7 @@ export async function registerDustGeneration({ sessionId, dustReceiverAddress, s
 
     return {
         txId: String(txId),
+        txHash: String(finalized.transactionHash()),
         changed: true,
         reason: null,
         registeredCount: unregistered.length,
@@ -181,6 +183,7 @@ export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, spons
         log('info', `dust-deregister: no registered NIGHT UTXOs to deregister.`);
         return {
             txId: null,
+            txHash: null,
             deregisteredCount: 0,
             totalNightUtxos: allCoins.length
         };
@@ -219,19 +222,20 @@ export async function deregisterDustGeneration({ sessionId, syncTimeoutMs, spons
 
     return {
         txId: String(txId),
+        txHash: String(finalized.transactionHash()),
         deregisteredCount: registered.length,
         totalNightUtxos: allCoins.length
     };
 }
 
-export async function transferNight({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs, tokenTypeHex, __replyPort }: {
+export async function transferToken({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs, tokenType, __replyPort }: {
     sessionId: string;
     receiverAddress: string;
     amount: string;          // atoms as a decimal string
     ttlIso?: string;          // defaults to 10 minutes from now
     syncTimeoutMs?: number;
     /** Raw token type (64 hex) to send instead of NIGHT. */
-    tokenTypeHex?: string;
+    tokenType?: string;
     /** Set by the dispatcher. Used to announce the tx before sending it. */
     __replyPort?: MessagePort;
 }) {
@@ -244,9 +248,9 @@ export async function transferNight({ sessionId, receiverAddress, amount, ttlIso
     await waitForSyncedStateBounded(entry, 'transfer', syncTimeoutMs);
     log('info', `transfer: synced.`);
 
-    const { receiver, outputs, ttl } = await transferOutputs(sdk, entry.networkId, { receiverAddress, amount, tokenTypeHex, ttlIso });
+    const { receiver, outputs, ttl } = await transferOutputs(sdk, entry.networkId, { receiverAddress, amount, tokenType, ttlIso });
 
-    log('info', `transfer: ${amount} ${tokenTypeHex ? `token ${tokenTypeHex.slice(0, 12)}...` : 'NIGHT'} to ${receiver.kind} addr ${receiverAddress.slice(0, 24)}...`);
+    log('info', `transfer: ${amount} ${tokenType ? `token ${tokenType.slice(0, 12)}...` : 'NIGHT'} to ${receiver.kind} addr ${receiverAddress.slice(0, 24)}...`);
 
     await captureDustSnapshot(entry, 'transfer');
     const recipe = await entry.facade.transferTransaction(
@@ -269,6 +273,7 @@ export async function transferNight({ sessionId, receiverAddress, amount, ttlIso
 
     return {
         txId: String(txId),
+        txHash: String(finalized.transactionHash()),
         toLedger: receiver.kind,
         amount: amount,
         receiverAddress: receiverAddress
@@ -331,13 +336,13 @@ export async function getBalance({ sessionId, syncTimeoutMs }: {
 }
 
 /** Estimates a transfer's fee without sending. The built tx is discarded, so its reserved coins become spendable again. */
-export async function estimateTransferFee({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs, tokenTypeHex }: {
+export async function estimateTransferFee({ sessionId, receiverAddress, amount, ttlIso, syncTimeoutMs, tokenType }: {
     sessionId: string;
     receiverAddress: string;
     amount: string;
     ttlIso?: string;
     syncTimeoutMs?: number;
-    tokenTypeHex?: string;
+    tokenType?: string;
 }) {
     const entry = facades.get(sessionId);
     if (!entry) throw new Error(`No facade for sessionId=${sessionId.slice(0, 16)}`);
@@ -345,7 +350,7 @@ export async function estimateTransferFee({ sessionId, receiverAddress, amount, 
 
     await waitForSyncedStateBounded(entry, 'estimateTransferFee', syncTimeoutMs);
 
-    const { receiver, outputs, ttl } = await transferOutputs(sdk, entry.networkId, { receiverAddress, amount, tokenTypeHex, ttlIso });
+    const { receiver, outputs, ttl } = await transferOutputs(sdk, entry.networkId, { receiverAddress, amount, tokenType, ttlIso });
 
     // Building reserves coins and dust until the recipe is discarded. Under the session lock no submit of this wallet
     // picks coins or saves its dust state in between.
@@ -356,4 +361,4 @@ export async function estimateTransferFee({ sessionId, receiverAddress, amount, 
     return { fee: fee.toString(), toLedger: receiver.kind };
 }
 
-export const tokenHandlers = { registerDustGeneration, deregisterDustGeneration, transferNight, getBalance, estimateTransferFee };
+export const tokenHandlers = { registerDustGeneration, deregisterDustGeneration, transferToken, getBalance, estimateTransferFee };

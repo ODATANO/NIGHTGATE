@@ -4,13 +4,13 @@
 
 import crypto from 'node:crypto';
 import cds from '@sap/cds';
-import { encrypt, decrypt, inspectCiphertext, KeyRing, UnknownEncryptionKeyError, UnboundEnvelopeError } from '../utils/crypto';
+import { encrypt, decrypt, inspectCiphertext, KeyRing, UnknownEncryptionKeyError } from '../utils/crypto';
 import { accountDekBinding, accountDekViewingKeySealBinding } from '../utils/envelope-bindings';
 import type { DbRunner } from '../utils/db-types';
 import type { AccountKey } from '#cds-models/midnight';
 import { NightgateError } from '../utils/errors';
 
-const { SELECT, INSERT, UPDATE } = cds.ql;
+const { SELECT, INSERT, UPDATE, DELETE } = cds.ql;
 const ENTITY = 'midnight.AccountKeys';
 
 /** Marks rows encrypted with a password derived from the DEK. */
@@ -64,19 +64,14 @@ export function openDekByStoragePassword(sealed: string, storagePassword: string
     }
 }
 
-/** True for an older `vk1:` value that is not yet wrapped with a server key. */
-export function isBareViewingKeySeal(stored: string): boolean {
-    return String(stored).startsWith(`${VK_SEAL_VERSION}:`);
-}
-
 /** Encrypts the DEK with the viewing key, then with a server key. Neither key alone can open it. */
 export function sealDekByViewingKey(dek: Buffer, storagePassword: string, ring: KeyRing, accountId: string): string {
     return encrypt(sealDekByStoragePassword(dek, storagePassword), ring, accountDekViewingKeySealBinding(accountId));
 }
 
-/** Removes the server-key layer, if present, then decrypts with the storage password. */
+/** Removes the server-key layer, then decrypts with the storage password. */
 export function openDekByViewingKey(stored: string, storagePassword: string, ring: KeyRing, accountId: string): Buffer {
-    const inner = isBareViewingKeySeal(stored) ? stored : decrypt(stored, ring, accountDekViewingKeySealBinding(accountId));
+    const inner = decrypt(stored, ring, accountDekViewingKeySealBinding(accountId));
     return openDekByStoragePassword(inner, storagePassword);
 }
 
@@ -196,7 +191,6 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
         try {
             dek = unwrapDek(row.wrappedDek, ring, accountId);
         } catch (err) {
-            if (err instanceof UnboundEnvelopeError) throw err;
             ringError = err;
         }
         let vkOpens: boolean | undefined;
@@ -207,7 +201,6 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
                 vkOpens = !dek || viaVk.equals(dek);
                 dek ??= viaVk;
             } catch (err) {
-                if (err instanceof UnboundEnvelopeError) throw err;
                 // A missing server key does not mean the viewing key is wrong.
                 if (err instanceof UnknownEncryptionKeyError) vkUnknownKey = err;
                 else vkOpens = false;
@@ -224,15 +217,13 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
             // The server key opened it, but the viewing key belongs to another wallet.
             throw new AccountDekUnavailableError(accountId, 'the viewing key does not match the account key');
         }
-        const { keyId, version } = inspectCiphertext(row.wrappedDek);
+        const { keyId } = inspectCiphertext(row.wrappedDek);
         const set: Record<string, unknown> = {};
-        if (keyId !== ring.activeId || version !== 3 || ringError) {
+        if (keyId !== ring.activeId || ringError) {
             set.wrappedDek = wrapDek(dek, ring, accountId);
         }
         if (storagePassword && !row.wrappedDekByViewingKey) {
             set.wrappedDekByViewingKey = sealDekByViewingKey(dek, storagePassword, ring, accountId);
-        } else if (row.wrappedDekByViewingKey && isBareViewingKeySeal(row.wrappedDekByViewingKey)) {
-            set.wrappedDekByViewingKey = encrypt(row.wrappedDekByViewingKey, ring, accountDekViewingKeySealBinding(accountId));
         } else if (row.wrappedDekByViewingKey && !vkUnknownKey) {
             const sealed = inspectCiphertext(row.wrappedDekByViewingKey);
             if (sealed.keyId !== ring.activeId) {
@@ -274,8 +265,8 @@ async function resolveUncached(args: ResolveAccountDekArgs, token: symbol): Prom
     return copy;
 }
 
-/** The server key id a stored DEK was encrypted with, read without decrypting. */
-export function accountDekKeyId(row: { wrappedDek?: string | null }): string | null {
-    if (!row?.wrappedDek) return null;
-    try { return inspectCiphertext(row.wrappedDek).keyId; } catch { return null; }
+/** Removes an account's stored DEK. Call it only when no row of the account is left, or those rows are lost. */
+export async function dropAccountDek(db: Runner, accountId: string): Promise<void> {
+    await db.run(DELETE.from(ENTITY).where({ accountId }));
+    evictAccountDek(accountId);
 }

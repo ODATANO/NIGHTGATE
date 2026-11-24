@@ -7,7 +7,7 @@ vi.mock('@sap/cds', () => {
         env: {
             requires: {
                 nightgate: {
-                    network: 'testnet'
+                    network: 'undeployed'
                 }
             }
         },
@@ -153,40 +153,6 @@ describe('MidnightCrawler helper paths', () => {
         } finally {
             warnSpy.mockRestore();
         }
-    });
-
-    it('creates SyncState when it is missing (shared utility)', async () => {
-        const { ensureSyncStateSingleton } = await import('../../srv/utils/sync-state.js');
-        const db = {
-            run: vi.fn()
-                .mockResolvedValueOnce(null)
-                .mockResolvedValueOnce(undefined)
-        };
-
-        await ensureSyncStateSingleton(db as any);
-
-        expect(db.run).toHaveBeenCalledTimes(2);
-        expect(selectWhereSpy).toHaveBeenCalledWith({ ID: 'SINGLETON' });
-        expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({
-            ID: 'SINGLETON',
-            networkId: 'testnet',
-            syncStatus: 'stopped',
-            chainHeight: 0,
-            consecutiveErrors: 0
-        }));
-    });
-
-    it('does nothing when SyncState already exists (shared utility)', async () => {
-        const { ensureSyncStateSingleton } = await import('../../srv/utils/sync-state.js');
-        // networkId matches the configured network: the row is properly bound,
-        // so neither the legacy-backfill nor the mismatch guard fires.
-        const db = {
-            run: vi.fn().mockResolvedValueOnce({ ID: 'SINGLETON', networkId: 'testnet' })
-        };
-
-        await expect(ensureSyncStateSingleton(db as any)).resolves.toBeUndefined();
-        expect(db.run).toHaveBeenCalledTimes(1);
-        expect(insertEntriesSpy).not.toHaveBeenCalled();
     });
 
     it('ignores unique-constraint races while creating SyncState (shared utility)', async () => {

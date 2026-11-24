@@ -39,7 +39,7 @@ describe('buildProofProvider', () => {
 
     it("defaults to the proof server", async () => {
         const res = await buildProofProvider({
-            connector: {}, zkConfigProvider, proverServerUri: 'http://localhost:6300', proofMod
+            connector: {}, zkConfigProvider, proofServerUrl: 'http://localhost:6300', proofMod
         });
         expect(res.provingModality).toBe('server');
         expect((res.proofProvider as any).uri).toBe('http://localhost:6300');
@@ -62,7 +62,7 @@ describe('buildProofProvider', () => {
                 proving: 'wallet',
                 connector: {}, // no getProvingProvider
                 zkConfigProvider,
-                proverServerUri: 'http://localhost:6300',
+                proofServerUrl: 'http://localhost:6300',
                 proofMod
             })
         ).rejects.toThrow(/does not implement getProvingProvider/);
@@ -71,15 +71,16 @@ describe('buildProofProvider', () => {
     it("'auto' prefers the wallet, and falls back to the server without it", async () => {
         const withWallet = await buildProofProvider({
             proving: 'auto',
-            connector: { getProvingProvider: async () => ({ marker: 'wallet-prover' }) },
+            // A stand-in for the wallet's prover: the test only checks which path was taken.
+            connector: { getProvingProvider: async () => ({ marker: 'wallet-prover' }) } as never,
             zkConfigProvider,
-            proverServerUri: 'http://localhost:6300',
+            proofServerUrl: 'http://localhost:6300',
             proofMod
         });
         expect(withWallet.provingModality).toBe('wallet');
 
         const withoutWallet = await buildProofProvider({
-            proving: 'auto', connector: {}, zkConfigProvider, proverServerUri: 'http://localhost:6300', proofMod
+            proving: 'auto', connector: {}, zkConfigProvider, proofServerUrl: 'http://localhost:6300', proofMod
         });
         expect(withoutWallet.provingModality).toBe('server');
     });
@@ -89,9 +90,9 @@ describe('buildProofProvider', () => {
         const refusing = { getProvingProvider: async () => { throw new Error('the user declined to prove'); } };
         const asking = async (connector: any) => { await connector.getProvingProvider(); return { marker: 'wallet-proof-provider' } as any; };
         dappConnectorProofProvider.mockImplementationOnce(asking).mockImplementationOnce(asking).mockImplementationOnce(asking);
-        const auto = await buildProofProvider({ proving: 'auto', connector: refusing, zkConfigProvider, proverServerUri: 'http://localhost:6300', proofMod });
+        const auto = await buildProofProvider({ proving: 'auto', connector: refusing, zkConfigProvider, proofServerUrl: 'http://localhost:6300', proofMod });
         expect(auto.provingModality).toBe('server');
-        await expect(buildProofProvider({ proving: 'wallet', connector: refusing, zkConfigProvider, proverServerUri: 'http://localhost:6300', proofMod }))
+        await expect(buildProofProvider({ proving: 'wallet', connector: refusing, zkConfigProvider, proofServerUrl: 'http://localhost:6300', proofMod }))
             .rejects.toThrow('the user declined to prove');
         // Without a proof server either, nothing can prove.
         expect((await buildProofProvider({ proving: 'auto', connector: refusing, zkConfigProvider, proofMod })).provingModality).toBe('none');
@@ -133,11 +134,11 @@ describe('createNightgateConnectorProviders: zk config', () => {
         }) as unknown as typeof fetch;
     }
     const connector = {
-        getConfiguration: async () => ({ indexerUri: 'https://indexer.example/graphql', indexerWsUri: 'wss://indexer.example/graphql/ws', substrateNodeUri: 'wss://node.example', networkId: 'preprod', proverServerUri: 'http://localhost:6300' }),
+        getConfiguration: async () => ({ indexerUri: 'https://indexer.example/graphql', indexerWsUri: 'wss://indexer.example/graphql/ws', substrateNodeUri: 'wss://node.example', networkId: 'preprod', proofServerUrl: 'http://localhost:6300' }),
         getShieldedAddresses: async () => ({ shieldedCoinPublicKey: 'cpk', shieldedEncryptionPublicKey: 'epk', shieldedAddress: 'addr' })
     };
     const assemble = (files: Record<string, Uint8Array | string>, extra: Record<string, unknown> = {}) => createNightgateConnectorProviders({
-        connector, contract: 'attestation-vault', webSocket: class {},
+        connector: connector as never, contractName: 'attestation-vault', webSocket: class {} as never,
         manifest: { contracts: [{ name: 'attestation-vault', zkConfigBaseUrl: BASE, circuits: ['attest'] }] },
         fetchFn: fakeFetch(files), ...extra
     });
@@ -162,12 +163,12 @@ describe('createNightgateConnectorProviders: zk config', () => {
         await expect(other.zkConfigProvider.getArtifactRuntimeVersion()).rejects.toThrow(/integrity/);
     });
 
-    it('hands a wallet key material that resolves key locations, which the plain provider refuses', async () => {
-        const { encodeContractKeyLocation, hashVerifierKey } = await import('@midnight-ntwrk/midnight-js-types');
+    it('hands out the key file provider of midnight-js and no helper of its own for wallet proving', async () => {
+        const { FetchZkConfigProvider } = await import('@midnight-ntwrk/midnight-js-fetch-zk-config-provider');
+        const browser = await import('../../src/browser/index.mjs' as string);
+        expect(browser.FetchZkConfigProvider).toBe(FetchZkConfigProvider);
         const providers = await assemble(served);
-        const location = encodeContractKeyLocation({ contractAddress: 'ab'.repeat(32), circuitId: 'attest', verifierKeyHash: hashVerifierKey(VERIFIER as any) } as any);
-        await expect(providers.zkConfigProvider.getVerifierKey(location)).rejects.toThrow(/Invalid circuitId/);
-        // The registry finds the circuit by its verifier key, then asks for the prover key, which is not served here.
-        await expect(providers.keyMaterialProvider().getVerifierKey(location)).rejects.toThrow(/attest\.prover/);
+        expect(providers.zkConfigProvider).toBeInstanceOf(FetchZkConfigProvider);
+        expect(providers).not.toHaveProperty('keyMaterialProvider');
     });
 });

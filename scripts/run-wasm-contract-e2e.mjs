@@ -40,11 +40,19 @@ async function post(path, body, timeoutMs = 60 * 60 * 1000) {
     return { status: r.status, body: parsed };
 }
 
+/** Reads a job. Its ids go into the URL, because getJobStatus is a function. */
+async function jobStatus(jobId, sessionId, headers = {}) {
+    const r = await fetch(`${ENDPOINT}/getJobStatus(jobId='${jobId}',sessionId='${sessionId}')`, { headers, signal: AbortSignal.timeout(60_000) });
+    const text = await r.text();
+    let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+    return { status: r.status, body: parsed };
+}
+
 async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS, intervalMs = JOB_POLL_MS } = {}) {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = null;
     while (Date.now() < deadline) {
-        const r = await post('/getJobStatus', { jobId, sessionId });
+        const r = await jobStatus(jobId, sessionId);
         if (r.status !== 200) fail(`getJobStatus(${jobId}) → HTTP ${r.status}: ${pretty(r.body)}`);
         const { status, result, errorCode, errorMessage } = r.body;
         if (status !== lastStatus) {
@@ -55,7 +63,7 @@ async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS
         }
         if (status === 'succeeded') {
             process.stdout.write('\n');
-            return result ? JSON.parse(result) : {};
+            return result ?? {};
         }
         if (status === 'failed') {
             process.stdout.write('\n');
@@ -91,12 +99,12 @@ async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS
 
     r = await post('/connectWalletForSigning', { sessionId, mnemonic: MNEMONIC });
     if (r.status !== 200 && r.status !== 201) fail(`connectWalletForSigning → HTTP ${r.status}: ${pretty(r.body)}`);
-    if (r.body?.prewarmJobId) await pollJob(sessionId, r.body.prewarmJobId, 'prewarm');
+    if (r.body?.jobId) await pollJob(sessionId, r.body.jobId, 'prewarm');
     console.log('OK   prewarm done');
 
     step(`2. deployContract(${ARTIFACT})`);
     const tDeploy = Date.now();
-    r = await post('/deployContract', { compiledArtifactRef: ARTIFACT, sessionId, initialPrivateState: '{}' });
+    r = await post('/deployContract', { contractName: ARTIFACT, sessionId, initialPrivateState: '{}' });
     if (r.status >= 400) fail(`deployContract → HTTP ${r.status}: ${pretty(r.body)}`);
     const deployResult = await pollJob(sessionId, r.body.jobId, 'deploy');
     const deploySecs = ((Date.now() - tDeploy) / 1000).toFixed(1);
@@ -110,7 +118,7 @@ async function pollJob(sessionId, jobId, label, { timeoutMs = PREWARM_TIMEOUT_MS
     r = await post('/submitContractCall', {
         contractAddress,
         circuit: CIRCUIT,
-        compiledArtifactRef: ARTIFACT,
+        contractName: ARTIFACT,
         sessionId,
         args: '[]'
     });

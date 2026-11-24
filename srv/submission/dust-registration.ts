@@ -2,12 +2,9 @@
 // The caller must have loaded the wallet for `cacheKey` in the worker first.
 
 import { walletRegisterDustGeneration, walletDeregisterDustGeneration, type RegisterDustGenerationOutcome, type SubmitIntentHook } from '../midnight/wallet-worker-client';
-import type { WalletFacadeBuildArgs } from './wallet-facade-builder';
 
 export interface RegisterDustGenerationArgs {
     cacheKey: string;
-    facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex'>;
-    seedHex: string;
     /** Dust address that receives the generated dust. Defaults to the wallet's own. */
     dustReceiverAddress?: string;
     syncTimeoutMs?: number;

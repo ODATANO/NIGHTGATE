@@ -16,7 +16,6 @@ import type * as DustV2 from '@midnightntwrk/wallet-sdk-dust-wallet/v2';
 import type { NodeClientSdk } from './phased-submit';
 import type * as AbstractionsSdk from '@midnightntwrk/wallet-sdk-abstractions';
 import type * as FacadeSdk from '@midnightntwrk/wallet-sdk-facade';
-import type * as ProvingSdk from '@midnightntwrk/wallet-sdk-capabilities/proving';
 import type * as ContractsSdk from '@midnight-ntwrk/midnight-js-contracts';
 import type * as IndexerSdk from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
 import type * as ProofSdk from '@midnight-ntwrk/midnight-js-http-client-proof-provider';
@@ -154,7 +153,6 @@ export async function loadLedger(): Promise<typeof LedgerV9> {
 let cachedWallet: Omit<WalletSdk, 'ledger' | 'facade'> | undefined;
 let cachedFacadeSdk: typeof FacadeSdk | undefined;
 let cachedContractsSdk: ContractsSdkBundle | undefined;
-let cachedProving: Promise<typeof ProvingSdk> | undefined;
 export let cachedAddressFormat: typeof AddressFormat | undefined;
 
 export async function loadAddressFormat(): Promise<typeof AddressFormat> {
@@ -194,12 +192,6 @@ export function loadNodeClientSdk(): Promise<NodeClientSdk> {
         Effect: effect.Effect, Scope: effect.Scope, Exit: effect.Exit, Stream: effect.Stream, Duration: effect.Duration
     }));
     return cachedNodeClient;
-}
-
-export async function loadProvingSdk(): Promise<typeof ProvingSdk> {
-    // Cached as a promise so concurrent first calls share one import.
-    cachedProving ??= import('@midnightntwrk/wallet-sdk-capabilities/proving');
-    return cachedProving;
 }
 
 export type ProvingMode = 'server' | 'wasm';

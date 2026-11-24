@@ -14,8 +14,8 @@ export interface HolderRegistryLedger {
 }
 
 /** The registry entry for a token type and claim key, computed by the contract's own code. */
-export function holderEntry(artifact: Pick<ContractArtifact<unknown>, 'pureCircuits'>, tokenTypeHex: string, claimKeyHex: string): string {
-    return kitHolderEntry(artifact.pureCircuits as Parameters<typeof kitHolderEntry>[0], tokenTypeHex, claimKeyHex);
+export function holderEntry(artifact: Pick<ContractArtifact<unknown>, 'pureCircuits'>, tokenType: string, claimKeyHex: string): string {
+    return kitHolderEntry(artifact.pureCircuits as Parameters<typeof kitHolderEntry>[0], tokenType, claimKeyHex);
 }
 
 export interface HolderRegistrationQuery {

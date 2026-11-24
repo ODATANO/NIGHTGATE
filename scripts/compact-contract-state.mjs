@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Moves stored per-action contract states to one state per contract plus a hash per action. Stop the server first.
-// Run: npx nightgate-compact-contract-state [--dry-run] [--batch 100] [sqlite-file]
+// Run: node scripts/compact-contract-state.mjs [--dry-run] [--batch 100] [sqlite-file]
 // Env: NIGHTGATE_DB_URL or NIGHTGATE_DB_PATH; NIGHTGATE_CRAWLER_CONTRACT_STATE_HISTORY keeps full states.
 
 import { createRequire } from 'node:module';
@@ -11,14 +11,6 @@ import { fileURLToPath } from 'node:url';
 const require = createRequire(import.meta.url);
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-function requireFromHost(name, hint) {
-    const candidates = [require, createRequire(path.join(process.cwd(), 'package.json'))];
-    for (const r of candidates) {
-        try { return r(name); } catch (e) { if (e?.code !== 'MODULE_NOT_FOUND' || !String(e.message).includes(name)) throw e; }
-    }
-    console.error(`'${name}' is not installed (neither next to @odatano/nightgate nor in ${process.cwd()}). ${hint}`);
-    process.exit(2);
-}
 
 function arg(name, fallback) {
     const i = process.argv.indexOf(name);
@@ -29,12 +21,11 @@ const DRY = process.argv.includes('--dry-run');
 const BATCH = Math.max(1, Number(arg('--batch', '100')) || 100);
 const positional = process.argv.slice(2).filter((a, i, all) => !a.startsWith('--') && all[i - 1] !== '--batch');
 
-const cds = requireFromHost('@sap/cds', 'Run this from a CAP project that has @sap/cds installed.');
+const cds = require('@sap/cds');
 const { postgresCredentials, postgresKind } = await import(new URL('../docker/cds-config.mjs', import.meta.url).href);
 
 const dbUrl = String(process.env.NIGHTGATE_DB_URL ?? '').trim();
 if (dbUrl) {
-    requireFromHost('@cap-js/postgres/package.json', 'Install it in the host: npm i @cap-js/postgres');
     cds.env.requires.kinds = { ...(cds.env.requires.kinds ?? {}), postgres: postgresKind() };
     cds.env.requires.db = { kind: 'postgres', credentials: postgresCredentials(dbUrl) };
 } else {

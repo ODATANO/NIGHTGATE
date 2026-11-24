@@ -5,9 +5,9 @@ import { getNightgateConfig, type NightgateConfig } from './nightgate-config';
 import { configList } from './config';
 import { NightgateError } from './errors';
 
-/** Session ids any authenticated caller may use as fee sponsor. Env NIGHTGATE_FEE_SPONSOR_SESSION wins over cds config `feeSponsorSessions`. */
+/** Session ids any authenticated caller may use as fee sponsor. Env NIGHTGATE_FEE_SPONSOR_SESSIONS wins over cds config `feeSponsorSessions`. */
 export function getConfiguredFeeSponsorSessions(config?: NightgateConfig): string[] {
-    const fromEnv = configList('NIGHTGATE_FEE_SPONSOR_SESSION');
+    const fromEnv = configList('NIGHTGATE_FEE_SPONSOR_SESSIONS');
     if (fromEnv.length) return fromEnv;
     const raw = Array.isArray(config?.feeSponsorSessions)
         ? config!.feeSponsorSessions.join(',')

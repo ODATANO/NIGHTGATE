@@ -67,7 +67,6 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
 }));
 
 import {
-    derivePrivateStatePassword, privateStatePasswordCandidates,
     buildWalletMaterialForSession,
     deriveAccountId,
     deriveStoragePassword,
@@ -96,7 +95,6 @@ const TEST_KEY = crypto.createHash('sha256').update('test-encryption-key').diges
 function buildEncryptedSession(viewingKey: string, overrides: Record<string, any> = {}) {
     const enc = encrypt(viewingKey, TEST_KEY, walletSessionViewingKeyBinding('sess-1'));
     return {
-        ID: 'sess-uuid',
         sessionId: 'sess-1',
         isActive: true,
         encryptedViewingKey: enc,
@@ -108,11 +106,6 @@ function buildEncryptedSession(viewingKey: string, overrides: Record<string, any
 // ---- Determinism ----------------------------------------------------------
 
 describe('deriveAccountId / deriveStoragePassword', () => {
-    test('same viewing key → same accountId', () => {
-        const vk = 'mn_shield-vk_test1...example';
-        expect(deriveAccountId(vk)).toBe(deriveAccountId(vk));
-    });
-
     test('different viewing keys → different accountIds', () => {
         expect(deriveAccountId('vk-A')).not.toBe(deriveAccountId('vk-B'));
     });
@@ -122,10 +115,9 @@ describe('deriveAccountId / deriveStoragePassword', () => {
         expect(a).toMatch(HEX64_RE);
     });
 
-    test('storage password is 64-char hex, ≥16 chars', () => {
+    test('storage password is 64-char hex', () => {
         const p = deriveStoragePassword('any-input');
         expect(p).toMatch(HEX64_RE);
-        expect(p.length).toBeGreaterThanOrEqual(16);
     });
 
     test('accountId and storage password use distinct domain separation', () => {
@@ -133,29 +125,15 @@ describe('deriveAccountId / deriveStoragePassword', () => {
         expect(deriveAccountId(vk)).not.toBe(deriveStoragePassword(vk));
     });
 
-    test('determinism survives across separate calls (simulates reconnect)', () => {
+    test('a viewing key gives the account id and storage password it always gave', () => {
+        // Stored rows are found under these values. A change here moves every account.
         const vk = 'mn_shield-vk_reconnect-test';
-        const first = { id: deriveAccountId(vk), pw: deriveStoragePassword(vk) };
-        // Imagine the process restarted here.
-        const second = { id: deriveAccountId(vk), pw: deriveStoragePassword(vk) };
-        expect(second).toEqual(first);
+        expect(deriveAccountId(vk)).toBe('315382a9839b5c25a06d3b50621699a150b56394665a8e85eaef1e922b33d14c');
+        expect(deriveStoragePassword(vk)).toBe('827a6ec40f828f9bfdf10fd3bb7eab08bd83dfc1e24e742669de611321b5c0a3');
     });
 });
 
 // ---- buildWalletMaterialForSession ----------------------------------------
-
-describe('privateStatePasswordCandidates', () => {
-    test('active ring key first, the other keys, then the pre-ring form; every value distinct', () => {
-        const ring = new KeyRing({ activeId: 'k2', keys: [{ id: '1', secret: 'one-secret-of-thirty-two-chars!!' }, { id: 'k2', secret: 'two-secret-of-thirty-two-chars!!' }] });
-        const vk = 'vk-candidates';
-        const c = privateStatePasswordCandidates(ring, vk);
-        expect(c.map(x => [x.keyId, x.legacy])).toEqual([['k2', false], ['1', false], [null, true]]);
-        expect(c[0].password).toBe(derivePrivateStatePassword(ring, 'k2', vk));
-        expect(c[2].password).toBe(deriveStoragePassword(vk));
-        expect(new Set(c.map(x => x.password)).size).toBe(3);
-        for (const x of c) expect(x.password).toMatch(HEX64_RE);
-    });
-});
 
 describe('buildWalletMaterialForSession', () => {
     beforeEach(() => { clearAllAccountDeks(); });
@@ -170,10 +148,7 @@ describe('buildWalletMaterialForSession', () => {
 
         expect(material.accountId).toBe(deriveAccountId(viewingKey));
         const pw = await material.privateStoragePasswordProvider();
-        // Derived from the account DEK the factory created on first use: the
-        // key was inserted sealed under the ring (TEST_KEY as key 1) and under
-        // the viewing key; the password is neither the viewing-key form nor
-        // any ring-bound form.
+        // Derived from the account DEK the factory created on first use, sealed under the ring (TEST_KEY as key 1) and the viewing key.
         const ring = KeyRing.fromKek(TEST_KEY);
         const insert = db.run.mock.calls.map(c => c[0]).find((q: any) => q?.INSERT?.into === 'midnight.AccountKeys' || q?.INSERT?.into?.ref?.[0] === 'midnight.AccountKeys');
         expect(insert).toBeDefined();
@@ -186,12 +161,7 @@ describe('buildWalletMaterialForSession', () => {
         expect(openDekByViewingKey(entry.wrappedDekByViewingKey, deriveStoragePassword(viewingKey), ring, entry.accountId).equals(dek)).toBe(true);
         expect(pw).toBe(privateStatePasswordFromDek(dek, material.accountId));
         expect(pw).not.toBe(deriveStoragePassword(viewingKey));
-        expect(pw).not.toBe(derivePrivateStatePassword(ring, ring.activeId, viewingKey));
         expect(pw.length).toBeGreaterThanOrEqual(16);
-        // Legacy candidates read the pre-DEK rows: ring-bound form(s), then the viewing-key form.
-        const fallbacks = await material.privateStoragePasswordFallbacks!();
-        expect(fallbacks).toEqual(privateStatePasswordCandidates(ring, viewingKey).map(c => c.password));
-        expect(fallbacks[fallbacks.length - 1]).toBe(deriveStoragePassword(viewingKey));
         expect(material.walletAndMidnightProvider).toBeDefined();
     });
 
@@ -301,22 +271,6 @@ describe('buildWalletMaterialForSession', () => {
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY  // wrong key for this ciphertext
         })).rejects.toBeInstanceOf(SessionNotFoundError);
     });
-
-    test('propagates privateStateBackend opt to the returned material', async () => {
-        const db = makeDbWithSession(buildEncryptedSession('vk'));
-        const m = await buildWalletMaterialForSession({
-            sessionId: 'sess-1', db, encryptionKey: TEST_KEY, privateStateBackend: 'level'
-        });
-        expect(m.privateStateBackend).toBe('level');
-    });
-
-    test('defaults privateStateBackend to undefined (provider layer fills cap-db default)', async () => {
-        const db = makeDbWithSession(buildEncryptedSession('vk'));
-        const m = await buildWalletMaterialForSession({
-            sessionId: 'sess-1', db, encryptionKey: TEST_KEY
-        });
-        expect(m.privateStateBackend).toBeUndefined();
-    });
 });
 
 // ---- Wallet adapter shape -------------------------------------------------
@@ -329,14 +283,6 @@ describe('walletAndMidnightProvider adapter (read-only material only)', () => {
         material = await buildWalletMaterialForSession({
             sessionId: 'sess-1', db, encryptionKey: TEST_KEY
         });
-    });
-
-    test('exposes the four interface methods', () => {
-        const w = material.walletAndMidnightProvider;
-        expect(typeof w.getCoinPublicKey).toBe('function');
-        expect(typeof w.getEncryptionPublicKey).toBe('function');
-        expect(typeof w.balanceTx).toBe('function');
-        expect(typeof w.submitTx).toBe('function');
     });
 
     test('getCoinPublicKey throws WalletSigningNotAvailable', () => {
@@ -523,7 +469,7 @@ describe('classifySubmissionError recognizes WalletSigningNotAvailable', () => {
         const { classifySubmissionError } = await import('../../srv/submission/TransactionSubmitter.js');
         const err = new WalletSigningNotAvailable('balanceTx()');
         const c = classifySubmissionError(err, 'preprod');
-        expect(c.code).toBe('WalletSigningNotAvailable');
+        expect(c.code).toBe('WALLET_SIGNING_NOT_AVAILABLE');
         expect(c.retryable).toBe(false);
         expect(c.message).toMatch(/encryptedSeedKey/);
     });

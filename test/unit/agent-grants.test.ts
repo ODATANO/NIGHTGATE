@@ -54,14 +54,15 @@ vi.mock('../../srv/submission/background-jobs', () => ({
 const mockResolveFeeSponsor = vi.hoisted(() => (vi.fn()));
 vi.mock('../../srv/submission/fee-sponsor', () => {
     class FeeSponsorError extends Error {
-        constructor(public readonly httpStatus: number, message: string) {
+        readonly code = 'FEE_SPONSOR_UNUSABLE';
+        constructor(public readonly status: number, message: string) {
             super(message);
             this.name = 'FeeSponsorError';
         }
     }
     // real env-reading behavior for the pool sentinel tests
     const getConfiguredFeeSponsorSessions = () =>
-        String(process.env.NIGHTGATE_FEE_SPONSOR_SESSION ?? '').split(',').map(s => s.trim()).filter(Boolean);
+        String(process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS ?? '').split(',').map(s => s.trim()).filter(Boolean);
     return { resolveFeeSponsor: mockResolveFeeSponsor, FeeSponsorError, getConfiguredFeeSponsorSessions };
 });
 vi.mock('../../srv/utils/nightgate-config', () => ({
@@ -81,6 +82,7 @@ import { currentGrantPolicy,
     hashAgentToken,
     recordDeployedContracts,
     reserveDeployBudget,
+    reserveMaintenanceBudget,
     releaseDeployBudget,
     recordMintedTokenTypes,
     consumeValueBudget,
@@ -182,10 +184,26 @@ describe('agent grants', () => {
         });
 
         it('rejects 400 when allowedActions contains a non-grantable action', async () => {
-            const req = makeReq({ sessionId: 'sess-1', allowedActions: ['anchorDocument', 'sendNight'] });
+            const req = makeReq({ sessionId: 'sess-1', allowedActions: ['anchorDocument', 'sendToken'] });
             await handlers.createAgentGrant(req);
-            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('sendNight'));
-            expect(AGENT_ALLOWLISTABLE_ACTIONS).not.toContain('sendNight');
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('sendToken'));
+            expect(AGENT_ALLOWLISTABLE_ACTIONS).not.toContain('sendToken');
+        });
+
+        it('refuses the name an action had before', async () => {
+            const req = makeReq({ sessionId: 'sess-1', allowedActions: ['issueFieldPredicateAttestation', 'proveFieldPredicate'] });
+            await handlers.createAgentGrant(req);
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('issueFieldPredicateAttestation'));
+        });
+
+        it('stores each action once', async () => {
+            mockDbRun.mockResolvedValueOnce(activeSessionRow()); // session lookup
+            mockDbRun.mockResolvedValueOnce(1);                  // insert
+            const req = makeReq({ sessionId: 'sess-1', allowedActions: ['proveFieldPredicate', 'proveFieldPredicate', 'proveFieldEquality'] });
+            const result = await handlers.createAgentGrant(req);
+
+            expect(req.reject).not.toHaveBeenCalled();
+            expect(result.allowedActions).toEqual(['proveFieldPredicate', 'proveFieldEquality']);
         });
 
         it('rejects 400 on a validUntil in the past', async () => {
@@ -198,7 +216,7 @@ describe('agent grants', () => {
             mockDbRun.mockResolvedValueOnce(null);
             const req = makeReq(VALID);
             await handlers.createAgentGrant(req);
-            expect(req.reject).toHaveBeenCalledWith(404, expect.stringContaining('Session'));
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'SESSION_NOT_FOUND' }));
             expect(selectOneWhereSpy).toHaveBeenCalledWith(
                 expect.objectContaining({ sessionId: 'sess-1', userId: TEST_USER_ID, isActive: true })
             );
@@ -216,7 +234,7 @@ describe('agent grants', () => {
         it('returns the token once and stores only its SHA-256', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow()); // session lookup
             mockDbRun.mockResolvedValueOnce(1);                  // insert
-            const req = makeReq({ ...VALID, maxJobsPerDay: 5, agentLabel: 'doc-bot' });
+            const req = makeReq({ ...VALID, maxJobsPerDay: 5, label: 'doc-bot' });
             const result = await handlers.createAgentGrant(req);
 
             expect(req.reject).not.toHaveBeenCalled();
@@ -239,7 +257,7 @@ describe('agent grants', () => {
                 'Sponsor session has no signing key. Call connectWalletForSigning for the sponsor session first.'));
             const req = makeReq({ ...VALID, sponsorSessionId: 'sponsor-dead' });
             await handlers.createAgentGrant(req);
-            expect(req.reject).toHaveBeenCalledWith(412, expect.stringContaining('sponsorSessionId:'));
+            expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 412, code: 'FEE_SPONSOR_UNUSABLE' }));
             expect(mockResolveFeeSponsor).toHaveBeenCalledWith(
                 expect.objectContaining({ sponsorSessionId: 'sponsor-dead', requestingUserId: TEST_USER_ID })
             );
@@ -293,24 +311,24 @@ describe('agent grants', () => {
         });
 
         it('validates like a single creation: a non-grantable action, a missing session', async () => {
-            const req = makeReq({ ...VALID, allowedActions: ['sendNight'] });
+            const req = makeReq({ ...VALID, allowedActions: ['sendToken'] });
             await handlers.createAgentGrants(req);
-            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('sendNight'));
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringContaining('sendToken'));
             mockDbRun.mockResolvedValueOnce(null);
             const gone = makeReq(VALID);
             await handlers.createAgentGrants(gone);
-            expect(gone.reject).toHaveBeenCalledWith(404, expect.stringContaining('Session'));
+            expect(gone.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'SESSION_NOT_FOUND' }));
             expect(insertEntriesSpy).not.toHaveBeenCalled();
         });
 
         it('writes count rows in one insert, distinct tokens shown once, labels generated from the stem', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow()); // session lookup
             mockDbRun.mockResolvedValueOnce(3);                  // insert
-            const req = makeReq({ ...VALID, agentLabel: 'trader', maxJobsPerDay: 40 });
+            const req = makeReq({ ...VALID, label: 'trader', maxJobsPerDay: 40 });
             const result = await handlers.createAgentGrants(req);
             expect(req.reject).not.toHaveBeenCalled();
             expect(result.grants).toHaveLength(3);
-            expect(result.grants.map((g: any) => g.agentLabel)).toEqual(['trader-1', 'trader-2', 'trader-3']);
+            expect(result.grants.map((g: any) => g.label)).toEqual(['trader-1', 'trader-2', 'trader-3']);
             expect(new Set(result.grants.map((g: any) => g.token)).size).toBe(3);
             for (const g of result.grants) expect(g.token).toMatch(/^ngat_[0-9a-f]{64}$/);
             expect(result.allowedActions).toEqual(VALID.allowedActions);
@@ -332,7 +350,7 @@ describe('agent grants', () => {
             mockDbRun.mockResolvedValueOnce(2);
             const req = makeReq({ ...VALID, count: 2, labels: [' maker ', 'taker'] });
             const result = await handlers.createAgentGrants(req);
-            expect(result.grants.map((g: any) => g.agentLabel)).toEqual(['maker', 'taker']);
+            expect(result.grants.map((g: any) => g.label)).toEqual(['maker', 'taker']);
             for (let i = 0; i < 9; i++) {
                 const r = makeReq({ ...VALID });
                 await handlers.createAgentGrants(r);
@@ -376,7 +394,7 @@ describe('agent grants', () => {
     describe('updateAgentGrant', () => {
         function existing(overrides: Record<string, any> = {}) {
             return grantRow({ maxJobsPerDay: 5, allowDeploy: false, maxDeploys: null, deploysUsed: 0,
-                allowedContracts: null, allowedCircuits: null, allowedTokenTypes: null, agentLabel: 'bot', ...overrides });
+                allowedContracts: null, allowedCircuits: null, allowedTokenTypes: null, label: 'bot', ...overrides });
         }
         const call = (data: Record<string, unknown>, opts: Record<string, unknown> = {}) =>
             handlers.updateAgentGrant(makeReq(data, { event: 'updateAgentGrant', ...opts }));
@@ -390,7 +408,7 @@ describe('agent grants', () => {
             const patch = updateSetSpy.mock.calls[0][0];
             expect(patch).toMatchObject({ maxJobsPerDay: 20, validUntil: null, allowDeploy: false, maxDeploys: null });
             expect(patch).not.toHaveProperty('allowedActions');
-            expect(patch).not.toHaveProperty('agentLabel');
+            expect(patch).not.toHaveProperty('label');
             expect(updateWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1', userId: TEST_USER_ID, isActive: true });
             expect(result).toEqual({ grantId: 'grant-1', updated: ['maxJobsPerDay', 'validUntil'] });
         });
@@ -425,7 +443,7 @@ describe('agent grants', () => {
 
         it('validates like creation: deploy budget below the used count, a past validUntil, a non-grantable action', async () => {
             mockDbRun.mockResolvedValueOnce(existing({
-                allowedActions: JSON.stringify(['sponsorUnboundTransaction']), allowDeploy: true, maxDeploys: 5, deploysUsed: 3
+                allowedActions: JSON.stringify(['sponsorUnbound']), allowDeploy: true, maxDeploys: 5, deploysUsed: 3
             }));
             const budget = makeReq({ grantId: 'grant-1', maxDeploys: 2 }, { event: 'updateAgentGrant' });
             await handlers.updateAgentGrant(budget);
@@ -437,9 +455,9 @@ describe('agent grants', () => {
             expect(past.reject).toHaveBeenCalledWith(400, expect.stringContaining('future'));
 
             mockDbRun.mockResolvedValueOnce(existing());
-            const bad = makeReq({ grantId: 'grant-1', allowedActions: ['sendNight'] }, { event: 'updateAgentGrant' });
+            const bad = makeReq({ grantId: 'grant-1', allowedActions: ['sendToken'] }, { event: 'updateAgentGrant' });
             await handlers.updateAgentGrant(bad);
-            expect(bad.reject).toHaveBeenCalledWith(400, expect.stringContaining('sendNight'));
+            expect(bad.reject).toHaveBeenCalledWith(400, expect.stringContaining('sendToken'));
 
             // the deploy right needs a sponsoring action in the EFFECTIVE list
             mockDbRun.mockResolvedValueOnce(existing());
@@ -450,7 +468,7 @@ describe('agent grants', () => {
         });
 
         it('lists and the deploy right patch as JSON like creation', async () => {
-            mockDbRun.mockResolvedValueOnce(existing({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']) }));
+            mockDbRun.mockResolvedValueOnce(existing({ allowedActions: JSON.stringify(['sponsorUnbound']) }));
             mockDbRun.mockResolvedValueOnce(1);
             const req = makeReq({ grantId: 'grant-1', allowedContracts: ['ab'.repeat(32)], allowDeploy: true, maxDeploys: 3 }, { event: 'updateAgentGrant' });
             await handlers.updateAgentGrant(req);
@@ -492,10 +510,11 @@ describe('agent grants', () => {
 
     describe('getGrantUsage', () => {
         const usageRows = [
-            { kind: 'anchorDocument', status: 'succeeded', chainStatus: 'success', txHash: 'AA' },
-            { kind: 'anchorDocument', status: 'succeeded', chainStatus: 'success', txHash: 'bb' },
-            { kind: 'anchorDocument', status: 'failed', chainStatus: null, txHash: null },
-            { kind: 'sponsorUnboundTransaction', status: 'succeeded', chainStatus: 'failure', txHash: 'cc' }
+            { kind: 'anchorDocument', status: 'succeeded', chainStatus: 'success', txId: '00AA', txHash: 'AA' },
+            // A job that stored its identifier alone is found through the identifier table.
+            { kind: 'anchorDocument', status: 'succeeded', chainStatus: 'success', txId: 'BB', txHash: null },
+            { kind: 'anchorDocument', status: 'failed', chainStatus: null, txId: null, txHash: null },
+            { kind: 'sponsorUnbound', status: 'succeeded', chainStatus: 'failure', txId: '00cc', txHash: 'cc' }
         ];
 
         beforeEach(() => { crawlerState.enabled = false; });
@@ -512,7 +531,7 @@ describe('agent grants', () => {
                 jobs: [
                     { kind: 'anchorDocument', status: 'failed', count: 1 },
                     { kind: 'anchorDocument', status: 'succeeded', count: 2 },
-                    { kind: 'sponsorUnboundTransaction', status: 'succeeded', count: 1 }
+                    { kind: 'sponsorUnbound', status: 'succeeded', count: 1 }
                 ]
             });
             const span = new Date(result.until).getTime() - new Date(result.since).getTime();
@@ -521,6 +540,21 @@ describe('agent grants', () => {
             expect(selectOneWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1', userId: TEST_USER_ID });
             expect(selectFromChain.where).toHaveBeenCalledWith({ grantId: 'grant-1', queuedAt: { '>=': result.since } });
             expect(selectFromChain.and).toHaveBeenCalledWith({ queuedAt: { '<=': result.until } });
+        });
+
+        it('counts in the rate class read', async () => {
+            process.env.NIGHTGATE_READ_RATE_LIMIT = '1';
+            try {
+                mockDbRun.mockResolvedValueOnce(grantRow({})).mockResolvedValueOnce([]);
+                const first = makeReq({ grantId: 'grant-1' }, { event: 'getGrantUsage' });
+                await handlers.getGrantUsage(first);
+                expect(first.reject).not.toHaveBeenCalled();
+                const second = makeReq({ grantId: 'grant-1' }, { event: 'getGrantUsage' });
+                await handlers.getGrantUsage(second);
+                expect(second.reject).toHaveBeenCalledWith(429, expect.stringMatching(/read: 1 per minute/));
+            } finally {
+                delete process.env.NIGHTGATE_READ_RATE_LIMIT;
+            }
         });
 
         it("today's budget counts only inside the current window", async () => {
@@ -534,13 +568,14 @@ describe('agent grants', () => {
             crawlerState.enabled = true;
             mockDbRun.mockResolvedValueOnce(grantRow());
             mockDbRun.mockResolvedValueOnce(usageRows);
-            mockDbRun.mockResolvedValueOnce([{ ID: 'tx-1' }, { ID: 'tx-2' }]);      // Transactions by either hash
+            mockDbRun.mockResolvedValueOnce([{ ID: 'tx-1' }, { ID: 'tx-2' }]);      // Transactions by ledger hash
             mockDbRun.mockResolvedValueOnce([{ transaction_ID: 'tx-2' }]);          // and by identifier
             mockDbRun.mockResolvedValueOnce([{ paidFees: '100' }, { paidFees: 50 }]); // their fee rows
             const result = await handlers.getGrantUsage(makeReq({ grantId: 'grant-1' }, { event: 'getGrantUsage' }));
             expect(result.dustPaid).toBe('150');
-            expect(selectFromChain.where).toHaveBeenCalledWith({ hash: { in: ['aa', 'bb'] }, or: { ledgerTxHash: { in: ['aa', 'bb'] } } });
-            expect(selectFromChain.where).toHaveBeenCalledWith({ identifier: { in: ['aa', 'bb'] } });
+            // A job with a hash is looked up by the hash alone, never by the extrinsic hash or its identifier.
+            expect(selectFromChain.where).toHaveBeenCalledWith({ txHash: { in: ['aa'] } });
+            expect(selectFromChain.where).toHaveBeenCalledWith({ txId: { in: ['bb'] } });
             expect(selectFromChain.where).toHaveBeenCalledWith({ transaction_ID: { in: ['tx-1', 'tx-2'] } });
         });
 
@@ -601,7 +636,7 @@ describe('agent grants', () => {
         it('the grant policy carries the minted types; the swap right is the action in allowedActions', async () => {
             mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorSwap']), mintedTokenTypes: JSON.stringify([T1]) }));
             expect(await currentGrantPolicy(db, 'grant-1')).toMatchObject({ mintedTokenTypes: [T1], allowSwaps: true });
-            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']) }));
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnbound']) }));
             expect(await currentGrantPolicy(db, 'grant-1')).toMatchObject({ mintedTokenTypes: [], allowSwaps: false });
         });
 
@@ -614,12 +649,12 @@ describe('agent grants', () => {
     });
 
     describe('lists the platform policy leaves nothing of are refused when written', () => {
-        const VALID = { sessionId: 'sess-1', allowedActions: ['sponsorFinalizedTransaction'] };
+        const VALID = { sessionId: 'sess-1', allowedActions: ['sponsorFinalized'] };
         const T = 'ab'.repeat(32);
         const OTHER = 'cd'.repeat(32);
         const existing = (overrides: Record<string, any> = {}) => grantRow({
             maxJobsPerDay: 5, allowDeploy: false, maxDeploys: null, deploysUsed: 0,
-            allowedContracts: null, allowedCircuits: null, allowedTokenTypes: null, agentLabel: 'bot', ...overrides
+            allowedContracts: null, allowedCircuits: null, allowedTokenTypes: null, label: 'bot', ...overrides
         });
 
         it('createAgentGrant: a token type outside the platform list is 400 naming it, nothing is written', async () => {
@@ -676,7 +711,7 @@ describe('agent grants', () => {
     });
 
     describe('per-grant sponsor allow-list', () => {
-        const VALID = { sessionId: 'sess-1', allowedActions: ['sponsorFinalizedTransaction'] };
+        const VALID = { sessionId: 'sess-1', allowedActions: ['sponsorFinalized'] };
 
         it('persists allowedContracts/allowedCircuits as JSON and returns them', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
@@ -724,12 +759,12 @@ describe('agent grants', () => {
         it('the enforcement hook attaches the parsed lists to req.agentGrant', async () => {
             const TOKEN = 'ngat_' + 'b'.repeat(64);
             mockDbRun.mockResolvedValueOnce(grantRow({
-                allowedActions: JSON.stringify(['sponsorFinalizedTransaction']),
+                allowedActions: JSON.stringify(['sponsorFinalized']),
                 allowedContracts: JSON.stringify(['0xVAULT']),
                 allowedCircuits: null
             }));
             const req = makeReq({ sponsorSessionId: undefined }, {
-                event: 'sponsorFinalizedTransaction', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN }
+                event: 'sponsorFinalized', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN }
             });
             await enforceAgentGrant(req, db);
             expect(req.reject).not.toHaveBeenCalled();
@@ -742,42 +777,88 @@ describe('agent grants', () => {
         it('needs a sponsor* action: a deploy is sponsored, never run by the server wallet', async () => {
             const req = makeReq({ sessionId: 'sess-1', allowedActions: ['anchorDocument'], allowDeploy: true });
             await handlers.createAgentGrant(req);
-            expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowDeploy needs 'sponsorFinalizedTransaction'/));
+            expect(req.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowDeploy needs 'sponsorFinalized'/));
         });
 
         it('defaults the deploy budget to 1, validates an explicit one, and refuses a budget without the right', async () => {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], allowDeploy: true });
+            const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound'], allowDeploy: true });
             const result = await handlers.createAgentGrant(req);
             expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({ allowDeploy: true, maxDeploys: 1, deploysUsed: 0 }));
             expect(result).toMatchObject({ allowDeploy: true, maxDeploys: 1 });
 
-            const bad = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], allowDeploy: true, maxDeploys: 0 });
+            const bad = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound'], allowDeploy: true, maxDeploys: 0 });
             await handlers.createAgentGrant(bad);
             expect(bad.reject).toHaveBeenCalledWith(400, expect.stringMatching(/maxDeploys must be an integer between 1 and 100/));
 
-            const noRight = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], maxDeploys: 3 });
+            const noRight = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound'], maxDeploys: 3 });
             await handlers.createAgentGrant(noRight);
             expect(noRight.reject).toHaveBeenCalledWith(400, expect.stringMatching(/maxDeploys needs allowDeploy/));
         });
 
         it('the hook grants the deploy right only while the budget lasts', async () => {
             const TOKEN = 'ngat_' + 'c'.repeat(64);
-            const tokenReq = () => makeReq({}, { event: 'sponsorUnboundTransaction', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN } });
-            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']), allowDeploy: true, maxDeploys: 2, deploysUsed: 1 }));
+            const tokenReq = () => makeReq({}, { event: 'sponsorUnbound', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN } });
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnbound']), allowDeploy: true, maxDeploys: 2, deploysUsed: 1 }));
             const open = tokenReq();
             await enforceAgentGrant(open, db);
             expect(open.agentGrant.allowDeploy).toBe(true);
 
-            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']), allowDeploy: true, maxDeploys: 2, deploysUsed: 2 }));
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnbound']), allowDeploy: true, maxDeploys: 2, deploysUsed: 2 }));
             const spent = tokenReq();
             await enforceAgentGrant(spent, db);
             expect(spent.agentGrant.allowDeploy).toBe(false);
 
-            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']) }));
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnbound']) }));
             const none = tokenReq();
             await enforceAgentGrant(none, db);
             expect(none.agentGrant.allowDeploy).toBe(false);
+        });
+
+        it('maintenance updates are a right of their own: a sponsor action, a budget of 8 by default, 1 to 100', async () => {
+            const noSponsor = makeReq({ sessionId: 'sess-1', allowedActions: ['anchorDocument'], allowMaintenance: true });
+            await handlers.createAgentGrant(noSponsor);
+            expect(noSponsor.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowMaintenance needs 'sponsorFinalized'/));
+
+            mockDbRun.mockResolvedValueOnce(activeSessionRow());
+            const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound'], allowDeploy: true, allowMaintenance: true });
+            const result = await handlers.createAgentGrant(req);
+            expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({ allowMaintenance: true, maxMaintenanceUpdates: 8, maintenanceUpdatesUsed: 0 }));
+            expect(result).toMatchObject({ allowMaintenance: true, maxMaintenanceUpdates: 8 });
+
+            const bad = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound'], allowMaintenance: true, maxMaintenanceUpdates: 101 });
+            await handlers.createAgentGrant(bad);
+            expect(bad.reject).toHaveBeenCalledWith(400, expect.stringMatching(/maxMaintenanceUpdates must be an integer between 1 and 100/));
+
+            const noRight = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound'], maxMaintenanceUpdates: 3 });
+            await handlers.createAgentGrant(noRight);
+            expect(noRight.reject).toHaveBeenCalledWith(400, expect.stringMatching(/maxMaintenanceUpdates needs allowMaintenance/));
+        });
+
+        it('the hook grants the maintenance right only while its budget lasts', async () => {
+            const TOKEN = 'ngat_' + 'c'.repeat(64);
+            const tokenReq = () => makeReq({}, { event: 'sponsorUnbound', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN } });
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnbound']), allowMaintenance: true, maxMaintenanceUpdates: 2, maintenanceUpdatesUsed: 1 }));
+            const open = tokenReq();
+            await enforceAgentGrant(open, db);
+            expect(open.agentGrant.allowMaintenance).toBe(true);
+
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnbound']), allowMaintenance: true, maxMaintenanceUpdates: 2, maintenanceUpdatesUsed: 2 }));
+            const spent = tokenReq();
+            await enforceAgentGrant(spent, db);
+            expect(spent.agentGrant.allowMaintenance).toBe(false);
+        });
+
+        it('reserveMaintenanceBudget takes all or nothing, and only on a grant with the right', async () => {
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowMaintenance: true, maxMaintenanceUpdates: 4, maintenanceUpdatesUsed: 1 })).mockResolvedValueOnce(1);
+            expect(await reserveMaintenanceBudget(db, 'grant-1', 1)).toBe(true);
+            expect(updateSetSpy).toHaveBeenCalledWith({ maintenanceUpdatesUsed: { '+=': 1 } });
+            expect(updateWhereSpy).toHaveBeenCalledWith({ ID: 'grant-1', isActive: true, allowMaintenance: true, maintenanceUpdatesUsed: { '<=': 3 } });
+
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowMaintenance: true, maxMaintenanceUpdates: 4, maintenanceUpdatesUsed: 4 })).mockResolvedValueOnce(0);
+            expect(await reserveMaintenanceBudget(db, 'grant-1', 1)).toBe(false);
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowMaintenance: false }));
+            expect(await reserveMaintenanceBudget(db, 'grant-1', 1)).toBe(false);
         });
 
         // The budget is reserved atomically before the broadcast; recordDeployedContracts only
@@ -796,8 +877,8 @@ describe('agent grants', () => {
 
         it('the hook hands deployedContracts to the sponsor policy', async () => {
             const TOKEN = 'ngat_' + 'd'.repeat(64);
-            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']), deployedContracts: JSON.stringify(['0xNEW']) }));
-            const req = makeReq({}, { event: 'sponsorUnboundTransaction', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN } });
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnbound']), deployedContracts: JSON.stringify(['0xNEW']) }));
+            const req = makeReq({}, { event: 'sponsorUnbound', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN } });
             await enforceAgentGrant(req, db);
             expect(req.agentGrant.deployedContracts).toEqual(['0xNEW']);
         });
@@ -862,7 +943,7 @@ describe('agent grants', () => {
             mockDbRun.mockResolvedValueOnce(grantRow({ allowedContracts: JSON.stringify(['c1']), allowedCircuits: null, deployedContracts: JSON.stringify(['d1']), allowDeploy: true }));
             expect(await currentGrantPolicy(db, 'g1')).toEqual({
                 allowedContracts: ['c1'], allowedCircuits: [], deployedContracts: ['d1'], allowedTokenTypes: [], mintedTokenTypes: [],
-                allowDeploy: true, allowSwaps: false, allowTransfers: false, allowUnshieldedOffers: false, allowedUnshieldedTokenTypes: []
+                allowDeploy: true, allowMaintenance: false, allowSwaps: false, allowTransfers: false, allowUnshieldedOffers: false, allowedUnshieldedTokenTypes: []
             });
             mockDbRun.mockResolvedValueOnce(grantRow({ isActive: false }));
             expect(await currentGrantPolicy(db, 'g1')).toBeNull();
@@ -875,14 +956,14 @@ describe('agent grants', () => {
         it('currentGrantPolicy carries the transfer and unshielded-offer rights, so a queued job keeps what the request check saw', async () => {
             const N1 = 'a'.repeat(64);
             mockDbRun.mockResolvedValueOnce(grantRow({
-                allowedActions: JSON.stringify(['sponsorTransfer', 'sponsorUnboundTransaction']),
+                allowedActions: JSON.stringify(['sponsorTransfer', 'sponsorUnbound']),
                 allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: JSON.stringify([N1])
             }));
             const grant = await currentGrantPolicy(db, 'g1');
             expect(grant).toMatchObject({ allowTransfers: true, allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1] });
             const floor = { allowedContracts: [], allowedCircuits: [], allowTransfers: true, allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1] };
             expect(effectiveSponsorPolicy(floor, grant)).toMatchObject({ allowTransfers: true, allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1] });
-            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnboundTransaction']) }));
+            mockDbRun.mockResolvedValueOnce(grantRow({ allowedActions: JSON.stringify(['sponsorUnbound']) }));
             expect(effectiveSponsorPolicy(floor, await currentGrantPolicy(db, 'g1'))).toMatchObject({ allowTransfers: false, allowUnshieldedOffers: false });
         });
 
@@ -895,7 +976,7 @@ describe('agent grants', () => {
 
         it('the grant lists bound every action naming a contract or circuit, an empty list bounds nothing', async () => {
             const scoped = () => grantRow({
-                allowedActions: JSON.stringify(['anchorDocument', 'issueFieldPredicateAttestation']),
+                allowedActions: JSON.stringify(['anchorDocument', 'proveFieldPredicate']),
                 allowedContracts: JSON.stringify(['ABCDEF01']),
                 allowedCircuits: JSON.stringify(['attest', 'attestGuarded', 'anchorContentRoot', 'proveFieldPredicate'])
             });
@@ -911,7 +992,7 @@ describe('agent grants', () => {
             expect(inside.user.id).toBe(TEST_USER_ID);
 
             mockDbRun.mockResolvedValueOnce(scoped());
-            const circuit = tokenReq('issueFieldPredicateAttestation', { sessionId: 'sess-1', contractAddress: 'abcdef01', circuit: 'bindPassport' });
+            const circuit = tokenReq('proveFieldPredicate', { sessionId: 'sess-1', contractAddress: 'abcdef01', circuit: 'bindPassport' });
             await enforceAgentGrant(circuit, db);
             expect(circuit.reject).toHaveBeenCalledWith(403, expect.stringMatching(/bindPassport.*allowedCircuits/));
 
@@ -922,10 +1003,10 @@ describe('agent grants', () => {
 
             // the sponsoring actions keep their own floor-and-grant check in the worker
             mockDbRun.mockResolvedValueOnce(grantRow({
-                allowedActions: JSON.stringify(['sponsorFinalizedTransaction']), sponsorSessionId: 'sponsor-1',
+                allowedActions: JSON.stringify(['sponsorFinalized']), sponsorSessionId: 'sponsor-1',
                 allowedContracts: JSON.stringify(['abcdef01'])
             }));
-            const sponsored = tokenReq('sponsorFinalizedTransaction', { sessionId: 'sess-1', contractAddress: 'ffff0000', transactionHex: '00' });
+            const sponsored = tokenReq('sponsorFinalized', { sessionId: 'sess-1', contractAddress: 'ffff0000', transactionHex: '00' });
             await enforceAgentGrant(sponsored, db);
             expect(sponsored.reject).not.toHaveBeenCalled();
         });
@@ -1002,7 +1083,7 @@ describe('agent grants', () => {
             // The standalone image admits a token request under a marker principal
             // and relies on this hook; a batch part carries no token header but
             // inherits that principal. It must not run as an authenticated user.
-            const req = makeReq({}, { event: 'sponsorFinalizedTransaction', user: { id: 'agent-token-transport' } });
+            const req = makeReq({}, { event: 'sponsorFinalized', user: { id: 'agent-token-transport' } });
             await enforceAgentGrant(req, db);
             expect(req.reject).toHaveBeenCalledWith(401, expect.stringContaining('agent token required'));
             expect(req.user).toEqual({ id: 'agent-token-transport' });
@@ -1010,7 +1091,7 @@ describe('agent grants', () => {
         });
 
         it('rejects 401 when the public verify marker principal reaches this service', async () => {
-            const req = makeReq({}, { event: 'verifyAttestationState', user: { id: 'public-verify-transport' } });
+            const req = makeReq({}, { event: 'verifyAttestation', user: { id: 'public-verify-transport' } });
             await enforceAgentGrant(req, db);
             expect(req.reject).toHaveBeenCalledWith(401, expect.stringContaining('authentication required'));
             expect(mockDbRun).not.toHaveBeenCalled();
@@ -1064,7 +1145,7 @@ describe('agent grants', () => {
         });
 
         it('rejects 403 for wallet lifecycle and grant admin regardless of allowlist', async () => {
-            for (const event of ['sendNight', 'deployContract', 'connectWallet', 'createAgentGrant']) {
+            for (const event of ['sendToken', 'deployContract', 'connectWallet', 'createAgentGrant']) {
                 mockDbRun.mockResolvedValueOnce(grantRow({
                     allowedActions: JSON.stringify([...AGENT_ALLOWLISTABLE_ACTIONS])
                 }));
@@ -1081,7 +1162,7 @@ describe('agent grants', () => {
             expect(req.reject).not.toHaveBeenCalled();
             expect(req.user.id).toBe(TEST_USER_ID);
             expect(req.data.sessionId).toBe('sess-1');
-            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, sponsorSessionId: null, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], mintedTokenTypes: [], allowDeploy: false, allowSwaps: false, allowTransfers: false, allowUnshieldedOffers: false, allowedUnshieldedTokenTypes: [] });
+            expect(req.agentGrant).toEqual({ ID: 'grant-1', sessionId: 'sess-1', userId: TEST_USER_ID, sponsorSessionId: null, allowedContracts: [], allowedCircuits: [], deployedContracts: [], allowedTokenTypes: [], mintedTokenTypes: [], allowDeploy: false, allowMaintenance: false, allowSwaps: false, allowTransfers: false, allowUnshieldedOffers: false, allowedUnshieldedTokenTypes: [] });
         });
 
         it('rejects 403 on a sessionId that does not match the grant', async () => {
@@ -1128,7 +1209,6 @@ describe('agent grants', () => {
         it('narrows READs of session-scoped entities to the grant, leaves chain entities open', async () => {
             for (const [target, expectedWhere] of [
                 ['NightgateService.WalletSessions', { sessionId: 'sess-1' }],
-                ['NightgateService.PendingSubmissions', { sessionId: 'sess-1' }],
                 ['NightgateService.Documents', { sessionId: 'sess-1' }],
                 ['NightgateService.AgentGrants', { ID: 'grant-1' }]
             ] as const) {
@@ -1156,7 +1236,7 @@ describe('agent grants', () => {
             mockDbRun.mockResolvedValueOnce(grantRow({
                 allowedActions: JSON.stringify([]), maxJobsPerDay: 1, jobsUsedToday: 1, budgetWindow: TODAY
             }));
-            const req = tokenReq('verifyAttestationState', { payloadHash: 'f'.repeat(64) });
+            const req = tokenReq('verifyAttestation', { payloadHash: 'f'.repeat(64) });
             await enforceAgentGrant(req, db);
             expect(req.reject).not.toHaveBeenCalled();
             expect(mockDbRun).toHaveBeenCalledTimes(1); // grant lookup only, no budget UPDATE
@@ -1165,22 +1245,22 @@ describe('agent grants', () => {
         it('a grant may pin the platform-pool sentinel; requires a configured pool', async () => {
             const PLATFORM_POOL_SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
             // without a pool: 412 at creation (after the session-ownership check)
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             mockDbRun.mockResolvedValueOnce({ sessionId: 'sess-1', isActive: true, expiresAt: null });
             const req = makeReq({
-                sessionId: 'sess-1', allowedActions: ['sponsorFinalizedTransaction'],
+                sessionId: 'sess-1', allowedActions: ['sponsorFinalized'],
                 sponsorSessionId: PLATFORM_POOL_SENTINEL
             });
             await handlers.createAgentGrant(req);
             expect(req.reject).toHaveBeenCalledWith(412, expect.stringMatching(/pool/));
 
-            // with a pool but EXTRA actions: 400 (only sponsorFinalizedTransaction
+            // with a pool but EXTRA actions: 400 (only sponsorFinalized
             // understands the sentinel; anything else would burn budget and fail)
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
             mockDbRun.mockResolvedValueOnce({ sessionId: 'sess-1', isActive: true, expiresAt: null });
             const mixed = makeReq({
                 sessionId: 'sess-1',
-                allowedActions: ['sponsorFinalizedTransaction', 'anchorDocument'],
+                allowedActions: ['sponsorFinalized', 'anchorDocument'],
                 sponsorSessionId: PLATFORM_POOL_SENTINEL
             });
             await handlers.createAgentGrant(mixed);
@@ -1191,15 +1271,15 @@ describe('agent grants', () => {
             mockDbRun.mockResolvedValueOnce({ sessionId: 'sess-1', isActive: true, expiresAt: null });
             const both = makeReq({
                 sessionId: 'sess-1',
-                allowedActions: ['sponsorFinalizedTransaction', 'sponsorUnboundTransaction', 'postSwapOffer', 'retireSwapOffer'],
+                allowedActions: ['sponsorFinalized', 'sponsorUnbound', 'postSwapOffer', 'retireSwapOffer'],
                 sponsorSessionId: PLATFORM_POOL_SENTINEL
             });
             await handlers.createAgentGrant(both);
             expect(both.reject).not.toHaveBeenCalled();
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
 
             // with a pool: getJobStatus may poll under ANY pool member
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1,pool-2';
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1,pool-2';
             try {
                 mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: PLATFORM_POOL_SENTINEL }));
                 const poll = tokenReq('getJobStatus', { jobId: 'j1', sessionId: 'pool-2' });
@@ -1220,24 +1300,23 @@ describe('agent grants', () => {
                 await enforceAgentGrant(foreign, db);
                 expect(foreign.reject).toHaveBeenCalledWith(403, expect.stringContaining('sessionId'));
             } finally {
-                delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+                delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             }
         });
 
-        it('sponsorFinalizedTransaction is grantable; the compute-only reads are free', async () => {
-            expect(AGENT_ALLOWLISTABLE_ACTIONS).toContain('sponsorFinalizedTransaction');
+        it('sponsorFinalized is grantable; the compute-only reads are free', async () => {
+            expect(AGENT_ALLOWLISTABLE_ACTIONS).toContain('sponsorFinalized');
             // the unbound (parallel) channel has the same trust shape and is grantable too.
-            expect(AGENT_ALLOWLISTABLE_ACTIONS).toContain('sponsorUnboundTransaction');
+            expect(AGENT_ALLOWLISTABLE_ACTIONS).toContain('sponsorUnbound');
             // still never grantable: the actions that could move funds or act
             // as the session in any other way
             expect(AGENT_ALLOWLISTABLE_ACTIONS).not.toContain('buildSponsorable');
-            expect(AGENT_ALLOWLISTABLE_ACTIONS).not.toContain('mintShieldedTestToken');
 
             mockDbRun.mockResolvedValueOnce(grantRow({
-                allowedActions: JSON.stringify(['sponsorFinalizedTransaction']),
+                allowedActions: JSON.stringify(['sponsorFinalized']),
                 sponsorSessionId: 'sponsor-1'
             }));
-            const req = tokenReq('sponsorFinalizedTransaction', { finalizedTxB64: 'AAAA' });
+            const req = tokenReq('sponsorFinalized', { finalizedTxB64: 'AAAA' });
             await enforceAgentGrant(req, db);
             expect(req.reject).not.toHaveBeenCalled();
             // the sponsor actions take no sponsor parameter; the handler reads the
@@ -1270,7 +1349,7 @@ describe('agent grants', () => {
             // and a WRITE naming the sponsor session as sessionId still rejects:
             // it would act under the sponsor's identity
             mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: 'sponsor-1' }));
-            const write = tokenReq('anchorDocument', { sha256: 'a'.repeat(64), sessionId: 'sponsor-1' });
+            const write = tokenReq('anchorDocument', { payloadHash: 'a'.repeat(64), sessionId: 'sponsor-1' });
             await enforceAgentGrant(write, db);
             expect(write.reject).toHaveBeenCalledWith(403, expect.stringContaining('sessionId'));
 
@@ -1289,7 +1368,7 @@ describe('agent grants', () => {
 
             // a pool wallet that is ALSO the grant's pin or own session keeps its id:
             // those jobs are stored under the wallet, not under the pool id
-            process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sponsor-1,sess-1';
+            process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-1,sess-1';
             try {
                 mockDbRun.mockResolvedValueOnce(grantRow({ sponsorSessionId: 'sponsor-1' }));
                 const pinnedMember = tokenReq('getJobStatus', { jobId: 'j1', sessionId: 'sponsor-1' });
@@ -1303,7 +1382,7 @@ describe('agent grants', () => {
                 expect(ownMember.reject).not.toHaveBeenCalled();
                 expect(ownMember.data.sessionId).toBe('sess-1');
             } finally {
-                delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+                delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
             }
         });
 
@@ -1453,22 +1532,27 @@ describe('agent grant circuit scope follows the action, not the request fields',
         expect(grantJobScopeViolation(grant, { kind: 'submitContractCallBatch' }, batch)).toMatch(/revokeDisclosure.*allowedCircuits/);
         // A workflow child is checked as the action its PARENT was admitted as; circuits still count.
         const child = { op: 'call', contractAddress: 'abcdef01', circuit: 'proveFieldPredicate', args: [] };
-        const proofGrant = { ...grant, allowedActions: JSON.stringify(['issueFieldPredicateAttestation']) };
-        expect(grantJobScopeViolation(proofGrant, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: 'issueFieldPredicateAttestation' }, child)).toMatch(/proveFieldPredicate.*allowedCircuits/);
-        expect(grantJobScopeViolation({ ...proofGrant, allowedCircuits: null }, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: 'issueFieldPredicateAttestation' }, child)).toBeNull();
+        const proofGrant = { ...grant, allowedActions: JSON.stringify(['proveFieldPredicate']) };
+        expect(grantJobScopeViolation(proofGrant, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: 'proveFieldPredicate' }, child)).toMatch(/proveFieldPredicate.*allowedCircuits/);
+        expect(grantJobScopeViolation({ ...proofGrant, allowedCircuits: null }, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: 'proveFieldPredicate' }, child)).toBeNull();
         // The parent's action left the grant while the child waited.
-        expect(grantJobScopeViolation({ ...grant, allowedActions: JSON.stringify(['anchorDocument']), allowedCircuits: null }, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: 'issueFieldPredicateAttestation' }, child)).toMatch(/issueFieldPredicateAttestation.*no longer allowed/);
+        expect(grantJobScopeViolation({ ...grant, allowedActions: JSON.stringify(['anchorDocument']), allowedCircuits: null }, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: 'proveFieldPredicate' }, child)).toMatch(/proveFieldPredicate.*no longer allowed/);
         // A child whose parent cannot be resolved is refused, never waved through.
         expect(grantJobScopeViolation({ ...proofGrant, allowedCircuits: null }, { kind: 'fieldPredicateProof', parentJobId: 'p', parentKind: null }, child)).toMatch(/parent job/);
         // Retract jobs are admitted as retractAttestation (mode 0) or purgeExpired (mode 1).
         const retractGrant = { allowedActions: JSON.stringify(['purgeExpired']), allowedContracts: null, allowedCircuits: null };
-        expect(grantJobScopeViolation(retractGrant, { kind: 'retract' }, { op: 'retract', mode: 1, contractAddress: 'abcdef01' })).toBeNull();
-        expect(grantJobScopeViolation(retractGrant, { kind: 'retract' }, { op: 'retract', mode: 0, contractAddress: 'abcdef01' })).toMatch(/retractAttestation/);
+        expect(grantJobScopeViolation(retractGrant, { kind: 'purgeExpired' }, { op: 'retract', mode: 1, contractAddress: 'abcdef01' })).toBeNull();
+        expect(grantJobScopeViolation(retractGrant, { kind: 'retractAttestation' }, { op: 'retract', mode: 0, contractAddress: 'abcdef01' })).toMatch(/retractAttestation/);
+
+        const registerGrant = { allowedActions: JSON.stringify(['registerDocument']), allowedContracts: null, allowedCircuits: JSON.stringify(['registerDocument']) };
+        const registerCmd = { op: 'registerDocument', contractAddress: 'abcdef01' };
+        expect(grantJobScopeViolation(registerGrant, { kind: 'registerDocument' }, registerCmd)).toBeNull();
+        expect(grantJobScopeViolation({ ...registerGrant, allowedCircuits: JSON.stringify(['attest']) }, { kind: 'registerDocument' }, registerCmd)).toMatch(/registerDocument.*allowedCircuits/);
     });
 
     it('circuitsOfRequest lists the server-side circuits of every grantable action', () => {
-        expect(circuitsOfRequest('issueFieldPredicateAttestationBatch', {})).toEqual(expect.arrayContaining(['anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison']));
-        expect(circuitsOfRequest('issueDocumentDiffAttestation', {})).toEqual(expect.arrayContaining(['anchorContentRoot', 'proveDocumentComparison']));
+        expect(circuitsOfRequest('proveClaims', {})).toEqual(expect.arrayContaining(['anchorContentRoot', 'proveFieldPredicate', 'proveFieldEquality', 'proveFieldMembership', 'proveDocumentComparison']));
+        expect(circuitsOfRequest('proveDocumentDiff', {})).toEqual(expect.arrayContaining(['anchorContentRoot', 'proveDocumentComparison']));
         expect(circuitsOfRequest('revokeDisclosure', {})).toEqual(['revokeDisclosure']);
         expect(circuitsOfRequest('reindexDisclosures', {})).toEqual([]);
         expect(circuitsOfRequest('unknownAction', {})).toBeNull();
@@ -1500,21 +1584,21 @@ describe('agent grants: unshielded offers and value budgets', () => {
     it('allowUnshieldedOffers needs a sponsor* action and is stored with its type list', async () => {
         const noRight = makeReq({ sessionId: 'sess-1', allowedActions: ['anchorDocument'], allowUnshieldedOffers: true });
         await handlers.createAgentGrant(noRight);
-        expect(noRight.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowUnshieldedOffers needs 'sponsorFinalizedTransaction'/));
+        expect(noRight.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowUnshieldedOffers needs 'sponsorFinalized'/));
 
-        const listOnly = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], allowedUnshieldedTokenTypes: [N1] });
+        const listOnly = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound'], allowedUnshieldedTokenTypes: [N1] });
         await handlers.createAgentGrant(listOnly);
         expect(listOnly.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowedUnshieldedTokenTypes needs allowUnshieldedOffers/));
 
         process.env.NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES = N1;
         mockDbRun.mockResolvedValueOnce(activeSessionRow());
-        const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [`0x${N1.toUpperCase()}`] });
+        const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound'], allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [`0x${N1.toUpperCase()}`] });
         const result = await handlers.createAgentGrant(req);
         expect(insertEntriesSpy).toHaveBeenCalledWith(expect.objectContaining({ allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: JSON.stringify([N1]) }));
         expect(result).toMatchObject({ allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1] });
         delete process.env.NIGHTGATE_SPONSOR_ALLOWED_UNSHIELDED_TOKEN_TYPES;
 
-        const outside = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction'], allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N2] });
+        const outside = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound'], allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N2] });
         await handlers.createAgentGrant(outside);
         expect(outside.reject).toHaveBeenCalledWith(400, expect.stringMatching(/allowedUnshieldedTokenTypes cdcd/));
     });
@@ -1522,9 +1606,9 @@ describe('agent grants: unshielded offers and value budgets', () => {
     it('the hook hands the unshielded right, its list and the transfer right to the request', async () => {
         const TOKEN = 'ngat_' + 'e'.repeat(64);
         mockDbRun.mockResolvedValueOnce(grantRow({
-            allowedActions: JSON.stringify(['sponsorUnboundTransaction', 'sponsorTransfer']), allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: JSON.stringify([N1])
+            allowedActions: JSON.stringify(['sponsorUnbound', 'sponsorTransfer']), allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: JSON.stringify([N1])
         }));
-        const req = makeReq({}, { event: 'sponsorUnboundTransaction', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN } });
+        const req = makeReq({}, { event: 'sponsorUnbound', user: { id: 'transport-user' }, headers: { 'x-agent-token': TOKEN } });
         await enforceAgentGrant(req, db);
         expect(req.agentGrant).toMatchObject({ allowUnshieldedOffers: true, allowedUnshieldedTokenTypes: [N1], allowTransfers: true, allowSwaps: false });
     });
@@ -1532,7 +1616,7 @@ describe('agent grants: unshielded offers and value budgets', () => {
     it('sponsorTransfer, burnFactoryToken and mintFactoryToken are grantable; a pool grant takes transfers but no mint', async () => {
         expect(AGENT_ALLOWLISTABLE_ACTIONS).toEqual(expect.arrayContaining(['sponsorTransfer', 'burnFactoryToken', 'mintFactoryToken']));
         const PLATFORM_POOL_SENTINEL = '00000000-0000-0000-0000-706f6f6c0000';
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'pool-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'pool-1';
         try {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
             const req = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorTransfer'], sponsorSessionId: PLATFORM_POOL_SENTINEL });
@@ -1545,24 +1629,24 @@ describe('agent grants: unshielded offers and value budgets', () => {
             await handlers.createAgentGrant(mint);
             expect(mint.reject).toHaveBeenCalledWith(400, expect.stringMatching(/cannot use the pool: mintFactoryToken$/));
         } finally {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         }
     });
 
     it('a grant bound to a fee sponsor wallet holds only actions the sponsor pays for, none that act as that wallet', async () => {
-        process.env.NIGHTGATE_FEE_SPONSOR_SESSION = 'sess-1';
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sess-1';
         try {
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            const acting = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction', 'anchorDocument', 'mintFactoryToken'] });
+            const acting = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound', 'anchorDocument', 'mintFactoryToken'] });
             await handlers.createAgentGrant(acting);
             expect(acting.reject).toHaveBeenCalledWith(400, 'sessionId is a fee sponsor wallet, which only pays fees; a grant bound to it cannot allow: anchorDocument, mintFactoryToken');
 
             mockDbRun.mockResolvedValueOnce(activeSessionRow());
-            const paying = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnboundTransaction', 'sponsorSwap', 'postSwapOffer'] });
+            const paying = makeReq({ sessionId: 'sess-1', allowedActions: ['sponsorUnbound', 'sponsorSwap', 'postSwapOffer'] });
             await handlers.createAgentGrant(paying);
             expect(paying.reject).not.toHaveBeenCalled();
         } finally {
-            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSION;
+            delete process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS;
         }
     });
 

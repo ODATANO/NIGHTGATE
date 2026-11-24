@@ -55,7 +55,7 @@ export function digestOfBase64(value: string | null | undefined): StateDigest {
 }
 
 export interface CurrentStateInput {
-    address: string;
+    contractAddress: string;
     height: number;
     state: string | null;
     zswapState: string | null;
@@ -67,9 +67,9 @@ export interface CurrentStateInput {
 // Stores `row` as the contract's current state, unless a state from a later block is already stored.
 // A state from the same block is replaced, so the last action of a block wins. Running it twice changes nothing.
 export async function upsertCurrentState(tx: DbRunner, row: CurrentStateInput): Promise<boolean> {
-    const address = normalizeContractAddress(row.address);
+    const address = normalizeContractAddress(row.contractAddress);
     const existing: Pick<ContractState, 'height'> | undefined = await tx.run(
-        SELECT.one.from(ContractStates).columns('height').where({ address })
+        SELECT.one.from(ContractStates).columns('height').where({ contractAddress: address })
     );
     if (existing && Number(existing.height) > row.height) return false;
     const values = {
@@ -81,15 +81,15 @@ export async function upsertCurrentState(tx: DbRunner, row: CurrentStateInput): 
         contractAction_ID: row.contractActionId
     };
     if (existing) {
-        await tx.run(UPDATE.entity(ContractStates).set(values).where({ address }));
+        await tx.run(UPDATE.entity(ContractStates).set(values).where({ contractAddress: address }));
     } else {
-        await tx.run(INSERT.into(ContractStates).entries({ address, ...values }));
+        await tx.run(INSERT.into(ContractStates).entries({ contractAddress: address, ...values }));
     }
     return true;
 }
 
 export interface ContractStateSnapshot {
-    address: string;
+    contractAddress: string;
     /** Block of the action the state comes from. */
     height: number | null;
     state: string | null;
@@ -203,12 +203,12 @@ export async function contractStateAt(
     const address = normalizeContractAddress(rawAddress);
     const current: ContractState | undefined = await db.run(
         SELECT.one.from(ContractStates)
-            .columns('address', 'height', 'state', 'zswapState', 'stateHash', 'zswapStateHash', 'contractAction_ID')
-            .where({ address })
+            .columns('contractAddress', 'height', 'state', 'zswapState', 'stateHash', 'zswapStateHash', 'contractAction_ID')
+            .where({ contractAddress: address })
     );
 
     const fromCurrent = async (row: ContractState): Promise<ContractStateSnapshot> => withBlockOf(db, {
-        address,
+        contractAddress: address,
         height: Number(row.height),
         state: base64Of(await readCapBinary(row.state)),
         zswapState: base64Of(await readCapBinary(row.zswapState)),
@@ -224,9 +224,9 @@ export async function contractStateAt(
         // The crawler stores an action before the supplement stores its state. Then the stored state is stale.
         newest = await db.run(
             SELECT.one.from(ContractActions)
-                .columns('ID', 'stateHash', 'transaction.block.height as height')
-                .where({ address })
-                .orderBy('transaction.block.height desc', 'transaction.transactionId desc', 'actionIndex desc')
+                .columns('ID', 'stateHash', 'blockHeight as height')
+                .where({ contractAddress: address })
+                .orderBy('blockHeight desc', 'indexInBlock desc', 'actionIndex desc')
         );
         if (!newest || newest.ID === current.contractAction_ID || Number(newest.height) <= Number(current.height)) return fromCurrent(current);
         staleHeight = Number(newest.height);
@@ -242,16 +242,16 @@ export async function contractStateAt(
     if (covered) {
         newest = await db.run(
             SELECT.one.from(ContractActions)
-                .columns('ID', 'state', 'zswapState', 'stateHash', 'zswapStateHash', 'transaction.block.height as height')
-                .where({ address })
-                .and({ 'transaction.block.height': { '<=': height } })
-                .orderBy('transaction.block.height desc', 'transaction.transactionId desc', 'actionIndex desc')
+                .columns('ID', 'state', 'zswapState', 'stateHash', 'zswapStateHash', 'blockHeight as height')
+                .where({ contractAddress: address })
+                .and({ blockHeight: { '<=': height } })
+                .orderBy('blockHeight desc', 'indexInBlock desc', 'actionIndex desc')
         );
         if (newest) {
             const state = await readCapBinary(newest.state);
             if (state) {
                 return withBlockOf(db, {
-                    address,
+                    contractAddress: address,
                     height: Number(newest.height),
                     state: state.toString('base64'),
                     zswapState: base64Of(await readCapBinary(newest.zswapState)),
@@ -296,7 +296,7 @@ export async function contractStateAt(
         ?? await askedParameters(fetchParameters, height)
         ?? fetched.ledgerParameters;
     return {
-        address,
+        contractAddress: address,
         height: fetched.height ?? actionHeight,
         state: fetched.state,
         zswapState: fetched.zswapState,
@@ -330,19 +330,19 @@ export async function compactStoredContractState(
     const log = opts.log ?? (() => undefined);
     const report: CompactionReport = { contracts: 0, currentStatesWritten: 0, actionsHashed: 0, statesCleared: 0 };
 
-    const addresses: Pick<ContractAction, 'address'>[] = await db.run(
-        SELECT.distinct.from(ContractActions).columns('address').where({ state: { '!=': null } })
+    const addresses: Pick<ContractAction, 'contractAddress'>[] = await db.run(
+        SELECT.distinct.from(ContractActions).columns('contractAddress').where({ state: { '!=': null } })
     ) || [];
     report.contracts = addresses.length;
     log(`${addresses.length} contract(s) with stored per-action state`);
 
-    for (const { address } of addresses) {
+    for (const { contractAddress: address } of addresses) {
         if (!address) continue;
         const newest: (Row<ContractAction, 'ID'> & { height?: number | null }) | undefined = await db.run(
             SELECT.one.from(ContractActions)
-                .columns('ID', 'state', 'zswapState', 'transaction.block.height as height')
-                .where({ address, state: { '!=': null } })
-                .orderBy('transaction.block.height desc', 'transaction.transactionId desc', 'actionIndex desc')
+                .columns('ID', 'state', 'zswapState', 'blockHeight as height')
+                .where({ contractAddress: address, state: { '!=': null } })
+                .orderBy('blockHeight desc', 'indexInBlock desc', 'actionIndex desc')
         );
         if (!newest || opts.dryRun) {
             if (newest) report.currentStatesWritten++;
@@ -351,7 +351,7 @@ export async function compactStoredContractState(
         const state = await readCapBinary(newest.state);
         const zswapState = await readCapBinary(newest.zswapState);
         const written = await db.tx((tx) => upsertCurrentState(tx, {
-            address,
+            contractAddress: address,
             height: Number(newest.height),
             state: base64Of(state),
             zswapState: base64Of(zswapState),
@@ -366,7 +366,7 @@ export async function compactStoredContractState(
     let last: string | undefined;
     for (;;) {
         // A dry run only counts rows, so it does not need to load the states.
-        const columns = opts.dryRun ? ['ID', 'address'] : ['ID', 'address', 'state', 'zswapState'];
+        const columns = opts.dryRun ? ['ID', 'contractAddress'] : ['ID', 'contractAddress', 'state', 'zswapState'];
         let query = SELECT.from(ContractActions)
             .columns(...columns)
             .where({ state: { '!=': null } })
@@ -381,12 +381,12 @@ export async function compactStoredContractState(
         for (const row of rows) {
             if (opts.dryRun) {
                 report.actionsHashed++;
-                if (!keepsStateHistory(opts.policy, row.address)) report.statesCleared++;
+                if (!keepsStateHistory(opts.policy, row.contractAddress)) report.statesCleared++;
                 continue;
             }
             const state = digestOf(await readCapBinary(row.state));
             const zswap = digestOf(await readCapBinary(row.zswapState));
-            const keep = keepsStateHistory(opts.policy, row.address);
+            const keep = keepsStateHistory(opts.policy, row.contractAddress);
             updates.push({
                 id: row.ID,
                 values: {

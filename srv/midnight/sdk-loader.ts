@@ -2,9 +2,6 @@
 // Covers only the main thread. The wallet worker loads its own SDK packages.
 
 import type * as IndexerSdk from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
-import type * as ProofSdk from '@midnight-ntwrk/midnight-js-http-client-proof-provider';
-import type * as ZkConfigSdk from '@midnight-ntwrk/midnight-js-node-zk-config-provider';
-import type * as LevelStateSdk from '@midnight-ntwrk/midnight-js-level-private-state-provider';
 import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
 import type * as LedgerV8 from '@midnightntwrk/ledger-v8';
 
@@ -12,9 +9,6 @@ type LedgerModule = typeof LedgerV9;
 
 export interface MidnightSdkBundle {
     indexer: typeof IndexerSdk;
-    proof: typeof ProofSdk;
-    zk: typeof ZkConfigSdk;
-    level: typeof LevelStateSdk;
 }
 
 let cachedBundle: MidnightSdkBundle | undefined;
@@ -25,13 +19,7 @@ export async function loadMidnightSdk(): Promise<MidnightSdkBundle> {
     if (inflight) return inflight;
 
     inflight = (async () => {
-        const [indexer, proof, zk, level] = await Promise.all([
-            import('@midnight-ntwrk/midnight-js-indexer-public-data-provider'),
-            import('@midnight-ntwrk/midnight-js-http-client-proof-provider'),
-            import('@midnight-ntwrk/midnight-js-node-zk-config-provider'),
-            import('@midnight-ntwrk/midnight-js-level-private-state-provider')
-        ]);
-        const bundle: MidnightSdkBundle = { indexer, proof, zk, level };
+        const bundle: MidnightSdkBundle = { indexer: await import('@midnight-ntwrk/midnight-js-indexer-public-data-provider') };
         cachedBundle = bundle;
         return bundle;
     })();

@@ -54,12 +54,12 @@ const FACTORIES: Record<string, WitnessFactory> = {
     'token-factory': buildTokenFactoryWitnesses
 };
 
-export function getContractWitnessFactory(contractName: string): WitnessFactory | undefined {
-    const exact = FACTORIES[contractName];
-    if (exact) return exact;
-    // Vault contracts registered under another name use the same witnesses.
-    // Empty witnesses would break owner-only calls.
-    if (contractName.startsWith('attestation-vault')) return buildAttestationVaultWitnesses;
-    if (contractName.startsWith('token-factory')) return buildTokenFactoryWitnesses;
-    return undefined;
+/** The witnesses of a contract package, by the package's contract name. `lineage` comes from the build's digest, never from the name it is registered under. */
+export function getContractWitnessFactory(lineage: string | undefined): WitnessFactory | undefined {
+    return lineage !== undefined && Object.hasOwn(FACTORIES, lineage) ? FACTORIES[lineage] : undefined;
+}
+
+/** Whether a contract package is an attestation vault, whose constructor takes the deployer's attester id. */
+export function isVaultLineage(lineage: string | undefined): boolean {
+    return lineage === 'attestation-vault' || lineage === 'attestation-vault-32';
 }

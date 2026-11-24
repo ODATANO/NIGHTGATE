@@ -18,7 +18,7 @@ const basic = (u: string, p: string) => 'Basic ' + Buffer.from(`${u}:${p}`).toSt
 let delegate: ReturnType<typeof vi.fn>;
 let auth: AuthMiddleware;
 
-async function run(headers: Record<string, string>, path = '/odata/v4/midnight/sponsorFinalizedTransaction', method = 'GET') {
+async function run(headers: Record<string, string>, path = '/odata/v4/midnight/sponsorFinalized', method = 'GET') {
     const req: any = { headers, baseUrl: path, originalUrl: path, ip: '10.0.0.1', method };
     const res: any = { statusCode: 200, set: vi.fn(), setHeader: vi.fn(), status: vi.fn().mockReturnThis(), json: vi.fn(), send: vi.fn(), end: vi.fn() };
     const next = vi.fn();
@@ -66,7 +66,7 @@ describe('transport lanes', () => {
         for (const [headers, path] of [
             [{ 'x-agent-token': '' }, '/odata/v4/midnight/x'],
             [{ 'x-agent-token': 'ngat_abc' }, '/odata/v4/midnight-admin/x'],
-            [{ 'x-agent-token': 'ngat_abc' }, '/odata/v4/midnightevil/sponsorFinalizedTransaction'],
+            [{ 'x-agent-token': 'ngat_abc' }, '/odata/v4/midnightevil/sponsorFinalized'],
             [{ 'x-agent-token': 'ngat_abc' }, '/odata/v4/midnight-admin/../nightgate-lookalike']
         ] as const) {
             const { req } = await run(headers as Record<string, string>, path);
@@ -86,7 +86,7 @@ describe('transport lanes', () => {
     });
 
     test('the public verify lane stays closed while NIGHTGATE_PUBLIC_VERIFY is unset', async () => {
-        const { req, res } = await run({}, "/odata/v4/midnight-verify/verifyAttestationState(contractAddress='c',payloadHash='p')");
+        const { req, res } = await run({}, "/odata/v4/midnight-verify/verifyAttestation(contractAddress='c',payloadHash='p')");
         expect(req.user).toBeUndefined();
         expect(delegate).toHaveBeenCalledTimes(1);
         expect(res.set).not.toHaveBeenCalledWith('Access-Control-Allow-Origin', '*');
@@ -95,13 +95,13 @@ describe('transport lanes', () => {
     test('enabled: the verify path passes under the public marker with CORS headers; lookalikes stay closed', async () => {
         process.env.NIGHTGATE_PUBLIC_VERIFY = 'true';
         __resetConfigForTests();
-        for (const path of ['/odata/v4/midnight-verify', "/odata/v4/midnight-verify/verifyPredicateState(contractAddress='c',payloadHash='p',predicate='setMembership')", '/odata/v4/midnight-verify?x=1']) {
+        for (const path of ['/odata/v4/midnight-verify', "/odata/v4/midnight-verify/verifyPredicate(contractAddress='c',payloadHash='p',predicate='setMembership')", '/odata/v4/midnight-verify?x=1']) {
             const { req, res, next } = await run({}, path);
             expect(next, path).toHaveBeenCalled();
             expect(req.user.id).toBe(PUBLIC_VERIFY_TRANSPORT_USER);
             expect(res.set).toHaveBeenCalledWith('Access-Control-Allow-Origin', '*');
         }
-        for (const path of ['/odata/v4/midnight-verifyx/a', '/odata/v4/midnight-verify-admin', '/odata/v4/midnight/verifyAttestationState()', '/odata/v4/midnight-admin/x']) {
+        for (const path of ['/odata/v4/midnight-verifyx/a', '/odata/v4/midnight-verify-admin', '/odata/v4/midnight/verifyAttestation()', '/odata/v4/midnight-admin/x']) {
             const { req } = await run({}, path);
             expect(req.user, path).toBeUndefined();
         }
@@ -112,7 +112,7 @@ describe('transport lanes', () => {
     test('the lane answers the CORS preflight itself', async () => {
         process.env.NIGHTGATE_PUBLIC_VERIFY = 'true';
         __resetConfigForTests();
-        const { res, next } = await run({ origin: 'https://example.org' }, '/odata/v4/midnight-verify/verifyAttestationState()', 'OPTIONS');
+        const { res, next } = await run({ origin: 'https://example.org' }, '/odata/v4/midnight-verify/verifyAttestation()', 'OPTIONS');
         expect(next).not.toHaveBeenCalled();
         expect(res.statusCode).toBe(204);
         expect(res.end).toHaveBeenCalled();

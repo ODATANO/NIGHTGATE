@@ -85,7 +85,7 @@ describe('deriveWalletInfo input validation (pre-SDK)', () => {
     });
 
     test('rejects a missing network', async () => {
-        await expect(deriveWalletInfo({ mnemonic: VALID, network: '' }))
+        await expect(deriveWalletInfo({ mnemonic: VALID, network: '' as never }))
             .rejects.toThrow(/network is required/);
     });
 

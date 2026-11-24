@@ -41,6 +41,7 @@ type Row = {
     leaseExpiresAt?: string | null;
     heartbeatAt?: string | null;
     submissionId?: string | null;
+    txId?: string | null;
     txHash?: string | null;
     chainStatus?: 'pending' | 'success' | 'failure' | 'dropped' | null;
     chainFinalizedAt?: string | null;
@@ -77,6 +78,17 @@ function matchesWhere(row: any, where: Record<string, unknown>): boolean {
     return true;
 }
 
+// The one text condition the job scans add to a where clause. Any other text fails the test.
+const ANNOUNCED_ONLY = 'txId is not null or txHash is not null';
+
+function matchesAlso(row: any, also: unknown[] | undefined): boolean {
+    for (const condition of also ?? []) {
+        if (condition !== ANNOUNCED_ONLY) throw new Error(`the store mock does not know the condition '${String(condition)}'`);
+        if (row.txId == null && row.txHash == null) return false;
+    }
+    return true;
+}
+
 // Injects "database is locked" failures into UPDATE queries, optionally only
 // for updates that set a specific target status. Simulates the SQLite write
 // lock being held by a foreign long commit.
@@ -102,7 +114,7 @@ const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
         return found[0] ?? null;
     }
     if (q.kind === 'select') {
-        let found = [...rows.values()].filter(r => matchesWhere(r, q.where));
+        let found = [...rows.values()].filter(r => matchesWhere(r, q.where) && matchesAlso(r, q.also));
         if (q.orderBy === 'ID asc') found.sort((a, b) => a.ID.localeCompare(b.ID));
         if (typeof q.limitValue === 'number') found = found.slice(0, q.limitValue);
         if (Array.isArray(q.columns)) {
@@ -158,6 +170,7 @@ const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
             leaseExpiresAt: entry.leaseExpiresAt ?? null,
             heartbeatAt:    entry.heartbeatAt ?? null,
             submissionId:   entry.submissionId ?? null,
+            txId:           entry.txId ?? null,
             txHash:         entry.txHash ?? null,
             createdAt:      now,
             modifiedAt:     now
@@ -202,9 +215,10 @@ const runMock = vi.hoisted(() => (vi.fn(async (q: any) => {
 vi.mock('@sap/cds', () => {
     const SELECT: any = {
         from: vi.fn((entity: any) => {
-            const obj: any = { kind: 'select', entity, columns: undefined, where: {}, orderBy: undefined, limitValue: undefined };
+            const obj: any = { kind: 'select', entity, columns: undefined, where: {}, also: [], orderBy: undefined, limitValue: undefined };
             obj.columns  = vi.fn((...cols: string[]) => { obj.columns = cols.flat(); return obj; });
             obj.where    = vi.fn((where: Record<string, unknown>) => { obj.where = where; return obj; });
+            obj.and      = vi.fn((condition: unknown) => { obj.also.push(condition); return obj; });
             obj.orderBy  = vi.fn((ob: string) => { obj.orderBy = ob; return obj; });
             obj.limit    = vi.fn((value: number) => { obj.limitValue = value; return obj; });
             return obj;
@@ -374,7 +388,7 @@ describe('startJob: insert row + return jobId', () => {
     });
 
     test('an admission that stays locked AFTER a completed step demands reconciliation, not failure', async () => {
-        // The parent carries no txHash of its own, so an ordinary error marks
+        // The parent carries no transaction of its own, so an ordinary error marks
         // it `failed` and the parent reconciler never looks at it again. With
         // step one already on chain, a retry would spend those fees twice.
         const processor = vi.fn(async () => ({ txHash: '0xstep-one' }));
@@ -475,7 +489,7 @@ describe('startJob: insert row + return jobId', () => {
         const work = vi.fn(async () => ({ txId: 'tx-123' }));
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   { receiverAddress: 'addr', amount: '100' },
             work
@@ -486,7 +500,7 @@ describe('startJob: insert row + return jobId', () => {
         const row = rows.get(ret.jobId)!;
         expect(row).toBeDefined();
         expect(row.status).toBe('pending');
-        expect(row.kind).toBe('sendNight');
+        expect(row.kind).toBe('sendToken');
         expect(row.sessionId).toBe('sess-1');
         expect(row.request).toBe(JSON.stringify({ receiverAddress: 'addr', amount: '100' }));
         expect(row.payloadFingerprint).toMatch(HEX64_RE);
@@ -498,7 +512,7 @@ describe('startJob: insert row + return jobId', () => {
         const work = vi.fn(async () => ({ ok: true, value: 42 }));
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   { receiverAddress: 'addr', amount: '100' },
             work
@@ -519,7 +533,7 @@ describe('startJob: insert row + return jobId', () => {
         const work = vi.fn(async () => { throw err; });
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   {},
             work
@@ -538,7 +552,7 @@ describe('startJob: insert row + return jobId', () => {
         const work = vi.fn(async () => { throw new Error('something exotic'); });
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   {},
             work
@@ -548,7 +562,7 @@ describe('startJob: insert row + return jobId', () => {
 
         const row = rows.get(ret.jobId)!;
         expect(row.status).toBe('failed');
-        expect(row.errorCode).toBe('Error');
+        expect(row.errorCode).toBe('UNKNOWN_ERROR');
         expect(row.errorMessage).toContain('something exotic');
     });
 
@@ -556,7 +570,7 @@ describe('startJob: insert row + return jobId', () => {
         const work = vi.fn(async () => ({ amount: 12345678901234567890n }));
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   {},
             work
@@ -577,6 +591,8 @@ describe('startJob: insert row + return jobId', () => {
             request: {},
             work: async () => {
                 await reportExternalExecution({ submissionId: 'sub-1' });
+                await reportExternalSubmission({ submissionId: 'sub-1', txId: '00abc' });
+                // A later report with the hash alone keeps the identifier announced before.
                 await reportExternalSubmission({ submissionId: 'sub-1', txHash: '0xabc' });
                 await new Promise<void>(resolve => { release = resolve; });
                 return { ok: true };
@@ -585,7 +601,7 @@ describe('startJob: insert row + return jobId', () => {
         await flushSpawn();
 
         expect(rows.get(ret.jobId)).toMatchObject({
-            status: 'submitted', submissionId: 'sub-1', txHash: '0xabc'
+            status: 'submitted', submissionId: 'sub-1', txId: '00abc', txHash: '0xabc'
         });
         release();
         await flushSpawn();
@@ -632,24 +648,24 @@ describe('startJob: insert row + return jobId', () => {
         expect(String((boundaryError as Error)?.message)).toMatch(/Lease lost before markJobExternalExecution/);
     });
 
-    test('routes a pre-broadcast live failure (no txHash) to failed, not reconciliation', async () => {
+    test('routes a pre-broadcast live failure (no txId) to failed, not reconciliation', async () => {
         const ret = await startJob({
             kind: 'deployContract', sessionId: 'sess-1', request: {},
             work: async () => {
                 await reportExternalExecution({ submissionId: 'sub-nobroadcast' });
-                throw new Error('proof generation failed'); // no txHash recorded -> no chain effect
+                throw new Error('proof generation failed'); // no txId recorded -> no chain effect
             }
         });
         await flushSpawn();
         expect(rows.get(ret.jobId)?.status).toBe('failed');
     });
 
-    test('routes a live failure after a real txHash to reconciliation', async () => {
+    test('routes a live failure after an announced txId to reconciliation', async () => {
         const ret = await startJob({
             kind: 'deployContract', sessionId: 'sess-1', request: {},
             work: async () => {
                 await reportExternalExecution({ submissionId: 'sub-ambiguous' });
-                await reportExternalSubmission({ submissionId: 'sub-ambiguous', txHash: '0xmaybe' });
+                await reportExternalSubmission({ submissionId: 'sub-ambiguous', txId: '0xmaybe' });
                 throw new Error('connection closed after broadcast');
             }
         });
@@ -657,24 +673,24 @@ describe('startJob: insert row + return jobId', () => {
         expect(rows.get(ret.jobId)).toMatchObject({
             status: 'reconciliation_required',
             errorCode: 'EXTERNAL_EXECUTION_FAILED',
-            txHash: '0xmaybe'
+            txId: '0xmaybe'
         });
     });
 
     test('parks an ambiguous submit (no node status, not on the indexer) under BROADCAST_UNCONFIRMED, not the failure code', async () => {
         const ret = await startJob({
-            kind: 'sponsorUnboundTransaction', sessionId: 'sess-1', request: {},
+            kind: 'sponsorUnbound', sessionId: 'sess-1', request: {},
             work: async () => {
                 await reportExternalExecution({ submissionId: 'sub-unconfirmed' });
-                await reportExternalSubmission({ submissionId: 'sub-unconfirmed', txHash: '00unconfirmed' });
+                await reportExternalSubmission({ submissionId: 'sub-unconfirmed', txId: '00unconfirmed' });
                 // what the worker RPC delivers: the classified ambiguous outcome (worker code `ambiguous` -> SubmitAmbiguous)
                 const message = 'submit watch timed out after 75000ms without a Finalized status';
-                throw Object.assign(new Error(message), { classification: { code: 'SubmitAmbiguous', retryable: false, message } });
+                throw Object.assign(new Error(message), { classification: { code: 'SUBMIT_AMBIGUOUS', retryable: false, message } });
             }
         });
         await flushSpawn();
         const row = rows.get(ret.jobId)!;
-        expect(row).toMatchObject({ status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txHash: '00unconfirmed' });
+        expect(row).toMatchObject({ status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED', txId: '00unconfirmed' });
         expect(String(row.errorMessage)).toMatch(/BROADCAST_NOT_INCLUDED/);
     });
 
@@ -683,17 +699,17 @@ describe('startJob: insert row + return jobId', () => {
             kind: 'deployContract', sessionId: 'sess-1', request: {},
             work: async () => {
                 await reportExternalExecution({ submissionId: 'sub-final' });
-                await reportExternalSubmission({ submissionId: 'sub-final', txHash: '00final' });
+                await reportExternalSubmission({ submissionId: 'sub-final', txId: '00final' });
                 throw new Error('reply lost');
             }
         });
         await flushSpawn();
         evidenceTables.get('midnight.PendingSubmissions')!.push({
-            ID: 'sub-final', txHash: '00final', contractAddress: '0xcontract', status: 'included'
+            ID: 'sub-final', txId: '00final', contractAddress: '0xcontract', status: 'included'
         });
         // The crawler cannot correlate the job (it indexes extrinsic hashes);
         // the confirmer answers by the ledger identifier the job stores.
-        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711, blockHash: '0xb4711', indexerTxHash: '0xi1' }));
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711, blockHash: '0xb4711', txHash: '0xi1' }));
         try {
             expect(await reconcileBackgroundJobs()).toBe(0);
             let n = await confirmChainOutcomesViaIndexer();
@@ -702,16 +718,16 @@ describe('startJob: insert row + return jobId', () => {
         } finally {
             registerChainOutcomeConfirmer(null);
         }
-        expect(rows.get(ret.jobId)).toMatchObject({ status: 'succeeded', errorCode: null, chainStatus: 'success', chainBlockHeight: 4711, chainBlockHash: '0xb4711', indexerTxHash: '0xi1' });
-        expect(JSON.parse(rows.get(ret.jobId)!.result!)).toMatchObject({ reconciled: true, txHash: '00final', contractAddress: '0xcontract' });
-        expect(evidenceTables.get('midnight.PendingSubmissions')![0]).toMatchObject({ status: 'finalized', chainBlockHeight: 4711 });
+        expect(rows.get(ret.jobId)).toMatchObject({ status: 'succeeded', errorCode: null, chainStatus: 'success', blockHeight: 4711, blockHash: '0xb4711', txId: '00final', txHash: '0xi1' });
+        expect(JSON.parse(rows.get(ret.jobId)!.result!)).toMatchObject({ reconciled: true, txId: '00final', txHash: '0xi1', contractAddress: '0xcontract' });
+        expect(evidenceTables.get('midnight.PendingSubmissions')![0]).toMatchObject({ status: 'finalized', blockHeight: 4711, txHash: '0xi1' });
     });
 
     test('a PROVEN on-chain failure of an identifier-keyed job (call did NOT apply) fails terminally WITH the confirmer block height, never reconciliation_required', async () => {
         registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 42, blockHash: '0xb42' }));
-        registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, JOB_KIND_TRAITS.sponsorUnboundTransaction, async () => {
+        registerBackgroundJobProcessor('sponsorUnbound', 1, JOB_KIND_TRAITS.sponsorUnbound, async () => {
             await reportExternalExecution({ submissionId: 'sub-partial' });
-            await reportExternalSubmission({ submissionId: 'sub-partial', txHash: '00partial' });
+            await reportExternalSubmission({ submissionId: 'sub-partial', txId: '00partial' });
             // What the worker RPC hands the main thread: the code and the height ride as data.
             const err: any = new Error('sponsored transaction 00partial is in block 42 but its contract call did NOT apply (ledger result PARTIAL_SUCCESS)');
             err.name = 'TxFailedError';
@@ -719,7 +735,7 @@ describe('startJob: insert row + return jobId', () => {
             throw err;
         });
         const ret = await startJob({
-            kind: 'sponsorUnboundTransaction', sessionId: 'sess-1', requestedBy: 'alice',
+            kind: 'sponsorUnbound', sessionId: 'sess-1', requestedBy: 'alice',
             request: {}, commandVersion: 1, command: { unboundTxB64: 'x' }
         });
         await flushSpawn();
@@ -728,48 +744,48 @@ describe('startJob: insert row + return jobId', () => {
         expect(row.errorCode).toBe('CHAIN_EXECUTION_FAILED');
         expect((row as any).chainStatus).toBe('failure');
         // The rollback coordinate: without it a reorg could never revert this failure.
-        expect((row as any).chainBlockHeight).toBe(42);
-        expect(row.txHash).toBe('00partial');
+        expect((row as any).blockHeight).toBe(42);
+        expect(row.txId).toBe('00partial');
         expect(row.leaseOwner).toBeNull();
     });
 
     test('a proven on-chain failure parks for the reconciliation pass when no confirmer answers (no evidence without generation-checked coordinates)', async () => {
         registerChainOutcomeConfirmer(null);
-        registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, JOB_KIND_TRAITS.sponsorUnboundTransaction, async () => {
+        registerBackgroundJobProcessor('sponsorUnbound', 1, JOB_KIND_TRAITS.sponsorUnbound, async () => {
             await reportExternalExecution({ submissionId: 'sub-noheight' });
-            await reportExternalSubmission({ submissionId: 'sub-noheight', txHash: '00noheight' });
+            await reportExternalSubmission({ submissionId: 'sub-noheight', txId: '00noheight' });
             const err: any = new Error('sponsored transaction 00noheight is in block ? but its contract call did NOT apply');
             err.name = 'TxFailedError';
             err.code = 'landed-not-applied'; err.retryable = false;
             throw err;
         });
         const ret = await startJob({
-            kind: 'sponsorUnboundTransaction', sessionId: 'sess-1', requestedBy: 'alice',
+            kind: 'sponsorUnbound', sessionId: 'sess-1', requestedBy: 'alice',
             request: {}, commandVersion: 1, command: { unboundTxB64: 'x' }
         });
         await flushSpawn();
-        expect(rows.get(ret.jobId)).toMatchObject({ status: 'reconciliation_required', errorCode: 'CHAIN_EXECUTION_FAILED_UNCONFIRMED', txHash: '00noheight' });
-        expect((rows.get(ret.jobId) as any).chainBlockHeight ?? null).toBeNull();
+        expect(rows.get(ret.jobId)).toMatchObject({ status: 'reconciliation_required', errorCode: 'CHAIN_EXECUTION_FAILED_UNCONFIRMED', txId: '00noheight' });
+        expect((rows.get(ret.jobId) as any).blockHeight ?? null).toBeNull();
     });
 
     // A rejected sponsoring attempt whose bookkeeping could not commit parks under a persisted
     // marker; the settle pass re-runs that bookkeeping until it commits.
     test('a rejected attempt whose bookkeeping failed parks under REJECTED_ATTEMPT_BOOKKEEPING_PENDING, and the settle pass closes row, refunds the grant and fails the job', async () => {
-        registerBackgroundJobProcessor('sponsorUnboundTransaction', 1, JOB_KIND_TRAITS.sponsorUnboundTransaction, async () => {
+        registerBackgroundJobProcessor('sponsorUnbound', 1, JOB_KIND_TRAITS.sponsorUnbound, async () => {
             await reportExternalExecution({ submissionId: 'sub-unbooked' });
-            await reportExternalSubmission({ submissionId: 'sub-unbooked', txHash: '00rejected' });
-            throw new SponsorAttemptBookkeepingPendingError('close/refund/hash could not be committed', { submissionId: 'sub-unbooked', txHash: '00rejected', grantId: 'grant-1', refund: 1 });
+            await reportExternalSubmission({ submissionId: 'sub-unbooked', txId: '00rejected' });
+            throw new SponsorAttemptBookkeepingPendingError('close/refund/hash could not be committed', { submissionId: 'sub-unbooked', txId: '00rejected', grantId: 'grant-1', refund: 1 });
         });
         const ret = await startJob({
-            kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', requestedBy: 'alice',
+            kind: 'sponsorUnbound', sessionId: 'sponsor-1', requestedBy: 'alice',
             request: {}, commandVersion: 1, command: { unboundTxB64: 'x', grantId: 'grant-1' }
         });
         await flushSpawn();
-        expect(rows.get(ret.jobId)).toMatchObject({ status: 'reconciliation_required', errorCode: 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING', txHash: '00rejected' });
+        expect(rows.get(ret.jobId)).toMatchObject({ status: 'reconciliation_required', errorCode: 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING', txId: '00rejected' });
 
         // the durable state the settle pass works from: the open attempt row with its reservation, and the grant
         evidenceTables.get('midnight.PendingSubmissions')!.push({
-            ID: 'sub-unbooked', txHash: '00rejected', status: 'pending',
+            ID: 'sub-unbooked', txId: '00rejected', status: 'pending',
             submitIntentData: JSON.stringify({ deployed: ['cc'.repeat(32)], deployReservation: { grantId: 'grant-1', count: 1 } })
         });
         evidenceTables.get('midnight.AgentGrants')!.push({ ID: 'grant-1', deploysUsed: 1, maxDeploys: 1 });
@@ -778,7 +794,7 @@ describe('startJob: insert row + return jobId', () => {
         if (n === 0) n = await settleRejectedSponsorAttempts(); // process-local scan cursor may need one wrap
         expect(n).toBe(1);
         const job = rows.get(ret.jobId)!;
-        expect(job).toMatchObject({ status: 'failed', errorCode: 'SPONSOR_ATTEMPT_REJECTED', txHash: null });
+        expect(job).toMatchObject({ status: 'failed', errorCode: 'SPONSOR_ATTEMPT_REJECTED', txId: null });
         expect(job.errorMessage).toMatch(/rejected before inclusion/);
         expect(evidenceTables.get('midnight.PendingSubmissions')!.find(r => r.ID === 'sub-unbooked')).toMatchObject({ status: 'failed', errorCode: 'REJECTED' });
         expect(evidenceTables.get('midnight.AgentGrants')!.find(r => r.ID === 'grant-1')?.deploysUsed).toBe(0);
@@ -791,26 +807,26 @@ describe('startJob: insert row + return jobId', () => {
     test('the settle pass refunds NOTHING for an attempt row that was already closed, and still fails the parked job', async () => {
         const now = new Date().toISOString();
         rows.set('job-unbooked-closed', {
-            ID: 'job-unbooked-closed', kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', status: 'reconciliation_required',
+            ID: 'job-unbooked-closed', kind: 'sponsorUnbound', sessionId: 'sponsor-1', status: 'reconciliation_required',
             idempotencyKey: null, request: '{}', result: null, errorCode: 'REJECTED_ATTEMPT_BOOKKEEPING_PENDING', errorMessage: 'x',
-            startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now, submissionId: 'sub-closed', txHash: '00closed', commandVersion: 1
+            startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now, submissionId: 'sub-closed', txId: '00closed', commandVersion: 1
         } as any);
         evidenceTables.get('midnight.PendingSubmissions')!.push({
-            ID: 'sub-closed', txHash: '00closed', status: 'failed', errorCode: 'REJECTED',
+            ID: 'sub-closed', txId: '00closed', status: 'failed', errorCode: 'REJECTED',
             submitIntentData: JSON.stringify({ deployReservation: { grantId: 'grant-2', count: 1 } })
         });
         evidenceTables.get('midnight.AgentGrants')!.push({ ID: 'grant-2', deploysUsed: 0, maxDeploys: 1 });
         let n = await settleRejectedSponsorAttempts();
         if (n === 0) n = await settleRejectedSponsorAttempts();
         expect(n).toBe(1);
-        expect(rows.get('job-unbooked-closed')).toMatchObject({ status: 'failed', errorCode: 'SPONSOR_ATTEMPT_REJECTED', txHash: null });
+        expect(rows.get('job-unbooked-closed')).toMatchObject({ status: 'failed', errorCode: 'SPONSOR_ATTEMPT_REJECTED', txId: null });
         expect(evidenceTables.get('midnight.AgentGrants')!.find(r => r.ID === 'grant-2')?.deploysUsed).toBe(0);
     });
 
     test('keeps the job in reconciliation when its projection finalizer fails', async () => {
         registerBackgroundJobProcessor('projectionLeaf', 1, LIGHT_KIND, async () => {
             await reportExternalExecution({ submissionId: 'sub-projection' });
-            await reportExternalSubmission({ submissionId: 'sub-projection', txHash: '00projection' });
+            await reportExternalSubmission({ submissionId: 'sub-projection', txId: '00projection' });
             throw new Error('reply lost');
         });
         registerBackgroundJobReconciliationFinalizer('projectionLeaf', 1, async () => {
@@ -821,7 +837,7 @@ describe('startJob: insert row + return jobId', () => {
             request: {}, commandVersion: 1, command: { resourceId: 'r1' }
         });
         await flushSpawn();
-        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-projection', txHash: '00projection', status: 'included' });
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-projection', txId: '00projection', status: 'included' });
         registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 1 }));
         try {
             expect(await confirmChainOutcomesViaIndexer()).toBe(0);
@@ -837,14 +853,14 @@ describe('startJob: insert row + return jobId', () => {
             kind: 'submitContractCall', sessionId: 'sess-1', request: {},
             work: async () => {
                 await reportExternalExecution({ submissionId: 'sub-open' });
-                await reportExternalSubmission({ submissionId: 'sub-open', txHash: '00open' });
+                await reportExternalSubmission({ submissionId: 'sub-open', txId: '00open' });
                 throw new Error('reply lost');
             }
         });
         await flushSpawn();
-        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-open', txHash: '00open', status: 'included' });
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-open', txId: '00open', status: 'included' });
         // A crawler row whose extrinsic hash happens to look related proves nothing.
-        evidenceTables.get('midnight.Transactions')!.push({ ID: 'indexed-open', hash: '0x00open' });
+        evidenceTables.get('midnight.Transactions')!.push({ ID: 'indexed-open', extrinsicHash: '0x00open' });
         expect(await reconcileBackgroundJobs()).toBe(0);
         registerChainOutcomeConfirmer(async () => null);
         try {
@@ -862,21 +878,21 @@ describe('startJob: insert row + return jobId', () => {
             kind: 'submitContractCall', sessionId: 'sess-1', request: {},
             work: async () => {
                 await reportExternalExecution({ submissionId: 'sub-chain-fail' });
-                await reportExternalSubmission({ submissionId: 'sub-chain-fail', txHash: '00chainfail' });
-                return { txHash: '00chainfail', status: 'included' };
+                await reportExternalSubmission({ submissionId: 'sub-chain-fail', txId: '00chainfail' });
+                return { txId: '00chainfail', status: 'included' };
             }
         });
         await flushSpawn();
-        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-chain-fail', txHash: '00chainfail', status: 'included' });
-        registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 77, blockHash: '0xb77', indexerTxHash: '0xi77' }));
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-chain-fail', txId: '00chainfail', status: 'included' });
+        registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 77, blockHash: '0xb77', txHash: '0xi77' }));
         try {
             expect(await confirmChainOutcomesViaIndexer()).toBe(1);
         } finally {
             registerChainOutcomeConfirmer(null);
         }
-        expect(rows.get(ret.jobId)).toMatchObject({ status: 'succeeded', chainStatus: 'failure', chainBlockHeight: 77, chainBlockHash: '0xb77' });
+        expect(rows.get(ret.jobId)).toMatchObject({ status: 'succeeded', chainStatus: 'failure', blockHeight: 77, blockHash: '0xb77' });
         expect(rows.get(ret.jobId)?.chainFinalizedAt).toBeTruthy();
-        expect(evidenceTables.get('midnight.PendingSubmissions')![0]).toMatchObject({ status: 'failed', errorCode: 'CHAIN_EXECUTION_FAILED', chainBlockHeight: 77 });
+        expect(evidenceTables.get('midnight.PendingSubmissions')![0]).toMatchObject({ status: 'failed', errorCode: 'CHAIN_EXECUTION_FAILED', blockHeight: 77 });
     });
 
     test('requeues a reconciliation parent only after every durable child succeeded', async () => {
@@ -884,7 +900,7 @@ describe('startJob: insert row + return jobId', () => {
         const base = { sessionId: 'sess-1', idempotencyKey: null, request: '{}', result: null,
             errorCode: null, errorMessage: null, startedAt: now, finishedAt: null,
             createdAt: now, modifiedAt: now };
-        rows.set('parent-ready', { ...base, ID: 'parent-ready', kind: 'issueFieldPredicateAttestation',
+        rows.set('parent-ready', { ...base, ID: 'parent-ready', kind: 'proveFieldPredicate',
             status: 'reconciliation_required', parentJobId: null, workflowStep: null,
             commandVersion: 1, command: '{}', requestedBy: 'alice' } as Row);
         rows.set('child-a', { ...base, ID: 'child-a', kind: 'fieldAnchorRoot', status: 'succeeded',
@@ -901,7 +917,7 @@ describe('startJob: insert row + return jobId', () => {
         let contextSeenByWork: string | undefined;
 
         const ret = await requestContext.run('request-transaction', () => startJob({
-            kind: 'sendNight',
+            kind: 'sendToken',
             sessionId: 'sess-1',
             request: {},
             work: async () => {
@@ -920,7 +936,7 @@ describe('startJob: insert row + return jobId', () => {
 
     test('does not execute work when the guarded pending claim affects zero rows', async () => {
         const work = vi.fn(async () => ({ ok: true }));
-        const ret = await startJob({ kind: 'sendNight', sessionId: 'sess-1', request: {}, work });
+        const ret = await startJob({ kind: 'sendToken', sessionId: 'sess-1', request: {}, work });
         Object.assign(rows.get(ret.jobId)!, { status: 'running', leaseOwner: 'another-worker' });
 
         await flushSpawn();
@@ -958,11 +974,11 @@ describe('bounded background scans remain fair beyond one page', () => {
             putRow(`recon-${String(i).padStart(3, '0')}`, {
                 status: 'reconciliation_required', result: null,
                 submissionId: i === 100 ? 'sub-late' : `sub-open-${i}`,
-                txHash: i === 100 ? '00late' : `00open${i}`
+                txId: i === 100 ? '00late' : `00open${i}`
             });
         }
-        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-late', txHash: '00late', status: 'included' });
-        registerChainOutcomeConfirmer(async (txHash) => txHash === '00late' ? { status: 'success', blockHeight: 5 } : null);
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-late', txId: '00late', status: 'included' });
+        registerChainOutcomeConfirmer(async (ref) => ref.txId === '00late' ? { status: 'success', blockHeight: 5 } : null);
         try {
             expect(await confirmChainOutcomesViaIndexer()).toBe(0);
             laterPass();
@@ -970,18 +986,18 @@ describe('bounded background scans remain fair beyond one page', () => {
         } finally {
             registerChainOutcomeConfirmer(null);
         }
-        expect(rows.get('recon-100')).toMatchObject({ status: 'succeeded', chainStatus: 'success', chainBlockHeight: 5 });
+        expect(rows.get('recon-100')).toMatchObject({ status: 'succeeded', chainStatus: 'success', blockHeight: 5 });
     });
 
     test('advances past 100 unresolved pending chain outcomes', async () => {
         for (let i = 0; i < 101; i++) {
             putRow(`chain-${String(i).padStart(3, '0')}`, {
                 chainStatus: 'pending', submissionId: i === 100 ? 'sub-late' : `sub-open-${i}`,
-                txHash: i === 100 ? '00late' : `00open${i}`
+                txId: i === 100 ? '00late' : `00open${i}`
             });
         }
-        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-late', txHash: '00late', status: 'included' });
-        registerChainOutcomeConfirmer(async (txHash) => txHash === '00late' ? { status: 'success', blockHeight: 6 } : null);
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-late', txId: '00late', status: 'included' });
+        registerChainOutcomeConfirmer(async (ref) => ref.txId === '00late' ? { status: 'success', blockHeight: 6 } : null);
         try {
             expect(await confirmChainOutcomesViaIndexer()).toBe(0);
             laterPass();
@@ -989,17 +1005,17 @@ describe('bounded background scans remain fair beyond one page', () => {
         } finally {
             registerChainOutcomeConfirmer(null);
         }
-        expect(rows.get('chain-100')).toMatchObject({ chainStatus: 'success', chainBlockHeight: 6 });
+        expect(rows.get('chain-100')).toMatchObject({ chainStatus: 'success', blockHeight: 6 });
     });
 
     test('advances past 100 unresolved workflow parents', async () => {
         for (let i = 0; i < 101; i++) {
             putRow(`parent-${String(i).padStart(3, '0')}`, {
-                kind: 'issueFieldPredicateAttestation', chainStatus: 'pending', txHash: null
+                kind: 'proveFieldPredicate', chainStatus: 'pending', txId: null
             });
         }
         putRow('child-late', {
-            kind: 'fieldPredicateProof', parentJobId: 'parent-100', chainStatus: 'success', txHash: '0xchild'
+            kind: 'fieldPredicateProof', parentJobId: 'parent-100', chainStatus: 'success', txId: '0xchild'
         });
 
         expect(await refreshSucceededChainOutcomes()).toBe(0);
@@ -1008,9 +1024,9 @@ describe('bounded background scans remain fair beyond one page', () => {
     });
 
     test('a workflow parent whose children all ended and one was dropped is dropped, not pending forever', async () => {
-        putRow('parent-drop', { kind: 'issueFieldPredicateAttestation', chainStatus: 'pending', txHash: null });
-        putRow('child-ok', { kind: 'fieldPredicateProof', parentJobId: 'parent-drop', chainStatus: 'success', txHash: '0xok' });
-        putRow('child-gone', { kind: 'fieldPredicateProof', parentJobId: 'parent-drop', chainStatus: 'dropped', txHash: '0xgone' });
+        putRow('parent-drop', { kind: 'proveFieldPredicate', chainStatus: 'pending', txId: null });
+        putRow('child-ok', { kind: 'fieldPredicateProof', parentJobId: 'parent-drop', chainStatus: 'success', txId: '0xok' });
+        putRow('child-gone', { kind: 'fieldPredicateProof', parentJobId: 'parent-drop', chainStatus: 'dropped', txId: '0xgone' });
         expect(await refreshSucceededChainOutcomes()).toBe(1);
         expect(rows.get('parent-drop')).toMatchObject({ chainStatus: 'dropped' });
     });
@@ -1034,14 +1050,14 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
     afterEach(() => registerChainOutcomeConfirmer(null));
 
     test('is a no-op when no confirmer is registered', async () => {
-        putSucceeded('job-noconfirmer', { txHash: '0xaaa' });
+        putSucceeded('job-noconfirmer', { txId: '0xaaa' });
         expect(await confirmChainOutcomesViaIndexer()).toBe(0);
         expect(rows.get('job-noconfirmer')?.chainStatus).toBe('pending');
     });
 
     test('advances a pending leaf to success without the crawler tables', async () => {
         registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
-        putSucceeded('job-ok', { txHash: '0xok' });
+        putSucceeded('job-ok', { txId: '0xok' });
         // evidenceTables intentionally empty: no PendingSubmissions / Transactions needed.
         expect(await confirmChainOutcomesViaIndexer()).toBe(1);
         expect(rows.get('job-ok')).toMatchObject({ status: 'succeeded', chainStatus: 'success' });
@@ -1050,29 +1066,29 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
 
     test('advances a legacy (null chainStatus) leaf to failure, keeping status succeeded', async () => {
         registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 4711 }));
-        putSucceeded('job-legacy', { txHash: '0xfail', chainStatus: null });
+        putSucceeded('job-legacy', { txId: '0xfail', chainStatus: null });
         expect(await confirmChainOutcomesViaIndexer()).toBe(1);
         expect(rows.get('job-legacy')).toMatchObject({ status: 'succeeded', chainStatus: 'failure' });
     });
 
     test('finalizes the attempt row with the outcome (without the crawler nothing else moves it past included)', async () => {
         registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
-        putSucceeded('job-row', { txHash: 'bare1', submissionId: 'sub-row' });
-        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-row', txHash: 'bare1', status: 'included' });
+        putSucceeded('job-row', { txId: 'bare1', submissionId: 'sub-row' });
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-row', txId: 'bare1', status: 'included' });
         expect(await confirmChainOutcomesViaIndexer()).toBe(1);
         expect(evidenceTables.get('midnight.PendingSubmissions')![0]).toMatchObject({ status: 'finalized' });
         expect(evidenceTables.get('midnight.PendingSubmissions')![0].finalizedAt).toBeTruthy();
 
         registerChainOutcomeConfirmer(async () => ({ status: 'failure', blockHeight: 4711 }));
-        putSucceeded('job-row-fail', { txHash: 'bare2' });
-        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-row-fail', txHash: 'bare2', status: 'included' });
+        putSucceeded('job-row-fail', { txId: 'bare2' });
+        evidenceTables.get('midnight.PendingSubmissions')!.push({ ID: 'sub-row-fail', txId: 'bare2', status: 'included' });
         expect(await confirmChainOutcomesViaIndexer()).toBe(1);
         expect(evidenceTables.get('midnight.PendingSubmissions')![1]).toMatchObject({ status: 'failed', errorCode: 'CHAIN_EXECUTION_FAILED' });
     });
 
     test('leaves the job pending when the tx is not yet finalized (null outcome)', async () => {
         registerChainOutcomeConfirmer(async () => null);
-        putSucceeded('job-pending', { txHash: '0xnotyet' });
+        putSucceeded('job-pending', { txId: '0xnotyet' });
         expect(await confirmChainOutcomesViaIndexer()).toBe(0);
         expect(rows.get('job-pending')?.chainStatus).toBe('pending');
     });
@@ -1083,7 +1099,7 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
             const start = Date.now();
             const confirmer = vi.fn(async () => null);
             registerChainOutcomeConfirmer(confirmer);
-            putSucceeded('job-wait', { txHash: '0xwait' });
+            putSucceeded('job-wait', { txId: '0xwait' });
             const passAt = async (ms: number) => { vi.setSystemTime(start + ms); await confirmChainOutcomesViaIndexer(); };
             await passAt(0);
             await passAt(2_000);
@@ -1102,7 +1118,7 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
     test('a lookup that throws pauses the job the same way', async () => {
         const confirmer = vi.fn(async () => { throw new Error('403 Forbidden'); });
         registerChainOutcomeConfirmer(confirmer);
-        putSucceeded('job-403', { txHash: '0x403' });
+        putSucceeded('job-403', { txId: '0x403' });
         await confirmChainOutcomesViaIndexer();
         await confirmChainOutcomesViaIndexer();
         expect(confirmer).toHaveBeenCalledTimes(1);
@@ -1115,7 +1131,7 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         let failing = true;
         const confirmer = vi.fn(async () => { if (failing) throw new Error('403 Forbidden'); return null; });
         registerChainOutcomeConfirmer(confirmer);
-        putSucceeded('job-outage', { txHash: '0xfeed' });
+        putSucceeded('job-outage', { txId: '0xfeed' });
         // An hour of outage, far longer than the doubling needs to reach its cap.
         for (let elapsed = 0; elapsed < 3_600_000; elapsed += 30_000) {
             vi.setSystemTime(start + elapsed);
@@ -1143,7 +1159,7 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         try {
             const confirmer = vi.fn(async () => null);
             registerChainOutcomeConfirmer(confirmer);
-            for (let i = 0; i < 50; i++) putSucceeded(`job-budget-${String(i).padStart(2, '0')}`, { txHash: `0xb${i}` });
+            for (let i = 0; i < 50; i++) putSucceeded(`job-budget-${String(i).padStart(2, '0')}`, { txId: `0xb${i}` });
             await confirmChainOutcomesViaIndexer();
             expect(confirmer).toHaveBeenCalledTimes(10);
             await confirmChainOutcomesViaIndexer();
@@ -1153,21 +1169,21 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         }
     });
 
-    test('resolves a BOUND kind parked in reconciliation_required with a hash (crawler off: no other evidence exists)', async () => {
+    test('resolves a BOUND kind parked in reconciliation_required with an identifier (crawler off: no other evidence exists)', async () => {
         registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
         const now = new Date().toISOString();
         rows.set('job-recon-bound', {
             ID: 'job-recon-bound', kind: 'submitContractCall', sessionId: 'sess-1', status: 'reconciliation_required',
             idempotencyKey: null, request: '{}', result: null, errorCode: 'EXTERNAL_EXECUTION_FAILED', errorMessage: 'watch timed out',
             startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now, chainStatus: 'pending',
-            txHash: '00bound'.padEnd(64, '0'), commandVersion: 1, commandEncoding: null, command: JSON.stringify({ op: 'call' })
+            txId: '00bound'.padEnd(64, '0'), commandVersion: 1, commandEncoding: null, command: JSON.stringify({ op: 'call' })
         } as any);
         let n = await confirmChainOutcomesViaIndexer();
         if (n === 0) n = await confirmChainOutcomesViaIndexer();
         expect(n).toBe(1);
         expect(rows.get('job-recon-bound')).toMatchObject({ status: 'succeeded', chainStatus: 'success', errorCode: null });
         const result = JSON.parse(rows.get('job-recon-bound')!.result as string);
-        expect(result).toMatchObject({ txHash: '00bound'.padEnd(64, '0'), reconciled: true });
+        expect(result).toMatchObject({ txId: '00bound'.padEnd(64, '0'), reconciled: true });
         // The job paid for itself, so its result names no sponsor. Only a sponsor job falls back to its own session.
         expect(result).not.toHaveProperty('feeSponsor');
     });
@@ -1175,15 +1191,15 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
     // The crawler-free path resolves identifier-keyed sponsor jobs from reconciliation_required too;
     // a reconciled success runs the kind's registered finalizer and reports its result.
     test('runs the registered finalizer for a reconciled identifier-keyed job and persists its result', async () => {
-        const finalizer = vi.fn(async (_cmd: unknown, _job: unknown, evidence: any) => ({ reconciled: true, txHash: evidence.txHash, deployed: ['cc'.repeat(32)], status: 'finalized' }));
-        registerBackgroundJobReconciliationFinalizer('sponsorUnboundTransaction', 1, finalizer);
-        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
+        const finalizer = vi.fn(async (_cmd: unknown, _job: unknown, evidence: any) => ({ reconciled: true, txId: evidence.txId, txHash: evidence.txHash, deployed: ['cc'.repeat(32)], status: 'finalized' }));
+        registerBackgroundJobReconciliationFinalizer('sponsorUnbound', 1, finalizer);
+        registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711, txHash: 'ee'.repeat(32) }));
         const now = new Date().toISOString();
         rows.set('job-recon-deploy', {
-            ID: 'job-recon-deploy', kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', status: 'reconciliation_required',
+            ID: 'job-recon-deploy', kind: 'sponsorUnbound', sessionId: 'sponsor-1', status: 'reconciliation_required',
             idempotencyKey: null, request: '{}', result: null, errorCode: 'PROCESS_RESTART_RECONCILE', errorMessage: 'x',
             startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now, chainStatus: 'pending',
-            txHash: '00recon'.padEnd(64, '0'), commandVersion: 1, commandEncoding: null, command: JSON.stringify({ op: 'sponsorUnbound', grantId: 'grant-1' })
+            txId: '00recon'.padEnd(64, '0'), commandVersion: 1, commandEncoding: null, command: JSON.stringify({ op: 'sponsorUnbound', grantId: 'grant-1' })
         } as any);
         // The reconcile cursor is process-local and may sit past this ID; a pass that finds nothing wraps it to the start.
         let n = await confirmChainOutcomesViaIndexer();
@@ -1191,23 +1207,24 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         expect(n).toBe(1);
         expect(finalizer).toHaveBeenCalledTimes(1);
         expect(finalizer.mock.calls[0][0]).toEqual({ op: 'sponsorUnbound', grantId: 'grant-1' });
-        expect(finalizer.mock.calls[0][2]).toMatchObject({ txHash: '00recon'.padEnd(64, '0') });
+        // The evidence names the job's identifier and the hash the indexer reported.
+        expect(finalizer.mock.calls[0][2]).toMatchObject({ txId: '00recon'.padEnd(64, '0'), txHash: 'ee'.repeat(32) });
         const row = rows.get('job-recon-deploy')!;
         expect(row).toMatchObject({ status: 'succeeded', chainStatus: 'success' });
-        expect(JSON.parse(String(row.result))).toMatchObject({ deployed: ['cc'.repeat(32)], txHash: '00recon'.padEnd(64, '0'), reconciled: true });
+        expect(JSON.parse(String(row.result))).toMatchObject({ deployed: ['cc'.repeat(32)], txId: '00recon'.padEnd(64, '0'), txHash: 'ee'.repeat(32), reconciled: true });
     });
 
     test('decrypts a bound aes-gcm command for the reconciliation finalizer', async () => {
         const finalizer = vi.fn(async (_cmd: unknown, _job: unknown, _evidence: unknown) => ({ reconciled: true, status: 'finalized' }));
-        registerBackgroundJobReconciliationFinalizer('sponsorUnboundTransaction', 1, finalizer);
+        registerBackgroundJobReconciliationFinalizer('sponsorUnbound', 1, finalizer);
         registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
         const now = new Date().toISOString();
         const command = encryptAtRest(JSON.stringify({ op: 'sponsorUnbound', grantId: 'grant-enc' }), getEncryptionKey(), jobCommandBinding('job-recon-enc'));
         rows.set('job-recon-enc', {
-            ID: 'job-recon-enc', kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', status: 'reconciliation_required',
+            ID: 'job-recon-enc', kind: 'sponsorUnbound', sessionId: 'sponsor-1', status: 'reconciliation_required',
             idempotencyKey: null, request: '{}', result: null, errorCode: 'BROADCAST_UNCONFIRMED', errorMessage: 'x',
             startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now, chainStatus: 'pending',
-            txHash: '00encr'.padEnd(64, '0'), commandVersion: 1, commandEncoding: 'aes-gcm-v1', command
+            txId: '00encr'.padEnd(64, '0'), commandVersion: 1, commandEncoding: 'aes-gcm-v1', command
         } as any);
         let n = await confirmChainOutcomesViaIndexer();
         if (n === 0) n = await confirmChainOutcomesViaIndexer();
@@ -1217,14 +1234,14 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
     });
 
     test('a throwing finalizer keeps a reconciled identifier-keyed job in reconciliation_required', async () => {
-        registerBackgroundJobReconciliationFinalizer('sponsorUnboundTransaction', 1, async () => { throw new Error('grant write failed'); });
+        registerBackgroundJobReconciliationFinalizer('sponsorUnbound', 1, async () => { throw new Error('grant write failed'); });
         registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
         const now = new Date().toISOString();
         rows.set('job-recon-throw', {
-            ID: 'job-recon-throw', kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', status: 'reconciliation_required',
+            ID: 'job-recon-throw', kind: 'sponsorUnbound', sessionId: 'sponsor-1', status: 'reconciliation_required',
             idempotencyKey: null, request: '{}', result: null, errorCode: null, errorMessage: null,
             startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now, chainStatus: 'pending',
-            txHash: '00throw'.padEnd(64, '0'), commandVersion: 1, commandEncoding: null, command: JSON.stringify({ op: 'sponsorUnbound' })
+            txId: '00throw'.padEnd(64, '0'), commandVersion: 1, commandEncoding: null, command: JSON.stringify({ op: 'sponsorUnbound' })
         } as any);
         expect(await confirmChainOutcomesViaIndexer()).toBe(0);
         expect(await confirmChainOutcomesViaIndexer()).toBe(0);
@@ -1235,7 +1252,7 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         const afterCommitted = vi.fn(async () => undefined);
         const afterThrown = vi.fn(async () => undefined);
         let seenTx: unknown;
-        registerBackgroundJobReconciliationFinalizer('sponsorUnboundTransaction', 1, async (cmd: any, _job, _evidence, tx, afterCommit) => {
+        registerBackgroundJobReconciliationFinalizer('sponsorUnbound', 1, async (cmd: any, _job, _evidence, tx, afterCommit) => {
             seenTx = tx;
             afterCommit(cmd.op === 'throw' ? afterThrown : afterCommitted);
             if (cmd.op === 'throw') throw new Error('grant write failed');
@@ -1244,18 +1261,18 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
         registerChainOutcomeConfirmer(async () => ({ status: 'success', blockHeight: 4711 }));
         const now = new Date().toISOString();
         const base = {
-            kind: 'sponsorUnboundTransaction', sessionId: 'sponsor-1', status: 'reconciliation_required',
+            kind: 'sponsorUnbound', sessionId: 'sponsor-1', status: 'reconciliation_required',
             idempotencyKey: null, request: '{}', result: null, errorCode: null, errorMessage: null,
             startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now, chainStatus: 'pending', commandVersion: 1, commandEncoding: null
         };
-        rows.set('job-recon-tx', { ...base, ID: 'job-recon-tx', txHash: '00txok'.padEnd(64, '0'), command: JSON.stringify({ op: 'ok' }) } as any);
+        rows.set('job-recon-tx', { ...base, ID: 'job-recon-tx', txId: '00txok'.padEnd(64, '0'), command: JSON.stringify({ op: 'ok' }) } as any);
         let n = await confirmChainOutcomesViaIndexer();
         if (n === 0) n = await confirmChainOutcomesViaIndexer();
         expect(n).toBe(1);
         expect(seenTx).toBeDefined();
         expect(afterCommitted).toHaveBeenCalledTimes(1);
 
-        rows.set('job-recon-tx-throw', { ...base, ID: 'job-recon-tx-throw', txHash: '00txno'.padEnd(64, '0'), command: JSON.stringify({ op: 'throw' }) } as any);
+        rows.set('job-recon-tx-throw', { ...base, ID: 'job-recon-tx-throw', txId: '00txno'.padEnd(64, '0'), command: JSON.stringify({ op: 'throw' }) } as any);
         await confirmChainOutcomesViaIndexer();
         await confirmChainOutcomesViaIndexer();
         expect(rows.get('job-recon-tx-throw')?.status).toBe('reconciliation_required');
@@ -1265,19 +1282,19 @@ describe('confirmChainOutcomesViaIndexer: crawler-free chainStatus advance', () 
     test('skips workflow parents (chainStatus is aggregated from children)', async () => {
         const confirmer = vi.fn(async () => ({ status: 'success' as const, blockHeight: 4711 }));
         registerChainOutcomeConfirmer(confirmer);
-        putSucceeded('parent-job', { kind: 'issueFieldPredicateAttestation', txHash: '0xparent' });
+        putSucceeded('parent-job', { kind: 'proveFieldPredicate', txId: '0xparent' });
         expect(await confirmChainOutcomesViaIndexer()).toBe(0);
         expect(confirmer).not.toHaveBeenCalled();
         expect(rows.get('parent-job')?.chainStatus).toBe('pending');
     });
 
     test('continues past a throwing confirmer without failing the whole pass', async () => {
-        registerChainOutcomeConfirmer(async (txHash) => {
-            if (txHash === '0xthrow') throw new Error('lookup blew up');
+        registerChainOutcomeConfirmer(async (ref) => {
+            if (ref.txId === '0xthrow') throw new Error('lookup blew up');
             return { status: 'success', blockHeight: 4711 };
         });
-        putSucceeded('job-throw', { txHash: '0xthrow' });
-        putSucceeded('job-after', { txHash: '0xafter' });
+        putSucceeded('job-throw', { txId: '0xthrow' });
+        putSucceeded('job-after', { txId: '0xafter' });
         expect(await confirmChainOutcomesViaIndexer()).toBe(1);
         expect(rows.get('job-throw')?.chainStatus).toBe('pending');
         expect(rows.get('job-after')?.chainStatus).toBe('success');
@@ -1290,7 +1307,7 @@ describe('startJob: idempotency', () => {
     test('reusing an idempotencyKey on a succeeded job returns the same jobId + result', async () => {
         const work1 = vi.fn(async () => ({ txId: 'tx-AAA' }));
         const first = await startJob({
-            kind:           'sendNight',
+            kind:           'sendToken',
             sessionId:      'sess-1',
             idempotencyKey: 'idem-1',
             request:        {},
@@ -1300,7 +1317,7 @@ describe('startJob: idempotency', () => {
 
         const work2 = vi.fn(async () => ({ txId: 'tx-BBB-should-not-be-called' }));
         const second = await startJob({
-            kind:           'sendNight',
+            kind:           'sendToken',
             sessionId:      'sess-1',
             idempotencyKey: 'idem-1',
             request:        {},
@@ -1318,7 +1335,7 @@ describe('startJob: idempotency', () => {
         let resolveWork!: (v: any) => void;
         const work1 = vi.fn(() => new Promise<any>(r => { resolveWork = r; }));
         const first = await startJob({
-            kind:           'sendNight',
+            kind:           'sendToken',
             sessionId:      'sess-1',
             idempotencyKey: 'idem-2',
             request:        {},
@@ -1330,7 +1347,7 @@ describe('startJob: idempotency', () => {
 
         const work2 = vi.fn(async () => ({ should: 'not be called' }));
         const second = await startJob({
-            kind:           'sendNight',
+            kind:           'sendToken',
             sessionId:      'sess-1',
             idempotencyKey: 'idem-2',
             request:        {},
@@ -1347,12 +1364,12 @@ describe('startJob: idempotency', () => {
 
     test('rejects reuse of an idempotency key with a different payload', async () => {
         await startJob({
-            kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-drift',
+            kind: 'sendToken', sessionId: 'sess-1', idempotencyKey: 'idem-drift',
             request: { amount: '1' }, work: async () => ({ ok: true })
         });
 
         await expect(startJob({
-            kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-drift',
+            kind: 'sendToken', sessionId: 'sess-1', idempotencyKey: 'idem-drift',
             request: { amount: '2' }, work: async () => ({ ok: true })
         })).rejects.toMatchObject({
             name: 'IdempotencyConflictError', status: 409, code: 'IDEMPOTENCY_KEY_CONFLICT',
@@ -1362,14 +1379,14 @@ describe('startJob: idempotency', () => {
 
     test('the conflict names the job to the caller that started it, and to nobody else', async () => {
         const first = await startJob({
-            kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-named', requestedBy: 'operator', grantId: 'grant-a',
+            kind: 'sendToken', sessionId: 'sess-1', idempotencyKey: 'idem-named', requestedBy: 'operator', grantId: 'grant-a',
             request: { amount: '1' }, work: async () => ({ ok: true })
         });
         await flushSpawn();
         const again = async (caller: { requestedBy?: string; grantId?: string | null }): Promise<Record<string, unknown>> => {
             try {
                 await startJob({
-                    kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-named', ...caller,
+                    kind: 'sendToken', sessionId: 'sess-1', idempotencyKey: 'idem-named', ...caller,
                     request: { amount: '2' }, work: async () => ({ ok: true })
                 });
             } catch (e) { return e as Record<string, unknown>; }
@@ -1391,21 +1408,21 @@ describe('startJob: idempotency', () => {
     test('deduplicates generated resource IDs using a stable semantic payload', async () => {
         const first = await startJob({
             kind: 'anchorDocument', sessionId: 'sess-1', idempotencyKey: 'anchor-1',
-            request: { sha256: 'abc', documentId: 'doc-1' },
-            idempotencyPayload: { sha256: 'abc' },
+            request: { payloadHash: 'abc', documentId: 'doc-1' },
+            idempotencyPayload: { payloadHash: 'abc' },
             work: async () => ({ ok: true })
         });
         const second = await startJob({
             kind: 'anchorDocument', sessionId: 'sess-1', idempotencyKey: 'anchor-1',
-            request: { sha256: 'abc', documentId: 'doc-2' },
-            idempotencyPayload: { sha256: 'abc' },
+            request: { payloadHash: 'abc', documentId: 'doc-2' },
+            idempotencyPayload: { payloadHash: 'abc' },
             work: async () => ({ ok: true })
         });
 
         expect(second).toMatchObject({
             jobId: first.jobId,
             deduplicated: true,
-            originalRequest: { sha256: 'abc', documentId: 'doc-1' }
+            originalRequest: { payloadHash: 'abc', documentId: 'doc-1' }
         });
     });
 
@@ -1413,7 +1430,7 @@ describe('startJob: idempotency', () => {
         // Idempotency stops a double submit. A retry after an error must not be stopped, even when it is rebuilt differently.
         const work1 = vi.fn(async () => { throw new Error('boom'); });
         const first = await startJob({
-            kind:           'sendNight',
+            kind:           'sendToken',
             sessionId:      'sess-1',
             idempotencyKey: 'idem-3',
             request:        { amount: '1' },
@@ -1424,7 +1441,7 @@ describe('startJob: idempotency', () => {
 
         const work2 = vi.fn(async () => ({ ok: true }));
         const second = await startJob({
-            kind:           'sendNight',
+            kind:           'sendToken',
             sessionId:      'sess-1',
             idempotencyKey: 'idem-3',
             request:        { amount: '2' },
@@ -1438,27 +1455,27 @@ describe('startJob: idempotency', () => {
         expect(rows.get(first.jobId)).toMatchObject({ status: 'failed', idempotencyKey: null });
 
         // The key now belongs to the succeeded job again: a repeat returns it, a different payload conflicts.
-        const third = await startJob({ kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-3', request: { amount: '2' }, work: async () => ({ ok: true }) });
+        const third = await startJob({ kind: 'sendToken', sessionId: 'sess-1', idempotencyKey: 'idem-3', request: { amount: '2' }, work: async () => ({ ok: true }) });
         expect(third.jobId).toBe(second.jobId);
-        await expect(startJob({ kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-3', request: { amount: '3' }, work: async () => ({ ok: true }) }))
+        await expect(startJob({ kind: 'sendToken', sessionId: 'sess-1', idempotencyKey: 'idem-3', request: { amount: '3' }, work: async () => ({ ok: true }) }))
             .rejects.toMatchObject({ code: 'IDEMPOTENCY_KEY_CONFLICT' });
     });
 
     test('a parked job keeps its idempotency key: a transaction may be on chain', async () => {
         const first = await startJob({
-            kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-parked',
+            kind: 'sendToken', sessionId: 'sess-1', idempotencyKey: 'idem-parked',
             request: { amount: '1' }, work: async () => ({ ok: true })
         });
         await flushSpawn();
         Object.assign(rows.get(first.jobId)!, { status: 'reconciliation_required', errorCode: 'BROADCAST_UNCONFIRMED' });
 
         const again = await startJob({
-            kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-parked',
+            kind: 'sendToken', sessionId: 'sess-1', idempotencyKey: 'idem-parked',
             request: { amount: '1' }, work: async () => ({ ok: true })
         });
         expect(again).toMatchObject({ jobId: first.jobId, status: 'reconciliation_required' });
         await expect(startJob({
-            kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: 'idem-parked',
+            kind: 'sendToken', sessionId: 'sess-1', idempotencyKey: 'idem-parked',
             request: { amount: '2' }, work: async () => ({ ok: true })
         })).rejects.toMatchObject({ code: 'IDEMPOTENCY_KEY_CONFLICT' });
         expect(rows.get(first.jobId)?.idempotencyKey).toBe('idem-parked');
@@ -1486,11 +1503,11 @@ describe('startJob: idempotency', () => {
 
     test('different sessionIds with the same key do not collide', async () => {
         const a = await startJob({
-            kind: 'sendNight', sessionId: 'sess-A', idempotencyKey: 'shared',
+            kind: 'sendToken', sessionId: 'sess-A', idempotencyKey: 'shared',
             request: {}, work: async () => ({ from: 'A' })
         });
         const b = await startJob({
-            kind: 'sendNight', sessionId: 'sess-B', idempotencyKey: 'shared',
+            kind: 'sendToken', sessionId: 'sess-B', idempotencyKey: 'shared',
             request: {}, work: async () => ({ from: 'B' })
         });
         await flushSpawn();
@@ -1503,11 +1520,11 @@ describe('startJob: idempotency', () => {
     test('a concurrent duplicate that collides on INSERT resolves to the winner job', async () => {
         const key = 'idem-concurrent';
         const winnerRow: any = {
-            ID: 'winner-job', kind: 'sendNight', sessionId: 'sess-1', status: 'pending',
+            ID: 'winner-job', kind: 'sendToken', sessionId: 'sess-1', status: 'pending',
             idempotencyKey: key, request: JSON.stringify({ a: 1 }), payloadFingerprint: null,
             result: null, errorCode: null, errorMessage: null, startedAt: null, queuedAt: null,
             externalExecutionAt: null, submittedAt: null, finishedAt: null, attempt: 0, maxAttempts: 1,
-            leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null, submissionId: null, txHash: null,
+            leaseOwner: null, leaseExpiresAt: null, heartbeatAt: null, submissionId: null, txId: null, txHash: null,
             createdAt: new Date().toISOString(), modifiedAt: new Date().toISOString()
         };
 
@@ -1529,7 +1546,7 @@ describe('startJob: idempotency', () => {
         try {
             const work = vi.fn(async () => ({ ok: true }));
             const ret = await startJob({
-                kind: 'sendNight', sessionId: 'sess-1', idempotencyKey: key,
+                kind: 'sendToken', sessionId: 'sess-1', idempotencyKey: key,
                 request: { a: 1 }, work
             });
             expect(ret).toMatchObject({ jobId: 'winner-job', deduplicated: true });
@@ -1553,7 +1570,7 @@ describe('startJob: concurrency classes', () => {
             await new Promise<void>(r => releaseGates.push(r));
             inFlight.count--;
         });
-        for (const kind of ['deployContract', 'submitContractCall', 'anchorDocument', 'sendNight', 'grantDisclosure', 'fieldEqualityProof']) {
+        for (const kind of ['deployContract', 'submitContractCall', 'anchorDocument', 'sendToken', 'grantDisclosure', 'fieldEqualityProof']) {
             await startJob({ kind, sessionId: `sess-${kind}`, request: {}, work: makeWork() });
         }
         await flushSpawn();
@@ -1573,7 +1590,7 @@ describe('startJob: concurrency classes', () => {
         let childrenRunning = 0;
         for (let i = 0; i < 4; i++) {
             await startJob({
-                kind: 'issueFieldEqualityAttestation', sessionId: `p-${i}`, request: {},
+                kind: 'proveFieldEquality', sessionId: `p-${i}`, request: {},
                 work: vi.fn(async () => { parentsRunning++; await new Promise<void>(r => parentGates.push(r)); })
             });
         }
@@ -1639,20 +1656,20 @@ describe('startJob: per-kind semaphore', () => {
     });
 
     test('every workflow parent kind is reconciled as a parent (none falls through to the leaf path)', () => {
-        // A parent row carries no txHash; the leaf sweep would skip it forever.
+        // A parent row carries no transaction; the leaf sweep would skip it forever.
         // Every handler kind whose executor drives runChild must be listed.
         const parents = __workflowParentKindsForTests();
         for (const kind of [
-            'issueFieldPredicateAttestation', 'issueFieldPredicateAttestationBatch',
-            'issueFieldEqualityAttestation', 'issueFieldMembershipAttestation',
-            'issueDocumentIntegrityAttestation', 'issueDocumentDiffAttestation'
+            'proveFieldPredicate', 'proveClaims',
+            'proveFieldEquality', 'proveFieldMembership',
+            'proveDocumentIntegrity', 'proveDocumentDiff'
         ]) {
             expect(parents.has(kind), kind).toBe(true);
         }
     });
 
     test('proof-generating child kinds and caller-side builds run under the heavy cap of 4', async () => {
-        for (const kind of ['fieldEqualityProof', 'fieldMembershipProof', 'documentIntegrityProof', 'documentDiffProof', 'buildSponsorableTx']) {
+        for (const kind of ['fieldEqualityProof', 'fieldMembershipProof', 'documentIntegrityProof', 'documentDiffProof', 'buildSponsorable']) {
             __resetForTests();
             const releaseGates: Array<() => void> = [];
             const inFlight = { count: 0, peak: 0 };
@@ -1749,7 +1766,7 @@ describe('getJobById', () => {
 
     test('returns the row for a known id', async () => {
         const r = await startJob({
-            kind: 'sendNight', sessionId: 'sess-X',
+            kind: 'sendToken', sessionId: 'sess-X',
             request: { foo: 'bar' },
             work: async () => ({ ok: true })
         });
@@ -1853,7 +1870,7 @@ describe('supersedeQueuedJobs (prewarm boot hygiene)', () => {
         seed('old-pending', { status: 'pending' });
         seed('old-running', { status: 'running', leaseOwner: 'other-instance' });
         seed('done', { status: 'succeeded' });
-        seed('other-kind', { kind: 'sendNight', status: 'pending' });
+        seed('other-kind', { kind: 'sendToken', status: 'pending' });
         seed('other-session', { sessionId: 'sess-2', status: 'pending' });
         seed('successor', { status: 'pending' });
 
@@ -1974,12 +1991,12 @@ describe('supersedeQueuedJobs (prewarm boot hygiene)', () => {
 describe('recoverInterruptedJobs', () => {
     test('fails pre-effect work but sends external execution to reconciliation after restart', async () => {
         const now = new Date().toISOString();
-        rows.set('p1', { ID: 'p1', kind: 'sendNight', sessionId: 's', status: 'pending', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: null, finishedAt: null, createdAt: now, modifiedAt: now });
-        rows.set('r1', { ID: 'r1', kind: 'sendNight', sessionId: 's', status: 'running', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
-        rows.set('d1', { ID: 'd1', kind: 'sendNight', sessionId: 's', status: 'running', idempotencyKey: null, request: null, commandVersion: 1, command: '{"op":"sendNight"}', requestedBy: 'alice', result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
-        rows.set('e1', { ID: 'e1', kind: 'sendNight', sessionId: 's', status: 'external_execution', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
-        rows.set('s1', { ID: 's1', kind: 'sendNight', sessionId: 's', status: 'succeeded', idempotencyKey: null, request: null, result: '{"ok":true}', errorCode: null, errorMessage: null, startedAt: now, finishedAt: now, createdAt: now, modifiedAt: now });
-        rows.set('f1', { ID: 'f1', kind: 'sendNight', sessionId: 's', status: 'failed', idempotencyKey: null, request: null, result: null, errorCode: 'OldErr', errorMessage: 'old', startedAt: now, finishedAt: now, createdAt: now, modifiedAt: now });
+        rows.set('p1', { ID: 'p1', kind: 'sendToken', sessionId: 's', status: 'pending', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: null, finishedAt: null, createdAt: now, modifiedAt: now });
+        rows.set('r1', { ID: 'r1', kind: 'sendToken', sessionId: 's', status: 'running', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
+        rows.set('d1', { ID: 'd1', kind: 'sendToken', sessionId: 's', status: 'running', idempotencyKey: null, request: null, commandVersion: 1, command: '{"op":"sendToken"}', requestedBy: 'alice', result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
+        rows.set('e1', { ID: 'e1', kind: 'sendToken', sessionId: 's', status: 'external_execution', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
+        rows.set('s1', { ID: 's1', kind: 'sendToken', sessionId: 's', status: 'succeeded', idempotencyKey: null, request: null, result: '{"ok":true}', errorCode: null, errorMessage: null, startedAt: now, finishedAt: now, createdAt: now, modifiedAt: now });
+        rows.set('f1', { ID: 'f1', kind: 'sendToken', sessionId: 's', status: 'failed', idempotencyKey: null, request: null, result: null, errorCode: 'OldErr', errorMessage: 'old', startedAt: now, finishedAt: now, createdAt: now, modifiedAt: now });
 
         const count = await recoverInterruptedJobs();
         expect(count).toBe(4);
@@ -1992,9 +2009,9 @@ describe('recoverInterruptedJobs', () => {
         expect(rows.get('r1')!.status).toBe('failed');
         expect(rows.get('r1')!.errorCode).toBe('PROCESS_RESTART_BEFORE_EXECUTION');
         expect(rows.get('d1')).toMatchObject({ status: 'pending', leaseOwner: null, errorCode: null });
-        // external_execution WITHOUT a hash: every worker submit path announces
+        // external_execution WITHOUT an identifier: every worker submit path announces
         // its identifier and waits for the ack before sending, so nothing was
-        // broadcast; fails plainly (a hash would have parked it for reconciliation).
+        // broadcast; fails plainly (an identifier would have parked it for reconciliation).
         expect(rows.get('e1')!.status).toBe('failed');
         expect(rows.get('e1')!.errorCode).toBe('PROCESS_RESTART_BEFORE_BROADCAST');
 
@@ -2006,15 +2023,18 @@ describe('recoverInterruptedJobs', () => {
         expect(await recoverInterruptedJobs()).toBe(0);
     });
 
-    test('external_execution WITHOUT a hash fails plainly for every kind (nothing announced = nothing broadcast); with a hash it parks for reconciliation', async () => {
+    test('external_execution WITHOUT an identifier fails plainly for every kind (nothing announced = nothing broadcast); with one it parks for reconciliation', async () => {
         const now = new Date().toISOString();
-        rows.set('rej', { ID: 'rej', kind: 'sponsorUnboundTransaction', sessionId: 's', status: 'external_execution', txHash: null, commandVersion: 1, command: '{}', requestedBy: 'u', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
-        rows.set('amb', { ID: 'amb', kind: 'sponsorUnboundTransaction', sessionId: 's', status: 'external_execution', txHash: '00ambiguous', commandVersion: 1, command: '{}', requestedBy: 'u', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
-        rows.set('oth', { ID: 'oth', kind: 'sendNight', sessionId: 's', status: 'external_execution', txHash: null, idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
+        rows.set('rej', { ID: 'rej', kind: 'sponsorUnbound', sessionId: 's', status: 'external_execution', txId: null, commandVersion: 1, command: '{}', requestedBy: 'u', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
+        rows.set('amb', { ID: 'amb', kind: 'sponsorUnbound', sessionId: 's', status: 'external_execution', txId: '00ambiguous', commandVersion: 1, command: '{}', requestedBy: 'u', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
+        rows.set('oth', { ID: 'oth', kind: 'sendToken', sessionId: 's', status: 'external_execution', txId: null, idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
+        // An older job whose ledger hash the start moved from txId to txHash was sent.
+        rows.set('hash', { ID: 'hash', kind: 'submitContractCall', sessionId: 's', status: 'external_execution', txId: null, txHash: 'ab'.repeat(32), commandVersion: 1, command: '{}', requestedBy: 'u', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: now, finishedAt: null, createdAt: now, modifiedAt: now });
         await recoverInterruptedJobs();
+        expect(rows.get('hash')).toMatchObject({ status: 'reconciliation_required', errorCode: 'PROCESS_RESTART_RECONCILE' });
         expect(rows.get('rej')!.status).toBe('failed');
         expect(rows.get('rej')!.errorCode).toBe('PROCESS_RESTART_BEFORE_BROADCAST');
-        expect(rows.get('amb')!.status).toBe('reconciliation_required'); // has a hash: may be on-chain
+        expect(rows.get('amb')!.status).toBe('reconciliation_required'); // has an identifier: may be on-chain
         expect(rows.get('amb')!.errorCode).toBe('PROCESS_RESTART_RECONCILE');
         expect(rows.get('oth')!.status).toBe('failed'); // bound kinds announce too
         expect(rows.get('oth')!.errorCode).toBe('PROCESS_RESTART_BEFORE_BROADCAST');
@@ -2033,7 +2053,7 @@ describe('recoverInterruptedJobs', () => {
         rows.set('c1', { ID: 'c1', kind: 'connectWalletForSigning', status: 'running', commandVersion: 1, command: '{"op":"prewarm"}', startedAt: now, leaseOwner: 'inst-1', ...base } as any);
         rows.set('c2', { ID: 'c2', kind: 'connectWalletForSigning', status: 'pending', commandVersion: 1, command: '{"op":"prewarm"}', startedAt: null, ...base } as any);
         // A funds-moving command with the same shape still returns to the queue.
-        rows.set('d1', { ID: 'd1', kind: 'sendNight', status: 'running', commandVersion: 1, command: '{"op":"sendNight"}', startedAt: now, ...base } as any);
+        rows.set('d1', { ID: 'd1', kind: 'sendToken', status: 'running', commandVersion: 1, command: '{"op":"sendToken"}', startedAt: now, ...base } as any);
 
         expect(await recoverInterruptedJobs()).toBe(3);
 
@@ -2058,14 +2078,14 @@ describe('recoverInterruptedJobs', () => {
             idempotencyKey: null, request: null, result: null,
             errorCode: null, errorMessage: null, startedAt: null, finishedAt: null,
             createdAt: now, modifiedAt: now, requestedBy: 'alice',
-            commandVersion: 1, command: '{"op":"sendNight"}'
+            commandVersion: 1, command: '{"op":"sendToken"}'
         };
-        rows.set('p1', { ID: 'p1', kind: 'sendNight', status: 'pending', sessionId: 'dead-1', leaseOwner: 'inst-0', ...base } as any);
+        rows.set('p1', { ID: 'p1', kind: 'sendToken', status: 'pending', sessionId: 'dead-1', leaseOwner: 'inst-0', ...base } as any);
         rows.set('p2', { ID: 'p2', kind: 'registerForDustGeneration', status: 'pending', sessionId: 'dead-2', ...base } as any);
         // Exempt (fee-sponsor) session id is not passed in: replay stays queued.
-        rows.set('p3', { ID: 'p3', kind: 'sendNight', status: 'pending', sessionId: 'sponsor-1', ...base } as any);
+        rows.set('p3', { ID: 'p3', kind: 'sendToken', status: 'pending', sessionId: 'sponsor-1', ...base } as any);
         // Post-effect states resolve from chain evidence, never from the session.
-        rows.set('p4', { ID: 'p4', kind: 'sendNight', status: 'reconciliation_required', sessionId: 'dead-1', ...base } as any);
+        rows.set('p4', { ID: 'p4', kind: 'sendToken', status: 'reconciliation_required', sessionId: 'dead-1', ...base } as any);
 
         expect(await dropPendingJobsForClosedSessions(['dead-1', 'dead-2'])).toBe(2);
 
@@ -2085,7 +2105,7 @@ describe('recoverInterruptedJobs', () => {
     test('survives transient lock contention on the recovery UPDATE', async () => {
         __setLockContentionBackoffForTests([0, 0, 0, 0, 0]);
         const now = new Date().toISOString();
-        rows.set('p1', { ID: 'p1', kind: 'sendNight', sessionId: 's', status: 'pending', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: null, finishedAt: null, createdAt: now, modifiedAt: now });
+        rows.set('p1', { ID: 'p1', kind: 'sendToken', sessionId: 's', status: 'pending', idempotencyKey: null, request: null, result: null, errorCode: null, errorMessage: null, startedAt: null, finishedAt: null, createdAt: now, modifiedAt: now });
 
         lockInjector.failUpdates = 2;
         lockInjector.matchStatus = 'failed';
@@ -2114,7 +2134,7 @@ describe('status-write contention hardening', () => {
         // The admission insert is retried like a status write.
         lockInjector.failInserts = 2;
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-adm',
             request:   {},
             work:      async () => ({ txId: 'tx-after-locked-insert' })
@@ -2132,12 +2152,12 @@ describe('status-write contention hardening', () => {
         lockInjector.failInserts = 99;
         try {
             await expect(startJob({
-                kind:      'sponsorUnboundTransaction',
+                kind:      'sponsorUnbound',
                 sessionId: 'sess-busy',
                 request:   {},
                 work:      async () => ({ txId: 'never-reached' })
             })).rejects.toMatchObject({
-                name: 'JobAdmissionBusyError', httpStatus: 503, status: 503,
+                name: 'JobAdmissionBusyError', status: 503,
                 // Wire contract of a busy reject: stable code, Retry-After hint, no production
                 // sanitisation (CAP strips every 5xx message under NODE_ENV=production).
                 code: 'JOB_ADMISSION_BUSY', retryAfterSeconds: 2, $sanitize: false
@@ -2152,7 +2172,7 @@ describe('status-write contention hardening', () => {
         lockInjector.matchStatus = 'succeeded';
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   {},
             work:      async () => ({ txId: 'tx-locked-then-fine' })
@@ -2170,7 +2190,7 @@ describe('status-write contention hardening', () => {
         lockInjector.matchStatus = 'failed';
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   {},
             work:      async () => { throw new Error('Transaction pool full: 1016 Immediately Dropped'); }
@@ -2210,7 +2230,7 @@ describe('status-write contention hardening', () => {
         lockInjector.matchStatus = 'succeeded';
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   {},
             work:      async () => ({ txId: 'tx-landed-on-chain' })
@@ -2229,11 +2249,11 @@ describe('status-write contention hardening', () => {
         lockInjector.matchStatus = 'succeeded';
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   {},
             work:      async () => {
-                for (const running of rows.values()) if (running.status === 'running') running.txHash = '00announced';
+                for (const running of rows.values()) if (running.status === 'running') running.txId = '00announced';
                 return { txId: 'tx-landed-on-chain' };
             }
         });
@@ -2253,7 +2273,7 @@ describe('status-write contention hardening', () => {
         lockInjector.matchStatus = 'failed';
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   {},
             work:      async () => { throw new Error('boom'); }
@@ -2279,7 +2299,7 @@ describe('status-write contention hardening', () => {
         });
 
         const ret = await startJob({
-            kind:      'sendNight',
+            kind:      'sendToken',
             sessionId: 'sess-1',
             request:   {},
             work:      async () => ({ ok: true })
@@ -2294,5 +2314,93 @@ describe('status-write contention hardening', () => {
         expect(row.errorCode).toBe('RESULT_PERSIST_FAILED');
 
         runMock.mockImplementation(original);
+    });
+});
+
+describe('startJob: commands it refuses to store', () => {
+    test('a command needs a positive version, an owner and a registered processor', async () => {
+        registerBackgroundJobProcessor('storedKind', 1, LIGHT_KIND, async () => ({ ok: true }));
+        const base = { kind: 'storedKind', sessionId: 'sess-1', requestedBy: 'alice', request: {}, command: { op: 'x' } };
+        await expect(startJob({ ...base, commandVersion: 0 })).rejects.toThrow(/commandVersion must be a positive integer/);
+        await expect(startJob({ ...base, commandVersion: 1.5 })).rejects.toThrow(/commandVersion must be a positive integer/);
+        await expect(startJob({ ...base, commandVersion: 1, requestedBy: undefined })).rejects.toThrow(/requestedBy is required/);
+        await expect(startJob({ ...base, commandVersion: 2 })).rejects.toThrow(/no command processor registered for 'storedKind' v2/);
+        expect(rows.size).toBe(0);
+    });
+
+    test('a command that names a contract the registry does not know is not stored', async () => {
+        registerBackgroundJobProcessor('contractKind', 1, LIGHT_KIND, async () => ({ ok: true }));
+        await expect(startJob({
+            kind: 'contractKind', sessionId: 'sess-1', requestedBy: 'alice', request: {},
+            commandVersion: 1, command: { op: 'call', contractName: 'no-such-contract' }
+        })).rejects.toThrow(/no-such-contract/);
+        expect(rows.size).toBe(0);
+    });
+
+    test('a command that already carries a digest keeps it', async () => {
+        registerBackgroundJobProcessor('pinnedKind', 1, LIGHT_KIND, async () => ({ ok: true }));
+        const job = await startJob({
+            kind: 'pinnedKind', sessionId: 'sess-1', requestedBy: 'alice', request: {},
+            commandVersion: 1, command: { op: 'call', contractName: 'no-such-contract', artifactDigest: 'd'.repeat(64) }
+        });
+        expect(JSON.parse(String(rows.get(job.jobId)?.command)).artifactDigest).toBe('d'.repeat(64));
+    });
+});
+
+type StepError = Error & { classification?: { code: string; retryable: boolean }; step?: string };
+
+describe('workflow steps that do not succeed', () => {
+    const parentOf = (id: string) => ({ ID: id, kind: 'workflow', sessionId: 'sess-1', requestedBy: 'alice', commandVersion: 1 }) as any;
+
+    test('a parent without a session or an owner cannot start a step', async () => {
+        await expect(runChildCommand({
+            parent: { ...parentOf('p-anon'), requestedBy: null }, kind: 'childStep', step: 'one', commandVersion: 1, request: {}, command: {}
+        })).rejects.toThrow(/lacks execution identity/);
+    });
+
+    test('a failed step fails the parent with CHILD_FAILED, and a second run of the parent does not run the step again', async () => {
+        const processor = vi.fn(async () => { throw new Error('the node refused the step'); });
+        registerBackgroundJobProcessor('failingStep', 1, LIGHT_KIND, processor);
+        const args = { parent: parentOf('p-failed'), kind: 'failingStep', step: 'one', commandVersion: 1, request: {}, command: { op: 'submit' } };
+
+        const first = runChildCommand(args).catch((e: unknown) => e);
+        await flushSpawn();
+        const err = await first as StepError;
+        expect(err.classification).toMatchObject({ code: 'CHILD_FAILED', retryable: false });
+        expect(err.message).toMatch(/one/);
+
+        const again = await runChildCommand(args).catch((e: unknown) => e) as StepError;
+        expect(again.classification).toMatchObject({ code: 'CHILD_FAILED' });
+        expect(processor).toHaveBeenCalledTimes(1);
+        expect([...rows.values()].filter(r => r.parentJobId === 'p-failed')).toHaveLength(1);
+    });
+
+    test('a step parked for reconciliation parks the parent too', async () => {
+        registerBackgroundJobProcessor('parkedStep', 1, LIGHT_KIND, async () => {
+            throw new WorkflowReconciliationRequiredError('sent, outcome unknown');
+        });
+        const pending = runChildCommand({ parent: parentOf('p-parked'), kind: 'parkedStep', step: 'send', commandVersion: 1, request: {}, command: { op: 'submit' } }).catch((e: unknown) => e);
+        await flushSpawn();
+        const err = await pending as StepError;
+        expect(err).toBeInstanceOf(WorkflowReconciliationRequiredError);
+        expect(err.name).toBe('ChildReconciliationRequiredError');
+        expect(err.step).toBe('send');
+    });
+
+    test('a step still running at the deadline parks the parent instead of failing it', async () => {
+        let release: () => void = () => undefined;
+        registerBackgroundJobProcessor('slowStep', 1, LIGHT_KIND, () => new Promise(resolve => { release = () => resolve({ ok: true }); }));
+        process.env.NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS = '1';
+        try {
+            const pending = runChildCommand({ parent: parentOf('p-slow'), kind: 'slowStep', step: 'wait', commandVersion: 1, request: {}, command: { op: 'submit' } }).catch((e: unknown) => e);
+            await flushSpawn();
+            const err = await pending as StepError;
+            expect(err).toBeInstanceOf(WorkflowReconciliationRequiredError);
+            expect(err.message).toMatch(/Timed out waiting for child job .* at workflow step 'wait'/);
+        } finally {
+            delete process.env.NIGHTGATE_CHILD_JOB_WAIT_TIMEOUT_MS;
+            release();
+            await flushSpawn();
+        }
     });
 });

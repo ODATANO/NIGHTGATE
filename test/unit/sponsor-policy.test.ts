@@ -152,36 +152,37 @@ describe('effectiveSponsorPolicy', () => {
     it('two non-empty lists sharing nothing refuse with 403 (a grant can never widen the floor)', () => {
         expect(() => effectiveSponsorPolicy(floor, { allowedContracts: ['C'] })).toThrow(SponsorPolicyEmptyError);
         try { effectiveSponsorPolicy(floor, { allowedCircuits: ['sendAllMyMoney'] }); }
-        catch (e: any) { expect(e.httpStatus).toBe(403); expect(e.code).toBe('SPONSOR_POLICY_EMPTY'); expect(e.message).toMatch(/allowedCircuits/); }
+        catch (e: any) { expect(e.status).toBe(403); expect(e.code).toBe('SPONSOR_POLICY_EMPTY'); expect(e.message).toMatch(/allowedCircuits/); }
     });
 });
 
-describe('allowDeploy: floor AND grant, never implied', () => {
-    const floorOpen = { allowedContracts: [], allowedCircuits: [], allowDeploy: true };
-    const floorClosed = { allowedContracts: [], allowedCircuits: [] };
+describe('allowDeploy: the grant decides, the server has no switch', () => {
+    const floor = { allowedContracts: [], allowedCircuits: [] };
 
-    it('is off unless the floor opens it', () => {
-        expect(effectiveSponsorPolicy(floorClosed).allowDeploy).toBe(false);
-        expect(effectiveSponsorPolicy(floorClosed, { allowDeploy: true }).allowDeploy).toBe(false);
+    it('a caller without a token may deploy: that is the operator', () => {
+        expect(effectiveSponsorPolicy(floor).allowDeploy).toBe(true);
     });
-    it('a plain caller inherits the open floor; a token caller needs it on the grant too', () => {
-        expect(effectiveSponsorPolicy(floorOpen).allowDeploy).toBe(true);
-        expect(effectiveSponsorPolicy(floorOpen, { allowedContracts: ['A'] }).allowDeploy).toBe(false);
-        expect(effectiveSponsorPolicy(floorOpen, { allowDeploy: true }).allowDeploy).toBe(true);
+    it('a token caller needs it on its grant', () => {
+        expect(effectiveSponsorPolicy(floor, { allowedContracts: ['A'] }).allowDeploy).toBe(false);
+        expect(effectiveSponsorPolicy(floor, { allowDeploy: false }).allowDeploy).toBe(false);
+        expect(effectiveSponsorPolicy(floor, { allowDeploy: true }).allowDeploy).toBe(true);
     });
-    it('reads the floor from env and from the policy file', () => {
-        process.env.NIGHTGATE_SPONSOR_ALLOW_DEPLOY = 'true';
-        expect(getGlobalSponsorPolicy().allowDeploy).toBe(true);
+    it('the former switch changes nothing', () => {
         process.env.NIGHTGATE_SPONSOR_ALLOW_DEPLOY = 'no';
-        expect(getGlobalSponsorPolicy().allowDeploy).toBe(false);
+        const policy = getGlobalSponsorPolicy();
+        expect(policy).not.toHaveProperty('allowDeploy');
+        expect(effectiveSponsorPolicy(policy, { allowDeploy: true }).allowDeploy).toBe(true);
+        expect(effectiveSponsorPolicy(policy).allowDeploy).toBe(true);
         delete process.env.NIGHTGATE_SPONSOR_ALLOW_DEPLOY;
+    });
+    it('a policy file that still names allowDeploy is read, and the key is ignored', () => {
         const file = path.join(tmpDir, 'p.json');
-        fs.writeFileSync(file, JSON.stringify({ allowedContracts: [], allowDeploy: true }));
+        fs.writeFileSync(file, JSON.stringify({ allowedContracts: ['X'], allowDeploy: false }));
         process.env.NIGHTGATE_SPONSOR_POLICY_FILE = file;
-        expect(getGlobalSponsorPolicy().allowDeploy).toBe(true);
-        fs.writeFileSync(file, JSON.stringify({ allowedContracts: [], allowDeploy: 'yes' }));
-        // Invalid edit: the last good policy (deploy open) stays in force.
-        expect(getGlobalSponsorPolicy().allowDeploy).toBe(true);
+        const policy = getGlobalSponsorPolicy();
+        expect(policy.allowedContracts).toEqual(['X']);
+        expect(policy).not.toHaveProperty('allowDeploy');
+        expect(effectiveSponsorPolicy(policy, { allowDeploy: true }).allowDeploy).toBe(true);
     });
 });
 
@@ -375,7 +376,7 @@ describe('describeGlobalSponsorPolicy', () => {
         process.env.NIGHTGATE_SPONSOR_ALLOWED_CONTRACTS = 'A,B';
         expect(describeGlobalSponsorPolicy()).toMatchObject({
             source: 'env', path: null, loadedAt: null, ignoredEnv: [], floorError: null,
-            floor: { allowedContracts: ['A', 'B'], allowedCircuits: [], allowedTokenTypes: [], allowDeploy: false, allowContractMints: false }
+            floor: { allowedContracts: ['A', 'B'], allowedCircuits: [], allowedTokenTypes: [], allowContractMints: false }
         });
     });
 

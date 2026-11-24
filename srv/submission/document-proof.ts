@@ -126,7 +126,7 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
             ...(f.kind != null ? { kind: f.kind } : {}),
             ...(f.scale != null ? { scale: f.scale } : {})
         }));
-        const slotWidth = vaultDims(data.compiledArtifactRef).width;
+        const slotWidth = vaultDims(data.contractName).width;
         if (specs.length > slotWidth) {
             return req.reject(400, `at most ${slotWidth} proof fields (depth-${Math.log2(slotWidth)} tree)`);
         }
@@ -149,7 +149,7 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
             }
         }
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
         let pure: PureCircuits;
         try {
             pure = await loadPure(compiledRef);
@@ -210,7 +210,7 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
             return req.reject(400, 'pass at most one of value / valueDigest');
         }
 
-        const compiledRef = vaultRef(data.compiledArtifactRef);
+        const compiledRef = vaultRef(data.contractName);
         let pure: PureCircuits;
         try {
             pure = await loadPure(compiledRef);
@@ -290,13 +290,13 @@ export function registerDocumentProofHandlers(srv: cds.ApplicationService, deps:
             const anchorRequest = {
                 event: 'anchorDocument',
                 data: {
-                    sha256: payloadHash,
+                    payloadHash,
                     contentType: AGENT_OUTPUT_CONTENT_TYPE,
                     storageRef: data.storageRef?.length ? data.storageRef : `agent-output://${data.agentId}`,
                     metadata: envelopeJson,
                     sessionId: data.sessionId,
                     contractAddress: data.contractAddress,
-                    compiledArtifactRef: data.compiledArtifactRef,
+                    contractName: data.contractName,
                     idempotencyKey: data.idempotencyKey,
                     sponsorSessionId: data.sponsorSessionId
                 },

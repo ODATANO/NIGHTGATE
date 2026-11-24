@@ -1078,7 +1078,7 @@ async function zeroEntry(entry: FacadeEntry, sessionId: string): Promise<void> {
 export async function cpuProfile({ seconds, dir }: { seconds?: number; dir?: string }) {
     const p = await profileCurrentThread(seconds ?? 20, { dir, filePrefix: 'worker' });
     log('info', `cpuProfile: ${p.seconds}s sampled, idle ${p.idlePercent}%, gc ${p.gcPercent}% (${p.gc.count} collections, ${p.gc.totalMs}ms), wasm ${p.wasmPercent}%, heap ${p.heapAfter.usedMb}/${p.heapAfter.limitMb} MB, external ${p.heapAfter.externalMb} MB, top: ${p.topFunctions.slice(0, 3).map((f: { label: string; percent: number }) => `${f.label.split('  ')[0]} ${f.percent}%`).join(', ')}`);
-    return { thread: 'worker', facadeCount: facades.size, ...p, gc: { ...p.gc, byKind: JSON.stringify(p.gc.byKind) } };
+    return { thread: 'worker', facadeCount: facades.size, ...p };
 }
 
 export async function waitForSyncedState({ sessionId, timeoutMs, stallMs }: { sessionId: string; timeoutMs?: number; stallMs?: number }) {

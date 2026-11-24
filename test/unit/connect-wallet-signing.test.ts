@@ -135,7 +135,6 @@ const VALID_SEED = 'a'.repeat(128); // 64-byte BIP39 seed (128 hex chars)
 
 function seedSession(db: ReturnType<typeof makeFakeDb>, overrides: any = {}) {
     db.tables['midnight.WalletSessions'].push({
-        ID: 'sess-uuid',
         sessionId: 'sess-1',
         userId: TEST_USER_ID, // must match req.user.id for the user-scoped load
         isActive: true,
@@ -276,8 +275,8 @@ describe('connectWalletForSigning: state transitions', () => {
         expect(result).toEqual({
             sessionId:      'sess-1',
             signingEnabled: true,
-            prewarmJobId:   'job-prewarm-test',
-            prewarmStatus:  'pending'
+            jobId:   'job-prewarm-test',
+            status:  'pending'
         });
         const row = db.tables['midnight.WalletSessions'][0];
         expect(row.encryptedSeedKey).toBeDefined();
@@ -309,8 +308,8 @@ describe('connectWalletForSigning: state transitions', () => {
         expect(result).toEqual({
             sessionId:      'sess-1',
             signingEnabled: true,
-            prewarmJobId:   null,
-            prewarmStatus:  null
+            jobId:   null,
+            status:  null
         });
         // Seed still encrypted + persisted; only the sync job was skipped.
         const row = db.tables['midnight.WalletSessions'][0];
@@ -346,8 +345,8 @@ describe('connectWalletForSigning: state transitions', () => {
             expect(result).toEqual({
                 sessionId:      'sess-1',
                 signingEnabled: true,
-                prewarmJobId:   null,
-                prewarmStatus:  null
+                jobId:   null,
+                status:  null
             });
         } finally {
             warn.mockRestore();
@@ -361,7 +360,7 @@ describe('connectWalletForSigning: state transitions', () => {
 
         const req = makeReq({ sessionId: 'missing', seedHex: VALID_SEED });
         await srv.handlers['connectWalletForSigning'](req);
-        expect(req.reject).toHaveBeenCalledWith(404, expect.stringMatching(/not found/i));
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'SESSION_NOT_FOUND' }));
     });
 
     test('410 when session is expired', async () => {
@@ -386,7 +385,7 @@ describe('connectWalletForSigning: state transitions', () => {
         req.user = { id: 'attacker' };
         await srv.handlers['connectWalletForSigning'](req);
         // Non-leaking: reads back as not-found rather than acting on it.
-        expect(req.reject).toHaveBeenCalledWith(404, expect.stringMatching(/not found/i));
+        expect(req.reject).toHaveBeenCalledWith(expect.objectContaining({ status: 404, code: 'SESSION_NOT_FOUND' }));
     });
 
     test('401 for an unauthenticated caller', async () => {

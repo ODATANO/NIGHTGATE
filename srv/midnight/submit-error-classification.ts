@@ -77,12 +77,12 @@ export function classifySubmitFailure(err: unknown, sent: { announced?: boolean 
     const haystack = `${message} ${classificationHaystack(err)}`;
 
     // The SDK may pass on only the message, so the message text is also checked.
-    const causality = chain.find((e) => (e as ErrorFields)?.code === 'BatchCausalityViolation' || nameOf(e) === 'BatchCausalityError') as ErrorFields;
+    const causality = chain.find((e) => (e as ErrorFields)?.code === 'BATCH_CAUSALITY_VIOLATION' || nameOf(e) === 'BatchCausalityError') as ErrorFields;
     if (causality || /violates the ledger's causality constraint/.test(haystack)) {
         const own = Array.isArray(causality?.calls) ? causality.calls as BatchCallStageInfo[] : undefined;
         return { code: 'causality', retryable: false, calls: own?.length ? own : parseBatchCallStages(haystack) };
     }
-    if (chain.some((e) => (e as ErrorFields)?.code === 'BatchGasBudgetExceeded') || /runs out of gas on the ledger/.test(haystack)) {
+    if (chain.some((e) => (e as ErrorFields)?.code === 'BATCH_GAS_BUDGET_EXCEEDED') || /runs out of gas on the ledger/.test(haystack)) {
         return { code: 'gas-budget', retryable: false };
     }
     // An earlier send of the same transaction has no known outcome, so it may still land.

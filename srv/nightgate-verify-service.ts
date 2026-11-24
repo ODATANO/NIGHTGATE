@@ -2,12 +2,12 @@
 // It serves the same verify handlers as the main service, behind a feature flag and a rate limit.
 
 import cds from '@sap/cds';
-import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { registerVerifyStateHandlers } from './submission/verify-state';
 import { checkRateClass } from './utils/rate-classes';
 import { configFlag } from './utils/config';
 import { normalizeHttpError } from './utils/http-errors';
 import { attachHexInput } from './utils/hex-input';
+import { attachInt64Results } from './utils/numbers';
 import type { Request } from '@sap/cds';
 
 /** Rejects with 404 while the feature is off and with 429 when the caller is over its rate limit.
@@ -24,7 +24,7 @@ export default class NightgateVerifyService extends cds.ApplicationService {
     async init(): Promise<void> {
         this.on('error', normalizeHttpError);
         attachHexInput(this);
-        await ensureNightgateModelLoaded();
+        attachInt64Results(this);
         registerVerifyStateHandlers(this, { gate: publicVerifyGate });
         await super.init();
     }

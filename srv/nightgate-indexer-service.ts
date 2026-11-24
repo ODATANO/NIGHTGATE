@@ -3,13 +3,13 @@ import { errorMessage } from './utils/errors';
 import { noteCrawlerRunning } from './utils/runtime-state';
 const { SELECT, UPDATE } = cds.ql;
 
-import { ensureNightgateModelLoaded } from './utils/cds-model';
 import { resolveNightgateRuntimeConfig, getNightgateConfig, crawlerStartConfig } from './utils/nightgate-config';
 import { ensureSyncStateSingleton } from './utils/sync-state';
 import { isCrawlerRunning, startCrawler, stopCrawler } from './crawler';
 import { pendingReindexHeight, reindexInProgress, startReindex, type ReindexCrawlerControl, type ReindexOutcome } from './crawler/reindex';
 import { configMs } from './utils/config';
 import { SyncState, ReorgLog } from '#cds-models/midnight';
+import { SyncState as PublicSyncState } from '#cds-models/NightgateIndexerService';
 import {
     buildHealth,
     buildLiveness,
@@ -22,9 +22,11 @@ import {
 import { checkRateClass } from './utils/rate-classes';
 import { normalizeHttpError } from './utils/http-errors';
 import { attachHexInput } from './utils/hex-input';
+import { attachInt64Results } from './utils/numbers';
+import { attachReadLimits } from './utils/runtime-gate';
 import { buildBoardStatus } from './submission/board-status';
 import { receiptPublicKey } from './submission/receipts';
-import { getBoardStatus, getReadiness, getReceiptKey, getReorgHistory, getRuntimeInfo, reindexFromHeight, resumeCrawler } from '#cds-models/NightgateIndexerService';
+import { getBoardStatus, getReadiness, getReceiptKey, getReorgHistory, getRuntimeInfo, getWorkerStatus, reindexFromHeight, resumeCrawler } from '#cds-models/NightgateIndexerService';
 import type { Request } from '@sap/cds';
 
 const log = cds.log('nightgate:indexer');
@@ -43,8 +45,9 @@ export default class NightgateIndexerService extends cds.ApplicationService {
 
     async init(): Promise<void> {
         this.on('error', normalizeHttpError);
+        attachReadLimits(this);
         attachHexInput(this);
-        await ensureNightgateModelLoaded();
+        attachInt64Results(this);
         this.db = await cds.connect.to('db');
 
         try {
@@ -53,9 +56,11 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             log.warn('SyncState init skipped:', (err as Error).message);
         }
 
-        this.on('getSyncStatus', async () => {
+        this.on('getSyncStatus', async (req: Request) => {
+            if (!checkRateClass('read', 'read', req)) return;
+            // Read through the service's view, which leaves out the markers of the background passes.
             const syncState = await this.db.run(
-                SELECT.one.from(SyncState).where({ ID: 'SINGLETON' })
+                SELECT.one.from(PublicSyncState).where({ ID: 'SINGLETON' })
             );
             return syncState || {
                 ID: 'SINGLETON',
@@ -66,11 +71,13 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             };
         });
 
-        this.on('getHealth', async () => buildHealth(this.db));
+        this.on('getHealth', async (req: Request) => {
+            if (!checkRateClass('read', 'read', req)) return;
+            return buildHealth(this.db);
+        });
 
         this.on(getReorgHistory, async (req) => {
-            const { limit } = req.data;
-            const effectiveLimit = Math.min(Math.max(limit || 10, 1), 100);
+            const effectiveLimit = req.data.limit ?? 10;
             return this.db.run(
                 SELECT.from(ReorgLog)
                     .orderBy('detectedAt desc')
@@ -84,8 +91,7 @@ export default class NightgateIndexerService extends cds.ApplicationService {
             if (!checkRateClass('read', 'read', req)) return;
             return buildRuntimeInfo();
         });
-        this.on('getWorkerStatus', async (req: Request) =>
-            buildWorkerStatus(Boolean(req.user?.is?.('admin'))));
+        this.on(getWorkerStatus, async () => buildWorkerStatus());
 
         this.on(getBoardStatus, async (req) => {
             if (!checkRateClass('read', 'read', req)) return;
