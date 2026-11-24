@@ -1243,6 +1243,10 @@ describe('owner-scoped entity reads', () => {
     it('rows without an owner get the user and session of the job that wrote them, and keep their change time', async () => {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const { backfillRowOwners } = require('../../srv/submission/job-store');
+        // The required job store holds its own key ring; without a set key each copy would draw its own random one.
+        const keyBefore = process.env.ENCRYPTION_KEY;
+        process.env.ENCRYPTION_KEY = '7'.repeat(64);
+        onTestFinished(() => { if (keyBefore === undefined) delete process.env.ENCRYPTION_KEY; else process.env.ENCRYPTION_KEY = keyBefore; });
         const old = '2026-01-10T10:00:00.000Z';
         const id = (n: number) => `b0000000-0000-4000-8000-00000000000${n}`;
         await db.run(cds.ql.DELETE.from(PREDICATES));
