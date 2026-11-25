@@ -303,7 +303,7 @@ export class IndexerSupplement {
                 const match = matched[i];
                 const state = digestOfBase64(match.state);
                 const zswapState = digestOfBase64(match.zswapState);
-                const keep = keepsStateHistory(this.config.contractState ?? DEFAULT_CONTRACT_STATE_POLICY, action.contractAddress);
+                const keep = keepsStateHistory(this.config.contractState ?? DEFAULT_CONTRACT_STATE_POLICY, action.contractAddress, action.actionType);
                 await dbTx.run(UPDATE.entity(ContractActions)
                     .set({
                         state: keep && match.state != null ? capBinaryInput(match.state) : null,

@@ -1217,28 +1217,29 @@ describe('contract state storage', () => {
         );
     }
 
-    /** One block at `height` whose transaction carries one CALL per address. */
-    async function seedCalls(height: number, addresses: string[]): Promise<string[]> {
+    /** One block at `height` whose transaction carries one action per address, a CALL unless named. */
+    async function seedCalls(height: number, addresses: Array<string | { address: string; actionType: string }>): Promise<string[]> {
         const blockId = await seedBlock(height, `0xcs${height}`);
         const txId = await seedTransaction(blockId, { txHash: `tx${height}` });
         const ids: string[] = [];
-        for (const [i, address] of addresses.entries()) {
+        for (const [i, entry] of addresses.entries()) {
+            const { address, actionType } = typeof entry === 'string' ? { address: entry, actionType: 'CALL' } : entry;
             const ID = cds.utils.uuid();
             ids.push(ID);
             await db.run(cds.ql.INSERT.into(CONTRACT_ACTIONS).entries({
-                ID, ...(await inTransaction(db, txId)), actionIndex: i, contractAddress: address, actionType: 'CALL', transaction_ID: txId
+                ID, ...(await inTransaction(db, txId)), actionIndex: i, contractAddress: address, actionType, transaction_ID: txId
             }));
         }
         return ids;
     }
 
-    function answerFor(height: number, calls: Array<{ address: string; state: string }>): any {
+    function answerFor(height: number, calls: Array<{ address: string; state: string; actionType?: string }>): any {
         return {
             height, ledgerParameters: null,
             transactions: [{
                 txHash: `tx${height}`, fee: null, segments: [],
                 contractActions: calls.map(c => ({
-                    actionType: 'CALL', address: c.address, state: b64(c.state), zswapState: null, balances: []
+                    actionType: c.actionType ?? 'CALL', address: c.address, state: b64(c.state), zswapState: null, balances: []
                 })),
                 zswapEvents: [], dustEvents: [], dustRegisteredOutputs: []
             }]
@@ -1252,10 +1253,10 @@ describe('contract state storage', () => {
         return out;
     }
 
-    async function supplyBlocks(blocks: Record<number, Array<{ address: string; state: string }>>, policy?: ContractStatePolicy): Promise<void> {
+    async function supplyBlocks(blocks: Record<number, Array<{ address: string; state: string; actionType?: string }>>, policy?: ContractStatePolicy): Promise<void> {
         const answers: Record<number, any> = {};
         for (const [height, calls] of Object.entries(blocks)) {
-            await seedCalls(Number(height), calls.map(c => c.address));
+            await seedCalls(Number(height), calls.map(c => ({ address: c.address, actionType: c.actionType ?? 'CALL' })));
             answers[Number(height)] = answerFor(Number(height), calls);
         }
         await setSync({ lastIndexedHeight: 20, lastSupplementedHeight: null });
@@ -1276,6 +1277,11 @@ describe('contract state storage', () => {
         );
         expect(await storedStates()).toEqual({ [CONTRACT]: 'kept', [OTHER]: undefined });
         expect(await db.run(cds.ql.SELECT.from(CONTRACT_STATES))).toHaveLength(2);
+    });
+
+    it('keeps the full state of a deploy under history `none`', async () => {
+        await supplyBlocks({ 10: [{ address: CONTRACT, state: 'deployed', actionType: 'DEPLOY' }, { address: OTHER, state: 'called' }] });
+        expect(await storedStates()).toEqual({ [CONTRACT]: 'deployed', [OTHER]: undefined });
     });
 
     it('does not let an older block replace a newer current state', async () => {
@@ -1336,6 +1342,22 @@ describe('contract state storage', () => {
 
             fetchState.mockResolvedValueOnce(fetched(b64('tampered')));
             expect((await stateAt(db, CONTRACT, 11, fetchState))?.verified).toBe(false);
+        });
+
+        it('stores a deploy state the database lacks once it matches the stored hash, then serves it from there', async () => {
+            await supplyBlocks({ 10: [{ address: CONTRACT, state: 's10', actionType: 'DEPLOY' }], 12: [{ address: CONTRACT, state: 's12' }] });
+            await storeParams(10, 12);
+            await db.run(cds.ql.UPDATE.entity(CONTRACT_ACTIONS).set({ state: null }).where({ blockHeight: 10 }));
+            const fetchState = vi.fn(async () => fetched(b64('tampered'), 10));
+            expect((await stateAt(db, CONTRACT, 10, fetchState))?.verified).toBe(false);
+            expect(await storedStates()).toEqual({ [CONTRACT]: undefined });
+
+            fetchState.mockResolvedValueOnce(fetched(b64('s10'), 10));
+            expect(await stateAt(db, CONTRACT, 10, fetchState)).toEqual(expect.objectContaining({ source: 'indexer', verified: true }));
+            const again = await stateAt(db, CONTRACT, 10, fetchState);
+            expect(again).toEqual(expect.objectContaining({ source: 'history', height: 10 }));
+            expect(text(again!.state)).toBe('s10');
+            expect(fetchState).toHaveBeenCalledTimes(2);
         });
 
         it('serves a kept per-action state from the database', async () => {
@@ -1539,6 +1561,18 @@ describe('contract state storage', () => {
             // Idempotent: nothing left to move.
             expect(await compactStoredContractState(db, { policy: contractStatePolicy('none') }))
                 .toEqual({ contracts: 0, currentStatesWritten: 0, actionsHashed: 0, statesCleared: 0 });
+        });
+
+        it('keeps the state of a deploy in every mode', async () => {
+            const [deploy] = await seedCalls(10, [{ address: CONTRACT, actionType: 'DEPLOY' }]);
+            const [call] = await seedCalls(12, [CONTRACT]);
+            for (const [ID, state] of [[deploy, 'd'], [call, 'c']]) {
+                await db.run(cds.ql.UPDATE.entity(CONTRACT_ACTIONS).set({ state: b64(state) }).where({ ID }));
+            }
+            const report = await compactStoredContractState(db, { policy: contractStatePolicy('none') });
+            expect(report.statesCleared).toBe(1);
+            const kept = await db.run(cds.ql.SELECT.from(CONTRACT_ACTIONS).columns('ID', 'state').where({ state: { '!=': null } }));
+            expect(kept.map((r: any) => r.ID)).toEqual([deploy]);
         });
 
         it('writes nothing on a dry run and keeps watched states', async () => {

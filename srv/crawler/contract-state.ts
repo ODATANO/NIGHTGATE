@@ -1,5 +1,5 @@
 // Stores contract state compactly. Each action keeps only the sha256 hash and the size of its state.
-// `ContractStates` holds the latest full state per contract. Full states per action are kept only for configured contracts.
+// `ContractStates` holds the latest full state per contract. Full states per action are kept for every deploy and for configured contracts.
 // Older states are fetched from the indexer when needed and checked against the stored hash.
 
 import { createHash } from 'node:crypto';
@@ -11,6 +11,7 @@ import { bareHex } from '../utils/hex-patterns';
 import { errorMessage } from '../utils/errors';
 
 const { SELECT, INSERT, UPDATE } = cds.ql;
+const log = cds.log('nightgate:crawler');
 
 export const CONTRACT_STATE_HISTORY_MODES = ['none', 'watched', 'all'] as const;
 export type ContractStateHistory = typeof CONTRACT_STATE_HISTORY_MODES[number];
@@ -34,8 +35,9 @@ export function contractStatePolicy(history: string | undefined, watched: readon
     return { history: mode, watched: new Set(watched.map(normalizeContractAddress).filter(Boolean)) };
 }
 
-export function keepsStateHistory(policy: ContractStatePolicy, address: string | null | undefined): boolean {
-    if (policy.history === 'all') return true;
+// A deploy's state is kept in every mode. Each call reads it, and there is one per contract.
+export function keepsStateHistory(policy: ContractStatePolicy, address: string | null | undefined, actionType: ContractAction['actionType'] | null | undefined): boolean {
+    if (actionType === 'DEPLOY' || policy.history === 'all') return true;
     if (policy.history === 'watched' && address) return policy.watched.has(normalizeContractAddress(address));
     return false;
 }
@@ -205,6 +207,17 @@ async function withBlockOf(db: DbService, snapshot: LocatedSnapshot, requestedHe
     return { ...snapshot, blockHash: block?.hash ?? null, ledgerParameters, ...coverage };
 }
 
+// Stores a deploy state the database lacks, once its hash matched. A failed write only means the next read asks the indexer again.
+async function keepDeployState(db: DbService, actionId: string, state: string, zswapState: string | null): Promise<void> {
+    try {
+        await db.run(UPDATE.entity(ContractActions)
+            .set({ state: capBinaryInput(state), zswapState: zswapState == null ? null : capBinaryInput(zswapState) })
+            .where({ ID: actionId, state: null }));
+    } catch (err) {
+        log.debug(`deploy state of action ${actionId} not stored: ${errorMessage(err)}`);
+    }
+}
+
 // The contract's state at `height`, or its current state when `height` is null. Null if no source knows an action of it.
 // Reads the database first, otherwise fetches from the indexer and checks against the stored hash.
 export async function contractStateAt(
@@ -256,7 +269,7 @@ export async function contractStateAt(
     if (covered) {
         newest = await db.run(
             SELECT.one.from(ContractActions)
-                .columns('ID', 'state', 'zswapState', 'stateHash', 'zswapStateHash', 'blockHeight as height')
+                .columns('ID', 'state', 'zswapState', 'stateHash', 'zswapStateHash', 'actionType', 'blockHeight as height')
                 .where({ contractAddress: address })
                 .and({ blockHeight: { '<=': height } })
                 .orderBy('blockHeight desc', 'indexInBlock desc', 'actionIndex desc')
@@ -302,6 +315,10 @@ export async function contractStateAt(
     const digest = digestOfBase64(fetched.state);
     const zswapDigest = digestOfBase64(fetched.zswapState);
     const expected = newest?.stateHash ?? null;
+    if (newest?.actionType === 'DEPLOY' && fetched.state && fetched.height === Number(newest.height) && expected === digest.hash
+        && (newest.zswapStateHash ?? null) === zswapDigest.hash) {
+        await keepDeployState(db, newest.ID, fetched.state, fetched.zswapState);
+    }
     const coverage = await coverageOf(db);
     // An action past the database's cursor is newer than any stored row.
     const newerThanStored = fetched.height != null && coverage.coveredHeight != null && fetched.height > coverage.coveredHeight;
@@ -380,7 +397,7 @@ export async function compactStoredContractState(
     let last: string | undefined;
     for (;;) {
         // A dry run only counts rows, so it does not need to load the states.
-        const columns = opts.dryRun ? ['ID', 'contractAddress'] : ['ID', 'contractAddress', 'state', 'zswapState'];
+        const columns = opts.dryRun ? ['ID', 'contractAddress', 'actionType'] : ['ID', 'contractAddress', 'actionType', 'state', 'zswapState'];
         let query = SELECT.from(ContractActions)
             .columns(...columns)
             .where({ state: { '!=': null } })
@@ -395,12 +412,12 @@ export async function compactStoredContractState(
         for (const row of rows) {
             if (opts.dryRun) {
                 report.actionsHashed++;
-                if (!keepsStateHistory(opts.policy, row.contractAddress)) report.statesCleared++;
+                if (!keepsStateHistory(opts.policy, row.contractAddress, row.actionType)) report.statesCleared++;
                 continue;
             }
             const state = digestOf(await readCapBinary(row.state));
             const zswap = digestOf(await readCapBinary(row.zswapState));
-            const keep = keepsStateHistory(opts.policy, row.contractAddress);
+            const keep = keepsStateHistory(opts.policy, row.contractAddress, row.actionType);
             updates.push({
                 id: row.ID,
                 values: {

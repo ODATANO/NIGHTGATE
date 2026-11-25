@@ -11,6 +11,11 @@
   hash. Such a state never changes, so repeated reads, such as the deploy
   state every call reads, no longer ask the indexer. New
   `NIGHTGATE_STATE_AT_CACHE_MB`, default 64, `0` keeps none.
+- Every deploy keeps its full state in `ContractActions` under each
+  `contractStateHistory` mode, so `stateAt` at a deploy height reads the
+  database. A deploy whose state the database lacks stores the indexer's
+  answer on the first read once it matches the stored hash.
+  `compactStoredContractState` keeps deploy states.
 - nightgate-tx: the builder over `{ api }` retries a 502 or 504 of `stateAt`
   within `stateRetryMs`, as it did for 503 and 429. A short indexer outage no
   longer fails a call before it is sent.
