@@ -38,15 +38,18 @@ function fakeClient(over: Record<string, any> = {}) {
 }
 
 describe('apiPublicDataProvider: contract state', () => {
-    it('retries a 503 or 429 of stateAt and gives up after stateRetryMs', async () => {
+    it('retries a 429, 502, 503 or 504 of stateAt and gives up after stateRetryMs', async () => {
         const { apiPublicDataProvider } = await importProvider();
         const behind = Object.assign(new Error('the indexer has not reached the action'), { status: 503 });
         const budget = Object.assign(new Error('indexer budget'), { status: 429, retryAfterSeconds: 0 });
+        const upstream = Object.assign(new Error('indexer could not serve the contract state: fetch failed'), { status: 502 });
+        const timeout = Object.assign(new Error('gateway timeout'), { status: 504 });
         const ok = { contractAddress: ADDRESS, height: 12, state: b64('s12'), zswapState: b64('z12'), ledgerParameters: b64('p12'), blockHash: '0xb12' };
-        const contractStateAt = vi.fn().mockRejectedValueOnce(behind).mockRejectedValueOnce(budget).mockResolvedValueOnce(ok);
+        const contractStateAt = vi.fn().mockRejectedValueOnce(behind).mockRejectedValueOnce(budget)
+            .mockRejectedValueOnce(upstream).mockRejectedValueOnce(timeout).mockResolvedValueOnce(ok);
         const provider: any = apiPublicDataProvider({ client: fakeClient({ contractStateAt }), mjTypes, mjUtils, mjProtocol, protocolVersion: V9, pollMs: 1 });
         expect(await provider.queryContractState(ADDRESS)).toEqual(stateRead('s12', 'p12'));
-        expect(contractStateAt).toHaveBeenCalledTimes(3);
+        expect(contractStateAt).toHaveBeenCalledTimes(5);
 
         const always = vi.fn(async () => { throw behind; });
         const impatient: any = apiPublicDataProvider({ client: fakeClient({ contractStateAt: always }), mjTypes, mjUtils, mjProtocol, protocolVersion: V9, pollMs: 1, stateRetryMs: 20 });

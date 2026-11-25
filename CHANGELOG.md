@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.47.2 - 2026-11-25
+
+`@odatano/nightgate-tx` 0.25.2 ships with it; the bullets that name it are its changes.
+
+### Fixes
+
+- `ContractStates/stateAt` keeps a state from the indexer at the block of one
+  of the contract's actions once the index holds that block under the same
+  hash. Such a state never changes, so repeated reads, such as the deploy
+  state every call reads, no longer ask the indexer. New
+  `NIGHTGATE_STATE_AT_CACHE_MB`, default 64, `0` keeps none.
+- nightgate-tx: the builder over `{ api }` retries a 502 or 504 of `stateAt`
+  within `stateRetryMs`, as it did for 503 and 429. A short indexer outage no
+  longer fails a call before it is sent.
+
+No schema change. Docs: `docs/reference.md`.
+
 ## 0.47.1 - 2026-11-25
 
 `@odatano/nightgate-tx` 0.25.1 ships with it; the bullets that name it are its changes.

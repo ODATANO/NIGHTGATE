@@ -22,8 +22,9 @@ import { parseExtrinsicCall } from './utils/scale';
 import { getNightgateConfig, resolveNightgateRuntimeConfig } from './utils/nightgate-config';
 import { RateLimiter } from './utils/rate-limiter';
 import { configNumber } from './utils/config';
+import { bareHex } from './utils/hex-patterns';
 import { rejectRateLimited } from './utils/rate-classes';
-import { Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, type TransactionResult, type TransactionSegment, type Transaction as IndexedTransaction, type BackgroundJob } from '#cds-models/midnight';
+import { Blocks, Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, type TransactionResult, type TransactionSegment, type Transaction as IndexedTransaction, type BackgroundJob } from '#cds-models/midnight';
 import { normalizeHttpError } from './utils/http-errors';
 import { messageWithoutUrls } from './utils/errors';
 import { getJobStatus, Block, ContractState, Transaction } from '#cds-models/NightgateService';
@@ -42,6 +43,47 @@ function listPage(data: { limit?: number | null; skip?: number | null }, default
 }
 const stateAtInFlight = new Map<string, Promise<FetchedContractState | null>>();
 const stateAtCache = new Map<string, { at: number; value: FetchedContractState }>();
+
+// A state at the block of its action never changes once the index holds that block, because the index holds finalized blocks only.
+// The map keeps insertion order: its first key is the one used longest ago.
+const finalStates = new Map<string, { bytes: number; value: FetchedContractState }>();
+let finalStateBytes = 0;
+
+function keepFinalState(key: string, value: FetchedContractState): void {
+    const budget = configNumber('NIGHTGATE_STATE_AT_CACHE_MB') * 1024 * 1024;
+    const bytes = (value.state?.length ?? 0) + (value.zswapState?.length ?? 0) + (value.ledgerParameters?.length ?? 0);
+    forgetFinalState(key);
+    if (bytes > budget) return;
+    finalStates.set(key, { bytes, value });
+    finalStateBytes += bytes;
+    for (const [oldest, entry] of finalStates) {
+        if (finalStateBytes <= budget) break;
+        finalStates.delete(oldest);
+        finalStateBytes -= entry.bytes;
+    }
+}
+
+function forgetFinalState(key: string): void {
+    const old = finalStates.get(key);
+    if (!old) return;
+    finalStates.delete(key);
+    finalStateBytes -= old.bytes;
+}
+
+function finalStateOf(key: string): FetchedContractState | undefined {
+    const kept = finalStates.get(key);
+    if (!kept) return undefined;
+    finalStates.delete(key);
+    finalStates.set(key, kept);
+    return kept.value;
+}
+
+/** True when the answer is the state at the asked block and the index holds that block under the same hash. */
+async function isFinalAnswer(db: cds.DatabaseService, height: number, value: FetchedContractState): Promise<boolean> {
+    if (value.height !== height || !value.blockHash) return false;
+    const block: Pick<Block, 'hash'> | undefined = await db.run(cds.ql.SELECT.one.from(Blocks).columns('hash').where({ height }));
+    return !!block?.hash && bareHex(block.hash) === bareHex(value.blockHash);
+}
 
 /** What byTxId reads across the identifier row, its transaction and that transaction's block. */
 interface TransactionLocation {
@@ -119,7 +161,7 @@ function fetchLedgerParametersFromIndexers(): LedgerParametersFetcher {
     };
 }
 
-function fetchContractStateFromIndexers(): ContractStateFetcher {
+function fetchContractStateFromIndexers(db: cds.DatabaseService): ContractStateFetcher {
     const urls = indexerUrls();
     const read = async (address: string, height: number | null): Promise<FetchedContractState | null> => {
         let lastError: unknown;
@@ -134,6 +176,8 @@ function fetchContractStateFromIndexers(): ContractStateFetcher {
     };
     return async (address, height) => {
         const key = `${address}:${height ?? 'newest'}`;
+        const final = height == null ? undefined : finalStateOf(key);
+        if (final) return final;
         const hit = height == null ? undefined : stateAtCache.get(key);
         if (hit && Date.now() - hit.at < STATE_AT_CACHE_MS) return hit.value;
         const pending = stateAtInFlight.get(key);
@@ -145,8 +189,11 @@ function fetchContractStateFromIndexers(): ContractStateFetcher {
         try {
             const value = await started;
             if (value && height != null) {
-                if (stateAtCache.size >= 500) stateAtCache.clear();
-                stateAtCache.set(key, { at: Date.now(), value });
+                if (await isFinalAnswer(db, height, value)) keepFinalState(key, value);
+                else {
+                    if (stateAtCache.size >= 500) stateAtCache.clear();
+                    stateAtCache.set(key, { at: Date.now(), value });
+                }
             }
             return value;
         } finally {
@@ -256,7 +303,7 @@ export default class NightgateService extends cds.ApplicationService {
             }
             try {
                 const snapshot = await contractStateAt(
-                    this.db, contractAddress, height == null ? null : Number(height), fetchContractStateFromIndexers(), fetchLedgerParametersFromIndexers()
+                    this.db, contractAddress, height == null ? null : Number(height), fetchContractStateFromIndexers(this.db), fetchLedgerParametersFromIndexers()
                 );
                 if (!snapshot) return req.reject(404, `no state known for contract ${contractAddress}`);
                 return snapshot;
@@ -264,6 +311,7 @@ export default class NightgateService extends cds.ApplicationService {
                 if (err instanceof IndexerBehind) {
                     // The cached answer predates the newest action. A retry must ask the indexer again.
                     stateAtCache.delete(`${err.address}:${err.height}`);
+                    forgetFinalState(`${err.address}:${err.height}`);
                     const behind = { status: 503, code: 'UNAVAILABLE', message: err.message, $sanitize: false };
                     return req.reject(behind);
                 }

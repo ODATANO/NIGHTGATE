@@ -527,6 +527,44 @@ describe('ContractStates', () => {
         }
     });
 
+    it('stateAt() keeps the state at a finalized action block and asks again for an answer from another block', async () => {
+        const address = 'f1'.repeat(32);
+        const other = 'f2'.repeat(32);
+        for (const [contract, base] of [[address, 530], [other, 540]] as const) {
+            await seedContractAction(await seedTransaction(await seedBlock(base, { ledgerParameters: Buffer.from('lp').toString('base64') })), { contractAddress: contract });
+            const latest = await seedContractAction(await seedTransaction(await seedBlock(base + 4)), { contractAddress: contract });
+            await db.run(cds.ql.INSERT.into(CONTRACT_STATES).entries({
+                contractAddress: contract, height: base + 4, state: Buffer.from('st').toString('base64'), contractAction_ID: latest
+            }));
+        }
+        await db.run(cds.ql.UPDATE.entity('midnight.SyncState').set({ lastIndexedHeight: 600 }).where({ ID: 'SINGLETON' }));
+        const answer = (hash: string, height: number) => new Response(JSON.stringify({ data: { contractAction: {
+            state: '0a0b', zswapState: null, transaction: { block: { hash, height, ledgerParameters: null } }
+        } } }), { status: 200 });
+        await new Promise(r => setTimeout(r, 1100));
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+            const { variables } = JSON.parse(String(init?.body));
+            return variables.address === address ? answer('0xblock530', 530) : answer('0xforked', 540);
+        });
+        const now = Date.now();
+        const clock = vi.spyOn(Date, 'now');
+        try {
+            const ask = (contract: string, height: number) => srv.send({ event: 'stateAt', entity: 'ContractStates', data: { contractAddress: contract, height } });
+            clock.mockReturnValue(now);
+            expect(await ask(address, 530)).toEqual(expect.objectContaining({ source: 'indexer', height: '530' }));
+            await ask(other, 540);
+            clock.mockReturnValue(now + 60_000);
+            expect(await ask(address, 530)).toEqual(expect.objectContaining({ source: 'indexer', height: '530' }));
+            await ask(other, 540);
+            const asked = fetchSpy.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).variables.address);
+            expect(asked.filter(a => a === address)).toHaveLength(1);
+            expect(asked.filter(a => a === other)).toHaveLength(2);
+        } finally {
+            clock.mockRestore();
+            fetchSpy.mockRestore();
+        }
+    });
+
     it('stateAt() names the cause of an indexer failure without its URL', async () => {
         await new Promise(r => setTimeout(r, 1100));
         const fetchSpy = vi.spyOn(globalThis, 'fetch')

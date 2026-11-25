@@ -70,7 +70,7 @@ const notInBuildOnly = (method) => () => {
 
 // `mjTypes` seals the served bytes for the SDK. `mjUtils` and `mjProtocol` name the ledger that wrote a state or a record.
 // `protocolVersion` dates a read when the server names no block: the version at which ledger 9 starts on the chain.
-// `maxLagBlocks`: a state further behind the chain is refused. `stateRetryMs`: how long a 503 or 429 of stateAt is retried.
+// `maxLagBlocks`: a state further behind the chain is refused. `stateRetryMs`: how long a 429, 502, 503 or 504 of stateAt is retried.
 export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 60, stateRetryMs = 30_000 }) {
     if (!client) throw new Error('apiPublicDataProvider: client is required');
     if (!mjTypes?.SerializedContractState?.fromBytes || !mjTypes?.LedgerTransaction?.fromBytes) throw new Error('apiPublicDataProvider: mjTypes module (midnight-js-types) is required');
@@ -89,6 +89,8 @@ export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, pr
     if (!(Number.isInteger(maxLagBlocks) && maxLagBlocks >= 0)) throw new Error('apiPublicDataProvider: maxLagBlocks must be a non-negative integer');
 
     // 503: the server's indexer has not reached the newest action yet. 429: its indexer budget is used up.
+    // 502 and 504: its indexer or the way to it failed. A read changes nothing, so asking again is safe.
+    const RETRIED = new Set([429, 502, 503, 504]);
     async function stateWithRetry(address, height, retryMs = stateRetryMs) {
         const deadline = Date.now() + retryMs;
         for (;;) {
@@ -96,7 +98,7 @@ export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, pr
                 return await client.contractStateAt({ contractAddress: address, height });
             } catch (err) {
                 const status = Number(err?.status);
-                if ((status !== 503 && status !== 429) || Date.now() >= deadline) throw err;
+                if (!RETRIED.has(status) || Date.now() >= deadline) throw err;
                 const waitMs = Number(err?.retryAfterSeconds) > 0 ? Number(err.retryAfterSeconds) * 1000 : pollMs;
                 await new Promise(r => setTimeout(r, Math.min(waitMs, Math.max(0, deadline - Date.now()))));
             }
@@ -239,7 +241,7 @@ export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, pr
             };
         },
 
-        // A watch retries a 503 or 429 for its whole timeout, not only for stateRetryMs.
+        // A watch retries those answers for its whole timeout, not only for stateRetryMs.
         watchForContractState: (address) => waitFor(`the state of contract ${address}`, (left) => contractState(address, undefined, left)),
 
         queryContractEvents: notInBuildOnly('queryContractEvents'),
