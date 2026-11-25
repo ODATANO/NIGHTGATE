@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.47.3 - 2026-11-25
+
+`@odatano/nightgate-tx` 0.25.3 ships with it; the bullets that name it are its changes.
+
+### Fixes
+
+- nightgate-tx: `createTxBuilder` takes `stateRetryMs` and hands it to the
+  reader over `{ api }`. The default is 120 s instead of 30 s, so an indexer
+  restart of about a minute no longer fails the next call before it is sent.
+
+No schema change, no server change. Docs: `docs/txbuilder.md`.
+
 ## 0.47.2 - 2026-11-25
 
 `@odatano/nightgate-tx` 0.25.2 ships with it; the bullets that name it are its changes.

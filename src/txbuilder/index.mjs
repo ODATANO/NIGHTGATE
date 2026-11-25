@@ -517,7 +517,7 @@ export async function createTxBuilder(opts) {
     // One indexer provider per builder. One per transaction would leak a socket each time.
     const sockets = apiClient ? null : trackingWebSocket(require('ws'));
     const publicDataProvider = apiClient
-        ? apiPublicDataProvider({ client: apiClient, mjTypes, mjUtils, mjProtocol, protocolVersion: Number(configuration.forks?.v9 ?? abstractions.ProtocolVersion.V9NativeForkVersion), ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}) })
+        ? apiPublicDataProvider({ client: apiClient, mjTypes, mjUtils, mjProtocol, protocolVersion: Number(configuration.forks?.v9 ?? abstractions.ProtocolVersion.V9NativeForkVersion), ...(opts.maxLagBlocks !== undefined ? { maxLagBlocks: opts.maxLagBlocks } : {}), ...(opts.stateRetryMs !== undefined ? { stateRetryMs: opts.stateRetryMs } : {}) })
         : indexerSdk.indexerPublicDataProvider(indexerHttpUrl, indexerWsUrl, sockets.WebSocket);
 
     const facade = await facadeSdk.WalletFacade.init({

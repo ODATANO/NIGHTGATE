@@ -318,6 +318,12 @@ describe('apiPublicDataProvider: a stale database is refused', () => {
         await expect(provider.queryContractState(ADDRESS)).resolves.toEqual(stateRead('s12', 'p12'));
     });
 
+    it('stateRetryMs must be a non-negative integer', async () => {
+        const { apiPublicDataProvider } = await importProvider();
+        expect(() => apiPublicDataProvider({ client: fakeClient(), mjTypes, mjUtils, mjProtocol, protocolVersion: V9, stateRetryMs: -1 })).toThrow(/stateRetryMs must be a non-negative integer/);
+        expect(() => apiPublicDataProvider({ client: fakeClient(), mjTypes, mjUtils, mjProtocol, protocolVersion: V9, stateRetryMs: 1.5 })).toThrow(/stateRetryMs must be a non-negative integer/);
+    });
+
     it('maxLagBlocks must be a non-negative integer', async () => {
         const { apiPublicDataProvider } = await importProvider();
         expect(() => apiPublicDataProvider({ client: fakeClient(), mjTypes, mjUtils, mjProtocol, protocolVersion: V9, maxLagBlocks: -1 })).toThrow(/non-negative integer/);

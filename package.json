@@ -1,6 +1,6 @@
 {
   "name": "@odatano/nightgate",
-  "version": "0.47.2",
+  "version": "0.47.3",
   "private": true,
   "description": "Midnight blockchain indexer and transaction service with an OData V4 API, built on SAP CAP",
   "homepage": "https://github.com/ODATANO/NIGHTGATE#readme",

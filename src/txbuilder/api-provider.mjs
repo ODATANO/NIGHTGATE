@@ -71,7 +71,7 @@ const notInBuildOnly = (method) => () => {
 // `mjTypes` seals the served bytes for the SDK. `mjUtils` and `mjProtocol` name the ledger that wrote a state or a record.
 // `protocolVersion` dates a read when the server names no block: the version at which ledger 9 starts on the chain.
 // `maxLagBlocks`: a state further behind the chain is refused. `stateRetryMs`: how long a 429, 502, 503 or 504 of stateAt is retried.
-export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 60, stateRetryMs = 30_000 }) {
+export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, protocolVersion, pollMs = 2_000, watchTimeoutMs = 120_000, maxLagBlocks = 60, stateRetryMs = 120_000 }) {
     if (!client) throw new Error('apiPublicDataProvider: client is required');
     if (!mjTypes?.SerializedContractState?.fromBytes || !mjTypes?.LedgerTransaction?.fromBytes) throw new Error('apiPublicDataProvider: mjTypes module (midnight-js-types) is required');
     if (!mjUtils?.ledgerVersionOfContractState || !mjUtils?.ledgerVersionOfLedgerParameters) throw new Error('apiPublicDataProvider: mjUtils module (midnight-js-utils) is required');
@@ -87,6 +87,7 @@ export function apiPublicDataProvider({ client, mjTypes, mjUtils, mjProtocol, pr
         return mjTypes.SerializedLedgerParameters.fromBytes(mjUtils.ledgerVersionOfLedgerParameters(raw), raw);
     };
     if (!(Number.isInteger(maxLagBlocks) && maxLagBlocks >= 0)) throw new Error('apiPublicDataProvider: maxLagBlocks must be a non-negative integer');
+    if (!(Number.isInteger(stateRetryMs) && stateRetryMs >= 0)) throw new Error('apiPublicDataProvider: stateRetryMs must be a non-negative integer');
 
     // 503: the server's indexer has not reached the newest action yet. 429: its indexer budget is used up.
     // 502 and 504: its indexer or the way to it failed. A read changes nothing, so asking again is safe.

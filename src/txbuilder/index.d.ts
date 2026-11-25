@@ -79,6 +79,11 @@ export interface CreateTxBuilderInput {
      * because a build on a stale state can fail on chain. Default 60.
      */
     maxLagBlocks?: number;
+    /**
+     * With `api`: how long a contract state read is asked again while the server answers 429, 502, 503 or 504,
+     * for example while its indexer has not reached the newest action. Default 120000 ms.
+     */
+    stateRetryMs?: number;
     /** Required without `api`; with `api` only for a wallet sync. */
     indexerHttpUrl?: string;
     /** Required without `api`; with `api` only for a wallet sync. */
