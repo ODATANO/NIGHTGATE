@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.47.1 - 2026-11-25
+
+`@odatano/nightgate-tx` 0.25.1 ships with it; the bullets that name it are its changes.
+
+### Fixes
+
+- A sponsored maintenance update counts against the grant's
+  `maxMaintenanceUpdates` and shows in `getGrantUsage.maintenanceUpdatesUsed`.
+  The submit notice of the wallet worker reached the job store without its
+  `maintained` contract, so no update was reserved. The right
+  `allowMaintenance` and the check that the grant deployed the contract applied.
+- The same notice keeps `segments`, `nullifiers`, `unshielded` and `transfer`,
+  which the recovery of a job after a restart reads.
+
+### Added
+
+- `Blocks/ledgerParametersAt(height?)` returns the ledger parameters in effect
+  at `height`, default the chain tip, with `coveredHeight` and `chainHeight`.
+  A builder needs them for a deploy, which has no contract state to read them
+  from. It shares the indexer budget of `stateAt` and answers 404 when
+  neither the database nor the indexer knows them.
+- nightgate-tx: `connect()` gains `ledgerParametersAt({ height })`, null on
+  404, and `getGrantUsage({ grantId, since, until })`. Both answers are typed.
+
+No schema change. Docs: `docs/actions.md`, `docs/reference.md`.
+
 ## 0.47.0 - 2026-11-24
 
 The last 0.x release. `@odatano/nightgate-tx` 0.25.0 ships with it; the bullets that name it are its changes.

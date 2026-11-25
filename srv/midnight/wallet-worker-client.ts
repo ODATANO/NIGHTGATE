@@ -449,12 +449,7 @@ export function setStateSaveSink(sink: StateSaveSink | undefined): void {
 }
 
 /** A tx the worker is about to send. The hook stores it first. If the hook throws, the worker does not send. */
-export interface SubmitIntentInfo {
-    txId: string; txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; ttl?: string;
-    segments?: Array<{ segment: number; calls: string[] }>;
-    /** Raw token types the calls mint. */
-    minted?: string[];
-}
+export type SubmitIntentInfo = SubmitIntent;
 export type SubmitIntentHook = (intent: SubmitIntentInfo) => Promise<void>;
 
 async function rpc<T>(method: string, args: unknown, timeoutMs: number = RPC_TIMEOUT_MS, onSubmitIntent?: SubmitIntentHook): Promise<T> {
@@ -564,7 +559,7 @@ async function rpcOnce<T>(slot: WorkerSlot, method: string, args: unknown, timeo
             if (answered) return;
             if (msg?.kind === 'submit-intent') {
                 // Store, then ack or nack. Once the worker answered it gave up and did not send, so no ack.
-                const intent: SubmitIntentInfo = { txId: String(msg.txId), txHash: String(msg.txHash), contractAddress: msg.contractAddress, circuits: msg.circuits, note: msg.note, sponsorAccountId: msg.sponsorAccountId, ...(Array.isArray(msg.deployed) ? { deployed: msg.deployed.map(String) } : {}), ...(typeof msg.ttl === 'string' ? { ttl: msg.ttl } : {}), ...(Array.isArray(msg.minted) && msg.minted.length ? { minted: msg.minted.map(String) } : {}) };
+                const { kind: _kind, ...intent } = msg;
                 const startedAt = Date.now();
                 const tracked: Promise<void> = Promise.resolve()
                     .then(() => onSubmitIntent?.(intent))

@@ -156,6 +156,33 @@ export interface ContractDeployInfo {
 // answer-types:start
 // Written by `npm run client:types` from the server's model. A field or a list item the model does not mark `not null` can be null.
 
+export interface LedgerParametersSnapshot {
+    height: number | string | null;
+    ledgerParameters: string;
+    coveredHeight: number | string | null;
+    chainHeight: number | string | null;
+}
+
+export interface Budget {
+    max: number | null;
+    used: number | null;
+    resetsAt: string | null;
+}
+
+export interface ValueBudgetState {
+    tokenType: string | null;
+    max: string | null;
+    used: string | null;
+    resetsAt: string | null;
+}
+
+export interface RateClassState {
+    name: string | null;
+    windowSeconds: number | null;
+    max: number | null;
+    remaining: number | null;
+}
+
 export interface PreparedField {
     field: string | null;
     fieldKey: string | null;
@@ -182,6 +209,27 @@ export interface SlotOpening {
     present: boolean | null;
     value: string | null;
     valueDigest: string | null;
+}
+
+/** The answer of `ledgerParametersAt`. */
+export type LedgerParametersAtAnswer = LedgerParametersSnapshot;
+
+/** The answer of `getGrantUsage`. */
+export interface GetGrantUsageAnswer {
+    grantId: string | null;
+    since: string | null;
+    until: string | null;
+    jobs: Array<{ kind: string | null; status: "pending" | "running" | "external_execution" | "submitted" | "reconciliation_required" | "succeeded" | "failed" | null; count: number | null; } | null>;
+    landed: number | null;
+    failed: number | null;
+    deploysUsed: number | null;
+    maxDeploys: number | null;
+    maintenanceUpdatesUsed: number | null;
+    maxMaintenanceUpdates: number | null;
+    jobsUsedToday: number | null;
+    maxJobsPerDay: number | null;
+    dustPaid: string | null;
+    limits: { jobsPerHour: Budget | null; jobsPerDay: Budget | null; valuePerDay: Array<ValueBudgetState | null>; classes: Array<RateClassState | null>; } | null;
 }
 
 /** The answer of `verifyAttestation`. */
@@ -403,6 +451,8 @@ export interface NightgateClient {
     // chain reads a transaction builder needs
     /** The contract's state at `height`, or its newest one. Null when the server knows no state. */
     contractStateAt(input: { contractAddress: string; height?: number | null }): Promise<ContractStateSnapshot | null>;
+    /** The ledger parameters in effect at `height`, or at the chain tip. Null when the server does not know them. */
+    ledgerParametersAt(input?: { height?: number | null }): Promise<LedgerParametersAtAnswer | null>;
     /** The block at `height`, or the newest one. Null while the server has not indexed it. */
     blockAt(height?: number | null): Promise<BlockInfo | null>;
     /** Null while the server has not indexed the transaction. */
@@ -421,6 +471,10 @@ export interface NightgateClient {
     verifyDocument(p: Params): Promise<VerifyDocumentAnswer>;
     deriveTokenType(p: Params): Promise<DeriveTokenTypeAnswer>;
     getHealth(): Promise<GetHealthAnswer>;
+
+    // grants
+    /** What a grant did and its limits. A token may leave `grantId` out. `since` and `until` are ISO timestamps, default the last 30 days. */
+    getGrantUsage(input?: { grantId?: string; since?: string; until?: string }): Promise<GetGrantUsageAnswer>;
 
     // input preparation, no transaction
     prepareDocumentProof(p: ActionParams): Promise<PrepareDocumentProofAnswer>;

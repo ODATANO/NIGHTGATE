@@ -12,7 +12,7 @@ import { getJobById, runWithoutAmbientTx } from './submission/background-jobs';
 import { jobResultObject } from './submission/job-store';
 import { storedChainSegments } from './submission/job-reconciliation';
 import { LONG_POLL_MAX_MS, holdUntil, waiterPool } from './utils/long-poll';
-import { contractStateAt, IndexerBudgetExhausted, IndexerBehind, IndexerUnavailable, type ContractStateFetcher, type FetchedContractState, type LedgerParametersFetcher } from './crawler/contract-state';
+import { contractStateAt, ledgerParametersAt, IndexerBudgetExhausted, IndexerBehind, IndexerUnavailable, type ContractStateFetcher, type FetchedContractState, type LedgerParametersFetcher } from './crawler/contract-state';
 import { fetchContractState, fetchLedgerParameters } from './crawler/indexer-supplement';
 import { normalizeIdentifier } from './crawler/transaction-identifiers';
 import { parseJsonStringList } from './utils/json-list';
@@ -26,7 +26,7 @@ import { rejectRateLimited } from './utils/rate-classes';
 import { Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, type TransactionResult, type TransactionSegment, type Transaction as IndexedTransaction, type BackgroundJob } from '#cds-models/midnight';
 import { normalizeHttpError } from './utils/http-errors';
 import { messageWithoutUrls } from './utils/errors';
-import { getJobStatus, ContractState, Transaction } from '#cds-models/NightgateService';
+import { getJobStatus, Block, ContractState, Transaction } from '#cds-models/NightgateService';
 import { narrowRead } from './utils/request-types';
 
 // One limit for all callers of this server, because an indexer may block the host's IP after too many requests.
@@ -155,7 +155,21 @@ function fetchContractStateFromIndexers(): ContractStateFetcher {
     };
 }
 
-
+/** Answers a used-up indexer budget with 429 and a failed indexer with 502. Any other error is rethrown. */
+function rejectIndexerFailure(req: cds.Request, err: unknown, what: string) {
+    if (err instanceof IndexerBudgetExhausted) {
+        const limiter = stateAtIndexerLimiter();
+        return rejectRateLimited(req, {
+            name: 'indexer-budget', limit: limiter.maxRequests,
+            windowSeconds: limiter.windowMs / 1000, retryAfterMs: err.retryAfterMs
+        });
+    }
+    if (!(err instanceof IndexerUnavailable)) throw err;
+    // CAP hides 5xx messages in production. The indexer's error stays visible, with URLs removed because they can carry keys.
+    const cause = messageWithoutUrls(err, '<indexer>');
+    const upstream = { status: 502, code: 'BAD_GATEWAY', message: `indexer could not serve ${what}: ${cause}`, $sanitize: false };
+    return req.reject(upstream);
+}
 
 export default class NightgateService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
@@ -169,7 +183,7 @@ export default class NightgateService extends cds.ApplicationService {
         attachAgentGrantEnforcement(this, this.db);
 
         attachRuntimeGate(this);
-        attachReadLimits(this, ['byHash', 'byTxId', 'ledgerTransaction', 'stateAt', 'getJobStatus']);
+        attachReadLimits(this, ['byHash', 'byTxId', 'ledgerTransaction', 'stateAt', 'ledgerParametersAt', 'getJobStatus']);
         attachHexInput(this);
         attachInt64Results(this);
 
@@ -247,25 +261,28 @@ export default class NightgateService extends cds.ApplicationService {
                 if (!snapshot) return req.reject(404, `no state known for contract ${contractAddress}`);
                 return snapshot;
             } catch (err) {
-                if (err instanceof IndexerBudgetExhausted) {
-                    const limiter = stateAtIndexerLimiter();
-                    return rejectRateLimited(req, {
-                        name: 'indexer-budget', limit: limiter.maxRequests,
-                        windowSeconds: limiter.windowMs / 1000, retryAfterMs: err.retryAfterMs
-                    });
-                }
                 if (err instanceof IndexerBehind) {
                     // The cached answer predates the newest action. A retry must ask the indexer again.
                     stateAtCache.delete(`${err.address}:${err.height}`);
                     const behind = { status: 503, code: 'UNAVAILABLE', message: err.message, $sanitize: false };
                     return req.reject(behind);
                 }
-                if (!(err instanceof IndexerUnavailable)) throw err;
-                // CAP hides 5xx messages in production. The indexer's error stays visible, with URLs removed because they can carry keys.
-                const cause = messageWithoutUrls(err, '<indexer>');
-                const at = height == null ? 'its newest state' : `height ${height}`;
-                const upstream = { status: 502, code: 'BAD_GATEWAY', message: `indexer could not serve the contract state at ${at}: ${cause}`, $sanitize: false };
-                return req.reject(upstream);
+                return rejectIndexerFailure(req, err, `the contract state at ${height == null ? 'its newest state' : `height ${height}`}`);
+            }
+        });
+
+        this.on(Block.actions.ledgerParametersAt, 'Blocks', async (req) => {
+            const { height } = req.data;
+            if (height != null && (!Number.isInteger(Number(height)) || Number(height) < 0)) {
+                return req.reject(400, 'height must be a non-negative integer');
+            }
+            const at = height == null ? null : Number(height);
+            try {
+                const snapshot = await ledgerParametersAt(this.db, at, fetchLedgerParametersFromIndexers());
+                if (!snapshot) return req.reject(404, `no ledger parameters known at ${at == null ? 'the chain tip' : `height ${at}`}`);
+                return snapshot;
+            } catch (err) {
+                return rejectIndexerFailure(req, err, `the ledger parameters at ${at == null ? 'the chain tip' : `height ${at}`}`);
             }
         });
 

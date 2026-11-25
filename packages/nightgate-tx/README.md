@@ -57,6 +57,8 @@ const proof = await ng.prepareDocumentProof({ document: doc, proofFields: [{ fie
 
 - One method per server action, such as `anchorDocument`, `proveFieldPredicate`, `grantDisclosure`, `sendToken`, `sponsorSwap` and `sponsorTransfer`. `callFunction` and `callAction` reach any other.
 - `read(table, { filter, orderby, top, skip, select })` returns the rows of a table, such as `ng.read('Transactions', { filter: 'blockHeight eq 5', orderby: 'indexInBlock' })`. `filter` and `orderby` are OData. A read returns at most the server's page size, 1000 rows by default: page with `skip` until a read is empty. `service: 'indexer'` reads a table of the indexer service.
+- Chain reads for a builder: `contractStateAt`, `ledgerParametersAt`, `blockAt`, `transactionByTxId`, `contractDeploy` and `ledgerTransaction`. Each is null while the server does not know the answer.
+- `getGrantUsage()` returns what the token's grant did and what is left of its limits.
 - In TypeScript the read methods return the server's answer as a type, for example `VerifyAttestationAnswer` and `GetWalletBalanceAnswer`. The types are written from the server's model. `callFunction<T>` and `callAction<T>` take the answer type you expect and return `unknown` without one.
 - Write actions submit the job and wait for its result. They long-poll `getJobStatus`. `longPollMs: 0` polls instead. A job can succeed before the chain answered: the result carries `chainStatus` and `blockHeight`.
 - A 409 `IDEMPOTENCY_KEY_CONFLICT` carries `err.job` with `{ jobId, status, chainStatus }` for the caller that started the job under that key.

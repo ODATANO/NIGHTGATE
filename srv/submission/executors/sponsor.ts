@@ -6,7 +6,7 @@ import { getNightgateConfig } from '../../utils/nightgate-config';
 import { SponsorAttemptBookkeepingPendingError } from '../background-jobs';
 import { reportSubmissionRejectedOn, reportBroadcastOn } from '../job-execution-context';
 import { PendingSubmissions, type BackgroundJob } from '#cds-models/midnight';
-import { walletSponsorFinalizedTx, walletSponsorUnboundTx } from '../../midnight/wallet-worker-client';
+import { walletSponsorFinalizedTx, walletSponsorUnboundTx, type SubmitIntentInfo } from '../../midnight/wallet-worker-client';
 import { PLATFORM_POOL_SENTINEL, acquireSponsor, releaseSponsor, benchSponsor, decideSponsorFailure, sponsorCandidatesNonExclusive, touchSponsor } from '../sponsor-pool';
 import { recordDeployedContracts, reserveDeployBudget, releaseDeployBudget, reserveMaintenanceBudget } from '../../sessions/agent-grants';
 import { maintenanceRefund } from '../../sessions/deploy-refund';
@@ -78,11 +78,7 @@ export function createSponsorExecutors(ctx: Pick<SubmissionContext, 'db'>) {
         };
         // Called just before the worker broadcasts. It stores what the worker chose,
         // so the result can be reconstructed from the attempt row after a crash.
-        const onSubmitIntent = () => async (intent: {
-            txId: string; txHash: string; contractAddress?: string; circuits?: string[]; note?: string; sponsorAccountId?: string; deployed?: string[]; maintained?: string[]; ttl?: string;
-            segments?: Array<{ segment: number; calls: string[] }>; minted?: string[]; nullifiers?: string[];
-            unshielded?: SubmitIntentCoordinates['unshielded']; transfer?: SubmitIntentCoordinates['transfer'];
-        }) => {
+        const onSubmitIntent = () => async (intent: SubmitIntentInfo) => {
             const submissionId = cds.utils.uuid();
             const deployed = (intent?.deployed ?? []).map(String).filter(Boolean);
             const grantId = command?.grantId ? String(command.grantId) : null;

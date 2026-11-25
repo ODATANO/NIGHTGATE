@@ -12,9 +12,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const START = '// answer-types:start';
 export const END = '// answer-types:end';
 
-/** The server operations whose answer a client method hands out unchanged, by service. */
+/** The server operations whose answer a client method hands out unchanged, by service. `Entity/name` is a bound function. */
 export const ANSWERS = {
     NightgateService: [
+        'Blocks/ledgerParametersAt', 'getGrantUsage',
         'verifyAttestation', 'verifyPredicate', 'verifyDisclosure', 'verifyPredicateAttestation', 'verifyDocument', 'deriveTokenType',
         'prepareDocumentProof', 'prepareMembershipSet',
         'connectWallet', 'connectWalletForSigning', 'disconnectWallet', 'deriveWalletInfo', 'getWalletBalance', 'getWalletSyncProgress'
@@ -66,9 +67,10 @@ export function clientAnswerTypes(csn) {
 
     const answers = [];
     for (const [service, operations] of Object.entries(ANSWERS)) {
-        for (const operation of operations) {
-            const definition = csn.definitions[`${service}.${operation}`];
-            if (!definition?.returns) throw new Error(`${service}.${operation}: the model has no such operation with an answer`);
+        for (const path of operations) {
+            const [entity, operation] = path.includes('/') ? path.split('/') : [null, path];
+            const definition = entity ? csn.definitions[`${service}.${entity}`]?.actions?.[operation] : csn.definitions[`${service}.${operation}`];
+            if (!definition?.returns) throw new Error(`${service}.${path}: the model has no such operation with an answer`);
             const { returns } = definition;
             const name = answerName(operation);
             answers.push(returns.elements && !returns.type

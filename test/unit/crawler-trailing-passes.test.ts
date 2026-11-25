@@ -23,7 +23,7 @@ import { redecodeFromHeight } from '../../srv/crawler/redecode';
 import { readCapBinary } from '../../srv/crawler/cap-binary';
 import { WorkerRpcUnansweredError } from '../../srv/midnight/worker-rpc/client';
 import {
-    compactStoredContractState, contractStateAt, contractStatePolicy, IndexerBudgetExhausted, IndexerBehind, type ContractStatePolicy
+    compactStoredContractState, contractStateAt, contractStatePolicy, ledgerParametersAt, IndexerBudgetExhausted, IndexerBehind, type ContractStatePolicy
 } from '../../srv/crawler/contract-state';
 
 cds.test(__dirname + '/../..');
@@ -1497,6 +1497,20 @@ describe('contract state storage', () => {
             const snap = await stateAt(db, CONTRACT, 11, fetchState);
             expect(snap).toEqual(expect.objectContaining({ source: 'indexer', blockHash: 'b10' }));
             expect(text(snap!.ledgerParameters)).toBe('p10');
+        });
+
+        it('ledgerParametersAt reads the stored change in effect, asks the indexer only without one, and is null when nobody knows', async () => {
+            await supplyBlocks(twoStates);
+            await storeParams(10, 12);
+            await setSync({ lastSupplementedHeight: 12, chainHeight: 14 });
+            const fetchParameters = vi.fn(async (height: number | null) => height === 5 ? b64('p5') : null);
+            const tip = await ledgerParametersAt(db, null, fetchParameters);
+            expect(tip).toEqual(expect.objectContaining({ height: null, coveredHeight: 12, chainHeight: 14 }));
+            expect(text(tip!.ledgerParameters)).toBe('params12');
+            expect(text((await ledgerParametersAt(db, 11, fetchParameters))!.ledgerParameters)).toBe('params10');
+            expect(fetchParameters).not.toHaveBeenCalled();
+            expect(text((await ledgerParametersAt(db, 5, fetchParameters))!.ledgerParameters)).toBe('p5');
+            expect(await ledgerParametersAt(db, 4, fetchParameters)).toBeNull();
         });
     });
 

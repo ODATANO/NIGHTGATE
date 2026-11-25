@@ -317,7 +317,12 @@ export function connect(opts) {
         return (await orNull(callFunction('Transactions/ledgerTransaction', { hash: hexOf(hash) })))?.ledgerTransaction ?? null;
     }
 
-    /** The block at `height`, or the newest one. Null while the server has not indexed it. */
+    /** The ledger parameters in effect at `height`, or at the chain tip. `ledgerParameters` is base64. Null when the server does not know them. */
+    function ledgerParametersAt({ height } = {}) {
+        const at = height == null ? 'null' : odataLiteral(height);
+        return orNull(request('GET', `${service}/Blocks/ledgerParametersAt(height=${at})`));
+    }
+
     /** One page of a table's rows. The server hands out at most its page size per read, 1000 rows by default: page with `skip` until a read is empty. */
     async function readTable(entity, { filter, orderby, top, skip, select, service: from = 'main' } = {}) {
         if (typeof entity !== 'string' || !/^[A-Za-z][A-Za-z0-9_]*$/.test(entity)) throw new Error('read: entity must be the name of a table, such as Blocks');
@@ -336,6 +341,7 @@ export function connect(opts) {
         return Array.isArray(page?.value) ? page.value : [];
     }
 
+    /** The block at `height`, or the newest one. Null while the server has not indexed it. */
     async function blockAt(height) {
         const pick = height == null ? '$orderby=height%20desc' : `$filter=${encodeURIComponent(`height eq ${odataLiteral(height)}`)}`;
         const page = await request('GET', `${service}/Blocks?${pick}&$top=1&$select=hash,height,protocolVersion,timestamp`);
@@ -378,6 +384,7 @@ export function connect(opts) {
 
         // ---- chain reads a transaction builder needs. No wallet, no login beyond the token. ----
         contractStateAt,
+        ledgerParametersAt,
         read: readTable,
         blockAt,
         transactionByTxId,
@@ -396,6 +403,10 @@ export function connect(opts) {
         getBoardStatus: () => request('GET', `${indexerService}/getBoardStatus()`),
         /** The key the instance signs job receipts with. No login. */
         getReceiptKey: () => request('GET', `${indexerService}/getReceiptKey()`),
+
+        // ---- grants ----
+        /** What a grant did and its limits. A token may leave `grantId` out. `since` and `until` are ISO timestamps, default the last 30 days. */
+        getGrantUsage: ({ grantId, since, until } = {}) => callFunction('getGrantUsage', { grantId, since, until }),
 
         // ---- input preparation. No wallet, no transaction. ----
         prepareDocumentProof: (p) => callAction('prepareDocumentProof', p),

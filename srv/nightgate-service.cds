@@ -14,12 +14,25 @@ using {
 @cds.server.body_parser.limit: '2mb'
 service NightgateService {
 
+    /** The ledger parameters in effect at a block. */
+    type LedgerParametersSnapshot {
+        height           : Integer64; // null = the chain tip
+        ledgerParameters : LargeString not null; // base64
+        coveredHeight    : Integer64; // the database holds every parameter change up to this block; null = supplement never ran
+        chainHeight      : Integer64; // the chain tip the crawler last saw
+    }
+
     @readonly
     entity Blocks                as
         projection on midnight.Blocks {
             *,
             parent,
             transactions
+        }
+        actions {
+            // height: optional, default the chain tip. 404 when neither this server nor its indexer knows them.
+            @cds.odata.bindingparameter.collection
+            function ledgerParametersAt(height: Integer64) returns LedgerParametersSnapshot;
         };
 
     @readonly

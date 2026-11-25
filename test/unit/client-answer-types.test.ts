@@ -20,10 +20,10 @@ describe('client answer types', () => {
 
     it('every listed operation has a client method that returns its answer type', () => {
         const declared = read('src/sdk/client.d.ts');
-        const operations = (Object.values(ANSWERS) as string[][]).flat();
-        expect(operations).toHaveLength(15);
+        const operations = (Object.values(ANSWERS) as string[][]).flat().map(path => path.split('/').pop()!);
+        expect(operations).toHaveLength(17);
         for (const operation of operations) {
-            expect(declared, operation).toMatch(new RegExp(`\\b${operation}\\([^)]*\\): Promise<${answerOf(operation)}>;`));
+            expect(declared, operation).toMatch(new RegExp(`\\b${operation}\\([^)]*\\): Promise<${answerOf(operation)}( \\| null)?>;`));
         }
     });
 

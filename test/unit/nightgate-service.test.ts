@@ -555,6 +555,47 @@ describe('ContractStates', () => {
             spy.mockRestore();
         }
     });
+
+    it('Blocks/ledgerParametersAt() serves the stored parameters in effect at a height or at the tip', async () => {
+        await seedBlock(700, { ledgerParameters: Buffer.from('lp700').toString('base64') });
+        await seedBlock(704, { ledgerParameters: Buffer.from('lp704').toString('base64') });
+        const tip = await cap.GET(`${API}/Blocks/ledgerParametersAt(height=null)`);
+        expect(tip.data).toEqual(expect.objectContaining({ height: null }));
+        expect(Buffer.from(tip.data.ledgerParameters, 'base64').toString()).toBe('lp704');
+        const at = await cap.GET(`${API}/Blocks/ledgerParametersAt(height=703)`);
+        expect(at.data).toEqual(expect.objectContaining({ height: '703' }));
+        expect(Buffer.from(at.data.ledgerParameters, 'base64').toString()).toBe('lp700');
+    });
+
+    it('Blocks/ledgerParametersAt() answers 404 when neither the database nor the indexer knows them', async () => {
+        await new Promise(r => setTimeout(r, 1100));
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ data: { block: null } }), { status: 200 }));
+        try {
+            await expect(srv.send({ event: 'ledgerParametersAt', entity: 'Blocks', data: { height: 1 } })).rejects.toMatchObject({ status: 404 });
+            expect(fetchSpy).toHaveBeenCalledTimes(1);
+        } finally {
+            fetchSpy.mockRestore();
+        }
+    });
+
+    it('Blocks/ledgerParametersAt() names the cause of an indexer failure without its URL', async () => {
+        await new Promise(r => setTimeout(r, 1100));
+        const fetchSpy = vi.spyOn(globalThis, 'fetch')
+            .mockImplementation(async () => { throw new Error('connect ECONNREFUSED https://indexer.example/api?key=secret'); });
+        try {
+            const err: any = await srv.send({ event: 'ledgerParametersAt', entity: 'Blocks', data: { height: 2 } }).catch((e: unknown) => e);
+            expect(err).toMatchObject({ status: 502, code: 'BAD_GATEWAY', $sanitize: false });
+            expect(err.message).toMatch(/ledger parameters at height 2: .*ECONNREFUSED <indexer>/);
+            expect(err.message).not.toMatch(/secret/);
+        } finally {
+            fetchSpy.mockRestore();
+        }
+    });
+
+    it('getGrantUsage() takes a grant id and timestamps in the form the client sends them', async () => {
+        const url = `${API}/getGrantUsage(grantId='00000000-0000-4000-8000-000000000000',since='2026-11-01T00:00:00Z',until='2026-11-02T00:00:00Z')`;
+        await expect(cap.GET(url)).rejects.toMatchObject({ response: { status: 404 } });
+    });
 });
 
 // ----------------------------------------------------------------------------

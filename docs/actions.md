@@ -122,7 +122,7 @@ Every limited call belongs to one rate class with a fixed window and one count. 
 | `admin` | hour | 10 | caller | `createAgentGrant`, `createAgentGrants`, `updateAgentGrant`, `rotateAgentGrantToken`, `revokeAgentGrant` |
 | `public-verify` | minute | 60 | client address | the functions under `/odata/v4/midnight-verify` |
 
-A grant adds `maxJobsPerHour` and `maxJobsPerDay` per UTC hour and day. A request that fails with a 4xx gives its unit back. Answers carry `RateLimit-Policy` and `RateLimit` headers. A refusal is `429 RATE_LIMITED` with `Retry-After`, not on `$batch` parts. `ContractStates/stateAt` shares one indexer budget for all callers (`NIGHTGATE_STATE_AT_INDEXER_RATE`, default 2 per second).
+A grant adds `maxJobsPerHour` and `maxJobsPerDay` per UTC hour and day. A request that fails with a 4xx gives its unit back. Answers carry `RateLimit-Policy` and `RateLimit` headers. A refusal is `429 RATE_LIMITED` with `Retry-After`, not on `$batch` parts. `ContractStates/stateAt` and `Blocks/ledgerParametersAt` share one indexer budget for all callers (`NIGHTGATE_STATE_AT_INDEXER_RATE`, default 2 per second).
 
 ## Sessions
 
@@ -324,7 +324,7 @@ An empty list means no restriction. Whoever reaches the endpoint can then make y
 
 A grant gives an autonomous agent a bearer token over one wallet session, sent in the `x-agent-token` header. Only its SHA-256 is stored. The token runs as the grant's operator, limited to `allowedActions`. Grantable are `anchorDocument`, `attestAgentOutput`, the `prove*` actions, `grantDisclosure`, `revokeDisclosure`, `reindexDisclosures`, `sponsorFinalized`, `sponsorUnbound`, `sponsorSwap`, `sponsorTransfer`, `postSwapOffer`, `retireSwapOffer`, `grantDisclosureToHolders`, `revokeHolderDisclosure`, `mintFactoryToken` and `burnFactoryToken`. Every other action answers 403 under a token.
 
-Always allowed under any token, without budget: entity reads (session entities narrowed to the grant's session, `GranteeIdentities` 403), the chain read functions including `ContractStates/stateAt`, the verify functions, `prepareDocumentProof`, `prepareMembershipSet`, `deriveTokenType`, `listSwapOffers`, `getSwapOffer`, `claimDisclosure`, `getJobStatus` and `getGrantUsage` for its own grant. `getSponsorPoolStatus` is 403. These calls still count in their rate class.
+Always allowed under any token, without budget: entity reads (session entities narrowed to the grant's session, `GranteeIdentities` 403), the chain read functions including `ContractStates/stateAt` and `Blocks/ledgerParametersAt`, the verify functions, `prepareDocumentProof`, `prepareMembershipSet`, `deriveTokenType`, `listSwapOffers`, `getSwapOffer`, `claimDisclosure`, `getJobStatus` and `getGrantUsage` for its own grant. `getSponsorPoolStatus` is 403. These calls still count in their rate class.
 
 ### `createAgentGrant(sessionId, allowedActions, maxJobsPerDay?, maxJobsPerHour?, sponsorSessionId?, validUntil?, label?, allowedContracts?, allowedCircuits?, allowDeploy?, maxDeploys?, allowedTokenTypes?, allowUnshieldedOffers?, allowedUnshieldedTokenTypes?, maxValuePerDay?) → { grantId, token, ... }`
 
@@ -346,7 +346,7 @@ Returns a new token once. The old one is 401 from the next request. Budgets and 
 
 Revokes at once. A grant of another user is 404. Rate class `admin`.
 
-### `getGrantUsage(grantId?, since?, until?) → { grantId, since, until, jobs, landed, failed, deploysUsed, maxDeploys, jobsUsedToday, maxJobsPerDay, dustPaid, limits }` (function)
+### `getGrantUsage(grantId?, since?, until?) → { grantId, since, until, jobs, landed, failed, deploysUsed, maxDeploys, maintenanceUpdatesUsed, maxMaintenanceUpdates, jobsUsedToday, maxJobsPerDay, dustPaid, limits }` (function)
 
 Jobs by kind and status between `since` and `until` (default the last 30 days, at most 366). `dustPaid` is the indexed DUST fees of the landed jobs, null without the crawler. `limits` holds `jobsPerHour`, `jobsPerDay`, `valuePerDay` and the rate `classes` the grant can reach, each with what is left. Owner-scoped. A token reads only its own grant and may leave `grantId` empty.
 
@@ -676,12 +676,15 @@ Bound read functions answer what a query cannot, for example `Transactions/byHas
 | `Transactions/byTxId(txId)` | one inclusion, 404 until indexed |
 | `Transactions/ledgerTransaction(hash)` | the ledger transaction as base64, 404 until indexed |
 | `ContractStates/stateAt(contractAddress, height?)` | one snapshot |
+| `Blocks/ledgerParametersAt(height?)` | the ledger parameters in effect, 404 when unknown |
 
 A transaction has two hashes and one or more identifiers. `extrinsicHash` is the hash of the extrinsic, as the node and Substrate tools show it. `txHash` is the hash of the ledger transaction, as explorers and the Midnight indexer show it. A ledger transaction has one or more identifiers, and a job names the last one as its `txId`; `byTxId` finds the transaction by any of them. `indexInBlock` is the position of the transaction in its block. `byHash` and `ledgerTransaction` find a transaction by either. An extrinsic hash can occur in more than one block, because the timestamp transaction repeats its hash.
 
 `Transactions/byTxId` returns `{ txId, extrinsicHash, txHash, blockHeight, blockHash, status, failedSegments }`. `status` is null until the indexer supplement has the result.
 
 `ContractStates/stateAt` returns the state at `height`, default the newest, with `source` `history`, `current` or `indexer`. `blockHash` belongs to the state's block. `ledgerParameters` are those in effect at `height`, default the chain tip, because a contract at rest keeps its old state while the chain moves on. Both are null when unknown. 404 when no state is known. 503 while the crawler holds a newer action than the indexer; retry in a few seconds. 429 `indexer-budget` past the shared budget. 502 `BAD_GATEWAY` when the indexer fails, with the cause in the message and URLs removed.
+
+`Blocks/ledgerParametersAt` returns `{ height, ledgerParameters, coveredHeight, chainHeight }`: the parameters in effect at `height`, default the chain tip, as base64. A builder needs them for a deploy, which has no contract state to read them from. The database answers first, else the indexer under the shared budget. 404 when neither knows them, 429 and 502 as for `stateAt`.
 
 ## Error model
 
@@ -699,7 +702,7 @@ CAP hides every 5xx message under `NODE_ENV=production`. These keep their body a
 | `WALLET_SYNCING` | a wallet read hit the sync gate | 15 s |
 | a retryable submission code | the JSON payload with `retryable: true` | none |
 
-`stateAt` keeps its 502 and 503 messages too. Every other 5xx keeps its `code` and withholds the message.
+`stateAt` and `ledgerParametersAt` keep their 502 and 503 messages too. Every other 5xx keeps its `code` and withholds the message.
 
 **Worker classification.** The wallet worker classifies a submit failure once from the SDK error objects and sends `code`, `ledgerCode`, `retryable`, batch `calls` and the cause chain as data.
 

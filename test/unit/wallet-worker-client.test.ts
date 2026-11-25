@@ -11,6 +11,7 @@
 import type { Mock, MockInstance } from 'vitest';
 import cds from '@sap/cds';
 import { WorkerSubmitError } from '../../srv/midnight/wallet-worker-protocol';
+import type { SubmitIntent } from '../../srv/midnight/worker/submit';
 import { isNightgateError, findNightgateError } from '../../srv/utils/errors';
 import { EventEmitter } from 'node:events';
 
@@ -383,6 +384,27 @@ describe('wallet-worker-client', () => {
             // the ttl rides along: the confirmer's deadline for a broadcast that never lands
             expect(persisted).toEqual([expect.objectContaining({ txId: 'id-h1', txHash: 'h1', contractAddress: 'c', circuits: ['increment'], ttl: '2026-09-10T06:31:34.000Z' })]);
             expect(acks).toEqual([{ kind: 'submit-intent-ack', txId: 'id-h1', ok: true }]);
+        });
+
+        it('every field the worker announces reaches the hook', async () => {
+            const announced: SubmitIntent = {
+                txId: 'id-all', txHash: 'h-all', contractAddress: 'c', circuits: ['<maintenance>'], note: 'n', sponsorAccountId: 'sp',
+                deployed: ['d1'], maintained: ['m1'], ttl: '2026-11-24T23:00:00.000Z',
+                segments: [{ segment: 1, calls: ['<maintenance>'] }], minted: ['t1'], nullifiers: ['nf1'],
+                unshielded: [{ type: 'u1', amount: '5', to: 'c' }], transfer: { tokenType: 'u1', amount: '5', to: 'addr' }
+            };
+            await startWithResponder((msg) => {
+                msg.port.on('message', (m: any) => { if (m?.kind === 'submit-intent-ack') msg.port.postMessage({ ok: true, result: { txHash: 'h-all' } }); });
+                msg.port.postMessage({ kind: 'submit-intent', ...announced });
+                return undefined;
+            });
+            const persisted: SubmitIntent[] = [];
+            await walletSubmitContractCall({
+                sessionId: 's1', proxyId: 'p', contractName: 'counter', contractAddress: 'c', circuit: 'increment', args: [],
+                registration: { artifactPath: '/a', privateStateId: 'p', zkConfigPath: '/zk' },
+                indexerHttpUrl: '', indexerWsUrl: '', proofServerUrl: '', networkId: 'preprod'
+            } as any, async (intent) => { persisted.push(intent); });
+            expect(persisted).toEqual([announced]);
         });
 
         it('a worker answer that arrives while the intent is still being persisted settles after the hook, and no ack follows', async () => {

@@ -619,6 +619,26 @@ describe('connect: the chain reads a transaction builder needs', () => {
         expect(calls[1].url).toMatch(/height=12\)$/);
     });
 
+    test('ledgerParametersAt asks Blocks with a null height for the tip and is null on 404', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([{ body: { height: null, ledgerParameters: 'bHA=' } }, { status: 404, body: { error: { message: 'no ledger parameters known at height 3' } } }]);
+        const ng = connect({ baseUrl: 'https://ng.example', fetchFn: fn as any });
+        expect(await ng.ledgerParametersAt()).toEqual(expect.objectContaining({ ledgerParameters: 'bHA=' }));
+        expect(calls[0].url).toBe('https://ng.example/odata/v4/midnight/Blocks/ledgerParametersAt(height=null)');
+        expect(await ng.ledgerParametersAt({ height: 3 })).toBeNull();
+        expect(calls[1].url).toMatch(/ledgerParametersAt\(height=3\)$/);
+    });
+
+    test('getGrantUsage leaves out what the caller did not give', async () => {
+        const { connect } = await importClient();
+        const { fn, calls } = fakeFetch([{ body: { grantId: 'g1', maintenanceUpdatesUsed: 2 } }, { body: { grantId: 'g1' } }]);
+        const ng = connect({ baseUrl: 'https://ng.example', agentToken: 'ngat_x', fetchFn: fn as any });
+        expect(await ng.getGrantUsage()).toEqual(expect.objectContaining({ maintenanceUpdatesUsed: 2 }));
+        expect(calls[0].url).toBe('https://ng.example/odata/v4/midnight/getGrantUsage()');
+        await ng.getGrantUsage({ grantId: 'g1', since: '2026-11-01T00:00:00Z' });
+        expect(calls[1].url).toBe("https://ng.example/odata/v4/midnight/getGrantUsage(grantId='g1',since='2026-11-01T00:00:00Z')");
+    });
+
     test('transactionByTxId is null on 404 and the inclusion otherwise', async () => {
         const { connect } = await importClient();
         const { fn, calls } = fakeFetch([{ status: 404, body: { error: { message: 'no indexed transaction carries identifier ffff' } } }]);

@@ -180,6 +180,20 @@ async function askedParameters(fetchParameters: LedgerParametersFetcher, height:
     }
 }
 
+export interface LedgerParametersSnapshot extends Pick<ContractStateSnapshot, 'coveredHeight' | 'chainHeight'> {
+    /** The requested block. Null for the chain tip. */
+    height: number | null;
+    /** Base64. */
+    ledgerParameters: string;
+}
+
+/** The ledger parameters in effect at `height`, or at the chain tip. Null if neither the database nor the indexer knows them. */
+export async function ledgerParametersAt(db: DbService, height: number | null, fetchParameters: LedgerParametersFetcher): Promise<LedgerParametersSnapshot | null> {
+    const ledgerParameters = await storedParameters(db, height) ?? await fetchParameters(height);
+    if (!ledgerParameters) return null;
+    return { height, ledgerParameters, ...await coverageOf(db) };
+}
+
 // A contract at rest keeps its old state while the chain changes its parameters, so they follow the
 // requested height and not the block of the state. A call built on older ones partitions wrongly.
 async function withBlockOf(db: DbService, snapshot: LocatedSnapshot, requestedHeight: number | null, fetchParameters: LedgerParametersFetcher): Promise<ContractStateSnapshot> {

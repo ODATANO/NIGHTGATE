@@ -117,6 +117,7 @@ export const AGENT_ALWAYS_ALLOWED_EVENTS: ReadonlySet<string> = new Set([
     // but CAP reports each one as its own event.
     'byHash', 'byTxId', 'ledgerTransaction', // Transactions
     'stateAt',                               // ContractStates
+    'ledgerParametersAt',                    // Blocks
     // getSponsorPoolStatus is excluded. Running as the issuer, a token would see
     // all sponsor sessions of that user.
 ]);
