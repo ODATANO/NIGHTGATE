@@ -40,6 +40,9 @@ vi.mock('@sap/cds', () => {
     return cds;
 });
 
+// The index check needs the model; its own tests boot the services.
+vi.mock('../../srv/utils/indexed-reads', () => ({ attachIndexedReads: vi.fn() }));
+
 import NightgateAnalyticsService from '../../srv/analytics-service';
 
 describe('NightgateAnalyticsService', () => {

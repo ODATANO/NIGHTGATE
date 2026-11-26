@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.47.6 - 2026-11-26
+
+### Changed
+
+- `Blocks`, `Transactions`, `TransactionResults`, `TransactionFees`,
+  `ContractActions`, `DustLedgerEvents` and `BlockStatistics` filter and
+  sort by indexed columns only. A `$filter` without a condition on an
+  indexed column, or a `$orderby` that does not start with one, answers
+  400 `QUERY_NOT_INDEXED`. A read along a key or a navigation takes any
+  filter, `$count=true` stays allowed.
+- At most 4 reads of one caller run at the same time
+  (`NIGHTGATE_QUERY_CONCURRENCY`); one more answers 429.
+- The time limit `NIGHTGATE_QUERY_TIMEOUT_MS` also bounds the read
+  functions, such as `byHash`, `stateAt` and the analytics counts.
+
+### Fixes
+
+- Index `ng_transactionidentifiers_tx` on
+  `TransactionIdentifiers.transaction_ID`. The crawler deleted the rows of
+  each decoded transaction by reading the whole table.
+
+No schema change. The index is created at the start.
+
 ## 0.47.5 - 2026-11-26
 
 `@odatano/nightgate-tx` 0.26.1 ships with it; the bullets that name it are its changes.

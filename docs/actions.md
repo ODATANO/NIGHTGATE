@@ -645,11 +645,13 @@ curl "http://localhost:4004/odata/v4/midnight/Blocks?\$filter=hash eq '0x718C…
 
 A read returns at most 1000 rows. When more exist, the answer carries `@odata.nextLink`, the address of the next page. `$count=true` adds the total. `createdAt` is the time the server stored the row.
 
-Reads have three limits:
+Reads have these limits:
 
 - Every read counts in the rate class `query`, 600 per minute per caller. Past it the answer is 429 with `Retry-After`.
+- A caller runs at most 4 reads at the same time (`NIGHTGATE_QUERY_CONCURRENCY`). One more answers 429 with `Retry-After`. `getJobStatus` does not count.
 - A `$batch` carries at most 20 requests (`NIGHTGATE_BATCH_MAX_PARTS`), and each counts as one read. A larger one answers 429 `BATCH_TOO_MANY_REQ`.
-- On PostgreSQL a read that runs longer than 15 seconds (`NIGHTGATE_QUERY_TIMEOUT_MS`) is stopped and answers 504 `QUERY_TIMEOUT`. Narrow the filter or sort by a column the table below uses. SQLite has no such limit.
+- On PostgreSQL a read or a read function that runs longer than 15 seconds (`NIGHTGATE_QUERY_TIMEOUT_MS`) is stopped and answers 504 `QUERY_TIMEOUT`. SQLite has no such limit.
+- `Blocks`, `Transactions`, `TransactionResults`, `TransactionFees`, `ContractActions`, `DustLedgerEvents` and `BlockStatistics` filter and sort by indexed columns only. A `$filter` needs one condition on an indexed column with `eq`, `lt`, `le`, `gt`, `ge` or `in`, joined to the rest with `and`. A `$orderby` starts with an indexed column. Otherwise the answer is 400 `QUERY_NOT_INDEXED`, and its message names the indexed columns. A read along a key or a navigation, such as `Blocks(<ID>)/transactions`, takes any filter. `$count=true` is allowed.
 
 The order of the chain is on the row. `Transactions`, `ContractActions` and `UnshieldedUtxos` carry `blockHeight` and `indexInBlock`, the place of the transaction in its block, next to their own `actionIndex` or `outputIndex`. A UTXO has the place of the transaction that created it. Sort by these columns, all ascending or all descending. `createdAt` is the time the server stored a row, the same for every row of a block, and says nothing about their order.
 

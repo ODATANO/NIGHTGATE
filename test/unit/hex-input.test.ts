@@ -73,15 +73,15 @@ describe('a filter finds a stored hex value in either spelling', () => {
 
     test.each([
         ['the operand left of the operator', 'Blocks', `'0x${BLOCK_HASH.toUpperCase()}' eq hash`],
-        ['a second hex field', 'Blocks', `author eq '0x${AUTHOR}'`],
+        ['a second hex field', 'Blocks', `height eq 7 and author eq '0x${AUTHOR}'`],
         ['a list', 'Blocks', `hash in ('0x${BLOCK_HASH}','0x${TIP}')`],
-        ['a negated group', 'Blocks', `not (hash ne '0x${BLOCK_HASH}')`],
-        ['startswith', 'Blocks', `startswith(hash,'0xABAB')`],
-        ['contains', 'Blocks', `contains(hash,'ABAB')`],
-        ['a field behind an association', 'Transactions', `block/hash eq '0x${BLOCK_HASH}'`],
-        ['a field inside any()', 'Blocks', `transactions/any(t:t/extrinsicHash eq '0x${TX_HASH.toUpperCase()}')`],
+        ['a negated group', 'Blocks', `height eq 7 and not (hash ne '0x${BLOCK_HASH}')`],
+        ['startswith', 'Blocks', `height eq 7 and startswith(hash,'0xABAB')`],
+        ['contains', 'Blocks', `height eq 7 and contains(hash,'ABAB')`],
+        ['a field behind an association', 'Transactions', `blockHeight eq 7 and block/hash eq '0x${BLOCK_HASH}'`],
+        ['a field inside any()', 'Blocks', `height eq 7 and transactions/any(t:t/extrinsicHash eq '0x${TX_HASH.toUpperCase()}')`],
         ['the ledger hash', 'Transactions', `txHash eq '0x${LEDGER_HASH}'`],
-        ['a contract address', 'Transactions', `contractAddress eq '0x${CONTRACT.toUpperCase()}'`],
+        ['a contract address', 'Transactions', `blockHeight eq 7 and contractAddress eq '0x${CONTRACT.toUpperCase()}'`],
         ['the actions of a contract', 'ContractActions', `contractAddress eq '0X${CONTRACT.toUpperCase()}'`]
     ])('%s', async (_name, entity, expression) => {
         const r = await filter(entity, expression);
@@ -136,13 +136,13 @@ describe('an operand that is not hex', () => {
     });
 
     test('is left alone on a field that is not hex', async () => {
-        const r = await filter('Transactions', `circuit eq '0xAB'`);
+        const r = await filter('Transactions', `blockHeight eq 7 and circuit eq '0xAB'`);
         expect(r.status).toBe(200);
         expect(r.data.value).toHaveLength(1);
     });
 
     test('null still compares', async () => {
-        const r = await filter('Blocks', 'stateRoot eq null');
+        const r = await filter('Blocks', 'height eq 7 and stateRoot eq null');
         expect(r.status).toBe(200);
         expect(r.data.value).toHaveLength(1);
     });

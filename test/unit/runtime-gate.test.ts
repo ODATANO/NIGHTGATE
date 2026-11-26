@@ -8,7 +8,7 @@
  */
 import cds from '@sap/cds';
 import { __resetRuntimeStateForTests, publishRuntimeState, readRuntimeState, noteCrawlerRunning } from '../../srv/utils/runtime-state';
-import { attachReadLimits, isRuntimeWriteEvent, runtimeUnavailableReason, RUNTIME_FREE_ACTIONS } from '../../srv/utils/runtime-gate';
+import { attachReadLimits, isRuntimeWriteEvent, runtimeUnavailableReason, RUNTIME_FREE_ACTIONS, __resetRunningReadsForTests } from '../../srv/utils/runtime-gate';
 import { __resetRateLimitersForTests } from '../../srv/utils/rate-classes';
 
 (cds as any).env.requires.auth = {
@@ -138,18 +138,22 @@ describe('offline runtime on the served API', () => {
 
 describe('the time limit of an entity read', () => {
     type Hook = (req: Record<string, unknown>) => Promise<void>;
-    const hookOf = (functions: string[] = []): Hook => {
+    const hookOf = (functions: string[] = [], untimed: string[] = []): Hook => {
         let hook: Hook | undefined;
-        attachReadLimits({ before: (_event: string, handler: Hook) => { hook = handler; } } as never, functions);
+        attachReadLimits({ before: (_event: string, handler: Hook) => { hook = handler; } } as never, functions, untimed);
         return hook!;
     };
-    const request = (event: string) => ({ event, user: { id: 'reader' }, reject: vi.fn() });
+    const request = (event: string) => {
+        const done: Array<() => void> = [];
+        return { event, user: { id: 'reader' }, reject: vi.fn(), on: (_event: string, listener: () => void) => { done.push(listener); }, end: () => done.forEach(l => l()) };
+    };
     const database = (cds as any).env.requires.db;
     const savedKind = database.kind;
     let run: ReturnType<typeof vi.spyOn>;
 
     beforeEach(() => {
         __resetRateLimitersForTests();
+        __resetRunningReadsForTests();
         run = vi.spyOn(cds.db, 'run').mockResolvedValue(undefined as never);
     });
     afterEach(() => {
@@ -164,10 +168,16 @@ describe('the time limit of an entity read', () => {
         expect(run).toHaveBeenCalledWith('SET LOCAL statement_timeout = 15000');
     });
 
-    test('is left out on SQLite, for a counted function and when switched off', async () => {
+    test('is set for a read function', async () => {
+        database.kind = 'postgres';
+        await hookOf(['getBlockCount'])(request('getBlockCount'));
+        expect(run).toHaveBeenCalledWith('SET LOCAL statement_timeout = 15000');
+    });
+
+    test('is left out on SQLite, for an untimed function and when switched off', async () => {
         await hookOf()(request('READ'));
         database.kind = 'postgres';
-        await hookOf(['getJobStatus'])(request('getJobStatus'));
+        await hookOf([], ['getJobStatus'])(request('getJobStatus'));
         process.env.NIGHTGATE_QUERY_TIMEOUT_MS = '0';
         await hookOf()(request('READ'));
         expect(run).not.toHaveBeenCalled();
@@ -199,6 +209,31 @@ describe('the time limit of an entity read', () => {
             expect(run).toHaveBeenCalledTimes(1);
         } finally {
             delete process.env.NIGHTGATE_QUERY_RATE_LIMIT;
+        }
+    });
+
+    test('a caller runs at most the configured number of reads at once', async () => {
+        process.env.NIGHTGATE_QUERY_CONCURRENCY = '2';
+        try {
+            const hook = hookOf(['getBlockCount'], ['getJobStatus']);
+            const first = request('READ');
+            await hook(first);
+            await hook(request('getBlockCount'));
+            const third = request('READ');
+            await hook(third);
+            expect(third.reject).toHaveBeenCalledWith(429, expect.stringMatching(/query: 2 reads at the same time/));
+            const poll = request('getJobStatus');
+            await hook(poll);
+            expect(poll.reject).not.toHaveBeenCalled();
+            first.end();
+            const fourth = request('READ');
+            await hook(fourth);
+            expect(fourth.reject).not.toHaveBeenCalled();
+            const other = { ...request('READ'), user: { id: 'someone-else' } };
+            await hook(other);
+            expect(other.reject).not.toHaveBeenCalled();
+        } finally {
+            delete process.env.NIGHTGATE_QUERY_CONCURRENCY;
         }
     });
 });

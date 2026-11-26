@@ -6,6 +6,7 @@ import { normalizeHttpError } from './utils/http-errors';
 import { attachHexInput } from './utils/hex-input';
 import { attachInt64Results } from './utils/numbers';
 import { attachReadLimits } from './utils/runtime-gate';
+import { attachIndexedReads } from './utils/indexed-reads';
 
 export default class NightgateAnalyticsService extends cds.ApplicationService {
     private db!: cds.DatabaseService;
@@ -14,6 +15,7 @@ export default class NightgateAnalyticsService extends cds.ApplicationService {
         this.on('error', normalizeHttpError);
         attachReadLimits(this, ['getBlockCount', 'getTransactionCount', 'getContractCount', 'getAverageTransactionsPerBlock']);
         attachHexInput(this);
+        attachIndexedReads(this, ['BlockStatistics']);
         attachInt64Results(this);
         this.db = await cds.connect.to('db');
 

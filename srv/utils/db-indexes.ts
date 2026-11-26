@@ -34,6 +34,8 @@ export const NIGHTGATE_INDEXES: readonly IndexSpec[] = [
     { name: 'ng_transactions_sender', table: 'midnight_Transactions', columns: ['senderAddress'] },
     { name: 'ng_transactions_receiver', table: 'midnight_Transactions', columns: ['receiverAddress'] },
     { name: 'ng_transactionresults_tx', table: 'midnight_TransactionResults', columns: ['transaction_ID'] },
+    // The key starts with txId. The decode pass and the rollback delete by transaction.
+    { name: 'ng_transactionidentifiers_tx', table: 'midnight_TransactionIdentifiers', columns: ['transaction_ID'] },
     // Used when data from the Midnight indexer is updated or deleted per transaction.
     { name: 'ng_transactionfees_tx', table: 'midnight_TransactionFees', columns: ['transaction_ID'] },
     { name: 'ng_transactionsegments_result', table: 'midnight_TransactionSegments', columns: ['transactionResult_ID'] },

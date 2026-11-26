@@ -3,8 +3,9 @@
 import cds from '@sap/cds';
 import { isBackgroundFenced } from './instance-lease';
 import { readRuntimeState, type RuntimeState } from './runtime-state';
-import { checkRateClass } from './rate-classes';
-import { configMs } from './config';
+import { checkRateClass, rejectRateLimited } from './rate-classes';
+import { principalRateKey } from './rate-limiter';
+import { configMs, configNumber } from './config';
 import type { Request } from '@sap/cds';
 
 /** Actions that only compute or use the database. They need no wallet worker, node or proof server. */
@@ -65,22 +66,48 @@ export function attachRuntimeGate(srv: cds.ApplicationService): void {
     });
 }
 
-/** On PostgreSQL the database stops a statement of the running read after the time limit. The setting ends with the read's transaction. */
+/** On PostgreSQL the database stops a statement of the running read after the time limit. The setting ends with its transaction. */
 async function boundReadTime(): Promise<void> {
     const ms = Math.floor(configMs('NIGHTGATE_QUERY_TIMEOUT_MS'));
     if (ms <= 0 || !/postgres/i.test(String(cds.env.requires?.db?.kind ?? ''))) return;
     await cds.db.run(`SET LOCAL statement_timeout = ${ms}`);
 }
 
-/** Counts every entity read and each call of `functions` in the rate class `query`, and bounds the time of an entity read. */
-export function attachReadLimits(srv: cds.ApplicationService, functions: readonly string[] = []): void {
-    const counted = new Set<string>(['READ', ...functions]);
+const runningReads = new Map<string, number>();
+
+/** Holds one of the caller's concurrent reads until the request's transaction ends. False after a 429. */
+function holdReadSlot(req: Request): boolean {
+    const key = principalRateKey(req, 'query');
+    const limit = configNumber('NIGHTGATE_QUERY_CONCURRENCY');
+    const running = runningReads.get(key) ?? 0;
+    if (running >= limit) {
+        rejectRateLimited(req, { name: 'query', limit, windowSeconds: 1, retryAfterMs: 1000, detail: `query: ${limit} reads at the same time` });
+        return false;
+    }
+    runningReads.set(key, running + 1);
+    req.on('done', () => {
+        const left = (runningReads.get(key) ?? 1) - 1;
+        if (left > 0) runningReads.set(key, left);
+        else runningReads.delete(key);
+    });
+    return true;
+}
+
+/** Counts every entity read and each call of `functions` and `untimed` in the rate class `query`.
+ *  Entity reads and `functions` are bounded in time and in how many run at once. `untimed` reads outside the request's transaction. */
+export function attachReadLimits(srv: cds.ApplicationService, functions: readonly string[] = [], untimed: readonly string[] = []): void {
+    const timed = new Set<string>(['READ', ...functions]);
     srv.before('*', async (req: Request) => {
         const event = String(req.event ?? '');
-        if (!counted.has(event)) return;
+        if (!timed.has(event) && !untimed.includes(event)) return;
         // The key of the count is the caller's grant, which the token check sets.
         if (req.agentPrincipalReady) await req.agentPrincipalReady;
         if (!checkRateClass('query', 'query', req)) return;
-        if (event === 'READ') await boundReadTime();
+        if (!timed.has(event) || !holdReadSlot(req)) return;
+        await boundReadTime();
     });
+}
+
+export function __resetRunningReadsForTests(): void {
+    runningReads.clear();
 }

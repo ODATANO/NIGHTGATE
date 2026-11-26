@@ -55,6 +55,7 @@ export const ERROR_CODES = {
     RUNTIME_TOPOLOGY_UNSUPPORTED: { status: 503, doc: 'The deployment topology (replicas, multitenancy, database) is not supported.' },
     PUBLIC_VERIFY_DISABLED: { status: 404, doc: 'Unauthenticated verification is not enabled on this server.' },
     QUERY_TIMEOUT: { status: 504, doc: 'A read ran longer than its time limit and was stopped; narrow the filter or sort by an indexed column.' },
+    QUERY_NOT_INDEXED: { status: 400, doc: 'A read of a chain table filters or sorts by a column without an index; the message names the columns that have one.' },
     PURE_CIRCUITS_UNAVAILABLE: { status: 404, doc: 'The artifact does not export the pure circuits this operation needs.' },
     TOKEN_FACTORY_UNAVAILABLE: { status: 404, doc: 'No token-factory lineage is registered, or the artifact is not one.' },
     RUNTIME_UNAVAILABLE: { status: 503, retryable: true, doc: 'The runtime did not start (schema, network or worker); see getRuntimeInfo.' },

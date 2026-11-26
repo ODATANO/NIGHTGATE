@@ -3,6 +3,7 @@ import cds from '@sap/cds';
 import { registerWalletSessionHandlers, startSessionCleanup } from './sessions/wallet-sessions';
 import { attachAgentGrantEnforcement, registerAgentGrantHandlers, awaitAgentPrincipal } from './sessions/agent-grants';
 import { attachRuntimeGate, attachReadLimits } from './utils/runtime-gate';
+import { attachIndexedReads } from './utils/indexed-reads';
 import { attachHexInput } from './utils/hex-input';
 import { attachInt64Results } from './utils/numbers';
 import { registerSubmissionHandlers } from './submission/handlers';
@@ -230,8 +231,9 @@ export default class NightgateService extends cds.ApplicationService {
         attachAgentGrantEnforcement(this, this.db);
 
         attachRuntimeGate(this);
-        attachReadLimits(this, ['byHash', 'byTxId', 'ledgerTransaction', 'stateAt', 'ledgerParametersAt', 'getJobStatus']);
+        attachReadLimits(this, ['byHash', 'byTxId', 'ledgerTransaction', 'stateAt', 'ledgerParametersAt'], ['getJobStatus']);
         attachHexInput(this);
+        attachIndexedReads(this, ['Blocks', 'Transactions', 'TransactionResults', 'TransactionFees', 'ContractActions', 'DustLedgerEvents']);
         attachInt64Results(this);
 
         this.on('READ', 'Blocks', async (req) => {

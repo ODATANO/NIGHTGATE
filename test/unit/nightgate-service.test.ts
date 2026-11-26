@@ -436,9 +436,8 @@ describe('ContractActions', () => {
         expect(newest.data.value.map((a: any) => a.circuit)).toEqual(['fifth', 'fourth']);
         const fromBlock2 = await read('ContractActions', "$filter=contractAddress eq 'c1' and blockHeight ge 2&$orderby=blockHeight,indexInBlock,actionIndex");
         expect(fromBlock2.data.value.map((a: any) => a.circuit)).toEqual(['fifth']);
-        // The insert time gives no order within the block: the same read by createdAt follows the row IDs.
-        const byInsertTime = await read('ContractActions', "$filter=contractAddress eq 'c1'&$orderby=createdAt");
-        expect(byInsertTime.data.value.map((a: any) => a.circuit)).toEqual(['fifth', 'fourth', 'third', 'second', 'first']);
+        // The insert time gives no order within the block, and no index serves it.
+        await expect(read('ContractActions', "$filter=contractAddress eq 'c1'&$orderby=createdAt")).rejects.toThrow(/QUERY_NOT_INDEXED|\$orderby must start/);
     });
 });
 
