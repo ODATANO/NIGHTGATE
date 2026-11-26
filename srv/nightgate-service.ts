@@ -27,7 +27,7 @@ import { rejectRateLimited } from './utils/rate-classes';
 import { Blocks, Transactions, TransactionIdentifiers, TransactionResults, TransactionSegments, type TransactionResult, type TransactionSegment, type Transaction as IndexedTransaction, type BackgroundJob } from '#cds-models/midnight';
 import { normalizeHttpError } from './utils/http-errors';
 import { messageWithoutUrls } from './utils/errors';
-import { getJobStatus, Block, ContractState, Transaction } from '#cds-models/NightgateService';
+import { getJobStatus, Block, ContractState, Transaction, Transactions as ServedTransactions } from '#cds-models/NightgateService';
 import { narrowRead } from './utils/request-types';
 
 // One limit for all callers of this server, because an indexer may block the host's IP after too many requests.
@@ -247,7 +247,7 @@ export default class NightgateService extends cds.ApplicationService {
             if (!hash) return req.reject(400, 'hash is required');
             const page = listPage(req.data, 100);
             return this.db.run(
-                cds.ql.SELECT.from(Transactions).where`extrinsicHash = ${hash} or txHash = ${hash}`
+                cds.ql.SELECT.from(ServedTransactions).where`extrinsicHash = ${hash} or txHash = ${hash}`
                     .orderBy('blockHeight desc', 'indexInBlock desc').limit(page.limit, page.skip)
             );
         });

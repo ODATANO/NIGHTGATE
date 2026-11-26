@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.47.5 - 2026-11-26
+
+`@odatano/nightgate-tx` 0.26.1 ships with it; the bullets that name it are its changes.
+
+### Fixes
+
+- `Transactions/byHash` answers with the columns of the service entity. It
+  returned `identifiers`, `merkleTreeRoot`, `startIndex` and `endIndex`,
+  which the service leaves out.
+- nightgate-tx: the README names the pinned packages with their scopes and
+  midnight-js 5.0.3.
+
+No schema change.
+
 ## 0.47.4 - 2026-11-26
 
 `@odatano/nightgate-tx` 0.26.0 ships with it; the bullets that name it are its changes.

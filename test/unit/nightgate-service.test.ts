@@ -303,6 +303,16 @@ describe('Transactions', () => {
         expect(res[0].extrinsicHash).toBe('abc1');
     });
 
+    it('byHash() leaves out the columns the service excludes', async () => {
+        await seedTransaction(await seedBlock(1), { extrinsicHash: 'abc3' });
+
+        const res = await cap.GET(`${API}/Transactions/byHash(hash='abc3')`);
+        expect(res.data.value).toHaveLength(1);
+        for (const column of ['identifiers', 'merkleTreeRoot', 'startIndex', 'endIndex']) {
+            expect(res.data.value[0]).not.toHaveProperty(column);
+        }
+    });
+
     it('allows the same extrinsic hash in different blocks', async () => {
         const firstBlock = await seedBlock(1);
         const secondBlock = await seedBlock(2);
