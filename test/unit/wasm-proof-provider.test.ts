@@ -19,7 +19,7 @@ vi.mock('@midnightntwrk/zkir-v3', () => ({
 
 const zkConfigToProvingKeyMaterial = vi.hoisted(() => (vi.fn((cfg: any) => ({ converted: cfg }))));
 const createLedger9ProofProvider = vi.hoisted(() => (vi.fn((pp: any) => ({ proveTx: vi.fn(), from: pp }))));
-vi.mock('@midnight-ntwrk/midnight-js-types', () => ({
+vi.mock('@midnightntwrk/midnight-js-types', () => ({
     zkConfigToProvingKeyMaterial,
     createLedger9ProofProvider
 }));

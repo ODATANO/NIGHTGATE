@@ -41,7 +41,7 @@ Node and indexer are built in for preview and for undeployed, the name of a loca
 | `indexerHttpUrl` | built in on preview, undeployed | Indexer GraphQL for the wallet SDK and the verify functions. Required on every other network |
 | `indexerWsUrl` | derived from `indexerHttpUrl` | Subscription endpoint, only for a non-standard indexer |
 | `proofServerUrl` | `http://localhost:6300` in server mode | Setting it selects server proving. Unset means wasm |
-| `proofTimeoutMs` | `300000` | One proof request in server mode. midnight-js retries up to three times |
+| `proofTimeoutMs` | `300000` | One proof request in server mode, retries included; a timed-out request is not retried |
 | `contracts` | the five lineages in `package.json`: `counter`, `attestation-vault`, `attestation-vault-32`, `holder-registry`, `token-factory` | `<ref>` to `{ package }` or `{ artifactPath, privateStateId, zkConfigPath }`. A relative path counts from the working directory. Optional `slotWidth` 16 or 32 for a vault artifact, `address` for `/contract-manifest` |
 | `sessionTtlMs` | `86400000` | Wallet session lifetime |
 | `closeSessionsOnRestart` | `true` | Close the previous process's wallet sessions at startup. Fee-sponsor sessions are exempt |

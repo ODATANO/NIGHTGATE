@@ -10,7 +10,7 @@ export {
     buildAttestationVaultWitnesses
 } from './witnesses.mjs';
 
-export { FetchZkConfigProvider } from '@midnight-ntwrk/midnight-js-fetch-zk-config-provider';
+export { FetchZkConfigProvider } from '@midnightntwrk/midnight-js-fetch-zk-config-provider';
 export { InMemoryPrivateStateProvider } from './private-state.mjs';
 export { createNightgateConnectorProviders, buildProofProvider, resolveManifestUrl } from './providers.mjs';
 export { connectContract } from './contract.mjs';

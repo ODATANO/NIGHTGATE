@@ -8,7 +8,7 @@ import { configNumber } from '../utils/config';
 import { NightgateError, messageWithoutUrls } from '../utils/errors';
 import { indexerQuery } from '../utils/indexer-graphql';
 import type { ContractState } from '@midnight-ntwrk/compact-runtime';
-import type { PublicDataProvider } from '@midnight-ntwrk/midnight-js-types';
+import type { PublicDataProvider } from '@midnightntwrk/midnight-js-types';
 
 export interface IndexerEndpoints {
     indexerHttpUrl: string;

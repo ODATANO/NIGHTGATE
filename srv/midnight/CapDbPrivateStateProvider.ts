@@ -20,7 +20,7 @@ import { bareHex } from '../utils/hex-patterns';
 import type {
     ContractPrivateStates, ExportPrivateStatesOptions, ExportSigningKeysOptions, ImportPrivateStatesOptions, ImportPrivateStatesResult,
     ImportSigningKeysOptions, ImportSigningKeysResult, PrivateStateExport, PrivateStateId, PrivateStateProvider, SigningKeyExport
-} from '@midnight-ntwrk/midnight-js-types';
+} from '@midnightntwrk/midnight-js-types';
 
 export type { SigningKeyExport };
 

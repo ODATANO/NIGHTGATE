@@ -92,7 +92,7 @@ describe.each(['@odatano/contract-attestation-vault', '@odatano/contract-attesta
     beforeAll(async () => {
         rt = await import('@midnight-ntwrk/compact-runtime');
         const kit: any = await import('@odatano/contract-kit');
-        const { SerializedContractState } = await import('@midnight-ntwrk/midnight-js-types');
+        const { SerializedContractState } = await import('@midnightntwrk/midnight-js-types');
         serializedContractState = (bytes) => SerializedContractState.fromBytes('v9', bytes);
         const mod = await import(pathToFileURL(pkg.artifactPath).href);
         const id = rt.persistentHash(new rt.CompactTypeBytes(32), SECRET);

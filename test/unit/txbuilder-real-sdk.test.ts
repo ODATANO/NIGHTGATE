@@ -51,12 +51,12 @@ function apiProvider() {
 
 beforeAll(async () => {
     ledger = await import('@midnightntwrk/ledger-v9');
-    contracts = await import('@midnight-ntwrk/midnight-js-contracts');
-    mjTypes = await import('@midnight-ntwrk/midnight-js-types');
-    mjUtils = await import('@midnight-ntwrk/midnight-js-utils');
-    mjProtocol = await import('@midnight-ntwrk/midnight-js-protocol');
+    contracts = await import('@midnightntwrk/midnight-js-contracts');
+    mjTypes = await import('@midnightntwrk/midnight-js-types');
+    mjUtils = await import('@midnightntwrk/midnight-js-utils');
+    mjProtocol = await import('@midnightntwrk/midnight-js-protocol');
     const { CompiledContract } = await import('@midnight-ntwrk/compact-js');
-    const { NodeZkConfigProvider } = await import('@midnight-ntwrk/midnight-js-node-zk-config-provider');
+    const { NodeZkConfigProvider } = await import('@midnightntwrk/midnight-js-node-zk-config-provider');
     ({ InMemoryPrivateStateProvider } = await import('@odatano/contract-kit' as string));
     ({ apiPublicDataProvider } = await import('../../src/txbuilder/api-provider.mjs' as string));
     ({ applyGasHeadroom } = await import('../../src/txbuilder/internals.mjs' as string));

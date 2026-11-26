@@ -2,7 +2,7 @@
 // The indexer, proof and wallet proving packages load only when used.
 // Paying the fee and submitting the transaction are left to the app.
 
-import { FetchZkConfigProvider } from '@midnight-ntwrk/midnight-js-fetch-zk-config-provider';
+import { FetchZkConfigProvider } from '@midnightntwrk/midnight-js-fetch-zk-config-provider';
 import { InMemoryPrivateStateProvider } from './private-state.mjs';
 
 /** Turns a manifest URL into an absolute URL. The server sends relative URLs unless a public base URL is configured. */
@@ -31,8 +31,8 @@ export async function createNightgateConnectorProviders(opts = {}) {
 
     // Loaded only here, so importing the package stays cheap.
     const [indexerMod, proofMod] = await Promise.all([
-        import('@midnight-ntwrk/midnight-js-indexer-public-data-provider'),
-        import('@midnight-ntwrk/midnight-js-http-client-proof-provider')
+        import('@midnightntwrk/midnight-js-indexer-public-data-provider'),
+        import('@midnightntwrk/midnight-js-http-client-proof-provider')
     ]);
 
     const zkConfigProvider = new FetchZkConfigProvider(entry.zkConfigBaseUrl, {
@@ -88,8 +88,8 @@ export async function buildProofProvider({ proving = 'server', connector, zkConf
     if (connectorCanProve && (proving === 'wallet' || proving === 'auto')) {
         // Loaded only here: proving on a server needs neither package.
         const [{ dappConnectorProofProvider }, { CostModel }] = await Promise.all([
-            import('@midnight-ntwrk/midnight-js-dapp-connector-proof-provider'),
-            import('@midnight-ntwrk/midnight-js-protocol/v9')
+            import('@midnightntwrk/midnight-js-dapp-connector-proof-provider'),
+            import('@midnightntwrk/midnight-js-protocol/v9')
         ]);
         try {
             const proofProvider = await dappConnectorProofProvider(connector, zkConfigProvider, CostModel.initialCostModel());

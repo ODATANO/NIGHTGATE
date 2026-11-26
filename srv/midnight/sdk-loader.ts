@@ -1,7 +1,7 @@
 // Loads the Midnight JS SDK once with a dynamic `import()`, because the SDK is ESM only.
 // Covers only the main thread. The wallet worker loads its own SDK packages.
 
-import type * as IndexerSdk from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
+import type * as IndexerSdk from '@midnightntwrk/midnight-js-indexer-public-data-provider';
 import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
 import type * as LedgerV8 from '@midnightntwrk/ledger-v8';
 
@@ -19,7 +19,7 @@ export async function loadMidnightSdk(): Promise<MidnightSdkBundle> {
     if (inflight) return inflight;
 
     inflight = (async () => {
-        const bundle: MidnightSdkBundle = { indexer: await import('@midnight-ntwrk/midnight-js-indexer-public-data-provider') };
+        const bundle: MidnightSdkBundle = { indexer: await import('@midnightntwrk/midnight-js-indexer-public-data-provider') };
         cachedBundle = bundle;
         return bundle;
     })();

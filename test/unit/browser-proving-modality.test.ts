@@ -13,10 +13,10 @@ import { createHash } from 'node:crypto';
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 
 const dappConnectorProofProvider = vi.hoisted(() => vi.fn(async (connector: unknown, zk: unknown, costModel: unknown) => ({ marker: 'wallet-proof-provider', connector, zk, costModel })));
-vi.mock('@midnight-ntwrk/midnight-js-dapp-connector-proof-provider', () => ({ dappConnectorProofProvider }));
-vi.mock('@midnight-ntwrk/midnight-js-protocol/v9', () => ({ CostModel: { initialCostModel: () => 'initial-cost-model' } }));
-vi.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({ indexerPublicDataProvider: () => ({ marker: 'public-data' }) }));
-vi.mock('@midnight-ntwrk/midnight-js-http-client-proof-provider', () => ({ httpClientProofProvider: (uri: string) => ({ marker: 'http-provider', uri }) }));
+vi.mock('@midnightntwrk/midnight-js-dapp-connector-proof-provider', () => ({ dappConnectorProofProvider }));
+vi.mock('@midnightntwrk/midnight-js-protocol/v9', () => ({ CostModel: { initialCostModel: () => 'initial-cost-model' } }));
+vi.mock('@midnightntwrk/midnight-js-indexer-public-data-provider', () => ({ indexerPublicDataProvider: () => ({ marker: 'public-data' }) }));
+vi.mock('@midnightntwrk/midnight-js-http-client-proof-provider', () => ({ httpClientProofProvider: (uri: string) => ({ marker: 'http-provider', uri }) }));
 
 // Loaded in beforeAll, not at module scope: this file compiles as CommonJS under the repo's
 // tsconfig, where a top-level await is an error. Types come from providers.d.mts.
@@ -164,7 +164,7 @@ describe('createNightgateConnectorProviders: zk config', () => {
     });
 
     it('hands out the key file provider of midnight-js and no helper of its own for wallet proving', async () => {
-        const { FetchZkConfigProvider } = await import('@midnight-ntwrk/midnight-js-fetch-zk-config-provider');
+        const { FetchZkConfigProvider } = await import('@midnightntwrk/midnight-js-fetch-zk-config-provider');
         const browser = await import('../../src/browser/index.mjs' as string);
         expect(browser.FetchZkConfigProvider).toBe(FetchZkConfigProvider);
         const providers = await assemble(served);

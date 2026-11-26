@@ -2,8 +2,8 @@
 // Keys come from the contract's files, or from the SDK for standard circuits. Proving blocks the thread.
 
 import type { KeyMaterialProvider } from '@midnightntwrk/zkir-v2';
-import type { ProofProvider, ZKConfigProvider } from '@midnight-ntwrk/midnight-js-types';
-import type * as MidnightJsTypes from '@midnight-ntwrk/midnight-js-types';
+import type { ProofProvider, ZKConfigProvider } from '@midnightntwrk/midnight-js-types';
+import type * as MidnightJsTypes from '@midnightntwrk/midnight-js-types';
 import type * as CompactJs from '@midnight-ntwrk/compact-js';
 
 /** Supplies the standard circuits' keys and the BLS parameters, as the SDK's `makeDefaultKeyMaterialProvider` does. */
@@ -29,7 +29,7 @@ async function loadDeps(): Promise<WasmProofDeps> {
             const [zkir, zkirV3, mjsTypes, proverEffect, compactJs] = await Promise.all([
                 import('@midnightntwrk/zkir-v2'),
                 import('@midnightntwrk/zkir-v3'),
-                import('@midnight-ntwrk/midnight-js-types'),
+                import('@midnightntwrk/midnight-js-types'),
                 import('@midnightntwrk/wallet-sdk-prover-client/effect'),
                 import('@midnight-ntwrk/compact-js')
             ]);

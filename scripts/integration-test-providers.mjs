@@ -2,9 +2,9 @@
 // Run: node scripts/integration-test-providers.mjs
 
 import WebSocket from 'ws';
-import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
-import { httpClientProofProvider }   from '@midnight-ntwrk/midnight-js-http-client-proof-provider';
-import { NodeZkConfigProvider }      from '@midnight-ntwrk/midnight-js-node-zk-config-provider';
+import { indexerPublicDataProvider } from '@midnightntwrk/midnight-js-indexer-public-data-provider';
+import { httpClientProofProvider }   from '@midnightntwrk/midnight-js-http-client-proof-provider';
+import { NodeZkConfigProvider }      from '@midnightntwrk/midnight-js-node-zk-config-provider';
 import path from 'node:path';
 import os from 'node:os';
 import { createRequire } from 'node:module';

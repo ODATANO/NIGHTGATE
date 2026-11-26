@@ -89,7 +89,7 @@ carries `jobId` and `sessionId`.
 | `attestationSecret` | no | attestation vault only, default derived from the seed |
 | `provingMode` | no | `wasm` (default) proves in-process. `server` proves wallet and contract circuits on `proofServerUrl` |
 | `proofServerUrl` | with `server` | the proof server receives the witnesses and sees the coins you spend. Use only one you run |
-| `proofTimeoutMs` | no | server proving, timeout of one proof request, default 300000. The SDK retries a timed-out proof, so set it above your slowest circuit |
+| `proofTimeoutMs` | no | server proving, deadline of one proof request with its retries, default 300000. A timed-out proof is not retried, so set it above your slowest circuit |
 | `walletSync` | no | `true` (default), `false`, `'shielded'` or `'coins'`. See the table below |
 | `walletState` | no | from `serializeWalletState()`. The sub-wallets in it resume instead of syncing from genesis |
 | `shieldedWallet` | no | a started shielded wallet of the same seed, such as `swap.shieldedWallet`. The builder balances from it and never starts or stops it. Excludes `walletState.shielded` |

@@ -21,13 +21,13 @@ export {
     type AttestationVaultWitnesses
 } from '@odatano/contract-kit';
 
-import { FetchZkConfigProvider } from '@midnight-ntwrk/midnight-js-fetch-zk-config-provider';
-import type { ProofProvider, ZKConfigProvider, ZKConfigRegistry } from '@midnight-ntwrk/midnight-js-types';
+import { FetchZkConfigProvider } from '@midnightntwrk/midnight-js-fetch-zk-config-provider';
+import type { ProofProvider, ZKConfigProvider, ZKConfigRegistry } from '@midnightntwrk/midnight-js-types';
 import type {
     DAppConnectorNetworkAPI,
     DAppConnectorProvingAPI,
     DAppConnectorWalletAPI
-} from '@midnight-ntwrk/midnight-js-dapp-connector-proof-provider';
+} from '@midnightntwrk/midnight-js-dapp-connector-proof-provider';
 
 /** The class of midnight-js that loads a contract's proving files over HTTP, here from `/zk-config/<contract>`: `new FetchZkConfigProvider(baseUrl, { fetchFunc? })`. */
 export { FetchZkConfigProvider };
@@ -46,7 +46,7 @@ export type ProvingModality = 'server' | 'wallet' | 'auto';
 /** Where proofs end up being made. 'none' when the wallet cannot prove and reports no proof server, so the app can only read. */
 export type AssembledProvingModality = 'server' | 'wallet' | 'none';
 
-/** The module that makes a proof provider for a proof server: `@midnight-ntwrk/midnight-js-http-client-proof-provider`. */
+/** The module that makes a proof provider for a proof server: `@midnightntwrk/midnight-js-http-client-proof-provider`. */
 export interface HttpProofModule { httpClientProofProvider(proofServerUrl: string, zkConfigProvider: KeyMaterialSource): ProofProvider }
 
 export interface ConnectorProvidersResult {

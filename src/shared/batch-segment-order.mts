@@ -2,7 +2,7 @@
 // The proof provider is the last point to change the numbers, so the wrapper renumbers them there.
 import { errorMessage } from './error-message.mjs';
 import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
-import type { ProofProvider, UnprovenTx } from '@midnight-ntwrk/midnight-js-types';
+import type { ProofProvider, UnprovenTx } from '@midnightntwrk/midnight-js-types';
 
 const utf8 = new TextDecoder();
 
@@ -29,7 +29,7 @@ let defaultCodec: Promise<UnprovenTxCodec> | undefined;
 export function unprovenTxCodec(): Promise<UnprovenTxCodec> {
     if (codecOverride) return Promise.resolve(codecOverride);
     if (!defaultCodec) {
-        const loading: Promise<UnprovenTxCodec> = Promise.all([import('@midnightntwrk/ledger-v9'), import('@midnight-ntwrk/midnight-js-types')]).then(([ledger, types]) => ({
+        const loading: Promise<UnprovenTxCodec> = Promise.all([import('@midnightntwrk/ledger-v9'), import('@midnightntwrk/midnight-js-types')]).then(([ledger, types]) => ({
             open: (handle) => handle.deserialize({ v9: ledger.Transaction }),
             seal: (tx) => types.LedgerTransaction.seal('v9', 'Unproven', tx)
         }));
@@ -197,14 +197,26 @@ export interface BatchOrderOptions {
 /** The intents in call order, matched by build-time segment id. Null when the ids do not fit the calls. */
 function pickBySegmentIds<I extends AnyIntent>(intents: ReadonlyMap<number, I>, circuitsInOrder: string[], segmentIds: number[] | undefined): Array<[number, I | undefined]> | null {
     if (!segmentIds || segmentIds.length !== circuitsInOrder.length) return null;
-    if (new Set(segmentIds).size !== segmentIds.length) return null;
-    const picked: Array<[number, I | undefined]> = [];
+    const nameOf = (intent: I | undefined) => entryPointName(callOf(intent?.actions?.[0])?.entryPoint);
+    const picked: Array<[number, I | undefined] | undefined> = [];
+    const claimed = new Set<number>();
     for (let i = 0; i < segmentIds.length; i++) {
-        const intent = intents.get(segmentIds[i]);
-        if (entryPointName(callOf(intent?.actions?.[0])?.entryPoint) !== circuitsInOrder[i]) return null;
-        picked.push([segmentIds[i], intent]);
+        const id = segmentIds[i];
+        if (claimed.has(id) || nameOf(intents.get(id)) !== circuitsInOrder[i]) continue;
+        claimed.add(id);
+        picked[i] = [id, intents.get(id)];
     }
-    return picked;
+    // On an id collision the SDK moves the later call's segment at merge, so its build-time id is stale.
+    // Such a call takes the one unclaimed intent of its circuit; two or more of one circuit are ambiguous.
+    for (let i = 0; i < segmentIds.length; i++) {
+        if (picked[i]) continue;
+        const left = [...intents.entries()].filter(([id, intent]) => !claimed.has(id) && nameOf(intent) === circuitsInOrder[i]);
+        const waiting = circuitsInOrder.filter((c, j) => !picked[j] && c === circuitsInOrder[i]).length;
+        if (left.length !== 1 || waiting !== 1) return null;
+        claimed.add(left[0][0]);
+        picked[i] = left[0];
+    }
+    return picked as Array<[number, I | undefined]>;
 }
 
 /** Gives the calls the existing segment ids in call order. Returns false and leaves `tx` unchanged on a mismatch. */

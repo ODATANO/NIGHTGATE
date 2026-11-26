@@ -15,8 +15,8 @@ const wallet = vi.hoisted(() => ({
     dappConnectorWalletProviders: vi.fn(async () => ({ walletProvider: { marker: 'wallet' }, midnightProvider: { marker: 'midnight' } })),
     dappConnectorProofProvider: vi.fn(async () => ({ marker: 'wallet-proof-provider' }))
 }));
-vi.mock('@midnight-ntwrk/midnight-js-contracts', () => sdk);
-vi.mock('@midnight-ntwrk/midnight-js-dapp-connector-proof-provider', () => wallet);
+vi.mock('@midnightntwrk/midnight-js-contracts', () => sdk);
+vi.mock('@midnightntwrk/midnight-js-dapp-connector-proof-provider', () => wallet);
 vi.mock('@midnight-ntwrk/compact-js', () => ({
     CompiledContract: {
         make: (name: string, ctor: unknown) => ({ name, ctor, pipe(step: (c: unknown) => unknown) { return step(this); } }),
@@ -24,9 +24,9 @@ vi.mock('@midnight-ntwrk/compact-js', () => ({
         withVacantWitnesses: (c: object) => ({ ...c, witnesses: 'vacant' })
     }
 }));
-vi.mock('@midnight-ntwrk/midnight-js-protocol/v9', () => ({ CostModel: { initialCostModel: () => 'initial-cost-model' } }));
-vi.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({ indexerPublicDataProvider: () => ({ marker: 'public-data' }) }));
-vi.mock('@midnight-ntwrk/midnight-js-http-client-proof-provider', () => ({ httpClientProofProvider: (uri: string) => ({ marker: 'http-provider', uri }) }));
+vi.mock('@midnightntwrk/midnight-js-protocol/v9', () => ({ CostModel: { initialCostModel: () => 'initial-cost-model' } }));
+vi.mock('@midnightntwrk/midnight-js-indexer-public-data-provider', () => ({ indexerPublicDataProvider: () => ({ marker: 'public-data' }) }));
+vi.mock('@midnightntwrk/midnight-js-http-client-proof-provider', () => ({ httpClientProofProvider: (uri: string) => ({ marker: 'http-provider', uri }) }));
 
 type ContractModule = typeof import('../../src/browser/contract.mjs');
 let connectContract: ContractModule['connectContract'];

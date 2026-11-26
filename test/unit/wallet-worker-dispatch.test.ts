@@ -173,7 +173,7 @@ vi.mock('@midnightntwrk/wallet-sdk-address-format', () => ({
 // Contract-path SDK seams (loadContractsSdk + buildWorkerContractProviders).
 const findDeployedContract = vi.hoisted(() => (vi.fn()));
 const ContractTypeError = vi.hoisted(() => class ContractTypeError extends Error {});
-vi.mock('@midnight-ntwrk/midnight-js-contracts', () => ({ findDeployedContract, ContractTypeError }));
+vi.mock('@midnightntwrk/midnight-js-contracts', () => ({ findDeployedContract, ContractTypeError }));
 // Query methods findDeployedContract hits per call; tracked so the
 // withFindContractQueryCache tests can count underlying indexer fetches.
 const publicDataMethods = vi.hoisted(() => ({
@@ -182,13 +182,13 @@ const publicDataMethods = vi.hoisted(() => ({
     queryContractState: vi.fn(async () => ({ currentState: true })),
     queryZSwapAndContractState: vi.fn(async () => ({ zswapAndState: true }))
 }));
-vi.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({
+vi.mock('@midnightntwrk/midnight-js-indexer-public-data-provider', () => ({
     indexerPublicDataProvider: vi.fn(() => ({ tag: 'publicData', ...publicDataMethods }))
 }));
 const proveTxMock = vi.hoisted(() => (vi.fn(async () => ({ proven: true }))));
 const httpClientProofProvider = vi.hoisted(() => (vi.fn(() => ({ tag: 'http-proof', proveTx: proveTxMock }))));
-vi.mock('@midnight-ntwrk/midnight-js-http-client-proof-provider', () => ({ httpClientProofProvider }));
-vi.mock('@midnight-ntwrk/midnight-js-node-zk-config-provider', () => ({
+vi.mock('@midnightntwrk/midnight-js-http-client-proof-provider', () => ({ httpClientProofProvider }));
+vi.mock('@midnightntwrk/midnight-js-node-zk-config-provider', () => ({
     NodeZkConfigProvider: vi.fn().mockImplementation(function (dir: string) { return { tag: 'zkConfig', directory: dir }; } as any)
 }));
 vi.mock('@midnight-ntwrk/compact-js', () => ({
@@ -269,7 +269,7 @@ vi.mock('@midnightntwrk/wallet-sdk-capabilities/submission', () => ({
 // loadDeps; stub its ESM imports so no real SDK loads in unit tests.
 vi.mock('@midnightntwrk/zkir-v2', () => ({ provingProvider: vi.fn(() => ({})) }));
 vi.mock('@midnightntwrk/zkir-v3', () => ({ provingProvider: vi.fn(() => ({})) }));
-vi.mock('@midnight-ntwrk/midnight-js-types', () => ({
+vi.mock('@midnightntwrk/midnight-js-types', () => ({
     zkConfigToProvingKeyMaterial: vi.fn(),
     createLedger9ProofProvider: vi.fn((pp: any) => ({ proveTx: vi.fn(), from: pp })),
     // The real factories narrow `{ version: 'v9', tx }`; the fakes pass the call straight through.
@@ -328,7 +328,7 @@ vi.mock('ws', () => {
 });
 
 import { MessageChannel } from 'node:worker_threads';
-import type { PublicDataProvider } from '@midnight-ntwrk/midnight-js-types';
+import type { PublicDataProvider } from '@midnightntwrk/midnight-js-types';
 import type { InspectedTx } from '../../srv/midnight/worker/sponsor';
 
 type SegmentIntent = NonNullable<InspectedTx['intents']> extends ReadonlyMap<number, infer I> ? I : never;

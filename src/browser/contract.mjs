@@ -51,9 +51,9 @@ export async function connectContract(opts = {}) {
     const manifest = opts.manifest ?? await loadManifest(manifestUrl, fetchFn);
     const [assembled, contracts, { CompiledContract }, walletMod] = await Promise.all([
         createNightgateConnectorProviders({ connector, manifest, manifestUrl, contractName, fetchFn, webSocket, proving, proofServerUrl, expectedManifestHash }),
-        import('@midnight-ntwrk/midnight-js-contracts'),
+        import('@midnightntwrk/midnight-js-contracts'),
         import('@midnight-ntwrk/compact-js'),
-        import('@midnight-ntwrk/midnight-js-dapp-connector-proof-provider')
+        import('@midnightntwrk/midnight-js-dapp-connector-proof-provider')
     ]);
     if (assembled.provingModality === 'none') {
         throw new Error("connectContract: nothing can prove for this contract. Pass proofServerUrl, or proving: 'wallet' for a wallet that proves itself");

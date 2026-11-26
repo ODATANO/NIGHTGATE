@@ -16,12 +16,12 @@ import type * as DustV2 from '@midnightntwrk/wallet-sdk-dust-wallet/v2';
 import type { NodeClientSdk } from './phased-submit';
 import type * as AbstractionsSdk from '@midnightntwrk/wallet-sdk-abstractions';
 import type * as FacadeSdk from '@midnightntwrk/wallet-sdk-facade';
-import type * as ContractsSdk from '@midnight-ntwrk/midnight-js-contracts';
-import type * as IndexerSdk from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
-import type * as ProofSdk from '@midnight-ntwrk/midnight-js-http-client-proof-provider';
-import type * as ZkConfigSdk from '@midnight-ntwrk/midnight-js-node-zk-config-provider';
+import type * as ContractsSdk from '@midnightntwrk/midnight-js-contracts';
+import type * as IndexerSdk from '@midnightntwrk/midnight-js-indexer-public-data-provider';
+import type * as ProofSdk from '@midnightntwrk/midnight-js-http-client-proof-provider';
+import type * as ZkConfigSdk from '@midnightntwrk/midnight-js-node-zk-config-provider';
 import type * as CompactJsSdk from '@midnight-ntwrk/compact-js';
-import type * as MidnightJsTypes from '@midnight-ntwrk/midnight-js-types';
+import type * as MidnightJsTypes from '@midnightntwrk/midnight-js-types';
 import { parentPort, type MessagePort } from 'node:worker_threads';
 import type { ReplayKind, ReplayTrack } from './sync-replay';
 import type { RevocableKeystore } from './revocable-keystore';
@@ -219,12 +219,12 @@ export async function loadSdk(): Promise<WalletSdk> {
 export async function loadContractsSdk(): Promise<ContractsSdkBundle> {
     if (cachedContractsSdk) return cachedContractsSdk;
     const [contracts, indexer, proof, zk, compactJs, types] = await Promise.all([
-        import('@midnight-ntwrk/midnight-js-contracts'),
-        import('@midnight-ntwrk/midnight-js-indexer-public-data-provider'),
-        import('@midnight-ntwrk/midnight-js-http-client-proof-provider'),
-        import('@midnight-ntwrk/midnight-js-node-zk-config-provider'),
+        import('@midnightntwrk/midnight-js-contracts'),
+        import('@midnightntwrk/midnight-js-indexer-public-data-provider'),
+        import('@midnightntwrk/midnight-js-http-client-proof-provider'),
+        import('@midnightntwrk/midnight-js-node-zk-config-provider'),
         import('@midnight-ntwrk/compact-js'),
-        import('@midnight-ntwrk/midnight-js-types')
+        import('@midnightntwrk/midnight-js-types')
     ]);
     cachedContractsSdk = { contracts, indexer, proof, zk, compactJs, types };
     return cachedContractsSdk;

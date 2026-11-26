@@ -112,6 +112,21 @@ describe('orderBatchSegments', () => {
         expect(tx.intents.get(90)).toBe(init3);
     });
 
+    test('a call whose segment the SDK moved on an id collision keeps its build order', () => {
+        const reg = intentFor('register');
+        const init1 = intentFor('initialiseField');
+        const init2 = intentFor('initialiseField');
+        // init2 was built on id 7 too; the merge moved it to 55.
+        const tx = txWithIntents([[55, init2], [12, reg], [7, init1]]);
+
+        const ok = orderBatchSegments(tx, ['register', 'initialiseField', 'initialiseField'], { segmentIds: [12, 7, 7] });
+
+        expect(ok).toBe(true);
+        expect(tx.intents.get(7)).toBe(reg);
+        expect(tx.intents.get(12)).toBe(init1);
+        expect(tx.intents.get(55)).toBe(init2);
+    });
+
     test('segment ids that do not fit the calls fall back to matching by name', () => {
         const attest = intentFor('attest');
         const bind = intentFor('bindPassport');

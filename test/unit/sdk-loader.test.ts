@@ -7,7 +7,7 @@
  * dedup logic without ever touching the real SDK.
  */
 
-vi.mock('@midnight-ntwrk/midnight-js-indexer-public-data-provider', () => ({ __esModule: true, marker: 'indexer' }));
+vi.mock('@midnightntwrk/midnight-js-indexer-public-data-provider', () => ({ __esModule: true, marker: 'indexer' }));
 vi.mock('@midnightntwrk/ledger-v9', () => ({ __esModule: true, marker: 'ledger-v9' }));
 
 import {

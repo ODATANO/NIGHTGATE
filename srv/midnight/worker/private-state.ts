@@ -1,7 +1,7 @@
 // The worker reads and writes contract private state through the main thread, which stores it in the database.
 
 import { parentPort, MessageChannel } from 'node:worker_threads';
-import type { ContractPrivateStates, PrivateStateProvider } from '@midnight-ntwrk/midnight-js-types';
+import type { ContractPrivateStates, PrivateStateProvider } from '@midnightntwrk/midnight-js-types';
 
 /** A stuck database must not hold the worker call and its session lock forever. */
 export const PRIVATE_STATE_RPC_TIMEOUT_MS = 60_000;

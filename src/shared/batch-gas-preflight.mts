@@ -3,7 +3,7 @@
 import { errorMessage } from './error-message.mjs';
 import { describeBatchSegments, type BatchReport } from './batch-segment-order.mjs';
 import type * as LedgerV9 from '@midnightntwrk/ledger-v9';
-import type { PublicDataProvider } from '@midnight-ntwrk/midnight-js-types';
+import type { PublicDataProvider } from '@midnightntwrk/midnight-js-types';
 
 const GAS_FAILURE = /out of gas|OutOfGas/;
 

@@ -1,4 +1,4 @@
-// HTTP timeout for one proof server request. The client retries a timeout up to three times, so a short one repeats slow proofs.
+// Deadline for one proof server request, its retries included. A request that runs into it is not retried.
 // `initialize()` copies the value into `NIGHTGATE_PROOF_TIMEOUT_MS` before the wallet worker starts.
 // This module does not import `@sap/cds`, because the worker thread loads it too.
 export const DEFAULT_PROOF_TIMEOUT_MS = 300_000;

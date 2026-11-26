@@ -453,12 +453,12 @@ export async function createTxBuilder(opts) {
         import('@midnightntwrk/wallet-sdk-dust-wallet'),
         import('@midnightntwrk/wallet-sdk-abstractions'),
         import('@midnight-ntwrk/compact-js'),
-        import('@midnight-ntwrk/midnight-js-contracts'),
-        import('@midnight-ntwrk/midnight-js-node-zk-config-provider'),
-        import('@midnight-ntwrk/midnight-js-indexer-public-data-provider'),
-        import('@midnight-ntwrk/midnight-js-types'),
-        import('@midnight-ntwrk/midnight-js-utils'),
-        import('@midnight-ntwrk/midnight-js-protocol')
+        import('@midnightntwrk/midnight-js-contracts'),
+        import('@midnightntwrk/midnight-js-node-zk-config-provider'),
+        import('@midnightntwrk/midnight-js-indexer-public-data-provider'),
+        import('@midnightntwrk/midnight-js-types'),
+        import('@midnightntwrk/midnight-js-utils'),
+        import('@midnightntwrk/midnight-js-protocol')
     ]);
 
     const { roleSeeds, keystore, attestationSecret, attesterId, addresses, shieldedKeys } = await deriveKeyMaterial({ seedHex, networkId, accountIndex, attestationSecret: opts.attestationSecret });
@@ -497,7 +497,7 @@ export async function createTxBuilder(opts) {
         ));
     let proofProvider;
     if (provingMode === 'server') {
-        const { httpClientProofProvider } = await import('@midnight-ntwrk/midnight-js-http-client-proof-provider');
+        const { httpClientProofProvider } = await import('@midnightntwrk/midnight-js-http-client-proof-provider');
         proofProvider = httpClientProofProvider(opts.proofServerUrl, zkConfigProvider, proofProviderConfig(opts));
     } else {
         const { buildWasmProofProvider } = require('../../srv/midnight/wasm-proof-provider.js');

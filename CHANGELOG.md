@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.47.4 - 2026-11-26
+
+`@odatano/nightgate-tx` 0.26.0 ships with it; the bullets that name it are its changes.
+
+### Changed
+
+- midnight-js 5.0.3 under the scope `@midnightntwrk`. Midnight publishes
+  midnight-js there since 5.0.2; `@midnight-ntwrk/midnight-js-*` ends at
+  5.0.1. `compact-js`, `compact-runtime` and `ledger-v9` are unchanged.
+- nightgate-tx: depends on `@midnightntwrk/midnight-js-*` 5.0.3. A consumer
+  that imports midnight-js itself moves to the same names, or it installs
+  two copies.
+- `proofTimeoutMs` is the deadline of one proof request with its retries.
+  midnight-js retries 429, 500 and 503, no longer a request that timed out,
+  and refuses a redirect from the proof server.
+
+### Fixes
+
+- A batch keeps its call order when midnight-js moved a call's segment
+  because two calls drew the same segment id. Such a batch failed before.
+
+No schema change. Docs: `docs/reference.md`, `docs/txbuilder.md`.
+
 ## 0.47.3 - 2026-11-25
 
 `@odatano/nightgate-tx` 0.25.3 ships with it; the bullets that name it are its changes.

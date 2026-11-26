@@ -3,10 +3,10 @@
 // Run with: node scripts/smoke-test-sdk.mjs
 
 const packages = [
-    '@midnight-ntwrk/midnight-js-contracts',
-    '@midnight-ntwrk/midnight-js-indexer-public-data-provider',
-    '@midnight-ntwrk/midnight-js-http-client-proof-provider',
-    '@midnight-ntwrk/midnight-js-node-zk-config-provider',
+    '@midnightntwrk/midnight-js-contracts',
+    '@midnightntwrk/midnight-js-indexer-public-data-provider',
+    '@midnightntwrk/midnight-js-http-client-proof-provider',
+    '@midnightntwrk/midnight-js-node-zk-config-provider',
     '@midnight-ntwrk/compact-runtime',
     '@midnightntwrk/ledger-v9',
     '@midnightntwrk/wallet-sdk-facade'

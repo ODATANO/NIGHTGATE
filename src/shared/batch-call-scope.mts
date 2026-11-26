@@ -6,7 +6,7 @@ import {
     unprovenTxCodec,
     withOrderedBatchSegments
 } from './batch-segment-order.mjs';
-import type { ProofProvider, PublicDataProvider, UnprovenTx } from '@midnight-ntwrk/midnight-js-types';
+import type { ProofProvider, PublicDataProvider, UnprovenTx } from '@midnightntwrk/midnight-js-types';
 import { checkBatchGas } from './batch-gas-preflight.mjs';
 import { errorMessage } from './error-message.mjs';
 
@@ -98,7 +98,7 @@ export async function runBatchInScope(
     if (typeof scoped !== 'function') {
         throw new Error(
             'submitContractCallBatch: withContractScopedTransaction not found in ' +
-            '@midnight-ntwrk/midnight-js-contracts; the installed SDK does not support batched call transactions'
+            '@midnightntwrk/midnight-js-contracts; the installed SDK does not support batched call transactions'
         );
     }
     for (const c of calls) {

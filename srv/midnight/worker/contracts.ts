@@ -17,8 +17,8 @@ import { createPrivateStateProxy } from './private-state';
 import { BoundSubmitIntent, WorkerWalletProvider, buildSponsoredWalletProvider, buildWorkerWalletProvider } from './submit';
 import { computeAttesterId, hexToBytes32 } from '@odatano/contract-kit';
 import type { CompiledContract, Witnesses } from '@midnight-ntwrk/compact-js';
-import type { Ledger9ContractProviders, Ledger9FoundContract } from '@midnight-ntwrk/midnight-js-contracts';
-import type { PrivateStateProvider, ProofProvider, PublicDataProvider, ZKConfigProvider } from '@midnight-ntwrk/midnight-js-types';
+import type { Ledger9ContractProviders, Ledger9FoundContract } from '@midnightntwrk/midnight-js-contracts';
+import type { PrivateStateProvider, ProofProvider, PublicDataProvider, ZKConfigProvider } from '@midnightntwrk/midnight-js-types';
 import { DEPLOY_ENTRY_POINT, resolveSponsorEntry } from './sponsor';
 
 /** Vault constructors take attester and recovery id as plain arguments, because witness reads exceed the node's cost limit. All-zero recovery id means none. */
