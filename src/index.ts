@@ -26,7 +26,7 @@ import { redactUrlCredentials } from '../srv/utils/redact-url';
 import { publishRuntimeState } from '../srv/utils/runtime-state';
 import { ensureSyncStateSingleton } from '../srv/utils/sync-state';
 import { closeSessionsFromPreviousProcess, adoptStoredSpellings } from '../srv/sessions/wallet-sessions';
-import { getConfiguredFeeSponsorSessions, prewarmFeeSponsorPool } from '../srv/submission/fee-sponsor';
+import { getConfiguredFeeSponsorSessions, prewarmFeeSponsorPool, rewarmSponsorsAfterWorkerExit } from '../srv/submission/fee-sponsor';
 import { isNodeTransportError } from '../srv/utils/retry';
 const log = cds.log('nightgate');
 import { startWalletWorker, stopWalletWorker } from '../srv/midnight/wallet-worker-client';
@@ -78,6 +78,7 @@ export interface NightgateIndexerStatus {
 let initialized = false;
 let leaseHolder: string | undefined;
 let stopLeaseHeartbeat: (() => void) | undefined;
+let stopSponsorRewarm: (() => void) | undefined;
 let lastStatus: NightgateIndexerStatus = {
     initialized: false,
     crawlerEnabled: false,
@@ -423,7 +424,7 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
         const pool = getConfiguredFeeSponsorSessions(nightgateConfig);
         if (pool.length > 0) {
             log.info(`Sponsor pool: warming ${pool.length} sponsor facade(s) in the background`);
-            void prewarmFeeSponsorPool({
+            const prewarm = {
                 db: cds.db,
                 config: nightgateConfig,
                 facadeConfig: {
@@ -434,7 +435,9 @@ export async function initialize(): Promise<NightgateIndexerStatus> {
                     relayUrl: nodeUrl
                 },
                 log
-            }).catch(err => log.warn(`Sponsor pool prewarm aborted: ${errorMessage(err)}`));
+            };
+            stopSponsorRewarm = rewarmSponsorsAfterWorkerExit(prewarm);
+            void prewarmFeeSponsorPool(prewarm).catch(err => log.warn(`Sponsor pool prewarm aborted: ${errorMessage(err)}`));
         }
     } catch (err) {
         const msg = errorMessage(err);
@@ -516,6 +519,8 @@ export async function shutdown(): Promise<void> {
     stopBackgroundJobProcessor();
     stopLeaseHeartbeat?.();
     stopLeaseHeartbeat = undefined;
+    stopSponsorRewarm?.();
+    stopSponsorRewarm = undefined;
     registerChainOutcomeConfirmer(null);
     try {
         await stopCrawler();

@@ -46,6 +46,11 @@ export function noteSponsorAccount(sponsorSessionId: string, accountId: string):
     sponsorAccounts.set(sponsorSessionId, accountId);
 }
 
+/** The worker key of a pool sponsor, known once it was resolved. */
+export function sponsorAccountOf(sponsorSessionId: string): string | undefined {
+    return sponsorAccounts.get(sponsorSessionId);
+}
+
 export function sponsorAtSyncGate(sponsorSessionId: string, now: number = Date.now()): boolean {
     const accountId = sponsorAccounts.get(sponsorSessionId);
     return !!accountId && syncGateReading(walletGetSyncProgress(accountId), now).caughtUp;

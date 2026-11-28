@@ -9,7 +9,7 @@ import { decrypt, getEncryptionKey } from '../utils/crypto';
 import { walletSessionViewingKeyBinding, walletSessionSeedBinding } from '../utils/envelope-bindings';
 import { deriveAccountId, deriveStoragePassword } from './wallet-material-factory';
 import { getOrBuildWalletFacade, type WalletFacadeBuildArgs } from './wallet-facade-builder';
-import { assignDedicatedWorker, walletWaitForSyncedState, walletWorkerPoolConfig } from '../midnight/wallet-worker-client';
+import { assignDedicatedWorker, onWorkerGone, walletWaitForSyncedState, walletWorkerPoolConfig, workerIdFor } from '../midnight/wallet-worker-client';
 import { NightgateError, errorMessage, type ERROR_CODES } from '../utils/errors';
 import { publishPrewarmState } from '../utils/runtime-state';
 
@@ -44,8 +44,8 @@ export interface ResolvedFeeSponsor {
 /** Re-exported. It lives in session-expiry.ts so lower-level modules can import it too. */
 export { getConfiguredFeeSponsorSessions } from '../utils/session-expiry';
 import { getConfiguredFeeSponsorSessions, isSessionExpired } from '../utils/session-expiry';
-import { configNumberFrom } from '../utils/config';
-import { noteSponsorAccount } from './sponsor-sync-gate';
+import { configMs, configNumberFrom } from '../utils/config';
+import { noteSponsorAccount, sponsorAccountOf } from './sponsor-sync-gate';
 import type { DbRunner } from '../utils/db-types';
 
 export interface ResolveFeeSponsorOptions {
@@ -126,9 +126,7 @@ export async function ensureFeeSponsorFacade(
     });
 }
 
-// Starts the platform sponsor wallets after boot. In a shared worker they start one at a time, because they would starve each other.
-// With a worker per sponsor they start side by side. A failing sponsor is logged and skipped, and the pool uses the others.
-export async function prewarmFeeSponsorPool(opts: {
+interface PrewarmOptions {
     db: DbRunner;
     config?: NightgateConfig;
     facadeConfig: Omit<WalletFacadeBuildArgs, 'seedHex' | 'syncStatePassphrase'>;
@@ -136,7 +134,34 @@ export async function prewarmFeeSponsorPool(opts: {
     encryptionKey?: Buffer;
     /** Defaults to `prewarmSyncBudgetMs()`. */
     syncBudgetMs?: number;
-}): Promise<{ warmed: string[]; failed: string[] }> {
+}
+
+/** Loads one pool sponsor and waits for it to reach the tip. False when the wallet could not be loaded. */
+async function warmFeeSponsor(sponsorSessionId: string, opts: PrewarmOptions, label: string): Promise<boolean> {
+    const started = Date.now();
+    try {
+        const sponsor = await resolveFeeSponsor({ db: opts.db, sponsorSessionId, config: opts.config, encryptionKey: opts.encryptionKey });
+        await ensureFeeSponsorFacade(sponsor, opts.facadeConfig);
+        opts.log?.info(`${label}: ${sponsorSessionId.slice(0, 8)} facade ready in ${Math.round((Date.now() - started) / 1000)}s`);
+        const syncBudget = opts.syncBudgetMs ?? prewarmSyncBudgetMs();
+        if (syncBudget > 0) {
+            try {
+                await walletWaitForSyncedState(sponsor.accountId, syncBudget);
+                opts.log?.info(`${label}: ${sponsorSessionId.slice(0, 8)} at tip after ${Math.round((Date.now() - started) / 1000)}s; next sponsor`);
+            } catch (err) {
+                opts.log?.warn(`${label}: ${sponsorSessionId.slice(0, 8)} not at tip within ${Math.round(syncBudget / 1000)}s (${errorMessage(err)}); it keeps catching up, the pool fails over to a synced member`);
+            }
+        }
+        return true;
+    } catch (err) {
+        opts.log?.warn(`${label}: ${sponsorSessionId.slice(0, 8)} failed (${errorMessage(err)}); the pool fails over at use time`);
+        return false;
+    }
+}
+
+// Starts the platform sponsor wallets after boot. In a shared worker they start one at a time, because they would starve each other.
+// With a worker per sponsor they start side by side. A failing sponsor is logged and skipped, and the pool uses the others.
+export async function prewarmFeeSponsorPool(opts: PrewarmOptions): Promise<{ warmed: string[]; failed: string[] }> {
     const pool = getConfiguredFeeSponsorSessions(opts.config);
     const warmed: string[] = [];
     const failed: string[] = [];
@@ -147,25 +172,7 @@ export async function prewarmFeeSponsorPool(opts: {
     });
     publish(pool.length > 0);
     const warmOne = async (sponsorSessionId: string): Promise<void> => {
-        const started = Date.now();
-        try {
-            const sponsor = await resolveFeeSponsor({ db: opts.db, sponsorSessionId, config: opts.config, encryptionKey: opts.encryptionKey });
-            await ensureFeeSponsorFacade(sponsor, opts.facadeConfig);
-            warmed.push(sponsorSessionId);
-            opts.log?.info(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} facade ready in ${Math.round((Date.now() - started) / 1000)}s`);
-            const syncBudget = opts.syncBudgetMs ?? prewarmSyncBudgetMs();
-            if (syncBudget > 0) {
-                try {
-                    await walletWaitForSyncedState(sponsor.accountId, syncBudget);
-                    opts.log?.info(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} at tip after ${Math.round((Date.now() - started) / 1000)}s; next sponsor`);
-                } catch (err) {
-                    opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} not at tip within ${Math.round(syncBudget / 1000)}s (${errorMessage(err)}); it keeps catching up, the pool fails over to a synced member`);
-                }
-            }
-        } catch (err) {
-            failed.push(sponsorSessionId);
-            opts.log?.warn(`sponsor pool prewarm: ${sponsorSessionId.slice(0, 8)} failed (${errorMessage(err)}); the pool fails over at use time`);
-        }
+        (await warmFeeSponsor(sponsorSessionId, opts, 'sponsor pool prewarm') ? warmed : failed).push(sponsorSessionId);
         publish(true);
     };
     if (walletWorkerPoolConfig().sponsorWorkers === 'dedicated') {
@@ -175,4 +182,48 @@ export async function prewarmFeeSponsorPool(opts: {
     }
     publish(false);
     return { warmed, failed };
+}
+
+const REWARM_MAX_DELAY_MS = 10 * 60_000;
+
+/** Loads the pool sponsors of a worker that exited again, so the next sponsored job finds them warm. Returns the stop function. */
+export function rewarmSponsorsAfterWorkerExit(opts: PrewarmOptions & { delayMs?: number }): () => void {
+    const delayMs = opts.delayMs ?? configMs('NIGHTGATE_SPONSOR_REWARM_DELAY_MS');
+    const timers = new Set<NodeJS.Timeout>();
+    const queued = new Set<string>();
+    let stopped = false;
+    const schedule = (ids: string[], waitMs: number): void => {
+        const timer = setTimeout(() => {
+            timers.delete(timer);
+            void (async () => {
+                const retry: string[] = [];
+                for (const id of ids) {
+                    if (stopped) return;
+                    if (await warmFeeSponsor(id, opts, 'sponsor rewarm')) queued.delete(id);
+                    else retry.push(id);
+                }
+                if (retry.length > 0 && !stopped) schedule(retry, Math.min(Math.max(waitMs, 1_000) * 2, REWARM_MAX_DELAY_MS));
+            })();
+        }, waitMs);
+        timer.unref();
+        timers.add(timer);
+    };
+    const off = onWorkerGone((reason, info) => {
+        if (reason !== 'exit' || stopped) return;
+        // A sponsor never loaded has no account yet. It was not in the worker, and a job loads it.
+        const ids = getConfiguredFeeSponsorSessions(opts.config).filter(id => {
+            const accountId = sponsorAccountOf(id);
+            return !!accountId && workerIdFor(accountId) === info.workerId && !queued.has(id);
+        });
+        if (ids.length === 0) return;
+        for (const id of ids) queued.add(id);
+        opts.log?.warn(`worker ${info.workerId} exited; loading ${ids.length} pool sponsor(s) again in ${Math.round(delayMs / 1000)}s`);
+        schedule(ids, delayMs);
+    });
+    return () => {
+        stopped = true;
+        off();
+        for (const t of timers) clearTimeout(t);
+        timers.clear();
+    };
 }

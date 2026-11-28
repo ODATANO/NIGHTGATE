@@ -18,10 +18,16 @@ vi.mock('../../srv/submission/wallet-facade-builder', () => ({
     getOrBuildWalletFacade: getOrBuildWalletFacadeMock
 }));
 const walletWaitForSyncedStateMock = vi.hoisted(() => vi.fn(async (..._args: any[]) => ({ synced: true })));
+const workerGone = vi.hoisted(() => ({ listeners: new Set<(reason: string, info: { workerId: string }) => void>() }));
 vi.mock('../../srv/midnight/wallet-worker-client', () => ({
     walletWaitForSyncedState: walletWaitForSyncedStateMock,
     assignDedicatedWorker: vi.fn(),
-    walletWorkerPoolConfig: () => ({ walletWorkers: 1, sponsorWorkers: 'shared' })
+    walletWorkerPoolConfig: () => ({ walletWorkers: 1, sponsorWorkers: 'shared' }),
+    workerIdFor: () => 'default',
+    onWorkerGone: (l: (reason: string, info: { workerId: string }) => void) => {
+        workerGone.listeners.add(l);
+        return () => workerGone.listeners.delete(l);
+    }
 }));
 
 import {
@@ -29,8 +35,10 @@ import {
     ensureFeeSponsorFacade,
     prewarmFeeSponsorPool,
     prewarmSyncBudgetMs,
+    rewarmSponsorsAfterWorkerExit,
     FeeSponsorError
 } from '../../srv/submission/fee-sponsor';
+import { __resetSponsorAccountsForTests } from '../../srv/submission/sponsor-sync-gate';
 import { readPrewarmState } from '../../srv/utils/runtime-state';
 import { deriveAccountId, deriveStoragePassword } from '../../srv/submission/wallet-material-factory';
 import { encrypt } from '../../srv/utils/crypto';
@@ -272,5 +280,83 @@ describe('prewarmFeeSponsorPool (boot)', () => {
         const out = await prewarmFeeSponsorPool({ db: { run: vi.fn() }, facadeConfig: {} as any });
         expect(out).toEqual({ warmed: [], failed: [] });
         expect(getOrBuildWalletFacadeMock).not.toHaveBeenCalled();
+    });
+});
+
+describe('rewarmSponsorsAfterWorkerExit', () => {
+    const cfg = { networkId: 'preprod', indexerHttpUrl: 'http://i', indexerWsUrl: 'ws://i', proofServerUrl: 'http://p', relayUrl: 'ws://n' } as any;
+    const exit = (reason: string, workerId = 'default') => { for (const l of workerGone.listeners) l(reason, { workerId }); };
+    const settle = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+
+    beforeEach(() => {
+        vi.useFakeTimers();
+        __resetSponsorAccountsForTests();
+        process.env.NIGHTGATE_FEE_SPONSOR_SESSIONS = 'sponsor-session-1';
+        getOrBuildWalletFacadeMock.mockImplementation(async () => ({}));
+        walletWaitForSyncedStateMock.mockImplementation(async () => ({ synced: true }));
+    });
+    afterEach(() => {
+        vi.useRealTimers();
+        workerGone.listeners.clear();
+    });
+
+    async function resolvedOnce(db: { run: any }) {
+        // A sponsor is known to the gate only after it was resolved once, as at boot.
+        await resolveFeeSponsor({ db, sponsorSessionId: 'sponsor-session-1', encryptionKey: TEST_KEY });
+        getOrBuildWalletFacadeMock.mockClear();
+    }
+
+    it('loads the sponsors of an exited worker again after the delay', async () => {
+        const db = { run: vi.fn(async () => sponsorRow({ sessionId: 'sponsor-session-1' })) };
+        await resolvedOnce(db);
+        const warns: string[] = [];
+        const stop = rewarmSponsorsAfterWorkerExit({ db, encryptionKey: TEST_KEY, facadeConfig: cfg, delayMs: 30_000, log: { info: () => {}, warn: (m) => warns.push(m) } });
+        exit('exit');
+        expect(warns.join(' ')).toMatch(/worker default exited; loading 1 pool sponsor\(s\) again in 30s/);
+        await vi.advanceTimersByTimeAsync(29_000);
+        expect(getOrBuildWalletFacadeMock).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1_000);
+        await settle();
+        expect(getOrBuildWalletFacadeMock).toHaveBeenCalledTimes(1);
+        expect(getOrBuildWalletFacadeMock.mock.calls[0][0]).toBe(deriveAccountId(VIEWING_KEY));
+        stop();
+    });
+
+    it('ignores a planned stop, another worker and sponsors never resolved', async () => {
+        const db = { run: vi.fn(async () => sponsorRow({ sessionId: 'sponsor-session-1' })) };
+        const stop = rewarmSponsorsAfterWorkerExit({ db, encryptionKey: TEST_KEY, facadeConfig: cfg, delayMs: 0 });
+        exit('exit');
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(getOrBuildWalletFacadeMock).not.toHaveBeenCalled();
+        await resolvedOnce(db);
+        exit('stop');
+        exit('exit', 'user-1');
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(getOrBuildWalletFacadeMock).not.toHaveBeenCalled();
+        stop();
+    });
+
+    it('retries a failed load with a doubled wait and stops on shutdown', async () => {
+        const db = { run: vi.fn(async () => sponsorRow({ sessionId: 'sponsor-session-1' })) };
+        await resolvedOnce(db);
+        getOrBuildWalletFacadeMock.mockImplementation(async () => { throw new Error('No response received from RPC endpoint in 60s'); });
+        const stop = rewarmSponsorsAfterWorkerExit({ db, encryptionKey: TEST_KEY, facadeConfig: cfg, delayMs: 10_000, log: { info: () => {}, warn: () => {} } });
+        exit('exit');
+        exit('exit'); // a second exit while queued schedules nothing more
+        await vi.advanceTimersByTimeAsync(10_000);
+        await settle();
+        expect(getOrBuildWalletFacadeMock).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(19_000);
+        await settle();
+        expect(getOrBuildWalletFacadeMock).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1_000);
+        await settle();
+        expect(getOrBuildWalletFacadeMock).toHaveBeenCalledTimes(2);
+        stop();
+        await vi.advanceTimersByTimeAsync(60 * 60_000);
+        expect(getOrBuildWalletFacadeMock).toHaveBeenCalledTimes(2);
+        exit('exit');
+        await vi.advanceTimersByTimeAsync(60 * 60_000);
+        expect(getOrBuildWalletFacadeMock).toHaveBeenCalledTimes(2);
     });
 });

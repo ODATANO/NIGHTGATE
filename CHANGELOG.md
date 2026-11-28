@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.47.7 - 2026-11-28
+
+### Fixes
+
+- A wallet worker that exits on its own no longer leaves its pool sponsors
+  unloaded. After `NIGHTGATE_SPONSOR_REWARM_DELAY_MS` (default 30 s) the
+  server loads them again and waits for the chain tip, as at the start. A
+  failed load is retried with a doubled wait, at most 10 minutes. Before,
+  `getSponsorPoolStatus` showed such a sponsor as `not warm yet` until a
+  restart, and the first job on it loaded the wallet itself.
+
+No schema change. `@odatano/nightgate-tx` unchanged.
+
 ## 0.47.6 - 2026-11-26
 
 ### Changed
