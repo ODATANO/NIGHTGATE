@@ -182,6 +182,7 @@ vi.mock('../../srv/utils/instance-lease', () => ({
 
 import cds from '@sap/cds';
 import { getStatus, initialize, shutdown } from '../../src/index';
+import { stopWalletWorker } from '../../srv/midnight/wallet-worker-client';
 
 describe('runtime initialize', () => {
     beforeEach(async () => {
@@ -271,6 +272,24 @@ describe('runtime initialize', () => {
             expect(mockClearAllEncryptionKeys).toHaveBeenCalledTimes(1);
             expect(mockAcquireLease).toHaveBeenCalledTimes(1);
             expect(mockReleaseLease).toHaveBeenCalledWith(expect.anything(), 'background', mockAcquireLease.mock.calls[0]?.[2]);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it('shutdown stops the wallet worker while the crawler is still stopping', async () => {
+        const logSpy = vi.spyOn(cds.log('nightgate'), 'info').mockImplementation(() => {});
+        try {
+            await initialize();
+            let finishCrawler: () => void = () => {};
+            mockStopCrawler.mockReturnValueOnce(new Promise<void>(resolve => { finishCrawler = resolve; }));
+            const stopping = shutdown();
+            await new Promise(r => setImmediate(r));
+            expect(stopWalletWorker).toHaveBeenCalledTimes(1);
+            expect(mockClearAllEncryptionKeys).not.toHaveBeenCalled();
+            finishCrawler();
+            await stopping;
+            expect(mockClearAllEncryptionKeys).toHaveBeenCalledTimes(1);
         } finally {
             logSpy.mockRestore();
         }

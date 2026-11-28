@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.47.8 - 2026-11-28
+
+### Fixes
+
+- A stop no longer waits without limit for the crawler. The background
+  passes and the in-flight batch share 30 s, the unsubscribe at the node,
+  the sync status write and the node disconnect get 5 s each.
+- The wallet worker stops beside the crawler, not after it. Its final
+  saves no longer depend on how long the crawler takes.
+- The log names how long the crawler and the wallet worker took to stop.
+
+No schema change. `@odatano/nightgate-tx` unchanged.
+
 ## 0.47.7 - 2026-11-28
 
 ### Fixes

@@ -45,8 +45,10 @@ interface ReorgInfo {
 /** The lowest start of an empty index. Block 0 has no events and often no timestamp, so the first block that can be stored is block 1, the anchor. */
 export const FIRST_START_HEIGHT = 2;
 
-/** stop() waits this long for the in-flight batch or live block before unsubscribing. */
+/** stop() waits this long in total for the background passes and the in-flight batch or live block. */
 const STOP_DRAIN_MS = 30_000;
+/** Limit for each node or database call of stop(). A hung node must not hold up the process stop. */
+const STOP_CALL_MS = 5_000;
 // Pause before a pipeline that failed on a transient error is driven again.
 const INGEST_REDRIVE_MS = 30_000;
 
@@ -256,41 +258,42 @@ export class MidnightCrawler {
 
     async stop(finalStatus: 'stopped' | 'error' = 'stopped'): Promise<void> {
         log.info('Stopping...');
+        const startedAt = Date.now();
         this.isRunning = false;
         if (this.redriveTimer) { clearTimeout(this.redriveTimer); this.redriveTimer = null; }
+        const drainUntil = startedAt + STOP_DRAIN_MS;
 
-        await Promise.allSettled([this.decoder?.stop(), this.supplement?.stop()]);
+        const passes = Promise.allSettled([this.decoder?.stop(), this.supplement?.stop()]);
+        if (!await settlesWithin(passes, drainUntil - Date.now())) {
+            log.warn(`Decode and supplement passes still running after ${STOP_DRAIN_MS} ms; stopping without them`);
+        }
         this.decoder = null;
         this.supplement = null;
 
         const inflight = [this.ingestPromise, this.liveProcessing].filter((p): p is Promise<void> => !!p);
-        if (inflight.length > 0) {
-            await Promise.race([
-                Promise.allSettled(inflight),
-                sleep(STOP_DRAIN_MS, undefined, { ref: false })
-            ]);
+        if (inflight.length > 0 && !await settlesWithin(Promise.allSettled(inflight), drainUntil - Date.now())) {
+            log.warn('In-flight batch still running at the stop deadline; stopping without it');
         }
 
         if (this.subscriptionId) {
-            try {
-                await this.nodeProvider.unsubscribeFinalizedHeads(this.subscriptionId);
-            } catch {
-                // best effort during shutdown
+            const id = this.subscriptionId;
+            if (!await settlesWithin(Promise.resolve().then(() => this.nodeProvider.unsubscribeFinalizedHeads(id)), STOP_CALL_MS)) {
+                log.warn(`Node did not confirm the unsubscribe within ${STOP_CALL_MS} ms`);
             }
             this.subscriptionId = null;
         }
 
-        try {
-            await this.db.run(
-                UPDATE.entity(SyncState).set({
-                    syncStatus: finalStatus
-                }).where({ ID: 'SINGLETON' })
-            );
-        } catch {
-            // DB might be closed
+        // The database may already be closed.
+        const saved = Promise.resolve().then(() => this.db.run(
+            UPDATE.entity(SyncState).set({
+                syncStatus: finalStatus
+            }).where({ ID: 'SINGLETON' })
+        ));
+        if (!await settlesWithin(saved, STOP_CALL_MS)) {
+            log.warn(`Sync status not stored within ${STOP_CALL_MS} ms`);
         }
 
-        log.info('Stopped');
+        log.info(`Stopped in ${Date.now() - startedAt} ms`);
     }
 
     // Allows one catch-up at a time, because the pipeline and the live handler can call this almost at once.
@@ -914,5 +917,16 @@ export class MidnightCrawler {
     /** Waits between retries and paced blocks. A method, so tests can replace the delay. */
     private sleep(ms: number): Promise<void> {
         return sleep(ms);
+    }
+}
+
+/** True when `work` settled within `ms`, false after that. A rejection counts as settled. */
+async function settlesWithin(work: Promise<unknown>, ms: number): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    const expired = new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, ms)); timer.unref(); });
+    try {
+        return await Promise.race([work.then(() => true, () => true), expired]);
+    } finally {
+        clearTimeout(timer);
     }
 }

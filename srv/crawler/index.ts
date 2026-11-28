@@ -3,7 +3,11 @@ import { installCrawlerFaultGuard } from './crawler-fault-guard';
 import { configBool } from '../utils/config';
 import { MidnightCrawler, CrawlerConfig } from './Crawler';
 import cds from '@sap/cds';
+import { withTimeout } from '../utils/timeout';
+import { errorMessage } from '../utils/errors';
 const log = cds.log('nightgate:crawler');
+
+const NODE_DISCONNECT_MS = 5_000;
 
 export { BlockProcessor } from './BlockProcessor';
 export type { ProcessResult } from './BlockProcessor';
@@ -55,10 +59,13 @@ export async function stopCrawler(): Promise<void> {
         activeCrawler = null;
     }
     if (activeNodeProvider) {
-        try {
-            await activeNodeProvider.disconnect();
-        } catch { /* ignore disconnect errors */ }
+        const provider = activeNodeProvider;
         activeNodeProvider = null;
+        try {
+            await withTimeout(provider.disconnect(), NODE_DISCONNECT_MS);
+        } catch (err) {
+            log.warn(`Node disconnect: ${errorMessage(err)}`);
+        }
     }
     log.info('Stopped');
 }

@@ -355,6 +355,36 @@ describe('MidnightCrawler orchestration', () => {
             expect(stopped).toBe(true);
         });
 
+        it('ends within its deadline when the background passes and the node hang', async () => {
+            vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+            try {
+                await setSyncState({ syncStatus: 'synced' });
+                const never = new Promise<never>(() => {});
+                const provider = { unsubscribeFinalizedHeads: vi.fn().mockReturnValue(never) };
+                const crawler = new MidnightCrawler(provider as any, { enabled: true });
+                (crawler as any).db = db;
+                (crawler as any).subscriptionId = 'sub-1';
+                (crawler as any).decoder = { stop: () => never };
+                (crawler as any).supplement = { stop: () => never };
+                (crawler as any).ingestPromise = never;
+
+                let stopped = false;
+                const stopping = crawler.stop().then(() => { stopped = true; });
+                await vi.advanceTimersByTimeAsync(29_000);
+                expect(stopped).toBe(false);
+                await vi.advanceTimersByTimeAsync(1_000);
+                await vi.advanceTimersByTimeAsync(10);
+                expect(provider.unsubscribeFinalizedHeads).toHaveBeenCalledWith('sub-1');
+                expect(stopped).toBe(false);
+                await vi.advanceTimersByTimeAsync(5_000);
+                await vi.waitFor(() => expect(stopped).toBe(true));
+                await stopping;
+                expect((await getSyncState()).syncStatus).toBe('stopped');
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
         it('drops a stale live subscription before subscribing again (no double processing after a reconnect race)', async () => {
             const provider = {
                 subscribeFinalizedHeads: vi.fn().mockResolvedValueOnce('sub-1').mockResolvedValueOnce('sub-2'),

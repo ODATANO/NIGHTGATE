@@ -522,22 +522,21 @@ export async function shutdown(): Promise<void> {
     stopSponsorRewarm?.();
     stopSponsorRewarm = undefined;
     registerChainOutcomeConfirmer(null);
-    try {
-        await stopCrawler();
-    } catch (err) {
-        const message = errorMessage(err);
-        log.warn(`Crawler stop error: ${message}`);
-        setLastStatus({
-            ...lastStatus,
-            lastError: message
-        });
-    }
-    try {
-        await stopWalletWorker();
-    } catch (err) {
-        const message = errorMessage(err);
-        log.warn(`Wallet worker stop error: ${message}`);
-    }
+    // The wallet stop runs beside the crawler stop, so a slow crawler never costs the final wallet saves.
+    const timed = async (name: string, stop: () => Promise<void>): Promise<void> => {
+        const startedAt = Date.now();
+        try {
+            await stop();
+        } catch (err) {
+            log.warn(`${name} stop error: ${errorMessage(err)}`);
+            if (name === 'Crawler') setLastStatus({ ...lastStatus, lastError: errorMessage(err) });
+        }
+        log.info(`${name} stopped after ${Date.now() - startedAt} ms`);
+    };
+    await Promise.all([
+        timed('Crawler', () => stopCrawler()),
+        timed('Wallet worker', () => stopWalletWorker())
+    ]);
     try {
         await stopDecodeWorker();
     } catch (err) {
